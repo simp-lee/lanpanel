@@ -2,7 +2,8 @@ package config
 
 const (
 	APIVersion                             = "lanpanel/v1alpha1"
-	DefaultHeadscaleVersion                = "0.28.0"
+	DefaultHeadscaleVersion                = "0.29.1"
+	DefaultLegoVersion                     = "v5.2.2"
 	DefaultHeadscaleMetricsPort            = 19090
 	DefaultPackageProbeReachabilityTimeout = "30s"
 	DefaultPackageProbeArtifactTimeout     = "5m"
@@ -40,6 +41,13 @@ type AdvancedConfig struct {
 	DNS01           DNS01Config           `yaml:"dns01"`
 	Network         NetworkConfig         `yaml:"network"`
 	Platform        PlatformConfig        `yaml:"platform"`
+}
+
+type DependencyConfig struct {
+	LegoSource   LegoSourceConfig   `yaml:"lego_source"`
+	PackageProbe PackageProbeConfig `yaml:"package_probe"`
+	Proxy        ProxyConfig        `yaml:"proxy"`
+	Platform     PlatformConfig     `yaml:"platform"`
 }
 
 type HeadscaleSourceConfig struct {

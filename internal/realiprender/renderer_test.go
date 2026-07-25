@@ -30,7 +30,7 @@ func TestStageRuntimeRendersProfileArtifacts(t *testing.T) {
 		UpdatedAt:       time.Unix(1700000000, 0).UTC(),
 	}
 	reference := realip.Reference{AppName: "example-app", Profile: "edgeone-prod", Domains: []string{"app.example.com"}}
-	staged, err := StageRuntime(profile, state, reference)
+	staged, err := StageRuntime(profile, state, reference, "/etc/lanpanel/lanpanel-app.yaml")
 	if err != nil {
 		t.Fatalf("StageRuntime() error = %v", err)
 	}
@@ -57,8 +57,11 @@ func TestStageRuntimeRendersProfileArtifacts(t *testing.T) {
 	if !strings.Contains(content["templates/realip/refresh.timer.tmpl"], "OnUnitActiveSec=3600s") || strings.Contains(content["templates/realip/refresh.timer.tmpl"], "3600000000000ns") {
 		t.Fatalf("refresh timer missing interval\n%s", content["templates/realip/refresh.timer.tmpl"])
 	}
-	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "/usr/local/bin/lanpanel app realip refresh --profile edgeone-prod") {
+	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod") {
 		t.Fatalf("refresh service missing command\n%s", content["templates/realip/refresh.service.tmpl"])
+	}
+	if strings.Contains(content["templates/realip/refresh.service.tmpl"], "--confirmation") {
+		t.Fatalf("refresh service must not embed manual confirmation\n%s", content["templates/realip/refresh.service.tmpl"])
 	}
 	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "TimeoutStartSec=2min") {
 		t.Fatalf("refresh service missing bounded timeout\n%s", content["templates/realip/refresh.service.tmpl"])
@@ -74,6 +77,31 @@ func TestStageRuntimeRendersProfileArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(content["generated/realip/reference.json"], `"app_name": "example-app"`) {
 		t.Fatalf("reference json missing app name\n%s", content["generated/realip/reference.json"])
+	}
+}
+
+func TestNewTemplateDataRejectsUnsafeAppConfigPath(t *testing.T) {
+	t.Parallel()
+
+	profile := realip.ProfileConfig{Name: "edgeone-prod", Provider: "edgeone", RefreshInterval: "1h"}
+	state := realip.State{ProfileName: "edgeone-prod", Provider: "edgeone"}
+	if _, err := NewTemplateData(profile, state, realip.Reference{}, "lanpanel-app.yaml"); err == nil || !strings.Contains(err.Error(), "must be absolute") {
+		t.Fatalf("NewTemplateData(relative) error = %v, want absolute path refusal", err)
+	}
+	for _, path := range []string{
+		"/etc/lanpanel/app;evil.yaml",
+		"/etc/lanpanel/app$evil.yaml",
+		"/etc/lanpanel/app{evil}.yaml",
+		"/etc/lanpanel/app%h.yaml",
+		"/etc/lanpanel/app name.yaml",
+	} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			if _, err := NewTemplateData(profile, state, realip.Reference{}, path); err == nil || !strings.Contains(err.Error(), "single systemd ExecStart token") {
+				t.Fatalf("NewTemplateData(%q) error = %v, want token refusal", path, err)
+			}
+		})
 	}
 }
 

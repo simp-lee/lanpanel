@@ -1,8 +1,9 @@
 package workflow
 
 import (
-	"lanpanel/internal/output"
+	"lanpanel/internal/domain"
 	"strings"
+	"unicode"
 )
 
 type Failure struct {
@@ -44,10 +45,6 @@ func (failure Failure) Summary() string {
 	}
 }
 
-func (failure Failure) Response(command string) output.Response {
-	return failure.Snapshot().Response(command)
-}
-
 func (failure Failure) Snapshot() FailureSnapshot {
 	return FailureSnapshot{
 		Summary:      failure.Summary(),
@@ -70,33 +67,33 @@ func (snapshot FailureSnapshot) HasContent() bool {
 		strings.TrimSpace(snapshot.RetryCommand) != ""
 }
 
-func (snapshot FailureSnapshot) Response(command string) output.Response {
-	fields := make([]output.Field, 0, 4)
+func (snapshot FailureSnapshot) ResultFields() []domain.ResultField {
+	fields := make([]domain.ResultField, 0, 4)
 	if step := strings.TrimSpace(snapshot.Step); step != "" {
-		fields = append(fields, output.Field{Label: "step", Value: step})
+		fields = append(fields, domain.ResultField{Label: "step", Value: step})
 	}
 	if operation := strings.TrimSpace(snapshot.Operation); operation != "" {
-		fields = append(fields, output.Field{Label: "what failed", Value: operation})
+		fields = append(fields, domain.ResultField{Label: "what failed", Value: operation})
 	}
 	if impact := strings.TrimSpace(snapshot.Impact); impact != "" {
-		fields = append(fields, output.Field{Label: "impact", Value: impact})
+		fields = append(fields, domain.ResultField{Label: "impact", Value: impact})
 	}
 	if details := strings.TrimSpace(snapshot.Details); details != "" {
-		fields = append(fields, output.Field{Label: "details", Value: details})
+		fields = append(fields, domain.ResultField{Label: "details", Value: details})
 	}
+	return fields
+}
 
+func (snapshot FailureSnapshot) NextSteps() []string {
 	nextSteps := append([]string(nil), snapshot.Remediation...)
 	if retry := strings.TrimSpace(snapshot.RetryCommand); retry != "" {
 		nextSteps = append(nextSteps, "Retry after remediation: "+retry)
 	}
+	return nextSteps
+}
 
-	return output.Response{
-		Command:   command,
-		Status:    "failed",
-		Summary:   snapshot.summary(),
-		Fields:    fields,
-		NextSteps: nextSteps,
-	}
+func (snapshot FailureSnapshot) SummaryText() string {
+	return snapshot.summary()
 }
 
 func (snapshot FailureSnapshot) summary() string {
@@ -128,4 +125,34 @@ func summarizeCause(err error) string {
 	}
 	line, _, _ := strings.Cut(message, "\n")
 	return strings.TrimSpace(line)
+}
+
+func ShellCommand(args ...string) string {
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if shellSafe(arg) {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+}
+
+func shellSafe(arg string) bool {
+	for _, r := range arg {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r):
+		case strings.ContainsRune("_@%+=:,./-", r):
+		default:
+			return false
+		}
+	}
+	return true
 }

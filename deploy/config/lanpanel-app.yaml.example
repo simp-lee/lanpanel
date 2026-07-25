@@ -1,4 +1,4 @@
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 
 app:
   name: "example-app"
@@ -14,6 +14,38 @@ app:
   listen: "127.0.0.1:18001"
   upstream: ""
 
+access:
+  # Required. Use browser for LanPanel Basic Auth at the app gateway, or public
+  # for an intentionally public HTTPS app with explicit risk confirmation.
+  access_mode: "browser" # browser | public
+  # CIDR allowlist is an extra source-IP gate. It never bypasses Basic Auth.
+  cidr_allowlist: []
+  # Required only when access_mode is public.
+  public_risk_confirmed: false
+  browser_auth:
+    # Browser app auth is separate from nginx.goaccess.auth_basic_user_file.
+    # Use exactly one browser credential source:
+    # - auth_basic_user_file: external app-gateway htpasswd, not GoAccess.
+    # - managed: LanPanel-created credential under /etc/lanpanel/browser-auth.
+    # Managed passwords are shown only as one-time UI secrets after create/rotate;
+    # configs and job history store only credential metadata and password_fingerprint.
+    # Managed delete is fail-closed: remove files manually after verifying no active
+    # or staged browser app config still references the htpasswd path.
+    # browser mode clears upstream Authorization. Apps that need business-layer
+    # Authorization must use explicit public exposure or wait for upstream-auth support.
+    auth_basic_user_file: "/etc/example-app/browser.htpasswd"
+    managed:
+      credential_id: ""
+      htpasswd_path: ""
+      username: ""
+      password_fingerprint: ""
+  origin_protection:
+    # Required. none means direct origin exposure and requires explicit risk
+    # confirmation. edgeone requires edgeone_profile below and DNS-01.
+    mode: "none" # none | edgeone
+    direct_origin_risk_confirmed: true
+    edgeone_profile: ""
+
 service:
   # listen mode only. The first token must be the absolute business binary path.
   exec_start: "/opt/example-app/example-app --listen 127.0.0.1:18001"
@@ -24,9 +56,10 @@ service:
 
 nginx:
   client_max_body_size: "20m"
-  # Uses the modern "http2 on;" directive. Requires Nginx >= 1.25.1
-  # with the http_v2 module. Set false for older distro Nginx packages.
-  http2: true
+  # Set true only when the target Nginx is >= 1.25.1 and has http_v2.
+  # Default is false so first app-only deploys do not require modern HTTP/2 support.
+  # When true, Lanpanel renders the modern "http2 on;" directive.
+  http2: false
   # Optional per-app Nginx logs. access_log may also be "off".
   # With GoAccess enabled and access_log empty, Lanpanel uses
   # /var/log/lanpanel/apps/<app-name>/access.log and manages logrotate.
@@ -48,11 +81,6 @@ nginx:
   # or /var/log/lanpanel/apps/<app-name>.
   error_log: ""
 
-  # Optional CDN real client IP profile reference. Leave empty unless this app
-  # is served through a Lanpanel-managed EdgeOne realip profile.
-  # EdgeOne realip profile mode requires app.acme_challenge: "dns-01".
-  realip_profile: ""
-
   # Optional GoAccess access-log dashboard. Keep disabled unless explicitly configured.
   # When enabled, auth_basic_user_file is required and must point to an existing
   # regular, non-empty htpasswd file with at least one user:hash credential line.
@@ -63,6 +91,9 @@ nginx:
   # and searchable by the Nginx runtime user.
   # Under /etc/<app-name>, use the direct /etc/<app-name>/goaccess.htpasswd
   # bootstrap path rather than a nested child path.
+  # The Management UI does not manage GoAccess htpasswd files. Create the
+  # htpasswd file on the server before enabling GoAccess, then store its
+  # absolute path in nginx.goaccess.auth_basic_user_file.
   # Create it on Debian/Ubuntu with:
   #   # Install the htpasswd command; it is provided by apache2-utils.
   #   sudo apt install -y apache2-utils
@@ -135,9 +166,10 @@ realip:
   #     # Uses Tencent Cloud China EdgeOne API endpoint teo.tencentcloudapi.com.
   #     # International endpoint teo.intl.tencentcloudapi.com is not supported.
   #     # Defaults to 72h; minimum is 1h. Use
-  #     # `sudo lanpanel app realip refresh --profile edgeone-prod`
-  #     # for immediate synchronization.
-  #     # Use `sudo lanpanel app realip diagnostics --profile edgeone-prod`
+  #     # `sudo lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod`
+  #     # for immediate synchronization. Add --confirmation origin-protection-manual
+  #     # only when the refresh output requires it.
+  #     # Use `sudo lanpanel app realip diagnostics --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod`
   #     # to inspect deployed state, references, credentials, and includes.
   #     refresh_interval: "72h"
   #     edgeone:
@@ -154,6 +186,14 @@ realip:
   #       # Keep the realip env_file separate when dns01.env_file also contains
   #       # lego DNS polling or propagation tuning.
   #       env_file: "/etc/lanpanel/realip/edgeone-prod.env"
+  #
+  # To use this profile for an app, set app.acme_challenge to dns-01,
+  # configure dns01.provider/env_file, and set:
+  # access:
+  #   origin_protection:
+  #     mode: "edgeone"
+  #     direct_origin_risk_confirmed: false
+  #     edgeone_profile: "edgeone-prod"
 
 dns01:
   provider: ""
@@ -191,3 +231,26 @@ tailscale:
   login_server: ""
   hostname: ""
   auth_key_file: ""
+
+dependencies:
+  lego_source:
+    # direct downloads the pinned lego archive from GitHub. Offline mode must
+    # point at the exact pinned archive for dependencies.platform.arch; Lanpanel
+    # verifies the built-in SHA-256 digest.
+    mode: "direct" # direct | offline
+    file_path: ""
+
+  package_probe:
+    # Used by app-only lego archive reachability and SHA-256 verification.
+    reachability_timeout: "30s"
+    artifact_timeout: "5m"
+
+  proxy:
+    # Applied to app deploy package commands and artifact downloads.
+    http_proxy: ""
+    https_proxy: ""
+    no_proxy: ""
+
+  platform:
+    # lanpanel app init writes the current binary architecture by default.
+    arch: "amd64"

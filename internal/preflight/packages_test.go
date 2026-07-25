@@ -18,7 +18,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "direct missing reachability confirmation",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:    "direct",
-				Version: "0.28.0",
+				Version: "0.29.1",
 			}),
 			status: StatusFail,
 		},
@@ -26,7 +26,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "direct missing integrity evidence",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:                "direct",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				ReachabilityChecked: true,
 				Reachable:           true,
 			}),
@@ -36,7 +36,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "direct verified",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:                "direct",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				ExpectedSHA256:      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				ReachabilityChecked: true,
 				Reachable:           true,
@@ -46,14 +46,14 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			status: StatusPass,
 			wantFindings: []string{
 				"Pinned lego archive source mode: direct.",
-				"Pinned lego archive URL: https://github.com/go-acme/lego/releases/download/v5.1.0/lego_v5.1.0_linux_amd64.tar.gz.",
+				"Pinned lego archive URL: https://github.com/go-acme/lego/releases/download/v5.2.2/lego_v5.2.2_linux_amd64.tar.gz.",
 			},
 		},
 		{
 			name: "mirror checksum mismatch",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:                "mirror",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				URL:                 "https://mirror.example.com/headscale.deb",
 				ExpectedSHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				ReachabilityChecked: true,
@@ -67,7 +67,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "mirror reachability not confirmed",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:           "mirror",
-				Version:        "0.28.0",
+				Version:        "0.29.1",
 				URL:            "https://mirror.example.com/headscale.deb",
 				ExpectedSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			}),
@@ -77,7 +77,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "mirror integrity not confirmed",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:                "mirror",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				URL:                 "https://mirror.example.com/headscale.deb",
 				ExpectedSHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				ReachabilityChecked: true,
@@ -89,7 +89,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "offline package missing",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:             "offline",
-				Version:          "0.28.0",
+				Version:          "0.29.1",
 				FilePath:         "/tmp/headscale.deb",
 				ExpectedSHA256:   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 				FileExists:       false,
@@ -101,7 +101,7 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "offline integrity not confirmed",
 			input: withVerifiedLegoSource(PackageSourceState{
 				Mode:           "offline",
-				Version:        "0.28.0",
+				Version:        "0.29.1",
 				FilePath:       "/tmp/headscale.deb",
 				ExpectedSHA256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 				FileExists:     true,
@@ -112,14 +112,14 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "lego reachability not confirmed",
 			input: PackageSourceState{
 				Mode:                "direct",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				ExpectedSHA256:      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				ReachabilityChecked: true,
 				Reachable:           true,
 				IntegrityChecked:    true,
 				ActualSHA256:        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-				LegoVersion:         "v5.1.0",
-				LegoURL:             "https://github.com/go-acme/lego/releases/download/v5.1.0/lego_v5.1.0_linux_amd64.tar.gz",
+				LegoVersion:         "v5.2.2",
+				LegoURL:             "https://github.com/go-acme/lego/releases/download/v5.2.2/lego_v5.2.2_linux_amd64.tar.gz",
 				LegoExpectedSHA256:  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			},
 			status: StatusFail,
@@ -128,15 +128,15 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "offline lego archive verified",
 			input: PackageSourceState{
 				Mode:                 "direct",
-				Version:              "0.28.0",
+				Version:              "0.29.1",
 				ExpectedSHA256:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				ReachabilityChecked:  true,
 				Reachable:            true,
 				IntegrityChecked:     true,
 				ActualSHA256:         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				LegoMode:             "offline",
-				LegoVersion:          "v5.1.0",
-				LegoFilePath:         "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz",
+				LegoVersion:          "v5.2.2",
+				LegoFilePath:         "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz",
 				LegoFileExists:       true,
 				LegoExpectedSHA256:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 				LegoIntegrityChecked: true,
@@ -145,22 +145,22 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			status: StatusPass,
 			wantFindings: []string{
 				"Pinned lego archive source mode: offline.",
-				"Offline lego archive path: /srv/packages/lego_v5.1.0_linux_amd64.tar.gz.",
+				"Offline lego archive path: /srv/packages/lego_v5.2.2_linux_amd64.tar.gz.",
 			},
 		},
 		{
 			name: "offline lego archive missing",
 			input: PackageSourceState{
 				Mode:                "direct",
-				Version:             "0.28.0",
+				Version:             "0.29.1",
 				ExpectedSHA256:      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				ReachabilityChecked: true,
 				Reachable:           true,
 				IntegrityChecked:    true,
 				ActualSHA256:        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				LegoMode:            "offline",
-				LegoVersion:         "v5.1.0",
-				LegoFilePath:        "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz",
+				LegoVersion:         "v5.2.2",
+				LegoFilePath:        "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz",
 				LegoExpectedSHA256:  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 			},
 			status: StatusFail,
@@ -169,15 +169,15 @@ func TestCheckPackageSourceModes(t *testing.T) {
 			name: "offline lego archive checksum mismatch",
 			input: PackageSourceState{
 				Mode:                 "direct",
-				Version:              "0.28.0",
+				Version:              "0.29.1",
 				ExpectedSHA256:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				ReachabilityChecked:  true,
 				Reachable:            true,
 				IntegrityChecked:     true,
 				ActualSHA256:         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 				LegoMode:             "offline",
-				LegoVersion:          "v5.1.0",
-				LegoFilePath:         "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz",
+				LegoVersion:          "v5.2.2",
+				LegoFilePath:         "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz",
 				LegoFileExists:       true,
 				LegoExpectedSHA256:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 				LegoIntegrityChecked: true,
@@ -210,8 +210,8 @@ func TestCheckPackageSourceModes(t *testing.T) {
 
 func withVerifiedLegoSource(state PackageSourceState) PackageSourceState {
 	state.LegoMode = "direct"
-	state.LegoVersion = "v5.1.0"
-	state.LegoURL = "https://github.com/go-acme/lego/releases/download/v5.1.0/lego_v5.1.0_linux_amd64.tar.gz"
+	state.LegoVersion = "v5.2.2"
+	state.LegoURL = "https://github.com/go-acme/lego/releases/download/v5.2.2/lego_v5.2.2_linux_amd64.tar.gz"
 	state.LegoExpectedSHA256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	state.LegoReachabilityChecked = true
 	state.LegoReachable = true

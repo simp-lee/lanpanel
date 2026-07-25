@@ -3,6 +3,10 @@
 /bin/
 /build/
 /dist/
+/node_modules/
+/docs/.vitepress/.temp/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
 
 # Go test and coverage artifacts
 *.test
@@ -10,6 +14,11 @@
 *.prof
 *.coverprofile
 coverage.*
+
+# Browser E2E artifacts
+/test-results/
+/playwright-report/
+/e2e/node_modules/
 
 # Local runtime config and secrets
 /lanpanel.yaml
@@ -26,6 +35,7 @@ coverage.*
 
 # Local editor and agent workspace state
 /.agents-work/
+/.pi-work/
 /.codex
 /.vscode/
 /.idea/

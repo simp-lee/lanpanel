@@ -7,13 +7,14 @@ import (
 	"lanpanel/internal/host"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewPackagePlanDirectUsesOfficialReleaseArtifact(t *testing.T) {
 	t.Parallel()
 
 	cfg := validConfig()
-	plan, err := NewPackagePlan(cfg, InstallPlanOptions{OfficialPackageSHA256: strings.Repeat("a", 64)})
+	plan, err := NewPackagePlan(cfg, InstallPlanOptions{})
 	if err != nil {
 		t.Fatalf("NewPackagePlan() error = %v", err)
 	}
@@ -27,19 +28,22 @@ func TestNewPackagePlanDirectUsesOfficialReleaseArtifact(t *testing.T) {
 	if plan.Arch != config.ArchAMD64 {
 		t.Fatalf("Arch = %q, want %q", plan.Arch, config.ArchAMD64)
 	}
-	if plan.AssetName != "headscale_0.28.0_linux_amd64.deb" {
+	if plan.AssetName != "headscale_0.29.1_linux_amd64.deb" {
 		t.Fatalf("AssetName = %q", plan.AssetName)
 	}
-	if plan.SourceURL != "https://github.com/juanfont/headscale/releases/download/v0.28.0/headscale_0.28.0_linux_amd64.deb" {
+	if plan.SourceURL != "https://github.com/juanfont/headscale/releases/download/v0.29.1/headscale_0.29.1_linux_amd64.deb" {
 		t.Fatalf("SourceURL = %q", plan.SourceURL)
 	}
-	if plan.ChecksumsURL != "https://github.com/juanfont/headscale/releases/download/v0.28.0/checksums.txt" {
+	if plan.ChecksumsURL != "https://github.com/juanfont/headscale/releases/download/v0.29.1/checksums.txt" {
 		t.Fatalf("ChecksumsURL = %q", plan.ChecksumsURL)
 	}
 	if plan.RequiresOfficialDigest {
-		t.Fatal("RequiresOfficialDigest = true, want false after digest provided")
+		t.Fatal("RequiresOfficialDigest = true, want false with built-in digest")
 	}
-	if plan.InstallPath() != "/var/cache/lanpanel/headscale_0.28.0_linux_amd64.deb" {
+	if plan.ExpectedSHA256 != sha256LinuxAMD64DEB {
+		t.Fatalf("ExpectedSHA256 = %q, want built-in digest", plan.ExpectedSHA256)
+	}
+	if plan.InstallPath() != "/var/cache/lanpanel/headscale_0.29.1_linux_amd64.deb" {
 		t.Fatalf("InstallPath() = %q", plan.InstallPath())
 	}
 }
@@ -49,8 +53,9 @@ func TestNewInstallPlanBuildsIntegrityCheckedInstallCommands(t *testing.T) {
 
 	cfg := validConfig()
 	plan, err := NewInstallPlan(cfg, InstallPlanOptions{
-		CacheDir:              "/tmp/lanpanel-packages",
-		OfficialPackageSHA256: strings.Repeat("b", 64),
+		CacheDir:            "/tmp/lanpanel-packages",
+		ReachabilityTimeout: 45 * time.Second,
+		ArtifactTimeout:     7 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewInstallPlan() error = %v", err)
@@ -64,10 +69,13 @@ func TestNewInstallPlanBuildsIntegrityCheckedInstallCommands(t *testing.T) {
 	if plan.Commands[1].Name != "curl" || !strings.Contains(strings.Join(plan.Commands[1].Args, " "), plan.Package.SourceURL) {
 		t.Fatalf("Commands[1] = %#v, want curl download command", plan.Commands[1])
 	}
-	if plan.Commands[2].Name != "sha256sum" || !strings.Contains(string(plan.Commands[2].Stdin), strings.Repeat("b", 64)) {
+	if got := strings.Join(plan.Commands[1].Args, " "); !strings.Contains(got, "--connect-timeout 45") || !strings.Contains(got, "--max-time 420") {
+		t.Fatalf("curl args = %q, want configured reachability and artifact timeouts", got)
+	}
+	if plan.Commands[2].Name != "sha256sum" || !strings.Contains(string(plan.Commands[2].Stdin), sha256LinuxAMD64DEB) {
 		t.Fatalf("Commands[2] = %#v, want sha256sum check", plan.Commands[2])
 	}
-	if got := strings.Join(plan.Commands[3].Args, " "); got != "install -y /tmp/lanpanel-packages/headscale_0.28.0_linux_amd64.deb" {
+	if got := strings.Join(plan.Commands[3].Args, " "); got != "install -y /tmp/lanpanel-packages/headscale_0.29.1_linux_amd64.deb" {
 		t.Fatalf("apt args = %q", got)
 	}
 	if got := plan.Commands[3].Env["DEBIAN_FRONTEND"]; got != "noninteractive" {
@@ -75,15 +83,15 @@ func TestNewInstallPlanBuildsIntegrityCheckedInstallCommands(t *testing.T) {
 	}
 }
 
-func TestNewPackagePlanRejectsInstallWithoutDigest(t *testing.T) {
+func TestNewPackagePlanRejectsMismatchedProvidedDigest(t *testing.T) {
 	t.Parallel()
 
-	_, err := NewPackagePlan(validConfig(), InstallPlanOptions{})
+	_, err := NewPackagePlan(validConfig(), InstallPlanOptions{OfficialPackageSHA256: strings.Repeat("a", 64)})
 	if err == nil {
-		t.Fatal("NewPackagePlan() error = nil, want digest error")
+		t.Fatal("NewPackagePlan() error = nil, want digest mismatch error")
 	}
-	if !strings.Contains(err.Error(), "SHA-256 digest is required") {
-		t.Fatalf("error = %q, want digest failure", err.Error())
+	if !strings.Contains(err.Error(), "does not match built-in digest") {
+		t.Fatalf("error = %q, want digest mismatch failure", err.Error())
 	}
 }
 
@@ -92,11 +100,11 @@ func TestNewPackagePlanRejectsUnsupportedHeadscaleVersion(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.Advanced.HeadscaleSource.Version = "0.29.0"
-	_, err := NewPackagePlan(cfg, InstallPlanOptions{OfficialPackageSHA256: strings.Repeat("a", 64)})
+	_, err := NewPackagePlan(cfg, InstallPlanOptions{})
 	if err == nil {
 		t.Fatal("NewPackagePlan() error = nil, want version failure")
 	}
-	if !strings.Contains(err.Error(), "headscale version must be 0.28.0") {
+	if !strings.Contains(err.Error(), "headscale version must be 0.29.1") {
 		t.Fatalf("error = %q, want version guardrail", err.Error())
 	}
 }

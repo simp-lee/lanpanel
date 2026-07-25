@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,11 +29,7 @@ func (c Config) WriteFile(path string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := writeFileNoFollow(path, data, 0o600); err != nil {
 		return fmt.Errorf("write config file: %w", err)
 	}
 
@@ -127,7 +125,7 @@ advanced:
 
   platform:
     arch: "%s"
-`, APIVersion, DefaultHeadscaleVersion, DefaultHeadscaleMetricsPort, DefaultPackageProbeReachabilityTimeout, DefaultPackageProbeArtifactTimeout, ArchAMD64)
+`, APIVersion, DefaultHeadscaleVersion, DefaultHeadscaleMetricsPort, DefaultPackageProbeReachabilityTimeout, DefaultPackageProbeArtifactTimeout, DefaultPlatformArch())
 
 	return []byte(data), nil
 }
@@ -138,13 +136,153 @@ func WriteExampleFile(path string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create example config directory: %w", err)
-	}
-
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := writeFileNoFollow(path, data, 0o644); err != nil {
 		return fmt.Errorf("write example config file: %w", err)
 	}
 
+	return nil
+}
+
+func writeFileNoFollow(path string, data []byte, perm os.FileMode) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve config file path: %w", err)
+	}
+	dir := filepath.Dir(absolute)
+	if err := ensureSafeConfigDirectory(dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	if err := ensureSafeConfigDirectory(dir); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(absolute); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s must not be a symlink", absolute)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s must be a regular file", absolute)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat config file: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(absolute)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary config file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary config file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temporary config file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary config file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary config file: %w", err)
+	}
+	if err := os.Rename(tmpPath, absolute); err != nil {
+		return fmt.Errorf("replace config file: %w", err)
+	}
+	if err := syncDirectory(dir); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func ensureSafeConfigDirectory(dir string) error {
+	clean := filepath.Clean(dir)
+	if clean == "." || !filepath.IsAbs(clean) {
+		return fmt.Errorf("config directory must resolve to a clean absolute path")
+	}
+	current := string(filepath.Separator)
+	if err := checkConfigDirectoryComponent(current, current == clean); err != nil {
+		return err
+	}
+	if clean == current {
+		return nil
+	}
+	parts := strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("config directory must resolve to a clean absolute path")
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("inspect config directory component %s: %w", current, err)
+		}
+		if err := validateConfigDirectoryComponent(current, info, current == clean); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkConfigDirectoryComponent(path string, immediate bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect config directory component %s: %w", path, err)
+	}
+	return validateConfigDirectoryComponent(path, info, immediate)
+}
+
+func validateConfigDirectoryComponent(path string, info os.FileInfo, immediate bool) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("config directory component %s must not be a symlink", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("config directory component %s must be a directory", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("config directory component %s owner could not be inspected", path)
+	}
+	euid := uint32(os.Geteuid())
+	if stat.Uid != euid && stat.Uid != 0 {
+		return fmt.Errorf("config directory component %s owner uid %d does not match effective uid %d or root", path, stat.Uid, euid)
+	}
+	if unsafeConfigDirectoryMode(info.Mode(), immediate, stat.Uid, euid) {
+		return fmt.Errorf("config directory component %s must not be writable by untrusted local users", path)
+	}
+	return nil
+}
+
+func unsafeConfigDirectoryMode(mode os.FileMode, immediate bool, uid uint32, euid uint32) bool {
+	if mode.Perm()&0o002 != 0 && (immediate || mode&os.ModeSticky == 0) {
+		return true
+	}
+	return mode.Perm()&0o020 != 0 && uid != euid && (immediate || mode&os.ModeSticky == 0)
+}
+
+func syncDirectory(dir string) error {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open config directory for sync: %w", err)
+	}
+	if err := handle.Sync(); err != nil {
+		_ = handle.Close()
+		return fmt.Errorf("sync config directory: %w", err)
+	}
+	if err := handle.Close(); err != nil {
+		return fmt.Errorf("close config directory: %w", err)
+	}
 	return nil
 }

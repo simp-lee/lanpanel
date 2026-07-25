@@ -26,13 +26,18 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install Nginx for runtime fixture tests
+      - name: Set up Node for E2E
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install runtime fixture dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nginx
+          sudo apt-get install -y apache2-utils nginx
 
-      - name: Test
-        run: go test ./...
+      - name: P0 release gate
+        run: make p0-release-gate
 
       - name: Build Linux binaries
         shell: bash

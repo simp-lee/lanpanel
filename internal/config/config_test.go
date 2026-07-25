@@ -45,8 +45,8 @@ func TestNewAppliesDefaultsAndRequiresUserInputs(t *testing.T) {
 	if cfg.Advanced.PackageProbe.ArtifactTimeout != DefaultPackageProbeArtifactTimeout {
 		t.Fatalf("PackageProbe.ArtifactTimeout = %q, want %q", cfg.Advanced.PackageProbe.ArtifactTimeout, DefaultPackageProbeArtifactTimeout)
 	}
-	if cfg.Advanced.Platform.Arch != ArchAMD64 {
-		t.Fatalf("Platform.Arch = %q, want %q", cfg.Advanced.Platform.Arch, ArchAMD64)
+	if cfg.Advanced.Platform.Arch != DefaultPlatformArch() {
+		t.Fatalf("Platform.Arch = %q, want %q", cfg.Advanced.Platform.Arch, DefaultPlatformArch())
 	}
 
 	err := cfg.Validate()
@@ -121,7 +121,7 @@ default:
 advanced:
   headscale_source:
     mode: direct
-    version: 0.28.0
+    version: 0.29.1
   headscale:
     metrics_port: 19090
   lego_source:
@@ -450,7 +450,7 @@ func TestValidateLegoSourceModes(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.Advanced.LegoSource.Mode = PackageSourceModeOffline
-	cfg.Advanced.LegoSource.FilePath = "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz"
+	cfg.Advanced.LegoSource.FilePath = "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want nil for offline lego archive", err)
 	}
@@ -687,7 +687,7 @@ default:
 advanced:
   package_source:
     mode: direct
-    version: 0.28.0
+    version: 0.29.1
 `,
 			want: "field package_source not found",
 		},
@@ -754,6 +754,95 @@ func TestExportAndLoadFileRoundTrip(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round trip mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestWriteFileRejectsSymlinkPath(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		write func(string) error
+	}{
+		{name: "config", write: validConfig().WriteFile},
+		{name: "example", write: WriteExampleFile},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			target := filepath.Join(dir, "target.yaml")
+			link := filepath.Join(dir, "lanpanel.yaml")
+			if err := os.WriteFile(target, []byte("sentinel"), 0o600); err != nil {
+				t.Fatalf("WriteFile(target) error = %v", err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatalf("Symlink() error = %v", err)
+			}
+
+			err := tt.write(link)
+			if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+				t.Fatalf("write() error = %v, want symlink refusal", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("ReadFile(target) error = %v", err)
+			}
+			if string(got) != "sentinel" {
+				t.Fatalf("target content = %q, want sentinel", got)
+			}
+			info, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("Lstat(link) error = %v", err)
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("link mode = %v, want symlink retained", info.Mode())
+			}
+		})
+	}
+}
+
+func TestWriteFileRejectsSymlinkParentComponent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	realParent := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(realParent, "child"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(real parent) error = %v", err)
+	}
+	linkParent := filepath.Join(dir, "link")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatalf("Symlink(parent) error = %v", err)
+	}
+	path := filepath.Join(linkParent, "child", "lanpanel.yaml")
+
+	err := validConfig().WriteFile(path)
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("WriteFile() error = %v, want symlink parent refusal", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("Lstat(path) error = %v, want no file created through symlink parent", err)
+	}
+}
+
+func TestWriteFileRejectsOtherWritableParent(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "unsafe")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatalf("Mkdir(unsafe) error = %v", err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("Chmod(unsafe) error = %v", err)
+	}
+	path := filepath.Join(dir, "lanpanel.yaml")
+
+	err := validConfig().WriteFile(path)
+	if err == nil || !strings.Contains(err.Error(), "untrusted local users") {
+		t.Fatalf("WriteFile() error = %v, want unsafe parent refusal", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("Lstat(path) error = %v, want no file created in unsafe parent", err)
 	}
 }
 

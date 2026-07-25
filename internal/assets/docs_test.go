@@ -41,7 +41,7 @@ func TestDeployDocsAlignWithCLIAndSupportMatrix(t *testing.T) {
 		"Windows",
 		"macOS",
 		"Debian/Ubuntu Linux",
-		"Tailscale client >= v1.74.0",
+		"Tailscale client >= v1.80.0",
 		"/generate_204",
 		"unix socket",
 		"preauth",
@@ -69,7 +69,7 @@ func TestRootReadmePointsToPrimaryDocs(t *testing.T) {
 		"lanpanel verify --config lanpanel.yaml",
 		"lanpanel status --config lanpanel.yaml",
 		"Debian, Ubuntu, or a Debian-family distribution with apt/dpkg/systemd",
-		"pinned lego v5.1.0",
+		"pinned lego v5.2.2",
 		"## Supported Scope",
 		"## Server Guide",
 		"## Client Guide",
@@ -104,6 +104,81 @@ func TestRootReadmePointsToPrimaryDocs(t *testing.T) {
 	}
 }
 
+func TestP0DocsDocumentReviewedUIAndReleaseBoundaries(t *testing.T) {
+	t.Parallel()
+
+	uiDoc := readRepoDoc(t, "docs", "p0-ui.md")
+	for _, want := range []string{
+		"loopback-only Management UI",
+		"does not use a CDN",
+		"frontend build\npipeline",
+		"main config summary, compact host health",
+		"derived exposure summary",
+		"Settings: structured main config fields",
+		"Resources: app access mode `browser|public`",
+		"Host Health: read-only OS, CPU, memory, disk, network-address, port-listener,\n  certificate-expiry facts, diagnostics checks, and allowed/forbidden action\n  boundaries",
+		"Diagnostics, Services, and Certificates/Nginx: typed main/app runtime evidence",
+		"modified paths, retry commands, and redacted summaries",
+		"owner mismatches instead of starting in a degraded in-memory mode",
+		"preauth keys are one-time",
+		"handoff secrets and are not stored in history",
+		"No public Management UI listen address",
+		"clear upstream\n  `Authorization`",
+	} {
+		if !strings.Contains(uiDoc, want) {
+			t.Fatalf("docs/p0-ui.md missing reviewed UI boundary %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"active/recent jobs,\n  modified paths, and risk counts",
+		"CDN script",
+		"node_modules",
+		"Tailwind",
+		"Use a public Management UI listen address",
+	} {
+		if strings.Contains(uiDoc, unwanted) {
+			t.Fatalf("docs/p0-ui.md contains unsupported UI claim %q", unwanted)
+		}
+	}
+
+	migrationDoc := readRepoDoc(t, "docs", "p0-migration.md")
+	for _, want := range []string{
+		"does not generate a\nmachine-readable export manifest",
+		"plaintext\n  passwords are not recoverable after the one-time display window",
+		"not a restore source of truth",
+		"P1 may add an export manifest",
+	} {
+		if !strings.Contains(migrationDoc, want) {
+			t.Fatalf("docs/p0-migration.md missing migration boundary %q", want)
+		}
+	}
+
+	releaseDoc := readRepoDoc(t, "docs", "p0-release-checklist.md")
+	for _, want := range []string{
+		"`go test ./...`",
+		"`make check`",
+		"`make e2e`",
+		"`E2E_ADDR=127.0.0.1:18081 make e2e`",
+		"No CDN htmx script reference in product pages",
+		"Browser apps protect proxy and static locations with Basic Auth",
+		"P1-only `private_client`, commercial, RBAC, account/OIDC/SSO, public remote\n  control, public Management UI, export manifest, and audit-log write paths are\n  not exposed in P0 UI",
+		"Exposure summary and resource cards stay derived, read-only interpretation\n  from config, staged files, checkpoints, diagnostics, and runtime checks; they\n  are not deploy or restore truth",
+		"Exit/Migration documents local config and state paths, non-exported secrets,\n  no export manifest, and recovery limits",
+	} {
+		if !strings.Contains(releaseDoc, want) {
+			t.Fatalf("docs/p0-release-checklist.md missing release gate %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"login?token=",
+		"LANPANEL_UI_TOKEN_URL='http",
+	} {
+		if strings.Contains(releaseDoc, unwanted) {
+			t.Fatalf("docs/p0-release-checklist.md leaks startup token URL guidance %q", unwanted)
+		}
+	}
+}
+
 func TestClientGuideIsSelfContained(t *testing.T) {
 	t.Parallel()
 
@@ -112,7 +187,7 @@ func TestClientGuideIsSelfContained(t *testing.T) {
 		"### Windows",
 		"### macOS",
 		"### Debian/Ubuntu Linux",
-		"Tailscale client >= v1.74.0",
+		"Tailscale client >= v1.80.0",
 		"tailscale",
 		"--login-server",
 		"--auth-key",
@@ -138,14 +213,26 @@ func TestOnboardingFreshKeyFlowIsConditional(t *testing.T) {
 
 	content := readRepoDoc(t, "README.md")
 	for _, want := range []string{
-		"Only if the lanpanel user is missing from users list",
-		"preauthkeys create --user <ID> --expiration 24h",
-		"creates a key that can register one client and expires after",
-		"preauthkeys create --user <ID> --expiration 24h --reusable",
-		"Use the numeric user ID shown by `users list` for the `lanpanel` user.",
+		"Use `sudo lanpanel ui` on the server and open it over an SSH tunnel for the P0 handoff flow.",
+		"open Headscale Onboarding",
+		"create a fresh one-time preauth key from the handoff page",
+		"The plaintext key is visible only in the immediate handoff result",
+		"create a different short-lived key for each client",
 	} {
 		if !strings.Contains(content, want) {
-			t.Fatalf("onboarding doc missing conditional fresh-key guidance %q", want)
+			t.Fatalf("onboarding doc missing UI handoff guidance %q", want)
+		}
+	}
+	if strings.Contains(content, "--reusable") {
+		t.Fatal("onboarding doc must not recommend reusable preauth keys")
+	}
+	for _, forbidden := range []string{
+		"preauthkeys create",
+		"headscale --config",
+		"local Headscale CLI",
+	} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("onboarding doc must not provide direct Headscale CLI secret handoff guidance %q", forbidden)
 		}
 	}
 }
@@ -165,7 +252,7 @@ func TestUserGuideDocumentsRuntimeSecurityBoundaries(t *testing.T) {
 		`provider: "tencentcloud"`,
 		"Route53 and gcloud may use the host credential chain",
 		"do not put raw tokens or keys directly in `env_file`",
-		"v5.1.0",
+		"v5.2.2",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("user README missing runtime security boundary detail %q", want)
@@ -179,26 +266,32 @@ func TestUserGuideDocumentsRuntimeSecurityBoundaries(t *testing.T) {
 	}
 }
 
-func TestChineseReadmeDocumentsAppCLI(t *testing.T) {
+func TestChineseDocsDocumentAppCLI(t *testing.T) {
 	t.Parallel()
 
-	content := readRepoDoc(t, "README.zh-CN.md")
-	if !containsHan(content) {
-		t.Fatal("README.zh-CN.md must remain localized")
+	readme := readRepoDoc(t, "README.zh-CN.md")
+	appDoc := readRepoDoc(t, "docs", "zh-CN", "app.md")
+	cliDoc := readRepoDoc(t, "docs", "zh-CN", "cli.md")
+	uiDoc := readRepoDoc(t, "docs", "zh-CN", "ui.md")
+	content := strings.Join([]string{readme, appDoc, cliDoc, uiDoc}, "\n")
+	if !containsHan(readme) || !containsHan(appDoc) || !containsHan(cliDoc) || !containsHan(uiDoc) {
+		t.Fatal("Chinese docs must remain localized")
 	}
 	for _, want := range []string{
-		"lanpanel app init --config lanpanel-apps/abc.yaml",
-		"sudo lanpanel app deploy --config lanpanel-apps/abc.yaml",
-		"lanpanel app verify --config lanpanel-apps/abc.yaml",
+		"lanpanel app init --config lanpanel-apps/example-app.yaml",
+		"sudo lanpanel app deploy --config lanpanel-apps/example-app.yaml",
+		"lanpanel app verify --config lanpanel-apps/example-app.yaml",
 		"deploy/config/lanpanel-app.yaml.example",
 		"`lanpanel app verify`",
-		"`static-passed`",
 		"systemd",
-		"Nginx runtime",
+		"runtime",
 		"GoAccess",
 		"Tailscale",
 		"`listen`",
 		"`lanpanel.yaml`",
+		"`--app-config` 不是必需参数",
+		"省略时 UI 使用默认 App 配置路径 `lanpanel-app.yaml`",
+		"点击 `Create Example App Config` 会把示例配置写到这个路径",
 		"`upstream`",
 		"Tailscale client",
 		"`tailscale.login_server`",
@@ -243,12 +336,11 @@ func TestChineseReadmeDocumentsAppCLI(t *testing.T) {
 		"`PrivateTmp=true`",
 		"journalctl -u <app-name>.service -e",
 		"`proxy.read_timeout`",
-		"tailnet upstream",
+		"tailnet",
 		"`lanpanel app status`",
-		"`deploy/templates/app/`",
 	} {
 		if !strings.Contains(content, want) {
-			t.Fatalf("additional Go services guide missing CLI guidance %q", want)
+			t.Fatalf("Chinese app docs missing CLI guidance %q", want)
 		}
 	}
 
@@ -262,7 +354,160 @@ func TestChineseReadmeDocumentsAppCLI(t *testing.T) {
 		"upstream metrics",
 	} {
 		if strings.Contains(content, unwanted) {
-			t.Fatalf("additional Go services guide still instructs manual runtime template deployment %q", unwanted)
+			t.Fatalf("Chinese app docs still instruct manual runtime template deployment %q", unwanted)
+		}
+	}
+}
+
+func TestChineseDocsCarryForwardBackupOperationalGuidance(t *testing.T) {
+	t.Parallel()
+
+	readme := readRepoDoc(t, "README.zh-CN.md")
+	appDoc := readRepoDoc(t, "docs", "zh-CN", "app.md")
+	operationsDoc := readRepoDoc(t, "docs", "zh-CN", "operations.md")
+	combined := strings.Join([]string{readme, appDoc, operationsDoc}, "\n")
+
+	for _, want := range []string{
+		"不是 VPN 客户端",
+		"| Headscale | v0.29.1",
+		"固定 lego v5.2.2",
+		"只部署同机 `listen` App 时可以没有主 `lanpanel.yaml`",
+		"配置文件名不是部署身份",
+		"真正的部署身份来自 `app.name`",
+		"当前版本不会自动做 `abc.com` 和 `www.abc.com` 之间的 canonical redirect",
+		"`upstream` 只适合 HTTP/WebSocket 服务，不用于 PostgreSQL、MySQL、Redis 等数据库或中间件端口公网发布",
+		"让客户端加入私有网络后直接连接 tailnet 地址",
+		"验证通过时 human/json 输出状态为 `static-passed`",
+		"sudo locale-gen zh_CN.UTF-8",
+		"TENCENTCLOUD_SESSION_TOKEN_FILE",
+		"DescribeOriginACL",
+		"EO-Connecting-IP",
+		"untrusted_source_ip",
+		"`refresh_interval` 最小为 `1h`",
+		"mirror 模式需要可访问 URL 和明确的 SHA-256",
+		"lego v5.2.2 archive",
+		"Headscale 应监听 `127.0.0.1:8080`",
+		"metrics 默认监听 `127.0.0.1:<advanced.headscale.metrics_port>`",
+		`& "$env:ProgramFiles\Tailscale\tailscale.exe" version`,
+		"tailscale set --hostname=<name>",
+		"systemctl status tailscaled --no-pager --full",
+		"自建内置 DERP 没有 `/generate_204`",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("Chinese docs did not carry forward backup guidance %q", want)
+		}
+	}
+}
+
+func TestChineseDocsStayBeginnerOriented(t *testing.T) {
+	t.Parallel()
+
+	readme := readRepoDoc(t, "README.zh-CN.md")
+	indexDoc := readRepoDoc(t, "docs", "zh-CN", "index.md")
+	quickstartDoc := readRepoDoc(t, "docs", "zh-CN", "quickstart.md")
+	appQuickstartDoc := readRepoDoc(t, "docs", "zh-CN", "app-quickstart.md")
+	uiDoc := readRepoDoc(t, "docs", "zh-CN", "ui.md")
+	appDoc := readRepoDoc(t, "docs", "zh-CN", "app.md")
+	cliDoc := readRepoDoc(t, "docs", "zh-CN", "cli.md")
+	operationsDoc := readRepoDoc(t, "docs", "zh-CN", "operations.md")
+	developmentDoc := readRepoDoc(t, "docs", "zh-CN", "development.md")
+	combined := strings.Join([]string{readme, indexDoc, quickstartDoc, appQuickstartDoc, uiDoc, appDoc, cliDoc, operationsDoc, developmentDoc}, "\n")
+
+	for _, want := range []string{
+		"第一次使用不要从命令参考开始读",
+		"先不要急着改高级选项",
+		"这个路径不要求先部署 Headscale 私有网络",
+		"第一次使用只需要记住三步",
+		"新手先记住一句话",
+		"这是新手推荐路径",
+		"以下是进阶配置",
+		"第一次使用建议先走 UI",
+		"如果你只是想发布同机业务 App，可以先跳过本文的 Headscale 和客户端接入部分",
+		"普通使用者不需要阅读本文",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("Chinese docs missing beginner-oriented guidance %q", want)
+		}
+	}
+}
+
+func TestChineseReadmeDocumentsBeginnerArchitectureOverview(t *testing.T) {
+	t.Parallel()
+
+	readme := readRepoDoc(t, "README.zh-CN.md")
+	for _, want := range []string{
+		"## 一图看懂",
+		"```text",
+		"公网用户 / Tailscale 客户端",
+		"80/tcp, 443/tcp, 3478/udp",
+		"Debian/Ubuntu 服务器",
+		"Nginx: 公网 HTTPS 入口",
+		"Headscale: 私有网络控制面，只在本机地址监听",
+		"内置 DERP/STUN: 直连失败时兜底",
+		"App listen: 同机服务只监听 127.0.0.1:port",
+		"App upstream: 通过本机 Tailscale client 访问 tailnet",
+		"私有网络内的 Grafana / Uptime Kuma / 内部管理后台",
+		"客户端通过 Headscale 登录私有网络",
+		"设备之间优先 WireGuard 直连",
+		"失败才通过 DERP 兜底",
+		"公网用户访问业务域名时只进入 Nginx",
+		"本机 App 只监听本机地址",
+		"`upstream` 只适合 HTTP/WebSocket 服务",
+		"不用于 PostgreSQL、MySQL、Redis 等数据库或中间件端口公网发布",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Fatalf("Chinese README missing beginner architecture overview detail %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"Lanpanel 执行逻辑<br/>Verify / Deploy / Jobs",
+		"配置文件<br/>lanpanel.yaml",
+		"管理员电脑<br/>浏览器 / SSH",
+		"直连优先<br/>失败走 DERP",
+		"flowchart LR",
+		"电脑 A<br/>Tailscale 客户端",
+		"手机 / 平板<br/>Tailscale 客户端",
+		"电脑 B<br/>Tailscale 客户端",
+		"公网访问者<br/>浏览器",
+		"同机业务 App<br/>listen 模式",
+		"tailnet 内业务服务<br/>100.64.x.y:port",
+		"私有网络内 HTTP/WebSocket 服务<br/>Grafana: 100.64.10.20:3000<br/>Uptime Kuma: 100.64.10.30:3001",
+		"私有网络内数据库 / 中间件<br/>PostgreSQL: 100.64.10.40:5432<br/>MySQL: 100.64.10.50:3306<br/>Redis: 100.64.10.60:6379",
+		"私有网络直连<br/>5432/tcp",
+		"私有网络直连<br/>3306/tcp",
+		"私有网络直连<br/>6379/tcp",
+	} {
+		if strings.Contains(readme, unwanted) {
+			t.Fatalf("Chinese README architecture diagram should focus on network connections, but contains %q", unwanted)
+		}
+	}
+}
+
+func TestChineseDocsDocumentTopologyDiagrams(t *testing.T) {
+	t.Parallel()
+
+	operationsDoc := readRepoDoc(t, "docs", "zh-CN", "operations.md")
+	appDoc := readRepoDoc(t, "docs", "zh-CN", "app.md")
+	combined := operationsDoc + "\n" + appDoc
+
+	for _, want := range []string{
+		"## 运行拓扑",
+		"443/tcp control + DERP",
+		"3478/udp STUN",
+		"proxies control traffic to 127.0.0.1:8080",
+		"metrics on 127.0.0.1:<metrics_port>",
+		"gRPC on 127.0.0.1:50443",
+		"STUN on 0.0.0.0:3478/udp",
+		"## App 运行拓扑",
+		"proxies / to 127.0.0.1:18001",
+		"Optional GoAccess dashboard",
+		"listens on loopback only",
+		"Tailscale client on this server",
+		"tailnet HTTP/WebSocket",
+		"100.64.x.y:port on another tailnet node",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("Chinese docs missing topology diagram detail %q", want)
 		}
 	}
 }
@@ -275,16 +520,132 @@ func TestReadmeUpstreamAppExamplesIncludeAPIVersion(t *testing.T) {
 		path string
 	}{
 		{name: "README", path: "README.md"},
-		{name: "README.zh-CN", path: "README.zh-CN.md"},
+		{name: "Chinese app doc", path: "docs/zh-CN/app.md"},
 	}
 	for _, doc := range docs {
 		content := readRepoDoc(t, doc.path)
 		block := readmeYAMLBlockContaining(t, content, `name: "tailapp"`)
-		if !strings.Contains(block, "api_version: lanpanel/app/v1alpha1") {
+		if !strings.Contains(block, "api_version: lanpanel/app/v1alpha2") {
 			t.Fatalf("%s upstream app example missing api_version", doc.name)
+		}
+		for _, want := range []string{"access:", `access_mode: "public"`, "public_risk_confirmed: true", "browser_auth:", "cidr_allowlist: []", "origin_protection:", `mode: "none"`, "direct_origin_risk_confirmed: true"} {
+			if !strings.Contains(block, want) {
+				t.Fatalf("%s upstream app example missing required access field %q", doc.name, want)
+			}
 		}
 		if !strings.Contains(block, "tailscale:") || !strings.Contains(block, "login_server") || !strings.Contains(block, "auth_key_file") {
 			t.Fatalf("%s upstream app example missing explicit external tailscale guidance", doc.name)
+		}
+	}
+}
+
+func TestReadmeListenAppExamplesIncludeRequiredAccessBlock(t *testing.T) {
+	t.Parallel()
+
+	docs := []struct {
+		name string
+		path string
+	}{
+		{name: "README", path: "README.md"},
+		{name: "Chinese app doc", path: "docs/zh-CN/app.md"},
+	}
+	for _, doc := range docs {
+		content := readRepoDoc(t, doc.path)
+		block := readmeYAMLBlockContaining(t, content, `name: "example-app"`)
+		for _, want := range []string{"api_version: lanpanel/app/v1alpha2", "access:", `access_mode: "public"`, "public_risk_confirmed: true", "browser_auth:", "cidr_allowlist: []", "origin_protection:", `mode: "none"`, "direct_origin_risk_confirmed: true"} {
+			if !strings.Contains(block, want) {
+				t.Fatalf("%s listen app example missing required access field %q", doc.name, want)
+			}
+		}
+	}
+}
+
+func TestAppDocsDocumentBrowserAuthBoundary(t *testing.T) {
+	t.Parallel()
+
+	readmes := []struct {
+		name            string
+		path            string
+		heading         string
+		goAccessHeading string
+		wants           []string
+		unwanted        string
+	}{
+		{
+			name:            "README",
+			path:            "README.md",
+			heading:         "#### Browser App Auth",
+			goAccessHeading: "#### GoAccess App Log Dashboard",
+			wants: []string{
+				"`access_mode: \"browser\"`",
+				"Basic Auth at the app gateway",
+				"`access.browser_auth.auth_basic_user_file`",
+				"separate from `nginx.goaccess.auth_basic_user_file`",
+				"Do not reuse GoAccess dashboard credentials",
+				"LanPanel-managed browser credential",
+				"/etc/lanpanel/browser-auth",
+				"one-time secret after create or rotate",
+				"not stored in app config or job history",
+				"`password_fingerprint`",
+				"clears the inbound `Authorization` header",
+				"business-layer `Authorization`",
+				"`public` risk path",
+			},
+			unwanted: "set `access.browser_auth.auth_basic_user_file` to an existing htpasswd file as described below",
+		},
+		{
+			name:            "README.zh-CN",
+			path:            "docs/zh-CN/app.md",
+			heading:         "### browser",
+			goAccessHeading: "## GoAccess 看板",
+			wants: []string{
+				"`access_mode: \"browser\"`",
+				"App gateway",
+				"`access.browser_auth.auth_basic_user_file`",
+				"Browser Auth 与 GoAccess dashboard Auth 是分开的",
+				"不要复用",
+				"Lanpanel 托管",
+				"/etc/lanpanel/browser-auth",
+				"明文密码只在一次性交接窗口展示",
+				"配置和任务历史只保存",
+				"`password_fingerprint`",
+				"清除上游 `Authorization` header",
+				"业务层 `Authorization`",
+				"`public` 风险路径",
+			},
+			unwanted: "按下文把 `access.browser_auth.auth_basic_user_file` 指向已有 htpasswd 文件",
+		},
+	}
+	for _, doc := range readmes {
+		content := readRepoDoc(t, doc.path)
+		section := markdownSection(t, content, doc.heading)
+		if strings.Index(content, doc.heading) > strings.Index(content, doc.goAccessHeading) {
+			t.Fatalf("%s browser auth section must appear before GoAccess section", doc.name)
+		}
+		for _, want := range doc.wants {
+			if !strings.Contains(section, want) {
+				t.Fatalf("%s browser auth section missing boundary %q", doc.name, want)
+			}
+		}
+		if strings.Contains(content, doc.unwanted) {
+			t.Fatalf("%s still points browser auth setup only to later GoAccess htpasswd guidance", doc.name)
+		}
+	}
+
+	example := readRepoDoc(t, "deploy", "config", "lanpanel-app.yaml.example")
+	for _, want := range []string{
+		"Browser app auth is separate from nginx.goaccess.auth_basic_user_file",
+		"Use exactly one browser credential source",
+		"external app-gateway htpasswd, not GoAccess",
+		"LanPanel-created credential under /etc/lanpanel/browser-auth",
+		"Managed passwords are shown only as one-time UI secrets after create/rotate",
+		"configs and job history store only credential metadata and password_fingerprint",
+		"browser mode clears upstream Authorization",
+		"Apps that need business-layer",
+		"Authorization must use explicit public exposure",
+	} {
+		if !strings.Contains(example, want) {
+			t.Fatalf("app config example missing browser auth boundary %q", want)
 		}
 	}
 }
@@ -302,7 +663,7 @@ func TestReadmeDocumentsStaticLocationCacheHeaderContract(t *testing.T) {
 		}
 	}
 
-	chinese := readRepoDoc(t, "README.zh-CN.md")
+	chinese := readRepoDoc(t, "docs", "zh-CN", "app.md")
 	for _, want := range []string{
 		"`expires`",
 		"`cache_control`",
@@ -318,7 +679,7 @@ func TestReadmeDocumentsStaticLocationCacheHeaderContract(t *testing.T) {
 		t.Fatal("app config example missing static cache-header contract")
 	}
 	for _, want := range []string{
-		"Set false for older distro Nginx packages",
+		"Default is false so first app-only deploys do not require modern HTTP/2 support",
 		"For app-only upstream configs without a main lanpanel.yaml",
 		"login_server explicitly",
 	} {
@@ -541,6 +902,21 @@ func readmeYAMLBlockContaining(t *testing.T, content string, marker string) stri
 		t.Fatalf("README marker %q YAML block is unterminated", marker)
 	}
 	return afterFence[:end]
+}
+
+func markdownSection(t *testing.T, content string, heading string) string {
+	t.Helper()
+
+	start := strings.Index(content, heading)
+	if start < 0 {
+		t.Fatalf("markdown heading %q missing", heading)
+	}
+	afterHeading := content[start+len(heading):]
+	next := strings.Index(afterHeading, "\n#### ")
+	if next >= 0 {
+		return afterHeading[:next]
+	}
+	return afterHeading
 }
 
 func containsHan(value string) bool {

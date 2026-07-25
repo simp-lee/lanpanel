@@ -5,34 +5,16 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"lanpanel/internal/prompt"
 	"os"
 	"strconv"
 	"strings"
 )
 
-type TextPrompt struct {
-	Default  string
-	Help     string
-	Validate func(string) error
-}
-
-type ConfirmPrompt struct {
-	Default bool
-	Help    string
-}
-
-type SelectPrompt struct {
-	Default string
-	Help    string
-	Options []string
-}
-
-type Prompter interface {
-	Enabled() bool
-	Text(label string, prompt TextPrompt) (string, error)
-	Confirm(label string, prompt ConfirmPrompt) (bool, error)
-	Select(label string, prompt SelectPrompt) (string, error)
-}
+type TextPrompt = prompt.TextPrompt
+type ConfirmPrompt = prompt.ConfirmPrompt
+type SelectPrompt = prompt.SelectPrompt
+type Prompter = prompt.Prompter
 
 type terminalPrompter struct {
 	reader  *bufio.Reader

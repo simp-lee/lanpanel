@@ -46,11 +46,16 @@ func (options sharedOptions) formatter(stdout io.Writer) (output.Formatter, erro
 	return output.NewFormatter(stdout, format), nil
 }
 
+func (ctx context) formatter(format output.Format) output.Formatter {
+	return output.NewFormatter(ctx.stdout, format)
+}
+
 var commands = map[string]command{
 	"app":    newAppCommand(),
 	"deploy": newDeployCommand(),
 	"init":   newInitCommand(),
 	"status": newStatusCommand(),
+	"ui":     newUICommand(),
 	"verify": newVerifyCommand(),
 }
 
@@ -159,6 +164,7 @@ func writeRootHelp(stdout io.Writer) error {
 		"  lanpanel init",
 		"  lanpanel deploy",
 		"  lanpanel verify",
+		"  lanpanel ui",
 		"",
 		"Commands:",
 	); err != nil {

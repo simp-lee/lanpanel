@@ -10,4 +10,4 @@ After=network-online.target nginx.service
 [Service]
 Type=oneshot
 TimeoutStartSec=2min
-ExecStart={{ .LanpanelBinary }} app realip refresh --profile {{ .ProfileName }}
+ExecStart={{ .LanpanelBinary }} app realip refresh --config {{ .AppConfigPath }} --profile {{ .ProfileName }}

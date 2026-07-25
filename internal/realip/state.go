@@ -2,6 +2,12 @@ package realip
 
 import "time"
 
+const (
+	ProfileSchemaVersion   = "lanpanel.realip.profile.v1"
+	StateSchemaVersion     = "lanpanel.realip.state.v1"
+	ReferenceSchemaVersion = "lanpanel.realip.reference.v1"
+)
+
 type ProfileConfig struct {
 	Name            string   `json:"name"`
 	Provider        string   `json:"provider"`

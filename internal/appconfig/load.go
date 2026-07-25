@@ -26,7 +26,7 @@ func LoadBytes(data []byte) (Config, error) {
 
 	cfg.applyDefaults()
 	cfg.normalize()
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateForExposurePlan(); err != nil {
 		return Config{}, err
 	}
 

@@ -3,7 +3,7 @@ package workflow
 import (
 	"fmt"
 	"lanpanel/internal/config"
-	"lanpanel/internal/output"
+	"lanpanel/internal/prompt"
 	"strings"
 	"testing"
 )
@@ -19,7 +19,7 @@ func (prompter *scriptedPrompter) Enabled() bool {
 	return prompter.enabled
 }
 
-func (prompter *scriptedPrompter) Text(label string, prompt output.TextPrompt) (string, error) {
+func (prompter *scriptedPrompter) Text(label string, prompt prompt.TextPrompt) (string, error) {
 	if len(prompter.texts) == 0 {
 		return "", fmt.Errorf("unexpected text prompt %q", label)
 	}
@@ -36,7 +36,7 @@ func (prompter *scriptedPrompter) Text(label string, prompt output.TextPrompt) (
 	return value, nil
 }
 
-func (prompter *scriptedPrompter) Confirm(label string, prompt output.ConfirmPrompt) (bool, error) {
+func (prompter *scriptedPrompter) Confirm(label string, prompt prompt.ConfirmPrompt) (bool, error) {
 	if len(prompter.confirms) == 0 {
 		return false, fmt.Errorf("unexpected confirm prompt %q", label)
 	}
@@ -45,7 +45,7 @@ func (prompter *scriptedPrompter) Confirm(label string, prompt output.ConfirmPro
 	return value, nil
 }
 
-func (prompter *scriptedPrompter) Select(label string, prompt output.SelectPrompt) (string, error) {
+func (prompter *scriptedPrompter) Select(label string, prompt prompt.SelectPrompt) (string, error) {
 	if len(prompter.selects) == 0 {
 		return "", fmt.Errorf("unexpected select prompt %q", label)
 	}
@@ -93,19 +93,20 @@ func TestRunInitCollectsDefaultGuidedConfig(t *testing.T) {
 		t.Fatalf("HeadscaleSource.Mode = %q, want %q", result.Config.Advanced.HeadscaleSource.Mode, config.PackageSourceModeDirect)
 	}
 
-	response := result.Response("lanpanel.yaml")
-	if response.Summary != "wrote guided config" {
-		t.Fatalf("Summary = %q, want %q", response.Summary, "wrote guided config")
+	if result.Summary() != "wrote guided config" {
+		t.Fatalf("Summary = %q, want %q", result.Summary(), "wrote guided config")
 	}
-	if response.Fields[1].Value != "guided default" {
-		t.Fatalf("config source = %q, want %q", response.Fields[1].Value, "guided default")
+	fields := result.Fields("lanpanel.yaml")
+	if fields[1].Value != "guided default" {
+		t.Fatalf("config source = %q, want %q", fields[1].Value, "guided default")
 	}
-	assertContainsStep(t, response.NextSteps, "Review the generated default section")
-	assertContainsStep(t, response.NextSteps, "lanpanel init --advanced --config lanpanel.advanced.yaml")
-	assertNotContainsStep(t, response.NextSteps, "lanpanel init --advanced --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "lanpanel deploy --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "lanpanel verify --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "validate this config now")
+	nextSteps := result.NextSteps("lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "Review the generated default section")
+	assertContainsStep(t, nextSteps, "lanpanel init --advanced --config lanpanel.advanced.yaml")
+	assertNotContainsStep(t, nextSteps, "lanpanel init --advanced --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "lanpanel deploy --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "lanpanel verify --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "validate this config now")
 }
 
 func TestRunInitAllowsServerURLBeforeBaseDomainIsKnown(t *testing.T) {
@@ -137,12 +138,12 @@ func TestRunInitAllowsServerURLBeforeBaseDomainIsKnown(t *testing.T) {
 func TestExampleInitResultResponseUsesSeparateAdvancedConfigPath(t *testing.T) {
 	t.Parallel()
 
-	response := ExampleInitResult().Response("lanpanel.yaml")
+	nextSteps := ExampleInitResult().NextSteps("lanpanel.yaml")
 
-	assertContainsStep(t, response.NextSteps, "lanpanel init --advanced --config lanpanel.advanced.yaml")
-	assertNotContainsStep(t, response.NextSteps, "lanpanel init --advanced --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "lanpanel verify --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "validate this config now")
+	assertContainsStep(t, nextSteps, "lanpanel init --advanced --config lanpanel.advanced.yaml")
+	assertNotContainsStep(t, nextSteps, "lanpanel init --advanced --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "lanpanel verify --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "validate this config now")
 }
 
 func TestRunInitCollectsAdvancedGuidedConfig(t *testing.T) {
@@ -207,14 +208,15 @@ func TestRunInitCollectsAdvancedGuidedConfig(t *testing.T) {
 		t.Fatalf("PublicIPv6 = %q, want %q", result.Config.Advanced.Network.PublicIPv6, "2001:db8::10")
 	}
 
-	response := result.Response("lanpanel.yaml")
-	if response.Fields[1].Value != "guided advanced" {
-		t.Fatalf("config source = %q, want %q", response.Fields[1].Value, "guided advanced")
+	fields := result.Fields("lanpanel.yaml")
+	if fields[1].Value != "guided advanced" {
+		t.Fatalf("config source = %q, want %q", fields[1].Value, "guided advanced")
 	}
-	assertContainsStep(t, response.NextSteps, "Review the generated advanced section before deploy")
-	assertContainsStep(t, response.NextSteps, "Prepare the root-only DNS-01 env file")
-	assertContainsStep(t, response.NextSteps, "lanpanel deploy --config lanpanel.yaml")
-	assertContainsStep(t, response.NextSteps, "lanpanel verify --config lanpanel.yaml")
+	nextSteps := result.NextSteps("lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "Review the generated advanced section before deploy")
+	assertContainsStep(t, nextSteps, "Prepare the root-only DNS-01 env file")
+	assertContainsStep(t, nextSteps, "lanpanel deploy --config lanpanel.yaml")
+	assertContainsStep(t, nextSteps, "lanpanel verify --config lanpanel.yaml")
 }
 
 func TestRunInitReturnsPromptValidationError(t *testing.T) {

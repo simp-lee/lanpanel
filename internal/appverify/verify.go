@@ -33,7 +33,7 @@ func StaticReport(cfg appconfig.Config, staged []apprender.StagedFile) Report {
 		checks = append(checks, Check{ID: id, Status: status, Summary: summary})
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateForExposurePlan(); err != nil {
 		add("config", StatusFail, "app config validation failed: "+err.Error())
 		return Report{Checks: checks}
 	}
@@ -93,6 +93,12 @@ func StaticReport(cfg appconfig.Config, staged []apprender.StagedFile) Report {
 		add("templates", StatusFail, err.Error())
 		return Report{Checks: checks}
 	}
+	if err == nil {
+		if validateErr := validateAppServiceStatic(cfg, names, staged); validateErr != nil {
+			add("templates", StatusFail, validateErr.Error())
+			return Report{Checks: checks}
+		}
+	}
 	add("templates", StatusPass, fmt.Sprintf("rendered %d app runtime files with complete systemd, Nginx, and deploy hook plans", len(staged)))
 	if hasNginx {
 		add("nginx", StatusPass, "Nginx app site includes multiple domains, Host/SNI guards, WebSocket handling, and fixed upstream support")
@@ -113,6 +119,96 @@ func StaticReport(cfg appconfig.Config, staged []apprender.StagedFile) Report {
 	}
 
 	return Report{Checks: checks}
+}
+
+func validateAppServiceStatic(cfg appconfig.Config, names appsvc.Names, staged []apprender.StagedFile) error {
+	if cfg.Mode() != appconfig.ModeListen {
+		return nil
+	}
+	serviceText := ""
+	for _, file := range staged {
+		if file.SourcePath == appassets.ServiceTemplate {
+			serviceText = string(file.Content)
+			break
+		}
+	}
+	if strings.TrimSpace(serviceText) == "" {
+		return fmt.Errorf("missing app service runtime file: %s", appassets.ServiceTemplate)
+	}
+	expectedExecStart := "ExecStart=" + strings.TrimSpace(cfg.Service.ExecStart)
+	execStartLines := systemdDirectiveLines(serviceText, "ExecStart")
+	if len(execStartLines) != 1 || execStartLines[0] != expectedExecStart {
+		return fmt.Errorf("app service must start configured service.exec_start")
+	}
+	if err := rejectExtraAppExecDirectives(serviceText); err != nil {
+		return err
+	}
+	typeValues := systemdDirectiveValues(serviceText, "Type")
+	if len(typeValues) != 1 || typeValues[0] != "simple" {
+		return fmt.Errorf("app service must set exactly one Type=simple directive")
+	}
+	userValues := systemdDirectiveValues(serviceText, "User")
+	if len(userValues) != 1 || userValues[0] != names.SystemUser {
+		return fmt.Errorf("app service must run as dedicated user %s", names.SystemUser)
+	}
+	groupValues := systemdDirectiveValues(serviceText, "Group")
+	if len(groupValues) != 1 || groupValues[0] != names.SystemGroup {
+		return fmt.Errorf("app service must run as dedicated group %s", names.SystemGroup)
+	}
+	if err := requireOptionalSystemdDirective(serviceText, "WorkingDirectory", strings.TrimSpace(cfg.Service.WorkingDirectory)); err != nil {
+		return fmt.Errorf("app service %w", err)
+	}
+	if err := requireOptionalSystemdDirective(serviceText, "EnvironmentFile", strings.TrimSpace(cfg.Service.EnvFile)); err != nil {
+		return fmt.Errorf("app service %w", err)
+	}
+	if err := requireSingleSystemdDirective(serviceText, "Restart", "on-failure", "app service"); err != nil {
+		return err
+	}
+	if err := requireSingleSystemdDirective(serviceText, "NoNewPrivileges", "true", "app service"); err != nil {
+		return err
+	}
+	if err := requireSingleSystemdDirective(serviceText, "PrivateTmp", "true", "app service"); err != nil {
+		return err
+	}
+	if err := requireSingleSystemdDirective(serviceText, "ProtectSystem", "full", "app service"); err != nil {
+		return err
+	}
+	if err := requireSingleSystemdDirective(serviceText, "ProtectHome", "true", "app service"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rejectExtraAppExecDirectives(serviceText string) error {
+	for _, line := range systemdDirectiveLinesWithPrefix(serviceText, "Exec") {
+		if strings.HasPrefix(line, "ExecStart=") {
+			continue
+		}
+		return fmt.Errorf("app service must not contain extra Exec directive %s", strings.SplitN(line, "=", 2)[0])
+	}
+	return nil
+}
+
+func requireOptionalSystemdDirective(text string, key string, want string) error {
+	values := systemdDirectiveValues(text, key)
+	if want == "" {
+		if len(values) != 0 {
+			return fmt.Errorf("must not set %s when not configured", key)
+		}
+		return nil
+	}
+	if len(values) != 1 || values[0] != want {
+		return fmt.Errorf("must set exactly one %s=%s", key, want)
+	}
+	return nil
+}
+
+func requireSingleSystemdDirective(text string, key string, want string, label string) error {
+	values := systemdDirectiveValues(text, key)
+	if len(values) != 1 || values[0] != want {
+		return fmt.Errorf("%s must set exactly one %s=%s directive", label, key, want)
+	}
+	return nil
 }
 
 func validateGoAccessStatic(cfg appconfig.Config, names appsvc.Names, staged []apprender.StagedFile) error {
@@ -822,6 +918,7 @@ func isRawCredentialKey(key string) bool {
 		return false
 	}
 	return strings.Contains(key, "TOKEN") ||
+		strings.Contains(key, "PASSWORD") ||
 		strings.Contains(key, "SECRET") ||
 		strings.Contains(key, "API_KEY") ||
 		key == "AWS_ACCESS_KEY_ID"

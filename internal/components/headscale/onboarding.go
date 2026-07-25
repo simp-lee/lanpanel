@@ -15,20 +15,19 @@ import (
 const (
 	DefaultUserName             = "lanpanel"
 	DefaultPreAuthKeyExpiration = 24 * time.Hour
+	MaxPreAuthKeyExpiration     = DefaultPreAuthKeyExpiration
 )
 
 var safeUserNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
-var sensitiveAuthKeyPattern = regexp.MustCompile(`(?:tskey|hskey|authkey)-[^\s]+`)
+var sensitiveAuthKeyPattern = regexp.MustCompile(`(?:(?:tskey|hskey|authkey)-|mkey:)[^\s]+`)
 
 type OnboardingOptions struct {
 	UserName   string
-	Reusable   bool
 	Expiration time.Duration
 }
 
 type OnboardingPlan struct {
 	UserName   string
-	Reusable   bool
 	Expiration time.Duration
 }
 
@@ -80,10 +79,12 @@ func NewOnboardingPlan(options OnboardingOptions) (OnboardingPlan, error) {
 	if expiration < time.Hour {
 		return OnboardingPlan{}, fmt.Errorf("preauthkey expiration must be at least 1h")
 	}
+	if expiration > MaxPreAuthKeyExpiration {
+		return OnboardingPlan{}, fmt.Errorf("preauthkey expiration must be at most %s", durationForCLI(MaxPreAuthKeyExpiration))
+	}
 
 	return OnboardingPlan{
 		UserName:   userName,
-		Reusable:   options.Reusable,
 		Expiration: expiration,
 	}, nil
 }
@@ -104,53 +105,68 @@ func ListUsersCommand() host.Command {
 }
 
 func CreatePreAuthKeyCommand(userID string, plan OnboardingPlan) host.Command {
-	args := []string{"preauthkeys", "create", "--user", strings.TrimSpace(userID), "--expiration", durationForCLI(plan.Expiration)}
-	if plan.Reusable {
-		args = append(args, "--reusable")
-	}
+	args := []string{"preauthkeys", "create", "--user", strings.TrimSpace(userID), "--expiration", durationForCLI(plan.Expiration), "--reusable=false"}
 	return HeadscaleCommand(args...)
 }
 
 func (onboarding Onboarding) CreatePreAuthKey(ctx context.Context, plan OnboardingPlan) (string, []host.Result, error) {
-	results := []host.Result{}
-	listResult, err := onboarding.listUsersWhenReady(ctx)
-	results = append(results, listResult)
+	userID, results, err := onboarding.ensureUser(ctx, plan.UserName)
 	if err != nil {
-		return "", results, commandErrorWithOutput(listResult, err)
-	}
-	userID, err := FindUserID(listResult.Stdout, plan.UserName)
-	if err != nil {
-		if !userWasNotFound(err) {
-			return "", results, err
-		}
-
-		createUserResult, createErr := onboarding.executor.Run(ctx, CreateUserCommand(plan.UserName))
-		results = append(results, createUserResult)
-		if createErr != nil && !commandLooksLikeExistingUser(createUserResult, createErr) {
-			return "", results, commandErrorWithOutput(createUserResult, createErr)
-		}
-
-		listResult, err = onboarding.listUsersWhenReady(ctx)
-		results = append(results, listResult)
-		if err != nil {
-			return "", results, commandErrorWithOutput(listResult, err)
-		}
-		userID, err = FindUserID(listResult.Stdout, plan.UserName)
-		if err != nil {
-			return "", results, err
-		}
+		return "", results, err
 	}
 
 	keyResult, err := onboarding.executor.Run(ctx, CreatePreAuthKeyCommand(userID, plan))
 	results = append(results, keyResult)
 	if err != nil {
-		return "", results, preAuthKeyCommandError(keyResult, err)
+		return "", results, preAuthKeyCommandError(err)
 	}
 	key := strings.TrimSpace(keyResult.Stdout)
 	if key == "" {
 		return "", results, fmt.Errorf("headscale preauthkeys create returned an empty key")
 	}
 	return key, results, nil
+}
+
+func (onboarding Onboarding) EnsureUser(ctx context.Context, userName string) ([]host.Result, error) {
+	plan, err := NewOnboardingPlan(OnboardingOptions{UserName: userName})
+	if err != nil {
+		return nil, err
+	}
+	_, results, err := onboarding.ensureUser(ctx, plan.UserName)
+	return results, err
+}
+
+func (onboarding Onboarding) ensureUser(ctx context.Context, userName string) (string, []host.Result, error) {
+	results := []host.Result{}
+	listResult, err := onboarding.listUsersWhenReady(ctx)
+	results = append(results, listResult)
+	if err != nil {
+		return "", results, err
+	}
+	userID, err := FindUserID(listResult.Stdout, userName)
+	if err == nil {
+		return userID, results, nil
+	}
+	if !userWasNotFound(err) {
+		return "", results, err
+	}
+
+	createUserResult, createErr := onboarding.executor.Run(ctx, CreateUserCommand(userName))
+	results = append(results, createUserResult)
+	if createErr != nil && !commandLooksLikeExistingUser(createUserResult, createErr) {
+		return "", results, createErr
+	}
+
+	listResult, err = onboarding.listUsersWhenReady(ctx)
+	results = append(results, listResult)
+	if err != nil {
+		return "", results, err
+	}
+	userID, err = FindUserID(listResult.Stdout, userName)
+	if err != nil {
+		return "", results, err
+	}
+	return userID, results, nil
 }
 
 func (onboarding Onboarding) listUsersWhenReady(ctx context.Context) (host.Result, error) {
@@ -190,7 +206,11 @@ func (onboarding Onboarding) listUsersWhenReady(ctx context.Context) (host.Resul
 func FindUserID(output string, userName string) (string, error) {
 	userName = strings.TrimSpace(userName)
 	matches := []User{}
-	for _, user := range ParseUsers(output) {
+	users, err := ParseUsers(output)
+	if err != nil {
+		return "", err
+	}
+	for _, user := range users {
 		if user.Name == userName {
 			matches = append(matches, user)
 		}
@@ -208,32 +228,25 @@ func FindUserID(output string, userName string) (string, error) {
 	return "", UserNotFoundError{UserName: userName}
 }
 
-func ParseUsers(output string) []User {
-	if users, ok := parseUsersJSON(output); ok {
-		return users
-	}
-	return parseUsersTable(output)
-}
-
-func parseUsersJSON(output string) ([]User, bool) {
+func ParseUsers(output string) ([]User, error) {
 	output = strings.TrimSpace(output)
 	if output == "" {
-		return nil, false
+		return nil, fmt.Errorf("headscale users list returned empty JSON output")
 	}
 
 	var users []cliUser
 	if err := json.Unmarshal([]byte(output), &users); err == nil {
-		return convertCLIUsers(users), true
+		return convertCLIUsers(users), nil
 	}
 
 	var wrapped struct {
 		Users []cliUser `json:"users"`
 	}
 	if err := json.Unmarshal([]byte(output), &wrapped); err == nil && wrapped.Users != nil {
-		return convertCLIUsers(wrapped.Users), true
+		return convertCLIUsers(wrapped.Users), nil
 	}
 
-	return nil, false
+	return nil, fmt.Errorf("decode headscale users list JSON output")
 }
 
 func convertCLIUsers(cliUsers []cliUser) []User {
@@ -246,83 +259,6 @@ func convertCLIUsers(cliUsers []cliUser) []User {
 		users = append(users, User{ID: strconv.FormatUint(user.ID, 10), Name: name})
 	}
 	return users
-}
-
-func parseUsersTable(output string) []User {
-	users := []User{}
-	nameColumn := 1
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		fields := splitTableLine(line)
-		if len(fields) < 2 {
-			continue
-		}
-		if column, ok := userNameColumn(fields); ok {
-			nameColumn = column
-			continue
-		}
-		if !looksNumeric(fields[0]) || nameColumn >= len(fields) {
-			continue
-		}
-		name := strings.TrimSpace(fields[nameColumn])
-		if name == "" {
-			continue
-		}
-		users = append(users, User{ID: fields[0], Name: name})
-	}
-	return users
-}
-
-func splitTableLine(line string) []string {
-	if strings.Contains(line, "|") {
-		rawFields := strings.Split(line, "|")
-		fields := make([]string, 0, len(rawFields))
-		for index, field := range rawFields {
-			field = strings.TrimSpace(field)
-			if field == "" && (index == 0 || index == len(rawFields)-1) {
-				continue
-			}
-			fields = append(fields, field)
-		}
-		return fields
-	}
-
-	if strings.Contains(line, "\t") {
-		rawFields := strings.Split(line, "\t")
-		fields := make([]string, 0, len(rawFields))
-		for _, field := range rawFields {
-			fields = append(fields, strings.TrimSpace(field))
-		}
-		return fields
-	}
-
-	return strings.Fields(line)
-}
-
-func userNameColumn(fields []string) (int, bool) {
-	if len(fields) == 0 || !strings.EqualFold(strings.TrimSpace(fields[0]), "id") {
-		return 0, false
-	}
-
-	nameColumn := -1
-	for index, field := range fields {
-		switch strings.ToLower(strings.TrimSpace(field)) {
-		case "username":
-			return index, true
-		case "name":
-			if nameColumn == -1 {
-				nameColumn = index
-			}
-		}
-	}
-	if nameColumn == -1 {
-		return 0, false
-	}
-	return nameColumn, true
 }
 
 func commandLooksLikeExistingUser(result host.Result, err error) bool {
@@ -358,43 +294,16 @@ func commandLooksLikeTransientHeadscaleCLIReadiness(result host.Result, err erro
 	}
 }
 
-func commandErrorWithOutput(result host.Result, err error) error {
-	if err == nil {
-		return nil
-	}
-	detail := firstNonEmptyLine(result.Stderr, result.Stdout)
-	if detail == "" {
-		return err
-	}
-	return fmt.Errorf("%w: %s", err, detail)
-}
-
-func preAuthKeyCommandError(result host.Result, err error) error {
+func preAuthKeyCommandError(err error) error {
 	if err == nil {
 		return nil
 	}
 	message := maskSensitiveAuthKeys(err.Error())
-	detail := maskSensitiveAuthKeys(firstNonEmptyLine(result.Stderr))
-	if detail == "" {
-		return errors.New(message)
-	}
-	return fmt.Errorf("%s: %s", message, detail)
+	return errors.New(message)
 }
 
 func maskSensitiveAuthKeys(text string) string {
 	return sensitiveAuthKeyPattern.ReplaceAllString(text, "<redacted>")
-}
-
-func firstNonEmptyLine(values ...string) string {
-	for _, value := range values {
-		for _, line := range strings.Split(value, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				return line
-			}
-		}
-	}
-	return ""
 }
 
 func userWasNotFound(err error) bool {
@@ -410,16 +319,4 @@ func durationForCLI(duration time.Duration) string {
 		return fmt.Sprintf("%dm", int(duration/time.Minute))
 	}
 	return duration.String()
-}
-
-func looksNumeric(value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, r := range value {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }

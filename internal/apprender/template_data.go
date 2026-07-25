@@ -29,6 +29,7 @@ type TemplateData struct {
 	ClientMaxBodySize string
 	AccessLog         string
 	ErrorLog          string
+	Access            AccessTemplateData
 	GoAccess          GoAccessTemplateData
 	Proxy             ProxyTemplateData
 	RealIP            RealIPTemplateData
@@ -40,6 +41,14 @@ type TemplateData struct {
 	PrivateKeyPath    string
 	TLSMarkerPath     string
 	HookPath          string
+}
+
+type AccessTemplateData struct {
+	Mode              string
+	Browser           bool
+	Public            bool
+	AuthBasicUserFile string
+	CIDRAllowlist     []string
 }
 
 type GoAccessTemplateData struct {
@@ -118,7 +127,7 @@ type StaticLocationTemplateData struct {
 }
 
 func NewTemplateData(cfg appconfig.Config) (TemplateData, error) {
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateForExposurePlan(); err != nil {
 		return TemplateData{}, err
 	}
 	names, err := appsvc.NewNames(cfg)
@@ -161,6 +170,7 @@ func NewTemplateData(cfg appconfig.Config) (TemplateData, error) {
 		ClientMaxBodySize: cfg.Nginx.EffectiveClientMaxBodySize(),
 		AccessLog:         nginxAccessLogPath(cfg),
 		ErrorLog:          cfg.Nginx.ErrorLog,
+		Access:            accessTemplateData(cfg),
 		GoAccess:          goAccessTemplateData(cfg, names),
 		Proxy:             proxyTemplateData(cfg.Nginx.Proxy),
 		RealIP:            realIP,
@@ -175,8 +185,18 @@ func NewTemplateData(cfg appconfig.Config) (TemplateData, error) {
 	}, nil
 }
 
+func accessTemplateData(cfg appconfig.Config) AccessTemplateData {
+	return AccessTemplateData{
+		Mode:              string(cfg.Access.AccessMode),
+		Browser:           cfg.Access.AccessMode == appconfig.AccessModeBrowser,
+		Public:            cfg.Access.AccessMode == appconfig.AccessModePublic,
+		AuthBasicUserFile: cfg.BrowserAuthUserFile(),
+		CIDRAllowlist:     append([]string(nil), cfg.Access.CIDRAllowlist...),
+	}
+}
+
 func realIPTemplateData(cfg appconfig.Config, names appsvc.Names) (RealIPTemplateData, error) {
-	profileName := strings.TrimSpace(cfg.Nginx.RealIPProfile)
+	profileName := cfg.EffectiveRealIPProfileName()
 	if profileName == "" || !cfg.RealIPEnabled() {
 		return RealIPTemplateData{}, nil
 	}

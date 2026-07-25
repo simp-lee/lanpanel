@@ -53,6 +53,7 @@ type Names struct {
 	GoAccessCanonicalAccessLogPath     string
 	GoAccessLogrotatePath              string
 	GoAccessSuggestedAuthBasicUserFile string
+	BrowserSuggestedAuthBasicUserFile  string
 	GoAccessWebSocketHost              string
 	GoAccessWebSocketPort              int
 	GoAccessWebSocketListen            string
@@ -80,7 +81,10 @@ type RealIPProfileNames struct {
 }
 
 func NewNames(cfg appconfig.Config) (Names, error) {
-	if err := cfg.Validate(); err != nil {
+	if cfg.PrivateClientAccessEnabled() {
+		return Names{}, fmt.Errorf("app service names are not available for private_client resources in P0")
+	}
+	if err := cfg.ValidateForExposurePlan(); err != nil {
 		return Names{}, err
 	}
 	appName := cfg.ResourceName()
@@ -135,6 +139,7 @@ func NewNames(cfg appconfig.Config) (Names, error) {
 		GoAccessCanonicalAccessLogPath:     GoAccessCanonicalAccessLogPath(cfg),
 		GoAccessLogrotatePath:              filepath.Join("/etc/logrotate.d", appName+"-goaccess"),
 		GoAccessSuggestedAuthBasicUserFile: filepath.Join(etcDir, "goaccess.htpasswd"),
+		BrowserSuggestedAuthBasicUserFile:  filepath.Join(etcDir, "browser.htpasswd"),
 		GoAccessWebSocketHost:              goAccessWebSocketHost,
 		GoAccessWebSocketPort:              goAccessWebSocketPort,
 		GoAccessWebSocketListen:            net.JoinHostPort(goAccessWebSocketHost, strconv.Itoa(goAccessWebSocketPort)),

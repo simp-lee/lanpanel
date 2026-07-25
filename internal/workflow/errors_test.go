@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestFailureResponseFormatsUserReadableSummary(t *testing.T) {
+func TestFailureSnapshotFormatsUserReadableFields(t *testing.T) {
 	t.Parallel()
 
 	failure := Failure{
@@ -20,33 +20,29 @@ func TestFailureResponseFormatsUserReadableSummary(t *testing.T) {
 		Cause:        errors.New("apt-get install headscale exited with status 100\nraw shell spew that should stay hidden"),
 	}
 
-	response := failure.Response("deploy")
-	if response.Command != "deploy" {
-		t.Fatalf("response.Command = %q, want %q", response.Command, "deploy")
+	snapshot := failure.Snapshot()
+	if snapshot.SummaryText() != "install packages failed: headscale package installation did not complete" {
+		t.Fatalf("SummaryText = %q, want failure summary", snapshot.SummaryText())
 	}
-	if response.Status != "failed" {
-		t.Fatalf("response.Status = %q, want %q", response.Status, "failed")
+	fields := snapshot.ResultFields()
+	if len(fields) != 4 {
+		t.Fatalf("len(fields) = %d, want 4", len(fields))
 	}
-	if response.Summary != "install packages failed: headscale package installation did not complete" {
-		t.Fatalf("response.Summary = %q, want failure summary", response.Summary)
+	if fields[2].Label != "impact" || fields[2].Value != "deploy cannot continue until host packages are installed" {
+		t.Fatalf("impact field = %#v, want user-readable impact", fields[2])
 	}
-	if len(response.Fields) != 4 {
-		t.Fatalf("len(response.Fields) = %d, want 4", len(response.Fields))
+	if fields[3].Value != "apt-get install headscale exited with status 100" {
+		t.Fatalf("details = %q, want sanitized single-line cause", fields[3].Value)
 	}
-	if response.Fields[2].Label != "impact" || response.Fields[2].Value != "deploy cannot continue until host packages are installed" {
-		t.Fatalf("impact field = %#v, want user-readable impact", response.Fields[2])
+	nextSteps := snapshot.NextSteps()
+	if len(nextSteps) != 3 {
+		t.Fatalf("len(nextSteps) = %d, want 3", len(nextSteps))
 	}
-	if response.Fields[3].Value != "apt-get install headscale exited with status 100" {
-		t.Fatalf("details = %q, want sanitized single-line cause", response.Fields[3].Value)
+	if nextSteps[2] != "Retry after remediation: lanpanel deploy --config lanpanel.yaml" {
+		t.Fatalf("retry step = %q, want retry command", nextSteps[2])
 	}
-	if len(response.NextSteps) != 3 {
-		t.Fatalf("len(response.NextSteps) = %d, want 3", len(response.NextSteps))
-	}
-	if response.NextSteps[2] != "Retry after remediation: lanpanel deploy --config lanpanel.yaml" {
-		t.Fatalf("retry step = %q, want retry command", response.NextSteps[2])
-	}
-	if failure.Error() != response.Summary {
-		t.Fatalf("Error() = %q, want %q", failure.Error(), response.Summary)
+	if failure.Error() != snapshot.SummaryText() {
+		t.Fatalf("Error() = %q, want %q", failure.Error(), snapshot.SummaryText())
 	}
 }
 
@@ -76,5 +72,15 @@ func TestFailureSnapshotCarriesSerializableUserContext(t *testing.T) {
 	}
 	if snapshot.RetryCommand != "lanpanel deploy --config lanpanel.yaml" {
 		t.Fatalf("RetryCommand = %q, want serialized retry command", snapshot.RetryCommand)
+	}
+}
+
+func TestShellCommandQuotesUnsafeArguments(t *testing.T) {
+	t.Parallel()
+
+	got := ShellCommand("lanpanel", "deploy", "--config", "/tmp/lan panel/a;touch x.yaml", "quote'path")
+	want := "lanpanel deploy --config '/tmp/lan panel/a;touch x.yaml' 'quote'\\''path'"
+	if got != want {
+		t.Fatalf("ShellCommand() = %q, want %q", got, want)
 	}
 }

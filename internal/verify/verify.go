@@ -13,7 +13,7 @@ import (
 	tlscomponent "lanpanel/internal/components/tls"
 )
 
-const MinimumTailscaleClientVersion = "1.74.0"
+const MinimumTailscaleClientVersion = "1.80.0"
 
 type Status string
 

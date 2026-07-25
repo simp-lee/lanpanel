@@ -1,7 +1,9 @@
 package appconfig
 
+import "lanpanel/internal/config"
+
 const (
-	APIVersion                = "lanpanel/app/v1alpha1"
+	APIVersion                = "lanpanel/app/v1alpha2"
 	DefaultConfigPath         = "lanpanel-app.yaml"
 	DefaultLanpanelConfigPath = "lanpanel.yaml"
 
@@ -33,18 +35,29 @@ const (
 
 	ModeListen   Mode = "listen"
 	ModeUpstream Mode = "upstream"
+
+	AccessModeBrowser       AccessMode = "browser"
+	AccessModePublic        AccessMode = "public"
+	AccessModePrivateClient AccessMode = "private_client"
+
+	OriginProtectionModeNone    OriginProtectionMode = "none"
+	OriginProtectionModeEdgeOne OriginProtectionMode = "edgeone"
 )
 
 type Mode string
+type AccessMode string
+type OriginProtectionMode string
 
 type Config struct {
-	APIVersion string          `yaml:"api_version"`
-	App        AppConfig       `yaml:"app"`
-	Service    ServiceConfig   `yaml:"service"`
-	Nginx      NginxConfig     `yaml:"nginx"`
-	RealIP     RealIPConfig    `yaml:"realip"`
-	DNS01      DNS01Config     `yaml:"dns01"`
-	Tailscale  TailscaleConfig `yaml:"tailscale"`
+	APIVersion   string                  `yaml:"api_version"`
+	App          AppConfig               `yaml:"app"`
+	Access       AccessConfig            `yaml:"access"`
+	Service      ServiceConfig           `yaml:"service"`
+	Nginx        NginxConfig             `yaml:"nginx"`
+	RealIP       RealIPConfig            `yaml:"realip"`
+	DNS01        DNS01Config             `yaml:"dns01"`
+	Tailscale    TailscaleConfig         `yaml:"tailscale"`
+	Dependencies config.DependencyConfig `yaml:"dependencies"`
 }
 
 type AppConfig struct {
@@ -56,6 +69,32 @@ type AppConfig struct {
 	Upstream         string   `yaml:"upstream"`
 }
 
+type AccessConfig struct {
+	AccessMode          AccessMode             `yaml:"access_mode"`
+	BrowserAuth         BrowserAuthConfig      `yaml:"browser_auth"`
+	CIDRAllowlist       []string               `yaml:"cidr_allowlist"`
+	PublicRiskConfirmed bool                   `yaml:"public_risk_confirmed"`
+	OriginProtection    OriginProtectionConfig `yaml:"origin_protection"`
+}
+
+type BrowserAuthConfig struct {
+	AuthBasicUserFile string                `yaml:"auth_basic_user_file"`
+	Managed           ManagedBrowserAuthRef `yaml:"managed"`
+}
+
+type ManagedBrowserAuthRef struct {
+	CredentialID        string `yaml:"credential_id"`
+	HtpasswdPath        string `yaml:"htpasswd_path"`
+	Username            string `yaml:"username"`
+	PasswordFingerprint string `yaml:"password_fingerprint"`
+}
+
+type OriginProtectionConfig struct {
+	Mode                      OriginProtectionMode `yaml:"mode"`
+	EdgeOneProfile            string               `yaml:"edgeone_profile"`
+	DirectOriginRiskConfirmed bool                 `yaml:"direct_origin_risk_confirmed"`
+}
+
 type ServiceConfig struct {
 	ExecStart        string `yaml:"exec_start"`
 	WorkingDirectory string `yaml:"working_directory"`
@@ -65,7 +104,6 @@ type ServiceConfig struct {
 type NginxConfig struct {
 	ClientMaxBodySize string                      `yaml:"client_max_body_size"`
 	HTTP2             *bool                       `yaml:"http2"`
-	RealIPProfile     string                      `yaml:"realip_profile"`
 	AccessLog         string                      `yaml:"access_log"`
 	ErrorLog          string                      `yaml:"error_log"`
 	GoAccess          NginxGoAccessConfig         `yaml:"goaccess"`

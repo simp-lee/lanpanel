@@ -15,6 +15,10 @@ func testAppConfig() appconfig.Config {
 	cfg.App.Domains = []string{"api.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/api/api --listen 127.0.0.1:18001"
 	return cfg
 }
@@ -36,6 +40,17 @@ func TestStaticReportRejectsForeignMarkerPrefix(t *testing.T) {
 	}
 }
 
+func TestStaticReportAllowsManualActivationConfirmations(t *testing.T) {
+	t.Parallel()
+
+	cfg := testAppConfig()
+	cfg.Access.PublicRiskConfirmed = false
+	report := StaticReport(cfg, mustStageRuntime(t, cfg))
+	if got := checkSummary(report, "config"); !strings.Contains(got, "valid") {
+		t.Fatalf("config summary = %q, want exposure-plan valid config", got)
+	}
+}
+
 func TestStaticReportRejectsSensitiveValues(t *testing.T) {
 	t.Parallel()
 
@@ -48,7 +63,9 @@ func TestStaticReportRejectsSensitiveValues(t *testing.T) {
 		{name: "headscale auth key", content: "hskey-auth-secret-value", want: "hskey-auth-"},
 		{name: "legacy tailscale auth key", content: "authkey-secret-value", want: "authkey-"},
 		{name: "raw dns token", content: "CF_DNS_API_TOKEN=secret-value", want: "CF_DNS_API_TOKEN"},
+		{name: "raw browser auth password", content: "BROWSER_AUTH_PASSWORD=secret-value", want: "BROWSER_AUTH_PASSWORD"},
 		{name: "raw dns token in systemd environment", content: "Environment=DO_AUTH_TOKEN=secret-value", want: "DO_AUTH_TOKEN"},
+		{name: "raw password in systemd environment", content: "Environment=BROWSER_AUTH_PASSWORD=secret-value", want: "BROWSER_AUTH_PASSWORD"},
 		{name: "raw dns token after safe systemd environment", content: "Environment=SAFE=1 CF_DNS_API_TOKEN=secret-value", want: "CF_DNS_API_TOKEN"},
 		{name: "raw auth token after safe systemd environment", content: "Environment=FOO=bar DO_AUTH_TOKEN=secret-value", want: "DO_AUTH_TOKEN"},
 		{name: "raw auth token after spaced systemd environment", content: "Environment = FOO=bar DO_AUTH_TOKEN=secret-value", want: "DO_AUTH_TOKEN"},
@@ -117,7 +134,7 @@ func TestStaticReportAllowsCredentialFileReferences(t *testing.T) {
 	report := StaticReport(cfg, []apprender.StagedFile{{
 		SourcePath: "templates/app/service.tmpl",
 		HostPath:   "/etc/systemd/system/api.service",
-		Content:    []byte("# " + appsvc.ManagedMarker("api") + "\nCF_DNS_API_TOKEN_FILE=/run/secrets/cf-token\n"),
+		Content:    []byte("# " + appsvc.ManagedMarker("api") + "\nCF_DNS_API_TOKEN_FILE=/run/secrets/cf-token\nBROWSER_AUTH_PASSWORD_FILE=/run/secrets/browser-password\n"),
 	}})
 	if got := checkSummary(report, "secrets"); !strings.Contains(got, "do not contain") {
 		t.Fatalf("secrets summary = %q, want pass", got)
@@ -199,6 +216,130 @@ func TestStaticReportRejectsRuntimeHostPathDrift(t *testing.T) {
 	}
 	if got := checkSummary(report, "templates"); !strings.Contains(got, "host path does not match runtime catalog") {
 		t.Fatalf("templates summary = %q, want host path drift detail", got)
+	}
+}
+
+func TestStaticReportRejectsAppServiceRuntimeDrift(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		cfg    func() appconfig.Config
+		mutate func(string) string
+		want   string
+	}{
+		{
+			name: "type drift",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "Type=simple", "Type=forking", 1)
+			},
+			want: "app service must set exactly one Type=simple directive",
+		},
+		{
+			name: "root user",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "User=api", "User=root", 1)
+			},
+			want: "app service must run as dedicated user api",
+		},
+		{
+			name: "root group",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "Group=api", "Group=root", 1)
+			},
+			want: "app service must run as dedicated group api",
+		},
+		{
+			name: "exec start drift",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "ExecStart=/opt/api/api --listen 127.0.0.1:18001", "ExecStart=/bin/true", 1)
+			},
+			want: "app service must start configured service.exec_start",
+		},
+		{
+			name: "extra exec directive",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return content + "\nExecStartPre=/bin/true\n"
+			},
+			want: "app service must not contain extra Exec directive ExecStartPre",
+		},
+		{
+			name: "restart removed",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "Restart=on-failure\n", "", 1)
+			},
+			want: "app service must set exactly one Restart=on-failure directive",
+		},
+		{
+			name: "no new privileges removed",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "NoNewPrivileges=true\n", "", 1)
+			},
+			want: "app service must set exactly one NoNewPrivileges=true directive",
+		},
+		{
+			name: "protect system weakened",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "ProtectSystem=full", "ProtectSystem=false", 1)
+			},
+			want: "app service must set exactly one ProtectSystem=full directive",
+		},
+		{
+			name: "unconfigured working directory injected",
+			cfg:  testAppConfig,
+			mutate: func(content string) string {
+				return strings.Replace(content, "ExecStart=", "WorkingDirectory=/srv/api\nExecStart=", 1)
+			},
+			want: "app service must not set WorkingDirectory when not configured",
+		},
+		{
+			name: "configured working directory removed",
+			cfg: func() appconfig.Config {
+				cfg := testAppConfig()
+				cfg.Service.WorkingDirectory = "/srv/api"
+				return cfg
+			},
+			mutate: func(content string) string {
+				return strings.Replace(content, "WorkingDirectory=/srv/api\n", "", 1)
+			},
+			want: "app service must set exactly one WorkingDirectory=/srv/api",
+		},
+		{
+			name: "configured environment file removed",
+			cfg: func() appconfig.Config {
+				cfg := testAppConfig()
+				cfg.Service.EnvFile = "/etc/api/service.env"
+				return cfg
+			},
+			mutate: func(content string) string {
+				return strings.Replace(content, "EnvironmentFile=/etc/api/service.env\n", "", 1)
+			},
+			want: "app service must set exactly one EnvironmentFile=/etc/api/service.env",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := tt.cfg()
+			staged := mutateStagedSource(mustStageRuntime(t, cfg), appassets.ServiceTemplate, tt.mutate)
+			report := StaticReport(cfg, staged)
+			if report.FailedCount() == 0 {
+				t.Fatal("FailedCount() = 0, want app service runtime drift failure")
+			}
+			if got := checkSummary(report, "templates"); !strings.Contains(got, tt.want) {
+				t.Fatalf("templates summary = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -343,6 +484,15 @@ func TestStaticReportRejectsGoAccessRuntimeDrift(t *testing.T) {
 			},
 			check: "nginx",
 			want:  "GoAccess dashboard disable_symlinks",
+		},
+		{
+			name:   "websocket authorization clear drift",
+			source: appassets.NginxTemplate,
+			mutate: func(content string) string {
+				return strings.Replace(content, `        proxy_set_header Authorization "";`+"\n", "", 1)
+			},
+			check: "nginx",
+			want:  "GoAccess WebSocket Authorization header clearing",
 		},
 		{
 			name:   "origin suffix drift",
@@ -1003,6 +1153,16 @@ func withoutSource(staged []apprender.StagedFile, sourcePath string) []apprender
 		filtered = append(filtered, file)
 	}
 	return filtered
+}
+
+func mutateStagedSource(staged []apprender.StagedFile, sourcePath string, mutate func(string) string) []apprender.StagedFile {
+	for i := range staged {
+		if staged[i].SourcePath == sourcePath {
+			staged[i].Content = []byte(mutate(string(staged[i].Content)))
+			return staged
+		}
+	}
+	return staged
 }
 
 func checkSummary(report Report, id string) string {

@@ -9,11 +9,12 @@ import (
 )
 
 type DNSProbe struct {
-	Host         string   `json:"host,omitempty"`
-	ResolvedIPs  []string `json:"resolved_ips,omitempty"`
-	LookupError  string   `json:"lookup_error,omitempty"`
-	ExpectedIPv4 string   `json:"expected_ipv4,omitempty"`
-	ExpectedIPv6 string   `json:"expected_ipv6,omitempty"`
+	Host            string   `json:"host,omitempty"`
+	ResolvedIPs     []string `json:"resolved_ips,omitempty"`
+	LookupError     string   `json:"lookup_error,omitempty"`
+	ExpectedIPv4    string   `json:"expected_ipv4,omitempty"`
+	ExpectedIPv6    string   `json:"expected_ipv6,omitempty"`
+	ExpectedIPError string   `json:"expected_ip_error,omitempty"`
 }
 
 type PortBinding struct {

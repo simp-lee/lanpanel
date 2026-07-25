@@ -4,7 +4,8 @@ package workflow
 import (
 	"fmt"
 	"lanpanel/internal/config"
-	"lanpanel/internal/output"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/prompt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -43,7 +44,7 @@ func ExampleInitResult() InitResult {
 	}
 }
 
-func RunInit(prompter output.Prompter, options InitOptions) (InitResult, error) {
+func RunInit(prompter prompt.Prompter, options InitOptions) (InitResult, error) {
 	if prompter == nil || !prompter.Enabled() {
 		return InitResult{}, fmt.Errorf("guided init requires interactive input")
 	}
@@ -53,7 +54,7 @@ func RunInit(prompter output.Prompter, options InitOptions) (InitResult, error) 
 	if options.Advanced {
 		mode = InitModeAdvanced
 	} else {
-		advanced, err := prompter.Confirm("Use advanced mode now?", output.ConfirmPrompt{
+		advanced, err := prompter.Confirm("Use advanced mode now?", prompt.ConfirmPrompt{
 			Default: false,
 			Help:    "Choose advanced if you need DNS-01, mirror or offline packages, offline lego archives, package probe timeouts, proxy, architecture, or public IP overrides.",
 		})
@@ -66,14 +67,14 @@ func RunInit(prompter output.Prompter, options InitOptions) (InitResult, error) 
 	}
 
 	var err error
-	if cfg.Default.ServerURL, err = prompter.Text("Headscale server URL", output.TextPrompt{
+	if cfg.Default.ServerURL, err = prompter.Text("Headscale server URL", prompt.TextPrompt{
 		Help:     "Use the public HTTPS URL clients will open, for example https://hs.example.com",
 		Validate: validateServerURL,
 	}); err != nil {
 		return InitResult{}, err
 	}
 
-	if cfg.Default.BaseDomain, err = prompter.Text("MagicDNS base domain", output.TextPrompt{
+	if cfg.Default.BaseDomain, err = prompter.Text("MagicDNS base domain", prompt.TextPrompt{
 		Help: "Must differ from the Headscale host name, for example tailnet.example.com",
 		Validate: func(value string) error {
 			return validateBaseDomain(cfg.Default.ServerURL, value)
@@ -82,7 +83,7 @@ func RunInit(prompter output.Prompter, options InitOptions) (InitResult, error) 
 		return InitResult{}, err
 	}
 
-	if cfg.Default.CertificateEmail, err = prompter.Text("Certificate email", output.TextPrompt{
+	if cfg.Default.CertificateEmail, err = prompter.Text("Certificate email", prompt.TextPrompt{
 		Help:     "Used for ACME registration and renewal notices",
 		Validate: validateCertificateEmail,
 	}); err != nil {
@@ -106,27 +107,32 @@ func RunInit(prompter output.Prompter, options InitOptions) (InitResult, error) 
 	}, nil
 }
 
-func (result InitResult) Response(configPath string) output.Response {
-	summary := "wrote example config"
-	sourceValue := "example template"
+func (result InitResult) Summary() string {
 	if result.Source == InitSourceGuided {
-		summary = "wrote guided config"
-		sourceValue = "guided " + string(result.Mode)
+		return "wrote guided config"
 	}
+	return "wrote example config"
+}
 
-	return output.Response{
-		Command: "init",
-		Status:  "written",
-		Summary: summary,
-		Fields: []output.Field{
-			{Label: "config path", Value: configPath},
-			{Label: "config source", Value: sourceValue},
-			{Label: "server url", Value: result.Config.Default.ServerURL},
-			{Label: "base domain", Value: result.Config.Default.BaseDomain},
-			{Label: "acme challenge", Value: result.Config.Default.ACMEChallenge},
-		},
-		NextSteps: result.nextSteps(configPath),
+func (result InitResult) SourceLabel() string {
+	if result.Source == InitSourceGuided {
+		return "guided " + string(result.Mode)
 	}
+	return "example template"
+}
+
+func (result InitResult) Fields(configPath string) []domain.ResultField {
+	return []domain.ResultField{
+		{Label: "config path", Value: configPath},
+		{Label: "config source", Value: result.SourceLabel()},
+		{Label: "server url", Value: result.Config.Default.ServerURL},
+		{Label: "base domain", Value: result.Config.Default.BaseDomain},
+		{Label: "acme challenge", Value: result.Config.Default.ACMEChallenge},
+	}
+}
+
+func (result InitResult) NextSteps(configPath string) []string {
+	return result.nextSteps(configPath)
 }
 
 func (result InitResult) nextSteps(configPath string) []string {
@@ -177,10 +183,10 @@ func suggestAdvancedConfigPath(configPath string) string {
 	return strings.TrimSuffix(configPath, extension) + ".advanced" + extension
 }
 
-func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
+func collectAdvancedFields(prompter prompt.Prompter, cfg *config.Config) error {
 	var err error
 
-	if cfg.Default.ACMEChallenge, err = prompter.Select("ACME challenge", output.SelectPrompt{
+	if cfg.Default.ACMEChallenge, err = prompter.Select("ACME challenge", prompt.SelectPrompt{
 		Default: config.ACMEChallengeHTTP01,
 		Help:    "Keep http-01 unless your environment specifically requires DNS-01",
 		Options: []string{config.ACMEChallengeHTTP01, config.ACMEChallengeDNS01},
@@ -189,7 +195,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 	}
 
 	if cfg.Default.ACMEChallenge == config.ACMEChallengeDNS01 {
-		if cfg.Advanced.DNS01.Provider, err = prompter.Text("DNS-01 provider", output.TextPrompt{
+		if cfg.Advanced.DNS01.Provider, err = prompter.Text("DNS-01 provider", prompt.TextPrompt{
 			Help:     "Use a lego DNS provider: " + tlscomponent.SupportedDNSProviderNames() + " (google is accepted as a gcloud alias)",
 			Validate: validateDNS01Provider,
 		}); err != nil {
@@ -200,7 +206,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		if err != nil {
 			return err
 		}
-		if cfg.Advanced.DNS01.EnvFile, err = prompter.Text("DNS-01 env file", output.TextPrompt{
+		if cfg.Advanced.DNS01.EnvFile, err = prompter.Text("DNS-01 env file", prompt.TextPrompt{
 			Help:     dns01EnvFileHelp(providerInfo),
 			Validate: validateDNS01EnvFile(providerInfo),
 		}); err != nil {
@@ -208,7 +214,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		}
 	}
 
-	if cfg.Advanced.HeadscaleSource.Mode, err = prompter.Select("Headscale source mode", output.SelectPrompt{
+	if cfg.Advanced.HeadscaleSource.Mode, err = prompter.Select("Headscale source mode", prompt.SelectPrompt{
 		Default: config.PackageSourceModeDirect,
 		Help:    "Use mirror or offline only when direct package download is not suitable",
 		Options: []string{config.PackageSourceModeDirect, config.PackageSourceModeMirror, config.PackageSourceModeOffline},
@@ -216,7 +222,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		return err
 	}
 
-	if cfg.Advanced.HeadscaleSource.Version, err = prompter.Text("Headscale package version", output.TextPrompt{
+	if cfg.Advanced.HeadscaleSource.Version, err = prompter.Text("Headscale package version", prompt.TextPrompt{
 		Default: config.DefaultHeadscaleVersion,
 		Help:    "Press Enter to keep the default tested version",
 		Validate: func(value string) error {
@@ -231,26 +237,26 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 
 	switch cfg.Advanced.HeadscaleSource.Mode {
 	case config.PackageSourceModeMirror:
-		if cfg.Advanced.HeadscaleSource.URL, err = prompter.Text("Headscale mirror package URL", output.TextPrompt{
+		if cfg.Advanced.HeadscaleSource.URL, err = prompter.Text("Headscale mirror package URL", prompt.TextPrompt{
 			Help:     "Use the full URL to the headscale .deb package",
 			Validate: validateMirrorURL,
 		}); err != nil {
 			return err
 		}
-		if cfg.Advanced.HeadscaleSource.SHA256, err = prompter.Text("Headscale mirror package SHA-256", output.TextPrompt{
+		if cfg.Advanced.HeadscaleSource.SHA256, err = prompter.Text("Headscale mirror package SHA-256", prompt.TextPrompt{
 			Help:     "Use the lowercase 64-character checksum for the package",
 			Validate: validateMirrorSHA256,
 		}); err != nil {
 			return err
 		}
 	case config.PackageSourceModeOffline:
-		if cfg.Advanced.HeadscaleSource.FilePath, err = prompter.Text("Offline Headscale package path", output.TextPrompt{
+		if cfg.Advanced.HeadscaleSource.FilePath, err = prompter.Text("Offline Headscale package path", prompt.TextPrompt{
 			Help:     "Use the absolute or relative path to the local headscale .deb file",
 			Validate: validateOfflinePath,
 		}); err != nil {
 			return err
 		}
-		if cfg.Advanced.HeadscaleSource.SHA256, err = prompter.Text("Offline Headscale package SHA-256", output.TextPrompt{
+		if cfg.Advanced.HeadscaleSource.SHA256, err = prompter.Text("Offline Headscale package SHA-256", prompt.TextPrompt{
 			Help:     "Use the lowercase 64-character checksum for the package",
 			Validate: validateOfflineSHA256,
 		}); err != nil {
@@ -258,7 +264,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		}
 	}
 
-	if cfg.Advanced.LegoSource.Mode, err = prompter.Select("lego archive source mode", output.SelectPrompt{
+	if cfg.Advanced.LegoSource.Mode, err = prompter.Select("lego archive source mode", prompt.SelectPrompt{
 		Default: config.PackageSourceModeDirect,
 		Help:    "Use offline only when this host cannot download the pinned lego GitHub release archive",
 		Options: []string{config.PackageSourceModeDirect, config.PackageSourceModeOffline},
@@ -266,7 +272,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		return err
 	}
 	if cfg.Advanced.LegoSource.Mode == config.PackageSourceModeOffline {
-		if cfg.Advanced.LegoSource.FilePath, err = prompter.Text("Offline lego archive path", output.TextPrompt{
+		if cfg.Advanced.LegoSource.FilePath, err = prompter.Text("Offline lego archive path", prompt.TextPrompt{
 			Help:     "Use the absolute or relative path to the local pinned lego .tar.gz archive",
 			Validate: validateLegoOfflinePath,
 		}); err != nil {
@@ -274,7 +280,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		}
 	}
 
-	configureProxy, err := prompter.Confirm("Configure HTTP or HTTPS proxy settings?", output.ConfirmPrompt{
+	configureProxy, err := prompter.Confirm("Configure HTTP or HTTPS proxy settings?", prompt.ConfirmPrompt{
 		Default: false,
 		Help:    "Leave this off unless the host needs a proxy to reach package or ACME endpoints",
 	})
@@ -282,26 +288,26 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		return err
 	}
 	if configureProxy {
-		if cfg.Advanced.Proxy.HTTPProxy, err = prompter.Text("http_proxy", output.TextPrompt{
+		if cfg.Advanced.Proxy.HTTPProxy, err = prompter.Text("http_proxy", prompt.TextPrompt{
 			Help:     "Optional. Leave empty to skip.",
 			Validate: validateHTTPProxy,
 		}); err != nil {
 			return err
 		}
-		if cfg.Advanced.Proxy.HTTPSProxy, err = prompter.Text("https_proxy", output.TextPrompt{
+		if cfg.Advanced.Proxy.HTTPSProxy, err = prompter.Text("https_proxy", prompt.TextPrompt{
 			Help:     "Optional. Leave empty to skip.",
 			Validate: validateHTTPSProxy,
 		}); err != nil {
 			return err
 		}
-		if cfg.Advanced.Proxy.NoProxy, err = prompter.Text("no_proxy", output.TextPrompt{
+		if cfg.Advanced.Proxy.NoProxy, err = prompter.Text("no_proxy", prompt.TextPrompt{
 			Help: "Optional. Use a comma-separated list such as 127.0.0.1,localhost",
 		}); err != nil {
 			return err
 		}
 	}
 
-	if cfg.Advanced.Platform.Arch, err = prompter.Select("Target architecture", output.SelectPrompt{
+	if cfg.Advanced.Platform.Arch, err = prompter.Select("Target architecture", prompt.SelectPrompt{
 		Default: config.ArchAMD64,
 		Help:    "Keep amd64 unless the host is arm64",
 		Options: []string{config.ArchAMD64, config.ArchARM64},
@@ -309,7 +315,7 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		return err
 	}
 
-	overrideIPs, err := prompter.Confirm("Override public IP detection?", output.ConfirmPrompt{
+	overrideIPs, err := prompter.Confirm("Override public IP detection?", prompt.ConfirmPrompt{
 		Default: false,
 		Help:    "Only use this if the host cannot advertise the right public address on its own",
 	})
@@ -317,13 +323,13 @@ func collectAdvancedFields(prompter output.Prompter, cfg *config.Config) error {
 		return err
 	}
 	if overrideIPs {
-		if cfg.Advanced.Network.PublicIPv4, err = prompter.Text("Public IPv4 override", output.TextPrompt{
+		if cfg.Advanced.Network.PublicIPv4, err = prompter.Text("Public IPv4 override", prompt.TextPrompt{
 			Help:     "Optional. Leave empty to skip.",
 			Validate: validatePublicIPv4,
 		}); err != nil {
 			return err
 		}
-		if cfg.Advanced.Network.PublicIPv6, err = prompter.Text("Public IPv6 override", output.TextPrompt{
+		if cfg.Advanced.Network.PublicIPv6, err = prompter.Text("Public IPv6 override", prompt.TextPrompt{
 			Help:     "Optional enhancement. Leave empty when the host has no usable IPv6.",
 			Validate: validatePublicIPv6,
 		}); err != nil {

@@ -22,7 +22,7 @@ func (c *Config) applyDefaults() {
 		c.Nginx.ClientMaxBodySize = DefaultNginxClientMaxBodySize
 	}
 	if c.Nginx.HTTP2 == nil {
-		enabled := true
+		enabled := false
 		c.Nginx.HTTP2 = &enabled
 	}
 	if strings.TrimSpace(c.Nginx.Proxy.ReadTimeout) == "" {
@@ -31,6 +31,7 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Nginx.Proxy.SendTimeout) == "" {
 		c.Nginx.Proxy.SendTimeout = DefaultNginxProxySendTimeout
 	}
+	c.Dependencies.ApplyDefaults()
 }
 
 func ExampleConfig() Config {
@@ -39,6 +40,10 @@ func ExampleConfig() Config {
 	cfg.App.Domains = []string{"abc.com", "www.abc.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/example-app/example-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/example-app"
 	return cfg
@@ -70,6 +75,32 @@ func (c Config) PrimaryDomain() string {
 
 func (c Config) ResourceName() string {
 	return strings.TrimSpace(c.App.Name)
+}
+
+func (c Config) BrowserAuthUserFile() string {
+	if strings.TrimSpace(c.Access.BrowserAuth.AuthBasicUserFile) != "" {
+		return strings.TrimSpace(c.Access.BrowserAuth.AuthBasicUserFile)
+	}
+	return strings.TrimSpace(c.Access.BrowserAuth.Managed.HtpasswdPath)
+}
+
+func (c Config) BrowserAuthEnabled() bool {
+	return c.Access.AccessMode == AccessModeBrowser
+}
+
+func (c Config) PublicAccessEnabled() bool {
+	return c.Access.AccessMode == AccessModePublic
+}
+
+func (c Config) PrivateClientAccessEnabled() bool {
+	return c.Access.AccessMode == AccessModePrivateClient
+}
+
+func (c Config) EffectiveRealIPProfileName() string {
+	if c.Access.OriginProtection.Mode != OriginProtectionModeEdgeOne {
+		return ""
+	}
+	return strings.TrimSpace(c.Access.OriginProtection.EdgeOneProfile)
 }
 
 func (c Config) NginxGoAccessCanonicalAccessLogPath() string {
@@ -137,7 +168,7 @@ func (c Config) RealIPProfile(name string) (RealIPProfileConfig, bool) {
 }
 
 func (c Config) RealIPEnabled() bool {
-	name := strings.TrimSpace(c.Nginx.RealIPProfile)
+	name := c.EffectiveRealIPProfileName()
 	if name == "" {
 		return false
 	}
@@ -146,7 +177,7 @@ func (c Config) RealIPEnabled() bool {
 }
 
 func (n NginxConfig) HTTP2Enabled() bool {
-	return n.HTTP2 == nil || *n.HTTP2
+	return n.HTTP2 != nil && *n.HTTP2
 }
 
 func (n NginxConfig) EffectiveClientMaxBodySize() string {

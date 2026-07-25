@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"lanpanel/internal/domain"
 	"strings"
 )
 
@@ -14,17 +15,15 @@ const (
 	FormatJSON  Format = "json"
 )
 
-type Field struct {
-	Label string `json:"label"`
-	Value string `json:"value"`
-}
+type Field = domain.ResultField
 
 type Response struct {
-	Command   string   `json:"command"`
-	Status    string   `json:"status"`
-	Summary   string   `json:"summary"`
-	Fields    []Field  `json:"fields,omitempty"`
-	NextSteps []string `json:"next_steps,omitempty"`
+	Command         string   `json:"command"`
+	Status          string   `json:"status"`
+	Summary         string   `json:"summary"`
+	Fields          []Field  `json:"fields,omitempty"`
+	NextSteps       []string `json:"next_steps,omitempty"`
+	OperationResult any      `json:"operation_result,omitempty"`
 }
 
 type Formatter struct {

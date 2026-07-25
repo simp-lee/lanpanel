@@ -6,19 +6,21 @@ import (
 	"lanpanel/internal/config"
 	"lanpanel/internal/host"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	Version = "v5.1.0"
+	Version = config.DefaultLegoVersion
 
 	BinaryPath      = "/opt/lanpanel/bin/lego"
 	DefaultCacheDir = "/var/cache/lanpanel"
 )
 
 const (
-	sha256LinuxAMD64 = "0bd70a30f36031b29b8158071a89140dd004993b030a89f6b6de4c6997a49908"
-	sha256LinuxARM64 = "16bb066dc17d3b8a916e896971f566d5c453893cbdd9c86976f6fbfebdaf2a79"
+	sha256LinuxAMD64 = "018de6d3f2da09630caa2fbbe8c6aa459323ad0ac0a053d0e808268914b38a8b"
+	sha256LinuxARM64 = "92c9d7d2a6377cdd4702bfaf7e0f61ea167456f1686a3899a12f289fe863c49b"
 )
 
 type ArchivePlan struct {
@@ -35,9 +37,11 @@ type ArchivePlan struct {
 }
 
 type InstallPlanOptions struct {
-	CacheDir          string
-	OfflineSourcePath string
-	Version           string
+	CacheDir            string
+	OfflineSourcePath   string
+	Version             string
+	ReachabilityTimeout time.Duration
+	ArtifactTimeout     time.Duration
 }
 
 type InstallPlan struct {
@@ -62,9 +66,17 @@ func NewInstallPlan(cfg config.Config, options InstallPlanOptions) (InstallPlan,
 	archivePath := archive.InstallPath()
 	commands := []host.Command{}
 	if archive.Mode != config.PackageSourceModeOffline {
+		curlArgs := []string{"-fL", "--retry", "3"}
+		if seconds := curlTimeoutSeconds(options.ReachabilityTimeout); seconds != "" {
+			curlArgs = append(curlArgs, "--connect-timeout", seconds)
+		}
+		if seconds := curlTimeoutSeconds(options.ArtifactTimeout); seconds != "" {
+			curlArgs = append(curlArgs, "--max-time", seconds)
+		}
+		curlArgs = append(curlArgs, "--output", archive.CachedPath, archive.SourceURL)
 		commands = append(commands,
 			host.Command{Name: "mkdir", Args: []string{"-p", "-m", "0755", "--", filepath.Dir(archive.CachedPath)}},
-			host.Command{Name: "curl", Args: []string{"-fL", "--retry", "3", "--output", archive.CachedPath, archive.SourceURL}},
+			host.Command{Name: "curl", Args: curlArgs},
 		)
 	}
 
@@ -180,6 +192,20 @@ func (installer Installer) Install(ctx context.Context, plan InstallPlan) ([]hos
 		}
 	}
 	return results, nil
+}
+
+func curlTimeoutSeconds(duration time.Duration) string {
+	if duration <= 0 {
+		return ""
+	}
+	seconds := int64(duration / time.Second)
+	if duration%time.Second != 0 {
+		seconds++
+	}
+	if seconds <= 0 {
+		seconds = 1
+	}
+	return strconv.FormatInt(seconds, 10)
 }
 
 func packageArch(cfg config.Config) string {

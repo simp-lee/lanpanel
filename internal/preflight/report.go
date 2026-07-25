@@ -3,6 +3,7 @@ package preflight
 
 import (
 	"fmt"
+	"lanpanel/internal/components/headscale"
 	"lanpanel/internal/config"
 	"net/url"
 	"strings"
@@ -85,7 +86,13 @@ func BuildReport(cfg config.Config, inputs Inputs) Report {
 		packageSource.FilePath = cfg.Advanced.HeadscaleSource.FilePath
 	}
 	if strings.TrimSpace(packageSource.ExpectedSHA256) == "" {
-		packageSource.ExpectedSHA256 = cfg.Advanced.HeadscaleSource.SHA256
+		if strings.TrimSpace(packageSource.Mode) == config.PackageSourceModeDirect {
+			if digest, err := headscale.PackageSHA256(packageSource.Version, cfg.Advanced.Platform.Arch); err == nil {
+				packageSource.ExpectedSHA256 = digest
+			}
+		} else {
+			packageSource.ExpectedSHA256 = cfg.Advanced.HeadscaleSource.SHA256
+		}
 	}
 
 	acme := inputs.ACME

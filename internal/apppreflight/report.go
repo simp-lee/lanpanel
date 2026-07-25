@@ -3,6 +3,7 @@ package apppreflight
 import (
 	"fmt"
 	"lanpanel/internal/appconfig"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/preflight"
 	"net/netip"
 	"strings"
@@ -11,9 +12,12 @@ import (
 type Status string
 
 const (
-	StatusPass Status = "pass"
-	StatusFail Status = "fail"
-	StatusWarn Status = "warn"
+	StatusPass          Status = "pass"
+	StatusFail          Status = "fail"
+	StatusWarn          Status = "warn"
+	StatusManual        Status = "manual"
+	StatusUnknown       Status = "unknown"
+	StatusNotApplicable Status = "not_applicable"
 )
 
 type Check struct {
@@ -24,38 +28,43 @@ type Check struct {
 }
 
 type Inputs struct {
-	Permissions                 preflight.PermissionState
-	DNS                         map[string]preflight.DNSProbe
-	Ports                       []preflight.PortBinding
-	AppListenChecked            bool
-	AppListenReady              bool
-	AppListenDetail             string
-	ServiceBinaryOK             bool
-	ServiceBinaryPath           string
-	ServiceEnvFile              string
-	ServiceEnvFileChecked       bool
-	ServiceEnvFileReady         bool
-	ServiceEnvFileDetail        string
-	TailscaleRequired           bool
-	TailscaleAuthKeyFile        string
-	TailscaleAuthKeyFileChecked bool
-	TailscaleAuthKeyFileReady   bool
-	TailscaleAuthKeyFileDetail  string
-	DNSCredentialsChecked       bool
-	DNSCredentialsReady         bool
-	DNSCredentialsDetail        string
-	GoAccessAuthFileChecked     bool
-	GoAccessAuthFileReady       bool
-	GoAccessAuthFileDetail      string
-	GoAccessPortChecked         bool
-	GoAccessPortReady           bool
-	GoAccessPortDetail          string
-	GoAccessLocaleChecked       bool
-	GoAccessLocaleReady         bool
-	GoAccessLocaleDetail        string
-	GoAccessLogFileChecked      bool
-	GoAccessLogFileReady        bool
-	GoAccessLogFileDetail       string
+	Permissions                     preflight.PermissionState
+	DNS                             map[string]preflight.DNSProbe
+	Ports                           []preflight.PortBinding
+	AppListenChecked                bool
+	AppListenReady                  bool
+	AppListenDetail                 string
+	ServiceBinaryOK                 bool
+	ServiceBinaryPath               string
+	ServiceEnvFile                  string
+	ServiceEnvFileChecked           bool
+	ServiceEnvFileReady             bool
+	ServiceEnvFileDetail            string
+	TailscaleRequired               bool
+	TailscaleAuthKeyFile            string
+	TailscaleAuthKeyFileChecked     bool
+	TailscaleAuthKeyFileReady       bool
+	TailscaleAuthKeyFileDetail      string
+	DNSCredentialsChecked           bool
+	DNSCredentialsReady             bool
+	DNSCredentialsDetail            string
+	GoAccessAuthFileChecked         bool
+	GoAccessAuthFileReady           bool
+	GoAccessAuthFileDetail          string
+	GoAccessPortChecked             bool
+	GoAccessPortReady               bool
+	GoAccessPortDetail              string
+	GoAccessLocaleChecked           bool
+	GoAccessLocaleReady             bool
+	GoAccessLocaleDetail            string
+	GoAccessLogFileChecked          bool
+	GoAccessLogFileReady            bool
+	GoAccessLogFileDetail           string
+	BrowserAuthFileChecked          bool
+	BrowserAuthFileReady            bool
+	BrowserAuthFileDetail           string
+	OriginProtectionStatus          domain.OriginProtectionStatus
+	OriginProtectionManualConfirmed bool
 }
 
 type Report struct {
@@ -85,7 +94,7 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 	if cfg.App.ACMEChallenge == appconfig.ACMEChallengeDNS01 {
 		switch {
 		case !inputs.DNSCredentialsChecked:
-			add("dns01-credentials", StatusFail, "DNS-01 provider env_file was not validated automatically", "Prepare a root-only dns01.env_file, or confirm this provider supports environment credentials from the current host identity.")
+			add("dns01-credentials", StatusUnknown, "DNS-01 provider env_file was not validated automatically", "Prepare a root-only dns01.env_file, or confirm this provider supports environment credentials from the current host identity.")
 		case !inputs.DNSCredentialsReady:
 			detail := strings.TrimSpace(inputs.DNSCredentialsDetail)
 			if detail == "" {
@@ -101,6 +110,8 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 			}
 			add("dns01-credentials", StatusPass, detail)
 		}
+	} else {
+		add("dns01-credentials", StatusNotApplicable, "DNS-01 credentials are not used for HTTP-01 app certificates")
 	}
 
 	if cfg.Mode() == appconfig.ModeListen {
@@ -119,7 +130,7 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 		if strings.TrimSpace(inputs.ServiceEnvFile) != "" {
 			switch {
 			case !inputs.ServiceEnvFileChecked:
-				add("service-env-file", StatusFail, "service.env_file was not validated automatically", "Confirm service.env_file exists, is root-owned, and has mode 0600.")
+				add("service-env-file", StatusUnknown, "service.env_file was not validated automatically", "Confirm service.env_file exists, is root-owned, and has mode 0600.")
 			case !inputs.ServiceEnvFileReady:
 				detail := strings.TrimSpace(inputs.ServiceEnvFileDetail)
 				if detail == "" {
@@ -136,17 +147,20 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 				add("service-env-file", StatusPass, detail)
 			}
 		}
+	} else {
+		add("app-listen", StatusNotApplicable, "app.listen is not used for upstream app targets")
+		add("service-binary", StatusNotApplicable, "service.exec_start is not used for upstream app targets")
 	}
 
 	if inputs.TailscaleRequired {
 		add("tailscale", StatusPass, "This app requires the tailnet; deploy will check the Tailscale client automatically")
 	} else {
-		add("tailscale", StatusPass, "This app does not require the tailnet; Tailscale client prerequisites are skipped")
+		add("tailscale", StatusNotApplicable, "This app does not require the tailnet; Tailscale client prerequisites are skipped")
 	}
 	if strings.TrimSpace(inputs.TailscaleAuthKeyFile) != "" {
 		switch {
 		case !inputs.TailscaleAuthKeyFileChecked:
-			add("tailscale-auth-key-file", StatusFail, "tailscale.auth_key_file was not validated automatically", "Confirm tailscale.auth_key_file exists, is root-owned, root-only, and contains exactly one preauth key.")
+			add("tailscale-auth-key-file", StatusUnknown, "tailscale.auth_key_file was not validated automatically", "Confirm tailscale.auth_key_file exists, is root-owned, root-only, and contains exactly one preauth key.")
 		case !inputs.TailscaleAuthKeyFileReady:
 			detail := strings.TrimSpace(inputs.TailscaleAuthKeyFileDetail)
 			if detail == "" {
@@ -173,7 +187,23 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 		}
 	}
 	if cfg.RealIPEnabled() {
-		add("realip-firewall", StatusWarn, "EdgeOne realip restores canonical client IP but does not manage cloud security groups or host firewalls", "Manually restrict origin 80/443 ingress to EdgeOne OriginACL current+next CIDRs in Tencent Cloud security groups, host firewall, or equivalent boundary.")
+		switch {
+		case inputs.OriginProtectionStatus == domain.OriginProtectionConfiguredPass:
+			add("realip-firewall", StatusPass, "EdgeOne origin protection checks passed for this operation")
+		case inputs.OriginProtectionManualConfirmed:
+			add("realip-firewall", StatusManual, "EdgeOne origin ingress restriction manual confirmation was recorded for this operation")
+		case inputs.OriginProtectionStatus == domain.OriginProtectionConfiguredFail:
+			add("realip-firewall", StatusFail, "EdgeOne origin protection checks failed for this operation", "Fix EdgeOne trusted CIDRs, real client IP header handling, spoofing rejection, Host/SNI guard, deployed references, or rollback state, then rerun.")
+		default:
+			add("realip-firewall", StatusUnknown, "EdgeOne realip cannot automatically verify cloud security groups or host firewalls", "Manually restrict origin 80/443 ingress to EdgeOne OriginACL current+next CIDRs in Tencent Cloud security groups, host firewall, or equivalent boundary, then rerun with --confirmation origin-protection-manual.")
+		}
+	} else {
+		add("realip-firewall", StatusNotApplicable, "EdgeOne RealIP origin protection is disabled for this app")
+	}
+	if cfg.BrowserAuthEnabled() {
+		addGoAccessCheck(&checks, "browser-auth-file", inputs.BrowserAuthFileChecked, inputs.BrowserAuthFileReady, inputs.BrowserAuthFileDetail, "access.browser_auth htpasswd file was not validated automatically", "Fix the browser auth htpasswd path, owner, permissions, content, parent-directory safety, or Nginx readability, then rerun.")
+	} else {
+		add("browser-auth-file", StatusNotApplicable, "browser auth is not required for this access mode")
 	}
 
 	return Report{Checks: checks}
@@ -207,7 +237,7 @@ func addGoAccessCheck(checks *[]Check, id string, checked bool, ready bool, deta
 	remediations := []string{}
 	switch {
 	case !checked:
-		status = StatusFail
+		status = StatusUnknown
 		summary = uncheckedSummary
 		remediations = append(remediations, remediation)
 	case !ready:
@@ -225,6 +255,9 @@ func addGoAccessCheck(checks *[]Check, id string, checked bool, ready bool, deta
 }
 
 func evaluateDNSProbe(cfg appconfig.Config, domain string, probe preflight.DNSProbe, ok bool) (Status, string, string) {
+	if errText := strings.TrimSpace(probe.ExpectedIPError); errText != "" {
+		return StatusFail, fmt.Sprintf("%s expected public IP detection failed: %s", domain, errText), "Fix tailscale.lanpanel_config, proxy settings, or advanced.network.public_ipv4/public_ipv6 in the main lanpanel.yaml, then rerun."
+	}
 	if !ok || strings.TrimSpace(probe.LookupError) != "" || len(probe.ResolvedIPs) == 0 {
 		if cfg.App.ACMEChallenge == appconfig.ACMEChallengeDNS01 {
 			if cfg.RealIPEnabled() {
@@ -392,7 +425,7 @@ func containsString(values []string, want string) bool {
 func (report Report) FailedCount() int {
 	count := 0
 	for _, check := range report.Checks {
-		if check.Status == StatusFail {
+		if check.Status == StatusFail || check.Status == StatusUnknown {
 			count++
 		}
 	}
@@ -401,7 +434,7 @@ func (report Report) FailedCount() int {
 
 func (report Report) Summary() string {
 	if report.FailedCount() > 0 {
-		return fmt.Sprintf("app deploy preflight found %d failed checks", report.FailedCount())
+		return fmt.Sprintf("app deploy preflight found %d blocking checks", report.FailedCount())
 	}
 	return "app deploy preflight passed"
 }

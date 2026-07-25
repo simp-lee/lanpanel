@@ -18,6 +18,10 @@ func testConfig() appconfig.Config {
 	cfg.App.Domains = []string{"abc.com", "www.abc.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/example-app/example-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/example-app"
 	return cfg
@@ -119,6 +123,9 @@ func TestNewNamesDerivesAppResourcePaths(t *testing.T) {
 	}
 	if names.GoAccessSuggestedAuthBasicUserFile != "/etc/example-app/goaccess.htpasswd" {
 		t.Fatalf("GoAccessSuggestedAuthBasicUserFile = %q, want recommended auth path", names.GoAccessSuggestedAuthBasicUserFile)
+	}
+	if names.BrowserSuggestedAuthBasicUserFile != "/etc/example-app/browser.htpasswd" {
+		t.Fatalf("BrowserSuggestedAuthBasicUserFile = %q, want recommended browser auth path", names.BrowserSuggestedAuthBasicUserFile)
 	}
 	if names.GoAccessWebSocketHost != "127.0.0.1" || names.GoAccessWebSocketPort == 7890 || names.GoAccessWebSocketListen == "0.0.0.0:7890" {
 		t.Fatalf("GoAccess websocket listen = %q (%s:%d), want stable loopback non-default", names.GoAccessWebSocketListen, names.GoAccessWebSocketHost, names.GoAccessWebSocketPort)
@@ -1392,6 +1399,40 @@ exec /usr/bin/stat "$@"
 	if strings.TrimSpace(string(content)) != ManagedMarker(bootstrap.AppName) {
 		t.Fatalf("bootstrap marker = %q, want %q", content, ManagedMarker(bootstrap.AppName))
 	}
+
+	dualBootstrap := baseNames
+	dualBootstrap.VarLibDir = filepath.Join(dir, "dual-bootstrap-var-lib")
+	dualBootstrap.EtcDir = filepath.Join(dir, "dual-bootstrap-etc")
+	dualBootstrap.HookDir = filepath.Join(dir, "dual-bootstrap-hooks")
+	dualBootstrap.VarLibMarkerPath = filepath.Join(dualBootstrap.VarLibDir, ".lanpanel-managed")
+	dualBootstrap.EtcMarkerPath = filepath.Join(dualBootstrap.EtcDir, ".lanpanel-managed")
+	dualBootstrap.HookDirMarkerPath = filepath.Join(dualBootstrap.HookDir, ".lanpanel-managed")
+	dualBootstrap.GoAccessSuggestedAuthBasicUserFile = filepath.Join(dualBootstrap.EtcDir, "goaccess.htpasswd")
+	dualBootstrap.BrowserSuggestedAuthBasicUserFile = filepath.Join(dualBootstrap.EtcDir, "browser.htpasswd")
+	if err := os.MkdirAll(dualBootstrap.EtcDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(dual bootstrap etc) error = %v", err)
+	}
+	browserAuthFile := filepath.Join(dualBootstrap.EtcDir, "browser.htpasswd")
+	goAccessAuthFile := filepath.Join(dualBootstrap.EtcDir, "goaccess.htpasswd")
+	for _, path := range []string{browserAuthFile, goAccessAuthFile} {
+		if err := os.WriteFile(path, []byte("user:hash\n"), 0o640); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	command = GuardRootDirectoriesWithAuthBootstrapsCommand(dualBootstrap, browserAuthFile, goAccessAuthFile)
+	cmd = exec.Command("sh", append([]string{"-c", command.Args[1]}, command.Args[2:]...)...)
+	cmd.Env = append(os.Environ(), "PATH="+binDir+":/usr/bin:/bin")
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("dual bootstrap root directory guard error = %v; output:\n%s", err, output)
+	}
+	content, err = os.ReadFile(dualBootstrap.EtcMarkerPath)
+	if err != nil {
+		t.Fatalf("ReadFile(dual bootstrap marker) error = %v", err)
+	}
+	if strings.TrimSpace(string(content)) != ManagedMarker(dualBootstrap.AppName) {
+		t.Fatalf("dual bootstrap marker = %q, want %q", content, ManagedMarker(dualBootstrap.AppName))
+	}
 }
 
 func TestGuardRootDirectoriesGoAccessAuthBootstrapRequiresSuggestedPath(t *testing.T) {
@@ -1709,6 +1750,77 @@ func TestGuardGoAccessAuthFileMetadataCommandOmitsRuntimeReadability(t *testing.
 		if strings.Contains(script, omitted) {
 			t.Fatalf("metadata auth guard script contains runtime readability dependency %q\n%s", omitted, script)
 		}
+	}
+}
+
+func TestGuardBrowserAuthFileCommandFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	names, err := NewNames(testConfig())
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	authDir := t.TempDir()
+	if err := os.Chmod(authDir, 0o700); err != nil {
+		t.Fatalf("Chmod(authDir) error = %v", err)
+	}
+	authFile := filepath.Join(authDir, "browser.htpasswd")
+	if err := os.WriteFile(authFile, []byte("user:hash\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile) error = %v", err)
+	}
+	script := GuardBrowserAuthFileCommand(names, authFile).Args[1]
+
+	output, err := runGoAccessAuthGuardScript(t, script, authFile, "unreadable")
+	if err == nil {
+		t.Fatalf("browser auth guard error = nil, want failure; output:\n%s", output)
+	}
+	if !strings.Contains(output, "cannot read access.browser_auth htpasswd file") {
+		t.Fatalf("output = %q, want browser auth readability failure", output)
+	}
+
+	output, err = runGoAccessAuthGuardScript(t, script, authFile, "ok")
+	if err != nil {
+		t.Fatalf("browser auth guard error = %v; output:\n%s", err, output)
+	}
+}
+
+func TestGuardManagedBrowserAuthFileCommandRequiresMarkerAndStrongBcrypt(t *testing.T) {
+	t.Parallel()
+
+	names, err := NewNames(testConfig())
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	authDir := t.TempDir()
+	if err := os.Chmod(authDir, 0o700); err != nil {
+		t.Fatalf("Chmod(authDir) error = %v", err)
+	}
+	authFile := filepath.Join(authDir, "browser.htpasswd")
+	validHash := "admin:$2y$12$" + strings.Repeat("a", 53)
+	if err := os.WriteFile(authFile, []byte("# LanPanel-managed browser-auth\n"+validHash+"\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile) error = %v", err)
+	}
+	script := GuardManagedBrowserAuthFileCommand(names, authFile).Args[1]
+
+	output, err := runGoAccessAuthGuardScript(t, script, authFile, "ok")
+	if err != nil {
+		t.Fatalf("managed browser auth guard error = %v; output:\n%s", err, output)
+	}
+
+	if err := os.WriteFile(authFile, []byte(validHash+"\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile without marker) error = %v", err)
+	}
+	output, err = runGoAccessAuthGuardScript(t, script, authFile, "ok")
+	if err == nil || !strings.Contains(output, "must keep the LanPanel marker") {
+		t.Fatalf("managed browser auth guard output = %q error = %v, want marker failure", output, err)
+	}
+
+	if err := os.WriteFile(authFile, []byte("# LanPanel-managed browser-auth\nadmin:$2y$10$"+strings.Repeat("a", 53)+"\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile weak hash) error = %v", err)
+	}
+	output, err = runGoAccessAuthGuardScript(t, script, authFile, "ok")
+	if err == nil || !strings.Contains(output, "bcrypt credential with cost at least 12") {
+		t.Fatalf("managed browser auth guard output = %q error = %v, want weak hash failure", output, err)
 	}
 }
 
@@ -3774,6 +3886,7 @@ func minimalGoAccessNginxText(names Names, dashboardGuard string, websocketGuard
         ` + websocketGuard + `
         proxy_pass http://` + names.GoAccessWebSocketListen + `;
         proxy_http_version 1.1;
+	        proxy_set_header Authorization "";
 	        proxy_set_header Upgrade $http_upgrade;
 	        proxy_set_header Connection $` + names.VarPrefix + `_connection_upgrade;
 	        proxy_set_header X-Real-IP $remote_addr;

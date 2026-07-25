@@ -16,6 +16,10 @@ func listenConfig() appconfig.Config {
 	cfg.App.Domains = []string{"abc.com", "www.abc.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/example-app/example-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/example-app"
 	return cfg
@@ -28,9 +32,11 @@ func TestStageRuntimeRendersListenModeAssets(t *testing.T) {
 	cfg.Service.EnvFile = "/opt/example-app/web.env"
 	staticAccessLog := false
 	proxyBuffering := false
+	http2 := true
 	cfg.Nginx.ClientMaxBodySize = "100m"
 	cfg.Nginx.AccessLog = "/var/log/lanpanel/custom/example-app.access.log"
 	cfg.Nginx.ErrorLog = "/var/log/nginx/example-app.error.log"
+	cfg.Nginx.HTTP2 = &http2
 	cfg.Nginx.Proxy.ConnectTimeout = "30s"
 	cfg.Nginx.Proxy.ReadTimeout = "600s"
 	cfg.Nginx.Proxy.SendTimeout = "600s"
@@ -138,6 +144,63 @@ func TestStageRuntimeRendersListenModeAssets(t *testing.T) {
 	}
 }
 
+func TestStageRuntimeRendersBrowserAccessControls(t *testing.T) {
+	t.Parallel()
+
+	cfg := listenConfig()
+	cfg.Access.AccessMode = appconfig.AccessModeBrowser
+	cfg.Access.PublicRiskConfirmed = false
+	cfg.Access.BrowserAuth.AuthBasicUserFile = "/etc/example-app/browser.htpasswd"
+	cfg.Access.CIDRAllowlist = []string{"203.0.113.0/24"}
+	cfg.Nginx.StaticLocations = []appconfig.NginxStaticLocationConfig{{
+		Path:  "/static/",
+		Alias: "/opt/example-app/web/static/",
+	}}
+	staged, err := StageRuntime(cfg)
+	if err != nil {
+		t.Fatalf("StageRuntime() error = %v", err)
+	}
+	nginxText := stagedText(t, staged, "templates/app/nginx.conf.tmpl")
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	if err := appsvc.ValidateRenderedNginx(cfg, names, []byte(nginxText)); err != nil {
+		t.Fatalf("ValidateRenderedNginx() error = %v\n%s", err, nginxText)
+	}
+	for _, want := range []string{
+		`auth_basic "Lanpanel Browser";`,
+		"auth_basic_user_file /etc/example-app/browser.htpasswd;",
+		"allow 203.0.113.0/24;",
+		"deny all;",
+		`proxy_set_header Authorization "";`,
+	} {
+		if !strings.Contains(nginxText, want) {
+			t.Fatalf("nginx content missing browser access fragment %q\n%s", want, nginxText)
+		}
+	}
+	if strings.Count(nginxText, `auth_basic "Lanpanel Browser";`) != 2 {
+		t.Fatalf("browser auth must cover static and proxy locations\n%s", nginxText)
+	}
+}
+
+func TestStageRuntimePublicAccessDoesNotRenderBrowserAuth(t *testing.T) {
+	t.Parallel()
+
+	cfg := listenConfig()
+	staged, err := StageRuntime(cfg)
+	if err != nil {
+		t.Fatalf("StageRuntime() error = %v", err)
+	}
+	nginxText := stagedText(t, staged, "templates/app/nginx.conf.tmpl")
+	if strings.Contains(nginxText, `auth_basic "Lanpanel Browser";`) {
+		t.Fatalf("public app rendered browser auth\n%s", nginxText)
+	}
+	if strings.Contains(nginxText, `proxy_set_header Authorization "";`) {
+		t.Fatalf("public app cleared Authorization header\n%s", nginxText)
+	}
+}
+
 func TestStageRuntimeAllowsRealIPDirectiveNamesInStaticAliasWhenRealIPDisabled(t *testing.T) {
 	t.Parallel()
 
@@ -179,7 +242,9 @@ func TestStageRuntimeRendersRealIPScopedDirectivesAndSanitizedHeaders(t *testing
 	cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
 	cfg.Nginx.GoAccess.Enabled = true
 	cfg.Nginx.GoAccess.AuthBasicUserFile = "/etc/example-app/goaccess.htpasswd"
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -288,7 +353,9 @@ func TestStageRuntimeKeepsRealIPRejectionLogWhenAccessLogOff(t *testing.T) {
 	cfg.DNS01.Provider = "tencentcloud"
 	cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
 	cfg.Nginx.AccessLog = "off"
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -402,6 +469,7 @@ func TestStageRuntimeRendersGoAccessAssetsAndNginxLocations(t *testing.T) {
 		"deny all;",
 		"location = /_lanpanel/apps/example-app/goaccess/ws {",
 		"proxy_pass http://127.0.0.1:",
+		`proxy_set_header Authorization "";`,
 		"proxy_read_timeout 3600s;",
 		"access_log off;",
 	} {
@@ -750,4 +818,15 @@ func TestRenderedNginxValidationRejectsMissingHTTPSHostGuard(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "HTTPS Host allowlist before proxy location") {
 		t.Fatalf("ValidateRenderedNginx() error = %v, want HTTPS Host guard failure", err)
 	}
+}
+
+func stagedText(t *testing.T, staged []StagedFile, sourcePath string) string {
+	t.Helper()
+	for _, file := range staged {
+		if file.SourcePath == sourcePath {
+			return string(file.Content)
+		}
+	}
+	t.Fatalf("staged source %s not found", sourcePath)
+	return ""
 }

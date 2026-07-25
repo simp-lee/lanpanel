@@ -14,6 +14,10 @@ func validListenConfig() Config {
 	cfg.App.Domains = []string{"abc.com", "www.abc.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/example-app/example-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/example-app"
 	return cfg
@@ -40,8 +44,8 @@ func TestNewAppliesDefaultsAndRequiresUserInputs(t *testing.T) {
 	if got := cfg.Nginx.EffectiveClientMaxBodySize(); got != DefaultNginxClientMaxBodySize {
 		t.Fatalf("nginx.client_max_body_size default = %q, want %q", got, DefaultNginxClientMaxBodySize)
 	}
-	if !cfg.NginxHTTP2Enabled() {
-		t.Fatal("nginx.http2 default = false, want true")
+	if cfg.NginxHTTP2Enabled() {
+		t.Fatal("nginx.http2 default = true, want false")
 	}
 	if got := cfg.Nginx.Proxy.EffectiveReadTimeout(); got != DefaultNginxProxyReadTimeout {
 		t.Fatalf("nginx.proxy.read_timeout default = %q, want %q", got, DefaultNginxProxyReadTimeout)
@@ -61,6 +65,9 @@ func TestNewAppliesDefaultsAndRequiresUserInputs(t *testing.T) {
 	if got := cfg.Nginx.GoAccess.EffectiveWebSocketPath(); got != "/_lanpanel/apps/<app-name>/goaccess/ws" {
 		t.Fatalf("nginx.goaccess.websocket_path effective default = %q, want app-scoped placeholder", got)
 	}
+	if cfg.Dependencies.LegoSource.Mode != "direct" {
+		t.Fatalf("dependencies.lego_source.mode = %q, want direct", cfg.Dependencies.LegoSource.Mode)
+	}
 
 	err := cfg.Validate()
 	if err == nil {
@@ -71,6 +78,8 @@ func TestNewAppliesDefaultsAndRequiresUserInputs(t *testing.T) {
 		"app.domains must contain at least one domain",
 		"app.certificate_email is required",
 		"one of app.listen or app.upstream is required",
+		"access.access_mode is required",
+		"access.origin_protection.mode is required",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("Validate() error = %q, want substring %q", err.Error(), want)
@@ -82,7 +91,7 @@ func TestLoadBytesValidListenConfig(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: example-app
   domains:
@@ -90,6 +99,15 @@ app:
     - www.abc.com
   certificate_email: ops@example.com
   listen: 127.0.0.1:18001
+access:
+  access_mode: browser
+  cidr_allowlist:
+    - 198.51.100.0/24
+  browser_auth:
+    auth_basic_user_file: /etc/example-app/browser.htpasswd
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: true
 service:
   exec_start: /opt/example-app/example-app --listen 127.0.0.1:18001
   working_directory: /opt/example-app
@@ -151,6 +169,15 @@ nginx:
 	}
 	if got := cfg.Service.EnvFile; got != "/opt/example-app/web.env" {
 		t.Fatalf("service.env_file = %q, want /opt/example-app/web.env", got)
+	}
+	if got := cfg.Access.AccessMode; got != AccessModeBrowser {
+		t.Fatalf("access.access_mode = %q, want browser", got)
+	}
+	if got := cfg.BrowserAuthUserFile(); got != "/etc/example-app/browser.htpasswd" {
+		t.Fatalf("BrowserAuthUserFile() = %q, want /etc/example-app/browser.htpasswd", got)
+	}
+	if got := cfg.Access.CIDRAllowlist; len(got) != 1 || got[0] != "198.51.100.0/24" {
+		t.Fatalf("access.cidr_allowlist = %#v, want 198.51.100.0/24", got)
 	}
 	if len(cfg.Nginx.StaticLocations) != 2 {
 		t.Fatalf("len(nginx.static_locations) = %d, want 2", len(cfg.Nginx.StaticLocations))
@@ -258,39 +285,51 @@ service:
 	}
 
 	if _, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: example-app
   domains: [abc.com]
   certificate_email: ops@example.com
   listen: 127.0.0.1:18001
   tailnet: true
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: true
 service:
   exec_start: /opt/example-app/example-app
-`)); err == nil {
-		t.Fatal("LoadBytes() unknown field error = nil, want non-nil")
+`)); err == nil || !strings.Contains(err.Error(), "tailnet") {
+		t.Fatalf("LoadBytes() unknown app field error = %v, want tailnet field failure", err)
 	}
 
 	if _, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: example-app
   domains: [abc.com]
   certificate_email: ops@example.com
   listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: true
 service:
   exec_start: /opt/example-app/example-app
 nginx:
   goaccess:
     public: true
-`)); err == nil {
-		t.Fatal("LoadBytes() unknown nginx.goaccess field error = nil, want non-nil")
+`)); err == nil || !strings.Contains(err.Error(), "public") {
+		t.Fatalf("LoadBytes() unknown nginx.goaccess field error = %v, want public field failure", err)
 	}
 
 	if _, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 ---
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 `)); err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
 		t.Fatalf("LoadBytes() multiple documents error = %v, want multiple document failure", err)
 	}
@@ -300,12 +339,18 @@ func TestLoadBytesDefaultsACMEChallengeButNotAPIVersion(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: example-app
   domains: [abc.com]
   certificate_email: ops@example.com
   listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: true
 service:
   exec_start: /opt/example-app/example-app
 `))
@@ -327,6 +372,148 @@ func TestValidateRejectsModeConflicts(t *testing.T) {
 	neither := validListenConfig()
 	neither.App.Listen = ""
 	expectValidationError(t, neither, "one of app.listen or app.upstream is required")
+}
+
+func TestValidateAccessRules(t *testing.T) {
+	t.Parallel()
+
+	publicUnconfirmed := validListenConfig()
+	publicUnconfirmed.Access.PublicRiskConfirmed = false
+	expectValidationError(t, publicUnconfirmed, "access.public_risk_confirmed must be true when access.access_mode is public")
+
+	originUnconfirmed := validListenConfig()
+	originUnconfirmed.Access.OriginProtection.DirectOriginRiskConfirmed = false
+	expectValidationError(t, originUnconfirmed, "access.origin_protection.direct_origin_risk_confirmed must be true when access.origin_protection.mode is none")
+
+	browserMissingAuth := validListenConfig()
+	browserMissingAuth.Access.AccessMode = AccessModeBrowser
+	browserMissingAuth.Access.PublicRiskConfirmed = false
+	expectValidationError(t, browserMissingAuth, "access.browser_auth.auth_basic_user_file or access.browser_auth.managed.htpasswd_path is required")
+
+	browserInvalidCIDR := validListenConfig()
+	browserInvalidCIDR.Access.AccessMode = AccessModeBrowser
+	browserInvalidCIDR.Access.PublicRiskConfirmed = false
+	browserInvalidCIDR.Access.BrowserAuth.AuthBasicUserFile = "/etc/example-app/browser.htpasswd"
+	browserInvalidCIDR.Access.CIDRAllowlist = []string{"not-cidr"}
+	expectValidationError(t, browserInvalidCIDR, "access.cidr_allowlist[0] must be a valid CIDR")
+
+	browser := validListenConfig()
+	browser.Access.AccessMode = AccessModeBrowser
+	browser.Access.PublicRiskConfirmed = false
+	browser.Access.BrowserAuth.AuthBasicUserFile = "/etc/example-app/browser.htpasswd"
+	browser.Access.CIDRAllowlist = []string{"203.0.113.0/24"}
+	if err := browser.Validate(); err != nil {
+		t.Fatalf("Validate() browser error = %v", err)
+	}
+
+	browserExternalManagedRoot := browser
+	browserExternalManagedRoot.Access.BrowserAuth.AuthBasicUserFile = "/etc/lanpanel/browser-auth/review.htpasswd"
+	expectValidationError(t, browserExternalManagedRoot, "access.browser_auth.auth_basic_user_file must not be under LanPanel-managed browser auth directory")
+
+	for _, tt := range []struct {
+		name string
+		path string
+	}{
+		{name: "variable", path: "/etc/example-app/$host.htpasswd"},
+		{name: "semicolon", path: "/etc/example-app/browser.htpasswd;return"},
+		{name: "open brace", path: "/etc/example-app/{browser}.htpasswd"},
+		{name: "close brace", path: "/etc/example-app/browser}.htpasswd"},
+		{name: "comment", path: "/etc/example-app/browser.htpasswd#comment"},
+	} {
+		tt := tt
+		t.Run("browser auth file rejects nginx syntax "+tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := browser
+			cfg.Access.BrowserAuth.AuthBasicUserFile = tt.path
+			expectValidationError(t, cfg, "access.browser_auth.auth_basic_user_file must not contain")
+		})
+	}
+
+	browserManaged := validListenConfig()
+	browserManaged.Access.AccessMode = AccessModeBrowser
+	browserManaged.Access.PublicRiskConfirmed = false
+	browserManaged.Access.BrowserAuth.Managed = ManagedBrowserAuthRef{
+		CredentialID:        "review",
+		HtpasswdPath:        "/etc/lanpanel/browser-auth/review.htpasswd",
+		Username:            "review.user",
+		PasswordFingerprint: "sha256:0011223344556677",
+	}
+	if err := browserManaged.Validate(); err != nil {
+		t.Fatalf("Validate() managed browser auth error = %v", err)
+	}
+
+	browserManagedLeadingHyphenUser := browserManaged
+	browserManagedLeadingHyphenUser.Access.BrowserAuth.Managed.Username = "-admin"
+	expectValidationError(t, browserManagedLeadingHyphenUser, "access.browser_auth.managed.username must contain only ASCII letters, digits, dot, underscore, and hyphen, and must not start with hyphen")
+
+	browserManagedOutsideRoot := browserManaged
+	browserManagedOutsideRoot.Access.BrowserAuth.Managed.HtpasswdPath = "/etc/example-app/browser.htpasswd"
+	expectValidationError(t, browserManagedOutsideRoot, "access.browser_auth.managed.htpasswd_path must be under /etc/lanpanel/browser-auth")
+
+	browserManagedRootDir := browserManaged
+	browserManagedRootDir.Access.BrowserAuth.Managed.HtpasswdPath = "/etc/lanpanel/browser-auth"
+	expectValidationError(t, browserManagedRootDir, "access.browser_auth.managed.htpasswd_path must be under /etc/lanpanel/browser-auth")
+
+	browserManagedWrongFile := browserManaged
+	browserManagedWrongFile.Access.BrowserAuth.Managed.HtpasswdPath = "/etc/lanpanel/browser-auth/other.htpasswd"
+	expectValidationError(t, browserManagedWrongFile, "access.browser_auth.managed.htpasswd_path must be /etc/lanpanel/browser-auth/<credential_id>.htpasswd")
+
+	browserManagedPlainFingerprint := browserManaged
+	browserManagedPlainFingerprint.Access.BrowserAuth.Managed.PasswordFingerprint = "plaintext-password"
+	expectValidationError(t, browserManagedPlainFingerprint, "access.browser_auth.managed.password_fingerprint must be sha256: followed by 16 lowercase hex characters")
+
+	publicWithBrowserAuth := validListenConfig()
+	publicWithBrowserAuth.Access.BrowserAuth.AuthBasicUserFile = "/etc/example-app/browser.htpasswd"
+	expectValidationError(t, publicWithBrowserAuth, "access.browser_auth must be empty when access.access_mode is public")
+
+	publicWithCIDR := validListenConfig()
+	publicWithCIDR.Access.CIDRAllowlist = []string{"203.0.113.0/24"}
+	expectValidationError(t, publicWithCIDR, "access.cidr_allowlist is only supported when access.access_mode is browser")
+
+	privateClient := validListenConfig()
+	privateClient.Access.AccessMode = AccessModePrivateClient
+	privateClient.Access.PublicRiskConfirmed = false
+	privateClient.Access.OriginProtection.DirectOriginRiskConfirmed = false
+	privateClient.Access.OriginProtection.Mode = OriginProtectionModeNone
+	if err := privateClient.ValidateForExposurePlan(); err != nil {
+		t.Fatalf("ValidateForExposurePlan() private_client error = %v", err)
+	}
+	expectValidationError(t, privateClient, "access.access_mode private_client is reserved for P1 and cannot be activated in P0")
+
+	privateClientWithPublicFields := privateClient
+	privateClientWithPublicFields.Access.PublicRiskConfirmed = true
+	expectValidationError(t, privateClientWithPublicFields, "access.public_risk_confirmed must be false when access.access_mode is private_client")
+}
+
+func TestLoadAndExportAllowMissingRiskConfirmations(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := LoadBytes([]byte(`
+api_version: lanpanel/app/v1alpha2
+app:
+  name: example-app
+  domains: [abc.com]
+  certificate_email: ops@example.com
+  acme_challenge: http-01
+  listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: false
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: false
+service:
+  exec_start: /opt/example-app/example-app --listen 127.0.0.1:18001
+`))
+	if err != nil {
+		t.Fatalf("LoadBytes() error = %v, want config load to allow missing manual confirmations", err)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want activation-level confirmation failure")
+	}
+	if _, err := cfg.ExportYAML(); err != nil {
+		t.Fatalf("ExportYAML() error = %v, want config export to allow missing manual confirmations", err)
+	}
 }
 
 func TestValidateRejectsUnsafeAppNames(t *testing.T) {
@@ -565,7 +752,9 @@ func TestValidateRealIPRules(t *testing.T) {
 	valid.App.ACMEChallenge = ACMEChallengeDNS01
 	valid.DNS01.Provider = "tencentcloud"
 	valid.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-	valid.Nginx.RealIPProfile = "edgeone-prod"
+	valid.Access.OriginProtection.Mode = OriginProtectionModeEdgeOne
+	valid.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	valid.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	valid.RealIP.Profiles = map[string]RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:         &enabled,
@@ -587,6 +776,10 @@ func TestValidateRealIPRules(t *testing.T) {
 	if !ok || profile.EffectiveRefreshInterval() != "72h" || !profile.IsEnabled() {
 		t.Fatalf("RealIPProfile(edgeone-prod) = %#v, %v; want enabled profile", profile, ok)
 	}
+
+	staleDirectOriginConfirmation := valid
+	staleDirectOriginConfirmation.Access.OriginProtection.DirectOriginRiskConfirmed = true
+	expectValidationError(t, staleDirectOriginConfirmation, "access.origin_protection.direct_origin_risk_confirmed must be false when access.origin_protection.mode is edgeone")
 
 	noReference := validListenConfig()
 	noReference.RealIP.Profiles = map[string]RealIPProfileConfig{
@@ -618,18 +811,21 @@ func TestValidateRealIPRules(t *testing.T) {
 	expectValidationError(t, unknownProvider, "realip.profiles.cdn.provider must be edgeone")
 
 	missingReference := validListenConfig()
-	missingReference.Nginx.RealIPProfile = "edgeone-prod"
-	expectValidationError(t, missingReference, "nginx.realip_profile references undefined realip profile edgeone-prod")
+	missingReference.Access.OriginProtection.Mode = OriginProtectionModeEdgeOne
+	missingReference.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	expectValidationError(t, missingReference, "access.origin_protection.edgeone_profile references undefined realip profile edgeone-prod")
 
 	disabledReference := validListenConfig()
-	disabledReference.Nginx.RealIPProfile = "edgeone-prod"
+	disabledReference.Access.OriginProtection.Mode = OriginProtectionModeEdgeOne
+	disabledReference.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
 	disabledReference.RealIP.Profiles = map[string]RealIPProfileConfig{
 		"edgeone-prod": {Enabled: &disabled, Provider: RealIPProviderEdgeOne},
 	}
-	expectValidationError(t, disabledReference, "nginx.realip_profile references disabled realip profile edgeone-prod")
+	expectValidationError(t, disabledReference, "access.origin_protection.edgeone_profile references disabled realip profile edgeone-prod")
 
 	http01Reference := validListenConfig()
-	http01Reference.Nginx.RealIPProfile = "edgeone-prod"
+	http01Reference.Access.OriginProtection.Mode = OriginProtectionModeEdgeOne
+	http01Reference.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
 	http01Reference.RealIP.Profiles = map[string]RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -640,7 +836,47 @@ func TestValidateRealIPRules(t *testing.T) {
 			},
 		},
 	}
-	expectValidationError(t, http01Reference, "app.acme_challenge must be dns-01 when nginx.realip_profile references an EdgeOne profile")
+	expectValidationError(t, http01Reference, "app.acme_challenge must be dns-01 when access.origin_protection.mode is edgeone")
+
+	expectLoadBytesError(t, `
+api_version: lanpanel/app/v1alpha2
+app:
+  name: example-app
+  domains: [abc.com]
+  certificate_email: ops@example.com
+  listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: none
+    direct_origin_risk_confirmed: true
+service:
+  exec_start: /opt/example-app/example-app
+nginx:
+  realip_profile: edgeone-prod
+`, "realip_profile")
+
+	goAccessSharedExternalBrowserAuth := validListenConfig()
+	goAccessSharedExternalBrowserAuth.Access.AccessMode = AccessModeBrowser
+	goAccessSharedExternalBrowserAuth.Access.PublicRiskConfirmed = false
+	goAccessSharedExternalBrowserAuth.Access.BrowserAuth.AuthBasicUserFile = "/etc/example-app/shared.htpasswd"
+	goAccessSharedExternalBrowserAuth.Nginx.GoAccess.Enabled = true
+	goAccessSharedExternalBrowserAuth.Nginx.GoAccess.AuthBasicUserFile = "/etc/example-app/shared.htpasswd"
+	expectValidationError(t, goAccessSharedExternalBrowserAuth, "nginx.goaccess.auth_basic_user_file must not equal access.browser_auth")
+
+	goAccessSharedManagedBrowserAuth := validListenConfig()
+	goAccessSharedManagedBrowserAuth.Access.AccessMode = AccessModeBrowser
+	goAccessSharedManagedBrowserAuth.Access.PublicRiskConfirmed = false
+	goAccessSharedManagedBrowserAuth.Access.BrowserAuth.Managed = ManagedBrowserAuthRef{
+		CredentialID:        "review",
+		HtpasswdPath:        "/etc/lanpanel/browser-auth/review.htpasswd",
+		Username:            "review.user",
+		PasswordFingerprint: "sha256:0011223344556677",
+	}
+	goAccessSharedManagedBrowserAuth.Nginx.GoAccess.Enabled = true
+	goAccessSharedManagedBrowserAuth.Nginx.GoAccess.AuthBasicUserFile = "/etc/lanpanel/browser-auth/review.htpasswd"
+	expectValidationError(t, goAccessSharedManagedBrowserAuth, "nginx.goaccess.auth_basic_user_file must not equal access.browser_auth")
 
 	missingEdgeOneFields := valid
 	missingEdgeOneFields.RealIP.Profiles = map[string]RealIPProfileConfig{
@@ -680,17 +916,22 @@ func TestLoadBytesRejectsUnknownRealIPFields(t *testing.T) {
 	t.Parallel()
 
 	_, err := LoadBytes([]byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: example-app
   domains: [abc.com]
   certificate_email: ops@example.com
   acme_challenge: dns-01
   listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: edgeone
+    direct_origin_risk_confirmed: false
+    edgeone_profile: edgeone-prod
 service:
   exec_start: /opt/example-app/example-app
-nginx:
-  realip_profile: edgeone-prod
 realip:
   profiles:
     edgeone-prod:
@@ -704,8 +945,8 @@ dns01:
   provider: tencentcloud
   env_file: /etc/lanpanel/dns/tencentcloud.env
 `))
-	if err == nil {
-		t.Fatal("LoadBytes() unknown realip profile field error = nil, want non-nil")
+	if err == nil || !strings.Contains(err.Error(), "header_override") {
+		t.Fatalf("LoadBytes() unknown realip profile field error = %v, want header_override field failure", err)
 	}
 }
 
@@ -1460,6 +1701,95 @@ func TestWriteFileUsesStrictPermissions(t *testing.T) {
 	}
 }
 
+func TestWriteFileRejectsSymlinkPath(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name  string
+		write func(string) error
+	}{
+		{name: "app config", write: validListenConfig().WriteFile},
+		{name: "example", write: WriteExampleFile},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			target := filepath.Join(dir, "target.yaml")
+			link := filepath.Join(dir, "lanpanel-app.yaml")
+			if err := os.WriteFile(target, []byte("sentinel"), 0o600); err != nil {
+				t.Fatalf("WriteFile(target) error = %v", err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatalf("Symlink() error = %v", err)
+			}
+
+			err := tt.write(link)
+			if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+				t.Fatalf("write() error = %v, want symlink refusal", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("ReadFile(target) error = %v", err)
+			}
+			if string(got) != "sentinel" {
+				t.Fatalf("target content = %q, want sentinel", got)
+			}
+			info, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("Lstat(link) error = %v", err)
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("link mode = %v, want symlink retained", info.Mode())
+			}
+		})
+	}
+}
+
+func TestWriteFileRejectsSymlinkParentComponent(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	realParent := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(realParent, "child"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(real parent) error = %v", err)
+	}
+	linkParent := filepath.Join(dir, "link")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatalf("Symlink(parent) error = %v", err)
+	}
+	path := filepath.Join(linkParent, "child", "lanpanel-app.yaml")
+
+	err := validListenConfig().WriteFile(path)
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("WriteFile() error = %v, want symlink parent refusal", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("Lstat(path) error = %v, want no file created through symlink parent", err)
+	}
+}
+
+func TestWriteFileRejectsOtherWritableParent(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "unsafe")
+	if err := os.Mkdir(dir, 0o777); err != nil {
+		t.Fatalf("Mkdir(unsafe) error = %v", err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("Chmod(unsafe) error = %v", err)
+	}
+	path := filepath.Join(dir, "lanpanel-app.yaml")
+
+	err := validListenConfig().WriteFile(path)
+	if err == nil || !strings.Contains(err.Error(), "untrusted local users") {
+		t.Fatalf("WriteFile() error = %v, want unsafe parent refusal", err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("Lstat(path) error = %v, want no file created in unsafe parent", err)
+	}
+}
+
 func expectValidationError(t *testing.T, cfg Config, want string) {
 	t.Helper()
 
@@ -1469,5 +1799,17 @@ func expectValidationError(t *testing.T, cfg Config, want string) {
 	}
 	if !strings.Contains(err.Error(), want) {
 		t.Fatalf("Validate() error = %q, want substring %q", err.Error(), want)
+	}
+}
+
+func expectLoadBytesError(t *testing.T, data string, want string) {
+	t.Helper()
+
+	_, err := LoadBytes([]byte(data))
+	if err == nil {
+		t.Fatalf("LoadBytes() error = nil, want substring %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("LoadBytes() error = %q, want substring %q", err.Error(), want)
 	}
 }

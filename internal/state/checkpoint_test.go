@@ -5,6 +5,7 @@ import (
 	"lanpanel/internal/workflow"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -74,6 +75,9 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	if loaded.CurrentCheckpoint != "staged-files-written" {
 		t.Fatalf("CurrentCheckpoint = %q, want %q", loaded.CurrentCheckpoint, "staged-files-written")
 	}
+	if loaded.SchemaVersion != CheckpointSchemaVersion {
+		t.Fatalf("SchemaVersion = %q, want %q", loaded.SchemaVersion, CheckpointSchemaVersion)
+	}
 	if loaded.DesiredStateDigest != "desired-state-a" {
 		t.Fatalf("DesiredStateDigest = %q, want %q", loaded.DesiredStateDigest, "desired-state-a")
 	}
@@ -103,6 +107,63 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreLoadRejectsMissingOrUnsupportedSchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{"desired_state_digest":"desired-state-a"}`},
+		{name: "unsupported", body: `{"schema_version":"lanpanel.checkpoint.v0","desired_state_digest":"desired-state-a"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "checkpoint.json")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			if _, err := NewStore(path).Load(); err == nil {
+				t.Fatal("Load() error = nil, want schema_version failure")
+			}
+		})
+	}
+}
+
+func TestStoreLoadRejectsUnknownFieldsAndMultipleJSONValues(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "unknown field", body: `{"schema_version":"lanpanel.checkpoint.v1","desired_state_digest":"desired-state-a","unexpected":true}`, want: "unknown field"},
+		{name: "multiple values", body: `{"schema_version":"lanpanel.checkpoint.v1"} {"schema_version":"lanpanel.checkpoint.v1"}`, want: "multiple JSON values"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "checkpoint.json")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			_, err := NewStore(path).Load()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Load() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestStoreSaveRejectsUnsupportedSchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "checkpoint.json")
+	if err := NewStore(path).Save(Checkpoint{SchemaVersion: "lanpanel.checkpoint.v0"}); err == nil {
+		t.Fatal("Save() error = nil, want schema_version failure")
+	}
+}
+
 func TestStoreSaveDoesNotCollideWithStaleFixedTempFile(t *testing.T) {
 	t.Parallel()
 
@@ -127,6 +188,93 @@ func TestStoreSaveDoesNotCollideWithStaleFixedTempFile(t *testing.T) {
 	}
 	if !loaded.HasCompleted("packages-installed") {
 		t.Fatalf("loaded checkpoint = %#v, want completed packages-installed", loaded)
+	}
+}
+
+func TestStoreCreatesPrivateCheckpointDirectory(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state", "checkpoint.json")
+	if err := NewStore(path).Save(Checkpoint{DesiredStateDigest: "desired-state-a"}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	info, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("Lstat(checkpoint dir) error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("checkpoint dir mode = %o, want 0700", got)
+	}
+}
+
+func TestStoreRejectsUnsafeCheckpointPathComponents(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("Mkdir(target) error = %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	if err := NewStore(filepath.Join(link, "checkpoint.json")).Save(Checkpoint{}); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Save(symlink parent) error = %v, want symlink refusal", err)
+	}
+	if _, err := NewStore(filepath.Join(link, "checkpoint.json")).Load(); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Load(symlink parent) error = %v, want symlink refusal", err)
+	}
+
+	writable := filepath.Join(base, "writable")
+	if err := os.Mkdir(writable, 0o700); err != nil {
+		t.Fatalf("Mkdir(writable) error = %v", err)
+	}
+	if err := os.Chmod(writable, 0o777); err != nil {
+		t.Fatalf("Chmod(writable) error = %v", err)
+	}
+	if err := NewStore(filepath.Join(writable, "checkpoint.json")).Save(Checkpoint{}); err == nil || !strings.Contains(err.Error(), "must not be writable by untrusted local users") {
+		t.Fatalf("Save(writable dir) error = %v, want writable directory refusal", err)
+	}
+	if _, err := NewStore(filepath.Join(writable, "checkpoint.json")).Load(); err == nil || !strings.Contains(err.Error(), "must not be writable by untrusted local users") {
+		t.Fatalf("Load(writable dir) error = %v, want writable directory refusal", err)
+	}
+}
+
+func TestStoreRejectsUnsafeCheckpointFile(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("Mkdir(state) error = %v", err)
+	}
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{"schema_version":"lanpanel.checkpoint.v1"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(target) error = %v", err)
+	}
+	link := filepath.Join(dir, "checkpoint-link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	if _, err := NewStore(link).Load(); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Load(symlink file) error = %v, want symlink file refusal", err)
+	}
+	if err := NewStore(link).Save(Checkpoint{}); err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("Save(symlink file) error = %v, want symlink file refusal", err)
+	}
+
+	writable := filepath.Join(dir, "checkpoint-writable.json")
+	if err := os.WriteFile(writable, []byte(`{"schema_version":"lanpanel.checkpoint.v1"}`), 0o622); err != nil {
+		t.Fatalf("WriteFile(writable) error = %v", err)
+	}
+	if err := os.Chmod(writable, 0o622); err != nil {
+		t.Fatalf("Chmod(writable) error = %v", err)
+	}
+	if _, err := NewStore(writable).Load(); err == nil || !strings.Contains(err.Error(), "must not be writable by group or others") {
+		t.Fatalf("Load(writable file) error = %v, want writable file refusal", err)
+	}
+	if err := NewStore(writable).Save(Checkpoint{}); err == nil || !strings.Contains(err.Error(), "must not be writable by group or others") {
+		t.Fatalf("Save(writable file) error = %v, want writable file refusal", err)
 	}
 }
 

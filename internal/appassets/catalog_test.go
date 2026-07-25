@@ -14,6 +14,10 @@ func testListenConfig() appconfig.Config {
 	cfg.App.Domains = []string{"abc.com", "www.abc.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/example-app/example-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/example-app"
 	return cfg

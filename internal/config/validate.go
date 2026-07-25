@@ -91,14 +91,10 @@ func (c Config) Validate() error {
 
 	validateHeadscaleSource(&errs, c.Advanced.HeadscaleSource)
 	validateHeadscale(&errs, c.Advanced.Headscale)
-	validateLegoSource(&errs, c.Advanced.LegoSource)
-	validatePackageProbe(&errs, c.Advanced.PackageProbe)
-	validateProxyURL(&errs, "advanced.proxy.http_proxy", c.Advanced.Proxy.HTTPProxy)
-	validateProxyURL(&errs, "advanced.proxy.https_proxy", c.Advanced.Proxy.HTTPSProxy)
+	validateDependencyConfig(&errs, "advanced", c.Advanced.DependencyConfig())
 	validateDNS01(&errs, acmeChallenge, c.Advanced.DNS01)
 	validateIPOverride(&errs, "advanced.network.public_ipv4", c.Advanced.Network.PublicIPv4, false)
 	validateIPOverride(&errs, "advanced.network.public_ipv6", c.Advanced.Network.PublicIPv6, true)
-	validatePlatform(&errs, c.Advanced.Platform)
 
 	if len(errs) == 0 {
 		return nil
@@ -146,6 +142,9 @@ func validateHeadscaleSource(errs *validationErrors, source HeadscaleSourceConfi
 		if filePath != "" {
 			*errs = append(*errs, "advanced.headscale_source.file_path is only allowed when advanced.headscale_source.mode is offline")
 		}
+		if sha256 != "" {
+			*errs = append(*errs, "advanced.headscale_source.sha256 is only allowed when advanced.headscale_source.mode is mirror or offline")
+		}
 	case PackageSourceModeMirror:
 		if urlValue == "" {
 			*errs = append(*errs, "advanced.headscale_source.url is required when advanced.headscale_source.mode is mirror")
@@ -179,34 +178,54 @@ func validateHeadscaleSource(errs *validationErrors, source HeadscaleSourceConfi
 	}
 }
 
-func validateLegoSource(errs *validationErrors, source LegoSourceConfig) {
+func ValidateDependencyConfig(fieldPrefix string, dependencies DependencyConfig) error {
+	var errs validationErrors
+	validateDependencyConfig(&errs, strings.TrimSpace(fieldPrefix), dependencies)
+	if len(errs) == 0 {
+		return nil
+	}
+	return errs
+}
+
+func validateDependencyConfig(errs *validationErrors, fieldPrefix string, dependencies DependencyConfig) {
+	if fieldPrefix == "" {
+		fieldPrefix = "dependencies"
+	}
+	validateLegoSource(errs, fieldPrefix+".lego_source", dependencies.LegoSource)
+	validatePackageProbe(errs, fieldPrefix+".package_probe", dependencies.PackageProbe)
+	validateProxyURL(errs, fieldPrefix+".proxy.http_proxy", dependencies.Proxy.HTTPProxy)
+	validateProxyURL(errs, fieldPrefix+".proxy.https_proxy", dependencies.Proxy.HTTPSProxy)
+	validatePlatform(errs, fieldPrefix+".platform", dependencies.Platform)
+}
+
+func validateLegoSource(errs *validationErrors, field string, source LegoSourceConfig) {
 	mode := strings.TrimSpace(source.Mode)
 	filePath := strings.TrimSpace(source.FilePath)
 
 	if mode == "" {
-		*errs = append(*errs, "advanced.lego_source.mode is required")
+		*errs = append(*errs, field+".mode is required")
 		return
 	}
 
 	switch mode {
 	case PackageSourceModeDirect:
 		if filePath != "" {
-			*errs = append(*errs, "advanced.lego_source.file_path is only allowed when advanced.lego_source.mode is offline")
+			*errs = append(*errs, field+".file_path is only allowed when "+field+".mode is offline")
 		}
 	case PackageSourceModeOffline:
 		if filePath == "" {
-			*errs = append(*errs, "advanced.lego_source.file_path is required when advanced.lego_source.mode is offline")
+			*errs = append(*errs, field+".file_path is required when "+field+".mode is offline")
 		} else if filepath.Clean(filePath) == "." {
-			*errs = append(*errs, "advanced.lego_source.file_path must be a valid file path")
+			*errs = append(*errs, field+".file_path must be a valid file path")
 		}
 	default:
-		*errs = append(*errs, "advanced.lego_source.mode must be one of: direct, offline")
+		*errs = append(*errs, field+".mode must be one of: direct, offline")
 	}
 }
 
-func validatePackageProbe(errs *validationErrors, probe PackageProbeConfig) {
-	validatePositiveDuration(errs, "advanced.package_probe.reachability_timeout", probe.ReachabilityTimeout)
-	validatePositiveDuration(errs, "advanced.package_probe.artifact_timeout", probe.ArtifactTimeout)
+func validatePackageProbe(errs *validationErrors, field string, probe PackageProbeConfig) {
+	validatePositiveDuration(errs, field+".reachability_timeout", probe.ReachabilityTimeout)
+	validatePositiveDuration(errs, field+".artifact_timeout", probe.ArtifactTimeout)
 }
 
 func validatePositiveDuration(errs *validationErrors, field string, raw string) {
@@ -334,10 +353,10 @@ func validateIPOverride(errs *validationErrors, field string, raw string, wantIP
 	}
 }
 
-func validatePlatform(errs *validationErrors, platform PlatformConfig) {
+func validatePlatform(errs *validationErrors, field string, platform PlatformConfig) {
 	arch := strings.TrimSpace(platform.Arch)
 	if arch == "" {
-		*errs = append(*errs, "advanced.platform.arch is required")
+		*errs = append(*errs, field+".arch is required")
 		return
 	}
 
@@ -345,7 +364,7 @@ func validatePlatform(errs *validationErrors, platform PlatformConfig) {
 	case ArchAMD64, ArchARM64:
 		return
 	default:
-		*errs = append(*errs, "advanced.platform.arch must be one of: amd64, arm64")
+		*errs = append(*errs, field+".arch must be one of: amd64, arm64")
 	}
 }
 

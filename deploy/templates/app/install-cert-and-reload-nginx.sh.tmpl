@@ -24,4 +24,4 @@ install -m 0644 "$LEGO_HOOK_CERT_PATH" "$target_dir/fullchain.pem"
 install -m 0600 "$LEGO_HOOK_CERT_KEY_PATH" "$target_dir/privkey.pem"
 
 nginx -t
-systemctl reload-or-restart nginx.service
+systemctl reload nginx.service

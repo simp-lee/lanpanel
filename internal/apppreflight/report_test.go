@@ -2,6 +2,7 @@ package apppreflight
 
 import (
 	"lanpanel/internal/appconfig"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/preflight"
 	"slices"
 	"strings"
@@ -16,6 +17,10 @@ func TestBuildReportChecksAuthKeyFileReadiness(t *testing.T) {
 	cfg.App.Domains = []string{"tailapp.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Upstream = "100.64.10.20:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Tailscale.AuthKeyFile = "/run/lanpanel/auth.key"
 	report := BuildReport(cfg, Inputs{
 		Permissions:                 preflight.PermissionState{IsRoot: true},
@@ -226,7 +231,9 @@ func TestBuildReportTreatsEdgeOneRealIPDNSAsCDNDNS(t *testing.T) {
 	enabled := true
 	cfg := validAppConfig()
 	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -263,12 +270,13 @@ func TestBuildReportTreatsEdgeOneRealIPDNSAsCDNDNS(t *testing.T) {
 			t.Parallel()
 
 			report := BuildReport(cfg, Inputs{
-				Permissions:           preflight.PermissionState{IsRoot: true},
-				DNS:                   map[string]preflight.DNSProbe{"app.example.com": tt.dns},
-				Ports:                 availableAppPorts(),
-				ServiceBinaryOK:       true,
-				DNSCredentialsChecked: true,
-				DNSCredentialsReady:   true,
+				Permissions:                     preflight.PermissionState{IsRoot: true},
+				DNS:                             map[string]preflight.DNSProbe{"app.example.com": tt.dns},
+				Ports:                           availableAppPorts(),
+				ServiceBinaryOK:                 true,
+				DNSCredentialsChecked:           true,
+				DNSCredentialsReady:             true,
+				OriginProtectionManualConfirmed: true,
 			})
 			if report.FailedCount() != 0 {
 				t.Fatalf("FailedCount() = %d, want EdgeOne DNS warning only", report.FailedCount())
@@ -283,6 +291,77 @@ func TestBuildReportTreatsEdgeOneRealIPDNSAsCDNDNS(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildReportBlocksEdgeOneRealIPWithoutOriginProtectionConfirmation(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	cfg := validAppConfig()
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
+	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
+		"edgeone-prod": {
+			Enabled:  &enabled,
+			Provider: appconfig.RealIPProviderEdgeOne,
+			EdgeOne: appconfig.RealIPEdgeOneConfig{
+				ZoneID:  "zone-2abcDEF123",
+				EnvFile: "/etc/lanpanel/realip/edgeone-prod.env",
+			},
+		},
+	}
+	baseInputs := Inputs{
+		Permissions:     preflight.PermissionState{IsRoot: true},
+		DNS:             validDNS(cfg),
+		Ports:           availableAppPorts(),
+		ServiceBinaryOK: true,
+	}
+
+	report := BuildReport(cfg, baseInputs)
+	if report.FailedCount() == 0 {
+		t.Fatal("FailedCount() = 0, want EdgeOne origin ingress confirmation failure")
+	}
+	if got := checkStatus(report, "realip-firewall"); got != StatusUnknown {
+		t.Fatalf("realip-firewall status = %q, want %q", got, StatusUnknown)
+	}
+	if got := checkSummary(report, "realip-firewall"); !strings.Contains(got, "cannot automatically verify") {
+		t.Fatalf("realip-firewall summary = %q, want manual verification failure", got)
+	}
+
+	baseInputs.OriginProtectionManualConfirmed = true
+	report = BuildReport(cfg, baseInputs)
+	if report.FailedCount() != 0 {
+		t.Fatalf("FailedCount() = %d, want confirmed EdgeOne origin ingress non-blocking manual status", report.FailedCount())
+	}
+	if got := checkStatus(report, "realip-firewall"); got != StatusManual {
+		t.Fatalf("realip-firewall status = %q, want %q", got, StatusManual)
+	}
+	if got := checkSummary(report, "realip-firewall"); !strings.Contains(got, "manual confirmation was recorded") {
+		t.Fatalf("realip-firewall summary = %q, want recorded confirmation", got)
+	}
+
+	baseInputs.OriginProtectionManualConfirmed = false
+	baseInputs.OriginProtectionStatus = domain.OriginProtectionConfiguredPass
+	report = BuildReport(cfg, baseInputs)
+	if report.FailedCount() != 0 {
+		t.Fatalf("FailedCount() = %d, want configured_pass EdgeOne origin protection pass", report.FailedCount())
+	}
+	if got := checkSummary(report, "realip-firewall"); !strings.Contains(got, "origin protection checks passed") {
+		t.Fatalf("realip-firewall summary = %q, want configured_pass summary", got)
+	}
+
+	baseInputs.OriginProtectionStatus = domain.OriginProtectionConfiguredFail
+	report = BuildReport(cfg, baseInputs)
+	if report.FailedCount() == 0 {
+		t.Fatal("FailedCount() = 0, want configured_fail EdgeOne origin protection failure")
+	}
+	if got := checkStatus(report, "realip-firewall"); got != StatusFail {
+		t.Fatalf("realip-firewall status = %q, want %q", got, StatusFail)
+	}
+	if got := checkSummary(report, "realip-firewall"); !strings.Contains(got, "checks failed") {
+		t.Fatalf("realip-firewall summary = %q, want configured_fail summary", got)
 	}
 }
 
@@ -381,6 +460,19 @@ func TestBuildReportChecksDNS01Credentials(t *testing.T) {
 	})
 	if report.FailedCount() == 0 {
 		t.Fatal("FailedCount() = 0, want DNS credentials failure")
+	}
+
+	report = BuildReport(cfg, Inputs{
+		Permissions:     preflight.PermissionState{IsRoot: true},
+		DNS:             validDNS(cfg),
+		Ports:           availableAppPorts(),
+		ServiceBinaryOK: true,
+	})
+	if report.FailedCount() == 0 {
+		t.Fatal("FailedCount() = 0, want unchecked DNS credentials to block activation")
+	}
+	if got := checkStatus(report, "dns01-credentials"); got != StatusUnknown {
+		t.Fatalf("dns01-credentials status = %q, want %q", got, StatusUnknown)
 	}
 
 	report = BuildReport(cfg, Inputs{
@@ -511,12 +603,86 @@ func TestBuildReportChecksGoAccessReadiness(t *testing.T) {
 	}
 }
 
+func TestBuildReportChecksBrowserAuthReadiness(t *testing.T) {
+	t.Parallel()
+
+	cfg := validAppConfig()
+	cfg.Access.AccessMode = appconfig.AccessModeBrowser
+	cfg.Access.PublicRiskConfirmed = false
+	cfg.Access.BrowserAuth.AuthBasicUserFile = "/etc/app/browser.htpasswd"
+
+	baseInputs := Inputs{
+		Permissions:     preflight.PermissionState{IsRoot: true},
+		DNS:             validDNS(cfg),
+		Ports:           availableAppPorts(),
+		ServiceBinaryOK: true,
+	}
+
+	report := BuildReport(cfg, baseInputs)
+	if report.FailedCount() == 0 {
+		t.Fatal("FailedCount() = 0, want unchecked browser auth failure")
+	}
+	if got := checkStatus(report, "browser-auth-file"); got != StatusUnknown {
+		t.Fatalf("browser-auth-file status = %q, want %q", got, StatusUnknown)
+	}
+	if got := checkSummary(report, "browser-auth-file"); !strings.Contains(got, "not validated automatically") {
+		t.Fatalf("browser-auth-file summary = %q, want unchecked failure", got)
+	}
+
+	inputs := baseInputs
+	inputs.BrowserAuthFileChecked = true
+	inputs.BrowserAuthFileReady = false
+	inputs.BrowserAuthFileDetail = "parent directory is group-writable"
+	report = BuildReport(cfg, inputs)
+	if report.FailedCount() == 0 {
+		t.Fatal("FailedCount() = 0, want browser auth readiness failure")
+	}
+	if got := checkSummary(report, "browser-auth-file"); !strings.Contains(got, "group-writable") {
+		t.Fatalf("browser-auth-file summary = %q, want readiness detail", got)
+	}
+
+	inputs.BrowserAuthFileReady = true
+	inputs.BrowserAuthFileDetail = "access.browser_auth htpasswd file passed validation"
+	report = BuildReport(cfg, inputs)
+	if report.FailedCount() != 0 {
+		t.Fatalf("FailedCount() = %d, want browser auth readiness pass", report.FailedCount())
+	}
+	if got := checkSummary(report, "browser-auth-file"); !strings.Contains(got, "passed validation") {
+		t.Fatalf("browser-auth-file summary = %q, want pass detail", got)
+	}
+}
+
+func TestBuildReportMarksDisabledChecksNotApplicable(t *testing.T) {
+	t.Parallel()
+
+	cfg := validAppConfig()
+	report := BuildReport(cfg, Inputs{
+		Permissions:     preflight.PermissionState{IsRoot: true},
+		DNS:             validDNS(cfg),
+		Ports:           availableAppPorts(),
+		ServiceBinaryOK: true,
+	})
+
+	for _, id := range []string{"dns01-credentials", "realip-firewall", "browser-auth-file", "tailscale"} {
+		if got := checkStatus(report, id); got != StatusNotApplicable {
+			t.Fatalf("%s status = %q, want %q", id, got, StatusNotApplicable)
+		}
+	}
+	if report.FailedCount() != 0 {
+		t.Fatalf("FailedCount() = %d, want not_applicable checks non-blocking", report.FailedCount())
+	}
+}
+
 func validAppConfig() appconfig.Config {
 	cfg := appconfig.New()
 	cfg.App.Name = "app"
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/app/app --listen 127.0.0.1:18001"
 	return cfg
 }
@@ -538,6 +704,15 @@ func checkSummary(report Report, id string) string {
 	for _, check := range report.Checks {
 		if check.ID == id {
 			return check.Summary
+		}
+	}
+	return ""
+}
+
+func checkStatus(report Report, id string) Status {
+	for _, check := range report.Checks {
+		if check.ID == id {
+			return check.Status
 		}
 	}
 	return ""

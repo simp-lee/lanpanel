@@ -29,19 +29,19 @@ func TestNewArchivePlanDirectPinsOfficialReleaseArtifact(t *testing.T) {
 	if plan.Arch != config.ArchAMD64 {
 		t.Fatalf("Arch = %q, want %q", plan.Arch, config.ArchAMD64)
 	}
-	if plan.AssetName != "lego_v5.1.0_linux_amd64.tar.gz" {
+	if plan.AssetName != "lego_v5.2.2_linux_amd64.tar.gz" {
 		t.Fatalf("AssetName = %q", plan.AssetName)
 	}
-	if plan.SourceURL != "https://github.com/go-acme/lego/releases/download/v5.1.0/lego_v5.1.0_linux_amd64.tar.gz" {
+	if plan.SourceURL != "https://github.com/go-acme/lego/releases/download/v5.2.2/lego_v5.2.2_linux_amd64.tar.gz" {
 		t.Fatalf("SourceURL = %q", plan.SourceURL)
 	}
-	if plan.ChecksumsURL != "https://github.com/go-acme/lego/releases/download/v5.1.0/lego_5.1.0_checksums.txt" {
+	if plan.ChecksumsURL != "https://github.com/go-acme/lego/releases/download/v5.2.2/lego_5.2.2_checksums.txt" {
 		t.Fatalf("ChecksumsURL = %q", plan.ChecksumsURL)
 	}
 	if plan.ExpectedSHA256 != sha256LinuxAMD64 {
 		t.Fatalf("ExpectedSHA256 = %q", plan.ExpectedSHA256)
 	}
-	if plan.InstallPath() != "/var/cache/lanpanel/lego_v5.1.0_linux_amd64.tar.gz" {
+	if plan.InstallPath() != "/var/cache/lanpanel/lego_v5.2.2_linux_amd64.tar.gz" {
 		t.Fatalf("InstallPath() = %q", plan.InstallPath())
 	}
 	if plan.BinaryPath != BinaryPath {
@@ -59,7 +59,7 @@ func TestNewArchivePlanPinsARM64SHA256(t *testing.T) {
 		t.Fatalf("NewArchivePlan() error = %v", err)
 	}
 
-	if plan.AssetName != "lego_v5.1.0_linux_arm64.tar.gz" {
+	if plan.AssetName != "lego_v5.2.2_linux_arm64.tar.gz" {
 		t.Fatalf("AssetName = %q", plan.AssetName)
 	}
 	if plan.ExpectedSHA256 != sha256LinuxARM64 {
@@ -95,13 +95,13 @@ func TestNewInstallPlanBuildsVerifiedInstallCommands(t *testing.T) {
 	if plan.Commands[1].Name != "curl" || !strings.Contains(strings.Join(plan.Commands[1].Args, " "), plan.Archive.SourceURL) {
 		t.Fatalf("Commands[1] = %#v, want curl download", plan.Commands[1])
 	}
-	if plan.Commands[2].Name != "sha256sum" || !strings.Contains(string(plan.Commands[2].Stdin), sha256LinuxAMD64+"  /tmp/lanpanel-cache/lego_v5.1.0_linux_amd64.tar.gz") {
+	if plan.Commands[2].Name != "sha256sum" || !strings.Contains(string(plan.Commands[2].Stdin), sha256LinuxAMD64+"  /tmp/lanpanel-cache/lego_v5.2.2_linux_amd64.tar.gz") {
 		t.Fatalf("Commands[2] = %#v, want sha256 check before install", plan.Commands[2])
 	}
 	if got := plan.Commands[3].String(); got != "mkdir -p -m 0755 -- /opt/lanpanel/bin" {
 		t.Fatalf("Commands[3] = %q", got)
 	}
-	if got := plan.Commands[4].String(); got != "tar -xzf /tmp/lanpanel-cache/lego_v5.1.0_linux_amd64.tar.gz -C /opt/lanpanel/bin lego" {
+	if got := plan.Commands[4].String(); got != "tar -xzf /tmp/lanpanel-cache/lego_v5.2.2_linux_amd64.tar.gz -C /opt/lanpanel/bin lego" {
 		t.Fatalf("Commands[4] = %q", got)
 	}
 	if got := plan.Commands[5].String(); got != "chmod 0755 /opt/lanpanel/bin/lego" {
@@ -117,7 +117,7 @@ func TestNewInstallPlanSupportsOfflineArchiveWithPinnedDigest(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.Advanced.LegoSource.Mode = config.PackageSourceModeOffline
-	cfg.Advanced.LegoSource.FilePath = "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz"
+	cfg.Advanced.LegoSource.FilePath = "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz"
 
 	plan, err := NewInstallPlan(cfg, InstallPlanOptions{})
 	if err != nil {
@@ -129,7 +129,7 @@ func TestNewInstallPlanSupportsOfflineArchiveWithPinnedDigest(t *testing.T) {
 	if plan.Archive.SourceURL != "" {
 		t.Fatalf("SourceURL = %q, want empty for offline", plan.Archive.SourceURL)
 	}
-	if plan.Archive.InstallPath() != "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz" {
+	if plan.Archive.InstallPath() != "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz" {
 		t.Fatalf("InstallPath() = %q", plan.Archive.InstallPath())
 	}
 	if plan.Commands[0].Name != "sha256sum" || !strings.Contains(string(plan.Commands[0].Stdin), plan.Archive.InstallPath()) {
@@ -140,14 +140,14 @@ func TestNewInstallPlanSupportsOfflineArchiveWithPinnedDigest(t *testing.T) {
 func TestNewInstallPlanOptionsOfflineSourceOverridesConfig(t *testing.T) {
 	t.Parallel()
 
-	plan, err := NewInstallPlan(validConfig(), InstallPlanOptions{OfflineSourcePath: "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz"})
+	plan, err := NewInstallPlan(validConfig(), InstallPlanOptions{OfflineSourcePath: "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz"})
 	if err != nil {
 		t.Fatalf("NewInstallPlan() error = %v", err)
 	}
 	if plan.Archive.Mode != config.PackageSourceModeOffline {
 		t.Fatalf("Mode = %q, want offline", plan.Archive.Mode)
 	}
-	if plan.Archive.InstallPath() != "/srv/packages/lego_v5.1.0_linux_amd64.tar.gz" {
+	if plan.Archive.InstallPath() != "/srv/packages/lego_v5.2.2_linux_amd64.tar.gz" {
 		t.Fatalf("InstallPath() = %q", plan.Archive.InstallPath())
 	}
 }

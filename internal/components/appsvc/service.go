@@ -119,14 +119,18 @@ fi`
 }
 
 func GuardRootDirectoriesCommand(names Names) host.Command {
-	return guardRootDirectoriesCommand(names, "")
+	return guardRootDirectoriesCommand(names, "", "")
 }
 
 func GuardRootDirectoriesWithGoAccessAuthBootstrapCommand(names Names, authFile string) host.Command {
-	return guardRootDirectoriesCommand(names, strings.TrimSpace(authFile))
+	return guardRootDirectoriesCommand(names, "", strings.TrimSpace(authFile))
 }
 
-func guardRootDirectoriesCommand(names Names, bootstrapFile string) host.Command {
+func GuardRootDirectoriesWithAuthBootstrapsCommand(names Names, browserAuthFile string, goAccessAuthFile string) host.Command {
+	return guardRootDirectoriesCommand(names, strings.TrimSpace(browserAuthFile), strings.TrimSpace(goAccessAuthFile))
+}
+
+func guardRootDirectoriesCommand(names Names, browserAuthFile string, goAccessAuthFile string) host.Command {
 	script := `set -eu
 app_name=$1
 var_lib_dir=$2
@@ -135,9 +139,11 @@ etc_dir=$4
 etc_marker=$5
 hook_dir=$6
 hook_marker=$7
-bootstrap_file=$8
+browser_auth_file=$8
+goaccess_auth_file=$9
 expected_marker="Lanpanel-managed: app.name=$app_name"
-suggested_auth_file="$etc_dir/goaccess.htpasswd"
+suggested_browser_auth_file="$etc_dir/browser.htpasswd"
+suggested_goaccess_auth_file="$etc_dir/goaccess.htpasswd"
 
 fail() {
     echo "$1" >&2
@@ -176,25 +182,43 @@ write_marker() {
 validate_bootstrap_file() {
     dir=$1
     file=$2
-    name=$(basename "$file")
+    expected=$3
+    label=$4
 
-    if [ "$file" != "$suggested_auth_file" ]; then
-        fail "GoAccess auth bootstrap file $file must be $suggested_auth_file"
+    if [ "$file" != "$expected" ]; then
+        fail "$label $file must be $expected"
     fi
     if [ "$(dirname "$file")" != "$dir" ]; then
-        fail "GoAccess auth bootstrap file $file is not directly under $dir"
+        fail "$label $file is not directly under $dir"
     fi
     if [ -L "$file" ]; then
-        fail "GoAccess auth bootstrap file $file must not be a symlink"
+        fail "$label $file must not be a symlink"
     fi
     if [ ! -f "$file" ]; then
-        fail "GoAccess auth bootstrap file $file must be a regular file"
+        fail "$label $file must be a regular file"
     fi
-    require_root_owned "$file" "GoAccess auth bootstrap file"
-    refuse_writable "$file" "GoAccess auth bootstrap file"
-    extra=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name "$name" ! -name ".lanpanel-managed" -print -quit) || fail "failed to inspect GoAccess auth bootstrap directory $dir"
+    require_root_owned "$file" "$label"
+    refuse_writable "$file" "$label"
+}
+
+validate_bootstrap_files() {
+    dir=$1
+    browser_name=""
+    goaccess_name=""
+    if [ -n "$browser_auth_file" ] && [ "$(dirname "$browser_auth_file")" = "$dir" ]; then
+        validate_bootstrap_file "$dir" "$browser_auth_file" "$suggested_browser_auth_file" "browser auth bootstrap file"
+        browser_name=$(basename "$browser_auth_file")
+    fi
+    if [ -n "$goaccess_auth_file" ] && [ "$(dirname "$goaccess_auth_file")" = "$dir" ]; then
+        validate_bootstrap_file "$dir" "$goaccess_auth_file" "$suggested_goaccess_auth_file" "GoAccess auth bootstrap file"
+        goaccess_name=$(basename "$goaccess_auth_file")
+    fi
+    if [ -z "$browser_name" ] && [ -z "$goaccess_name" ]; then
+        fail "$dir exists without $expected_marker and no expected auth bootstrap file is directly under it"
+    fi
+    extra=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name "$browser_name" ! -name "$goaccess_name" ! -name ".lanpanel-managed" -print -quit) || fail "failed to inspect auth bootstrap directory $dir"
     if [ -n "$extra" ]; then
-        fail "$dir exists without $expected_marker and contains files other than the expected GoAccess auth bootstrap file"
+        fail "$dir exists without $expected_marker and contains files other than expected auth bootstrap files"
     fi
 }
 
@@ -217,8 +241,8 @@ check_existing_root() {
         fail "$marker is a symlink; refusing to trust app root ownership"
     fi
     if [ ! -e "$marker" ]; then
-        if [ -n "$bootstrap_file" ] && [ "$dir" = "$(dirname "$bootstrap_file")" ]; then
-            validate_bootstrap_file "$dir" "$bootstrap_file"
+        if { [ -n "$browser_auth_file" ] && [ "$dir" = "$(dirname "$browser_auth_file")" ]; } || { [ -n "$goaccess_auth_file" ] && [ "$dir" = "$(dirname "$goaccess_auth_file")" ]; }; then
+            validate_bootstrap_files "$dir"
             write_marker "$dir" "$marker"
             return
         fi
@@ -258,7 +282,8 @@ create_missing_root "$hook_dir" "$hook_marker"`
 		names.VarLibDir, names.VarLibMarkerPath,
 		names.EtcDir, names.EtcMarkerPath,
 		names.HookDir, names.HookDirMarkerPath,
-		strings.TrimSpace(bootstrapFile),
+		strings.TrimSpace(browserAuthFile),
+		strings.TrimSpace(goAccessAuthFile),
 	}
 	return host.Command{
 		Name:        "sh",

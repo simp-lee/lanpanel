@@ -3,6 +3,7 @@ package appconfig
 import (
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/config"
 	"lanpanel/internal/realip"
 	"net"
 	"net/mail"
@@ -23,6 +24,15 @@ var nginxSizeValuePattern = regexp.MustCompile(`^[0-9]+(?:[kKmMgG])?$`)
 var nginxTimeValuePattern = regexp.MustCompile(`^[0-9]+(?:ms|s|m|h|d|w|M|y)?$`)
 var goAccessURLPathPattern = regexp.MustCompile(`^/[A-Za-z0-9._~/-]+$`)
 var systemdSafeEmailPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$`)
+var browserAuthPasswordFingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{16}$`)
+
+var browserAuthManagedRoot = "/etc/lanpanel/browser-auth"
+
+func UnsafeSetBrowserAuthManagedRootForTest(root string) func() {
+	previous := browserAuthManagedRoot
+	browserAuthManagedRoot = filepath.Clean(strings.TrimSpace(root))
+	return func() { browserAuthManagedRoot = previous }
+}
 
 func (errs validationErrors) Error() string {
 	return strings.Join(errs, "; ")
@@ -38,11 +48,21 @@ func (c *Config) normalize() {
 	for i, domain := range c.App.Domains {
 		c.App.Domains[i] = normalizeDomain(domain)
 	}
+	c.Access.AccessMode = AccessMode(strings.TrimSpace(string(c.Access.AccessMode)))
+	c.Access.BrowserAuth.AuthBasicUserFile = strings.TrimSpace(c.Access.BrowserAuth.AuthBasicUserFile)
+	c.Access.BrowserAuth.Managed.CredentialID = strings.TrimSpace(c.Access.BrowserAuth.Managed.CredentialID)
+	c.Access.BrowserAuth.Managed.HtpasswdPath = strings.TrimSpace(c.Access.BrowserAuth.Managed.HtpasswdPath)
+	c.Access.BrowserAuth.Managed.Username = strings.TrimSpace(c.Access.BrowserAuth.Managed.Username)
+	c.Access.BrowserAuth.Managed.PasswordFingerprint = strings.TrimSpace(c.Access.BrowserAuth.Managed.PasswordFingerprint)
+	for i, cidr := range c.Access.CIDRAllowlist {
+		c.Access.CIDRAllowlist[i] = strings.TrimSpace(cidr)
+	}
+	c.Access.OriginProtection.Mode = OriginProtectionMode(strings.TrimSpace(string(c.Access.OriginProtection.Mode)))
+	c.Access.OriginProtection.EdgeOneProfile = strings.TrimSpace(c.Access.OriginProtection.EdgeOneProfile)
 	c.Service.ExecStart = strings.TrimSpace(c.Service.ExecStart)
 	c.Service.WorkingDirectory = strings.TrimSpace(c.Service.WorkingDirectory)
 	c.Service.EnvFile = strings.TrimSpace(c.Service.EnvFile)
 	c.Nginx.ClientMaxBodySize = strings.TrimSpace(c.Nginx.ClientMaxBodySize)
-	c.Nginx.RealIPProfile = strings.TrimSpace(c.Nginx.RealIPProfile)
 	c.Nginx.AccessLog = strings.TrimSpace(c.Nginx.AccessLog)
 	c.Nginx.ErrorLog = strings.TrimSpace(c.Nginx.ErrorLog)
 	c.Nginx.GoAccess.Language = strings.TrimSpace(c.Nginx.GoAccess.Language)
@@ -78,9 +98,25 @@ func (c *Config) normalize() {
 	c.Tailscale.LoginServer = normalizeLoginServer(c.Tailscale.LoginServer)
 	c.Tailscale.Hostname = strings.TrimSpace(c.Tailscale.Hostname)
 	c.Tailscale.AuthKeyFile = strings.TrimSpace(c.Tailscale.AuthKeyFile)
+	c.Dependencies.LegoSource.Mode = strings.TrimSpace(c.Dependencies.LegoSource.Mode)
+	c.Dependencies.LegoSource.FilePath = strings.TrimSpace(c.Dependencies.LegoSource.FilePath)
+	c.Dependencies.PackageProbe.ReachabilityTimeout = strings.TrimSpace(c.Dependencies.PackageProbe.ReachabilityTimeout)
+	c.Dependencies.PackageProbe.ArtifactTimeout = strings.TrimSpace(c.Dependencies.PackageProbe.ArtifactTimeout)
+	c.Dependencies.Proxy.HTTPProxy = strings.TrimSpace(c.Dependencies.Proxy.HTTPProxy)
+	c.Dependencies.Proxy.HTTPSProxy = strings.TrimSpace(c.Dependencies.Proxy.HTTPSProxy)
+	c.Dependencies.Proxy.NoProxy = strings.TrimSpace(c.Dependencies.Proxy.NoProxy)
+	c.Dependencies.Platform.Arch = strings.TrimSpace(c.Dependencies.Platform.Arch)
 }
 
 func (c Config) Validate() error {
+	return c.validate(false)
+}
+
+func (c Config) ValidateForExposurePlan() error {
+	return c.validate(true)
+}
+
+func (c Config) validate(allowMissingConfirmations bool) error {
 	var errs validationErrors
 
 	if c.APIVersion == "" {
@@ -94,6 +130,7 @@ func (c Config) Validate() error {
 	validateEmail(&errs, "app.certificate_email", c.App.CertificateEmail)
 	validateACMEChallenge(&errs, c.App.ACMEChallenge)
 	validateMode(&errs, c)
+	validateAccess(&errs, c, allowMissingConfirmations)
 	validateService(&errs, c)
 	validateNginx(&errs, c)
 	validateRealIP(&errs, c)
@@ -101,11 +138,162 @@ func (c Config) Validate() error {
 	validateGoAccessPathConflicts(&errs, c)
 	validateDNS01(&errs, c.App.ACMEChallenge, c.DNS01)
 	validateTailscale(&errs, c)
+	if err := config.ValidateDependencyConfig("dependencies", c.Dependencies); err != nil {
+		errs = append(errs, err.Error())
+	}
 
 	if len(errs) == 0 {
 		return nil
 	}
 	return errs
+}
+
+func validateAccess(errs *validationErrors, c Config, allowMissingConfirmations bool) {
+	switch c.Access.AccessMode {
+	case AccessModeBrowser:
+		validateBrowserAccess(errs, c)
+	case AccessModePublic:
+		if !c.Access.PublicRiskConfirmed && !allowMissingConfirmations {
+			*errs = append(*errs, "access.public_risk_confirmed must be true when access.access_mode is public")
+		}
+		if browserAuthHasFields(c.Access.BrowserAuth) {
+			*errs = append(*errs, "access.browser_auth must be empty when access.access_mode is public")
+		}
+		if len(c.Access.CIDRAllowlist) > 0 {
+			*errs = append(*errs, "access.cidr_allowlist is only supported when access.access_mode is browser")
+		}
+	case AccessModePrivateClient:
+		if !allowMissingConfirmations {
+			*errs = append(*errs, "access.access_mode private_client is reserved for P1 and cannot be activated in P0")
+		}
+		if c.Access.PublicRiskConfirmed {
+			*errs = append(*errs, "access.public_risk_confirmed must be false when access.access_mode is private_client")
+		}
+		if browserAuthHasFields(c.Access.BrowserAuth) {
+			*errs = append(*errs, "access.browser_auth must be empty when access.access_mode is private_client")
+		}
+		if len(c.Access.CIDRAllowlist) > 0 {
+			*errs = append(*errs, "access.cidr_allowlist is only supported when access.access_mode is browser")
+		}
+	case "":
+		*errs = append(*errs, "access.access_mode is required")
+	default:
+		*errs = append(*errs, "access.access_mode must be one of: browser, public, private_client")
+	}
+
+	for i, cidr := range c.Access.CIDRAllowlist {
+		field := fmt.Sprintf("access.cidr_allowlist[%d]", i)
+		if cidr == "" {
+			*errs = append(*errs, field+" is required when set")
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			*errs = append(*errs, field+" must be a valid CIDR")
+		}
+	}
+
+	validateOriginProtection(errs, c, allowMissingConfirmations)
+}
+
+func validateBrowserAccess(errs *validationErrors, c Config) {
+	userFile := c.BrowserAuthUserFile()
+	if userFile == "" {
+		*errs = append(*errs, "access.browser_auth.auth_basic_user_file or access.browser_auth.managed.htpasswd_path is required when access.access_mode is browser")
+	} else {
+		validateNginxDirectivePath(errs, "access.browser_auth.auth_basic_user_file", userFile, true)
+	}
+	if c.Access.BrowserAuth.AuthBasicUserFile != "" && pathUnderRoot(c.Access.BrowserAuth.AuthBasicUserFile, browserAuthManagedRoot) {
+		*errs = append(*errs, "access.browser_auth.auth_basic_user_file must not be under LanPanel-managed browser auth directory; use access.browser_auth.managed")
+	}
+	if c.Access.PublicRiskConfirmed {
+		*errs = append(*errs, "access.public_risk_confirmed must be false when access.access_mode is browser")
+	}
+	managed := c.Access.BrowserAuth.Managed
+	if managed.CredentialID != "" || managed.HtpasswdPath != "" || managed.Username != "" || managed.PasswordFingerprint != "" {
+		if c.Access.BrowserAuth.AuthBasicUserFile != "" {
+			*errs = append(*errs, "access.browser_auth.auth_basic_user_file and access.browser_auth.managed must not both be set")
+		}
+		if managed.CredentialID == "" {
+			*errs = append(*errs, "access.browser_auth.managed.credential_id is required when managed browser auth is used")
+		} else if !isSafeAppName(managed.CredentialID) {
+			*errs = append(*errs, "access.browser_auth.managed.credential_id must start with a lowercase letter, contain only lowercase letters, digits, and hyphens, and must not end with a hyphen")
+		}
+		if managed.HtpasswdPath == "" {
+			*errs = append(*errs, "access.browser_auth.managed.htpasswd_path is required when managed browser auth is used")
+		} else {
+			validateNginxDirectivePath(errs, "access.browser_auth.managed.htpasswd_path", managed.HtpasswdPath, true)
+			if !pathIsChildOfRoot(managed.HtpasswdPath, browserAuthManagedRoot) {
+				*errs = append(*errs, "access.browser_auth.managed.htpasswd_path must be under "+browserAuthManagedRoot)
+			} else if filepath.Dir(filepath.Clean(managed.HtpasswdPath)) != browserAuthManagedRoot || filepath.Base(managed.HtpasswdPath) != managed.CredentialID+".htpasswd" {
+				*errs = append(*errs, "access.browser_auth.managed.htpasswd_path must be /etc/lanpanel/browser-auth/<credential_id>.htpasswd")
+			}
+		}
+		if managed.Username == "" {
+			*errs = append(*errs, "access.browser_auth.managed.username is required when managed browser auth is used")
+		} else if !isSafeBrowserAuthUsername(managed.Username) {
+			*errs = append(*errs, "access.browser_auth.managed.username must contain only ASCII letters, digits, dot, underscore, and hyphen, and must not start with hyphen")
+		}
+		if managed.PasswordFingerprint == "" {
+			*errs = append(*errs, "access.browser_auth.managed.password_fingerprint is required when managed browser auth is used")
+		} else if !browserAuthPasswordFingerprintPattern.MatchString(managed.PasswordFingerprint) {
+			*errs = append(*errs, "access.browser_auth.managed.password_fingerprint must be sha256: followed by 16 lowercase hex characters")
+		}
+	}
+}
+
+func validateOriginProtection(errs *validationErrors, c Config, allowMissingConfirmations bool) {
+	if c.Access.AccessMode == AccessModePrivateClient {
+		if c.Access.OriginProtection.Mode != "" && c.Access.OriginProtection.Mode != OriginProtectionModeNone {
+			*errs = append(*errs, "access.origin_protection.mode must be none or omitted when access.access_mode is private_client")
+		}
+		if c.Access.OriginProtection.DirectOriginRiskConfirmed {
+			*errs = append(*errs, "access.origin_protection.direct_origin_risk_confirmed must be false when access.access_mode is private_client")
+		}
+		if c.Access.OriginProtection.EdgeOneProfile != "" {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile must be empty when access.access_mode is private_client")
+		}
+		return
+	}
+	switch c.Access.OriginProtection.Mode {
+	case OriginProtectionModeNone:
+		if !c.Access.OriginProtection.DirectOriginRiskConfirmed && !allowMissingConfirmations {
+			*errs = append(*errs, "access.origin_protection.direct_origin_risk_confirmed must be true when access.origin_protection.mode is none")
+		}
+		if c.Access.OriginProtection.EdgeOneProfile != "" {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile must be empty when access.origin_protection.mode is none")
+		}
+	case OriginProtectionModeEdgeOne:
+		if c.Access.OriginProtection.DirectOriginRiskConfirmed {
+			*errs = append(*errs, "access.origin_protection.direct_origin_risk_confirmed must be false when access.origin_protection.mode is edgeone")
+		}
+		profileName := c.Access.OriginProtection.EdgeOneProfile
+		if profileName == "" {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile is required when access.origin_protection.mode is edgeone")
+			return
+		}
+		if !isSafeRealIPProfileName(profileName) {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile must start with a lowercase letter, contain only lowercase letters, digits, and hyphens, and must not end with a hyphen")
+			return
+		}
+		profile, ok := c.RealIP.Profiles[profileName]
+		if !ok {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile references undefined realip profile "+profileName)
+			return
+		}
+		if !profile.IsEnabled() {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile references disabled realip profile "+profileName)
+		}
+		if strings.TrimSpace(profile.Provider) != RealIPProviderEdgeOne {
+			*errs = append(*errs, "access.origin_protection.edgeone_profile must reference an EdgeOne realip profile")
+		}
+		if c.App.ACMEChallenge != ACMEChallengeDNS01 {
+			*errs = append(*errs, "app.acme_challenge must be dns-01 when access.origin_protection.mode is edgeone")
+		}
+	case "":
+		*errs = append(*errs, "access.origin_protection.mode is required")
+	default:
+		*errs = append(*errs, "access.origin_protection.mode must be one of: none, edgeone")
+	}
 }
 
 func validateAppName(errs *validationErrors, name string) {
@@ -274,9 +462,6 @@ func validateNginx(errs *validationErrors, c Config) {
 	if cfg.ClientMaxBodySize != "" && !nginxSizeValuePattern.MatchString(cfg.ClientMaxBodySize) {
 		*errs = append(*errs, "nginx.client_max_body_size must be a simple nginx size such as 20m")
 	}
-	if cfg.RealIPProfile != "" && !isSafeRealIPProfileName(cfg.RealIPProfile) {
-		*errs = append(*errs, "nginx.realip_profile must start with a lowercase letter, contain only lowercase letters, digits, and hyphens, and must not end with a hyphen")
-	}
 	validateNginxOptionalLogPath(errs, "nginx.access_log", cfg.AccessLog, true)
 	validateNginxOptionalLogPath(errs, "nginx.error_log", cfg.ErrorLog, false)
 	validateNginxGoAccess(errs, c)
@@ -353,20 +538,20 @@ func validateRealIP(errs *validationErrors, c Config) {
 		validateRealIPProfile(errs, field, profile)
 	}
 
-	profileName := strings.TrimSpace(c.Nginx.RealIPProfile)
+	profileName := c.EffectiveRealIPProfileName()
 	if profileName == "" {
 		return
 	}
 	profile, ok := c.RealIP.Profiles[profileName]
 	if !ok {
-		*errs = append(*errs, "nginx.realip_profile references undefined realip profile "+profileName)
+		*errs = append(*errs, "access.origin_protection.edgeone_profile references undefined realip profile "+profileName)
 		return
 	}
 	if !profile.IsEnabled() {
-		*errs = append(*errs, "nginx.realip_profile references disabled realip profile "+profileName)
+		*errs = append(*errs, "access.origin_protection.edgeone_profile references disabled realip profile "+profileName)
 	}
 	if strings.TrimSpace(profile.Provider) == RealIPProviderEdgeOne && c.App.ACMEChallenge != ACMEChallengeDNS01 {
-		*errs = append(*errs, "app.acme_challenge must be dns-01 when nginx.realip_profile references an EdgeOne profile")
+		*errs = append(*errs, "app.acme_challenge must be dns-01 when access.origin_protection.edgeone_profile references an EdgeOne profile")
 	}
 }
 
@@ -525,6 +710,46 @@ func validateGoAccessURLPath(errs *validationErrors, field string, path string) 
 	}
 }
 
+func browserAuthHasFields(cfg BrowserAuthConfig) bool {
+	return strings.TrimSpace(cfg.AuthBasicUserFile) != "" ||
+		strings.TrimSpace(cfg.Managed.CredentialID) != "" ||
+		strings.TrimSpace(cfg.Managed.HtpasswdPath) != "" ||
+		strings.TrimSpace(cfg.Managed.Username) != "" ||
+		strings.TrimSpace(cfg.Managed.PasswordFingerprint) != ""
+}
+
+func isSafeBrowserAuthUsername(username string) bool {
+	if username == "" || len(username) > 64 {
+		return false
+	}
+	if username[0] == '-' {
+		return false
+	}
+	for _, r := range username {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func pathUnderRoot(path string, root string) bool {
+	cleanPath := filepath.Clean(strings.TrimSpace(path))
+	cleanRoot := filepath.Clean(root)
+	return cleanPath == cleanRoot || strings.HasPrefix(cleanPath, cleanRoot+string(filepath.Separator))
+}
+
+func pathIsChildOfRoot(path string, root string) bool {
+	cleanPath := filepath.Clean(strings.TrimSpace(path))
+	cleanRoot := filepath.Clean(root)
+	return strings.HasPrefix(cleanPath, cleanRoot+string(filepath.Separator))
+}
+
 func validateGoAccessWebSocketListen(errs *validationErrors, listen string) {
 	host, portString, err := net.SplitHostPort(listen)
 	if err != nil {
@@ -660,6 +885,15 @@ func validateGoAccessPathConflicts(errs *validationErrors, c Config) {
 
 	authFile := strings.TrimSpace(c.Nginx.GoAccess.AuthBasicUserFile)
 	if authFile == "" {
+		return
+	}
+	browserAuthFile := strings.TrimSpace(c.BrowserAuthUserFile())
+	if browserAuthFile != "" && cleanPathEqual(authFile, browserAuthFile) {
+		*errs = append(*errs, "nginx.goaccess.auth_basic_user_file must not equal access.browser_auth auth_basic_user_file or managed htpasswd_path")
+		return
+	}
+	if pathIsUnder(authFile, browserAuthManagedRoot) {
+		*errs = append(*errs, "nginx.goaccess.auth_basic_user_file must not be under LanPanel-managed browser auth directory")
 		return
 	}
 	validateGoAccessAuthFileAppEtcPath(errs, c, authFile)
@@ -922,8 +1156,14 @@ func validateNginxOptionalLogPath(errs *validationErrors, field string, path str
 	if allowOff && path == "off" {
 		return
 	}
+	validateNginxDirectivePath(errs, field, path, true)
+}
+
+func validateNginxDirectivePath(errs *validationErrors, field string, path string, requireAbs bool) {
 	if !filepath.IsAbs(path) {
-		*errs = append(*errs, field+" must be an absolute path when set")
+		if requireAbs {
+			*errs = append(*errs, field+" must be an absolute path when set")
+		}
 		return
 	}
 	if filepath.Clean(path) != path {

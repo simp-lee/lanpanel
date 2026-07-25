@@ -19,7 +19,7 @@ default:
 advanced:
   headscale_source:
     mode: "direct" # direct | mirror | offline
-    version: "0.28.0"
+    version: "0.29.1"
     url: ""
     sha256: ""
     file_path: ""

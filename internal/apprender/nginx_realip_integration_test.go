@@ -239,13 +239,16 @@ func renderedNginxRealIPFixtureConfig(t *testing.T, dir string, httpPort int, ht
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 	cfg.App.Listen = upstreamAddress
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
 	cfg.Service.ExecStart = "/bin/true --listen " + upstreamAddress
 	cfg.Service.WorkingDirectory = "/tmp"
 	cfg.Nginx.HTTP2 = &http2
 	cfg.Nginx.GoAccess.Enabled = true
 	cfg.Nginx.GoAccess.AuthBasicUserFile = authPath
 	cfg.Nginx.GoAccess.AuthCIDRAllowlist = []string{"9.9.9.9/32"}
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,

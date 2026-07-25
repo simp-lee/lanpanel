@@ -1,6 +1,7 @@
 package appsvc
 
 import (
+	"fmt"
 	"lanpanel/internal/host"
 	"strings"
 )
@@ -308,8 +309,8 @@ chmod 0640 "$report_file"`
 }
 
 func GuardGoAccessAuthFileCommand(names Names, authFile string) host.Command {
-	script := goAccessAuthFileMetadataGuardScript() + `
-nginx_user=${2:-www-data}
+	script := authFileMetadataGuardScript("nginx.goaccess.auth_basic_user_file") + `
+	nginx_user=${2:-www-data}
 
 if ! command -v runuser >/dev/null 2>&1; then
     fail "runuser is required to verify nginx.goaccess.auth_basic_user_file readability"
@@ -331,14 +332,58 @@ fi`
 func GuardGoAccessAuthFileMetadataCommand(names Names, authFile string) host.Command {
 	return host.Command{
 		Name:        "sh",
-		Args:        []string{"-c", goAccessAuthFileMetadataGuardScript(), "lanpanel-app-goaccess-auth-file-metadata", strings.TrimSpace(authFile)},
+		Args:        []string{"-c", authFileMetadataGuardScript("nginx.goaccess.auth_basic_user_file"), "lanpanel-app-goaccess-auth-file-metadata", strings.TrimSpace(authFile)},
 		DisplayName: "guard-goaccess-auth-file-metadata",
 		DisplayArgs: []string{strings.TrimSpace(authFile)},
 	}
 }
 
-func goAccessAuthFileMetadataGuardScript() string {
-	return `set -eu
+func GuardBrowserAuthFileCommand(names Names, authFile string) host.Command {
+	script := authFileMetadataGuardScript("access.browser_auth htpasswd file") + `
+nginx_user=${2:-www-data}
+
+if ! command -v runuser >/dev/null 2>&1; then
+    fail "runuser is required to verify access.browser_auth htpasswd file readability"
+fi
+if ! getent passwd "$nginx_user" >/dev/null 2>&1; then
+    fail "nginx runtime user $nginx_user does not exist"
+fi
+if ! runuser -u "$nginx_user" -- test -r "$auth_file"; then
+    fail "nginx runtime user $nginx_user cannot read access.browser_auth htpasswd file"
+fi`
+	return host.Command{
+		Name:        "sh",
+		Args:        []string{"-c", script, "lanpanel-app-browser-auth-file", strings.TrimSpace(authFile), "www-data"},
+		DisplayName: "guard-browser-auth-file",
+		DisplayArgs: []string{strings.TrimSpace(authFile)},
+	}
+}
+
+func GuardManagedBrowserAuthFileCommand(names Names, authFile string) host.Command {
+	script := authFileMetadataGuardScript("access.browser_auth managed htpasswd file") + `
+if ! awk '
+    NR == 1 && $0 == "# LanPanel-managed browser-auth" { marker = 1; next }
+    /^[[:space:]]*($|#)/ { next }
+    {
+        count++
+        if ($0 !~ /^[^:[:space:]][^:[:space:]]*:\$2[aby]\$(1[2-9]|[2-9][0-9])\$[.\/A-Za-z0-9]{53}$/) {
+            bad = 1
+        }
+    }
+    END { exit marker && count == 1 && !bad ? 0 : 1 }
+' "$auth_file"; then
+    fail "access.browser_auth managed htpasswd file must keep the LanPanel marker and exactly one bcrypt credential with cost at least 12"
+fi`
+	return host.Command{
+		Name:        "sh",
+		Args:        []string{"-c", script, "lanpanel-app-managed-browser-auth-file", strings.TrimSpace(authFile)},
+		DisplayName: "guard-managed-browser-auth-file",
+		DisplayArgs: []string{strings.TrimSpace(authFile)},
+	}
+}
+
+func authFileMetadataGuardScript(label string) string {
+	return fmt.Sprintf(`set -eu
 auth_file=$1
 
 fail() {
@@ -347,49 +392,49 @@ fail() {
 }
 
 if [ -L "$auth_file" ]; then
-    fail "nginx.goaccess.auth_basic_user_file must not be a symlink"
+    fail "%[1]s must not be a symlink"
 fi
 if [ ! -f "$auth_file" ]; then
-    fail "nginx.goaccess.auth_basic_user_file must be a regular file"
+    fail "%[1]s must be a regular file"
 fi
 if [ ! -s "$auth_file" ]; then
-    fail "nginx.goaccess.auth_basic_user_file must not be empty"
+    fail "%[1]s must not be empty"
 fi
 if ! awk '
     /^[[:space:]]*($|#)/ { next }
     /^[^:[:space:]][^:[:space:]]*:[^[:space:]][^[:space:]]*$/ { found = 1 }
     END { exit found ? 0 : 1 }
 ' "$auth_file"; then
-    fail "nginx.goaccess.auth_basic_user_file must contain at least one user:hash credential line"
+    fail "%[1]s must contain at least one user:hash credential line"
 fi
-if [ "$(stat -c %u "$auth_file")" != "0" ]; then
-    fail "nginx.goaccess.auth_basic_user_file must be owned by root"
+if [ "$(stat -c %%u "$auth_file")" != "0" ]; then
+    fail "%[1]s must be owned by root"
 fi
-unsafe_mode=$(find "$auth_file" -maxdepth 0 \( -perm -020 -o -perm -004 -o -perm -002 -o -perm -001 \) -print -quit) || fail "failed to inspect nginx.goaccess.auth_basic_user_file permissions"
+unsafe_mode=$(find "$auth_file" -maxdepth 0 \( -perm -020 -o -perm -004 -o -perm -002 -o -perm -001 \) -print -quit) || fail "failed to inspect %[1]s permissions"
 if [ -n "$unsafe_mode" ]; then
-    fail "nginx.goaccess.auth_basic_user_file must not be group-writable or accessible by others"
+    fail "%[1]s must not be group-writable or accessible by others"
 fi
 dir=$(dirname "$auth_file")
 while :; do
     if [ -L "$dir" ]; then
-        fail "nginx.goaccess.auth_basic_user_file parent directory $dir must not be a symlink"
+        fail "%[1]s parent directory $dir must not be a symlink"
     fi
     if [ ! -d "$dir" ]; then
-        fail "nginx.goaccess.auth_basic_user_file parent path $dir must be a directory"
+        fail "%[1]s parent path $dir must be a directory"
     fi
-    if [ "$(stat -c %u "$dir")" != "0" ]; then
-        fail "nginx.goaccess.auth_basic_user_file parent directory $dir must be owned by root"
+    if [ "$(stat -c %%u "$dir")" != "0" ]; then
+        fail "%[1]s parent directory $dir must be owned by root"
     fi
-    writable=$(find "$dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit) || fail "failed to inspect nginx.goaccess.auth_basic_user_file parent directory $dir permissions"
+    writable=$(find "$dir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print -quit) || fail "failed to inspect %[1]s parent directory $dir permissions"
     if [ -n "$writable" ]; then
-        fail "nginx.goaccess.auth_basic_user_file parent directory $dir must not be writable by group or others"
+        fail "%[1]s parent directory $dir must not be writable by group or others"
     fi
     parent=$(dirname "$dir")
     if [ "$parent" = "$dir" ]; then
         break
     fi
     dir=$parent
-done`
+done`, label)
 }
 
 func GuardGoAccessCanonicalLogReadableCommand(names Names) host.Command {

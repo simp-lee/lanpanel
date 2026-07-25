@@ -8,14 +8,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"lanpanel/internal/appconfig"
+	"lanpanel/internal/appguard"
 	"lanpanel/internal/apprender"
 	"lanpanel/internal/assets"
+	"lanpanel/internal/browserauth"
 	"lanpanel/internal/components/appsvc"
 	"lanpanel/internal/components/headscale"
 	legocomponent "lanpanel/internal/components/lego"
+	nginxcomponent "lanpanel/internal/components/nginx"
 	"lanpanel/internal/config"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/exposure"
 	"lanpanel/internal/host"
 	"lanpanel/internal/output"
 	"lanpanel/internal/preflight"
@@ -25,12 +31,15 @@ import (
 	"lanpanel/internal/realiprender"
 	"lanpanel/internal/render"
 	"lanpanel/internal/state"
+	uipkg "lanpanel/internal/ui"
+	"lanpanel/internal/uistate"
 	"lanpanel/internal/workflow"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,11 +52,37 @@ import (
 func runCLI(t *testing.T, args ...string) (string, string, error) {
 	t.Helper()
 
+	if cliResourceStoreDir == filepath.Join(uipkg.DefaultStateDir, "resources") {
+		useCLIResourceStore(t)
+	}
+
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
 	err := Execute(args, &stdout, &stderr, "test")
 	return stdout.String(), stderr.String(), err
+}
+
+func useCLIResourceStore(t *testing.T) string {
+	t.Helper()
+
+	previous := cliResourceStoreDir
+	dir := filepath.Join(secureCLIStateParent(t), "resources")
+	cliResourceStoreDir = dir
+	t.Cleanup(func() {
+		cliResourceStoreDir = previous
+	})
+	return dir
+}
+
+func TestDeployRetryCommandShellQuotesConfigPath(t *testing.T) {
+	t.Parallel()
+
+	got := deployRetryCommand("/tmp/lan panel/a;touch x.yaml")
+	want := "lanpanel deploy --config '/tmp/lan panel/a;touch x.yaml'"
+	if got != want {
+		t.Fatalf("deployRetryCommand() = %q, want %q", got, want)
+	}
 }
 
 func fieldValue(fields []output.Field, label string) (string, bool) {
@@ -57,6 +92,15 @@ func fieldValue(fields []output.Field, label string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func eventsContain(events []uistate.Event, message string) bool {
+	for _, event := range events {
+		if event.Message == message {
+			return true
+		}
+	}
+	return false
 }
 
 type staticFileInfo struct {
@@ -94,6 +138,74 @@ func (info staticFileInfo) Sys() any {
 	return &syscall.Stat_t{Uid: info.uid}
 }
 
+func approvedTestExposurePlanForConfig(t *testing.T, configPath string, operation domain.ExposurePlanOperation, observations exposure.AppObservations) domain.ExposurePlan {
+	t.Helper()
+
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile(app config) error = %v", err)
+	}
+	plan, err := exposure.AppPlanWithObservations("ins_0123456789abcdef0123456789abcdef", "test", cfg, exposure.AppPlanOptions{
+		ConfigPath: configPath,
+		Operation:  operation,
+	}, observations)
+	if err != nil {
+		t.Fatalf("AppPlanWithObservations() error = %v", err)
+	}
+	for _, confirmation := range plan.Decision.RequiredConfirmations {
+		reason, err := domain.ManualConfirmationReason(confirmation)
+		if err != nil {
+			t.Fatalf("ManualConfirmationReason(%q) error = %v", confirmation, err)
+		}
+		plan.Access.ManualConfirmations = append(plan.Access.ManualConfirmations, domain.ManualConfirmation{
+			ConfirmationID: "evt_20260620T120000Z_00112233",
+			Reason:         reason,
+			Actor:          domain.Actor{Source: domain.ActorSourceUI, EffectiveUID: 1000, EffectiveUser: "uid:1000"},
+			ConfirmedAt:    "2026-06-20T12:00:00Z",
+		})
+	}
+	return plan
+}
+
+func validEdgeOneDeployedExposureState() realip.State {
+	return realip.State{
+		ProfileName:     "edgeone-prod",
+		Provider:        appconfig.RealIPProviderEdgeOne,
+		ZoneID:          "zone-2abcDEF123",
+		OriginACLStatus: "online",
+		OriginACLFamily: "global",
+		CurrentVersion:  "v1",
+		CurrentCIDRs:    []string{"8.8.8.8/32"},
+		TrustedCIDRs:    []string{"8.8.8.8/32"},
+		UpdatedAt:       time.Date(2026, 6, 2, 1, 2, 3, 0, time.UTC),
+	}
+}
+
+func validEdgeOneDeployedExposureArtifactInfo(path string) (fs.FileInfo, error) {
+	switch path {
+	case "/etc/nginx/lanpanel/realip/edgeone-prod/active.conf",
+		"/etc/nginx/lanpanel/realip/edgeone-prod/trusted-cidrs.conf",
+		"/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service":
+		return staticFileInfo{name: filepath.Base(path), mode: 0o644, size: 1}, nil
+	default:
+		return nil, os.ErrNotExist
+	}
+}
+
+func validEdgeOneDeployedExposureArtifact(path string, configPath string) ([]byte, error) {
+	marker := "# Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone\n"
+	switch path {
+	case "/etc/nginx/lanpanel/realip/edgeone-prod/active.conf":
+		return []byte(marker + "set_real_ip_from 8.8.8.8/32;\n"), nil
+	case "/etc/nginx/lanpanel/realip/edgeone-prod/trusted-cidrs.conf":
+		return []byte(marker + "8.8.8.8/32 1;\n"), nil
+	case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service":
+		return managedRealIPRefreshServiceContent("edgeone-prod", configPath), nil
+	default:
+		return nil, os.ErrNotExist
+	}
+}
+
 func TestExecute_HelpOutput(t *testing.T) {
 	t.Parallel()
 
@@ -118,6 +230,435 @@ func TestExecute_HelpOutput(t *testing.T) {
 			t.Fatalf("stdout = %q, want substring %q", stdout, want)
 		}
 	}
+}
+
+func TestExecute_UIRejectsEmptyStateDir(t *testing.T) {
+	t.Parallel()
+
+	stdout, stderr, err := runCLI(t, "ui", "--state-dir=")
+	if err == nil || !strings.Contains(err.Error(), "ui state-dir is required") {
+		t.Fatalf("Execute(ui --state-dir=) error = %v, want state dir failure", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+}
+
+func TestExecute_UIPassesWhitespacePaddedStateDirToServer(t *testing.T) {
+	previousNewUIServer := newUIServerFn
+	t.Cleanup(func() {
+		newUIServerFn = previousNewUIServer
+	})
+
+	rawStateDir := " " + secureUITestStateDir(t) + " "
+	var captured uipkg.Options
+	newUIServerFn = func(options uipkg.Options) (managementUIServer, error) {
+		captured = options
+		return stubManagementUIServer{err: errors.New("stop ui after options capture")}, nil
+	}
+
+	_, _, err := runCLI(t, "ui", "--state-dir", rawStateDir)
+	if err == nil || !strings.Contains(err.Error(), "stop ui after options capture") {
+		t.Fatalf("Execute(ui) error = %v, want captured server stop", err)
+	}
+	if captured.StateDir != rawStateDir {
+		t.Fatalf("StateDir = %q, want raw untrimmed %q", captured.StateDir, rawStateDir)
+	}
+}
+
+func TestExecute_UIUsesManagedDefaultStateDir(t *testing.T) {
+	previousNewUIServer := newUIServerFn
+	t.Cleanup(func() {
+		newUIServerFn = previousNewUIServer
+	})
+
+	var captured uipkg.Options
+	newUIServerFn = func(options uipkg.Options) (managementUIServer, error) {
+		captured = options
+		return stubManagementUIServer{err: errors.New("stop ui after options capture")}, nil
+	}
+
+	stdout, stderr, err := runCLI(t, "ui")
+	if err == nil || !strings.Contains(err.Error(), "stop ui after options capture") {
+		t.Fatalf("Execute(ui) error = %v, want captured server stop", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	for _, want := range []string{
+		"LanPanel UI listening on http://127.0.0.1:18080",
+		"SSH tunnel: ssh -L 18080:127.0.0.1:18080 user@server",
+		"Startup token TTL: 1m0s",
+		"Security: loopback-only management UI; use SSH local forwarding; do not expose this port; startup token is one-time and expires.",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want ui startup output %q", stdout, want)
+		}
+	}
+	if captured.StateDir != uipkg.DefaultStateDir {
+		t.Fatalf("StateDir = %q, want %q", captured.StateDir, uipkg.DefaultStateDir)
+	}
+}
+
+func TestExecute_UIInjectsHeadscalePreAuthCreator(t *testing.T) {
+	previousNewUIServer := newUIServerFn
+	previousNewHeadscaleOnboarder := newHeadscaleOnboarderFn
+	previousNewHostExecutor := newHostExecutorFn
+	t.Cleanup(func() {
+		newUIServerFn = previousNewUIServer
+		newHeadscaleOnboarderFn = previousNewHeadscaleOnboarder
+		newHostExecutorFn = previousNewHostExecutor
+	})
+
+	var captured uipkg.Options
+	newUIServerFn = func(options uipkg.Options) (managementUIServer, error) {
+		captured = options
+		return stubManagementUIServer{err: errors.New("stop ui after options capture")}, nil
+	}
+	newHeadscaleOnboarderFn = func(host.Executor) headscaleOnboarder {
+		return stubHeadscaleOnboarder{key: "hskey-auth-ui"}
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		if env != nil {
+			t.Fatalf("ui preauth executor env = %#v, want nil", env)
+		}
+		return host.NewExecutor(nil, nil)
+	}
+
+	stdout, stderr, err := runCLI(t, "ui", "--state-dir", secureUITestStateDir(t))
+	if err == nil || !strings.Contains(err.Error(), "stop ui after options capture") {
+		t.Fatalf("Execute(ui) error = %v, want captured server stop", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "Open once: http://127.0.0.1:18080/login-token-redacted") {
+		t.Fatalf("stdout = %q, want startup URL from stub server", stdout)
+	}
+	if captured.HostWorkflow == nil {
+		t.Fatal("ui HostWorkflow is nil")
+	}
+	if captured.PreAuthKeyCreator == nil {
+		t.Fatal("ui PreAuthKeyCreator is nil")
+	}
+	plan, err := headscale.NewOnboardingPlan(headscale.OnboardingOptions{UserName: "lanpanel", Expiration: time.Hour})
+	if err != nil {
+		t.Fatalf("NewOnboardingPlan() error = %v", err)
+	}
+	key, _, err := captured.PreAuthKeyCreator.CreatePreAuthKey(stdcontext.Background(), plan)
+	if err != nil {
+		t.Fatalf("CreatePreAuthKey() error = %v", err)
+	}
+	if key != "hskey-auth-ui" {
+		t.Fatalf("preauth key = %q, want injected creator key", key)
+	}
+}
+
+func TestUIHostWorkflowRealIPRefreshUsesTypedConfigPath(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	appConfigPath := filepath.Join(dir, "lanpanel-app.yaml")
+	enabled := true
+	cfg := appconfig.ExampleConfig()
+	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
+	cfg.DNS01.Provider = "tencentcloud"
+	cfg.DNS01.EnvFile = "/etc/lanpanel/dns01/tencentcloud.env"
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
+	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
+		"edgeone-prod": {
+			Enabled:  &enabled,
+			Provider: appconfig.RealIPProviderEdgeOne,
+			EdgeOne: appconfig.RealIPEdgeOneConfig{
+				ZoneID:  "zone-prod",
+				EnvFile: "/etc/lanpanel/realip/edgeone-prod.env",
+			},
+		},
+		"edgeone-next": {
+			Enabled:  &enabled,
+			Provider: appconfig.RealIPProviderEdgeOne,
+			EdgeOne: appconfig.RealIPEdgeOneConfig{
+				ZoneID:  "zone-next",
+				EnvFile: "/etc/lanpanel/realip/edgeone-next.env",
+			},
+		},
+	}
+	if err := cfg.WriteFile(appConfigPath); err != nil {
+		t.Fatalf("WriteFile(app config) error = %v", err)
+	}
+
+	plan := approvedTestExposurePlanForConfig(t, appConfigPath, domain.ExposurePlanOperationRealIPRefresh, exposure.AppObservations{OriginProtectionStatus: domain.OriginProtectionConfiguredManual})
+	result, err := newUIHostWorkflow(context{stdout: io.Discard, stderr: io.Discard, version: "test"}).RunRealIPRefresh(stdcontext.Background(), appConfigPath, "edgeone-next", plan, []string{appOriginProtectionManualConfirmation})
+	if err == nil {
+		t.Fatal("RunRealIPRefresh() error = nil, want inactive profile failure from config-aware typed path")
+	}
+	if !strings.Contains(err.Error(), "Realip app config validation failed") || strings.Contains(err.Error(), "root privileges") {
+		t.Fatalf("RunRealIPRefresh() error = %v, want config validation failure before root gate", err)
+	}
+	wantRetry := workflow.ShellCommand("sudo", "lanpanel", "app", "realip", "refresh", "--config", appConfigPath, "--profile", "edgeone-next", "--confirmation", appOriginProtectionManualConfirmation)
+	if result.RetryCommand != wantRetry {
+		t.Fatalf("RetryCommand = %q, want %q", result.RetryCommand, wantRetry)
+	}
+}
+
+func TestUIHostWorkflowAppDeployPassesManualExposureConfirmationToTypedPath(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	previousPermission := detectPermissionStateFn
+	previousDNS := detectAppDNSFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		detectAppDNSFn = previousDNS
+	})
+	detectPermissionStateFn = func() preflight.PermissionState {
+		return preflight.PermissionState{User: "ui", SudoWorks: true}
+	}
+	detectAppDNSFn = func(appconfig.Config) map[string]preflight.DNSProbe {
+		t.Fatal("detectAppDNSFn called before app deploy root gate")
+		return nil
+	}
+
+	plan := approvedTestExposurePlanForConfig(t, configPath, domain.ExposurePlanOperationDeploy, exposure.AppObservations{OriginProtectionStatus: domain.OriginProtectionConfiguredManual})
+	result, err := newUIHostWorkflow(context{stdout: io.Discard, stderr: io.Discard, version: "test"}).RunAppDeploy(stdcontext.Background(), configPath, plan, []string{appOriginProtectionManualConfirmation})
+	if err == nil || !strings.Contains(err.Error(), "app deploy preflight found 1 failed check") {
+		t.Fatalf("RunAppDeploy() error = %v, want root gate after confirmation", err)
+	}
+	if strings.Contains(err.Error(), "requires manual confirmations") {
+		t.Fatalf("RunAppDeploy() error = %v, confirmation was not forwarded to typed path", err)
+	}
+	if result.RetryCommand != workflow.ShellCommand("sudo", "lanpanel", "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation) {
+		t.Fatalf("RetryCommand = %q", result.RetryCommand)
+	}
+	if len(result.Progress) == 0 {
+		t.Fatal("Progress = empty, want app deploy progress events")
+	}
+}
+
+func TestUIHostWorkflowAppDeployUsesBrowserAuthRuntimePassBeforeDeploy(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewBrowserAuthManagedApp)
+	stubPassingAppDeployPreflight(t)
+	previousStage := stageAppRuntimeFilesFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+	})
+	stageCalled := false
+	stageAppRuntimeFilesFn = func(cfg appconfig.Config) ([]apprender.StagedFile, error) {
+		stageCalled = true
+		if !cfg.BrowserAuthEnabled() {
+			t.Fatal("stageAppRuntimeFilesFn received non-browser-auth config")
+		}
+		return nil, errors.New("stage reached")
+	}
+
+	plan := approvedTestExposurePlanForConfig(t, configPath, domain.ExposurePlanOperationDeploy, exposure.AppObservations{
+		BrowserAuthRuntimeStatus: domain.DiagnosticStatusPass,
+		BrowserAuthMarkerStatus:  domain.DiagnosticStatusPass,
+	})
+	result, err := newUIHostWorkflow(context{stdout: io.Discard, stderr: io.Discard, version: "test"}).RunAppDeploy(stdcontext.Background(), configPath, plan, nil)
+	if err == nil || !strings.Contains(err.Error(), "App runtime template rendering failed") {
+		t.Fatalf("RunAppDeploy() error = %v, want deploy operation to reach runtime staging", err)
+	}
+	if strings.Contains(err.Error(), "exposure plan is blocked") || strings.Contains(err.Error(), "App exposure plan blocked host mutation") {
+		t.Fatalf("RunAppDeploy() error = %v, want browser auth runtime readability to pass before host mutation", err)
+	}
+	if !stageCalled {
+		t.Fatal("stageAppRuntimeFilesFn was not called; app deploy operation was blocked before host mutation")
+	}
+	if result.Kind != domain.JobKindAppDeploy || result.Summary != "App runtime template rendering failed" {
+		t.Fatalf("result = %#v, want app deploy staging failure result", result)
+	}
+}
+
+func TestUIHostWorkflowAppDeployBlocksBrowserAuthRuntimeNotReadyBeforeMutation(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewBrowserAuthManagedApp)
+	stubPassingAppDeployPreflight(t)
+	previousDetectAppBrowserAuthFileState := detectAppBrowserAuthFileStateFn
+	previousStage := stageAppRuntimeFilesFn
+	t.Cleanup(func() {
+		detectAppBrowserAuthFileStateFn = previousDetectAppBrowserAuthFileState
+		stageAppRuntimeFilesFn = previousStage
+	})
+	detectAppBrowserAuthFileStateFn = func(appconfig.Config) (bool, bool, string) {
+		return true, false, "browser auth file is not root-readable"
+	}
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		t.Fatal("stageAppRuntimeFilesFn must not be called when browser auth runtime check fails")
+		return nil, nil
+	}
+
+	result, err := workflow.RunAppDeploy(workflow.Context{
+		Version: "test",
+		HostWorkflow: newUIHostWorkflow(context{
+			stdout:  io.Discard,
+			stderr:  io.Discard,
+			version: "test",
+		}),
+	}, configPath, "ins_0123456789abcdef0123456789abcdef")
+	if err == nil || !strings.Contains(err.Error(), "app deploy exposure plan is blocked") {
+		t.Fatalf("RunAppDeploy() error = %v, want exposure gate to block before mutation", err)
+	}
+	if result.ExposurePlan == nil {
+		t.Fatal("ExposurePlan = nil, want blocking browser auth exposure plan")
+	}
+	if result.ExposurePlan.Decision.Status != domain.ExposurePlanDecisionFail {
+		t.Fatalf("ExposurePlan.Decision.Status = %q, want fail", result.ExposurePlan.Decision.Status)
+	}
+}
+
+func TestUIHostWorkflowRealIPRefreshPassesManualExposureConfirmationToTypedPath(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	previousPermission := detectPermissionStateFn
+	previousAcquireLock := acquireRealIPProfileLockFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		acquireRealIPProfileLockFn = previousAcquireLock
+	})
+	detectPermissionStateFn = func() preflight.PermissionState {
+		return preflight.PermissionState{User: "ui", SudoWorks: true}
+	}
+	acquireRealIPProfileLockFn = func(profileName string) (realIPProfileLock, error) {
+		t.Fatalf("acquireRealIPProfileLockFn called before realip refresh root gate for %q", profileName)
+		return nil, nil
+	}
+
+	plan := approvedTestExposurePlanForConfig(t, configPath, domain.ExposurePlanOperationRealIPRefresh, exposure.AppObservations{OriginProtectionStatus: domain.OriginProtectionConfiguredManual})
+	result, err := newUIHostWorkflow(context{stdout: io.Discard, stderr: io.Discard, version: "test"}).RunRealIPRefresh(stdcontext.Background(), configPath, "edgeone-prod", plan, []string{appOriginProtectionManualConfirmation})
+	if err == nil || !strings.Contains(err.Error(), "app realip refresh preflight found 1 failed check") {
+		t.Fatalf("RunRealIPRefresh() error = %v, want root gate after confirmation", err)
+	}
+	if strings.Contains(err.Error(), "requires manual confirmations") {
+		t.Fatalf("RunRealIPRefresh() error = %v, confirmation was not forwarded to typed path", err)
+	}
+	if result.RetryCommand != workflow.ShellCommand("sudo", "lanpanel", "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--confirmation", appOriginProtectionManualConfirmation) {
+		t.Fatalf("RetryCommand = %q", result.RetryCommand)
+	}
+	if len(result.Progress) == 0 {
+		t.Fatal("Progress = empty, want realip refresh progress events")
+	}
+}
+
+func TestUIHostWorkflowMainStatusUsesCheckpointStatusResponse(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "lanpanel.yaml")
+	if err := config.ExampleConfig().WriteFile(configPath); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	checkpointPath := filepath.Join(dir, "state", "checkpoint.json")
+	checkpoint := state.Checkpoint{}
+	checkpoint.MarkCompleted("runtime-assets-installed")
+	checkpoint.RecordModifiedPaths("/etc/headscale/config.yaml")
+	if err := state.NewStore(checkpointPath).Save(checkpoint); err != nil {
+		t.Fatalf("Save(checkpoint) error = %v", err)
+	}
+
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	t.Cleanup(func() {
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+	})
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+
+	result, err := newUIHostWorkflow(context{stdout: io.Discard, stderr: io.Discard, version: "test"}).RunMainStatus(stdcontext.Background(), configPath)
+	if err != nil {
+		t.Fatalf("RunMainStatus() error = %v", err)
+	}
+	if result.Kind != domain.JobKindStatus {
+		t.Fatalf("Kind = %q, want status", result.Kind)
+	}
+	if result.Status != domain.JobStatusUnknown {
+		t.Fatalf("Status = %q, want unknown for stale deploy context", result.Status)
+	}
+	if !strings.Contains(result.Summary, "persisted deploy context is missing its desired-state fingerprint") {
+		t.Fatalf("Summary = %q, want stale deploy context summary", result.Summary)
+	}
+	if result.RetryCommand != workflow.ShellCommand("lanpanel", "status", "--config", configPath) {
+		t.Fatalf("RetryCommand = %q, want status retry command", result.RetryCommand)
+	}
+	if got, ok := fieldValue(result.Fields, "checkpoint path"); !ok || got != checkpointPath {
+		t.Fatalf("checkpoint path field = %q, %v; want %q", got, ok, checkpointPath)
+	}
+}
+
+func TestUIHostWorkflowMainDeployUsesTypedResultWithoutStdout(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "missing-lanpanel.yaml")
+	stdout := failWriter{t: t, name: "stdout"}
+	result, err := newUIHostWorkflow(context{stdout: stdout, stderr: io.Discard, version: "test"}).RunMainDeploy(stdcontext.Background(), configPath)
+	if err != nil {
+		t.Fatalf("RunMainDeploy() error = %v", err)
+	}
+	if result.Kind != domain.JobKindDeploy || result.Status != domain.JobStatusFailed {
+		t.Fatalf("result = %#v, want failed deploy operation result", result)
+	}
+	if result.Summary != "no config file found" {
+		t.Fatalf("Summary = %q, want typed missing-config summary", result.Summary)
+	}
+	if result.RetryCommand != workflow.ShellCommand("lanpanel", "deploy", "--config", configPath) {
+		t.Fatalf("RetryCommand = %q, want typed deploy retry command", result.RetryCommand)
+	}
+}
+
+type failWriter struct {
+	t    *testing.T
+	name string
+}
+
+func (writer failWriter) Write(data []byte) (int, error) {
+	writer.t.Helper()
+	writer.t.Fatalf("%s Write(%q), want no CLI stdout rendering", writer.name, string(data))
+	return 0, nil
+}
+
+type stubManagementUIServer struct {
+	err error
+}
+
+func (server stubManagementUIServer) StartupURL() string {
+	return "http://127.0.0.1:18080/login-token-redacted"
+}
+
+func (server stubManagementUIServer) SSHExample() string {
+	return "ssh -L 18080:127.0.0.1:18080 user@server"
+}
+
+func (server stubManagementUIServer) TokenTTL() time.Duration {
+	return time.Minute
+}
+
+func (server stubManagementUIServer) ListenAndServe() error {
+	return server.err
+}
+
+func secureUITestStateDir(t *testing.T) string {
+	t.Helper()
+	return secureCLIStateParent(t)
+}
+
+func secureCLIStateParent(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir() error = %v", err)
+	}
+	dir, err := os.MkdirTemp(home, ".lanpanel-cli-test-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	return dir
 }
 
 func TestExecute_AppHelpOutputIsEnglishReadable(t *testing.T) {
@@ -173,8 +714,9 @@ func TestExecute_AppRealIPValidateReferenceHelp(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Report deployed realip profile diagnostics.",
-		"lanpanel app realip diagnostics --profile name [--format human|json]",
+		"lanpanel app realip diagnostics --config path --profile name [--format human|json]",
 		"--profile string",
+		"--config string",
 		"--format string",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -191,14 +733,145 @@ func TestExecute_AppRealIPValidateReferenceHelp(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Validate a deployed realip app reference.",
-		"lanpanel app realip validate-reference --profile name --app name --path path",
+		"lanpanel app realip validate-reference --profile name --app name --path path [--format human|json]",
 		"--profile string",
 		"--app string",
 		"--path string",
+		"--format string",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout = %q, want substring %q", stdout, want)
 		}
+	}
+}
+
+func TestExecute_AppRealIPValidateReferenceWritesTypedOutput(t *testing.T) {
+	path := "/var/lib/lanpanel/realip/edgeone-prod/references/first.json"
+	previous := runRealIPValidateReferenceFn
+	t.Cleanup(func() { runRealIPValidateReferenceFn = previous })
+
+	runRealIPValidateReferenceFn = func(ctx workflow.Context, profileName string, appName string, referencePath string) (workflow.OperationResult, error) {
+		if ctx.Version != "test" {
+			t.Fatalf("workflow context version = %q, want test", ctx.Version)
+		}
+		if profileName != "edgeone-prod" || appName != "first" || referencePath != path {
+			t.Fatalf("RunRealIPValidateReference args = %q, %q, %q", profileName, appName, referencePath)
+		}
+		return workflow.OperationResult{
+			Kind:    domain.JobKindRealIPValidateRef,
+			Status:  domain.JobStatusSucceeded,
+			Summary: "realip reference validation passed",
+			Fields: []output.Field{
+				{Label: "profile", Value: profileName},
+				{Label: "app", Value: appName},
+				{Label: "reference path", Value: referencePath},
+				{Label: "domains", Value: "app.example.com"},
+			},
+			Diagnostics: []domain.DiagnosticItem{{
+				ID:               "realip-reference-file",
+				Status:           domain.DiagnosticStatusPass,
+				Scope:            domain.DiagnosticScopeRealIP,
+				Severity:         domain.DiagnosticSeverityInfo,
+				Summary:          "realip reference file matches the managed contract",
+				EvidenceSource:   domain.DiagnosticEvidenceRenderedFile,
+				ResponsibleParty: domain.DiagnosticResponsibleLanPanel,
+				Redaction:        domain.RedactionNone,
+				RedactionStatus:  domain.RedactionStatusNoSensitiveData,
+			}},
+		}, nil
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "realip", "validate-reference", "--profile", "edgeone-prod", "--app", "first", "--path", path, "--format", "json")
+	if err != nil {
+		t.Fatalf("Execute(json) error = %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("json stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app realip validate-reference" || response.Status != "passed" || response.Summary != "realip reference validation passed" {
+		t.Fatalf("json response = %#v, want passed validate-reference response", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindRealIPValidateRef || result.Status != domain.JobStatusSucceeded || result.Summary != response.Summary {
+		t.Fatalf("operation result = %#v, want validate-reference success", result)
+	}
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].ID != "realip-reference-file" {
+		t.Fatalf("operation result diagnostics = %#v, want validate-reference diagnostic", result.Diagnostics)
+	}
+	if got, ok := fieldValue(response.Fields, "domains"); !ok || got != "app.example.com" {
+		t.Fatalf("domains field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+
+	stdout, stderr, err = runCLI(t, "app", "realip", "validate-reference", "--profile", "edgeone-prod", "--app", "first", "--path", path)
+	if err != nil {
+		t.Fatalf("Execute(human) error = %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("human stderr = %q, want empty", stderr)
+	}
+	for _, want := range []string{
+		"lanpanel app realip validate-reference: realip reference validation passed",
+		"profile: edgeone-prod",
+		"app: first",
+		"domains: app.example.com",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("human stdout = %q, want substring %q", stdout, want)
+		}
+	}
+}
+
+func TestExecute_AppRealIPValidateReferenceWritesTypedFailureOutput(t *testing.T) {
+	path := "/var/lib/lanpanel/realip/edgeone-prod/references/first.json"
+	previous := runRealIPValidateReferenceFn
+	t.Cleanup(func() { runRealIPValidateReferenceFn = previous })
+
+	runRealIPValidateReferenceFn = func(workflow.Context, string, string, string) (workflow.OperationResult, error) {
+		err := errors.New("deployed realip reference must be root-only")
+		return workflow.OperationResult{
+			Kind:    domain.JobKindRealIPValidateRef,
+			Status:  domain.JobStatusFailed,
+			Summary: err.Error(),
+			Fields: []output.Field{
+				{Label: "reference path", Value: path},
+				{Label: "details", Value: err.Error()},
+			},
+			Diagnostics: []domain.DiagnosticItem{{
+				ID:               "realip-reference-file",
+				Status:           domain.DiagnosticStatusFail,
+				Scope:            domain.DiagnosticScopeRealIP,
+				Severity:         domain.DiagnosticSeverityCritical,
+				Summary:          err.Error(),
+				EvidenceSource:   domain.DiagnosticEvidenceRenderedFile,
+				ResponsibleParty: domain.DiagnosticResponsibleLanPanel,
+				BlocksActivation: true,
+				Redaction:        domain.RedactionNone,
+				RedactionStatus:  domain.RedactionStatusNoSensitiveData,
+			}},
+		}, err
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "realip", "validate-reference", "--profile", "edgeone-prod", "--app", "first", "--path", path, "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "app realip validate-reference: deployed realip reference must be root-only") {
+		t.Fatalf("Execute(json failure) error = %v, want typed validate-reference failure", err)
+	}
+	if stderr != "" {
+		t.Fatalf("json failure stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app realip validate-reference" || response.Status != "failed" || response.Summary != "deployed realip reference must be root-only" {
+		t.Fatalf("json response = %#v, want failed validate-reference response", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].Status != domain.DiagnosticStatusFail {
+		t.Fatalf("operation result diagnostics = %#v, want failing validate-reference diagnostic", result.Diagnostics)
+	}
+	if got, ok := fieldValue(response.Fields, "details"); !ok || got != "deployed realip reference must be root-only" {
+		t.Fatalf("details field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+	if len(response.NextSteps) != 1 || !strings.Contains(response.NextSteps[0], "Fix the deployed realip reference path") {
+		t.Fatalf("next steps = %#v, want validate-reference remediation", response.NextSteps)
 	}
 }
 
@@ -259,6 +932,29 @@ func TestExecute_InitWritesExampleConfig(t *testing.T) {
 	}
 }
 
+func TestExecute_InitExistingConfigWritesTypedFailure(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "lanpanel.yaml")
+	if err := os.WriteFile(configPath, []byte("existing"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	stdout, stderr, err := runCLI(t, "init", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want existing config failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindConfigSave || result.Status != domain.JobStatusFailed || result.RetryCommand == "" {
+		t.Fatalf("operation_result = %#v, want failed config_save with retry command", result)
+	}
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].Status != domain.DiagnosticStatusFail {
+		t.Fatalf("Diagnostics = %#v, want failed diagnostic", result.Diagnostics)
+	}
+}
+
 func TestExecute_AppInitWritesExampleConfig(t *testing.T) {
 	t.Parallel()
 
@@ -273,12 +969,38 @@ func TestExecute_AppInitWritesExampleConfig(t *testing.T) {
 	if !strings.Contains(stdout, "lanpanel app init: App example config written") {
 		t.Fatalf("stdout = %q, want app init summary", stdout)
 	}
+	if !strings.Contains(stdout, "create access.browser_auth.auth_basic_user_file") || !strings.Contains(stdout, "Browser Auth credential") {
+		t.Fatalf("stdout = %q, want browser auth preparation next step", stdout)
+	}
 	loaded, err := appconfig.LoadFile(configPath)
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
 	if loaded.App.Name != "example-app" {
 		t.Fatalf("app.name = %q, want example-app", loaded.App.Name)
+	}
+}
+
+func TestExecute_AppInitExistingConfigWritesTypedFailure(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "lanpanel-app.yaml")
+	if err := os.WriteFile(configPath, []byte("existing"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	stdout, stderr, err := runCLI(t, "app", "init", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want existing app config failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindAppInit || result.Status != domain.JobStatusFailed || result.RetryCommand == "" {
+		t.Fatalf("operation_result = %#v, want failed app_init with retry command", result)
+	}
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].Status != domain.DiagnosticStatusFail {
+		t.Fatalf("Diagnostics = %#v, want failed diagnostic", result.Diagnostics)
 	}
 }
 
@@ -298,11 +1020,18 @@ func TestExecute_AppVerifyRejectsExampleFlag(t *testing.T) {
 }
 
 func TestExecute_AppVerifyJSON(t *testing.T) {
-	t.Parallel()
+	useCLIResourceStore(t)
 
 	configPath := filepath.Join(t.TempDir(), "lanpanel-app.yaml")
-	if err := appconfig.WriteExampleFile(configPath); err != nil {
-		t.Fatalf("WriteExampleFile() error = %v", err)
+	cfg := appconfig.ExampleConfig()
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.BrowserAuth.AuthBasicUserFile = ""
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{}
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
+	if err := cfg.WriteFile(configPath); err != nil {
+		t.Fatalf("WriteFile(app config) error = %v", err)
 	}
 	stdout, stderr, err := runCLI(t, "app", "verify", "--config", configPath, "--format", "json")
 	if err != nil {
@@ -322,8 +1051,91 @@ func TestExecute_AppVerifyJSON(t *testing.T) {
 		t.Fatalf("summary = %q, want app verify summary", response.Summary)
 	}
 	scope, ok := fieldValue(response.Fields, "verification scope")
-	if !ok || !strings.Contains(scope, "static-only") {
+	if !ok || !strings.Contains(scope, "read-only exposure observations") {
 		t.Fatalf("verification scope = %q, %v; fields = %#v", scope, ok, response.Fields)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("operation_result.diagnostics = empty, want app verify diagnostics")
+	}
+	if result.ExposurePlan == nil || result.ExposurePlan.Resource.ID == "" {
+		t.Fatalf("operation_result.exposure_plan = %#v, want app exposure plan", result.ExposurePlan)
+	}
+}
+
+func TestExecute_AppVerifyUsesStableCLIResourceState(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "lanpanel-app.yaml")
+	cfg := appconfig.ExampleConfig()
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.BrowserAuth.AuthBasicUserFile = ""
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{}
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
+	if err := cfg.WriteFile(configPath); err != nil {
+		t.Fatalf("WriteFile(app config) error = %v", err)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "verify", "--config", configPath, "--format", "json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app verify" || response.Status != "static-passed" {
+		t.Fatalf("response = %#v, want app verify static-passed", response)
+	}
+	if got, ok := fieldValue(response.Fields, "instance id source"); !ok || got != "cli-resource-store" {
+		t.Fatalf("instance id source = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+	first := mustDecodeOperationResult(t, stdout)
+	if first.ExposurePlan == nil || first.ExposurePlan.Resource.ID == "" {
+		t.Fatalf("operation_result.exposure_plan = %#v, want static exposure plan", first.ExposurePlan)
+	}
+
+	secondStdout, _, err := runCLI(t, "app", "verify", "--config", configPath, "--format", "json")
+	if err != nil {
+		t.Fatalf("Execute() second error = %v", err)
+	}
+	second := mustDecodeOperationResult(t, secondStdout)
+	if second.ExposurePlan == nil || second.ExposurePlan.Resource.ID != first.ExposurePlan.Resource.ID {
+		t.Fatalf("resource id changed across verify runs: first=%#v second=%#v", first.ExposurePlan, second.ExposurePlan)
+	}
+}
+
+func TestExecute_AppVerifyFailsOnUnsafeResourceState(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "lanpanel-app.yaml")
+	cfg := appconfig.ExampleConfig()
+	if err := cfg.WriteFile(configPath); err != nil {
+		t.Fatalf("WriteFile(app config) error = %v", err)
+	}
+	dir := t.TempDir()
+	writableParent := filepath.Join(dir, "writable-parent")
+	if err := os.Mkdir(writableParent, 0o700); err != nil {
+		t.Fatalf("Mkdir(writable parent) error = %v", err)
+	}
+	if err := os.Chmod(writableParent, 0o777); err != nil {
+		t.Fatalf("Chmod(writable parent) error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(writableParent, 0o700)
+	})
+	previousStore := cliResourceStoreDir
+	cliResourceStoreDir = filepath.Join(writableParent, "resources")
+	t.Cleanup(func() { cliResourceStoreDir = previousStore })
+
+	stdout, _, err := runCLI(t, "app", "verify", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want unsafe resource state failure")
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app verify" || response.Status != "failed" {
+		t.Fatalf("response = %#v, want app verify failed", response)
+	}
+	if !strings.Contains(response.Summary, "App exposure instance initialization failed") {
+		t.Fatalf("summary = %q, want resource instance failure", response.Summary)
 	}
 }
 
@@ -347,7 +1159,7 @@ func TestExecute_AppDeployInvalidConfigReturnsErrorWithJSON(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("api_version: wrong\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil {
 		t.Fatal("Execute() error = nil, want invalid config error")
 	}
@@ -387,6 +1199,180 @@ func TestExecute_AppDeployPreflightBlockReturnsErrorWithJSON(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), response.Summary) {
 		t.Fatalf("error = %q, want summary %q", err.Error(), response.Summary)
+	}
+}
+
+func TestExecute_AppDeployRequiresManualExposureConfirmationBeforePreflight(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	previousPermission := detectPermissionStateFn
+	previousDNS := detectAppDNSFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		detectAppDNSFn = previousDNS
+	})
+	detectPermissionStateFn = func() preflight.PermissionState {
+		return preflight.PermissionState{User: "deploy", SudoWorks: true}
+	}
+	detectAppDNSFn = func(appconfig.Config) map[string]preflight.DNSProbe {
+		t.Fatal("detectAppDNSFn called before app deploy root gate")
+		return nil
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "app deploy exposure plan requires manual confirmations") {
+		t.Fatalf("Execute() error = %v, want manual confirmation error", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app deploy" || response.Status != "blocked" {
+		t.Fatalf("response = %#v, want app deploy blocked", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindAppDeploy || result.Status != domain.JobStatusFailed || result.Summary != response.Summary {
+		t.Fatalf("operation result = %#v, want app deploy failed block", result)
+	}
+	if got, ok := fieldValue(response.Fields, "missing confirmations"); !ok || !strings.Contains(got, appOriginProtectionManualConfirmation) {
+		t.Fatalf("missing confirmations field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+}
+
+func TestExecute_AppDeployManualExposureConfirmationProceedsToRootGate(t *testing.T) {
+	resourceDir := useCLIResourceStore(t)
+	uiStateDir := filepath.Dir(resourceDir)
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	previousPermission := detectPermissionStateFn
+	previousDNS := detectAppDNSFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		detectAppDNSFn = previousDNS
+	})
+	detectPermissionStateFn = func() preflight.PermissionState {
+		return preflight.PermissionState{User: "deploy", SudoWorks: true}
+	}
+	detectAppDNSFn = func(appconfig.Config) map[string]preflight.DNSProbe {
+		t.Fatal("detectAppDNSFn called before app deploy root gate")
+		return nil
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "app deploy preflight found 1 failed check") {
+		t.Fatalf("Execute() error = %v, want root gate error", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app deploy" || response.Status != "blocked" {
+		t.Fatalf("response = %#v, want app deploy blocked", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.ExposurePlan == nil || len(result.ExposurePlan.Access.ManualConfirmations) != 1 {
+		t.Fatalf("operation_result.exposure_plan = %#v, want recorded manual confirmation", result.ExposurePlan)
+	}
+	records, err := uistate.NewStore(uiStateDir).ListRecords()
+	if err != nil {
+		t.Fatalf("ListRecords() error = %v", err)
+	}
+	if len(records) != 1 || records[0].Kind != domain.JobKindAppDeploy || records[0].Status != domain.JobStatusSucceeded {
+		t.Fatalf("records = %#v, want succeeded CLI manual confirmation record", records)
+	}
+	events, err := uistate.NewStore(uiStateDir).ListEvents(records[0].ID)
+	if err != nil {
+		t.Fatalf("ListEvents() error = %v", err)
+	}
+	if !eventsContain(events, "manual confirmation submitted: origin-protection-manual") {
+		t.Fatalf("events = %#v, want manual confirmation event", events)
+	}
+	if got, ok := fieldValue(response.Fields, "check permissions"); !ok || !strings.Contains(got, "root privileges") || !strings.Contains(got, "deploy") {
+		t.Fatalf("permissions field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+}
+
+func TestCLIExposurePlanUsesPersistedInstanceIDAcrossConfigPaths(t *testing.T) {
+	resourceDir := useCLIResourceStore(t)
+	cfg := appconfig.ExampleConfig()
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
+
+	first, err := cliAppHostMutationExposurePlan("test", "/etc/lanpanel/first-app.yaml", cfg, domain.ExposurePlanOperationDeploy, preflight.PermissionState{IsRoot: true}, nil)
+	if err != nil {
+		t.Fatalf("cliAppHostMutationExposurePlan(first) error = %v", err)
+	}
+	second, err := cliAppHostMutationExposurePlan("test", "/opt/lanpanel/second-app.yaml", cfg, domain.ExposurePlanOperationDeploy, preflight.PermissionState{IsRoot: true}, nil)
+	if err != nil {
+		t.Fatalf("cliAppHostMutationExposurePlan(second) error = %v", err)
+	}
+	if first.Resource.ID != second.Resource.ID {
+		t.Fatalf("Resource.ID changed with config path: first %q second %q", first.Resource.ID, second.Resource.ID)
+	}
+	data, err := os.ReadFile(filepath.Join(resourceDir, "instance_id"))
+	if err != nil {
+		t.Fatalf("ReadFile(instance_id) error = %v", err)
+	}
+	var stored struct {
+		SchemaVersion string `json:"schema_version"`
+		InstanceID    string `json:"instance_id"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatalf("Unmarshal(instance_id) error = %v; data = %q", err, data)
+	}
+	if stored.SchemaVersion != domain.InstanceSchemaVersion || !strings.HasPrefix(stored.InstanceID, "ins_") {
+		t.Fatalf("instance_id record = %#v, want schema %q and persisted ins_ id", stored, domain.InstanceSchemaVersion)
+	}
+}
+
+func TestCLIExposurePlanBlocksUnverifiedEdgeOneOriginProtection(t *testing.T) {
+	useCLIResourceStore(t)
+	useStubRealIPProfileLock(t, "edgeone-prod", nil)
+	cfg := appconfig.ExampleConfig()
+	configureReviewAppEdgeOneOrigin(&cfg)
+
+	plan, err := cliAppHostMutationExposurePlan("test", "/etc/lanpanel/lanpanel-app.yaml", cfg, domain.ExposurePlanOperationRealIPRefresh, preflight.PermissionState{IsRoot: true}, nil)
+	if err != nil {
+		t.Fatalf("cliAppHostMutationExposurePlan() error = %v", err)
+	}
+	if plan.OriginProtection == domain.OriginProtectionConfiguredManual || plan.Decision.Status == domain.ExposurePlanDecisionManual {
+		t.Fatalf("plan = %#v, want unverified EdgeOne to block as unknown/fail instead of manual", plan)
+	}
+	if plan.Decision.Status != domain.ExposurePlanDecisionUnknown && plan.Decision.Status != domain.ExposurePlanDecisionFail {
+		t.Fatalf("Decision.Status = %q, want unknown or fail", plan.Decision.Status)
+	}
+}
+
+func TestCLIBrowserAuthReadyCheckSetsRuntimeReadable(t *testing.T) {
+	useCLIResourceStore(t)
+	previousDetectAppBrowserAuthFileState := detectAppBrowserAuthFileStateFn
+	t.Cleanup(func() { detectAppBrowserAuthFileStateFn = previousDetectAppBrowserAuthFileState })
+	detectAppBrowserAuthFileStateFn = func(appconfig.Config) (bool, bool, string) {
+		return true, true, "browser auth runtime file checks passed"
+	}
+
+	cfg := appconfig.ExampleConfig()
+	cfg.Access.AccessMode = appconfig.AccessModeBrowser
+	cfg.Access.PublicRiskConfirmed = false
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{
+		CredentialID:        "review",
+		HtpasswdPath:        "/etc/lanpanel/browser-auth/review.htpasswd",
+		Username:            "admin",
+		PasswordFingerprint: "sha256:0011223344556677",
+	}
+
+	observations := cliObservedBrowserAuthObservations(cfg)
+	if observations.BrowserAuthRuntimeStatus != domain.DiagnosticStatusPass {
+		t.Fatalf("BrowserAuthRuntimeStatus = %q, want pass", observations.BrowserAuthRuntimeStatus)
+	}
+	if observations.BrowserAuthMarkerStatus != domain.DiagnosticStatusPass {
+		t.Fatalf("BrowserAuthMarkerStatus = %q, want static managed marker pass", observations.BrowserAuthMarkerStatus)
+	}
+	plan, err := cliAppHostMutationExposurePlan("test", "/etc/lanpanel/browser-app.yaml", cfg, domain.ExposurePlanOperationDeploy, preflight.PermissionState{IsRoot: true}, nil)
+	if err != nil {
+		t.Fatalf("cliAppHostMutationExposurePlan() error = %v", err)
+	}
+	if plan.Decision.Status == domain.ExposurePlanDecisionFail || plan.Decision.Status == domain.ExposurePlanDecisionUnknown || len(plan.Decision.Blockers) != 0 {
+		t.Fatalf("plan = %#v, want runtime-readable browser auth without blockers", plan)
 	}
 }
 
@@ -1051,18 +2037,33 @@ func TestExecute_AppDeployStaticFailureReturnsErrorWithJSON(t *testing.T) {
 }
 
 func TestExecute_AppVerifyStaticFailureReturnsErrorWithJSON(t *testing.T) {
+	useCLIResourceStore(t)
+
 	configPath := writeReviewAppConfig(t)
-	previousStage := stageAppRuntimeFilesFn
+	previousRun := runAppVerifyWorkflowFn
 	t.Cleanup(func() {
-		stageAppRuntimeFilesFn = previousStage
+		runAppVerifyWorkflowFn = previousRun
 	})
-	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
-		return []apprender.StagedFile{{
-			SourcePath: "templates/app/nginx.conf.tmpl",
-			HostPath:   filepath.Join(t.TempDir(), "review-app.conf"),
-			Mode:       0o644,
-			Content:    []byte("server { listen 443 ssl; }"),
-		}}, nil
+	runAppVerifyWorkflowFn = func(workflow.Context, string, string) (workflow.OperationResult, error) {
+		return workflow.OperationResult{
+			Kind:    domain.JobKindAppVerify,
+			Status:  domain.JobStatusFailed,
+			Summary: "app verify found 1 failing check",
+			Fields:  []output.Field{{Label: "check nginx", Value: "fail: missing Nginx app site template"}},
+			Diagnostics: []domain.DiagnosticItem{{
+				ID:               "nginx",
+				Status:           domain.DiagnosticStatusFail,
+				Scope:            domain.DiagnosticScopeResource,
+				Severity:         domain.DiagnosticSeverityCritical,
+				Summary:          "missing Nginx app site template",
+				EvidenceSource:   domain.DiagnosticEvidenceRenderedFile,
+				ResponsibleParty: domain.DiagnosticResponsibleLanPanel,
+				BlocksActivation: true,
+				Redaction:        domain.RedactionNone,
+				RedactionStatus:  domain.RedactionStatusNoSensitiveData,
+			}},
+			RetryCommand: workflow.ShellCommand("lanpanel", "app", "verify", "--config", configPath),
+		}, nil
 	}
 
 	stdout, stderr, err := runCLI(t, "app", "verify", "--config", configPath, "--format", "json")
@@ -1075,6 +2076,10 @@ func TestExecute_AppVerifyStaticFailureReturnsErrorWithJSON(t *testing.T) {
 	response := mustDecodeResponse(t, stdout)
 	if response.Command != "app verify" || response.Status != "failed" {
 		t.Fatalf("response = %#v, want app verify failed", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].ID != "nginx" {
+		t.Fatalf("operation_result.diagnostics = %#v, want workflow diagnostics", result.Diagnostics)
 	}
 }
 
@@ -1300,6 +2305,18 @@ func TestExecute_AppDeploySurfacesPreflightWarningsOnSuccess(t *testing.T) {
 	if !ok || !strings.Contains(warning, "could not confirm") {
 		t.Fatalf("preflight warning field = %q, %v; fields = %#v", warning, ok, response.Fields)
 	}
+	if got, ok := fieldValue(response.Fields, "access mode"); !ok || got != "public" {
+		t.Fatalf("access mode field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+	if got, ok := fieldValue(response.Fields, "public exposure risk"); !ok || !strings.Contains(got, "confirmed=true") || !strings.Contains(got, "no LanPanel Basic Auth") {
+		t.Fatalf("public exposure risk field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+	if got, ok := fieldValue(response.Fields, "origin protection"); !ok || got != "none" {
+		t.Fatalf("origin protection field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+	if got, ok := fieldValue(response.Fields, "direct origin risk"); !ok || got != "confirmed=true" {
+		t.Fatalf("direct origin risk field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
 	if !slices.ContainsFunc(response.NextSteps, func(step string) bool {
 		return strings.Contains(step, "advanced.network.public_ipv4")
 	}) {
@@ -1350,13 +2367,16 @@ func TestDetectAppExpectedPublicIPsFallsBackToCurrentHostProbe(t *testing.T) {
 	t.Cleanup(func() {
 		detectAppCurrentPublicIPsFn = previousDetect
 	})
-	detectAppCurrentPublicIPsFn = func(*http.Client) (string, string) {
-		return "8.8.8.8", "2001:4860:4860::8888"
+	detectAppCurrentPublicIPsFn = func(*http.Client) (string, string, error) {
+		return "8.8.8.8", "2001:4860:4860::8888", nil
 	}
 
 	cfg := appconfig.New()
 	cfg.Tailscale.LoginServer = "https://hs.example.com"
-	ipv4, ipv6 := detectAppExpectedPublicIPs(cfg)
+	ipv4, ipv6, err := detectAppExpectedPublicIPs(cfg)
+	if err != nil {
+		t.Fatalf("detectAppExpectedPublicIPs() error = %v", err)
+	}
 	if ipv4 != "8.8.8.8" || ipv6 != "2001:4860:4860::8888" {
 		t.Fatalf("detectAppExpectedPublicIPs() = %q, %q; want detected public IPs", ipv4, ipv6)
 	}
@@ -1674,6 +2694,203 @@ func TestExecute_AppDeployUpstreamRemovesManagedListenService(t *testing.T) {
 	if slices.Contains(events, "systemctl-enable review-app.service") || slices.Contains(events, "systemctl-restart review-app.service") {
 		t.Fatalf("events = %v, did not expect local app service activation", events)
 	}
+	checkpoint, err := state.NewStore(state.DefaultCheckpointPath(configPath)).Load()
+	if err != nil {
+		t.Fatalf("Load(app checkpoint) error = %v", err)
+	}
+	if checkpoint.LastFailure != nil || checkpoint.CurrentCheckpoint != "" || !checkpoint.HasDeployContext() {
+		t.Fatalf("app checkpoint = %#v, want successful deploy context", checkpoint)
+	}
+	if !slices.Contains(checkpoint.ModifiedPaths, "/etc/nginx/sites-available/review-app.conf") {
+		t.Fatalf("app checkpoint modified paths = %#v, want app site", checkpoint.ModifiedPaths)
+	}
+}
+
+func TestExecute_AppDeployUpstreamRollsBackStaleListenServiceSystemdStateAfterTimerFailure(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
+		cfg.App.Listen = ""
+		cfg.App.Upstream = "100.64.10.20:18001"
+		cfg.Service.ExecStart = ""
+		cfg.Service.WorkingDirectory = ""
+		cfg.Tailscale.LoginServer = "https://hs.example.com"
+	})
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	servicePath := "/etc/systemd/system/" + names.ServiceUnit
+	oldServiceUnit := []byte("# Lanpanel-managed: app.name=review-app\n[Service]\nExecStart=/usr/bin/old-review-app\n")
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		servicePath: {content: oldServiceUnit, mode: 0o644},
+	}}
+
+	events := []string{}
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		if event := appDeployOrderEvent(command); event != "" {
+			events = append(events, event)
+		}
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "tailscale" && strings.Join(actual.Args, " ") == "status --json" {
+			return host.Result{Stdout: `{"BackendState":"Running","Self":{"Online":true}}`}, nil
+		}
+		if actual.Name == "tailscale" && strings.Join(actual.Args, " ") == "debug prefs" {
+			return host.Result{Stdout: `{"ControlURL":"https://hs.example.com","RouteAll":false,"CorpDNS":false,"ShieldsUp":true}`}, nil
+		}
+		if actual.Name == "cat" && len(actual.Args) == 1 && actual.Args[0] == "/var/lib/lanpanel/tailscale-client.json" {
+			return host.Result{Stdout: `{"login_server":"https://hs.example.com","accept_dns":false,"accept_routes":false,"shields_up":true,"managed_by":"lanpanel"}`}, nil
+		}
+		if actual.Name == "sh" && len(actual.Args) >= 3 && actual.Args[2] == "lanpanel-app-remove-stale-service" {
+			delete(fileSystem.files, servicePath)
+			return host.Result{Stdout: servicePath + "\n"}, nil
+		}
+		if actual.Name == "systemctl" {
+			switch strings.Join(actual.Args, " ") {
+			case "is-enabled " + names.ServiceUnit:
+				return host.Result{Stdout: "enabled\n"}, nil
+			case "is-active " + names.ServiceUnit:
+				return host.Result{Stdout: "active\n"}, nil
+			case "enable " + names.ServiceUnit:
+				events = append(events, "restore-enable-service")
+			case "start " + names.ServiceUnit:
+				events = append(events, "restore-start-service")
+			case "start " + names.RenewTimerUnit:
+				return host.Result{Stderr: "timer start failed"}, errors.New("timer start failed")
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want renew timer start failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "Failed to start app certificate renewal timer" {
+		t.Fatalf("summary = %q, want renew timer failure", response.Summary)
+	}
+	if got, ok := fileSystem.files[servicePath]; !ok || !bytes.Equal(got.content, oldServiceUnit) {
+		t.Fatalf("%s = %#v, want restored old service unit", servicePath, got)
+	}
+	for _, want := range []string{"remove-stale-service", "restore-enable-service", "restore-start-service"} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("events = %#v, missing %q", events, want)
+		}
+	}
+}
+
+func TestExecute_AppDeployRejectsRuntimeEnabledServiceStateBeforeSystemdMutation(t *testing.T) {
+	configPath := writeReviewAppConfig(t)
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
+
+	serviceMutations := []string{}
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{}, nil
+		}
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "is-enabled " + names.ServiceUnit:
+				return host.Result{Stdout: "enabled-runtime\n"}, nil
+			case "enable " + names.ServiceUnit, "restart " + names.ServiceUnit, "enable " + names.RenewTimerUnit, "start " + names.RenewTimerUnit:
+				serviceMutations = append(serviceMutations, args)
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want runtime-enabled systemd snapshot failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "systemd unit state snapshot failed" {
+		t.Fatalf("summary = %q, want systemd snapshot failure", response.Summary)
+	}
+	if !strings.Contains(stdout, "enabled-runtime") {
+		t.Fatalf("stdout = %q, want unsupported enabled-runtime state detail", stdout)
+	}
+	if len(serviceMutations) != 0 {
+		t.Fatalf("service mutations = %#v, want none before exact state snapshot failure", serviceMutations)
+	}
 }
 
 func TestExecute_AppDeployEnabledSiteGuardBlocksForeignPath(t *testing.T) {
@@ -1964,7 +3181,9 @@ func TestExecute_AppDeployRealIPReferenceWaitsForLaterGuards(t *testing.T) {
 		enabled := true
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "route53"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2044,7 +3263,7 @@ func TestExecute_AppDeployRealIPReferenceWaitsForLaterGuards(t *testing.T) {
 		}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil {
 		t.Fatal("Execute() error = nil, want Nginx server_name conflict")
 	}
@@ -2070,7 +3289,9 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "tencentcloud"
 		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2098,6 +3319,7 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 	previousFileSystem := newAppHostFileSystemFn
 	previousReferenceReader := readDeployedRealIPReferencesFn
 	previousLoadCredentials := loadEdgeOneCredentialsFn
+	previousDescribe := describeEdgeOneOriginACLFn
 	previousAcquireRealIPProfileLock := acquireRealIPProfileLockFn
 	t.Cleanup(func() {
 		stageAppRuntimeFilesFn = previousStage
@@ -2105,6 +3327,7 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 		newAppHostFileSystemFn = previousFileSystem
 		readDeployedRealIPReferencesFn = previousReferenceReader
 		loadEdgeOneCredentialsFn = previousLoadCredentials
+		describeEdgeOneOriginACLFn = previousDescribe
 		acquireRealIPProfileLockFn = previousAcquireRealIPProfileLock
 	})
 	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
@@ -2119,8 +3342,25 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 	readDeployedRealIPReferencesFn = func(string) ([]realip.Reference, error) {
 		return nil, nil
 	}
+	loadCredentialCalls := 0
 	loadEdgeOneCredentialsFn = func(edgeone.FileSystem, string) (edgeone.Credentials, error) {
+		loadCredentialCalls++
+		if loadCredentialCalls == 1 {
+			return edgeone.Credentials{SecretID: "id", SecretKey: "key"}, nil
+		}
 		return edgeone.Credentials{}, errors.New("credential boom")
+	}
+	describeEdgeOneOriginACLFn = func(stdcontext.Context, edgeone.Credentials, string) (*edgeone.OriginACLInfo, error) {
+		return &edgeone.OriginACLInfo{
+			Status:          "online",
+			L7Hosts:         []string{"app.example.com"},
+			OriginACLFamily: "global",
+			CurrentOriginACL: &edgeone.OriginACL{
+				Version:         "v1",
+				ActiveTime:      "2026-06-01T00:00:00Z",
+				EntireAddresses: edgeone.Addresses{IPv4: []string{"8.8.8.8"}},
+			},
+		}, nil
 	}
 	acquireRealIPProfileLockFn = func(profileName string) (realIPProfileLock, error) {
 		if profileName != "edgeone-prod" {
@@ -2131,7 +3371,7 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 		}}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil {
 		t.Fatal("Execute() error = nil, want credential and lock release failure")
 	}
@@ -2153,17 +3393,21 @@ func TestExecute_AppDeploySurfacesRealIPLockReleaseFailureOnDeployFailure(t *tes
 func TestExecute_AppDeployRejectsHTTP01RealIPBeforeHostSideEffects(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "lanpanel-app.yaml")
 	if err := os.WriteFile(configPath, []byte(`
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 app:
   name: review-app
   domains: [app.example.com]
   certificate_email: ops@example.com
   acme_challenge: http-01
   listen: 127.0.0.1:18001
+access:
+  access_mode: public
+  public_risk_confirmed: true
+  origin_protection:
+    mode: edgeone
+    edgeone_profile: edgeone-prod
 service:
   exec_start: /bin/true --listen 127.0.0.1:18001
-nginx:
-  realip_profile: edgeone-prod
 realip:
   profiles:
     edgeone-prod:
@@ -2209,7 +3453,7 @@ realip:
 		t.Fatalf("status = %q, want invalid-config", response.Status)
 	}
 	details, ok := fieldValue(response.Fields, "details")
-	if !ok || !strings.Contains(details, "app.acme_challenge must be dns-01 when nginx.realip_profile references an EdgeOne profile") {
+	if !ok || !strings.Contains(details, "app.acme_challenge must be dns-01 when access.origin_protection.mode is edgeone") {
 		t.Fatalf("details = %q, %v; want HTTP-01 realip validation failure", details, ok)
 	}
 }
@@ -2298,6 +3542,19 @@ func TestExecute_AppDeployHappyPathOrder(t *testing.T) {
 				{"lego-run", "nginx-enabled-guard-activate"},
 				{"nginx-enabled-guard-activate", "nginx-enable"},
 				{"nginx-enable", "systemctl-enable review-app.service"},
+			},
+		},
+		{
+			name: "listen browser http01",
+			configure: func(cfg *appconfig.Config) {
+				cfg.Access.AccessMode = appconfig.AccessModeBrowser
+				cfg.Access.PublicRiskConfirmed = false
+				cfg.Access.BrowserAuth.AuthBasicUserFile = "/etc/review-app/browser.htpasswd"
+			},
+			wantBefore: [][2]string{
+				{"apt-install", "browser-auth-guard"},
+				{"browser-auth-guard", "systemctl-enable-now nginx.service"},
+				{"browser-auth-guard", "nginx-enabled-guard-activate"},
 			},
 		},
 		{
@@ -2438,7 +3695,9 @@ func TestExecute_AppDeployInstallsRealIPReferenceBeforeNginxReload(t *testing.T)
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "tencentcloud"
 		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2552,7 +3811,7 @@ func TestExecute_AppDeployInstallsRealIPReferenceBeforeNginxReload(t *testing.T)
 		}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err != nil {
 		t.Fatalf("Execute() error = %v\nstdout=%s", err, stdout)
 	}
@@ -2584,7 +3843,9 @@ func TestExecute_AppDeployRollsBackRealIPSharedArtifactsOnNginxReloadFailure(t *
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "tencentcloud"
 		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2625,9 +3886,11 @@ func TestExecute_AppDeployRollsBackRealIPSharedArtifactsOnNginxReloadFailure(t *
 	}
 	marker := realIPManagedMarker("edgeone-prod", appconfig.RealIPProviderEdgeOne)
 	oldState := mustJSON(t, struct {
+		SchemaVersion   string `json:"schema_version"`
 		LanpanelManaged string `json:"lanpanel_managed"`
 		realip.State
 	}{
+		SchemaVersion:   realip.StateSchemaVersion,
 		LanpanelManaged: marker,
 		State: realip.State{
 			ProfileName:     "edgeone-prod",
@@ -2717,7 +3980,7 @@ func TestExecute_AppDeployRollsBackRealIPSharedArtifactsOnNginxReloadFailure(t *
 			delete(fileSystem.files, actual.Args[2])
 			return host.Result{}, nil
 		}
-		if actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload-or-restart nginx.service" {
+		if actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload nginx.service" {
 			reloads++
 			if reloads == 1 {
 				return host.Result{Stderr: "reload failed"}, errors.New("reload failed")
@@ -2732,7 +3995,7 @@ func TestExecute_AppDeployRollsBackRealIPSharedArtifactsOnNginxReloadFailure(t *
 		return host.NewSystemd(executor)
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil {
 		t.Fatal("Execute() error = nil, want Nginx reload failure")
 	}
@@ -2769,13 +4032,499 @@ func TestExecute_AppDeployRollsBackRealIPSharedArtifactsOnNginxReloadFailure(t *
 	}
 }
 
+func TestExecute_AppDeployRollsBackRealIPSharedArtifactsAfterPostActivationTimerFailure(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
+		enabled := true
+		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
+		cfg.DNS01.Provider = "tencentcloud"
+		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
+		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
+			"edgeone-prod": {
+				Enabled:  &enabled,
+				Provider: appconfig.RealIPProviderEdgeOne,
+				EdgeOne: appconfig.RealIPEdgeOneConfig{
+					ZoneID:  "zone-2abcDEF123",
+					EnvFile: "/etc/lanpanel/realip/edgeone-prod.env",
+				},
+			},
+		}
+	})
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	detectAppDNSCredentialStateFn = func(appconfig.Config) (bool, bool, string) {
+		return true, true, "dns credentials ready"
+	}
+
+	realIPNames, err := appsvc.NewRealIPProfileNames("edgeone-prod", appconfig.RealIPProviderEdgeOne, "review-app")
+	if err != nil {
+		t.Fatalf("NewRealIPProfileNames() error = %v", err)
+	}
+	appNames, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	oldAppNginxSite := []byte("# Lanpanel-managed: app.name=review-app\nold app site without realip\n")
+	oldProfile := realip.ProfileConfig{
+		Name:            "edgeone-prod",
+		Provider:        appconfig.RealIPProviderEdgeOne,
+		ZoneID:          "zone-2abcDEF123",
+		EnvFile:         "/etc/lanpanel/realip/edgeone-prod.env",
+		RefreshInterval: "72h",
+		Domains:         []string{"app.example.com"},
+	}
+	marker := realIPManagedMarker("edgeone-prod", appconfig.RealIPProviderEdgeOne)
+	oldState := mustJSON(t, struct {
+		SchemaVersion   string `json:"schema_version"`
+		LanpanelManaged string `json:"lanpanel_managed"`
+		realip.State
+	}{
+		SchemaVersion:   realip.StateSchemaVersion,
+		LanpanelManaged: marker,
+		State: realip.State{
+			ProfileName:     "edgeone-prod",
+			Provider:        appconfig.RealIPProviderEdgeOne,
+			ZoneID:          "zone-2abcDEF123",
+			OriginACLFamily: "global",
+			TrustedCIDRs:    []string{"7.7.7.7/32"},
+		},
+	})
+	oldFiles := map[string][]byte{
+		realIPNames.NginxIncludePath:   []byte(marker + "\nold active\n"),
+		realIPNames.TrustedCIDRPath:    []byte(marker + "\nold trusted\n"),
+		realIPNames.RefreshServicePath: []byte("# " + marker + "\nold service\n"),
+		realIPNames.RefreshTimerPath:   []byte("# " + marker + "\nold timer\n"),
+		realIPNames.StatePath:          oldState,
+		realIPNames.MetadataPath:       managedRealIPProfileJSON(t, "edgeone-prod", oldProfile),
+	}
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
+	fileSystem.files[appNames.NginxAvailablePath] = mutableRealIPFile{content: oldAppNginxSite, mode: 0o644}
+	fileSystem.files[appNames.NginxEnabledPath] = mutableRealIPFile{content: []byte(appNames.NginxAvailablePath), mode: os.ModeSymlink | 0o777}
+	for path, content := range oldFiles {
+		mode := fs.FileMode(0o644)
+		if strings.HasPrefix(path, "/var/lib/lanpanel/realip/") {
+			mode = 0o600
+		}
+		fileSystem.files[path] = mutableRealIPFile{content: append([]byte(nil), content...), mode: mode}
+	}
+
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousReferenceReader := readDeployedRealIPReferencesFn
+	previousLoadCredentials := loadEdgeOneCredentialsFn
+	previousDescribe := describeEdgeOneOriginACLFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		readDeployedRealIPReferencesFn = previousReferenceReader
+		loadEdgeOneCredentialsFn = previousLoadCredentials
+		describeEdgeOneOriginACLFn = previousDescribe
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	readDeployedRealIPReferencesFn = func(dir string) ([]realip.Reference, error) {
+		if dir != realIPNames.ReferenceDir {
+			t.Fatalf("reference dir = %q", dir)
+		}
+		return []realip.Reference{{AppName: "other-app", Profile: "edgeone-prod", Domains: []string{"other.example.com"}}}, nil
+	}
+	loadEdgeOneCredentialsFn = func(_ edgeone.FileSystem, envFile string) (edgeone.Credentials, error) {
+		if envFile != "/etc/lanpanel/realip/edgeone-prod.env" {
+			t.Fatalf("envFile = %q", envFile)
+		}
+		return edgeone.Credentials{SecretID: "id", SecretKey: "key"}, nil
+	}
+	describeEdgeOneOriginACLFn = func(_ stdcontext.Context, _ edgeone.Credentials, zoneID string) (*edgeone.OriginACLInfo, error) {
+		if zoneID != "zone-2abcDEF123" {
+			t.Fatalf("zoneID = %q", zoneID)
+		}
+		return &edgeone.OriginACLInfo{
+			Status:          "online",
+			L7Hosts:         []string{"app.example.com", "other.example.com"},
+			OriginACLFamily: "global",
+			CurrentOriginACL: &edgeone.OriginACL{
+				Version:         "v2",
+				ActiveTime:      "2026-06-01T00:00:00Z",
+				EntireAddresses: edgeone.Addresses{IPv4: []string{"8.8.8.8"}},
+			},
+		}, nil
+	}
+	reloads := 0
+	systemdRollbackEvents := []string{}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{}, nil
+		}
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "stop " + appNames.ServiceUnit,
+				"disable " + appNames.ServiceUnit,
+				"stop " + appNames.RenewTimerUnit,
+				"disable " + appNames.RenewTimerUnit,
+				"stop " + realIPNames.RefreshTimerUnit,
+				"disable " + realIPNames.RefreshTimerUnit:
+				systemdRollbackEvents = append(systemdRollbackEvents, args)
+			}
+			if args == "reload nginx.service" {
+				reloads++
+				return host.Result{}, nil
+			}
+			if args == "start "+realIPNames.RefreshTimerUnit {
+				return host.Result{Stderr: "timer start failed"}, errors.New("timer start failed")
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want realip timer start failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "Failed to start realip refresh timer" {
+		t.Fatalf("summary = %q, want realip timer start failure", response.Summary)
+	}
+	if reloads != 2 {
+		t.Fatalf("reload attempts = %d, want activation reload plus restored config reload", reloads)
+	}
+	for path, want := range oldFiles {
+		got, ok := fileSystem.files[path]
+		if !ok {
+			t.Fatalf("%s missing after rollback", path)
+		}
+		if !bytes.Equal(got.content, want) {
+			t.Fatalf("%s content = %q, want rollback to %q", path, got.content, want)
+		}
+	}
+	if _, ok := fileSystem.files[realIPNames.ReferencePathForApp]; ok {
+		t.Fatalf("%s still exists after rollback", realIPNames.ReferencePathForApp)
+	}
+	if got := fileSystem.files[appNames.NginxAvailablePath].content; !bytes.Equal(got, oldAppNginxSite) {
+		t.Fatalf("%s content = %q, want rollback to old app site %q", appNames.NginxAvailablePath, got, oldAppNginxSite)
+	}
+	if strings.Contains(string(fileSystem.files[appNames.NginxAvailablePath].content), "/etc/nginx/lanpanel/realip/edgeone-prod/active.conf") {
+		t.Fatalf("%s still references realip include after rollback\n%s", appNames.NginxAvailablePath, string(fileSystem.files[appNames.NginxAvailablePath].content))
+	}
+	if _, ok := fileSystem.files[appNames.NginxEnabledPath]; !ok {
+		t.Fatalf("%s missing after rollback", appNames.NginxEnabledPath)
+	}
+	for _, want := range []string{
+		"stop " + realIPNames.RefreshTimerUnit,
+		"disable " + realIPNames.RefreshTimerUnit,
+		"stop " + appNames.RenewTimerUnit,
+		"disable " + appNames.RenewTimerUnit,
+		"stop " + appNames.ServiceUnit,
+		"disable " + appNames.ServiceUnit,
+	} {
+		if !slices.Contains(systemdRollbackEvents, want) {
+			t.Fatalf("systemd rollback events = %#v, missing %q", systemdRollbackEvents, want)
+		}
+	}
+}
+
+func TestExecute_AppDeployRollsBackAppNginxSiteWithoutRealIPOnReloadFailure(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
+		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
+		cfg.DNS01.Provider = "tencentcloud"
+		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
+	})
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	detectAppDNSCredentialStateFn = func(appconfig.Config) (bool, bool, string) {
+		return true, true, "dns credentials ready"
+	}
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	servicePath := filepath.Join("/etc/systemd/system", names.ServiceUnit)
+	renewTimerPath := filepath.Join("/etc/systemd/system", names.RenewTimerUnit)
+	defaultSitePath := "/etc/nginx/sites-enabled/default"
+	defaultSiteTarget := "/etc/nginx/sites-available/default"
+	oldAppNginxSite := []byte("# Lanpanel-managed: app.name=review-app\nold app site\n")
+	oldServiceUnit := []byte("# Lanpanel-managed: app.name=review-app\n[Service]\nExecStart=/usr/bin/old-review-app\n")
+	oldRenewTimer := []byte("# Lanpanel-managed: app.name=review-app\n[Timer]\nOnCalendar=old\n")
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		names.NginxAvailablePath: {content: oldAppNginxSite, mode: 0o644},
+		names.NginxEnabledPath:   {content: []byte(names.NginxAvailablePath), mode: os.ModeSymlink | 0o777},
+		defaultSitePath:          {content: []byte(defaultSiteTarget), mode: os.ModeSymlink | 0o777},
+		servicePath:              {content: oldServiceUnit, mode: 0o644},
+		renewTimerPath:           {content: oldRenewTimer, mode: 0o644},
+	}}
+
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	reloads := 0
+	nginxTests := 0
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{}, nil
+		}
+		if actual.Name == "readlink" && len(actual.Args) == 2 && actual.Args[0] == "--" && actual.Args[1] == defaultSitePath {
+			return host.Result{Stdout: defaultSiteTarget + "\n"}, nil
+		}
+		if actual.Name == "ln" && len(actual.Args) == 4 && actual.Args[0] == "-sfn" && actual.Args[1] == "--" && actual.Args[3] == defaultSitePath {
+			fileSystem.files[defaultSitePath] = mutableRealIPFile{content: []byte(actual.Args[2]), mode: os.ModeSymlink | 0o777}
+			return host.Result{}, nil
+		}
+		if actual.Name == appsvc.NginxBinaryPath && strings.Join(actual.Args, " ") == "-t" {
+			nginxTests++
+		}
+		if actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload nginx.service" {
+			reloads++
+			if reloads == 1 {
+				return host.Result{Stderr: "reload failed"}, errors.New("reload failed")
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want Nginx reload failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "Failed to enable app Nginx site" {
+		t.Fatalf("summary = %q, want Nginx activation failure", response.Summary)
+	}
+	if reloads != 2 {
+		t.Fatalf("reload attempts = %d, want failed reload plus restored config reload", reloads)
+	}
+	if nginxTests < 2 {
+		t.Fatalf("nginx -t calls = %d, want activation test plus rollback verification", nginxTests)
+	}
+	if got := fileSystem.files[names.NginxAvailablePath].content; !bytes.Equal(got, oldAppNginxSite) {
+		t.Fatalf("%s content = %q, want rollback to old app site %q", names.NginxAvailablePath, got, oldAppNginxSite)
+	}
+	if got := fileSystem.files[servicePath].content; !bytes.Equal(got, oldServiceUnit) {
+		t.Fatalf("%s content = %q, want rollback to old service %q", servicePath, got, oldServiceUnit)
+	}
+	if got := fileSystem.files[renewTimerPath].content; !bytes.Equal(got, oldRenewTimer) {
+		t.Fatalf("%s content = %q, want rollback to old renew timer %q", renewTimerPath, got, oldRenewTimer)
+	}
+	if _, ok := fileSystem.files[names.HookPath]; ok {
+		t.Fatalf("%s still exists after rollback", names.HookPath)
+	}
+	if _, ok := fileSystem.files[names.NginxEnabledPath]; !ok {
+		t.Fatalf("%s missing after rollback", names.NginxEnabledPath)
+	}
+	if got, ok := fileSystem.files[defaultSitePath]; !ok || got.mode&os.ModeSymlink == 0 || string(got.content) != defaultSiteTarget {
+		t.Fatalf("%s = %#v, want restored symlink to %s", defaultSitePath, got, defaultSiteTarget)
+	}
+}
+
+func TestExecute_AppDeployRollsBackAppRuntimeAfterPostActivationServiceFailure(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
+		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
+		cfg.DNS01.Provider = "tencentcloud"
+		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
+	})
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	detectAppDNSCredentialStateFn = func(appconfig.Config) (bool, bool, string) {
+		return true, true, "dns credentials ready"
+	}
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	servicePath := filepath.Join("/etc/systemd/system", names.ServiceUnit)
+	renewTimerPath := filepath.Join("/etc/systemd/system", names.RenewTimerUnit)
+	oldAppNginxSite := []byte("# Lanpanel-managed: app.name=review-app\nold app site\n")
+	oldServiceUnit := []byte("# Lanpanel-managed: app.name=review-app\n[Service]\nExecStart=/usr/bin/old-review-app\n")
+	oldRenewTimer := []byte("# Lanpanel-managed: app.name=review-app\n[Timer]\nOnCalendar=old\n")
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		names.NginxAvailablePath: {content: oldAppNginxSite, mode: 0o644},
+		names.NginxEnabledPath:   {content: []byte(names.NginxAvailablePath), mode: os.ModeSymlink | 0o777},
+		servicePath:              {content: oldServiceUnit, mode: 0o644},
+		renewTimerPath:           {content: oldRenewTimer, mode: 0o644},
+	}}
+
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	reloads := 0
+	nginxTests := 0
+	daemonReloads := 0
+	systemdRollbackEvents := []string{}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{}, nil
+		}
+		if actual.Name == appsvc.NginxBinaryPath && strings.Join(actual.Args, " ") == "-t" {
+			nginxTests++
+		}
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "daemon-reload":
+				daemonReloads++
+			case "reload nginx.service":
+				reloads++
+			case "stop " + names.ServiceUnit, "disable " + names.ServiceUnit, "stop " + names.RenewTimerUnit, "disable " + names.RenewTimerUnit:
+				systemdRollbackEvents = append(systemdRollbackEvents, args)
+			case "restart " + names.ServiceUnit:
+				return host.Result{Stderr: "restart failed"}, errors.New("restart failed")
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want app service restart failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "Failed to restart app service" {
+		t.Fatalf("summary = %q, want app service restart failure", response.Summary)
+	}
+	if reloads != 2 {
+		t.Fatalf("reload attempts = %d, want activation reload plus restored config reload", reloads)
+	}
+	if nginxTests < 2 {
+		t.Fatalf("nginx -t calls = %d, want activation test plus rollback verification", nginxTests)
+	}
+	if daemonReloads < 2 {
+		t.Fatalf("daemon-reload calls = %d, want deploy reload plus rollback reload", daemonReloads)
+	}
+	for _, want := range []string{"stop " + names.ServiceUnit, "disable " + names.ServiceUnit} {
+		if !slices.Contains(systemdRollbackEvents, want) {
+			t.Fatalf("systemd rollback events = %#v, missing %q", systemdRollbackEvents, want)
+		}
+	}
+	for _, unexpected := range []string{"stop " + names.RenewTimerUnit, "disable " + names.RenewTimerUnit} {
+		if slices.Contains(systemdRollbackEvents, unexpected) {
+			t.Fatalf("systemd rollback events = %#v, did not expect %q before renew timer mutation", systemdRollbackEvents, unexpected)
+		}
+	}
+	if got := fileSystem.files[names.NginxAvailablePath].content; !bytes.Equal(got, oldAppNginxSite) {
+		t.Fatalf("%s content = %q, want rollback to old app site %q", names.NginxAvailablePath, got, oldAppNginxSite)
+	}
+	if got := fileSystem.files[servicePath].content; !bytes.Equal(got, oldServiceUnit) {
+		t.Fatalf("%s content = %q, want rollback to old service %q", servicePath, got, oldServiceUnit)
+	}
+	if got := fileSystem.files[renewTimerPath].content; !bytes.Equal(got, oldRenewTimer) {
+		t.Fatalf("%s content = %q, want rollback to old renew timer %q", renewTimerPath, got, oldRenewTimer)
+	}
+	if _, ok := fileSystem.files[names.HookPath]; ok {
+		t.Fatalf("%s still exists after rollback", names.HookPath)
+	}
+	if _, ok := fileSystem.files[names.NginxEnabledPath]; !ok {
+		t.Fatalf("%s missing after rollback", names.NginxEnabledPath)
+	}
+}
+
 func TestExecute_AppDeployRollsBackPartialRealIPReferenceInstallFailure(t *testing.T) {
 	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
 		enabled := true
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "tencentcloud"
 		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2865,7 +4614,7 @@ func TestExecute_AppDeployRollsBackPartialRealIPReferenceInstallFailure(t *testi
 		return host.NewExecutor(runner, env)
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "reference install boom") {
 		t.Fatalf("Execute() error = %v, want reference install failure\nstdout=%s", err, stdout)
 	}
@@ -2887,7 +4636,9 @@ func TestExecute_AppDeployDoesNotInstallRealIPReferenceBeforeCertificateSuccess(
 		cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 		cfg.DNS01.Provider = "tencentcloud"
 		cfg.DNS01.EnvFile = "/etc/lanpanel/dns/tencentcloud.env"
-		cfg.Nginx.RealIPProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+		cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+		cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 		cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 			"edgeone-prod": {
 				Enabled:  &enabled,
@@ -2957,7 +4708,7 @@ func TestExecute_AppDeployDoesNotInstallRealIPReferenceBeforeCertificateSuccess(
 		}, nil
 	}
 
-	stdout, _, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	stdout, _, err := runCLI(t, "app", "deploy", "--config", configPath, "--confirmation", appOriginProtectionManualConfirmation, "--format", "json")
 	if err == nil {
 		t.Fatal("Execute() error = nil, want certificate failure")
 	}
@@ -3108,6 +4859,67 @@ func TestExecute_AppDeployGoAccessExplicitLogChecksReadableBeforeDirectoryWrites
 			strings.Contains(step, "journalctl -u "+names.ServiceUnit+" -e")
 	}) {
 		t.Fatalf("next steps = %#v, want error log and app service troubleshooting commands", response.NextSteps)
+	}
+}
+
+func TestExecute_AppDeployBrowserAuthBootstrapReachesRootGuard(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
+		cfg.Access.AccessMode = appconfig.AccessModeBrowser
+		cfg.Access.PublicRiskConfirmed = false
+		cfg.Access.BrowserAuth.AuthBasicUserFile = "/etc/review-app/browser.htpasswd"
+	})
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+
+	events := []string{}
+	rootGuardSawBrowserAuthBootstrap := false
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return recordingAppInstaller{
+			events:  &events,
+			results: []host.FileInstallResult{{HostPath: "/etc/nginx/sites-available/review-app.conf", Changed: true}},
+		}
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(&scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+			if event := appDeployOrderEvent(command); event != "" {
+				events = append(events, event)
+			}
+			if command.DisplayName == "guard-app-root-directories" && slices.Contains(command.Args, cfg.Access.BrowserAuth.AuthBasicUserFile) {
+				rootGuardSawBrowserAuthBootstrap = true
+			}
+			return host.Result{}, nil
+		}}, env)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v\nstdout=%s", err, stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !rootGuardSawBrowserAuthBootstrap {
+		t.Fatalf("browser deploy root guard did not receive auth bootstrap path %q", cfg.Access.BrowserAuth.AuthBasicUserFile)
+	}
+	assertEventBefore(t, events, "browser-auth-guard", "install-files")
+	response := mustDecodeResponse(t, stdout)
+	if response.Status != "applied" {
+		t.Fatalf("response = %#v, want applied", response)
 	}
 }
 
@@ -3362,6 +5174,10 @@ func TestExecute_AppDeployRejectsGoAccessAccessLogHiddenBySystemdIsolation(t *te
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/tmp"
 	cfg.Nginx.AccessLog = "/var/log/lanpanel/custom/review-app.access.log"
@@ -3479,6 +5295,115 @@ func TestExecute_AppDeployDisabledGoAccessRemovesStaleRuntime(t *testing.T) {
 	actions, ok := fieldValue(response.Fields, "host actions")
 	if !ok || !strings.Contains(actions, "removed stale GoAccess runtime") {
 		t.Fatalf("host actions = %q, %v; fields = %#v", actions, ok, response.Fields)
+	}
+}
+
+func TestExecute_AppDeployRollsBackDisabledGoAccessRuntimeAfterLaterTimerFailure(t *testing.T) {
+	configPath := writeReviewAppConfig(t)
+	cfg, err := appconfig.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	staged := stagedRuntimeWithTempHostPaths(t, cfg)
+	stubPassingAppDeployPreflight(t)
+	names, err := appsvc.NewNames(cfg)
+	if err != nil {
+		t.Fatalf("NewNames() error = %v", err)
+	}
+	goAccessUnitPath := "/etc/systemd/system/" + names.GoAccessServiceUnit
+	oldGoAccessUnit := []byte("# Lanpanel-managed: app.name=review-app\n[Service]\nExecStart=/usr/bin/goaccess-old\n")
+	oldGoAccessConfig := []byte("# Lanpanel-managed: app.name=review-app\nold goaccess config\n")
+	oldGoAccessLogrotate := []byte("# Lanpanel-managed: app.name=review-app\nold logrotate\n")
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		goAccessUnitPath:            {content: oldGoAccessUnit, mode: 0o644},
+		names.GoAccessConfigPath:    {content: oldGoAccessConfig, mode: 0o644},
+		names.GoAccessLogrotatePath: {content: oldGoAccessLogrotate, mode: 0o644},
+	}}
+
+	events := []string{}
+	previousStage := stageAppRuntimeFilesFn
+	previousInstaller := newAppFileInstallerFn
+	previousExecutor := newHostExecutorFn
+	previousFileSystem := newAppHostFileSystemFn
+	previousSystemd := newHostSystemdFn
+	t.Cleanup(func() {
+		stageAppRuntimeFilesFn = previousStage
+		newAppFileInstallerFn = previousInstaller
+		newHostExecutorFn = previousExecutor
+		newAppHostFileSystemFn = previousFileSystem
+		newHostSystemdFn = previousSystemd
+	})
+	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
+		return staged, nil
+	}
+	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newAppHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{}, nil
+		}
+		if actual.Name == "sh" && len(actual.Args) >= 3 && actual.Args[2] == "lanpanel-app-remove-goaccess-runtime" {
+			delete(fileSystem.files, goAccessUnitPath)
+			delete(fileSystem.files, names.GoAccessConfigPath)
+			delete(fileSystem.files, names.GoAccessLogrotatePath)
+			events = append(events, "remove-goaccess-runtime")
+			return host.Result{Stdout: strings.Join([]string{goAccessUnitPath, names.GoAccessConfigPath, names.GoAccessLogrotatePath}, "\n") + "\n"}, nil
+		}
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "is-enabled " + names.GoAccessServiceUnit:
+				return host.Result{Stdout: "enabled\n"}, nil
+			case "is-active " + names.GoAccessServiceUnit:
+				return host.Result{Stdout: "active\n"}, nil
+			case "enable " + names.GoAccessServiceUnit:
+				events = append(events, "restore-enable-goaccess")
+			case "start " + names.GoAccessServiceUnit:
+				events = append(events, "restore-start-goaccess")
+			case "start " + names.RenewTimerUnit:
+				return host.Result{Stderr: "timer start failed"}, errors.New("timer start failed")
+			}
+		}
+		return host.Result{}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
+	if err == nil {
+		t.Fatal("Execute() error = nil, want renew timer start failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Summary != "Failed to start app certificate renewal timer" {
+		t.Fatalf("summary = %q, want renew timer failure", response.Summary)
+	}
+	for path, want := range map[string][]byte{
+		goAccessUnitPath:            oldGoAccessUnit,
+		names.GoAccessConfigPath:    oldGoAccessConfig,
+		names.GoAccessLogrotatePath: oldGoAccessLogrotate,
+	} {
+		got, ok := fileSystem.files[path]
+		if !ok || !bytes.Equal(got.content, want) {
+			t.Fatalf("%s = %#v, want restored content %q", path, got, want)
+		}
+	}
+	for _, want := range []string{"remove-goaccess-runtime", "restore-enable-goaccess", "restore-start-goaccess"} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("events = %#v, missing %q", events, want)
+		}
 	}
 }
 
@@ -4846,7 +6771,7 @@ func TestExecute_AppDeployChecksTailscaleBeforePortHandoffStops(t *testing.T) {
 	}
 }
 
-func TestExecute_AppDeployCreatesLocalHeadscalePreauthKeyForDerivedLoginServer(t *testing.T) {
+func TestExecute_AppDeployRequiresExplicitTailscaleAuthMaterialForDerivedLoginServer(t *testing.T) {
 	baseDir := t.TempDir()
 	mainConfigPath := filepath.Join(baseDir, "lanpanel.yaml")
 	writeReviewMainConfig(t, mainConfigPath, "https://hs.example.com")
@@ -4857,67 +6782,39 @@ func TestExecute_AppDeployCreatesLocalHeadscalePreauthKeyForDerivedLoginServer(t
 		cfg.Service.WorkingDirectory = ""
 		cfg.Tailscale.LanpanelConfig = mainConfigPath
 	})
-	cfg, err := appconfig.LoadFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	staged := stagedRuntimeWithTempHostPaths(t, cfg)
 	stubPassingAppDeployPreflight(t)
 
-	secret := "tskey-auth-secret-cli-regression"
-	previousStage := stageAppRuntimeFilesFn
-	previousInstaller := newAppFileInstallerFn
 	previousExecutor := newHostExecutorFn
 	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
 		actual := unwrapMaybeSudoHostCommand(command)
-		switch actual.Name {
-		case "tailscale":
-			if strings.Join(actual.Args, " ") == "status --json" {
-				return host.Result{Command: command, Stdout: `{"BackendState":"NeedsLogin"}`}, nil
-			}
-		case "headscale":
-			args := strings.Join(actual.Args, " ")
-			switch {
-			case strings.Contains(args, "users list --output json"):
-				return host.Result{Command: command, Stdout: `[{"id":2,"name":"lanpanel"}]`}, nil
-			case strings.Contains(args, "preauthkeys create"):
-				return host.Result{Command: command, Stdout: secret + "\n"}, nil
-			}
+		if actual.Name == "tailscale" && strings.Join(actual.Args, " ") == "status --json" {
+			return host.Result{Command: command, Stdout: `{"BackendState":"NeedsLogin"}`}, nil
 		}
 		return host.Result{Command: command}, nil
 	}}
 	t.Cleanup(func() {
-		stageAppRuntimeFilesFn = previousStage
-		newAppFileInstallerFn = previousInstaller
 		newHostExecutorFn = previousExecutor
 	})
-	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
-		return staged, nil
-	}
-	newAppFileInstallerFn = func(host.Executor, host.PrivilegeStrategy) appStagedFileInstaller {
-		return stubFileInstaller{results: []host.FileInstallResult{{HostPath: "/etc/nginx/sites-available/review-app.conf", Changed: true}}}
-	}
 	newHostExecutorFn = func(env map[string]string) host.Executor {
 		return host.NewExecutor(runner, env)
 	}
 
 	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
-	if err != nil {
-		t.Fatalf("Execute() error = %v\nstdout=%s", err, stdout)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want explicit auth material failure")
 	}
 	if stderr != "" {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
 	response := mustDecodeResponse(t, stdout)
-	if response.Status != "applied" {
-		t.Fatalf("response = %#v, want applied", response)
+	if response.Summary != "Tailscale client prerequisite failed" {
+		t.Fatalf("summary = %q, want Tailscale failure", response.Summary)
 	}
-	if strings.Contains(stdout, secret) {
-		t.Fatalf("stdout leaked local Headscale preauth key: %q", stdout)
+	details, ok := fieldValue(response.Fields, "details")
+	if !ok || !strings.Contains(details, "app deploy does not create Headscale preauth keys") || !strings.Contains(details, "tailscale.auth_key_file") {
+		t.Fatalf("details = %q, %v; want explicit auth material guidance", details, ok)
 	}
 
-	preauthFound := false
-	tailscaleUpFound := false
 	tailscaledEnableCount := 0
 	for _, command := range runner.commands {
 		actual := unwrapMaybeSudoHostCommand(command)
@@ -4926,181 +6823,14 @@ func TestExecute_AppDeployCreatesLocalHeadscalePreauthKeyForDerivedLoginServer(t
 			tailscaledEnableCount++
 		}
 		if actual.Name == "headscale" && strings.Contains(args, "preauthkeys create") {
-			preauthFound = true
-			if !strings.Contains(args, "--expiration 1h") {
-				t.Fatalf("preauth command args = %q, want 1h expiration", args)
-			}
-			if strings.Contains(args, "--reusable") {
-				t.Fatalf("preauth command args = %q, must not be reusable", args)
-			}
+			t.Fatalf("commands = %#v, app deploy must not create a Headscale preauth key", runner.commands)
 		}
 		if actual.Name == "tailscale" && len(actual.Args) > 0 && actual.Args[0] == "up" {
-			tailscaleUpFound = true
-			if !slices.Contains(actual.Args, "--login-server") || !slices.Contains(actual.Args, "https://hs.example.com") {
-				t.Fatalf("tailscale up args = %#v, want derived login server", actual.Args)
-			}
-			if !slices.Contains(actual.Args, secret) {
-				t.Fatalf("tailscale up args = %#v, want auth key passed to child process", actual.Args)
-			}
-			if strings.Contains(command.String(), secret) {
-				t.Fatalf("tailscale up display leaked auth key: %q", command.String())
-			}
-			if !strings.Contains(command.String(), "<redacted>") {
-				t.Fatalf("tailscale up display = %q, want redacted auth key", command.String())
-			}
+			t.Fatalf("commands = %#v, app deploy must not run tailscale up without explicit auth material", runner.commands)
 		}
-	}
-	if !preauthFound {
-		t.Fatalf("commands = %#v, want local Headscale preauth creation", runner.commands)
-	}
-	if !tailscaleUpFound {
-		t.Fatalf("commands = %#v, want tailscale up", runner.commands)
 	}
 	if tailscaledEnableCount != 1 {
 		t.Fatalf("tailscaled enable count = %d, want 1; commands = %#v", tailscaledEnableCount, runner.commands)
-	}
-}
-
-func TestExecute_AppDeployMasksLocalHeadscalePreauthKeyWhenPreauthCreationFails(t *testing.T) {
-	baseDir := t.TempDir()
-	mainConfigPath := filepath.Join(baseDir, "lanpanel.yaml")
-	writeReviewMainConfig(t, mainConfigPath, "https://hs.example.com")
-	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
-		cfg.App.Listen = ""
-		cfg.App.Upstream = "100.64.10.20:18001"
-		cfg.Service.ExecStart = ""
-		cfg.Service.WorkingDirectory = ""
-		cfg.Tailscale.LanpanelConfig = mainConfigPath
-	})
-	cfg, err := appconfig.LoadFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	staged := stagedRuntimeWithTempHostPaths(t, cfg)
-	stubPassingAppDeployPreflight(t)
-
-	secret := "tskey-auth-secret-cli-regression"
-	previousStage := stageAppRuntimeFilesFn
-	previousExecutor := newHostExecutorFn
-	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
-		actual := unwrapMaybeSudoHostCommand(command)
-		switch actual.Name {
-		case "tailscale":
-			if strings.Join(actual.Args, " ") == "status --json" {
-				return host.Result{Command: command, Stdout: `{"BackendState":"NeedsLogin"}`}, nil
-			}
-		case "headscale":
-			args := strings.Join(actual.Args, " ")
-			switch {
-			case strings.Contains(args, "users list --output json"):
-				return host.Result{Command: command, Stdout: `[{"id":2,"name":"lanpanel"}]`}, nil
-			case strings.Contains(args, "preauthkeys create"):
-				return host.Result{Command: command, Stdout: secret + "\n", Stderr: "created " + secret + " but failed", ExitCode: 1}, errors.New("headscale failed with " + secret)
-			}
-		}
-		return host.Result{Command: command}, nil
-	}}
-	t.Cleanup(func() {
-		stageAppRuntimeFilesFn = previousStage
-		newHostExecutorFn = previousExecutor
-	})
-	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
-		return staged, nil
-	}
-	newHostExecutorFn = func(env map[string]string) host.Executor {
-		return host.NewExecutor(runner, env)
-	}
-
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
-	if err == nil {
-		t.Fatal("Execute() error = nil, want non-nil")
-	}
-	if stderr != "" {
-		t.Fatalf("stderr = %q, want empty", stderr)
-	}
-	if strings.Contains(stdout, secret) || strings.Contains(err.Error(), secret) {
-		t.Fatalf("failure output leaked local Headscale preauth key:\nstdout=%s\nerr=%v", stdout, err)
-	}
-	response := mustDecodeResponse(t, stdout)
-	if response.Summary != "Tailscale client prerequisite failed" {
-		t.Fatalf("summary = %q, want Tailscale failure", response.Summary)
-	}
-	details, ok := fieldValue(response.Fields, "details")
-	if !ok || !strings.Contains(details, "<redacted>") {
-		t.Fatalf("details = %q, %v; want redacted auth key", details, ok)
-	}
-}
-
-func TestExecute_AppDeployMasksLocalHeadscalePreauthKeyWhenTailscaleUpFails(t *testing.T) {
-	baseDir := t.TempDir()
-	mainConfigPath := filepath.Join(baseDir, "lanpanel.yaml")
-	writeReviewMainConfig(t, mainConfigPath, "https://hs.example.com")
-	configPath := writeReviewAppConfigWith(t, func(cfg *appconfig.Config) {
-		cfg.App.Listen = ""
-		cfg.App.Upstream = "100.64.10.20:18001"
-		cfg.Service.ExecStart = ""
-		cfg.Service.WorkingDirectory = ""
-		cfg.Tailscale.LanpanelConfig = mainConfigPath
-	})
-	cfg, err := appconfig.LoadFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	staged := stagedRuntimeWithTempHostPaths(t, cfg)
-	stubPassingAppDeployPreflight(t)
-
-	secret := "tskey-auth-secret-cli-regression"
-	previousStage := stageAppRuntimeFilesFn
-	previousExecutor := newHostExecutorFn
-	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
-		actual := unwrapMaybeSudoHostCommand(command)
-		switch actual.Name {
-		case "tailscale":
-			if strings.Join(actual.Args, " ") == "status --json" {
-				return host.Result{Command: command, Stdout: `{"BackendState":"NeedsLogin"}`}, nil
-			}
-			if len(actual.Args) > 0 && actual.Args[0] == "up" {
-				return host.Result{Command: command, Stderr: "failed with " + secret, ExitCode: 1}, errors.New("tailscale rejected " + secret)
-			}
-		case "headscale":
-			args := strings.Join(actual.Args, " ")
-			switch {
-			case strings.Contains(args, "users list --output json"):
-				return host.Result{Command: command, Stdout: `[{"id":2,"name":"lanpanel"}]`}, nil
-			case strings.Contains(args, "preauthkeys create"):
-				return host.Result{Command: command, Stdout: secret + "\n"}, nil
-			}
-		}
-		return host.Result{Command: command}, nil
-	}}
-	t.Cleanup(func() {
-		stageAppRuntimeFilesFn = previousStage
-		newHostExecutorFn = previousExecutor
-	})
-	stageAppRuntimeFilesFn = func(appconfig.Config) ([]apprender.StagedFile, error) {
-		return staged, nil
-	}
-	newHostExecutorFn = func(env map[string]string) host.Executor {
-		return host.NewExecutor(runner, env)
-	}
-
-	stdout, stderr, err := runCLI(t, "app", "deploy", "--config", configPath, "--format", "json")
-	if err == nil {
-		t.Fatal("Execute() error = nil, want non-nil")
-	}
-	if stderr != "" {
-		t.Fatalf("stderr = %q, want empty", stderr)
-	}
-	if strings.Contains(stdout, secret) || strings.Contains(err.Error(), secret) {
-		t.Fatalf("failure output leaked local Headscale preauth key:\nstdout=%s\nerr=%v", stdout, err)
-	}
-	response := mustDecodeResponse(t, stdout)
-	if response.Summary != "Tailscale client prerequisite failed" {
-		t.Fatalf("summary = %q, want Tailscale failure", response.Summary)
-	}
-	details, ok := fieldValue(response.Fields, "details")
-	if !ok || !strings.Contains(details, "<redacted>") {
-		t.Fatalf("details = %q, %v; want redacted auth key", details, ok)
 	}
 }
 
@@ -5112,6 +6842,21 @@ func mustDecodeResponse(t *testing.T, stdout string) output.Response {
 		t.Fatalf("json.Unmarshal() error = %v; stdout = %q", err, stdout)
 	}
 	return response
+}
+
+func mustDecodeOperationResult(t *testing.T, stdout string) workflow.OperationResult {
+	t.Helper()
+
+	var envelope struct {
+		OperationResult workflow.OperationResult `json:"operation_result"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; stdout = %q", err, stdout)
+	}
+	if envelope.OperationResult.Kind == "" {
+		t.Fatalf("operation_result missing from stdout = %q", stdout)
+	}
+	return envelope.OperationResult
 }
 
 func writeReviewAppConfig(t *testing.T) string {
@@ -5129,6 +6874,10 @@ func writeReviewAppConfigWith(t *testing.T, configure func(*appconfig.Config)) s
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/tmp"
 	if configure != nil {
@@ -5138,6 +6887,37 @@ func writeReviewAppConfigWith(t *testing.T, configure func(*appconfig.Config)) s
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	return configPath
+}
+
+func configureReviewAppEdgeOneOrigin(cfg *appconfig.Config) {
+	enabled := true
+	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
+	cfg.DNS01.Provider = "tencentcloud"
+	cfg.DNS01.EnvFile = "/etc/lanpanel/dns01.env"
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
+	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
+		"edgeone-prod": {
+			Enabled:  &enabled,
+			Provider: appconfig.RealIPProviderEdgeOne,
+			EdgeOne: appconfig.RealIPEdgeOneConfig{
+				ZoneID:  "zone-2abcDEF123",
+				EnvFile: "/etc/lanpanel/realip/edgeone-prod.env",
+			},
+		},
+	}
+}
+
+func configureReviewBrowserAuthManagedApp(cfg *appconfig.Config) {
+	cfg.Access.AccessMode = appconfig.AccessModeBrowser
+	cfg.Access.PublicRiskConfirmed = false
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{
+		CredentialID:        "review",
+		HtpasswdPath:        "/etc/lanpanel/browser-auth/review.htpasswd",
+		Username:            "admin",
+		PasswordFingerprint: "sha256:0011223344556677",
+	}
 }
 
 func writeReviewMainConfig(t *testing.T, path string, serverURL string) {
@@ -5191,7 +6971,7 @@ func appDeployOrderEvent(command host.Command) string {
 			return "systemctl-enable lanpanel-realip-edgeone-prod-refresh.timer"
 		case "start lanpanel-realip-edgeone-prod-refresh.timer":
 			return "systemctl-start lanpanel-realip-edgeone-prod-refresh.timer"
-		case "reload-or-restart nginx.service":
+		case "reload nginx.service":
 			return "nginx-reload"
 		}
 	case "sh":
@@ -5205,6 +6985,8 @@ func appDeployOrderEvent(command host.Command) string {
 				return "remove-goaccess-runtime"
 			case "lanpanel-app-remove-goaccess-logrotate":
 				return "remove-goaccess-logrotate"
+			case "lanpanel-app-browser-auth-file":
+				return "browser-auth-guard"
 			case "lanpanel-app-guard-goaccess-runtime-removal":
 				return "guard-goaccess-runtime-removal"
 			case "lanpanel-app-guard-goaccess-logrotate-removal":
@@ -5239,6 +7021,19 @@ func assertEventBefore(t *testing.T, events []string, before string, after strin
 	afterIndex := slices.Index(events, after)
 	if beforeIndex < 0 || afterIndex < 0 || beforeIndex >= afterIndex {
 		t.Fatalf("events = %v, want %q before %q", events, before, after)
+	}
+}
+
+func assertEventSubsequence(t *testing.T, events []string, want ...string) {
+	t.Helper()
+
+	start := 0
+	for _, expected := range want {
+		index := slices.Index(events[start:], expected)
+		if index < 0 {
+			t.Fatalf("events = %v, want subsequence %v", events, want)
+		}
+		start += index + 1
 	}
 }
 
@@ -5353,6 +7148,8 @@ func (fileSystem readOnlyAppFileSystem) Lstat(name string) (fs.FileInfo, error) 
 func stubPassingAppDeployPreflight(t *testing.T) {
 	t.Helper()
 
+	useCLIResourceStore(t)
+
 	previousPermissionState := detectPermissionStateFn
 	previousDetectAppDNS := detectAppDNSFn
 	previousDetectAppCurrentPublicIPs := detectAppCurrentPublicIPsFn
@@ -5362,6 +7159,7 @@ func stubPassingAppDeployPreflight(t *testing.T) {
 	previousDetectAppServiceEnvFileState := detectAppServiceEnvFileStateFn
 	previousDetectAppTailscaleAuthKeyFileState := detectAppTailscaleAuthKeyFileStateFn
 	previousDetectAppGoAccessAuthFileState := detectAppGoAccessAuthFileStateFn
+	previousDetectAppBrowserAuthFileState := detectAppBrowserAuthFileStateFn
 	previousDetectAppGoAccessPortState := detectAppGoAccessPortStateFn
 	previousDetectAppGoAccessAppListenBlockers := detectAppGoAccessAppListenBlockersFn
 	previousDetectAppGoAccessAppPortBlockers := detectAppGoAccessAppPortBlockersFn
@@ -5381,6 +7179,7 @@ func stubPassingAppDeployPreflight(t *testing.T) {
 		detectAppServiceEnvFileStateFn = previousDetectAppServiceEnvFileState
 		detectAppTailscaleAuthKeyFileStateFn = previousDetectAppTailscaleAuthKeyFileState
 		detectAppGoAccessAuthFileStateFn = previousDetectAppGoAccessAuthFileState
+		detectAppBrowserAuthFileStateFn = previousDetectAppBrowserAuthFileState
 		detectAppGoAccessPortStateFn = previousDetectAppGoAccessPortState
 		detectAppGoAccessAppListenBlockersFn = previousDetectAppGoAccessAppListenBlockers
 		detectAppGoAccessAppPortBlockersFn = previousDetectAppGoAccessAppPortBlockers
@@ -5422,6 +7221,12 @@ func stubPassingAppDeployPreflight(t *testing.T) {
 	}
 	detectAppGoAccessAuthFileStateFn = func(appconfig.Config) (bool, bool, string) {
 		return true, true, "goaccess auth ok"
+	}
+	detectAppBrowserAuthFileStateFn = func(cfg appconfig.Config) (bool, bool, string) {
+		if !cfg.BrowserAuthEnabled() {
+			return false, false, ""
+		}
+		return true, true, "browser auth ok"
 	}
 	detectAppGoAccessPortStateFn = func(appconfig.Config) (bool, bool, string) {
 		return true, true, "goaccess port ok"
@@ -6060,11 +7865,11 @@ func TestSocketBindHostsOverlapUsesWildcardAddressFamily(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := socketBindHostsOverlap(tt.left, tt.right); got != tt.want {
-				t.Fatalf("socketBindHostsOverlap(%q, %q) = %v, want %v", tt.left, tt.right, got, tt.want)
+			if got := appguard.SocketBindHostsOverlap(tt.left, tt.right); got != tt.want {
+				t.Fatalf("SocketBindHostsOverlap(%q, %q) = %v, want %v", tt.left, tt.right, got, tt.want)
 			}
-			if got := socketBindHostsOverlap(tt.right, tt.left); got != tt.want {
-				t.Fatalf("socketBindHostsOverlap(%q, %q) = %v, want %v", tt.right, tt.left, got, tt.want)
+			if got := appguard.SocketBindHostsOverlap(tt.right, tt.left); got != tt.want {
+				t.Fatalf("SocketBindHostsOverlap(%q, %q) = %v, want %v", tt.right, tt.left, got, tt.want)
 			}
 		})
 	}
@@ -6420,6 +8225,92 @@ func TestDetectAppGoAccessAuthFileStateRequiresSafeParentDirectory(t *testing.T)
 	}
 }
 
+func TestDetectAppBrowserAuthFileStateRequiresManagedMarkerAndStrongBcrypt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatalf("Chmod(temp parent dir) error = %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("Chmod(temp dir) error = %v", err)
+	}
+	authFile := filepath.Join(dir, "browser.htpasswd")
+	cfg := appconfig.ExampleConfig()
+	cfg.Access.AccessMode = appconfig.AccessModeBrowser
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{
+		CredentialID:        "review-app",
+		HtpasswdPath:        authFile,
+		Username:            "admin",
+		PasswordFingerprint: "sha256:1234",
+	}
+
+	previousLstat := lstatAppServicePathFn
+	t.Cleanup(func() {
+		lstatAppServicePathFn = previousLstat
+	})
+	safeDirs := ancestorDirs(dir)
+	lstatAppServicePathFn = func(path string) (os.FileInfo, error) {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := safeDirs[path]; ok {
+			return rootOwnedModeFileInfo{name: info.Name(), mode: os.ModeDir | 0o755}, nil
+		}
+		return rootOwnedModeFileInfo{name: info.Name(), mode: info.Mode(), size: info.Size(), gid: 33}, nil
+	}
+
+	if err := os.WriteFile(authFile, []byte("admin:$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ12345\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile) error = %v", err)
+	}
+	checked, ready, detail := detectAppBrowserAuthFileState(cfg)
+	if !checked || ready || !strings.Contains(detail, "missing LanPanel marker") {
+		t.Fatalf("detectAppBrowserAuthFileState() = checked %t ready %t detail %q, want missing marker failure", checked, ready, detail)
+	}
+
+	weak := browserauth.Marker + "\nadmin:$2y$05$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ12345\n"
+	if err := os.WriteFile(authFile, []byte(weak), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile weak) error = %v", err)
+	}
+	checked, ready, detail = detectAppBrowserAuthFileState(cfg)
+	if !checked || ready || !strings.Contains(detail, "cost at least 12") {
+		t.Fatalf("detectAppBrowserAuthFileState() = checked %t ready %t detail %q, want weak bcrypt failure", checked, ready, detail)
+	}
+
+	extra := browserauth.Marker + "\nadmin:$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ12345\nbackup:plain-hash\n"
+	if err := os.WriteFile(authFile, []byte(extra), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile extra) error = %v", err)
+	}
+	checked, ready, detail = detectAppBrowserAuthFileState(cfg)
+	if !checked || ready || !strings.Contains(detail, "exactly one credential line") {
+		t.Fatalf("detectAppBrowserAuthFileState() = checked %t ready %t detail %q, want extra credential failure", checked, ready, detail)
+	}
+
+	strong := browserauth.Marker + "\nadmin:$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ12345\n"
+	if err := os.WriteFile(authFile, []byte(strong), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile strong) error = %v", err)
+	}
+	checked, ready, detail = detectAppBrowserAuthFileState(cfg)
+	if !checked || !ready {
+		t.Fatalf("detectAppBrowserAuthFileState() = checked %t ready %t detail %q, want managed file ready", checked, ready, detail)
+	}
+	if strings.Contains(detail, "Nginx runtime user www-data") || strings.Contains(detail, "runtime readability check") {
+		t.Fatalf("detail = %q, must not claim preflight completed Nginx runtime readability", detail)
+	}
+
+	cfg.Access.BrowserAuth.Managed = appconfig.ManagedBrowserAuthRef{}
+	cfg.Access.BrowserAuth.AuthBasicUserFile = authFile
+	if err := os.WriteFile(authFile, []byte("admin:plain-hash\n"), 0o640); err != nil {
+		t.Fatalf("WriteFile(authFile external) error = %v", err)
+	}
+	checked, ready, detail = detectAppBrowserAuthFileState(cfg)
+	if !checked || !ready {
+		t.Fatalf("detectAppBrowserAuthFileState() = checked %t ready %t detail %q, want external htpasswd ready without managed marker", checked, ready, detail)
+	}
+	if strings.Contains(detail, "Nginx runtime user www-data") || strings.Contains(detail, "runtime readability check") {
+		t.Fatalf("detail = %q, must not claim preflight completed Nginx runtime readability", detail)
+	}
+}
+
 func ancestorDirs(path string) map[string]struct{} {
 	dirs := map[string]struct{}{}
 	dir := path
@@ -6550,7 +8441,7 @@ func TestEnsureAppGoAccessDependencyRequiresRenderedRuntimeOptions(t *testing.T)
 	}
 }
 
-func TestEnsureAppGoAccessDependencyIncludesGoAccessOutputOnHelpFailure(t *testing.T) {
+func TestEnsureAppGoAccessDependencyOmitsGoAccessOutputOnHelpFailure(t *testing.T) {
 	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
 		if command.Name == appsvc.GoAccessBinaryPath {
 			switch strings.Join(command.Args, " ") {
@@ -6574,8 +8465,8 @@ func TestEnsureAppGoAccessDependencyIncludesGoAccessOutputOnHelpFailure(t *testi
 		t.Fatal("ensureAppGoAccessDependency() error = nil, want help failure")
 	}
 	message := err.Error()
-	if !strings.Contains(message, "output: goaccess: locale not supported") {
-		t.Fatalf("error = %q, want GoAccess output", message)
+	if strings.Contains(message, "output:") || strings.Contains(message, "goaccess: locale not supported") {
+		t.Fatalf("error = %q, must not include GoAccess output", message)
 	}
 	if strings.Contains(message, "verbose follow-up") {
 		t.Fatalf("error = %q, do not want multiline command output", message)
@@ -6675,6 +8566,12 @@ func TestEnsureAppGoAccessDependencyChecksFreshDBRestoreCompatibility(t *testing
 
 func TestAppHostDependencyPackagesForGoAccess(t *testing.T) {
 	disabled := appconfig.New()
+	disabledPackages := appHostDependencyPackages(disabled)
+	for _, want := range []string{"nginx", "apache2-utils"} {
+		if !slices.Contains(disabledPackages, want) {
+			t.Fatalf("disabled GoAccess dependencies = %#v, want base package %s", disabledPackages, want)
+		}
+	}
 	if slices.Contains(appHostDependencyPackages(disabled), "goaccess") {
 		t.Fatalf("disabled GoAccess dependencies = %#v, did not expect goaccess", appHostDependencyPackages(disabled))
 	}
@@ -6699,6 +8596,25 @@ func TestAppHostDependencyPackagesForGoAccess(t *testing.T) {
 	}
 	if slices.Contains(explicitPackages, "logrotate") {
 		t.Fatalf("explicit-log GoAccess dependencies = %#v, did not expect managed logrotate dependency", explicitPackages)
+	}
+}
+
+func TestEnsureBrowserAuthDependenciesInstallsNginxAndHtpasswdPackage(t *testing.T) {
+	runner := &scriptedHostRunner{}
+	err := ensureBrowserAuthDependencies(stdcontext.Background(), host.NewExecutor(runner, nil))
+	if err != nil {
+		t.Fatalf("ensureBrowserAuthDependencies() error = %v", err)
+	}
+	got := []string{}
+	for _, command := range runner.commands {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "apt-get" {
+			got = append(got, strings.Join(actual.Args, " "))
+		}
+	}
+	want := []string{"update", "install -y nginx apache2-utils"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("apt-get commands = %#v, want %#v", got, want)
 	}
 }
 
@@ -6834,10 +8750,7 @@ func TestExecute_DeployJSONSummary(t *testing.T) {
 		return true, true, rawURL + " returned 200."
 	}
 	hashRemoteArtifactFn = func(_ *http.Client, rawURL string) (string, error) {
-		if sha, ok := testLegoArchiveHash(t, rawURL); ok {
-			return sha, nil
-		}
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 	lookupOfficialPackageDigestFn = func(_ *http.Client, version string, arch string) (string, error) {
 		return strings.Repeat("a", 64), nil
@@ -6857,51 +8770,49 @@ func TestExecute_DeployJSONSummary(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
 
-	var response struct {
-		Command   string                  `json:"command"`
-		Status    preflight.Status        `json:"status"`
-		Summary   string                  `json:"summary"`
-		Checks    []preflight.CheckResult `json:"checks"`
-		NextSteps []string                `json:"next_steps"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v; stdout = %q", err, stdout)
-	}
+	response := mustDecodeResponse(t, stdout)
 	if response.Command != "deploy" {
 		t.Fatalf("response.Command = %q, want %q", response.Command, "deploy")
 	}
-	if response.Status != preflight.StatusFail {
+	if response.Status != string(preflight.StatusFail) {
 		t.Fatalf("response.Status = %q, want %q", response.Status, preflight.StatusFail)
 	}
 	if !strings.Contains(response.Summary, "blocked by") {
 		t.Fatalf("response.Summary = %q, want blocked-summary text", response.Summary)
 	}
-	if len(response.Checks) == 0 {
-		t.Fatal("response.Checks = empty, want preflight checks")
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindDeploy || result.Status != domain.JobStatusFailed {
+		t.Fatalf("operation result = %#v, want failed deploy result", result)
 	}
-	if response.Checks[0].ID != "permissions" {
-		t.Fatalf("first check id = %q, want %q", response.Checks[0].ID, "permissions")
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("operation result diagnostics = empty, want preflight checks")
+	}
+	if len(result.Progress) == 0 {
+		t.Fatal("operation result progress = empty, want deploy progress events")
+	}
+	if result.Diagnostics[0].ID != "preflight-permissions" {
+		t.Fatalf("first diagnostic id = %q, want %q", result.Diagnostics[0].ID, "preflight-permissions")
 	}
 
-	checksByID := map[string]preflight.CheckResult{}
-	for _, check := range response.Checks {
-		checksByID[check.ID] = check
+	diagnosticsByID := map[string]domain.DiagnosticItem{}
+	for _, diagnostic := range result.Diagnostics {
+		diagnosticsByID[strings.TrimPrefix(diagnostic.ID, "preflight-")] = diagnostic
 	}
 
-	if checksByID["ports"].Status != preflight.StatusFail {
-		t.Fatalf("ports status = %q, want %q", checksByID["ports"].Status, preflight.StatusFail)
+	if diagnosticsByID["ports"].Status != domain.DiagnosticStatusFail {
+		t.Fatalf("ports status = %q, want %q", diagnosticsByID["ports"].Status, domain.DiagnosticStatusFail)
 	}
-	if checksByID["firewall"].Status != preflight.StatusPass {
-		t.Fatalf("firewall status = %q, want %q", checksByID["firewall"].Status, preflight.StatusPass)
+	if diagnosticsByID["firewall"].Status != domain.DiagnosticStatusPass {
+		t.Fatalf("firewall status = %q, want %q", diagnosticsByID["firewall"].Status, domain.DiagnosticStatusPass)
 	}
-	if checksByID["services"].Status != preflight.StatusWarn {
-		t.Fatalf("services status = %q, want %q", checksByID["services"].Status, preflight.StatusWarn)
+	if diagnosticsByID["services"].Status != domain.DiagnosticStatusWarn {
+		t.Fatalf("services status = %q, want %q", diagnosticsByID["services"].Status, domain.DiagnosticStatusWarn)
 	}
-	if checksByID["package-source"].Status != preflight.StatusPass {
-		t.Fatalf("package-source status = %q, want %q", checksByID["package-source"].Status, preflight.StatusPass)
+	if diagnosticsByID["package-source"].Status != domain.DiagnosticStatusPass {
+		t.Fatalf("package-source status = %q, want %q", diagnosticsByID["package-source"].Status, domain.DiagnosticStatusPass)
 	}
-	if checksByID["acme"].Status != preflight.StatusPass {
-		t.Fatalf("acme status = %q, want %q", checksByID["acme"].Status, preflight.StatusPass)
+	if diagnosticsByID["acme"].Status != domain.DiagnosticStatusPass {
+		t.Fatalf("acme status = %q, want %q", diagnosticsByID["acme"].Status, domain.DiagnosticStatusPass)
 	}
 	if len(response.NextSteps) == 0 {
 		t.Fatal("response.NextSteps = empty, want remediation steps")
@@ -6969,10 +8880,7 @@ func TestExecute_DeployJSONBlocksOnManualHostChecks(t *testing.T) {
 		return true, true, rawURL + " returned 200."
 	}
 	hashRemoteArtifactFn = func(_ *http.Client, rawURL string) (string, error) {
-		if sha, ok := testLegoArchiveHash(t, rawURL); ok {
-			return sha, nil
-		}
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 	lookupOfficialPackageDigestFn = func(_ *http.Client, version string, arch string) (string, error) {
 		return strings.Repeat("a", 64), nil
@@ -6992,22 +8900,22 @@ func TestExecute_DeployJSONBlocksOnManualHostChecks(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
 
-	var response struct {
-		Command string           `json:"command"`
-		Status  preflight.Status `json:"status"`
-		Summary string           `json:"summary"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &response); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v; stdout = %q", err, stdout)
-	}
+	response := mustDecodeResponse(t, stdout)
 	if response.Command != "deploy" {
 		t.Fatalf("response.Command = %q, want %q", response.Command, "deploy")
 	}
-	if response.Status != preflight.StatusManual {
+	if response.Status != string(preflight.StatusManual) {
 		t.Fatalf("response.Status = %q, want %q", response.Status, preflight.StatusManual)
 	}
 	if !strings.Contains(response.Summary, "waiting on") {
 		t.Fatalf("response.Summary = %q, want manual summary", response.Summary)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindDeploy || result.Status != domain.JobStatusFailed {
+		t.Fatalf("operation result = %#v, want failed deploy result", result)
+	}
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("operation result diagnostics = empty, want preflight checks")
 	}
 }
 
@@ -7867,6 +9775,10 @@ func TestDetectAppServiceEnvFileStateRequiresRootOnlyFile(t *testing.T) {
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
 	cfg.Service.EnvFile = envFile
 
@@ -8014,6 +9926,8 @@ func TestEnsureAppNginxRuntimeCompatibilityChecksHTTP2DirectiveVersion(t *testin
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
+	enabled := true
+	cfg.Nginx.HTTP2 = &enabled
 
 	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
 		actual := unwrapMaybeSudoHostCommand(command)
@@ -8037,7 +9951,6 @@ func TestEnsureAppNginxRuntimeCompatibilityChecksHTTP2DirectiveVersion(t *testin
 		t.Fatalf("commands = %#v, want no nginx -v when http2 disabled", runner.commands)
 	}
 
-	enabled := true
 	cfg.Nginx.HTTP2 = &enabled
 	runner.run = func(command host.Command) (host.Result, error) {
 		actual := unwrapMaybeSudoHostCommand(command)
@@ -8088,9 +10001,13 @@ func TestEnsureAppNginxRuntimeCompatibilityChecksRealIPModule(t *testing.T) {
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
 	cfg.Nginx.HTTP2 = &disabledHTTP2
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabledRealIP,
@@ -8114,6 +10031,9 @@ func TestEnsureAppNginxRuntimeCompatibilityChecksRealIPModule(t *testing.T) {
 	err := ensureAppNginxRuntimeCompatibility(stdcontext.Background(), cfg, host.NewExecutor(runner, nil))
 	if err == nil || !strings.Contains(err.Error(), "--with-http_realip_module") {
 		t.Fatalf("ensureAppNginxRuntimeCompatibility() error = %v, want realip module failure", err)
+	}
+	if !strings.Contains(err.Error(), "access.origin_protection.edgeone_profile") || strings.Contains(err.Error(), "nginx.realip_profile") {
+		t.Fatalf("ensureAppNginxRuntimeCompatibility() error = %v, want current origin protection remediation", err)
 	}
 
 	runner.run = func(command host.Command) (host.Result, error) {
@@ -8187,7 +10107,22 @@ func TestReadDeployedRealIPProfileRequiresManagedContract(t *testing.T) {
 		{
 			name:    "unmarked json",
 			content: mustJSON(t, base),
-			want:    "lanpanel_managed marker",
+			want:    "schema_version",
+		},
+		{
+			name: "unknown field",
+			content: []byte(`{
+  "schema_version": "lanpanel.realip.profile.v1",
+  "lanpanel_managed": "Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone",
+  "name": "edgeone-prod",
+  "provider": "edgeone",
+  "zone_id": "zone-2abcDEF123",
+  "env_file": "/etc/lanpanel/realip/edgeone-prod.env",
+  "refresh_interval": "72h",
+  "domains": ["app.example.com"],
+  "unexpected": true
+}` + "\n"),
+			want: `unknown field "unexpected"`,
 		},
 		{
 			name:    "marker mismatch",
@@ -8336,8 +10271,29 @@ func TestReadDeployedRealIPStateRequiresManagedContract(t *testing.T) {
 	}
 
 	_, err = parseDeployedRealIPState(mustJSON(t, valid), "/var/lib/lanpanel/realip/edgeone-prod/state.json", "edgeone-prod")
-	if err == nil || !strings.Contains(err.Error(), "lanpanel_managed marker") {
-		t.Fatalf("parseDeployedRealIPState() error = %v, want marker failure", err)
+	if err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("parseDeployedRealIPState() error = %v, want schema version failure", err)
+	}
+
+	unknown := []byte(`{
+  "schema_version": "lanpanel.realip.state.v1",
+  "lanpanel_managed": "Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone",
+  "profile_name": "edgeone-prod",
+  "provider": "edgeone",
+  "zone_id": "zone-2abcDEF123",
+  "origin_acl_status": "online",
+  "origin_acl_family": "global",
+  "current_version": "v1",
+  "current_active_time": "",
+  "l7_hosts": null,
+  "current_cidrs": ["8.8.8.8/32"],
+  "trusted_cidrs": ["8.8.8.8/32"],
+  "updated_at": "2026-06-02T01:02:03Z",
+  "unexpected": true
+}` + "\n")
+	_, err = parseDeployedRealIPState(unknown, "/var/lib/lanpanel/realip/edgeone-prod/state.json", "edgeone-prod")
+	if err == nil || !strings.Contains(err.Error(), `unknown field "unexpected"`) {
+		t.Fatalf("parseDeployedRealIPState() error = %v, want unknown field failure", err)
 	}
 }
 
@@ -8420,8 +10376,8 @@ func TestReadRealIPProfileFromFSRequiresManagedContract(t *testing.T) {
 
 	fileSystem.files[path] = mutableRealIPFile{content: mustJSON(t, profile), mode: 0o600}
 	_, _, err = readRealIPProfileFromFS(fileSystem, path)
-	if err == nil || !strings.Contains(err.Error(), "lanpanel_managed marker") {
-		t.Fatalf("readRealIPProfileFromFS() error = %v, want marker failure", err)
+	if err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("readRealIPProfileFromFS() error = %v, want schema version failure", err)
 	}
 }
 
@@ -8589,9 +10545,11 @@ func managedRealIPProfileJSON(t *testing.T, markerProfile string, profile realip
 	t.Helper()
 
 	value := struct {
+		SchemaVersion   string `json:"schema_version"`
 		LanpanelManaged string `json:"lanpanel_managed"`
 		realip.ProfileConfig
 	}{
+		SchemaVersion:   realip.ProfileSchemaVersion,
 		LanpanelManaged: realIPManagedMarker(markerProfile, appconfig.RealIPProviderEdgeOne),
 		ProfileConfig:   profile,
 	}
@@ -8602,9 +10560,11 @@ func managedRealIPStateJSON(t *testing.T, markerProfile string, state realip.Sta
 	t.Helper()
 
 	value := struct {
+		SchemaVersion   string `json:"schema_version"`
 		LanpanelManaged string `json:"lanpanel_managed"`
 		realip.State
 	}{
+		SchemaVersion:   realip.StateSchemaVersion,
 		LanpanelManaged: realIPManagedMarker(markerProfile, appconfig.RealIPProviderEdgeOne),
 		State:           state,
 	}
@@ -8725,7 +10685,20 @@ func TestReadDeployedRealIPReferencesRequiresManagedContract(t *testing.T) {
 			name:    "unmarked json",
 			file:    "first.json",
 			content: []byte(`{"app_name":"first","profile":"edgeone-prod","domains":["app.example.com"]}`),
-			want:    "lanpanel_managed marker",
+			want:    "schema_version",
+		},
+		{
+			name: "unknown field",
+			file: "first.json",
+			content: []byte(`{
+  "schema_version": "lanpanel.realip.reference.v1",
+  "lanpanel_managed": "Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone",
+  "app_name": "first",
+  "profile": "edgeone-prod",
+  "domains": ["app.example.com"],
+  "unexpected": true
+}` + "\n"),
+			want: `unknown field "unexpected"`,
 		},
 		{
 			name:    "profile mismatch",
@@ -8847,9 +10820,11 @@ func managedRealIPReferenceJSONWithProfile(t *testing.T, markerProfile string, r
 	t.Helper()
 
 	value := struct {
+		SchemaVersion   string `json:"schema_version"`
 		LanpanelManaged string `json:"lanpanel_managed"`
 		realip.Reference
 	}{
+		SchemaVersion:   realip.ReferenceSchemaVersion,
 		LanpanelManaged: realIPManagedMarker(markerProfile, appconfig.RealIPProviderEdgeOne),
 		Reference: realip.Reference{
 			AppName: appName,
@@ -9136,8 +11111,12 @@ func TestPrepareAppRealIPProfileReplacesExistingReferenceForSameApp(t *testing.T
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -9186,7 +11165,10 @@ func TestPrepareAppRealIPProfileReplacesExistingReferenceForSameApp(t *testing.T
 		}, nil
 	}
 	marker := "Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone"
-	stageRealIPRuntimeFilesFn = func(profile realip.ProfileConfig, state realip.State, reference realip.Reference) ([]realiprender.StagedFile, error) {
+	stageRealIPRuntimeFilesFn = func(profile realip.ProfileConfig, state realip.State, reference realip.Reference, appConfigPath string) ([]realiprender.StagedFile, error) {
+		if appConfigPath != "/etc/lanpanel/lanpanel-app.yaml" {
+			t.Fatalf("appConfigPath = %q, want /etc/lanpanel/lanpanel-app.yaml", appConfigPath)
+		}
 		if strings.Join(profile.Domains, ",") != "api.example.com,new.example.com" {
 			t.Fatalf("profile domains = %#v, want old app reference replaced by current domains", profile.Domains)
 		}
@@ -9205,7 +11187,7 @@ func TestPrepareAppRealIPProfileReplacesExistingReferenceForSameApp(t *testing.T
 	}
 
 	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
-	names, state, staged, err := prepareAppRealIPProfile(stdcontext.Background(), cfg, fileSystem)
+	names, state, staged, err := prepareAppRealIPProfile(stdcontext.Background(), cfg, fileSystem, "/etc/lanpanel/lanpanel-app.yaml")
 	if err != nil {
 		t.Fatalf("prepareAppRealIPProfile() error = %v", err)
 	}
@@ -9230,8 +11212,12 @@ func TestAppRealIPDeployFieldsIncludeRuntimeDiagnostics(t *testing.T) {
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.ACMEChallenge = appconfig.ACMEChallengeDNS01
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeEdgeOne
+	cfg.Access.OriginProtection.EdgeOneProfile = "edgeone-prod"
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = false
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
-	cfg.Nginx.RealIPProfile = "edgeone-prod"
 	cfg.RealIP.Profiles = map[string]appconfig.RealIPProfileConfig{
 		"edgeone-prod": {
 			Enabled:  &enabled,
@@ -9293,13 +11279,25 @@ func TestExecute_AppRealIPRefreshRequiresProfileAndRoot(t *testing.T) {
 		t.Fatalf("stdout = %q, want required-profile response", stdout)
 	}
 
+	stdout, stderr, err = runCLI(t, "app", "realip", "refresh", "--profile", "edgeone-prod")
+	if err == nil || !strings.Contains(err.Error(), "--config is required") {
+		t.Fatalf("app realip refresh missing config error = %v, want required config error", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "--config is required") || !strings.Contains(stdout, "Pass --config with the app config") {
+		t.Fatalf("stdout = %q, want required-config response", stdout)
+	}
+
 	previousPermission := detectPermissionStateFn
 	t.Cleanup(func() { detectPermissionStateFn = previousPermission })
 	detectPermissionStateFn = func() preflight.PermissionState {
 		return preflight.PermissionState{User: "deployer", SudoWorks: true}
 	}
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 
-	stdout, stderr, err = runCLI(t, "app", "realip", "refresh", "--profile", "edgeone-prod")
+	stdout, stderr, err = runCLI(t, "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--confirmation", appOriginProtectionManualConfirmation)
 	if err == nil || !strings.Contains(err.Error(), "preflight found 1 failed check") {
 		t.Fatalf("app realip refresh root gate error = %v, want root gate error", err)
 	}
@@ -9311,8 +11309,46 @@ func TestExecute_AppRealIPRefreshRequiresProfileAndRoot(t *testing.T) {
 	}
 }
 
+func TestExecute_AppRealIPRefreshRejectsNonRootBeforeDeployedProfileObservation(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	previousPermission := detectPermissionStateFn
+	previousAcquireLock := acquireRealIPProfileLockFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		acquireRealIPProfileLockFn = previousAcquireLock
+	})
+	detectPermissionStateFn = func() preflight.PermissionState {
+		return preflight.PermissionState{User: "deployer", SudoWorks: true}
+	}
+	acquireRealIPProfileLockFn = func(profileName string) (realIPProfileLock, error) {
+		t.Fatalf("acquireRealIPProfileLockFn called before app realip refresh root gate for %q", profileName)
+		return nil, nil
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "realip refresh exposure plan requires manual confirmations") {
+		t.Fatalf("app realip refresh error = %v, want manual confirmation gate", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "app realip refresh" || response.Status != "blocked" || !strings.Contains(response.Summary, "requires manual confirmations") {
+		t.Fatalf("response = %#v, want realip refresh manual confirmation block", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindRealIPRefresh || result.Status != domain.JobStatusFailed || result.Summary != response.Summary {
+		t.Fatalf("operation result = %#v, want realip refresh failed block", result)
+	}
+	if got, ok := fieldValue(response.Fields, "missing confirmations"); !ok || !strings.Contains(got, appOriginProtectionManualConfirmation) {
+		t.Fatalf("missing confirmations field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+}
+
 func useAppRealIPDiagnosticsGuardFileSystem(t *testing.T, fileSystem host.FileSystem) {
 	t.Helper()
+
+	useCLIResourceStore(t)
 
 	previousFileSystem := newAppHostFileSystemFn
 	t.Cleanup(func() { newAppHostFileSystemFn = previousFileSystem })
@@ -9379,10 +11415,10 @@ func validAppRealIPDiagnosticsFileSystem(t *testing.T) mutableRealIPFileSystem {
 	return fileSystem
 }
 
-func managedRealIPRefreshServiceContent(profileName string) []byte {
+func managedRealIPRefreshServiceContent(profileName string, configPath string) []byte {
 	marker := "# " + realIPManagedMarker(profileName, appconfig.RealIPProviderEdgeOne)
 	return []byte(marker + `
-# Source: deploy/templates/realip/refresh.service.tmpl
+	# Source: deploy/templates/realip/refresh.service.tmpl
 
 [Unit]
 Description=Refresh Lanpanel realip profile ` + profileName + `
@@ -9393,8 +11429,8 @@ After=network-online.target nginx.service
 [Service]
 Type=oneshot
 TimeoutStartSec=2min
-ExecStart=` + realipassets.DefaultRefreshBinaryPath + ` app realip refresh --profile ` + profileName + `
-`)
+	ExecStart=` + realipassets.DefaultRefreshBinaryPath + ` app realip refresh --config ` + configPath + ` --profile ` + profileName + `
+	`)
 }
 
 func managedRealIPRefreshTimerContent(t *testing.T, profileName string, refreshInterval string) []byte {
@@ -9419,21 +11455,61 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-`)
+	`)
+}
+
+func TestExecute_AppRealIPDiagnosticsRequiresConfig(t *testing.T) {
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "--config is required") {
+		t.Fatalf("app realip diagnostics missing config error = %v, want required config error", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Status != "invalid-config" || response.Summary != "--config is required" {
+		t.Fatalf("response = %#v, want required config response", response)
+	}
+}
+
+func TestRealIPRuntimeAppConfigPathRejectsSystemdSensitiveTokens(t *testing.T) {
+	t.Parallel()
+
+	if got, err := realIPRuntimeAppConfigPath("/etc/lanpanel/lanpanel-app.yaml"); err != nil || got != "/etc/lanpanel/lanpanel-app.yaml" {
+		t.Fatalf("realIPRuntimeAppConfigPath(valid) = %q, %v", got, err)
+	}
+	for _, path := range []string{
+		"/etc/lanpanel/app;evil.yaml",
+		"/etc/lanpanel/app$evil.yaml",
+		"/etc/lanpanel/app{evil}.yaml",
+		"/etc/lanpanel/app%h.yaml",
+		"/etc/lanpanel/app name.yaml",
+	} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			if _, err := realIPRuntimeAppConfigPath(path); err == nil || !strings.Contains(err.Error(), "single systemd ExecStart token") {
+				t.Fatalf("realIPRuntimeAppConfigPath(%q) error = %v, want token refusal", path, err)
+			}
+		})
+	}
 }
 
 func TestExecute_AppRealIPDiagnosticsSurfacesLockReleaseFailureOnFailure(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	previousPermissionState := detectPermissionStateFn
 	previousExecutor := newHostExecutorFn
 	previousFileSystem := newAppHostFileSystemFn
 	previousAcquireLock := acquireRealIPProfileLockFn
 	previousReadProfile := readDeployedRealIPProfileFn
+	previousReadArtifact := readDeployedRealIPArtifactFn
 	t.Cleanup(func() {
 		detectPermissionStateFn = previousPermissionState
 		newHostExecutorFn = previousExecutor
 		newAppHostFileSystemFn = previousFileSystem
 		acquireRealIPProfileLockFn = previousAcquireLock
 		readDeployedRealIPProfileFn = previousReadProfile
+		readDeployedRealIPArtifactFn = previousReadArtifact
 	})
 	detectPermissionStateFn = func() preflight.PermissionState {
 		return preflight.PermissionState{User: "root", IsRoot: true}
@@ -9459,7 +11535,7 @@ func TestExecute_AppRealIPDiagnosticsSurfacesLockReleaseFailureOnFailure(t *test
 		return realip.ProfileConfig{}, errors.New("profile boom")
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil {
 		t.Fatal("app realip diagnostics error = nil, want profile and lock release failure")
 	}
@@ -9482,6 +11558,7 @@ func TestExecute_AppRealIPDiagnosticsSurfacesLockReleaseFailureOnFailure(t *test
 }
 
 func TestExecute_AppRealIPDiagnosticsJSONSuccessReportsDeployedState(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
 	lockEvents := []string{}
 	useStubRealIPProfileLock(t, "edgeone-prod", &lockEvents)
@@ -9575,7 +11652,7 @@ func TestExecute_AppRealIPDiagnosticsJSONSuccessReportsDeployedState(t *testing.
 		case "/etc/nginx/lanpanel/realip/edgeone-prod/trusted-cidrs.conf":
 			return []byte(marker + "8.8.8.8/32 1;\n9.9.9.0/24 1;\n"), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service":
-			return managedRealIPRefreshServiceContent("edgeone-prod"), nil
+			return managedRealIPRefreshServiceContent("edgeone-prod", configPath), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.timer":
 			return managedRealIPRefreshTimerContent(t, "edgeone-prod", "72h"), nil
 		default:
@@ -9583,7 +11660,7 @@ func TestExecute_AppRealIPDiagnosticsJSONSuccessReportsDeployedState(t *testing.
 		}
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err != nil {
 		t.Fatalf("app realip diagnostics error = %v", err)
 	}
@@ -9603,7 +11680,7 @@ func TestExecute_AppRealIPDiagnosticsJSONSuccessReportsDeployedState(t *testing.
 		"realip trusted CIDRs":               "8.8.8.8/32, 9.9.9.0/24",
 		"realip nginx include status":        "present root-owned mode 0644, CIDRs match state",
 		"realip trusted CIDR include status": "present root-owned mode 0644, CIDRs match state",
-		"realip refresh service status":      "present root-owned mode 0644, command matches profile",
+		"realip refresh service status":      "present root-owned mode 0644, command matches profile and app config",
 		"realip refresh timer status":        "present root-owned mode 0644, timer matches profile",
 	} {
 		got, ok := fieldValue(response.Fields, label)
@@ -9626,9 +11703,13 @@ func TestValidateDeployedRealIPSystemdArtifacts(t *testing.T) {
 	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
 		switch path {
 		case "/service":
-			return managedRealIPRefreshServiceContent("edgeone-prod"), nil
+			return managedRealIPRefreshServiceContent("edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"), nil
 		case "/bad-service":
-			return []byte("# " + marker + "\n[Service]\nType=oneshot\nTimeoutStartSec=2min\nExecStart=/usr/local/bin/lanpanel app realip refresh --profile other\n"), nil
+			return []byte("# " + marker + "\n[Service]\nType=oneshot\nTimeoutStartSec=2min\nExecStart=/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile other\n"), nil
+		case "/profile-only-service":
+			return []byte("# " + marker + "\n[Service]\nType=oneshot\nTimeoutStartSec=2min\nExecStart=/usr/local/bin/lanpanel app realip refresh --profile edgeone-prod\n"), nil
+		case "/multi-service":
+			return []byte("# " + marker + "\n[Service]\nType=oneshot\nTimeoutStartSec=2min\nExecStart=/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod\nExecStart=/usr/local/bin/lanpanel app realip refresh --profile edgeone-prod\n"), nil
 		case "/timer":
 			return managedRealIPRefreshTimerContent(t, "edgeone-prod", "72h"), nil
 		case "/bad-timer":
@@ -9638,14 +11719,23 @@ func TestValidateDeployedRealIPSystemdArtifacts(t *testing.T) {
 		}
 	}
 
-	if err := validateDeployedRealIPRefreshService("/service", marker, "edgeone-prod"); err != nil {
+	if err := validateDeployedRealIPRefreshService("/service", marker, "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"); err != nil {
 		t.Fatalf("validateDeployedRealIPRefreshService(valid) error = %v", err)
 	}
 	if err := validateDeployedRealIPRefreshTimer("/timer", marker, realip.ProfileConfig{RefreshInterval: "72h"}); err != nil {
 		t.Fatalf("validateDeployedRealIPRefreshTimer(valid) error = %v", err)
 	}
-	if err := validateDeployedRealIPRefreshService("/bad-service", marker, "edgeone-prod"); err == nil || !strings.Contains(err.Error(), "ExecStart=/usr/local/bin/lanpanel app realip refresh --profile edgeone-prod") {
+	if err := validateDeployedRealIPRefreshService("/bad-service", marker, "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"); err == nil || !strings.Contains(err.Error(), "ExecStart=/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod") {
 		t.Fatalf("validateDeployedRealIPRefreshService(bad) error = %v, want ExecStart mismatch", err)
+	}
+	if err := validateDeployedRealIPRefreshService("/multi-service", marker, "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"); err == nil || !strings.Contains(err.Error(), "exactly one ExecStart line") {
+		t.Fatalf("validateDeployedRealIPRefreshService(multi) error = %v, want exactly-one ExecStart failure", err)
+	}
+	if err := validateDeployedRealIPRefreshService("/profile-only-service", marker, "edgeone-prod", ""); err == nil || !strings.Contains(err.Error(), "requires an app config path") {
+		t.Fatalf("validateDeployedRealIPRefreshService(profile-only) error = %v, want required config failure", err)
+	}
+	if err := validateDeployedRealIPRefreshService("/profile-only-service", marker, "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"); err == nil || !strings.Contains(err.Error(), "must be \"ExecStart=/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod\"") {
+		t.Fatalf("validateDeployedRealIPRefreshService(profile-only with config) error = %v, want config-aware ExecStart mismatch", err)
 	}
 	if err := validateDeployedRealIPRefreshTimer("/bad-timer", marker, realip.ProfileConfig{RefreshInterval: "72h"}); err == nil || !strings.Contains(err.Error(), "OnUnitActiveSec=259200s") {
 		t.Fatalf("validateDeployedRealIPRefreshTimer(bad) error = %v, want interval mismatch", err)
@@ -9697,6 +11787,7 @@ func TestDeployedRealIPRegularFileStatusRejectsUnsafeArtifacts(t *testing.T) {
 }
 
 func TestExecute_AppRealIPDiagnosticsJSONFailureReportsCredentialCheck(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
 	useStubRealIPProfileLock(t, "edgeone-prod", nil)
 
@@ -9757,7 +11848,7 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsCredentialCheck(t *testin
 		case "/etc/nginx/lanpanel/realip/edgeone-prod/trusted-cidrs.conf":
 			return []byte(marker + "8.8.8.8/32 1;\n"), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service":
-			return managedRealIPRefreshServiceContent("edgeone-prod"), nil
+			return managedRealIPRefreshServiceContent("edgeone-prod", configPath), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.timer":
 			return managedRealIPRefreshTimerContent(t, "edgeone-prod", "72h"), nil
 		default:
@@ -9765,7 +11856,7 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsCredentialCheck(t *testin
 		}
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile diagnostics failed") {
 		t.Fatalf("app realip diagnostics error = %v, want diagnostics failure", err)
 	}
@@ -9782,6 +11873,7 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsCredentialCheck(t *testin
 }
 
 func TestExecute_AppRealIPDiagnosticsRejectsUnsafeProfileBeforeMetadataRead(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	fileSystem := validAppRealIPDiagnosticsFileSystem(t)
 	names, err := appsvc.NewRealIPProfileNames("edgeone-prod", appconfig.RealIPProviderEdgeOne, "")
 	if err != nil {
@@ -9810,7 +11902,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsUnsafeProfileBeforeMetadataRead(t *t
 		return edgeone.Credentials{}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile diagnostics failed") {
 		t.Fatalf("app realip diagnostics error = %v, want diagnostics failure", err)
 	}
@@ -9827,6 +11919,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsUnsafeProfileBeforeMetadataRead(t *t
 }
 
 func TestExecute_AppRealIPDiagnosticsRejectsStateProfileZoneMismatch(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
 	useStubRealIPProfileLock(t, "edgeone-prod", nil)
 
@@ -9873,7 +11966,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsStateProfileZoneMismatch(t *testing.
 		return edgeone.Credentials{}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile diagnostics failed") {
 		t.Fatalf("app realip diagnostics error = %v, want diagnostics failure", err)
 	}
@@ -9890,6 +11983,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsStateProfileZoneMismatch(t *testing.
 }
 
 func TestExecute_AppRealIPDiagnosticsRejectsStateTrustedCIDRMismatch(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
 	useStubRealIPProfileLock(t, "edgeone-prod", nil)
 
@@ -9937,7 +12031,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsStateTrustedCIDRMismatch(t *testing.
 		return edgeone.Credentials{}, nil
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile diagnostics failed") {
 		t.Fatalf("app realip diagnostics error = %v, want diagnostics failure", err)
 	}
@@ -9954,6 +12048,7 @@ func TestExecute_AppRealIPDiagnosticsRejectsStateTrustedCIDRMismatch(t *testing.
 }
 
 func TestExecute_AppRealIPDiagnosticsJSONFailureReportsMismatchedIncludes(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
 	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
 	useStubRealIPProfileLock(t, "edgeone-prod", nil)
 
@@ -10014,7 +12109,7 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsMismatchedIncludes(t *tes
 		case "/etc/nginx/lanpanel/realip/edgeone-prod/trusted-cidrs.conf":
 			return []byte(marker + "8.8.8.8/32 1;\n"), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service":
-			return managedRealIPRefreshServiceContent("edgeone-prod"), nil
+			return managedRealIPRefreshServiceContent("edgeone-prod", configPath), nil
 		case "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.timer":
 			return managedRealIPRefreshTimerContent(t, "edgeone-prod", "72h"), nil
 		default:
@@ -10022,7 +12117,7 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsMismatchedIncludes(t *tes
 		}
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "diagnostics", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile diagnostics failed") {
 		t.Fatalf("app realip diagnostics error = %v, want diagnostics failure", err)
 	}
@@ -10039,16 +12134,24 @@ func TestExecute_AppRealIPDiagnosticsJSONFailureReportsMismatchedIncludes(t *tes
 }
 
 func TestExecute_AppRealIPRefreshJSONFailureReportsRuntimePaths(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	useCLIResourceStore(t)
 	previousPermission := detectPermissionStateFn
 	previousProfileReader := readDeployedRealIPProfileFn
+	previousStateReader := readDeployedRealIPStateFn
 	previousReferenceReader := readDeployedRealIPReferencesFn
+	previousLstatArtifact := lstatDeployedRealIPArtifactFn
+	previousReadArtifact := readDeployedRealIPArtifactFn
 	previousLoadCredentials := loadEdgeOneCredentialsFn
 	previousDescribe := describeEdgeOneOriginACLFn
 	previousAcquireRealIPProfileLock := acquireRealIPProfileLockFn
 	t.Cleanup(func() {
 		detectPermissionStateFn = previousPermission
 		readDeployedRealIPProfileFn = previousProfileReader
+		readDeployedRealIPStateFn = previousStateReader
 		readDeployedRealIPReferencesFn = previousReferenceReader
+		lstatDeployedRealIPArtifactFn = previousLstatArtifact
+		readDeployedRealIPArtifactFn = previousReadArtifact
 		loadEdgeOneCredentialsFn = previousLoadCredentials
 		describeEdgeOneOriginACLFn = previousDescribe
 		acquireRealIPProfileLockFn = previousAcquireRealIPProfileLock
@@ -10073,11 +12176,21 @@ func TestExecute_AppRealIPRefreshJSONFailureReportsRuntimePaths(t *testing.T) {
 			RefreshInterval: "72h",
 		}, nil
 	}
+	readDeployedRealIPStateFn = func(path string, profileName string) (realip.State, error) {
+		if path != "/var/lib/lanpanel/realip/edgeone-prod/state.json" || profileName != "edgeone-prod" {
+			t.Fatalf("state path/profile = %q/%q", path, profileName)
+		}
+		return validEdgeOneDeployedExposureState(), nil
+	}
 	readDeployedRealIPReferencesFn = func(dir string) ([]realip.Reference, error) {
 		if dir != "/var/lib/lanpanel/realip/edgeone-prod/references" {
 			t.Fatalf("reference dir = %q", dir)
 		}
 		return []realip.Reference{{AppName: "review-app", Profile: "edgeone-prod", Domains: []string{"app.example.com"}}}, nil
+	}
+	lstatDeployedRealIPArtifactFn = validEdgeOneDeployedExposureArtifactInfo
+	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
+		return validEdgeOneDeployedExposureArtifact(path, configPath)
 	}
 	loadEdgeOneCredentialsFn = func(_ edgeone.FileSystem, envFile string) (edgeone.Credentials, error) {
 		if envFile != "/etc/lanpanel/realip/edgeone-prod.env" {
@@ -10089,7 +12202,7 @@ func TestExecute_AppRealIPRefreshJSONFailureReportsRuntimePaths(t *testing.T) {
 		return nil, errors.New("edgeone api unavailable")
 	}
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err == nil || !strings.Contains(err.Error(), "Realip profile refresh failed") {
 		t.Fatalf("app realip refresh error = %v, want refresh failure", err)
 	}
@@ -10099,6 +12212,10 @@ func TestExecute_AppRealIPRefreshJSONFailureReportsRuntimePaths(t *testing.T) {
 	response := mustDecodeResponse(t, stdout)
 	if response.Status != "failed" {
 		t.Fatalf("response.Status = %q, want failed", response.Status)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindRealIPRefresh || result.Status != domain.JobStatusFailed || result.Summary != response.Summary {
+		t.Fatalf("operation result = %#v, want realip refresh failure", result)
 	}
 	for label, want := range map[string]string{
 		"profile":          "edgeone-prod",
@@ -10118,10 +12235,57 @@ func TestExecute_AppRealIPRefreshJSONFailureReportsRuntimePaths(t *testing.T) {
 	}
 }
 
-func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t *testing.T) {
+func TestExecute_AppRealIPRefreshRejectsMismatchedDeployedConfigBeforeSideEffects(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	useAppRealIPDiagnosticsGuardFileSystem(t, validAppRealIPDiagnosticsFileSystem(t))
+	useStubRealIPProfileLock(t, "edgeone-prod", nil)
+
 	previousPermission := detectPermissionStateFn
 	previousProfileReader := readDeployedRealIPProfileFn
+	previousReadArtifact := readDeployedRealIPArtifactFn
+	t.Cleanup(func() {
+		detectPermissionStateFn = previousPermission
+		readDeployedRealIPProfileFn = previousProfileReader
+		readDeployedRealIPArtifactFn = previousReadArtifact
+	})
+
+	detectPermissionStateFn = func() preflight.PermissionState { return preflight.PermissionState{IsRoot: true} }
+	readDeployedRealIPProfileFn = func(string) (realip.ProfileConfig, error) {
+		t.Fatalf("readDeployedRealIPProfileFn must not be called when deployed refresh service is bound to another config")
+		return realip.ProfileConfig{}, nil
+	}
+	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
+		if path != "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service" {
+			return nil, os.ErrNotExist
+		}
+		return managedRealIPRefreshServiceContent("edgeone-prod", "/etc/lanpanel/other-app.yaml"), nil
+	}
+
+	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
+	if err == nil || !strings.Contains(err.Error(), "realip refresh exposure plan is blocked") {
+		t.Fatalf("app realip refresh error = %v, want exposure plan block", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Status != "blocked" {
+		t.Fatalf("response.Status = %q, want blocked", response.Status)
+	}
+	if got, ok := fieldValue(response.Fields, "origin protection"); !ok || got != string(domain.OriginProtectionConfiguredFail) {
+		t.Fatalf("origin protection field = %q, %v; fields = %#v", got, ok, response.Fields)
+	}
+}
+
+func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t *testing.T) {
+	configPath := writeReviewAppConfigWith(t, configureReviewAppEdgeOneOrigin)
+	useCLIResourceStore(t)
+	previousPermission := detectPermissionStateFn
+	previousProfileReader := readDeployedRealIPProfileFn
+	previousStateReader := readDeployedRealIPStateFn
 	previousReferenceReader := readDeployedRealIPReferencesFn
+	previousLstatArtifact := lstatDeployedRealIPArtifactFn
+	previousReadArtifact := readDeployedRealIPArtifactFn
 	previousLoadCredentials := loadEdgeOneCredentialsFn
 	previousDescribe := describeEdgeOneOriginACLFn
 	previousStage := stageRealIPRuntimeFilesFn
@@ -10133,7 +12297,10 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 	t.Cleanup(func() {
 		detectPermissionStateFn = previousPermission
 		readDeployedRealIPProfileFn = previousProfileReader
+		readDeployedRealIPStateFn = previousStateReader
 		readDeployedRealIPReferencesFn = previousReferenceReader
+		lstatDeployedRealIPArtifactFn = previousLstatArtifact
+		readDeployedRealIPArtifactFn = previousReadArtifact
 		loadEdgeOneCredentialsFn = previousLoadCredentials
 		describeEdgeOneOriginACLFn = previousDescribe
 		stageRealIPRuntimeFilesFn = previousStage
@@ -10169,6 +12336,13 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 			RefreshInterval: "72h",
 		}, nil
 	}
+	readDeployedRealIPStateFn = func(path string, profileName string) (realip.State, error) {
+		lockEvents = append(lockEvents, "read-state")
+		if path != "/var/lib/lanpanel/realip/edgeone-prod/state.json" || profileName != "edgeone-prod" {
+			t.Fatalf("state path/profile = %q/%q", path, profileName)
+		}
+		return validEdgeOneDeployedExposureState(), nil
+	}
 	readDeployedRealIPReferencesFn = func(dir string) ([]realip.Reference, error) {
 		if dir != "/var/lib/lanpanel/realip/edgeone-prod/references" {
 			t.Fatalf("reference dir = %q", dir)
@@ -10177,6 +12351,10 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 			{AppName: "first", Profile: "edgeone-prod", Domains: []string{"app.example.com"}},
 			{AppName: "second", Profile: "edgeone-prod", Domains: []string{"api.example.com"}},
 		}, nil
+	}
+	lstatDeployedRealIPArtifactFn = validEdgeOneDeployedExposureArtifactInfo
+	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
+		return validEdgeOneDeployedExposureArtifact(path, configPath)
 	}
 	loadEdgeOneCredentialsFn = func(_ edgeone.FileSystem, envFile string) (edgeone.Credentials, error) {
 		if envFile != "/etc/lanpanel/realip/edgeone-prod.env" {
@@ -10206,7 +12384,10 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 		}, nil
 	}
 	marker := "Lanpanel-managed: realip.profile=edgeone-prod provider=edgeone"
-	stageRealIPRuntimeFilesFn = func(profile realip.ProfileConfig, state realip.State, reference realip.Reference) ([]realiprender.StagedFile, error) {
+	stageRealIPRuntimeFilesFn = func(profile realip.ProfileConfig, state realip.State, reference realip.Reference, appConfigPath string) ([]realiprender.StagedFile, error) {
+		if appConfigPath != configPath {
+			t.Fatalf("appConfigPath = %q, want %q", appConfigPath, configPath)
+		}
 		if strings.Join(profile.Domains, ",") != "app.example.com,api.example.com" {
 			t.Fatalf("profile domains = %#v, want merged deployed references", profile.Domains)
 		}
@@ -10239,7 +12420,7 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 	}
 	newHostSystemdFn = func(executor host.Executor) host.Systemd { return host.NewSystemd(executor) }
 
-	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--profile", "edgeone-prod", "--format", "json")
+	stdout, stderr, err := runCLI(t, "app", "realip", "refresh", "--config", configPath, "--profile", "edgeone-prod", "--format", "json")
 	if err != nil {
 		t.Fatalf("app realip refresh error = %v", err)
 	}
@@ -10252,6 +12433,13 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 	}
 	if response.Status != "refreshed" {
 		t.Fatalf("response.Status = %q, want refreshed", response.Status)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindRealIPRefresh || result.Status != domain.JobStatusSucceeded || result.Summary != response.Summary {
+		t.Fatalf("operation result = %#v, want realip refresh success", result)
+	}
+	if strings.Join(result.ModifiedPaths, ",") != "/etc/nginx/lanpanel/realip/edgeone-prod/active.conf" {
+		t.Fatalf("ModifiedPaths = %#v, want actual refreshed artifact only", result.ModifiedPaths)
 	}
 	if got, ok := fieldValue(response.Fields, "profile"); !ok || got != "edgeone-prod (edgeone)" {
 		t.Fatalf("profile field = %q, %v", got, ok)
@@ -10282,15 +12470,21 @@ func TestExecute_AppRealIPRefreshJSONSuccessUsesDeployedMetadataAndReferences(t 
 	for _, want := range []string{
 		"systemctl daemon-reload",
 		"nginx -t",
-		"systemctl reload-or-restart nginx.service",
+		"systemctl reload nginx.service",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("commands = %q, missing %q", joined, want)
 		}
 	}
-	assertEventBefore(t, lockEvents, "lock edgeone-prod", "read-profile")
-	assertEventBefore(t, lockEvents, "read-profile", "nginx-reload")
-	assertEventBefore(t, lockEvents, "nginx-reload", "unlock edgeone-prod")
+	assertEventSubsequence(t, lockEvents,
+		"lock edgeone-prod",
+		"read-profile",
+		"unlock edgeone-prod",
+		"lock edgeone-prod",
+		"read-profile",
+		"nginx-reload",
+		"unlock edgeone-prod",
+	)
 }
 
 func TestRefreshDeployedRealIPProfileSurfacesLockReleaseFailureOnFailure(t *testing.T) {
@@ -10329,9 +12523,15 @@ func TestRefreshDeployedRealIPProfileSurfacesLockReleaseFailureOnFailure(t *test
 		}
 		return realip.ProfileConfig{}, errors.New("profile boom")
 	}
+	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
+		if path != "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service" {
+			return nil, os.ErrNotExist
+		}
+		return managedRealIPRefreshServiceContent("edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"), nil
+	}
 
 	var effects appDeployEffects
-	_, _, _, err := refreshDeployedRealIPProfile(stdcontext.Background(), "edgeone-prod", &effects)
+	_, _, _, err := refreshDeployedRealIPProfile(stdcontext.Background(), "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml", &effects)
 	if err == nil {
 		t.Fatal("refreshDeployedRealIPProfile() error = nil, want profile and lock release failure")
 	}
@@ -10350,6 +12550,7 @@ func TestRefreshDeployedRealIPProfileRejectsInvalidMetadataBeforeSideEffects(t *
 	previousDescribe := describeEdgeOneOriginACLFn
 	previousStage := stageRealIPRuntimeFilesFn
 	previousAcquireRealIPProfileLock := acquireRealIPProfileLockFn
+	previousReadArtifact := readDeployedRealIPArtifactFn
 	t.Cleanup(func() {
 		readDeployedRealIPProfileFn = previousProfileReader
 		readDeployedRealIPReferencesFn = previousReferenceReader
@@ -10357,6 +12558,7 @@ func TestRefreshDeployedRealIPProfileRejectsInvalidMetadataBeforeSideEffects(t *
 		describeEdgeOneOriginACLFn = previousDescribe
 		stageRealIPRuntimeFilesFn = previousStage
 		acquireRealIPProfileLockFn = previousAcquireRealIPProfileLock
+		readDeployedRealIPArtifactFn = previousReadArtifact
 	})
 	acquireRealIPProfileLockFn = func(profileName string) (realIPProfileLock, error) {
 		if profileName != "edgeone-prod" {
@@ -10378,6 +12580,12 @@ func TestRefreshDeployedRealIPProfileRejectsInvalidMetadataBeforeSideEffects(t *
 		}
 		return readDeployedRealIPProfile(invalidPath)
 	}
+	readDeployedRealIPArtifactFn = func(path string) ([]byte, error) {
+		if path != "/etc/systemd/system/lanpanel-realip-edgeone-prod-refresh.service" {
+			return nil, os.ErrNotExist
+		}
+		return managedRealIPRefreshServiceContent("edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml"), nil
+	}
 	readDeployedRealIPReferencesFn = func(string) ([]realip.Reference, error) {
 		t.Fatalf("readDeployedRealIPReferencesFn must not be called after invalid profile metadata")
 		return nil, nil
@@ -10390,15 +12598,15 @@ func TestRefreshDeployedRealIPProfileRejectsInvalidMetadataBeforeSideEffects(t *
 		t.Fatalf("describeEdgeOneOriginACLFn must not be called after invalid profile metadata")
 		return nil, nil
 	}
-	stageRealIPRuntimeFilesFn = func(realip.ProfileConfig, realip.State, realip.Reference) ([]realiprender.StagedFile, error) {
+	stageRealIPRuntimeFilesFn = func(realip.ProfileConfig, realip.State, realip.Reference, string) ([]realiprender.StagedFile, error) {
 		t.Fatalf("stageRealIPRuntimeFilesFn must not be called after invalid profile metadata")
 		return nil, nil
 	}
 
 	var effects appDeployEffects
-	_, _, _, err := refreshDeployedRealIPProfile(stdcontext.Background(), "edgeone-prod", &effects)
-	if err == nil || !strings.Contains(err.Error(), "lanpanel_managed marker") {
-		t.Fatalf("refreshDeployedRealIPProfile() error = %v, want marker failure", err)
+	_, _, _, err := refreshDeployedRealIPProfile(stdcontext.Background(), "edgeone-prod", "/etc/lanpanel/lanpanel-app.yaml", &effects)
+	if err == nil || !strings.Contains(err.Error(), "schema_version") {
+		t.Fatalf("refreshDeployedRealIPProfile() error = %v, want schema version failure", err)
 	}
 	if len(effects.actions) != 0 || len(effects.modifiedPaths) != 0 {
 		t.Fatalf("effects = %#v, want no side effects recorded", effects)
@@ -11313,7 +13521,7 @@ func TestInstallAndActivateRealIPRefreshRollsBackOnNginxTestFailure(t *testing.T
 			if nginxTests == 1 {
 				return host.Result{Stderr: "nginx test failed"}, errors.New("nginx test failed")
 			}
-		case actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload-or-restart nginx.service":
+		case actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload nginx.service":
 			nginxReloads++
 		}
 		return host.Result{}, nil
@@ -11358,7 +13566,7 @@ func TestInstallAndActivateRealIPRefreshRollsBackOnNginxReloadFailure(t *testing
 				nginxTests++
 			}
 		case "systemctl":
-			if strings.Join(actual.Args, " ") == "reload-or-restart nginx.service" {
+			if strings.Join(actual.Args, " ") == "reload nginx.service" {
 				nginxReloads++
 				if nginxReloads == 1 {
 					return host.Result{Stderr: "reload failed"}, errors.New("reload failed")
@@ -11407,7 +13615,7 @@ func TestRollbackRealIPDeployReloadsRestoredNginxAfterReloadFailure(t *testing.T
 				nginxTests++
 			}
 		case "systemctl":
-			if strings.Join(actual.Args, " ") == "reload-or-restart nginx.service" {
+			if strings.Join(actual.Args, " ") == "reload nginx.service" {
 				nginxReloads++
 			}
 		}
@@ -11456,6 +13664,10 @@ func TestActivateAppNginxDoesNotFallbackAfterSystemctlReloadFailure(t *testing.T
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/bin/true --listen 127.0.0.1:18001"
 	names, err := appsvc.NewNames(cfg)
 	if err != nil {
@@ -11463,7 +13675,7 @@ func TestActivateAppNginxDoesNotFallbackAfterSystemctlReloadFailure(t *testing.T
 	}
 	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
 		actual := unwrapMaybeSudoHostCommand(command)
-		if actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload-or-restart nginx.service" {
+		if actual.Name == "systemctl" && strings.Join(actual.Args, " ") == "reload nginx.service" {
 			return host.Result{ExitCode: 1, Stderr: "reload failed"}, errors.New("reload failed")
 		}
 		return host.Result{}, nil
@@ -11866,6 +14078,7 @@ func TestExecute_DeployInstallsRuntimeAssetsAndStatusShowsPersistedCheckpoint(t 
 	hostRoot := filepath.Join(baseDir, "host")
 	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
 	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
 	previousCheckpointPath := checkpointPathForConfigFn
 	previousStore := checkpointStoreForConfigFn
 	previousExecutor := newHostExecutorFn
@@ -11873,6 +14086,7 @@ func TestExecute_DeployInstallsRuntimeAssetsAndStatusShowsPersistedCheckpoint(t 
 	runner := &scriptedHostRunner{}
 	t.Cleanup(func() {
 		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
 		checkpointPathForConfigFn = previousCheckpointPath
 		checkpointStoreForConfigFn = previousStore
 		newHostExecutorFn = previousExecutor
@@ -11880,6 +14094,9 @@ func TestExecute_DeployInstallsRuntimeAssetsAndStatusShowsPersistedCheckpoint(t 
 	})
 	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
 		return host.NewFileInstaller(nil, hostRoot)
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
 	}
 	checkpointPathForConfigFn = func(string) string {
 		return checkpointPath
@@ -11997,8 +14214,361 @@ func TestExecute_DeployInstallsRuntimeAssetsAndStatusShowsPersistedCheckpoint(t 
 	if !strings.Contains(statusStdout, "checkpoint path: "+checkpointPath) {
 		t.Fatalf("status stdout = %q, want checkpoint path", statusStdout)
 	}
-	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.74.0") {
+	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.80.0") {
 		t.Fatalf("status stdout = %q, want minimum client version", statusStdout)
+	}
+}
+
+func TestExecute_DeployRollsBackRuntimeFilesAfterNginxActivationFailure(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+
+	stubPassingDeployPreflight(t)
+
+	const oldSite = "server { # previous lanpanel config\n}\n"
+	const oldSiteMode fs.FileMode = 0o640
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		nginxcomponent.SiteAvailablePath: {content: []byte(oldSite), mode: oldSiteMode},
+	}}
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
+	previousNginxActivator := newNginxActivatorFn
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	runner := &scriptedHostRunner{}
+	t.Cleanup(func() {
+		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
+		newNginxActivatorFn = previousNginxActivator
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	newNginxActivatorFn = func(host.Executor) nginxSiteActivator {
+		return failingNginxActivator{err: errors.New("nginx activation boom")}
+	}
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	runner.run = func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{Command: command}, nil
+		}
+		return successfulDeployHostResult(command)
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want Nginx activation failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: activate Nginx site failed") {
+		t.Fatalf("stdout = %q, want Nginx activation failure summary", stdout)
+	}
+
+	restored, ok := fileSystem.files[nginxcomponent.SiteAvailablePath]
+	if !ok {
+		t.Fatalf("%s missing after rollback", nginxcomponent.SiteAvailablePath)
+	}
+	if string(restored.content) != oldSite {
+		t.Fatalf("restored Nginx site = %q, want %q", string(restored.content), oldSite)
+	}
+	if restored.mode.Perm() != oldSiteMode {
+		t.Fatalf("restored Nginx site mode = %o, want %o", restored.mode.Perm(), oldSiteMode)
+	}
+	if _, ok := fileSystem.files["/etc/headscale/config.yaml"]; ok {
+		t.Fatal("/etc/headscale/config.yaml exists after rollback, want new runtime file removed")
+	}
+	if !ranHostCommand(runner.commands, "nginx", "-t") {
+		t.Fatalf("commands = %#v, want nginx -t after runtime rollback", runner.commands)
+	}
+	if !ranHostCommand(runner.commands, "systemctl", "reload nginx.service") {
+		t.Fatalf("commands = %#v, want nginx reload after runtime rollback", runner.commands)
+	}
+
+	checkpoint, err := state.NewStore(checkpointPath).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if checkpoint.HasCompleted(deployCheckpointRuntimeAssetsInstalled) {
+		t.Fatalf("CompletedCheckpoints = %v, want runtime checkpoint removed after rollback", checkpoint.CompletedCheckpoints)
+	}
+	if len(checkpoint.RuntimeFileSnapshots) != 0 {
+		t.Fatalf("RuntimeFileSnapshots = %#v, want cleared after rollback", checkpoint.RuntimeFileSnapshots)
+	}
+	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "activate Nginx site" {
+		t.Fatalf("LastFailure = %#v, want activate Nginx site failure", checkpoint.LastFailure)
+	}
+}
+
+func TestExecute_DeployRollsBackPersistedRuntimeFilesAfterResumedNginxActivationFailure(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	desiredDigest, err := deployDesiredStateDigest(cfg)
+	if err != nil {
+		t.Fatalf("deployDesiredStateDigest() error = %v", err)
+	}
+
+	stubPassingDeployPreflight(t)
+
+	const oldSite = "server { # previous config before interrupted deploy\n}\n"
+	const oldSiteMode fs.FileMode = 0o640
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		nginxcomponent.SiteAvailablePath: {content: []byte("server { # interrupted desired config\n}\n"), mode: 0o644},
+		"/etc/headscale/config.yaml":     {content: []byte("server_url: https://hs.example.com\n"), mode: 0o600},
+	}}
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	checkpoint := state.Checkpoint{
+		DesiredStateDigest: desiredDigest,
+		CurrentCheckpoint:  deployCheckpointTLSBootstrapReady,
+		CompletedCheckpoints: []string{
+			deployCheckpointPackageManagerReady,
+			deployCheckpointPackageArchitectureConfirmed,
+			deployCheckpointHostDependenciesInstalled,
+			deployCheckpointLegoInstalled,
+			deployCheckpointHeadscalePackageInstalled,
+			deployCheckpointRuntimeAssetsInstalled,
+			deployCheckpointTLSBootstrapReady,
+		},
+		RuntimeFileSnapshots: []state.FileSnapshot{
+			{HostPath: nginxcomponent.SiteAvailablePath, Exists: true, Content: []byte(oldSite), Mode: uint32(oldSiteMode)},
+			{HostPath: "/etc/headscale/config.yaml"},
+		},
+	}
+	if err := state.NewStore(checkpointPath).Save(checkpoint); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
+	previousNginxActivator := newNginxActivatorFn
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	runner := &scriptedHostRunner{}
+	installerCalled := false
+	t.Cleanup(func() {
+		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
+		newNginxActivatorFn = previousNginxActivator
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
+		installerCalled = true
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
+	}
+	newNginxActivatorFn = func(host.Executor) nginxSiteActivator {
+		return failingNginxActivator{err: errors.New("nginx activation boom")}
+	}
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	runner.run = func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "rm" && len(actual.Args) == 3 && actual.Args[0] == "-f" && actual.Args[1] == "--" {
+			delete(fileSystem.files, actual.Args[2])
+			return host.Result{Command: command}, nil
+		}
+		return successfulDeployHostResult(command)
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want Nginx activation failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !installerCalled {
+		t.Fatal("runtime installer was not called after pending rollback")
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: activate Nginx site failed") {
+		t.Fatalf("stdout = %q, want Nginx activation failure summary", stdout)
+	}
+	restored, ok := fileSystem.files[nginxcomponent.SiteAvailablePath]
+	if !ok || string(restored.content) != oldSite || restored.mode.Perm() != oldSiteMode {
+		t.Fatalf("restored site = %#v, %v; want old site content and mode", restored, ok)
+	}
+	if _, ok := fileSystem.files["/etc/headscale/config.yaml"]; ok {
+		t.Fatal("/etc/headscale/config.yaml exists after resumed rollback, want removed")
+	}
+
+	loaded, err := state.NewStore(checkpointPath).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.HasCompleted(deployCheckpointRuntimeAssetsInstalled) {
+		t.Fatalf("CompletedCheckpoints = %v, want runtime checkpoint removed after resumed rollback", loaded.CompletedCheckpoints)
+	}
+	if len(loaded.RuntimeFileSnapshots) != 0 {
+		t.Fatalf("RuntimeFileSnapshots = %#v, want cleared after resumed rollback", loaded.RuntimeFileSnapshots)
+	}
+	if loaded.LastFailure == nil || loaded.LastFailure.Step != "activate Nginx site" {
+		t.Fatalf("LastFailure = %#v, want activate Nginx site failure", loaded.LastFailure)
+	}
+}
+
+func TestExecute_DeployRejectsUnsafeCheckpointPathBeforeHostMutation(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	target := filepath.Join(baseDir, "checkpoint-target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("Mkdir(target) error = %v", err)
+	}
+	link := filepath.Join(baseDir, "checkpoint-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+	checkpointPath := filepath.Join(link, "checkpoint.json")
+
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	runner := &scriptedHostRunner{}
+	t.Cleanup(func() {
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+	})
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want unsafe checkpoint failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: load deploy checkpoint failed") {
+		t.Fatalf("stdout = %q, want checkpoint load failure", stdout)
+	}
+	if !strings.Contains(stdout, "must not be a symlink") {
+		t.Fatalf("stdout = %q, want symlink refusal detail", stdout)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("host commands = %#v, want no host mutation before checkpoint path safety passes", runner.commands)
+	}
+}
+
+func TestExecute_DeployJSONSuccessWritesTypedOperationResult(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	stubPassingDeployPreflight(t)
+
+	hostRoot := filepath.Join(baseDir, "host")
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	previousInstaller := newDeployFileInstallerFn
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	runner := &scriptedHostRunner{}
+	t.Cleanup(func() {
+		newDeployFileInstallerFn = previousInstaller
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
+		return host.NewFileInstaller(nil, hostRoot)
+	}
+	checkpointPathForConfigFn = func(string) string { return checkpointPath }
+	checkpointStoreForConfigFn = func(string) state.Store { return state.NewStore(checkpointPath) }
+	runner.run = func(command host.Command) (host.Result, error) {
+		return successfulDeployHostResult(command)
+	}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd { return host.NewSystemd(executor) }
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath, "--format", "json")
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	response := mustDecodeResponse(t, stdout)
+	if response.Command != "deploy" || response.Status != "applied" {
+		t.Fatalf("response = %#v, want deploy applied response", response)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if result.Kind != domain.JobKindDeploy || result.Status != domain.JobStatusSucceeded {
+		t.Fatalf("operation result = %#v, want successful deploy", result)
+	}
+	if len(result.ModifiedPaths) != 6 || result.ModifiedPaths[0] != "/etc/headscale/config.yaml" {
+		t.Fatalf("ModifiedPaths = %#v, want actual deploy paths", result.ModifiedPaths)
+	}
+	if result.RetryCommand != workflow.ShellCommand("lanpanel", "deploy", "--config", configPath) {
+		t.Fatalf("RetryCommand = %q, want deploy retry command", result.RetryCommand)
+	}
+	if len(result.Progress) == 0 {
+		t.Fatal("Progress = empty, want deploy progress events")
 	}
 }
 
@@ -12063,31 +14633,31 @@ func TestExecute_DeployHTTP01FreshHostDoesNotRequirePreexistingChallengeRoute(t 
 	if strings.Contains(stdout, "HTTP-01 readiness could not be confirmed") {
 		t.Fatalf("stdout = %q, do not want preinstall HTTP-01 route failure", stdout)
 	}
+	for _, command := range runner.commands {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "headscale" && strings.Contains(strings.Join(actual.Args, " "), "preauthkeys create") {
+			t.Fatalf("deploy command %q must not create a preauth key", command.String())
+		}
+	}
 }
 
 func TestDetectPackageSourceStateUsesHeadscaleComponentOfficialPackageURLs(t *testing.T) {
 	cfg := config.ExampleConfig()
-	packagePlan, err := headscale.NewPackagePlan(cfg, headscale.InstallPlanOptions{
-		OfficialPackageSHA256: strings.Repeat("a", 64),
-	})
+	packagePlan, err := headscale.NewPackagePlan(cfg, headscale.InstallPlanOptions{})
 	if err != nil {
 		t.Fatalf("NewPackagePlan() error = %v", err)
 	}
 
 	previousProbePackageURL := probePackageURLFn
 	previousHashRemoteArtifact := hashRemoteArtifactFn
-	previousLookupOfficialPackageDigest := lookupOfficialPackageDigestFn
 	t.Cleanup(func() {
 		probePackageURLFn = previousProbePackageURL
 		hashRemoteArtifactFn = previousHashRemoteArtifact
-		lookupOfficialPackageDigestFn = previousLookupOfficialPackageDigest
 	})
 
 	var probedURL string
 	var probedURLs []string
 	var hashedURLs []string
-	var lookupVersion string
-	var lookupArch string
 	probePackageURLFn = func(_ *http.Client, rawURL string) (bool, bool, string) {
 		probedURL = rawURL
 		probedURLs = append(probedURLs, rawURL)
@@ -12095,15 +14665,7 @@ func TestDetectPackageSourceStateUsesHeadscaleComponentOfficialPackageURLs(t *te
 	}
 	hashRemoteArtifactFn = func(_ *http.Client, rawURL string) (string, error) {
 		hashedURLs = append(hashedURLs, rawURL)
-		if sha, ok := testLegoArchiveHash(t, rawURL); ok {
-			return sha, nil
-		}
-		return strings.Repeat("a", 64), nil
-	}
-	lookupOfficialPackageDigestFn = func(_ *http.Client, version string, arch string) (string, error) {
-		lookupVersion = version
-		lookupArch = arch
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 
 	state := detectPackageSourceState(cfg)
@@ -12116,11 +14678,8 @@ func TestDetectPackageSourceStateUsesHeadscaleComponentOfficialPackageURLs(t *te
 	if !slices.Contains(hashedURLs, packagePlan.SourceURL) {
 		t.Fatalf("hashedURLs = %#v, want Headscale component SourceURL %q", hashedURLs, packagePlan.SourceURL)
 	}
-	if lookupVersion != packagePlan.Version || lookupArch != packagePlan.Arch {
-		t.Fatalf("lookup version/arch = %q/%q, want %q/%q", lookupVersion, lookupArch, packagePlan.Version, packagePlan.Arch)
-	}
-	if state.ExpectedSHA256 != strings.Repeat("a", 64) {
-		t.Fatalf("ExpectedSHA256 = %q, want official digest", state.ExpectedSHA256)
+	if state.ExpectedSHA256 != packagePlan.ExpectedSHA256 {
+		t.Fatalf("ExpectedSHA256 = %q, want built-in digest %q", state.ExpectedSHA256, packagePlan.ExpectedSHA256)
 	}
 	legoURL := legocomponent.OfficialArchiveURL(legocomponent.Version, config.ArchAMD64)
 	if !slices.Contains(probedURLs, legoURL) || !slices.Contains(hashedURLs, legoURL) {
@@ -12150,10 +14709,7 @@ func TestDetectPackageSourceStateUsesConfiguredPackageProbeTimeouts(t *testing.T
 	}
 	hashRemoteArtifactFn = func(client *http.Client, rawURL string) (string, error) {
 		artifactTimeouts = append(artifactTimeouts, client.Timeout)
-		if sha, ok := testLegoArchiveHash(t, rawURL); ok {
-			return sha, nil
-		}
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 	lookupOfficialPackageDigestFn = func(client *http.Client, version string, arch string) (string, error) {
 		artifactTimeouts = append(artifactTimeouts, client.Timeout)
@@ -12184,7 +14740,7 @@ func TestDetectPackageSourceStateUsesConfiguredPackageProbeTimeouts(t *testing.T
 
 func TestDetectPackageSourceStateUsesOfflineLegoArchiveWithoutRemoteProbe(t *testing.T) {
 	cfg := config.ExampleConfig()
-	archivePath := filepath.Join(t.TempDir(), "lego_v5.1.0_linux_amd64.tar.gz")
+	archivePath := filepath.Join(t.TempDir(), "lego_v5.2.2_linux_amd64.tar.gz")
 	if err := os.WriteFile(archivePath, []byte("not the real archive"), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -12208,7 +14764,7 @@ func TestDetectPackageSourceStateUsesOfflineLegoArchiveWithoutRemoteProbe(t *tes
 	}
 	hashRemoteArtifactFn = func(_ *http.Client, rawURL string) (string, error) {
 		hashedURLs = append(hashedURLs, rawURL)
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 	lookupOfficialPackageDigestFn = func(_ *http.Client, version string, arch string) (string, error) {
 		return strings.Repeat("a", 64), nil
@@ -12438,6 +14994,7 @@ func TestExecute_DeployDNS01SourcesEnvFileThroughSudo(t *testing.T) {
 	hostRoot := filepath.Join(baseDir, "host")
 	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
 	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
 	previousCheckpointPath := checkpointPathForConfigFn
 	previousStore := checkpointStoreForConfigFn
 	previousExecutor := newHostExecutorFn
@@ -12445,6 +15002,7 @@ func TestExecute_DeployDNS01SourcesEnvFileThroughSudo(t *testing.T) {
 	runner := &scriptedHostRunner{}
 	t.Cleanup(func() {
 		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
 		checkpointPathForConfigFn = previousCheckpointPath
 		checkpointStoreForConfigFn = previousStore
 		newHostExecutorFn = previousExecutor
@@ -12452,6 +15010,9 @@ func TestExecute_DeployDNS01SourcesEnvFileThroughSudo(t *testing.T) {
 	})
 	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
 		return host.NewFileInstaller(nil, hostRoot)
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
 	}
 	checkpointPathForConfigFn = func(string) string {
 		return checkpointPath
@@ -12537,6 +15098,9 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 		}
 	}
 
+	fileSystem := mutableRealIPFileSystem{files: map[string]mutableRealIPFile{
+		nginxcomponent.SiteAvailablePath: {content: []byte("server { # interrupted runtime config\n}\n"), mode: 0o644},
+	}}
 	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
 	if err := state.NewStore(checkpointPath).Save(state.Checkpoint{
 		DesiredStateDigest: desiredStateDigest,
@@ -12549,12 +15113,16 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 			deployCheckpointHeadscalePackageInstalled,
 			deployCheckpointRuntimeAssetsInstalled,
 		},
+		RuntimeFileSnapshots: []state.FileSnapshot{
+			{HostPath: nginxcomponent.SiteAvailablePath, Exists: true, Content: []byte("server { # previous runtime config\n}\n"), Mode: 0o644},
+		},
 	}); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 
 	previousStageRuntime := stageRuntimeFilesFn
 	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
 	previousCheckpointPath := checkpointPathForConfigFn
 	previousStore := checkpointStoreForConfigFn
 	previousExecutor := newHostExecutorFn
@@ -12563,6 +15131,7 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 	t.Cleanup(func() {
 		stageRuntimeFilesFn = previousStageRuntime
 		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
 		checkpointPathForConfigFn = previousCheckpointPath
 		checkpointStoreForConfigFn = previousStore
 		newHostExecutorFn = previousExecutor
@@ -12574,7 +15143,10 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 		return previousStageRuntime(cfg)
 	}
 	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
-		return stubFileInstaller{err: errors.New("unexpected file install during resumed deploy")}
+		return mutableRealIPInstaller{fileSystem: fileSystem}
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return fileSystem
 	}
 	checkpointPathForConfigFn = func(string) string {
 		return checkpointPath
@@ -12604,11 +15176,11 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
-	if !strings.Contains(stdout, "lanpanel deploy: preflight passed; runtime assets already match the desired state and verification checks passed") {
-		t.Fatalf("stdout = %q, want resumed deploy summary", stdout)
+	if !strings.Contains(stdout, "lanpanel deploy: preflight passed, server components were installed, runtime assets were applied, and verification checks passed") {
+		t.Fatalf("stdout = %q, want resumed deploy summary with runtime reinstall", stdout)
 	}
 	if stageCalls != 2 {
-		t.Fatalf("stageRuntimeFilesFn() calls = %d, want digest and static verify staging passes during resumed deploy", stageCalls)
+		t.Fatalf("stageRuntimeFilesFn() calls = %d, want runtime reinstall and static verify staging passes during resumed deploy", stageCalls)
 	}
 	if got := len(runner.commands); got < 10 {
 		t.Fatalf("len(commands) = %d, want resumed certificate/service/onboarding commands", got)
@@ -12624,7 +15196,7 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 			issueIndex = index
 		}
 	}
-	if runner.commands[0].Name != "mkdir" || migrationIndex < 0 || issueIndex < 0 || migrationIndex >= issueIndex {
+	if migrationIndex < 0 || issueIndex < 0 || migrationIndex >= issueIndex {
 		t.Fatalf("commands = %#v, want HTTP-01 bootstrap and lego migration before lego issuance", runner.commands)
 	}
 
@@ -12655,6 +15227,9 @@ func TestExecute_DeployResumesFromRecordedCheckpoint(t *testing.T) {
 	}
 	if checkpoint.LastFailure != nil {
 		t.Fatalf("LastFailure = %#v, want nil", checkpoint.LastFailure)
+	}
+	if len(checkpoint.RuntimeFileSnapshots) != 0 {
+		t.Fatalf("RuntimeFileSnapshots = %#v, want cleared after successful deploy", checkpoint.RuntimeFileSnapshots)
 	}
 }
 
@@ -12793,48 +15368,7 @@ func TestCertificateIssueRemediationsAreChallengeSpecific(t *testing.T) {
 	}
 }
 
-func TestCommandErrorWithOutputIncludesFirstOutputLine(t *testing.T) {
-	result := host.Result{
-		Command:  host.Command{Name: "/opt/lanpanel/bin/lego", Args: []string{"run"}},
-		ExitCode: 1,
-		Stderr:   "could not obtain certificates: connection refused\nverbose details",
-	}
-	err := commandErrorWithOutput(result, &host.CommandError{Result: result, Err: errors.New("exit status 1")})
-
-	message := err.Error()
-	if !strings.Contains(message, "output: could not obtain certificates: connection refused") {
-		t.Fatalf("error = %q, want first output line", message)
-	}
-	if strings.Contains(message, "verbose details") {
-		t.Fatalf("error = %q, do not want multiline command output", message)
-	}
-}
-
-func TestCommandErrorWithOutputPrefersDiagnosticLine(t *testing.T) {
-	result := host.Result{
-		Command:  host.Command{Name: "/opt/lanpanel/bin/lego", Args: []string{"run"}},
-		ExitCode: 1,
-		Stdout: strings.Join([]string{
-			"2026-05-21T22:47:59+08:00 INFO Private key saved. filepath=/var/lib/lanpanel/lego/accounts/acme-v02.api.letsencrypt.org/ops@example.com/ops@example.com.key",
-			"2026-05-21T22:48:00+08:00 INFO Could not find the solver. domain=hs.example.com type=tls-alpn-01 solvers=http-01",
-			"2026-05-21T22:48:01+08:00 ERR Could not obtain certificates error=\"one or more domains had a problem\"",
-		}, "\n"),
-	}
-	err := commandErrorWithOutput(result, &host.CommandError{Result: result, Err: errors.New("exit status 1")})
-
-	message := err.Error()
-	if !strings.Contains(message, "ERR Could not obtain certificates") {
-		t.Fatalf("error = %q, want diagnostic lego output line", message)
-	}
-	if strings.Contains(message, "Private key saved") {
-		t.Fatalf("error = %q, do not want earlier non-diagnostic lego output", message)
-	}
-	if strings.Contains(message, "Could not find the solver") {
-		t.Fatalf("error = %q, do not want normal lego solver-selection info", message)
-	}
-}
-
-func TestExecute_DeployCertificateFailureIncludesLegoOutput(t *testing.T) {
+func TestExecute_DeployCertificateFailureOmitsLegoOutput(t *testing.T) {
 	baseDir := t.TempDir()
 	configPath := filepath.Join(baseDir, "lanpanel.yaml")
 	if err := config.WriteExampleFile(configPath); err != nil {
@@ -12915,8 +15449,11 @@ func TestExecute_DeployCertificateFailureIncludesLegoOutput(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
-	if !strings.Contains(stdout, "output: could not obtain certificates: acme: error: connection refused") {
-		t.Fatalf("stdout = %q, want lego output detail", stdout)
+	if !strings.Contains(stdout, "exited with status 1") {
+		t.Fatalf("stdout = %q, want command failure cause", stdout)
+	}
+	if strings.Contains(stdout, "output:") || strings.Contains(stdout, "could not obtain certificates: acme: error: connection refused") {
+		t.Fatalf("stdout = %q, must not include lego output detail", stdout)
 	}
 	if strings.Contains(stdout, "full lego trace") {
 		t.Fatalf("stdout = %q, do not want multiline lego trace", stdout)
@@ -12981,9 +15518,20 @@ func TestExecute_DeployClearsServicesCheckpointWhenOnboardingFails(t *testing.T)
 	checkpointStoreForConfigFn = func(string) state.Store {
 		return state.NewStore(checkpointPath)
 	}
+	restarts := 0
 	runner.run = func(command host.Command) (host.Result, error) {
 		actual := unwrapMaybeSudoHostCommand(command)
-		if actual.Name != "systemctl" || strings.Join(actual.Args, " ") != "restart headscale.service" {
+		if actual.Name != "systemctl" {
+			t.Fatalf("unexpected host command %q", command.String())
+		}
+		switch strings.Join(actual.Args, " ") {
+		case "is-enabled headscale.service":
+			return host.Result{Command: command, Stdout: "enabled\n"}, nil
+		case "is-active headscale.service":
+			return host.Result{Command: command, Stdout: "active\n"}, nil
+		case "restart headscale.service":
+			restarts++
+		default:
 			t.Fatalf("unexpected host command %q", command.String())
 		}
 		return host.Result{Command: command}, nil
@@ -13005,14 +15553,14 @@ func TestExecute_DeployClearsServicesCheckpointWhenOnboardingFails(t *testing.T)
 	if stderr != "" {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
-	if !strings.Contains(stdout, "lanpanel deploy: create onboarding preauthkey failed") {
+	if !strings.Contains(stdout, "lanpanel deploy: prepare onboarding user failed") {
 		t.Fatalf("stdout = %q, want onboarding failure summary", stdout)
 	}
 	if !strings.Contains(stdout, "journalctl -u headscale.service") {
 		t.Fatalf("stdout = %q, want service-health remediation", stdout)
 	}
-	if len(runner.commands) != 1 {
-		t.Fatalf("commands = %d, want resumed Headscale restart before onboarding", len(runner.commands))
+	if restarts != 1 {
+		t.Fatalf("headscale restarts = %d, want resumed Headscale restart before onboarding", restarts)
 	}
 
 	checkpoint, err := state.NewStore(checkpointPath).Load()
@@ -13025,8 +15573,119 @@ func TestExecute_DeployClearsServicesCheckpointWhenOnboardingFails(t *testing.T)
 	if checkpoint.CurrentCheckpoint == deployCheckpointServicesEnabled {
 		t.Fatalf("CurrentCheckpoint = %q, want services checkpoint cleared", checkpoint.CurrentCheckpoint)
 	}
-	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "create onboarding preauthkey" {
+	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "prepare onboarding user" {
 		t.Fatalf("LastFailure = %#v, want onboarding failure snapshot", checkpoint.LastFailure)
+	}
+}
+
+func TestExecute_DeployRollsBackResumedHeadscaleRestartFailure(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	cfg, err := config.LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	desiredStateDigest, err := deployDesiredStateDigest(cfg)
+	if err != nil {
+		t.Fatalf("deployDesiredStateDigest() error = %v", err)
+	}
+	stubPassingDeployPreflight(t)
+
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	if err := state.NewStore(checkpointPath).Save(state.Checkpoint{
+		DesiredStateDigest: desiredStateDigest,
+		CurrentCheckpoint:  deployCheckpointServicesEnabled,
+		CompletedCheckpoints: []string{
+			deployCheckpointPackageManagerReady,
+			deployCheckpointPackageArchitectureConfirmed,
+			deployCheckpointHostDependenciesInstalled,
+			deployCheckpointLegoInstalled,
+			deployCheckpointHeadscalePackageInstalled,
+			deployCheckpointRuntimeAssetsInstalled,
+			deployCheckpointTLSBootstrapReady,
+			deployCheckpointNginxActivated,
+			deployCheckpointLegoCommandReady,
+			deployCheckpointCertificateIssued,
+			deployCheckpointSystemdDaemonReloaded,
+			deployCheckpointServicesEnabled,
+		},
+	}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	events := []string{}
+	t.Cleanup(func() {
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name != "systemctl" {
+			t.Fatalf("unexpected host command %q", command.String())
+		}
+		switch strings.Join(actual.Args, " ") {
+		case "is-enabled headscale.service":
+			return host.Result{Command: command, Stdout: "enabled\n"}, nil
+		case "is-active headscale.service":
+			return host.Result{Command: command, Stdout: "active\n"}, nil
+		case "restart headscale.service":
+			events = append(events, "restart-headscale-failed")
+			return host.Result{Command: command, Stderr: "restart failed"}, errors.New("restart failed")
+		case "enable headscale.service":
+			events = append(events, "restore-enable-headscale")
+		case "start headscale.service":
+			events = append(events, "restore-start-headscale")
+		default:
+			t.Fatalf("unexpected host command %q", command.String())
+		}
+		return host.Result{Command: command}, nil
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want resumed Headscale restart failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: restart Headscale failed") {
+		t.Fatalf("stdout = %q, want restart Headscale failure", stdout)
+	}
+	for _, want := range []string{"restart-headscale-failed", "restore-enable-headscale", "restore-start-headscale"} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("events = %#v, missing %q", events, want)
+		}
+	}
+	checkpoint, err := state.NewStore(checkpointPath).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if checkpoint.HasCompleted(deployCheckpointServicesEnabled) {
+		t.Fatalf("CompletedCheckpoints = %v, want services checkpoint removed after restart failure", checkpoint.CompletedCheckpoints)
+	}
+	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "restart Headscale" {
+		t.Fatalf("LastFailure = %#v, want restart Headscale failure snapshot", checkpoint.LastFailure)
 	}
 }
 
@@ -13295,6 +15954,9 @@ func TestExecute_DeployDeferredMissingLegoPersistsFailureAndStatusShowsCheckpoin
 		case "dpkg":
 			return host.Result{Stdout: "amd64\n"}, nil
 		case "systemctl":
+			if strings.Join(command.Args, " ") == "reload nginx.service" {
+				return host.Result{Command: command}, nil
+			}
 			result := host.Result{Command: command, Stderr: "Failed to connect to bus: No such file or directory"}
 			return result, &host.CommandError{Result: result, Err: errors.New("exit status 1")}
 		default:
@@ -13369,7 +16031,7 @@ func TestExecute_DeployDeferredMissingLegoPersistsFailureAndStatusShowsCheckpoin
 	if !strings.Contains(statusStdout, "warnings: lego is not installed; public certificate issuance was deferred and Nginx remains on the temporary HTTP-01 bootstrap certificate") {
 		t.Fatalf("status stdout = %q, want deferred lego warning", statusStdout)
 	}
-	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.74.0") {
+	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.80.0") {
 		t.Fatalf("status stdout = %q, want minimum client version", statusStdout)
 	}
 }
@@ -13415,6 +16077,9 @@ func TestExecute_DeployDeferredSystemdPersistsFailureBeforeServicesAndOnboarding
 		case "dpkg":
 			return host.Result{Command: command, Stdout: "amd64\n"}, nil
 		case "systemctl":
+			if strings.Join(actual.Args, " ") == "reload nginx.service" {
+				return host.Result{Command: command}, nil
+			}
 			result := host.Result{Command: command, Stderr: "Failed to connect to bus: No such file or directory", ExitCode: 1}
 			return result, &host.CommandError{Result: result, Err: errors.New("exit status 1")}
 		default:
@@ -13492,6 +16157,171 @@ func TestExecute_DeployDeferredSystemdPersistsFailureBeforeServicesAndOnboarding
 	}
 	if !strings.Contains(statusStdout, "warnings: systemd is unavailable; service enablement and onboarding were deferred") {
 		t.Fatalf("status stdout = %q, want systemd warning", statusStdout)
+	}
+}
+
+func TestExecute_DeployRollsBackServiceSystemdStateAfterRenewTimerStartFailure(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	stubPassingDeployPreflight(t)
+
+	hostRoot := filepath.Join(baseDir, "host")
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	previousInstaller := newDeployFileInstallerFn
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	events := []string{}
+	t.Cleanup(func() {
+		newDeployFileInstallerFn = previousInstaller
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
+		return host.NewFileInstaller(nil, hostRoot)
+	}
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "enable headscale.service nginx.service lanpanel-lego-renew.timer":
+				events = append(events, "enable-services")
+			case "start lanpanel-lego-renew.timer":
+				events = append(events, "start-renew-failed")
+				return host.Result{Command: command, Stderr: "timer start failed"}, errors.New("timer start failed")
+			case "stop lanpanel-lego-renew.timer", "disable lanpanel-lego-renew.timer", "stop nginx.service", "disable nginx.service", "stop headscale.service", "disable headscale.service":
+				events = append(events, "rollback-"+args)
+			}
+		}
+		return successfulDeployHostResult(command)
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want renew timer start failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: start renewal timer failed") {
+		t.Fatalf("stdout = %q, want renewal timer failure", stdout)
+	}
+	for _, want := range []string{
+		"enable-services",
+		"start-renew-failed",
+		"rollback-stop lanpanel-lego-renew.timer",
+		"rollback-disable lanpanel-lego-renew.timer",
+		"rollback-stop nginx.service",
+		"rollback-disable nginx.service",
+		"rollback-stop headscale.service",
+		"rollback-disable headscale.service",
+	} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("events = %#v, missing %q", events, want)
+		}
+	}
+	checkpoint, err := state.NewStore(checkpointPath).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if slices.Contains(checkpoint.CompletedCheckpoints, deployCheckpointServicesEnabled) {
+		t.Fatalf("CompletedCheckpoints = %v, did not want services-enabled after rollback", checkpoint.CompletedCheckpoints)
+	}
+	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "start renewal timer" {
+		t.Fatalf("LastFailure = %#v, want renewal timer failure", checkpoint.LastFailure)
+	}
+}
+
+func TestExecute_DeployRejectsRuntimeEnabledServiceStateBeforeServiceMutation(t *testing.T) {
+	baseDir := t.TempDir()
+	configPath := filepath.Join(baseDir, "lanpanel.yaml")
+	if err := config.WriteExampleFile(configPath); err != nil {
+		t.Fatalf("WriteExampleFile() error = %v", err)
+	}
+	stubPassingDeployPreflight(t)
+
+	hostRoot := filepath.Join(baseDir, "host")
+	checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+	previousInstaller := newDeployFileInstallerFn
+	previousCheckpointPath := checkpointPathForConfigFn
+	previousStore := checkpointStoreForConfigFn
+	previousExecutor := newHostExecutorFn
+	previousSystemd := newHostSystemdFn
+	serviceMutations := []string{}
+	t.Cleanup(func() {
+		newDeployFileInstallerFn = previousInstaller
+		checkpointPathForConfigFn = previousCheckpointPath
+		checkpointStoreForConfigFn = previousStore
+		newHostExecutorFn = previousExecutor
+		newHostSystemdFn = previousSystemd
+	})
+	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
+		return host.NewFileInstaller(nil, hostRoot)
+	}
+	checkpointPathForConfigFn = func(string) string {
+		return checkpointPath
+	}
+	checkpointStoreForConfigFn = func(string) state.Store {
+		return state.NewStore(checkpointPath)
+	}
+	runner := &scriptedHostRunner{run: func(command host.Command) (host.Result, error) {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == "systemctl" {
+			args := strings.Join(actual.Args, " ")
+			switch args {
+			case "is-enabled headscale.service":
+				return host.Result{Command: command, Stdout: "enabled-runtime\n"}, nil
+			case "enable headscale.service nginx.service lanpanel-lego-renew.timer", "start lanpanel-lego-renew.timer", "restart headscale.service":
+				serviceMutations = append(serviceMutations, args)
+			}
+		}
+		return successfulDeployHostResult(command)
+	}}
+	newHostExecutorFn = func(env map[string]string) host.Executor {
+		return host.NewExecutor(runner, env)
+	}
+	newHostSystemdFn = func(executor host.Executor) host.Systemd {
+		return host.NewSystemd(executor)
+	}
+
+	stdout, stderr, err := runCLI(t, "deploy", "--config", configPath)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want runtime-enabled systemd snapshot failure")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	if !strings.Contains(stdout, "lanpanel deploy: snapshot service systemd state failed") || !strings.Contains(stdout, "enabled-runtime") {
+		t.Fatalf("stdout = %q, want exact state snapshot failure", stdout)
+	}
+	if len(serviceMutations) != 0 {
+		t.Fatalf("service mutations = %#v, want none before exact state snapshot failure", serviceMutations)
+	}
+	checkpoint, err := state.NewStore(checkpointPath).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if checkpoint.LastFailure == nil || checkpoint.LastFailure.Step != "snapshot service systemd state" {
+		t.Fatalf("LastFailure = %#v, want systemd snapshot failure", checkpoint.LastFailure)
 	}
 }
 
@@ -13653,6 +16483,12 @@ func TestExecute_DeployUsesSudoOnlyForPrivilegedHostMutationsAndDefersMissingLeg
 				t.Fatalf("privileged mutation was not sudo-wrapped: %q", command.String())
 			}
 			return host.Result{Command: command}, nil
+		case "stat":
+			if command.Name != "sudo" {
+				t.Fatalf("privileged file snapshot was not sudo-wrapped: %q", command.String())
+			}
+			result := host.Result{Command: command, Stderr: "stat: cannot statx: No such file or directory", ExitCode: 1}
+			return result, &host.CommandError{Result: result, Err: errors.New("exit status 1")}
 		case "/opt/lanpanel/bin/lego":
 			if strings.Join(actual.Args, " ") == "--version" && command.Name != "sudo" {
 				result := host.Result{Command: command}
@@ -13678,7 +16514,7 @@ func TestExecute_DeployUsesSudoOnlyForPrivilegedHostMutationsAndDefersMissingLeg
 			}
 			switch args := strings.Join(actual.Args, " "); {
 			case strings.Contains(args, "users list"):
-				return host.Result{Command: command, Stdout: "ID | Name\n1 | lanpanel\n"}, nil
+				return host.Result{Command: command, Stdout: `[{"id":1,"name":"lanpanel"}]` + "\n"}, nil
 			case strings.Contains(args, "preauthkeys create"):
 				return host.Result{Command: command, Stdout: "tskey-test\n"}, nil
 			default:
@@ -13848,6 +16684,7 @@ func TestExecute_DeployUsesConfiguredProxyForGoPreflightProbes(t *testing.T) {
 	previousHashRemoteArtifact := hashRemoteArtifactFn
 	previousLookupOfficialPackageDigest := lookupOfficialPackageDigestFn
 	previousInstaller := newDeployFileInstallerFn
+	previousFileSystem := newDeployHostFileSystemFn
 	previousExecutor := newHostExecutorFn
 	previousSystemd := newHostSystemdFn
 	t.Cleanup(func() {
@@ -13864,6 +16701,7 @@ func TestExecute_DeployUsesConfiguredProxyForGoPreflightProbes(t *testing.T) {
 		hashRemoteArtifactFn = previousHashRemoteArtifact
 		lookupOfficialPackageDigestFn = previousLookupOfficialPackageDigest
 		newDeployFileInstallerFn = previousInstaller
+		newDeployHostFileSystemFn = previousFileSystem
 		newHostExecutorFn = previousExecutor
 		newHostSystemdFn = previousSystemd
 	})
@@ -13911,6 +16749,9 @@ func TestExecute_DeployUsesConfiguredProxyForGoPreflightProbes(t *testing.T) {
 	lookupOfficialPackageDigestFn = lookupOfficialPackageDigest
 	newDeployFileInstallerFn = func(_ host.Executor, _ host.PrivilegeStrategy) stagedFileInstaller {
 		return stubFileInstaller{}
+	}
+	newDeployHostFileSystemFn = func(host.Executor, host.PrivilegeStrategy) host.FileSystem {
+		return mutableRealIPFileSystem{files: map[string]mutableRealIPFile{}}
 	}
 
 	runner := &scriptedHostRunner{}
@@ -14244,7 +17085,7 @@ func TestExecute_StatusSuppressesStaleDeployContextAfterConfigChange(t *testing.
 			if !strings.Contains(statusStdout, "checkpoint path: "+checkpointPath) {
 				t.Fatalf("status stdout = %q, want checkpoint path", statusStdout)
 			}
-			if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.74.0") {
+			if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.80.0") {
 				t.Fatalf("status stdout = %q, want minimum client version", statusStdout)
 			}
 			if !strings.Contains(statusStdout, "lanpanel deploy --config "+configPath) {
@@ -14308,7 +17149,7 @@ func TestExecute_StatusTreatsDigestlessDeployContextAsStale(t *testing.T) {
 	if !strings.Contains(statusStdout, "lanpanel deploy --config "+configPath) {
 		t.Fatalf("status stdout = %q, want deploy next step", statusStdout)
 	}
-	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.74.0") {
+	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.80.0") {
 		t.Fatalf("status stdout = %q, want minimum client version", statusStdout)
 	}
 	for _, unwanted := range []string{
@@ -14391,20 +17232,17 @@ func TestExecute_DeployHostCommandFailureStillWritesReadableFailureWhenCheckpoin
 	if stderr != "" {
 		t.Fatalf("stderr = %q, want empty", stderr)
 	}
-	if !strings.Contains(err.Error(), "confirm package architecture failed: collecting host package architecture via dpkg") {
-		t.Fatalf("error = %q, want original failure summary", err.Error())
+	if !strings.Contains(err.Error(), "persist deploy failure failed: saving deploy failure recovery state") {
+		t.Fatalf("error = %q, want fatal recovery persistence failure", err.Error())
 	}
-	if !strings.Contains(err.Error(), "could not save recovery point") {
-		t.Fatalf("error = %q, want checkpoint warning", err.Error())
+	if !strings.Contains(stdout, "lanpanel deploy: persist deploy failure failed: saving deploy failure recovery state") {
+		t.Fatalf("stdout = %q, want fatal recovery persistence response", stdout)
 	}
-	if !strings.Contains(stdout, "lanpanel deploy: confirm package architecture failed: collecting host package architecture via dpkg") {
-		t.Fatalf("stdout = %q, want failure response", stdout)
+	if !strings.Contains(stdout, "details: confirm package architecture failed") || !strings.Contains(stdout, "could not save recovery point") {
+		t.Fatalf("stdout = %q, want original failure and recovery save details", stdout)
 	}
-	if !strings.Contains(stdout, "details: dpkg --print-architecture exited with status 2") {
-		t.Fatalf("stdout = %q, want sanitized host command detail", stdout)
-	}
-	if !strings.Contains(stdout, "checkpoint warning: could not save recovery point:") {
-		t.Fatalf("stdout = %q, want checkpoint warning", stdout)
+	if strings.Contains(stdout, "checkpoint warning") {
+		t.Fatalf("stdout = %q, must not downgrade checkpoint save failure to warning", stdout)
 	}
 }
 
@@ -14484,7 +17322,7 @@ func TestExecute_DeployUsesSudoForPrivilegedHostMutations(t *testing.T) {
 			}
 			switch args := strings.Join(actual.Args, " "); {
 			case strings.Contains(args, "users list"):
-				return host.Result{Command: command, Stdout: "ID | Name\n1 | lanpanel\n"}, nil
+				return host.Result{Command: command, Stdout: `[{"id":1,"name":"lanpanel"}]` + "\n"}, nil
 			case strings.Contains(args, "preauthkeys create"):
 				return host.Result{Command: command, Stdout: "tskey-test\n"}, nil
 			default:
@@ -14622,7 +17460,7 @@ func TestExecute_CommandsFormatCheckpointLoadFailures(t *testing.T) {
 			if !strings.Contains(stdout, "checkpoint path: "+checkpointPath) {
 				t.Fatalf("stdout = %q, want checkpoint path", stdout)
 			}
-			if tc.command == "status" && !strings.Contains(stdout, "minimum client version: Tailscale >= v1.74.0") {
+			if tc.command == "status" && !strings.Contains(stdout, "minimum client version: Tailscale >= v1.80.0") {
 				t.Fatalf("stdout = %q, want minimum client version", stdout)
 			}
 			if !strings.Contains(stdout, tc.wantDetails) {
@@ -14743,7 +17581,7 @@ func TestExecute_StatusFormatsDesiredStateFingerprintFailures(t *testing.T) {
 	if !strings.Contains(stdout, "details: render runtime manifest: missing template value") {
 		t.Fatalf("stdout = %q, want sanitized fingerprint failure details", stdout)
 	}
-	if !strings.Contains(stdout, "minimum client version: Tailscale >= v1.74.0") {
+	if !strings.Contains(stdout, "minimum client version: Tailscale >= v1.80.0") {
 		t.Fatalf("stdout = %q, want minimum client version", stdout)
 	}
 }
@@ -14850,7 +17688,7 @@ func TestExecute_DeployFailurePersistsFailureSnapshotAndStatusShowsIt(t *testing
 	if !strings.Contains(statusStdout, "checkpoint path: "+checkpointPath) {
 		t.Fatalf("status stdout = %q, want checkpoint path", statusStdout)
 	}
-	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.74.0") {
+	if !strings.Contains(statusStdout, "minimum client version: Tailscale >= v1.80.0") {
 		t.Fatalf("status stdout = %q, want minimum client version", statusStdout)
 	}
 }
@@ -14862,6 +17700,18 @@ type stubFileInstaller struct {
 
 func (installer stubFileInstaller) Install(_ []render.StagedFile) ([]host.FileInstallResult, error) {
 	return append([]host.FileInstallResult(nil), installer.results...), installer.err
+}
+
+type failingNginxActivator struct {
+	err error
+}
+
+func (activator failingNginxActivator) EnableTestAndReload(stdcontext.Context) ([]host.Result, error) {
+	result := host.Result{
+		Command: host.Command{Name: "sh", DisplayName: "activate-nginx-site"},
+		Stderr:  "nginx activation failed\n",
+	}
+	return []host.Result{result}, activator.err
 }
 
 type mutableRealIPFile struct {
@@ -14967,6 +17817,10 @@ type stubHeadscaleOnboarder struct {
 	err error
 }
 
+func (onboarder stubHeadscaleOnboarder) EnsureUser(stdcontext.Context, string) ([]host.Result, error) {
+	return nil, onboarder.err
+}
+
 func (onboarder stubHeadscaleOnboarder) CreatePreAuthKey(stdcontext.Context, headscale.OnboardingPlan) (string, []host.Result, error) {
 	return onboarder.key, nil, onboarder.err
 }
@@ -15002,7 +17856,7 @@ func successfulDeployHostResult(command host.Command) (host.Result, error) {
 		args := strings.Join(actual.Args, " ")
 		switch {
 		case strings.Contains(args, "users list"):
-			return host.Result{Command: command, Stdout: "ID | Name\n1 | lanpanel\n"}, nil
+			return host.Result{Command: command, Stdout: `[{"id":1,"name":"lanpanel"}]` + "\n"}, nil
 		case strings.Contains(args, "preauthkeys create"):
 			return host.Result{Command: command, Stdout: "tskey-test\n"}, nil
 		default:
@@ -15024,6 +17878,16 @@ func successfulDeployHostResult(command host.Command) (host.Result, error) {
 	}
 }
 
+func ranHostCommand(commands []host.Command, name string, args string) bool {
+	for _, command := range commands {
+		actual := unwrapMaybeSudoHostCommand(command)
+		if actual.Name == name && strings.Join(actual.Args, " ") == args {
+			return true
+		}
+	}
+	return false
+}
+
 func testLegoArchiveHash(t *testing.T, rawURL string) (string, bool) {
 	t.Helper()
 	if !strings.Contains(rawURL, "lego_") {
@@ -15038,6 +17902,25 @@ func testLegoArchiveHash(t *testing.T, rawURL string) (string, bool) {
 		t.Fatalf("ArchiveSHA256() error = %v", err)
 	}
 	return sha, true
+}
+
+func testRemoteArtifactHash(t *testing.T, rawURL string) string {
+	t.Helper()
+	if sha, ok := testLegoArchiveHash(t, rawURL); ok {
+		return sha
+	}
+	if strings.Contains(rawURL, "headscale_") {
+		arch := config.ArchAMD64
+		if strings.Contains(rawURL, "_arm64") {
+			arch = config.ArchARM64
+		}
+		sha, err := headscale.PackageSHA256(headscale.Version, arch)
+		if err != nil {
+			t.Fatalf("PackageSHA256() error = %v", err)
+		}
+		return sha
+	}
+	return strings.Repeat("a", 64)
 }
 
 type scriptedHostRunner struct {
@@ -15059,11 +17942,32 @@ func (lock stubRealIPProfileLock) Release() error {
 func (runner *scriptedHostRunner) Run(_ stdcontext.Context, command host.Command) (host.Result, error) {
 	runner.commands = append(runner.commands, command)
 	if runner.run == nil {
-		return host.Result{Command: command}, nil
+		return defaultScriptedHostResult(command), nil
 	}
 	result, err := runner.run(command)
 	result.Command = command
+	if err == nil && result.Stdout == "" && result.Stderr == "" {
+		result = defaultScriptedHostResultWithBase(command, result)
+	}
 	return result, err
+}
+
+func defaultScriptedHostResult(command host.Command) host.Result {
+	return defaultScriptedHostResultWithBase(command, host.Result{Command: command})
+}
+
+func defaultScriptedHostResultWithBase(command host.Command, result host.Result) host.Result {
+	actual := unwrapMaybeSudoHostCommand(command)
+	if actual.Name != "systemctl" || len(actual.Args) != 2 {
+		return result
+	}
+	switch actual.Args[0] {
+	case "is-enabled":
+		result.Stdout = "disabled\n"
+	case "is-active":
+		result.Stdout = "inactive\n"
+	}
+	return result
 }
 
 func stubPassingDeployPreflight(t *testing.T) {
@@ -15128,10 +18032,7 @@ func stubPassingDeployPreflight(t *testing.T) {
 		return true, true, rawURL + " returned 200."
 	}
 	hashRemoteArtifactFn = func(_ *http.Client, rawURL string) (string, error) {
-		if sha, ok := testLegoArchiveHash(t, rawURL); ok {
-			return sha, nil
-		}
-		return strings.Repeat("a", 64), nil
+		return testRemoteArtifactHash(t, rawURL), nil
 	}
 	lookupOfficialPackageDigestFn = func(_ *http.Client, version string, arch string) (string, error) {
 		return strings.Repeat("a", 64), nil
@@ -15312,6 +18213,10 @@ func TestExecute_VerifyReportsInvalidConfigDetails(t *testing.T) {
 	if !ok || !strings.Contains(value, "unsupported DNS-01 provider \"unsupported\"") {
 		t.Fatalf("details field = %q, %v; fields = %#v", value, ok, response.Fields)
 	}
+	result := mustDecodeOperationResult(t, jsonStdout)
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].ID != "main-config" {
+		t.Fatalf("operation_result.diagnostics = %#v, want main config diagnostic", result.Diagnostics)
+	}
 }
 
 func TestExecute_StatusJSONIncludesClientVersionForDeployHistory(t *testing.T) {
@@ -15364,8 +18269,113 @@ func TestExecute_StatusJSONIncludesClientVersionForDeployHistory(t *testing.T) {
 		t.Fatalf("response.Status = %q, want deploy-history", response.Status)
 	}
 	value, ok := fieldValue(response.Fields, "minimum client version")
-	if !ok || value != "Tailscale >= v1.74.0" {
+	if !ok || value != "Tailscale >= v1.80.0" {
 		t.Fatalf("minimum client version field = %q, %v; fields = %#v", value, ok, response.Fields)
+	}
+	result := mustDecodeOperationResult(t, stdout)
+	if len(result.Diagnostics) == 0 || result.Diagnostics[0].ID != "status:deploy-history" {
+		t.Fatalf("operation_result.diagnostics = %#v, want deploy-history status diagnostic", result.Diagnostics)
+	}
+}
+
+func TestExecute_StatusJSONWritesTypedDiagnosticsForStateVariants(t *testing.T) {
+	tests := []struct {
+		name             string
+		configure        func(t *testing.T, configPath string, checkpointPath string)
+		wantOutputStatus string
+		wantDiagnosticID string
+		wantStatus       domain.DiagnosticStatus
+	}{
+		{
+			name:             "config ready",
+			configure:        func(t *testing.T, configPath string, checkpointPath string) {},
+			wantOutputStatus: "config-ready",
+			wantDiagnosticID: "status:config-ready",
+			wantStatus:       domain.DiagnosticStatusPass,
+		},
+		{
+			name: "stale checkpoint",
+			configure: func(t *testing.T, configPath string, checkpointPath string) {
+				if err := state.NewStore(checkpointPath).Save(state.Checkpoint{
+					DesiredStateDigest:   strings.Repeat("a", 64),
+					CompletedCheckpoints: []string{deployCheckpointPackageManagerReady},
+				}); err != nil {
+					t.Fatalf("Save(stale checkpoint) error = %v", err)
+				}
+			},
+			wantOutputStatus: "stale-deploy-context",
+			wantDiagnosticID: "status:stale-deploy-context",
+			wantStatus:       domain.DiagnosticStatusUnknown,
+		},
+		{
+			name: "deploy failed",
+			configure: func(t *testing.T, configPath string, checkpointPath string) {
+				cfg, err := config.LoadFile(configPath)
+				if err != nil {
+					t.Fatalf("LoadFile() error = %v", err)
+				}
+				digest, err := deployDesiredStateDigest(cfg)
+				if err != nil {
+					t.Fatalf("deployDesiredStateDigest() error = %v", err)
+				}
+				if err := state.NewStore(checkpointPath).Save(state.Checkpoint{
+					DesiredStateDigest: digest,
+					LastFailure: &workflow.FailureSnapshot{
+						Summary: "install runtime assets failed",
+						Step:    "install runtime assets",
+						Details: "write /etc/headscale/config.yaml: permission denied",
+					},
+				}); err != nil {
+					t.Fatalf("Save(failed checkpoint) error = %v", err)
+				}
+			},
+			wantOutputStatus: "deploy-failed",
+			wantDiagnosticID: "status:deploy-failed",
+			wantStatus:       domain.DiagnosticStatusFail,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			configPath := filepath.Join(baseDir, "lanpanel.yaml")
+			if err := config.WriteExampleFile(configPath); err != nil {
+				t.Fatalf("WriteExampleFile() error = %v", err)
+			}
+			checkpointPath := filepath.Join(baseDir, "state", "checkpoint.json")
+			previousCheckpointPath := checkpointPathForConfigFn
+			previousStore := checkpointStoreForConfigFn
+			t.Cleanup(func() {
+				checkpointPathForConfigFn = previousCheckpointPath
+				checkpointStoreForConfigFn = previousStore
+			})
+			checkpointPathForConfigFn = func(string) string {
+				return checkpointPath
+			}
+			checkpointStoreForConfigFn = func(string) state.Store {
+				return state.NewStore(checkpointPath)
+			}
+			tt.configure(t, configPath, checkpointPath)
+
+			stdout, stderr, err := runCLI(t, "status", "--config", configPath, "--format", "json")
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if stderr != "" {
+				t.Fatalf("stderr = %q, want empty", stderr)
+			}
+			response := mustDecodeResponse(t, stdout)
+			if response.Status != tt.wantOutputStatus {
+				t.Fatalf("response.Status = %q, want %q", response.Status, tt.wantOutputStatus)
+			}
+			result := mustDecodeOperationResult(t, stdout)
+			if len(result.Diagnostics) == 0 {
+				t.Fatal("operation_result.diagnostics = empty")
+			}
+			if result.Diagnostics[0].ID != tt.wantDiagnosticID || result.Diagnostics[0].Status != tt.wantStatus {
+				t.Fatalf("first diagnostic = %#v, want id %q status %q", result.Diagnostics[0], tt.wantDiagnosticID, tt.wantStatus)
+			}
+		})
 	}
 }
 
@@ -15397,6 +18407,10 @@ func goAccessEnabledAppConfig() appconfig.Config {
 	cfg.App.Domains = []string{"app.example.com"}
 	cfg.App.CertificateEmail = "ops@example.com"
 	cfg.App.Listen = "127.0.0.1:18001"
+	cfg.Access.AccessMode = appconfig.AccessModePublic
+	cfg.Access.PublicRiskConfirmed = true
+	cfg.Access.OriginProtection.Mode = appconfig.OriginProtectionModeNone
+	cfg.Access.OriginProtection.DirectOriginRiskConfirmed = true
 	cfg.Service.ExecStart = "/opt/review-app/review-app --listen 127.0.0.1:18001"
 	cfg.Service.WorkingDirectory = "/opt/review-app"
 	cfg.Nginx.GoAccess.Enabled = true

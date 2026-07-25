@@ -16,7 +16,6 @@ func ValidateReloadHook(content []byte) error {
 	setIndex := lineIndex(active, "set -eu")
 	testIndex := lineIndex(active, "nginx -t")
 	systemctlIndex := lineContainsIndex(active, "systemctl reload nginx")
-	fallbackIndex := lineIndex(active, "nginx -s reload")
 	if setIndex < 0 {
 		errs = append(errs, "reload hook missing set -eu")
 	}
@@ -26,8 +25,8 @@ func ValidateReloadHook(content []byte) error {
 	if systemctlIndex < 0 {
 		errs = append(errs, "reload hook missing systemctl reload nginx")
 	}
-	if fallbackIndex < 0 {
-		errs = append(errs, "reload hook missing nginx -s reload")
+	if lineIndex(active, "nginx -s reload") >= 0 {
+		errs = append(errs, "reload hook must not fallback to nginx -s reload")
 	}
 	for _, want := range []struct {
 		text  string
@@ -40,8 +39,6 @@ func ValidateReloadHook(content []byte) error {
 		{text: `install -d -m 0755 "$target_dir"`, label: "reload hook stable TLS directory install"},
 		{text: `install -m 0644 "$LEGO_HOOK_CERT_PATH" "$target_dir/fullchain.pem"`, label: "reload hook fullchain install"},
 		{text: `install -m 0600 "$LEGO_HOOK_CERT_KEY_PATH" "$target_dir/privkey.pem"`, label: "reload hook private key install"},
-		{text: `system has not been booted with systemd`, label: "reload hook systemd unavailable fallback marker"},
-		{text: `failed to connect to bus: no such file or directory`, label: "reload hook missing systemd bus fallback marker"},
 	} {
 		mustContainText(&errs, text, want.text, want.label)
 	}
@@ -56,9 +53,6 @@ func ValidateReloadHook(content []byte) error {
 	}
 	if testIndex >= 0 && systemctlIndex >= 0 && testIndex > systemctlIndex {
 		errs = append(errs, "reload hook must run nginx -t before systemctl reload nginx")
-	}
-	if testIndex >= 0 && fallbackIndex >= 0 && testIndex > fallbackIndex {
-		errs = append(errs, "reload hook must run nginx -t before nginx -s reload")
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))

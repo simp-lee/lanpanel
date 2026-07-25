@@ -1,13 +1,11 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/output"
-	"lanpanel/internal/render"
-	"lanpanel/internal/verify"
-	"os"
+	"lanpanel/internal/workflow"
+	"strings"
 )
 
 func newVerifyCommand() command {
@@ -39,74 +37,11 @@ func runVerify(ctx context, args []string) error {
 		return err
 	}
 
-	if _, err := os.Stat(options.configPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return formatter.Write(output.Response{
-				Command: "verify",
-				Status:  "missing-config",
-				Summary: "no config file found",
-				Fields: []output.Field{
-					{Label: "config path", Value: options.configPath},
-					{Label: "happy path", Value: "init -> deploy -> verify"},
-				},
-				NextSteps: []string{
-					fmt.Sprintf("Run 'lanpanel init --config %s' to generate a starter config.", options.configPath),
-				},
-			})
-		}
-		return fmt.Errorf("stat config file: %w", err)
-	}
-
-	cfg, err := loadConfig(options.configPath)
+	result, err := workflow.RunMainVerify(workflow.Context{Version: ctx.version}, options.configPath)
 	if err != nil {
-		return formatter.Write(output.Response{
-			Command: "verify",
-			Status:  "invalid-config",
-			Summary: "config file exists but failed validation",
-			Fields: []output.Field{
-				{Label: "config path", Value: options.configPath},
-				{Label: "details", Value: err.Error()},
-			},
-			NextSteps: []string{
-				fmt.Sprintf("Fix the config at %s and rerun 'lanpanel verify --config %s'.", options.configPath, options.configPath),
-			},
-		})
+		return err
 	}
-
-	staged, err := render.StageRuntime(cfg)
-	if err != nil {
-		return formatter.Write(output.Response{
-			Command: "verify",
-			Status:  "failed",
-			Summary: "runtime asset rendering failed",
-			Fields: append(configFields(options.configPath, cfg),
-				output.Field{Label: "details", Value: err.Error()},
-			),
-			NextSteps: []string{fmt.Sprintf("Fix config/template inputs and rerun 'lanpanel verify --config %s'.", options.configPath)},
-		})
-	}
-	report := verify.StaticReport(cfg, staged)
-	fields := append(configFields(options.configPath, cfg),
-		output.Field{Label: "checks", Value: verify.SummarizeChecks(report.Checks)},
-		output.Field{Label: "minimum client version", Value: "Tailscale >= v" + verify.MinimumTailscaleClientVersion},
-	)
-	fields = append(fields, verifyCheckFields(report.Checks)...)
-	status := "passed"
-	if report.Status() == verify.StatusFail {
-		status = "failed"
-	}
-
-	nextSteps := []string{
-		fmt.Sprintf("Use 'lanpanel deploy --config %s' to apply or refresh server runtime state.", options.configPath),
-		"After deploy, join at least two clients from different networks and observe direct or DERP fallback paths.",
-	}
-	return formatter.Write(output.Response{
-		Command:   "verify",
-		Status:    status,
-		Summary:   report.Summary(),
-		Fields:    fields,
-		NextSteps: nextSteps,
-	})
+	return writeOperationResult(formatter, "verify", mainVerifyOutputStatus(result), result, mainVerifyNextSteps(options.configPath, result))
 }
 
 func writeVerifyHelp(stdout io.Writer) error {
@@ -122,13 +57,37 @@ func writeVerifyHelp(stdout io.Writer) error {
 	)
 }
 
-func verifyCheckFields(checks []verify.Check) []output.Field {
-	fields := make([]output.Field, 0, len(checks))
-	for _, check := range checks {
-		fields = append(fields, output.Field{
-			Label: "check " + check.ID,
-			Value: string(check.Status) + ": " + check.Summary,
-		})
+func mainVerifyOutputStatus(result workflow.OperationResult) string {
+	if result.Status == "succeeded" {
+		return "passed"
 	}
-	return fields
+	for _, diagnostic := range result.Diagnostics {
+		if diagnostic.ID != "main-config" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(result.Summary), "no config file found") {
+			return "missing-config"
+		}
+		return "invalid-config"
+	}
+	return "failed"
+}
+
+func mainVerifyNextSteps(configPath string, result workflow.OperationResult) []string {
+	switch mainVerifyOutputStatus(result) {
+	case "missing-config":
+		return []string{fmt.Sprintf("Run 'lanpanel init --config %s' to generate a starter config.", configPath)}
+	case "invalid-config":
+		return []string{fmt.Sprintf("Fix the config at %s and rerun 'lanpanel verify --config %s'.", configPath, configPath)}
+	case "failed":
+		for _, diagnostic := range result.Diagnostics {
+			if diagnostic.ID == "main-runtime-stage" {
+				return []string{fmt.Sprintf("Fix config/template inputs and rerun 'lanpanel verify --config %s'.", configPath)}
+			}
+		}
+	}
+	return []string{
+		fmt.Sprintf("Use 'lanpanel deploy --config %s' to apply or refresh server runtime state.", configPath),
+		"After deploy, join at least two clients from different networks and observe direct or DERP fallback paths.",
+	}
 }

@@ -275,6 +275,7 @@ server {
         proxy_pass http://{{ .GoAccess.WebSocketUpstream }};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header Authorization "";
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection ${{ .VarPrefix }}_connection_upgrade;
         proxy_set_header X-Real-IP $remote_addr;
@@ -314,6 +315,17 @@ server {
 {{ range .StaticLocations }}
     location {{ if .Exact }}= {{ end }}{{ .Path }} {
         alias {{ .Alias }};
+{{- if $.Access.Browser }}
+        satisfy all;
+        auth_basic "Lanpanel Browser";
+        auth_basic_user_file {{ $.Access.AuthBasicUserFile }};
+{{- range $.Access.CIDRAllowlist }}
+        allow {{ . }};
+{{- end }}
+{{- if $.Access.CIDRAllowlist }}
+        deny all;
+{{- end }}
+{{- end }}
 {{- if .DefaultType }}
         default_type {{ .DefaultType }};
 {{- end }}
@@ -339,6 +351,9 @@ server {
         proxy_pass http://{{ .VarPrefix }}_upstream;
         proxy_http_version 1.1;
         proxy_set_header Host ${{ .VarPrefix }}_validated_host;
+{{- if .Access.Browser }}
+        proxy_set_header Authorization "";
+{{- end }}
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection ${{ .VarPrefix }}_connection_upgrade;
         proxy_set_header X-Real-IP $remote_addr;
@@ -370,6 +385,17 @@ server {
 {{- end }}
 {{- if .Proxy.RequestBufferingSet }}
         proxy_request_buffering {{ .Proxy.RequestBuffering }};
+{{- end }}
+{{- if .Access.Browser }}
+        satisfy all;
+        auth_basic "Lanpanel Browser";
+        auth_basic_user_file {{ .Access.AuthBasicUserFile }};
+{{- range .Access.CIDRAllowlist }}
+        allow {{ . }};
+{{- end }}
+{{- if .Access.CIDRAllowlist }}
+        deny all;
+{{- end }}
 {{- end }}
         proxy_redirect off;
     }

@@ -1,13 +1,12 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"lanpanel/internal/config"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/output"
 	"lanpanel/internal/workflow"
-	"os"
+	"strings"
 )
 
 func newInitCommand() command {
@@ -48,12 +47,6 @@ func runInit(ctx context, args []string) error {
 	}
 	formatter := output.NewFormatter(ctx.stdout, format)
 
-	if _, err := os.Stat(options.configPath); err == nil {
-		return fmt.Errorf("config file already exists at %s", options.configPath)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat config file: %w", err)
-	}
-
 	promptWriter := ctx.stderr
 	if promptWriter == nil {
 		promptWriter = ctx.stdout
@@ -61,11 +54,8 @@ func runInit(ctx context, args []string) error {
 	prompter := output.NewPrompter(ctx.stdin, promptWriter)
 
 	if example {
-		result := workflow.ExampleInitResult()
-		if err := config.WriteExampleFile(options.configPath); err != nil {
-			return err
-		}
-		return formatter.Write(result.Response(options.configPath))
+		result, err := workflow.RunMainInit(workflow.Context{Version: ctx.version}, options.configPath)
+		return writeMainInitOperationResult(formatter, options.configPath, result, err)
 	}
 
 	if advanced && !prompter.Enabled() {
@@ -77,18 +67,84 @@ func runInit(ctx context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("run guided init: %w", err)
 		}
-		if err := result.Config.WriteFile(options.configPath); err != nil {
-			return err
+		if err := workflow.EnsureNewConfigTarget(options.configPath, "config file"); err != nil {
+			return writeInitFailureResponse(formatter, options.configPath, initFailureOutputStatus(err), initFailureSummary(err), err)
 		}
-		return formatter.Write(result.Response(options.configPath))
+		if err := result.Config.WriteFile(options.configPath); err != nil {
+			return writeInitFailureResponse(formatter, options.configPath, "failed", "failed to write guided config", err)
+		}
+		return writeInitResponse(formatter, initResultResponse(result, options.configPath), options.configPath)
 	}
 
-	result := workflow.ExampleInitResult()
-	if err := config.WriteExampleFile(options.configPath); err != nil {
+	result, err := workflow.RunMainInit(workflow.Context{Version: ctx.version}, options.configPath)
+	return writeMainInitOperationResult(formatter, options.configPath, result, err)
+}
+
+func writeMainInitOperationResult(formatter output.Formatter, configPath string, result workflow.OperationResult, err error) error {
+	status := "written"
+	nextSteps := workflow.ExampleInitResult().NextSteps(configPath)
+	if result.Status == domain.JobStatusFailed {
+		status = initFailureOutputStatus(err)
+		nextSteps = []string{"Choose a different --config path or remove the existing failed target and rerun init."}
+	}
+	if result.Kind != "" {
+		if writeErr := writeOperationResult(formatter, "init", status, result, nextSteps); writeErr != nil {
+			return writeErr
+		}
+	}
+	return err
+}
+
+func initFailureOutputStatus(cause error) string {
+	if cause != nil && strings.Contains(cause.Error(), "already exists") {
+		return "already-exists"
+	}
+	return "failed"
+}
+
+func initFailureSummary(cause error) string {
+	if cause != nil && strings.Contains(cause.Error(), "already exists") {
+		return "config file already exists"
+	}
+	if cause != nil && strings.HasPrefix(cause.Error(), "stat ") {
+		return "failed to inspect config file"
+	}
+	return "failed to write config file"
+}
+
+func initResultResponse(result workflow.InitResult, configPath string) output.Response {
+	return output.Response{
+		Command:   "init",
+		Status:    "written",
+		Summary:   result.Summary(),
+		Fields:    result.Fields(configPath),
+		NextSteps: result.NextSteps(configPath),
+	}
+}
+
+func writeInitResponse(formatter output.Formatter, response output.Response, configPath string) error {
+	result := commandOperationResult(response.Command, response.Status, domain.JobStatusSucceeded, domain.DiagnosticStatusPass, response.Summary, response.Fields, "")
+	result.Kind = domain.JobKindConfigSave
+	result.ModifiedPaths = []string{configPath}
+	return writeOperationResult(formatter, response.Command, response.Status, result, response.NextSteps)
+}
+
+func writeInitFailureResponse(formatter output.Formatter, configPath string, outputStatus string, summary string, cause error) error {
+	result := workflow.OperationResult{
+		Kind:    domain.JobKindConfigSave,
+		Status:  domain.JobStatusFailed,
+		Summary: summary,
+		Fields: []output.Field{
+			{Label: "config path", Value: configPath},
+			{Label: "details", Value: cause.Error()},
+		},
+		Diagnostics:  []domain.DiagnosticItem{commandDiagnosticItem(domain.JobKindConfigSave, "init", outputStatus, domain.DiagnosticStatusFail, summary)},
+		RetryCommand: workflow.ShellCommand("lanpanel", "init", "--config", configPath),
+	}
+	if err := writeOperationResult(formatter, "init", outputStatus, result, []string{"Choose a different --config path or remove the existing failed target and rerun init."}); err != nil {
 		return err
 	}
-
-	return formatter.Write(result.Response(options.configPath))
+	return cause
 }
 
 func writeInitHelp(stdout io.Writer) error {

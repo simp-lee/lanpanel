@@ -38,8 +38,8 @@ func (renderer Renderer) Stage(catalog []realipassets.Asset, data TemplateData) 
 	return staged, nil
 }
 
-func StageRuntime(profile realip.ProfileConfig, state realip.State, reference realip.Reference) ([]StagedFile, error) {
-	data, err := NewTemplateData(profile, state, reference)
+func StageRuntime(profile realip.ProfileConfig, state realip.State, reference realip.Reference, appConfigPath string) ([]StagedFile, error) {
+	data, err := NewTemplateData(profile, state, reference, appConfigPath)
 	if err != nil {
 		return nil, err
 	}

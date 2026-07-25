@@ -618,7 +618,7 @@ func TestNginxCommand() host.Command {
 }
 
 func ReloadNginxCommand() host.Command {
-	return host.Command{Name: "systemctl", Args: []string{"reload-or-restart", "nginx.service"}}
+	return host.Command{Name: "systemctl", Args: []string{"reload", "nginx.service"}}
 }
 
 func ValidateRenderedNginx(cfg appconfig.Config, names Names, content []byte) error {
@@ -713,7 +713,7 @@ func validateHTTPSServerBlock(errs *[]string, block string, cfg appconfig.Config
 		"if ($"+names.VarPrefix+"_host_header_valid = 0) {\n        return 421;\n    }",
 		"location / {\n        proxy_pass",
 		"HTTPS Host allowlist before proxy location")
-	validateStaticLocations(errs, block, cfg.Nginx.StaticLocations)
+	validateStaticLocations(errs, block, cfg)
 	validateAppProxyLocation(errs, block, cfg, names)
 }
 
@@ -753,13 +753,19 @@ func validateAppProxyLocation(errs *[]string, block string, cfg appconfig.Config
 	if cfg.Nginx.Proxy.RequestBuffering != nil {
 		mustHaveNginxDirective(errs, appProxyBlock, 1, "proxy request buffering", "proxy_request_buffering", nginxBool(*cfg.Nginx.Proxy.RequestBuffering))
 	}
+	if cfg.BrowserAuthEnabled() {
+		mustHaveNginxDirectiveLine(errs, appProxyBlock, 1, `proxy_set_header Authorization "";`, "HTTPS app browser Authorization header clearing")
+		validateBrowserAccessControls(errs, appProxyBlock, cfg, "HTTPS app proxy")
+	} else if nginxHasDirectiveLineAtDepth(appProxyBlock, 1, `proxy_set_header Authorization "";`) {
+		*errs = append(*errs, "HTTPS app proxy must not clear Authorization outside browser access mode")
+	}
 }
 
 func validateRealIPNginx(errs *[]string, text string, httpBlock string, httpsBlock string, cfg appconfig.Config, names Names) {
 	if !cfg.RealIPEnabled() {
 		for _, forbidden := range []string{"real_ip_header", "set_real_ip_from", "real_ip_recursive"} {
 			if nginxHasDirectiveName(text, forbidden) {
-				*errs = append(*errs, "realip directive or guard "+forbidden+" must be absent when nginx.realip_profile is empty")
+				*errs = append(*errs, "realip directive or guard "+forbidden+" must be absent when access.origin_protection.mode is not edgeone")
 			}
 		}
 		for _, forbidden := range []string{
@@ -768,17 +774,18 @@ func validateRealIPNginx(errs *[]string, text string, httpBlock string, httpsBlo
 			"$" + names.VarPrefix + "_realip_reject_reason",
 		} {
 			if nginxHasVariableReference(text, forbidden) {
-				*errs = append(*errs, "realip directive or guard "+strings.TrimPrefix(forbidden, "$"+names.VarPrefix+"_")+" must be absent when nginx.realip_profile is empty")
+				*errs = append(*errs, "realip directive or guard "+strings.TrimPrefix(forbidden, "$"+names.VarPrefix+"_")+" must be absent when access.origin_protection.mode is not edgeone")
 			}
 		}
 		return
 	}
-	profile, ok := cfg.RealIPProfile(cfg.Nginx.RealIPProfile)
+	profileName := cfg.EffectiveRealIPProfileName()
+	profile, ok := cfg.RealIPProfile(profileName)
 	if !ok {
 		*errs = append(*errs, "realip profile data missing for rendered Nginx validation")
 		return
 	}
-	realIPNames, err := NewRealIPProfileNames(cfg.Nginx.RealIPProfile, profile.Provider, names.AppName)
+	realIPNames, err := NewRealIPProfileNames(profileName, profile.Provider, names.AppName)
 	if err != nil {
 		*errs = append(*errs, err.Error())
 		return
@@ -954,6 +961,7 @@ func validateGoAccessNginx(errs *[]string, text string, httpBlock string, httpsB
 		if !nginxHasDirectiveFieldsAtDepth(websocketBlock, 1, "proxy_http_version", "1.1") {
 			*errs = append(*errs, "GoAccess WebSocket HTTP/1.1 proxy missing")
 		}
+		mustHaveNginxDirectiveLine(errs, websocketBlock, 1, `proxy_set_header Authorization "";`, "GoAccess WebSocket Authorization header clearing")
 		mustHaveNginxDirective(errs, websocketBlock, 1, "GoAccess WebSocket Upgrade header", "proxy_set_header", "Upgrade", "$http_upgrade")
 		mustHaveNginxDirective(errs, websocketBlock, 1, "GoAccess WebSocket Connection header", "proxy_set_header", "Connection", "$"+names.VarPrefix+"_connection_upgrade")
 		mustHaveNginxDirective(errs, websocketBlock, 1, "GoAccess WebSocket canonical X-Real-IP forwarding", "proxy_set_header", "X-Real-IP", "$remote_addr")
@@ -1138,6 +1146,10 @@ func nginxStatementFields(block string) [][]string {
 }
 
 func validateGoAccessAllowDenyDirectives(errs *[]string, block string, cidrs []string, label string) {
+	validateAllowDenyDirectives(errs, block, cidrs, label, "nginx.goaccess.auth_cidr_allowlist")
+}
+
+func validateAllowDenyDirectives(errs *[]string, block string, cidrs []string, label string, source string) {
 	expected := make([]string, 0, len(cidrs)+1)
 	for _, cidr := range cidrs {
 		expected = append(expected, "allow "+cidr+";")
@@ -1148,12 +1160,12 @@ func validateGoAccessAllowDenyDirectives(errs *[]string, block string, cidrs []s
 
 	actual := nginxTopLevelDirectiveLines(block, "allow", "deny")
 	if len(actual) != len(expected) {
-		*errs = append(*errs, label+" CIDR allow/deny directives must exactly match nginx.goaccess.auth_cidr_allowlist")
+		*errs = append(*errs, label+" CIDR allow/deny directives must exactly match "+source)
 		return
 	}
 	for i := range expected {
 		if actual[i] != expected[i] {
-			*errs = append(*errs, label+" CIDR allow/deny directives must exactly match nginx.goaccess.auth_cidr_allowlist")
+			*errs = append(*errs, label+" CIDR allow/deny directives must exactly match "+source)
 			return
 		}
 	}
@@ -1242,8 +1254,8 @@ func nginxWithoutComments(block string) string {
 	return builder.String()
 }
 
-func validateStaticLocations(errs *[]string, httpsBlock string, locations []appconfig.NginxStaticLocationConfig) {
-	for _, location := range locations {
+func validateStaticLocations(errs *[]string, httpsBlock string, cfg appconfig.Config) {
+	for _, location := range cfg.Nginx.StaticLocations {
 		header := staticLocationHeader(location)
 		block := nginxBlockStartingWith(httpsBlock, header)
 		if block == "" {
@@ -1270,7 +1282,25 @@ func validateStaticLocations(errs *[]string, httpsBlock string, locations []appc
 		if location.AccessLog != nil && !*location.AccessLog {
 			mustContain(errs, block, "access_log off;", "static location "+location.Path+" access_log off")
 		}
+		if cfg.BrowserAuthEnabled() {
+			validateBrowserAccessControls(errs, block, cfg, "static location "+location.Path)
+		} else if strings.Contains(block, `auth_basic "Lanpanel Browser";`) {
+			*errs = append(*errs, "static location "+location.Path+" must not render browser auth outside browser access mode")
+		}
 	}
+}
+
+func validateBrowserAccessControls(errs *[]string, block string, cfg appconfig.Config, label string) {
+	mustHaveNginxDirective(errs, block, 1, label+" browser satisfy all", "satisfy", "all")
+	mustHaveNginxDirectiveLine(errs, block, 1, `auth_basic "Lanpanel Browser";`, label+" browser basic auth")
+	mustHaveNginxDirectiveLine(errs, block, 1, "auth_basic_user_file "+cfg.BrowserAuthUserFile()+";", label+" browser auth_basic_user_file")
+	if nginxHasDirectiveFieldsAtDepth(block, 1, "auth_basic", "off") {
+		*errs = append(*errs, label+" must not disable browser basic auth")
+	}
+	if nginxHasDirectiveFields(block, "satisfy", "any") {
+		*errs = append(*errs, label+" must require both browser basic auth and CIDR allowlist checks")
+	}
+	validateAllowDenyDirectives(errs, block, cfg.Access.CIDRAllowlist, label+" browser", "access.cidr_allowlist")
 }
 
 func staticLocationHeader(location appconfig.NginxStaticLocationConfig) string {

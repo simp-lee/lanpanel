@@ -12,7 +12,7 @@ Lanpanel is a Go server deployment tool, not a VPN client. It is for individuals
 | Automatically configure Headscale, Nginx, certificate renewal, and baseline verification on one cloud server | Yes. This is the core goal of this repository. |
 | Publish same-host Go web services or tailnet HTTP/WebSocket services to HTTPS, with an optional access-log dashboard | Yes. Use `lanpanel app` and optionally enable `nginx.goaccess`. |
 | Publish only a Go web service on the cloud server without a private Tailscale/Headscale network | Yes. Use `lanpanel app` in `listen` mode. |
-| Build multi-host high availability, Kubernetes, Terraform, Ansible, Web UI, or OIDC/SSO | No. These are outside the current scope. |
+| Build multi-host high availability, Kubernetes, Terraform, Ansible, a public remote control panel, or OIDC/SSO | No. These are outside the current scope. |
 | Find a Tailscale client, general reverse proxy framework, or Go SDK | No. This repository is mainly a CLI, config examples, and runtime templates. |
 
 ## Quick Start
@@ -29,15 +29,23 @@ Install a published release binary on the target server. First open [Releases](h
 
 ```bash
 VERSION=vX.Y.Z
-curl -fsSL https://raw.githubusercontent.com/simp-lee/lanpanel/main/scripts/install.sh | sh -s -- "${VERSION}"
+curl -fsSL "https://raw.githubusercontent.com/simp-lee/lanpanel/${VERSION}/scripts/install.sh" | sh -s -- "${VERSION}"
 lanpanel --help
 ```
 
-The install script detects `x86_64` and `arm64`/`aarch64`, downloads the matching GitHub release asset for `VERSION`, verifies it against `checksums.txt`, and installs `lanpanel` to `/usr/local/bin/lanpanel`.
+The install script is loaded from the same release tag as `VERSION`. It detects `x86_64` and `arm64`/`aarch64`, downloads the matching GitHub release asset for `VERSION`, verifies it against `checksums.txt`, and installs `lanpanel` to `/usr/local/bin/lanpanel`.
 
 If you are using a source checkout instead of a release binary, run `make build` and install `./lanpanel` to `/usr/local/bin/lanpanel`.
 
-Then run the default workflow (`init -> verify -> deploy -> verify -> status`). Before deploy, inspect `lanpanel.yaml`; if it still contains example values, change at least `default.server_url`, `default.base_domain`, and `default.certificate_email` to your real values.
+For most first-time users, start the loopback-only Management UI on the target server and open it through an SSH tunnel:
+
+```bash
+sudo lanpanel ui --listen 127.0.0.1:18080
+```
+
+The command prints a one-time startup URL and an SSH tunnel example. Open the URL from your local browser through that tunnel; after the startup token is exchanged, Lanpanel redirects to a URL without the token. Use the UI to save the main config, run Verify, run Deploy, and then use Headscale Onboarding to create a short-lived one-time preauth key handoff. The UI is the recommended entry point for normal operation; it keeps write actions behind explicit jobs, local state, CSRF protection, and root-only host mutation checks.
+
+The CLI remains the automation and reference path. To use it directly, run the default workflow (`init -> verify -> deploy -> verify -> status`). Before deploy, inspect `lanpanel.yaml`; if it still contains example values, change at least `default.server_url`, `default.base_domain`, and `default.certificate_email` to your real values.
 
 ```bash
 lanpanel init --config lanpanel.yaml
@@ -48,7 +56,7 @@ lanpanel verify --config lanpanel.yaml
 lanpanel status --config lanpanel.yaml
 ```
 
-After `deploy` succeeds, the CLI prints an initial preauth key. Use it for the first client, then create a fresh key for each additional client.
+After CLI `deploy` succeeds, you can still open the loopback Management UI through an SSH tunnel and use Headscale onboarding. The deploy command does not print reusable onboarding secrets.
 
 The default workflow above deploys a private Tailscale/Headscale network. If you only want to publish a same-host Go service, skip the main `lanpanel init` and `lanpanel deploy` workflow and go to "Additional Go Services" below.
 
@@ -57,13 +65,13 @@ The default workflow above deploys a private Tailscale/Headscale network. If you
 | Area | Baseline |
 | --- | --- |
 | Server OS | Debian, Ubuntu, or a Debian-family distribution with apt/dpkg/systemd |
-| Control plane | Headscale v0.28.0 on loopback behind Nginx |
-| TLS automation | HTTP-01 or DNS-01 with a lanpanel-managed pinned lego v5.1.0 binary |
+| Control plane | Headscale v0.29.1 on loopback behind Nginx |
+| TLS automation | HTTP-01 or DNS-01 with a lanpanel-managed pinned lego v5.2.2 binary |
 | Relay | Embedded Headscale DERP and STUN on `3478/udp`; no official DERP fallback |
 | Clients | Windows, macOS, Debian/Ubuntu Linux |
-| Client baseline | Tailscale client >= v1.74.0 |
+| Client baseline | Tailscale client >= v1.80.0 |
 
-Lanpanel intentionally keeps the scope small: no multi-host high availability, Kubernetes, Terraform, Ansible, Web UI, OIDC/SSO, automatic SQLite backup and restore, official DERP fallback, or remote gRPC/API-key management by default.
+Lanpanel intentionally keeps the scope small: no multi-host high availability, Kubernetes, Terraform, Ansible, public remote control panel, OIDC/SSO, automatic SQLite backup and restore, official DERP fallback, or remote gRPC/API-key management by default. The P0 Management UI is loopback-only and intended for SSH tunnel access.
 
 ## Server Guide
 
@@ -73,7 +81,7 @@ Lanpanel intentionally keeps the scope small: no multi-host high availability, K
 - Host capabilities: `apt-get`, `dpkg`, and a booted systemd runtime must be available before deploy can mutate the host.
 - DNS: point the public Headscale name, for example `hs.example.com`, at the server.
 - Firewall: allow `80/tcp`, `443/tcp`, and `3478/udp` in both host firewall and cloud security group.
-- Packages: the server must reach the Headscale `.deb` and pinned lego archive, or you must prepare mirror/offline sources.
+- Packages: the server must reach the Headscale `.deb` and pinned lego archive, or you must prepare mirror/offline sources. The Management UI can upload the official pinned lego archive and Headscale `.deb` when GitHub is blocked.
 - Clients: prepare at least two clients from different networks for final validation.
 - China mainland deployments: confirm ICP/hosting access requirements, cloud ingress, package reachability, proxy settings, and whether HTTP-01 is practical. Use DNS-01, mirrors, offline artifacts, or proxies when needed.
 
@@ -171,7 +179,7 @@ Run deploy on the target server:
 sudo lanpanel deploy --config lanpanel.yaml
 ```
 
-Deploy checks config, OS family, host capabilities, permissions, DNS, ports, package sources, ACME readiness, and service conflicts. Then it installs dependencies, installs lego and Headscale, renders runtime files, issues the certificate, enables services, creates the first local Headscale user and preauth key, and runs static verification.
+Deploy checks config, OS family, host capabilities, permissions, DNS, ports, package sources, ACME readiness, and service conflicts. Then it installs dependencies, installs lego and Headscale, renders runtime files, issues the certificate, enables services, prepares the default local Headscale onboarding user, and runs static verification. It does not create or print a preauth key; generate one later through the loopback Management UI onboarding handoff.
 
 If a step fails, fix the named issue and rerun the same deploy command. Lanpanel records checkpoints beside the config file under `.lanpanel/`.
 
@@ -329,14 +337,14 @@ The config filename is not the deployment identity. `app.name` names the systemd
 
 `upstream` means tailnet upstream mode: public Nginx proxies to a fixed HTTP/WebSocket address on another tailnet node, such as `100.64.10.20:18001`. This mode does not generate a local app service. `listen` and `upstream` are mutually exclusive; `upstream` mode automatically requires the Tailscale client. Use `upstream` only for HTTP/WebSocket services, not PostgreSQL, Redis, MySQL, or other database ports.
 
-The default app config enables `nginx.http2: true`. The target host's Nginx must be `1.25.1` or newer and include the `http_v2` module; if you use an older Debian/Ubuntu distro Nginx package, set `nginx.http2: false` in the app config before deploy.
+The default app config sets `nginx.http2: false`, so first app deploys do not require modern HTTP/2 directive support. If you set `nginx.http2: true`, the target host's Nginx must be `1.25.1` or newer and include the `http_v2` module.
 
 #### Minimal App Config
 
 `listen` mode example:
 
 ```yaml
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 
 app:
   name: "example-app"
@@ -353,6 +361,18 @@ service:
   working_directory: "/opt/example-app"
   env_file: ""
 
+access:
+  access_mode: "public"
+  public_risk_confirmed: true
+  browser_auth:
+    auth_basic_user_file: ""
+    managed: {}
+  cidr_allowlist: []
+  origin_protection:
+    mode: "none"
+    edgeone_profile: ""
+    direct_origin_risk_confirmed: true
+
 tailscale:
   enabled_for_listen: false
 ```
@@ -362,7 +382,7 @@ Replace `abc.com` with your real app domain, and replace `/opt/example-app/examp
 `upstream` mode example:
 
 ```yaml
-api_version: lanpanel/app/v1alpha1
+api_version: lanpanel/app/v1alpha2
 
 app:
   name: "tailapp"
@@ -378,6 +398,18 @@ service:
   working_directory: ""
   env_file: ""
 
+access:
+  access_mode: "public"
+  public_risk_confirmed: true
+  browser_auth:
+    auth_basic_user_file: ""
+    managed: {}
+  cidr_allowlist: []
+  origin_protection:
+    mode: "none"
+    edgeone_profile: ""
+    direct_origin_risk_confirmed: true
+
 tailscale:
   # If there is no main lanpanel.yaml beside this app config, set login_server explicitly.
   # login_server: "https://hs.example.com"
@@ -386,7 +418,26 @@ tailscale:
 
 Multiple domains belong in one `app.domains` list. They are written to the same Nginx `server_name`, the same certificate SAN set, and the same Host/SNI allowlist. The first app release does not create canonical redirects between names such as `abc.com` and `www.abc.com`; they serve the same app by default.
 
+These minimal examples intentionally use `access_mode: "public"` and require both public exposure and direct-origin risk confirmations. To use `browser` mode instead, use the Browser App Auth rules below.
+
 If the app needs a systemd environment file such as `web.env`, set `service.env_file` to that absolute path. Deploy checks that it is a root-owned, root-only file and renders it as `EnvironmentFile=`. `service.env_file` is only used in `listen` mode.
+
+#### Browser App Auth
+
+Use `access_mode: "browser"` when Lanpanel should put Basic Auth at the app gateway. Browser app auth protects proxy and static locations before the request reaches the business app.
+
+Choose exactly one browser credential source:
+
+| Source | How to configure | Boundary |
+| --- | --- | --- |
+| External htpasswd | Set `access.browser_auth.auth_basic_user_file` to an existing app-gateway htpasswd file | This is separate from `nginx.goaccess.auth_basic_user_file`. Do not reuse GoAccess dashboard credentials |
+| LanPanel-managed browser credential | Create or rotate it in the loopback Management UI, then copy the managed `credential_id`, `htpasswd_path`, `username`, and `password_fingerprint` into `access.browser_auth.managed` | The htpasswd file lives under `/etc/lanpanel/browser-auth`; the plaintext browser password is shown only as a one-time secret after create or rotate |
+
+Managed browser passwords are not stored in app config or job history. The stored app config contains only credential metadata and `password_fingerprint`; if the one-time display window is gone, rotate the credential and update the app config with the new fingerprint.
+
+Managed credential deletion is fail-closed in P0. The Management UI refuses automated delete when it cannot prove the htpasswd path is unreferenced by every active or staged `browser` app; after checking all app configs, remove the file manually if it is no longer used.
+
+In `browser` mode, Lanpanel clears the inbound `Authorization` header before proxying to the upstream app. Apps that need business-layer `Authorization` must use the explicit `public` risk path in P0 or wait for a later upstream-auth design.
 
 #### Advanced App Config
 
@@ -395,7 +446,7 @@ For a first deployment, you can usually leave the `nginx` section alone. Revisit
 | Config | Default or purpose |
 | --- | --- |
 | `nginx.client_max_body_size` | Defaults to `20m` |
-| `nginx.http2` | Enabled by default and renders the modern `http2 on;` directive |
+| `nginx.http2` | Disabled by default; when enabled, renders the modern `http2 on;` directive |
 | `nginx.access_log` / `nginx.error_log` | Optional per-app log files; `access_log` may also be `off` |
 | `proxy.read_timeout` | App proxy read timeout, default `600s` |
 | `proxy.send_timeout` | App proxy send timeout, default `600s` |
@@ -437,7 +488,7 @@ nginx:
     websocket_listen: "" # usually leave empty; defaults to 127.0.0.1:<app-derived-port>
 ```
 
-Before enabling GoAccess, create the htpasswd file. It must be an existing regular, non-empty file with at least one `user:hash` credential line whose user and hash contain no whitespace. Keep it root-owned, not group-writable, not accessible by other local users, and readable by the Nginx runtime user. Every parent directory for `auth_basic_user_file` must be root-owned, not group/other writable, and searchable by the Nginx runtime user. When it is under `/etc/<app-name>`, use only the direct `/etc/<app-name>/goaccess.htpasswd` path.
+Create the htpasswd file before enabling GoAccess, then store its absolute path in `nginx.goaccess.auth_basic_user_file` through the app config or Management UI form. It must be an existing regular, non-empty file with at least one `user:hash` credential line whose user and hash contain no whitespace. Keep it root-owned, not group-writable, not accessible by other local users, and readable by the Nginx runtime user. Every parent directory for `auth_basic_user_file` must be root-owned, not group/other writable, and searchable by the Nginx runtime user. When it is under `/etc/<app-name>`, use only the direct `/etc/<app-name>/goaccess.htpasswd` path. The Management UI does not create or rotate GoAccess htpasswd files; GoAccess dashboard credentials are separate from browser app credentials.
 
 When `auth_cidr_allowlist` is empty, only basic auth is required. When it is non-empty, Nginx requires both a matching source IP and successful basic auth. It is not an IP allowlist that bypasses the password check.
 
@@ -527,8 +578,11 @@ For Tencent Cloud EdgeOne, keep real client IP restoration explicit and app-scop
 ```yaml
 app:
   acme_challenge: "dns-01"
-nginx:
-  realip_profile: "edgeone-prod"
+access:
+  origin_protection:
+    mode: "edgeone"
+    edgeone_profile: "edgeone-prod"
+    direct_origin_risk_confirmed: false
 realip:
   profiles:
     edgeone-prod:
@@ -578,7 +632,7 @@ EOF
 
 This first EdgeOne realip implementation calls the Tencent Cloud China EdgeOne API endpoint `teo.tencentcloudapi.com`. International EdgeOne accounts that require `teo.intl.tencentcloudapi.com` are not supported by this release.
 
-Then add the `nginx.realip_profile` and `realip.profiles.edgeone-prod` config shown above to the app config, with DNS-01 already configured as described earlier. On first enablement, run:
+Then add the `access.origin_protection` and `realip.profiles.edgeone-prod` config shown above to the app config, with DNS-01 already configured as described earlier. On first enablement, run:
 
 ```bash
 lanpanel app verify --config lanpanel-apps/example-app.yaml
@@ -588,28 +642,30 @@ sudo lanpanel app deploy --config lanpanel-apps/example-app.yaml
 To synchronize EdgeOne OriginACL immediately, run:
 
 ```bash
-sudo lanpanel app realip refresh --profile edgeone-prod --format human
-sudo lanpanel app realip diagnostics --profile edgeone-prod --format human
+sudo lanpanel app realip refresh --config lanpanel-apps/example-app.yaml --profile edgeone-prod --format human
+sudo lanpanel app realip diagnostics --config lanpanel-apps/example-app.yaml --profile edgeone-prod --format human
 ```
+
+Submit `--confirmation origin-protection-manual` only when the exposure plan reports `configured_manual` and requires it, after restricting origin `80/443` ingress to EdgeOne OriginACL current+next CIDRs in Tencent Cloud security groups, host firewall, or an equivalent boundary. `configured_pass` requires no manual confirmation.
 
 `upstream` mode uses the same realip profile; set `listen` to empty in the app config, fill the fixed tailnet `upstream`, and prepare the Tailscale client as described above. After the first deploy and every refresh, update Tencent Cloud security groups, host firewalls, or an equivalent boundary from the EdgeOne OriginACL current+next CIDRs reported by Lanpanel, allowing only those CIDRs to reach origin `80/443`. This is a manual operation; the script does not and should not call `ConfirmOriginACLUpdate`.
 
 For dedicated EdgeOne realip credentials, grant permission only for the target EdgeOne zone and `DescribeOriginACL`. When the credentials are shared with DNS-01, grant DNSPod record management plus `DescribeOriginACL` for the target EdgeOne zone. Lanpanel does not call `ConfirmOriginACLUpdate`, does not modify EdgeOne site/DNS/cert settings, and does not accept non-EdgeOne providers, manual CIDRs, `trust_all`, custom headers, `X-Forwarded-For` as the realip input, Headscale realip, or global Nginx realip. The client IP header is fixed to `EO-Connecting-IP`.
 
-When enabled, Lanpanel renders app-site scoped `set_real_ip_from`/`real_ip_header` directives, rebuilds upstream `X-Real-IP` and `X-Forwarded-For` from canonical `$remote_addr`, keeps `X-Forwarded-Proto` as the origin Nginx `$scheme`, and clears inbound forwarded/client-IP headers such as `Forwarded`, `X-Original-Forwarded-For`, `X-Client-IP`, `EO-Connecting-IP`, and `EO-Client-IP`. Non-trusted direct requests are rejected by the generated app site and logged as `untrusted_source_ip`. Do not edit generated app Nginx sites directly; rerun `sudo lanpanel app deploy --config lanpanel-apps/example-app.yaml` to regenerate app-site templates. After EdgeOne OriginACL CIDR changes, refresh the shared realip profile artifacts and then inspect them with:
+When enabled, Lanpanel renders app-site scoped `set_real_ip_from`/`real_ip_header` directives, rebuilds upstream `X-Real-IP` and `X-Forwarded-For` from canonical `$remote_addr`, keeps `X-Forwarded-Proto` as the origin Nginx `$scheme`, and clears inbound forwarded/client-IP headers such as `Forwarded`, `X-Original-Forwarded-For`, `X-Client-IP`, `EO-Connecting-IP`, and `EO-Client-IP`. Non-trusted direct requests are rejected by the generated app site and logged as `untrusted_source_ip`. Do not edit generated app Nginx sites directly; rerun `sudo lanpanel app deploy --config lanpanel-apps/example-app.yaml` to regenerate app-site templates, adding `--confirmation origin-protection-manual` only if the exposure plan requires it. After EdgeOne OriginACL CIDR changes, refresh the shared realip profile artifacts and then inspect them with:
 
 ```bash
-sudo lanpanel app realip refresh --profile edgeone-prod --format human
-sudo lanpanel app realip diagnostics --profile edgeone-prod --format human
+sudo lanpanel app realip refresh --config lanpanel-apps/example-app.yaml --profile edgeone-prod --format human
+sudo lanpanel app realip diagnostics --config lanpanel-apps/example-app.yaml --profile edgeone-prod --format human
 ```
 
 Use `--format json` when a machine-readable response is needed.
 
-The timer defaults to `72h` and `refresh_interval` must be at least `1h` because EdgeOne origin ACL changes are low frequency. Subscribe to EdgeOne origin ACL/IP change notifications and use Lanpanel refresh or diagnostics output to track deployed current+next CIDRs. If EdgeOne returns `NextOriginACL`, Lanpanel trusts current+next CIDRs so Nginx can accept the transition. Operators must still update Tencent Cloud security groups, host firewalls, or an equivalent boundary so origin `80/443` only accepts EdgeOne OriginACL current+next CIDRs, then confirm the EdgeOne origin IP update outside Lanpanel. Lanpanel reports this as a manual confirmation item; it does not manage cloud firewalls.
+The timer defaults to `72h` and `refresh_interval` must be at least `1h` because EdgeOne origin ACL changes are low frequency. Subscribe to EdgeOne origin ACL/IP change notifications and use Lanpanel refresh or diagnostics output to track deployed current+next CIDRs. If EdgeOne returns `NextOriginACL`, Lanpanel trusts current+next CIDRs so Nginx can accept the transition. Operators must still update Tencent Cloud security groups, host firewalls, or an equivalent boundary so origin `80/443` only accepts EdgeOne OriginACL current+next CIDRs, then confirm the EdgeOne origin IP update outside Lanpanel. Lanpanel asks for manual confirmation only when the exposure plan cannot verify the boundary; it does not manage cloud firewalls.
 
 #### App Verify And Status
 
-`lanpanel app verify` is a static config/template check for the app workflow. A passing run prints `static-passed`. It validates schema, template rendering, Nginx Host/SNI guards, certificate paths, systemd planning, Tailscale requirement inference, GoAccess dashboard/WebSocket runtime files when enabled, and sensitive-value leakage. It does not read deployed host files, systemd state, certificate SANs, Nginx runtime state, GoAccess process state, or Tailscale online state. `lanpanel app deploy` also runs the same kind of static checks.
+`lanpanel app verify` is a static config/template check for the app workflow. A passing run prints `static-passed`. It validates schema, exposure-plan blockers, template rendering, Nginx Host/SNI guards, certificate paths, systemd planning, Tailscale requirement inference, GoAccess dashboard/WebSocket runtime files when enabled, and sensitive-value leakage. If the exposure plan is `fail` or `unknown`, verify fails before rendering public runtime paths. It does not read deployed host files, systemd state, certificate SANs, Nginx runtime state, GoAccess process state, or Tailscale online state. `lanpanel app deploy` also runs the same kind of static checks.
 
 The main `lanpanel status` command reads the main deployment checkpoint, activation history, and last recoverable failure. The first app release has no separate checkpoint store, so there is no `lanpanel app status`.
 
@@ -631,7 +687,7 @@ Use `curl`, `nginx -t`, certificate inspection, and `systemctl` for deployed hos
 
 ### Security Boundaries
 
-- The Go CLI is the only intended user-facing server entrypoint.
+- The intended local management entrypoints are the Go CLI and the loopback-only Management UI over an SSH tunnel; never expose the Management UI on a public listen address.
 - Public HTTP and HTTPS terminate at Nginx. Headscale control-plane traffic does not bind to a public interface.
 - Explicit HTTP and HTTPS `default_server` catch-all blocks reject unmatched Host or SNI traffic instead of proxying it to Headscale.
 - Headscale administration stays local through the unix socket; do not expose remote gRPC or API-key management unless you intentionally add it.
@@ -657,10 +713,11 @@ Preflight blocks:
 
 Package and lego failures:
 
-- Direct Headscale source downloads the pinned Headscale v0.28.0 `.deb` and verifies SHA-256 evidence.
+- Direct Headscale source downloads the pinned Headscale v0.29.1 `.deb` and verifies SHA-256 evidence.
 - Mirror mode requires a reachable URL and explicit SHA-256 digest.
 - Offline mode requires a local `.deb` path and explicit SHA-256 digest.
-- Offline lego mode requires `advanced.lego_source.file_path` to point at the exact pinned lego v5.1.0 archive for `advanced.platform.arch`.
+- Offline lego mode requires `advanced.lego_source.file_path` to point at the exact pinned lego v5.2.2 archive for `advanced.platform.arch`.
+- The Management UI `Dependency Uploads` section can store the pinned official lego archive or Headscale `.deb`, verify the built-in SHA-256, and switch the matching config source to offline mode.
 - Existing certificates created with lego v4 are migrated automatically before issuance or renewal. If migration fails, inspect the reported lego data path, fix permissions or unexpected files, and rerun deploy.
 
 Runtime failures:
@@ -692,7 +749,7 @@ Use this section after `lanpanel deploy` and `lanpanel verify` pass.
 Give each client user:
 
 - `server_url`, for example `https://hs.example.com`.
-- A fresh one-time preauth key. The key printed by deploy is enough for the first device; create another key for each additional client.
+- A fresh one-time preauth key created through the Headscale onboarding handoff. Create a different key for each client.
 - The MagicDNS suffix from `base_domain`, for example `tailnet.example.com`.
 - The platform instructions from this section.
 
@@ -700,29 +757,15 @@ Keep Headscale administration local. The default runtime config uses `/var/run/h
 
 ### Create A Fresh Preauth Key
 
-`lanpanel deploy` creates the initial `lanpanel` user and a one-time preauth key when Headscale is running. Headscale preauth keys are not reusable by default: the command below creates a key that can register one client and expires after 24 hours. To onboard more clients, run the command again and give each client a different key.
+`lanpanel deploy` prepares Headscale and the default `lanpanel` onboarding user. Use `sudo lanpanel ui` on the server and open it over an SSH tunnel for the P0 handoff flow. The default UI state directory is intended for sudo-owned sessions; a non-root process must use a separate explicit `--state-dir` that it owns, and it still cannot complete root-gated preauth or browser-auth handoff jobs.
 
-```bash
-sudo headscale --config /etc/headscale/config.yaml users list
-# Only if the lanpanel user is missing from users list:
-sudo headscale --config /etc/headscale/config.yaml users create lanpanel
-sudo headscale --config /etc/headscale/config.yaml users list
-sudo headscale --config /etc/headscale/config.yaml preauthkeys create --user <ID> --expiration 24h
-```
-
-Use the numeric user ID shown by `users list` for the `lanpanel` user. Use a short expiration for one-time onboarding. Only when you intentionally want one key to register multiple clients, add `--reusable`:
-
-```bash
-sudo headscale --config /etc/headscale/config.yaml preauthkeys create --user <ID> --expiration 24h --reusable
-```
-
-Treat reusable keys as a convenience for controlled automation or short maintenance windows, not as the default handout for end-user devices.
+In the Management UI, open Headscale Onboarding, confirm the `lanpanel` onboarding user readiness, and create a fresh one-time preauth key from the handoff page. The plaintext key is visible only in the immediate handoff result and is not written to job/event history, diagnostics, workflow output, or stored results. Headscale preauth keys are not reusable by default: create a different short-lived key for each client.
 
 ### Shared Validation
 
 Every supported client should:
 
-- install Tailscale client >= v1.74.0
+- install Tailscale client >= v1.80.0
 - join with the supplied `server_url` and preauth key
 - accept managed DNS with `--accept-dns=true` or the platform UI equivalent
 - appear online in `tailscale status`
@@ -735,7 +778,7 @@ Validate at least two clients from different networks, such as home broadband pl
 
 ### Windows
 
-Install Tailscale client >= v1.74.0 from <https://tailscale.com/download/windows> or Microsoft Store. For custom login server setup, open Administrator PowerShell.
+Install Tailscale client >= v1.80.0 from <https://tailscale.com/download/windows> or Microsoft Store. For custom login server setup, open Administrator PowerShell.
 
 ```powershell
 & "$env:ProgramFiles\Tailscale\tailscale.exe" version
@@ -754,7 +797,7 @@ Daily operations:
 
 ### macOS
 
-Install Tailscale client >= v1.74.0 from <https://tailscale.com/download/mac>. The standalone package is the usual choice; the Mac App Store version is also supported.
+Install Tailscale client >= v1.80.0 from <https://tailscale.com/download/mac>. The standalone package is the usual choice; the Mac App Store version is also supported.
 
 Graphical flow for an already-authenticated App Store or standalone client: select the Tailscale menu bar icon, open Settings, choose Accounts, select the down arrow in the lower-left corner, enter `server_url`, then add the account. On a fresh client with no existing tailnet account, use the CLI flow.
 
@@ -777,7 +820,7 @@ tailscale up --login-server https://hs.example.com --accept-dns=true
 
 ### Debian/Ubuntu Linux
 
-Install Tailscale client >= v1.74.0 from the official Linux package source:
+Install Tailscale client >= v1.80.0 from the official Linux package source:
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -802,7 +845,7 @@ sudo tailscale up --login-server https://hs.example.com --accept-dns=true
 ### Client Troubleshooting
 
 - Re-check `server_url`, preauth key freshness, and whether the key has already been consumed.
-- Confirm the client is running Tailscale client >= v1.74.0.
+- Confirm the client is running Tailscale client >= v1.80.0.
 - If MagicDNS does not resolve, confirm managed DNS was accepted and `base_domain` is correct.
 - If a peer path stays on DERP, that can be acceptable when UDP direct connectivity is blocked. The real failure is losing peer connectivity entirely.
 - If `tailscale` is missing, reinstall from the platform section above.
