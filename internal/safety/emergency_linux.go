@@ -3,8 +3,10 @@
 package safety
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -51,6 +53,7 @@ type EmergencyStopFence struct {
 type EmergencyClearProof struct {
 	Generation           uint64
 	StopFenceGeneration  uint64
+	StopFenceDigest      string
 	InventoryDigest      string
 	OwnedGraphDigest     string
 	RuntimeClosureDigest string
@@ -59,11 +62,14 @@ type EmergencyClearProof struct {
 }
 
 type EmergencyState struct {
-	Sequence          uint64
-	NormalInitialized bool
-	GlobalClose       GlobalClose
-	StopFence         *EmergencyStopFence
-	ClearProof        *EmergencyClearProof
+	Sequence                uint64
+	StopFenceSequence       uint64
+	ReservedStopFenceKind   StopFenceKind
+	ReservedStopFenceDigest string
+	NormalInitialized       bool
+	GlobalClose             GlobalClose
+	StopFence               *EmergencyStopFence
+	ClearProof              *EmergencyClearProof
 }
 
 type EmergencyPoint string
@@ -188,7 +194,7 @@ func openEmergency(path string, owner filetxn.Owner, options EmergencyOptions, c
 		_ = store.closeDescriptors()
 		return nil, err
 	}
-	if validSlots == 0 || validSlots == 1 && current.GlobalClose.Phase == GlobalCloseNone && current.StopFence == nil {
+	if validSlots == 0 || validSlots == 1 && current.GlobalClose.Phase == GlobalCloseNone && current.StopFence == nil && current.ReservedStopFenceKind == "" {
 		_ = store.closeDescriptors()
 		return nil, fmt.Errorf("emergency backing does not have unambiguous fail-closed authority")
 	}
@@ -220,7 +226,7 @@ func (store *EmergencyStore) Authority() (EmergencyState, error) {
 	if err != nil {
 		return EmergencyState{}, err
 	}
-	if validSlots == 0 || validSlots == 1 && latest.GlobalClose.Phase == GlobalCloseNone && latest.StopFence == nil {
+	if validSlots == 0 || validSlots == 1 && latest.GlobalClose.Phase == GlobalCloseNone && latest.StopFence == nil && latest.ReservedStopFenceKind == "" {
 		return EmergencyState{}, ErrEmergencyAmbiguous
 	}
 	store.setCurrent(latest)
@@ -243,7 +249,7 @@ func (store *EmergencyStore) PrepareCommit(lease *locks.Lease) (*EmergencyCommit
 	if err != nil {
 		return nil, err
 	}
-	if validSlots == 0 || validSlots == 1 && latest.GlobalClose.Phase == GlobalCloseNone && latest.StopFence == nil {
+	if validSlots == 0 || validSlots == 1 && latest.GlobalClose.Phase == GlobalCloseNone && latest.StopFence == nil && latest.ReservedStopFenceKind == "" {
 		return nil, ErrEmergencyAmbiguous
 	}
 	store.setCurrent(latest)
@@ -418,10 +424,25 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 	if next.StopFence != nil && !validEmergencyFence(*next.StopFence, next.GlobalClose) {
 		return false
 	}
-	if current.StopFence == nil && next.StopFence != nil && role != RoleContraction {
+	if next.StopFenceSequence < current.StopFenceSequence || next.StopFenceSequence != 0 && !validStopFenceKind(next.ReservedStopFenceKind) || next.StopFenceSequence == 0 && next.ReservedStopFenceKind != "" || next.StopFenceSequence != 0 && next.ReservedStopFenceKind != StopFenceContraction && !isDigest(next.ReservedStopFenceDigest) {
 		return false
 	}
+	if current.StopFence == nil && next.StopFence == nil {
+		unchanged := next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest
+		reserved := next.ReservedStopFenceKind != StopFenceContraction && next.StopFenceSequence == current.StopFenceSequence+1 && role == stopFenceWriter(next.ReservedStopFenceKind)
+		if !unchanged && !reserved {
+			return false
+		}
+	}
+	if current.StopFence == nil && next.StopFence != nil {
+		if role != RoleContraction || next.ReservedStopFenceKind != StopFenceContraction || next.StopFenceSequence != current.StopFenceSequence+1 || next.StopFence.Generation != next.StopFenceSequence {
+			return false
+		}
+	}
 	if current.StopFence != nil && next.StopFence == nil {
+		if next.StopFenceSequence != current.StopFenceSequence || next.ReservedStopFenceKind != current.ReservedStopFenceKind || next.ReservedStopFenceDigest != current.ReservedStopFenceDigest {
+			return false
+		}
 		expectedRole := RoleJournalConvergence
 		if current.StopFence.Kind == StopFenceGenerationUpgrade {
 			expectedRole = RoleUpgradeRecovery
@@ -430,7 +451,7 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 			return false
 		}
 	}
-	if current.StopFence != nil && next.StopFence != nil && *current.StopFence != *next.StopFence && (role != RoleContraction || !sameEmergencyFenceBinding(*current.StopFence, *next.StopFence)) {
+	if current.StopFence != nil && next.StopFence != nil && (next.StopFenceSequence != current.StopFenceSequence || next.ReservedStopFenceKind != current.ReservedStopFenceKind || next.ReservedStopFenceDigest != current.ReservedStopFenceDigest || *current.StopFence != *next.StopFence && (role != RoleContraction || !sameEmergencyFenceBinding(*current.StopFence, *next.StopFence))) {
 		return false
 	}
 	return true
@@ -443,7 +464,7 @@ func validEmergencyClearProof(proof *EmergencyClearProof, current EmergencyState
 	if current.GlobalClose.Phase != GlobalCloseNone && proof.Generation != current.GlobalClose.Generation {
 		return false
 	}
-	if current.StopFence != nil && proof.StopFenceGeneration != current.StopFence.Generation {
+	if current.StopFence != nil && (proof.StopFenceGeneration != current.StopFence.Generation || proof.StopFenceDigest != EmergencyFenceDigest(*current.StopFence)) {
 		return false
 	}
 	return true
@@ -477,6 +498,16 @@ func validEmergencyFence(fence EmergencyStopFence, global GlobalClose) bool {
 	return true
 }
 
+// EmergencyFenceDigest binds the complete fixed-format emergency fence identity.
+func EmergencyFenceDigest(fence EmergencyStopFence) string {
+	data, err := json.Marshal(fence)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func sameEmergencyFenceBinding(left, right EmergencyStopFence) bool {
 	return left.Kind == right.Kind && left.OriginOperation == right.OriginOperation && left.ScopeKind == right.ScopeKind && left.ResourceID == right.ResourceID && left.Generation == right.Generation && left.GlobalGeneration == right.GlobalGeneration && left.ClosingGeneration == right.ClosingGeneration && left.CertificateGeneration == right.CertificateGeneration && left.EdgeOneGeneration == right.EdgeOneGeneration && left.OwnershipDigest == right.OwnershipDigest && left.OwnedGraphDigest == right.OwnedGraphDigest && left.InventoryDigest == right.InventoryDigest
 }
@@ -491,7 +522,7 @@ func validStopFenceKind(kind StopFenceKind) bool {
 }
 
 func encodeEmergency(slot []byte, state EmergencyState) {
-	copy(slot[0:8], "LPSAFE02")
+	copy(slot[0:8], "LPSAFE03")
 	binary.LittleEndian.PutUint64(slot[8:16], state.Sequence)
 	binary.LittleEndian.PutUint64(slot[16:24], state.GlobalClose.Generation)
 	slot[24] = phaseCode(state.GlobalClose.Phase)
@@ -503,6 +534,7 @@ func encodeEmergency(slot []byte, state EmergencyState) {
 		slot[29] = 1
 		binary.LittleEndian.PutUint64(slot[376:384], proof.Generation)
 		binary.LittleEndian.PutUint64(slot[384:392], proof.StopFenceGeneration)
+		putDigest(slot[504:536], proof.StopFenceDigest)
 		if proof.NginxTestPassed {
 			slot[392] |= 1
 		}
@@ -513,6 +545,9 @@ func encodeEmergency(slot []byte, state EmergencyState) {
 		putDigest(slot[432:464], proof.OwnedGraphDigest)
 		putDigest(slot[464:496], proof.RuntimeClosureDigest)
 	}
+	binary.LittleEndian.PutUint64(slot[496:504], state.StopFenceSequence)
+	slot[536] = fenceCode(state.ReservedStopFenceKind)
+	putDigest(slot[544:576], state.ReservedStopFenceDigest)
 	if state.StopFence != nil {
 		fence := state.StopFence
 		slot[25] = 1
@@ -546,19 +581,22 @@ func encodeEmergency(slot []byte, state EmergencyState) {
 }
 
 func decodeEmergency(slot []byte) (EmergencyState, bool) {
-	if string(slot[0:8]) != "LPSAFE02" {
+	if string(slot[0:8]) != "LPSAFE03" {
 		return EmergencyState{}, false
 	}
 	want := binary.LittleEndian.Uint32(slot[emergencySlotSize-4:])
 	if crc32.ChecksumIEEE(slot[:emergencySlotSize-4]) != want {
 		return EmergencyState{}, false
 	}
-	state := EmergencyState{Sequence: binary.LittleEndian.Uint64(slot[8:16]), NormalInitialized: slot[28] == 1, GlobalClose: GlobalClose{Phase: phaseFromCode(slot[24]), Generation: binary.LittleEndian.Uint64(slot[16:24])}}
-	if state.Sequence == 0 || validateGlobalClose(state.GlobalClose) != nil {
+	state := EmergencyState{Sequence: binary.LittleEndian.Uint64(slot[8:16]), StopFenceSequence: binary.LittleEndian.Uint64(slot[496:504]), ReservedStopFenceKind: fenceFromCode(slot[536]), NormalInitialized: slot[28] == 1, GlobalClose: GlobalClose{Phase: phaseFromCode(slot[24]), Generation: binary.LittleEndian.Uint64(slot[16:24])}}
+	if state.StopFenceSequence != 0 && state.ReservedStopFenceKind != StopFenceContraction {
+		state.ReservedStopFenceDigest = getDigest(slot[544:576])
+	}
+	if state.Sequence == 0 || validateGlobalClose(state.GlobalClose) != nil || state.StopFenceSequence == 0 && state.ReservedStopFenceKind != "" || state.StopFenceSequence != 0 && !validStopFenceKind(state.ReservedStopFenceKind) || state.StopFenceSequence != 0 && state.ReservedStopFenceKind != StopFenceContraction && !isDigest(state.ReservedStopFenceDigest) {
 		return EmergencyState{}, false
 	}
 	if slot[29] != 0 {
-		proof := EmergencyClearProof{Generation: binary.LittleEndian.Uint64(slot[376:384]), StopFenceGeneration: binary.LittleEndian.Uint64(slot[384:392]), NginxTestPassed: slot[392]&1 != 0, RuntimeClosed: slot[392]&2 != 0, InventoryDigest: getDigest(slot[400:432]), OwnedGraphDigest: getDigest(slot[432:464]), RuntimeClosureDigest: getDigest(slot[464:496])}
+		proof := EmergencyClearProof{Generation: binary.LittleEndian.Uint64(slot[376:384]), StopFenceGeneration: binary.LittleEndian.Uint64(slot[384:392]), StopFenceDigest: getDigest(slot[504:536]), NginxTestPassed: slot[392]&1 != 0, RuntimeClosed: slot[392]&2 != 0, InventoryDigest: getDigest(slot[400:432]), OwnedGraphDigest: getDigest(slot[432:464]), RuntimeClosureDigest: getDigest(slot[464:496])}
 		if !isDigest(proof.InventoryDigest) || !isDigest(proof.OwnedGraphDigest) || !isDigest(proof.RuntimeClosureDigest) {
 			return EmergencyState{}, false
 		}
@@ -566,7 +604,7 @@ func decodeEmergency(slot []byte) (EmergencyState, bool) {
 	}
 	if slot[25] != 0 {
 		fence := EmergencyStopFence{Kind: StopFenceContraction, ScopeKind: scopeFromCode(slot[27]), Generation: binary.LittleEndian.Uint64(slot[32:40]), GlobalGeneration: binary.LittleEndian.Uint64(slot[40:48]), ClosingGeneration: binary.LittleEndian.Uint64(slot[48:56]), CertificateGeneration: binary.LittleEndian.Uint64(slot[56:64]), EdgeOneGeneration: binary.LittleEndian.Uint64(slot[64:72]), ObservedUnix: int64(binary.LittleEndian.Uint64(slot[72:80])), OriginOperation: getFixedString(slot[80:145]), ResourceID: getFixedString(slot[145:274]), OwnershipDigest: getDigest(slot[274:306]), OwnedGraphDigest: getDigest(slot[306:338]), InventoryDigest: getDigest(slot[338:370]), AccessMayRemain: slot[26]&1 != 0, MasterStopped: slot[26]&2 != 0, WorkersStopped: slot[26]&4 != 0, ListenersStopped: slot[26]&8 != 0}
-		if !validEmergencyFence(fence, state.GlobalClose) {
+		if !validEmergencyFence(fence, state.GlobalClose) || fence.Generation != state.StopFenceSequence {
 			return EmergencyState{}, false
 		}
 		state.StopFence = &fence
@@ -676,7 +714,7 @@ func (store *EmergencyStore) scanLatestSequence() (uint64, int, bool, error) {
 		if n != len(slot) {
 			return 0, 0, false, errors.New("short emergency slot read")
 		}
-		if string(slot[0:8]) != "LPSAFE02" || crc32.ChecksumIEEE(slot[:emergencySlotSize-4]) != binary.LittleEndian.Uint32(slot[emergencySlotSize-4:]) {
+		if string(slot[0:8]) != "LPSAFE03" || crc32.ChecksumIEEE(slot[:emergencySlotSize-4]) != binary.LittleEndian.Uint32(slot[emergencySlotSize-4:]) {
 			continue
 		}
 		sequence := binary.LittleEndian.Uint64(slot[8:16])
@@ -686,7 +724,7 @@ func (store *EmergencyStore) scanLatestSequence() (uint64, int, bool, error) {
 		valid++
 		if sequence > best {
 			best = sequence
-			inactive = phaseFromCode(slot[24]) == GlobalCloseNone && slot[25] == 0
+			inactive = phaseFromCode(slot[24]) == GlobalCloseNone && slot[25] == 0 && fenceFromCode(slot[536]) == ""
 		}
 	}
 	return best, valid, inactive, nil

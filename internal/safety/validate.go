@@ -51,6 +51,9 @@ func Validate(state State) error {
 		}
 	}
 	if state.StopFence != nil {
+		if state.StopFence.FenceGeneration != state.StopFenceSequence {
+			return fmt.Errorf("active stop fence does not match retained generation sequence")
+		}
 		if err := validateStopFence(*state.StopFence, state); err != nil {
 			return err
 		}
@@ -111,6 +114,9 @@ func validateBackupTransition(marker BackupTransition) error {
 }
 
 func validateHeadscale(headscale HeadscaleSafety) error {
+	if maximumGeneration(headscaleGenerations(headscale)) > headscale.GenerationSequence {
+		return fmt.Errorf("Headscale generation exceeds its monotonic sequence")
+	}
 	if headscale.CertificateExpiry != nil {
 		if err := validateDeadlineMarker(*headscale.CertificateExpiry); err != nil {
 			return fmt.Errorf("headscale certificate expiry: %w", err)
@@ -135,6 +141,9 @@ func validateHeadscale(headscale HeadscaleSafety) error {
 func validateResource(resource ResourceSafety) error {
 	if !validRef(resource.ResourceID) || !isDigest(resource.OwnershipDigest) {
 		return fmt.Errorf("resource ID and ownership digest are required")
+	}
+	if maximumGeneration(resourceGenerations(resource)) > resource.GenerationSequence {
+		return fmt.Errorf("resource generation exceeds its monotonic sequence")
 	}
 	if resource.State != ResourceActive && resource.State != ResourceDeleting {
 		return fmt.Errorf("resource state %q is unsupported", resource.State)
@@ -222,7 +231,7 @@ func validateChallenge(challenge ChallengePending) error {
 }
 
 func validateReactivating(reactivating Reactivating) error {
-	if reactivating.Generation == 0 || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() || reactivating.ACLUntil.IsZero() {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() || reactivating.ACLUntil.IsZero() {
 		return fmt.Errorf("reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {
@@ -232,7 +241,7 @@ func validateReactivating(reactivating Reactivating) error {
 }
 
 func validateHeadscaleReactivating(reactivating HeadscaleReactivating) error {
-	if reactivating.Generation == 0 || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() {
 		return fmt.Errorf("Headscale reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {
@@ -299,7 +308,11 @@ func validateStopFence(fence StopFence, state State) error {
 	for _, marker := range fence.SafetyGenerations {
 		listed[marker.Kind] = marker.Generation
 	}
-	for kind, generation := range applicableMarkerGenerations(fence.Scope, state) {
+	applicable := applicableMarkerGenerations(fence.Scope, state)
+	if len(listed) != len(applicable) {
+		return fmt.Errorf("stop fence safety generation set is not exact")
+	}
+	for kind, generation := range applicable {
 		if listed[kind] != generation {
 			return fmt.Errorf("stop fence omits applicable marker %q generation", kind)
 		}
@@ -321,24 +334,59 @@ func validateStopFence(fence StopFence, state State) error {
 		if err := validateMarkerGenerations(fence.Contraction.Authorities); err != nil {
 			return err
 		}
+		if fence.Scope.Kind == "app" {
+			resource := findResource(state, fence.Scope.ResourceID)
+			if resource == nil || resource.OwnershipDigest != fence.Contraction.OwnershipDigest {
+				return fmt.Errorf("contraction stop fence does not match App ownership authority")
+			}
+		}
 		return bindMarkerGenerations(fence.Contraction.Authorities, fence.Scope, state)
 	case StopFenceIngressActivation:
 		p := fence.IngressActivation
-		if p == nil || !validRef(p.IntentRef) || p.CandidateGeneration == 0 {
-			return fmt.Errorf("ingress activation stop fence payload is incomplete")
+		if fence.Scope.Kind != "app" && fence.Scope.Kind != "headscale" {
+			return fmt.Errorf("ingress activation stop fence requires App or Headscale scope")
+		}
+		if p == nil || !validRef(p.IntentRef) || p.CandidateGeneration == 0 || p.PriorGeneration == 0 || p.PriorGeneration+1 != p.CandidateGeneration {
+			return fmt.Errorf("ingress activation stop fence payload is incomplete or generation-invalid")
+		}
+		if fence.Scope.Kind == "app" {
+			resource := findResource(state, fence.Scope.ResourceID)
+			if resource == nil || resource.Reactivating == nil || resource.Reactivating.Generation != p.CandidateGeneration || resource.Reactivating.PriorGeneration != p.PriorGeneration || resource.Reactivating.PlanID != p.IntentRef {
+				return fmt.Errorf("ingress activation stop fence does not match App reactivation authority")
+			}
+		} else if fence.Scope.Kind == "headscale" && (state.Headscale.Reactivating == nil || state.Headscale.Reactivating.Generation != p.CandidateGeneration || state.Headscale.Reactivating.PriorGeneration != p.PriorGeneration || state.Headscale.Reactivating.PlanID != p.IntentRef) {
+			return fmt.Errorf("ingress activation stop fence does not match Headscale reactivation authority")
 		}
 	case StopFenceCertificateActivation:
 		p := fence.CertificateActivation
+		if fence.Scope.Kind != "app" && fence.Scope.Kind != "headscale" {
+			return fmt.Errorf("certificate activation stop fence requires App or Headscale scope")
+		}
 		if p == nil || !validRef(p.JournalRef) || p.ResourceGeneration == 0 || !isDigest(p.PriorPointer) || !isDigest(p.CandidatePointer) || p.ExpiryGeneration == 0 {
 			return fmt.Errorf("certificate activation stop fence payload is incomplete")
+		}
+		if fence.Scope.Kind == "app" {
+			resource := findResource(state, fence.Scope.ResourceID)
+			if resource == nil || resource.GenerationSequence != p.ResourceGeneration || resource.CertificateExpiry == nil || resource.CertificateExpiry.Generation != p.ExpiryGeneration {
+				return fmt.Errorf("certificate activation stop fence does not match App generation and expiry authority")
+			}
+		} else if fence.Scope.Kind == "headscale" && (state.Headscale.GenerationSequence != p.ResourceGeneration || state.Headscale.CertificateExpiry == nil || state.Headscale.CertificateExpiry.Generation != p.ExpiryGeneration) {
+			return fmt.Errorf("certificate activation stop fence does not match Headscale generation and expiry authority")
 		}
 	case StopFenceEdgeOneRefresh:
 		p := fence.EdgeOneRefresh
 		if p == nil || !validRef(p.JournalRef) || p.ResourceGeneration == 0 || !isDigest(p.PriorACL) || !isDigest(p.CandidateACL) || p.PriorDeadline.IsZero() || p.CandidateDeadline.IsZero() {
 			return fmt.Errorf("EdgeOne refresh stop fence payload is incomplete")
 		}
+		resource := findResource(state, fence.Scope.ResourceID)
+		if fence.Scope.Kind != "app" || resource == nil || resource.GenerationSequence != p.ResourceGeneration || resource.EdgeOne.RefreshJournal != p.JournalRef || !resource.EdgeOne.Deadline.Equal(p.PriorDeadline) && !resource.EdgeOne.Deadline.Equal(p.CandidateDeadline) {
+			return fmt.Errorf("EdgeOne refresh stop fence does not match journal, generation, and deadline authority")
+		}
 	case StopFenceMaintenanceTransition, StopFenceGenerationUpgrade:
 		p := fence.Transition
+		if fence.Scope.Kind != "installation" {
+			return fmt.Errorf("transition stop fence requires installation scope")
+		}
 		if p == nil || !validRef(p.JournalRef) || !isDigest(p.CurrentEnvelope) || !isDigest(p.TargetEnvelope) || !isDigest(p.RuntimeClosureDigest) || !isDigest(p.GenerationClosureDigest) {
 			return fmt.Errorf("transition stop fence payload is incomplete")
 		}
@@ -437,7 +485,9 @@ func bindMarkerGenerations(values []MarkerGeneration, scope FenceScope, state St
 		var generation uint64
 		switch value.Kind {
 		case "global_close":
-			generation = state.GlobalClose.Generation
+			if state.GlobalClose.Phase != GlobalCloseNone {
+				generation = state.GlobalClose.Generation
+			}
 		case "maintenance_pending":
 			if state.MaintenancePending != nil {
 				generation = state.MaintenancePending.Generation
@@ -500,6 +550,56 @@ func bindMarkerGenerations(values []MarkerGeneration, scope FenceScope, state St
 		}
 	}
 	return nil
+}
+
+func resourceGenerations(resource ResourceSafety) map[string]uint64 {
+	values := map[string]uint64{}
+	if resource.StickyUnpublished != nil {
+		values["sticky_unpublished"] = resource.StickyUnpublished.Generation
+	}
+	if resource.Closing != nil {
+		values["closing"] = resource.Closing.Generation
+	}
+	if resource.Contraction != nil {
+		values["contraction"] = resource.Contraction.Generation
+	}
+	if resource.CertificateExpiry != nil {
+		values["certificate_expiry"] = resource.CertificateExpiry.Generation
+	}
+	if resource.EdgeOne.Expiry != nil {
+		values["edgeone_expiry"] = resource.EdgeOne.Expiry.Generation
+	}
+	if resource.ChallengePending != nil {
+		values["challenge_pending"] = resource.ChallengePending.Generation
+	}
+	if resource.Reactivating != nil {
+		values["reactivating"] = resource.Reactivating.Generation
+	}
+	return values
+}
+
+func headscaleGenerations(headscale HeadscaleSafety) map[string]uint64 {
+	values := map[string]uint64{}
+	if headscale.CertificateExpiry != nil {
+		values["certificate_expiry"] = headscale.CertificateExpiry.Generation
+	}
+	if headscale.ChallengePending != nil {
+		values["challenge_pending"] = headscale.ChallengePending.Generation
+	}
+	if headscale.Reactivating != nil {
+		values["reactivating"] = headscale.Reactivating.Generation
+	}
+	return values
+}
+
+func maximumGeneration(values map[string]uint64) uint64 {
+	var maximum uint64
+	for _, generation := range values {
+		if generation > maximum {
+			maximum = generation
+		}
+	}
+	return maximum
 }
 
 func validMarkerKind(kind MarkerKind) bool {

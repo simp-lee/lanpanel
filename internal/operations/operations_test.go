@@ -3,6 +3,7 @@ package operations
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
@@ -74,15 +75,16 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		safetyStore := &fakeSafety{state: openSafetyState(), authority: manager.Authority()}
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
-		admitter, _ := NewAdmitter(normal, safetyStore, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{2}, 64)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/app-one", ActorIdentity: "session-one", PlanID: plan.ID, SafetyBinding: SafetyBinding{ResourceID: "app-one"}, ExpectedRevision: 2})
+		admitter, _ := NewAdmitter(normal, safetyStore, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{2}, 96)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
+		deadline := now.Add(time.Hour)
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 2})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if record.Status != jobs.StatusReserved {
 			t.Fatalf("reserved job=%#v", record)
 		}
-		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/app-one", ActorIdentity: "session-one", PlanID: plan.ID, SafetyBinding: SafetyBinding{ResourceID: "app-one"}, ExpectedRevision: 3}); err == nil {
+		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 3}); err == nil {
 			t.Fatal("one Plan reserved multiple jobs")
 		}
 		if err := admission.Release(); err != nil {
@@ -92,50 +94,72 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := mutation.AcquireExposure(context.Background(), "resource/app-one", manager); err == nil {
+		if _, _, err := mutation.AcquireExposure(context.Background(), "resource/res_00000000000000000000000000000001", manager); err == nil {
 			t.Fatal("exposure-to-mutation reverse acquisition succeeded")
 		}
 		_ = reverse.Release()
-		mutationLease, exposure, err := mutation.AcquireExposure(context.Background(), "resource/app-one", manager)
+		mutationLease, exposure, err := mutation.AcquireExposure(context.Background(), "resource/res_00000000000000000000000000000001", manager)
 		if err != nil {
 			t.Fatal(err)
 		}
-		intent, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 1, ConfirmationProof: plan.NonceDigest})
+		foreignMutation := &MutationLease{fd: mutationLease.fd, target: mutationLease.target, authority: locks.Authority{}}
+		if _, err := admitter.ConsumePlan(context.Background(), foreignMutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
+			t.Fatal("operation accepted a mutation lease from another authority")
+		}
+		intent, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if intent.Phase != PhaseLocalIntent {
 			t.Fatalf("intent=%#v", intent)
 		}
-		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 1, ConfirmationProof: plan.NonceDigest}); err == nil {
+		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
 			t.Fatal("Plan/reservation consumed twice")
-		}
-		child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "child-one", JobID: record.ID, Profile: "provider", State: ChildSubmitted, SubmittedAt: now}
-		if err := ReserveChild(context.Background(), normal, mutationLease, exposure, 4, child); err != nil {
-			t.Fatal(err)
-		}
-		child.State = ChildRunning
-		if err := TransitionChild(context.Background(), normal, mutationLease, exposure, 5, child); err != nil {
-			t.Fatal(err)
 		}
 		rawInstallation, err := persist.EncodeEntry(testOperationInstallation())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := normal.Update(context.Background(), exposure, 6, func(transaction *persist.Transaction) error {
+		if _, _, err := normal.Update(context.Background(), exposure, 4, func(transaction *persist.Transaction) error {
 			return transaction.Create("installations/current", rawInstallation)
 		}); err != nil {
 			t.Fatal(err)
 		}
-		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: JournalAppContraction, Operation: Publish, InstallationID: testOperationInstallation().InstallationID, Target: "resource/app-one", Generation: 1, Deadline: now.Add(time.Hour), ArtifactDigest: testDigest("artifact"), SafetyMarkerDigest: testDigest("marker"), ChildIDs: []string{"child-one"}, Phase: JournalPrepared}
-		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 7, journal, true); err != nil {
+		child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "child-one", JobID: record.ID, InstallationID: testOperationInstallation().InstallationID, Operation: Publish, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 4, Profile: "provider", InputDigest: testDigest("input"), ArtifactDigest: testDigest("artifact"), Deadline: deadline, State: ChildSubmitted, SubmittedAt: now}
+		if err := ReleaseExposure(mutationLease, exposure); err != nil {
+			t.Fatal(err)
+		}
+		childAdmission, err := manager.Acquire(context.Background(), locks.MutationAdmission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := admitter.ReserveChild(context.Background(), childAdmission, 5, child); err != nil {
+			t.Fatal(err)
+		}
+		if err := childAdmission.Release(); err != nil {
+			t.Fatal(err)
+		}
+		mutationLease, exposure, err = mutation.AcquireExposure(context.Background(), "resource/res_00000000000000000000000000000001", manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child.State = ChildRunning
+		if err := admitter.TransitionChild(context.Background(), mutationLease, exposure, 6, child); err != nil {
+			t.Fatal(err)
+		}
+		journalMarkerDigest, err := safetyBindingDigest(intent.SafetyBinding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: JournalAppContraction, Operation: Publish, InstallationID: testOperationInstallation().InstallationID, Target: "resource/res_00000000000000000000000000000001", Generation: 4, Deadline: deadline, ArtifactDigest: testDigest("artifact"), SafetyMarkerDigest: journalMarkerDigest, ResourceIDs: []string{"res_00000000000000000000000000000001"}, ChildIDs: []string{"child-one"}, Phase: JournalPrepared}
+		if err := admitter.PutJournal(context.Background(), mutationLease, exposure, 7, journal, true); err != nil {
 			t.Fatal(err)
 		}
 		journal.Phase = JournalActive
-		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 8, journal, false); err != nil {
+		if err := admitter.PutJournal(context.Background(), mutationLease, exposure, 8, journal, false); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := EnterRemoteWait(context.Background(), normal, mutationLease, exposure, 9, record.ID); err != nil {
+		if _, err := admitter.EnterRemoteWait(context.Background(), mutationLease, exposure, 9, record.ID); err != nil {
 			t.Fatal(err)
 		}
 		contraction, err := manager.Acquire(context.Background(), locks.Exposure)
@@ -152,32 +176,105 @@ func TestOperationAdmissionContract(t *testing.T) {
 		child.TerminalAt = &stamp
 		child.Outcome = ChildSucceeded
 		child.ResultDigest = testDigest("child-result")
-		if err := TransitionChild(context.Background(), normal, reentryMutation, reentryExposure, 11, child); err != nil {
+		if err := admitter.TransitionChild(context.Background(), reentryMutation, reentryExposure, 11, child); err != nil {
 			t.Fatal(err)
 		}
 		journal.Phase = JournalTerminal
-		if err := PutJournal(context.Background(), normal, reentryMutation, reentryExposure, 12, journal, false); err != nil {
+		if err := admitter.PutJournal(context.Background(), reentryMutation, reentryExposure, 12, journal, false); err != nil {
 			t.Fatal(err)
 		}
-		decision, err := admitter.DecideExactReconciliation(reentryExposure, journal.ID, ExactReconciliationObservation{Deadline: journal.Deadline, ArtifactDigest: journal.ArtifactDigest, SafetyMarkerDigest: journal.SafetyMarkerDigest})
+		if _, err := admitter.DecideExactReconciliation(reentryExposure, journal.ID, ExactReconciliationObservation{Deadline: journal.Deadline, ArtifactDigest: journal.ArtifactDigest, SafetyMarkerDigest: journal.SafetyMarkerDigest}); err == nil {
+			t.Fatal("exact reconciliation ran without a new durable startup/timer job")
+		}
+		if err := ReleaseExposure(reentryMutation, reentryExposure); err != nil {
+			t.Fatal(err)
+		}
+		reconciliationAdmission, err := manager.Acquire(context.Background(), locks.MutationAdmission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admitter.random = bytes.NewReader(bytes.Repeat([]byte{7}, 32))
+		reconciliationJob, err := admitter.Admit(context.Background(), reconciliationAdmission, AdmitRequest{Operation: AutomaticReconciliation, Target: "journal/" + journal.ID, ActorIdentity: "startup-recovery", Source: AdmissionStartup, ExpectedRevision: 13})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reconciliationAdmission.Release(); err != nil {
+			t.Fatal(err)
+		}
+		reconciliationMutation, reconciliationExposure, err := mutation.AcquireExposure(context.Background(), "journal/"+journal.ID, manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admitter.BeginPlanless(context.Background(), reconciliationMutation, reconciliationExposure, ConsumeRequest{JobID: reconciliationJob.ID, ExpectedRevision: 14, IntentGeneration: 15}); err != nil {
+			t.Fatal(err)
+		}
+		safetyStore.state.Resources[0].GenerationSequence = 3
+		safetyStore.state.Resources[0].StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 3, Reason: "exact_reconciliation"}
+		observation := ExactReconciliationObservation{ReconciliationJobID: reconciliationJob.ID, Deadline: journal.Deadline, ArtifactDigest: journal.ArtifactDigest, SafetyMarkerDigest: journal.SafetyMarkerDigest, ObservedAt: now, Closures: []ExactResourceClosure{{ResourceID: "res_00000000000000000000000000000001", OwnershipDigest: testDigest("owner"), ContractionGeneration: 3, RuntimeClosureDigest: testDigest("runtime-closure"), DiskClosureDigest: testDigest("disk-closure"), ListenerClosureDigest: testDigest("listener-closure")}}}
+		decision, err := admitter.DecideExactReconciliation(reconciliationExposure, journal.ID, observation)
 		if err != nil || decision.Action != ReconcileContractApp || decision.Target != journal.Target {
 			t.Fatalf("DecideExactReconciliation() = %#v, %v", decision, err)
 		}
-		if _, err := admitter.DecideExactReconciliation(nil, journal.ID, ExactReconciliationObservation{}); err == nil {
+		if _, err := admitter.DecideExactReconciliation(nil, journal.ID, observation); err == nil {
 			t.Fatal("exact reconciliation read without exposure authority")
 		}
-		completed, err := admitter.Complete(context.Background(), reentryMutation, reentryExposure, 13, record.ID, "complete", nil, []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: "app-one"}}, "")
-		if err != nil || completed.Result != jobs.ResultSucceeded {
-			t.Fatalf("Complete()=%#v,%v", completed, err)
+		staleObservation := observation
+		staleObservation.ObservedAt = now.Add(-2 * time.Minute)
+		if _, err := admitter.DecideExactReconciliation(reconciliationExposure, journal.ID, staleObservation); err == nil {
+			t.Fatal("exact reconciliation accepted stale closure evidence")
 		}
-		if _, _, err := normal.Update(context.Background(), reentryExposure, 14, func(transaction *persist.Transaction) error {
-			rewritten := completed
-			rewritten.Postconditions[0].Identity = "other"
-			return jobs.Replace(transaction, rewritten)
+		mismatchedObservation := observation
+		mismatchedObservation.SafetyMarkerDigest = testDigest("other-marker")
+		if _, err := admitter.DecideExactReconciliation(reconciliationExposure, journal.ID, mismatchedObservation); err == nil {
+			t.Fatal("exact reconciliation accepted mismatched observed marker authority")
+		}
+		now = now.Add(time.Second)
+		terminalObservation := observation
+		terminalObservation.ObservedAt = now
+		reconciliationResult, err := admitter.CompleteExactReconciliation(context.Background(), reconciliationMutation, reconciliationExposure, 15, decision, terminalObservation, reconciliationJob.ID)
+		if err != nil || reconciliationResult.Result != jobs.ResultSucceeded {
+			t.Fatalf("CompleteExactReconciliation()=%#v,%v", reconciliationResult, err)
+		}
+		if err := ReleaseExposure(reconciliationMutation, reconciliationExposure); err != nil {
+			t.Fatal(err)
+		}
+		closedDocument, err := normal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedInstallation, err := domain.DecodeInstallation(closedDocument.Entries["installations/current"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		closedRecord := closedInstallation.Resources[0].PublicationRecord
+		if closedRecord.State != domain.PublicationUnpublished || closedRecord.UnpublishedGeneration != 3 || closedRecord.LastJobID != reconciliationJob.ID {
+			t.Fatalf("exact reconciliation did not atomically persist fresh unpublished authority: %#v", closedRecord)
+		}
+		if closedInstallation.Resources[0].ManagedProcess.Requested != domain.ProcessRequestedStopped {
+			t.Fatal("exact reconciliation rewrote managed-process intent")
+		}
+		finalMutation, finalExposure, err := mutation.AcquireExposure(context.Background(), "resource/res_00000000000000000000000000000001", manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admitter.Complete(context.Background(), finalMutation, finalExposure, 16, record.ID, "complete", nil, []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: "res_00000000000000000000000000000001"}}, ""); err == nil {
+			t.Fatal("superseded publish completed after exact reconciliation contraction")
+		}
+		jobStore, err := jobs.NewStore(normal, jobs.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		interrupted, err := jobStore.Read(record.ID)
+		if err != nil || interrupted.Result != jobs.ResultInterrupted {
+			t.Fatalf("superseded original job=%#v,%v", interrupted, err)
+		}
+		if _, _, err := normal.Update(context.Background(), finalExposure, 16, func(transaction *persist.Transaction) error {
+			interrupted.Postconditions[0].Identity = "other"
+			return jobs.Replace(transaction, interrupted)
 		}); err == nil {
-			t.Fatal("terminal job was rewritten through raw transaction")
+			t.Fatal("terminal interrupted job was rewritten through raw transaction")
 		}
-		if err := ReleaseExposure(reentryMutation, reentryExposure); err != nil {
+		if err := ReleaseExposure(finalMutation, finalExposure); err != nil {
 			t.Fatal(err)
 		}
 		consumed, err := planStore.Read(plan.ID)
@@ -202,7 +299,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		closed.GlobalClose = safety.GlobalClose{Phase: safety.GlobalCloseClosing, Generation: 1}
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, &changingSafety{states: []safety.State{openSafetyState(), closed}, authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{4}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/app-one", ActorIdentity: "session-one", PlanID: plan.ID, SafetyBinding: SafetyBinding{ResourceID: "app-one"}, ExpectedRevision: 2})
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 2})
 		if err == nil {
 			t.Fatal("safety race admitted operation")
 		}
@@ -227,7 +324,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return clock }, Random: bytes.NewReader(bytes.Repeat([]byte{6}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/app-one", ActorIdentity: "session-one", PlanID: plan.ID, SafetyBinding: SafetyBinding{ResourceID: "app-one"}, ExpectedRevision: 2})
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 2})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -235,11 +332,11 @@ func TestOperationAdmissionContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		clock = now.Add(11 * time.Minute)
-		mutationLease, exposure, err := mutation.AcquireExposure(context.Background(), "resource/app-one", manager)
+		mutationLease, exposure, err := mutation.AcquireExposure(context.Background(), "resource/res_00000000000000000000000000000001", manager)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 1, ConfirmationProof: plan.NonceDigest}); err == nil {
+		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
 			t.Fatal("expired Plan consumed")
 		}
 		_ = ReleaseExposure(mutationLease, exposure)
@@ -265,20 +362,35 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
 			t.Fatal("normal admission crossed a stop fence")
 		}
-		if validType(Type("startup_recovery")) {
-			t.Fatal("startup reconciliation was exposed through normal Plan admission")
+		if err := validateAdmissionSource(StartupContraction, AdmissionPlan, "plan"); err == nil {
+			t.Fatal("startup contraction was exposed through Plan admission")
+		}
+		if err := validateAdmissionSource(Upgrade, AdmissionPlan, "plan"); err == nil {
+			t.Fatal("generation upgrade was exposed through ordinary management Plan admission")
+		}
+		if err := validateSafetyTargetBinding(AdmitRequest{Operation: Publish, Target: "resource/app-a", PlanID: "plan", Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "app-b"}}); err == nil {
+			t.Fatal("resource target was admitted under another resource's safety authority")
 		}
 		state = safety.EmptyState()
 		state.DependencyTransitionPending = &safety.TransitionMarker{Generation: 3}
 		deadline := time.Now().UTC().Add(-time.Minute)
-		state.Resources = []safety.ResourceSafety{{ResourceID: "app-one", CertificateExpiry: &safety.DeadlineMarker{Generation: 4, Deadline: deadline}}}
-		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "app-one", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, false, time.Now()); err != nil {
+		state.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 4, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), CertificateExpiry: &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}}}
+		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, false, time.Now()); err != nil {
 			t.Fatalf("deadline contraction exception rejected: %v", err)
 		}
+		futureDeadline := time.Now().UTC().Add(time.Hour)
+		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 5, Deadline: futureDeadline, Binding: "future"}
+		state.Resources[0].GenerationSequence = 5
+		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 5, Deadline: futureDeadline}, false, time.Now()); err == nil {
+			t.Fatal("timer expiry contracted before its bound deadline")
+		}
+		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}
+		state.Resources[0].GenerationSequence = 4
 		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
 			t.Fatal("publish crossed dependency transition")
 		}
 		independent, _, independentManager := unavailableProof(t)
+		independentSafety := independent.safety.(*fakeSafety)
 		exposure, err := independentManager.Acquire(context.Background(), locks.Exposure)
 		if err != nil {
 			t.Fatal(err)
@@ -291,26 +403,33 @@ func TestOperationAdmissionContract(t *testing.T) {
 			}
 			return proof
 		}
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, state, SafetyBinding{ResourceID: "app-one", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
+		independentSafety.state = state
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		emergency := safety.EmptyState()
-		if err := independent.AuthorizeStateIndependentContraction(EmergencyCloseAll, emergency, SafetyBinding{GlobalGeneration: 0, ProposedGeneration: 1}, fresh(), exposure, func() error { return nil }); err != nil {
+		independentSafety.state = emergency
+		if err := independent.AuthorizeStateIndependentContraction(EmergencyCloseAll, SafetyBinding{GlobalGeneration: 0, ProposedGeneration: 1}, fresh(), exposure, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		edge := safety.EmptyState()
-		edge.Resources = []safety.ResourceSafety{{ResourceID: "app-one", EdgeOne: safety.EdgeOneSafety{Expiry: &safety.DeadlineMarker{Generation: 5, Deadline: deadline}}}}
-		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, edge, SafetyBinding{ResourceID: "app-one", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
+		edge.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 5, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), EdgeOne: safety.EdgeOneSafety{Expiry: &safety.DeadlineMarker{Generation: 5, Deadline: deadline, Binding: "edgeone"}}}}
+		independentSafety.state = edge
+		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
-		if err := independent.AuthorizeStateIndependentContraction(Type("startup_recovery"), safety.EmptyState(), SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
-			t.Fatal("startup callback bypassed exact-journal reconciliation")
+		startup := safety.EmptyState()
+		startup.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 6, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), Reactivating: &safety.Reactivating{Generation: 6, PriorGeneration: 5, PlanID: "plan", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle"), BaseMarkers: absentSafetySnapshot(), CertificateUntil: time.Now().Add(time.Hour), ACLUntil: time.Now().Add(time.Hour)}}}
+		independentSafety.state = startup
+		if err := independent.AuthorizeStateIndependentContraction(StartupContraction, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan", IntentGeneration: 6, CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle")}, fresh(), exposure, func() error { return nil }); err != nil {
+			t.Fatalf("startup contraction was rejected: %v", err)
 		}
-		if err := independent.AuthorizeStateIndependentContraction(Publish, safety.EmptyState(), SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(Publish, SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
 			t.Fatal("publish entered state-independent exception")
 		}
 		_, otherProof, _ := unavailableProof(t)
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, state, SafetyBinding{ResourceID: "app-one", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, otherProof, exposure, func() error { return nil }); err == nil {
+		independentSafety.state = state
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, otherProof, exposure, func() error { return nil }); err == nil {
 			t.Fatal("unavailability proof from another store was accepted")
 		}
 	})
@@ -324,6 +443,9 @@ func TestOperationAdmissionContract(t *testing.T) {
 		handoffAdmitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if _, _, err := mutation.AcquireExposure(context.Background(), "installation", manager); err == nil {
+			t.Fatal("ordinary mutation retained the admission lock into exposure acquisition")
 		}
 		committed := false
 		err = handoffAdmitter.FencedHandoff(context.Background(), admission, mutation, manager, HandoffBackupEnter, "installation", "", func(m *MutationLease, e *locks.Lease) error {
@@ -358,7 +480,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{9}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
 		document, _ = normal.Read()
-		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/app-one", ActorIdentity: "session-one", PlanID: plan.ID, SafetyBinding: SafetyBinding{ResourceID: "app-one"}, ExpectedRevision: document.Revision}); err != nil {
+		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: document.Revision}); err != nil {
 			t.Fatal(err)
 		}
 		err = handoffAdmitter.FencedHandoff(context.Background(), admission, mutation, manager, HandoffMaintenance, "installation", "", func(*MutationLease, *locks.Lease) error {
@@ -403,6 +525,78 @@ func TestOperationResultBranchTable(t *testing.T) {
 	})
 }
 
+func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	beforeInstallation := operationStateInstallation()
+	afterInstallation := operationStateInstallation()
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + afterInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{9}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = jobs.Start(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningRecord := record
+	record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "state_committed", Status: jobs.PostconditionVerified, Identity: "res_00000000000000000000000000000001"}}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInstallation.Resources[0].PublicationRecord.UnpublishedGeneration++
+	afterInstallation.Resources[0].PublicationRecord.LastOperation = domain.OperationPublish
+	afterInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	afterInstallation.Resources[0].PublicationRecord.LastJobID = record.ID
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{}}
+	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{}}
+	encode := func(value any) json.RawMessage {
+		raw, err := persist.EncodeEntry(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before.Entries["installations/current"] = encode(beforeInstallation)
+	after.Entries["installations/current"] = encode(afterInstallation)
+	if err := validateOperationStateTransitions(before, after); err == nil {
+		t.Fatal("resource operation state changed without job and intent")
+	}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: "plan-one", AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + afterInstallation.Resources[0].ID, Phase: PhaseTerminal, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	activeIntent := intent
+	activeIntent.Phase = PhaseLocalIntent
+	before.Entries[reservationKey(record.ID)] = encode(activeIntent)
+	before.Entries["jobs/"+record.ID] = encode(runningRecord)
+	after.Entries[reservationKey(record.ID)] = encode(intent)
+	after.Entries["jobs/"+record.ID] = encode(record)
+	if err := validateOperationStateTransitions(before, after); err != nil {
+		t.Fatalf("atomic operation state transition rejected: %v", err)
+	}
+	arbitraryPrune := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{}}
+	for key, raw := range after.Entries {
+		arbitraryPrune.Entries[key] = append(json.RawMessage(nil), raw...)
+	}
+	delete(arbitraryPrune.Entries, reservationKey(record.ID))
+	delete(arbitraryPrune.Entries, "jobs/"+record.ID)
+	if err := validateOperationStateTransitions(after, arbitraryPrune); err == nil {
+		t.Fatal("recent terminal operation graph was deleted outside exact overflow retention")
+	}
+	replayedInstallation := afterInstallation
+	replayedInstallation.Resources = append([]domain.AppResource(nil), afterInstallation.Resources...)
+	replayedInstallation.Resources[0].PublicationRecord.UnpublishedGeneration++
+	replay := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{}}
+	for key, raw := range after.Entries {
+		replay.Entries[key] = append(json.RawMessage(nil), raw...)
+	}
+	replay.Entries["installations/current"] = encode(replayedInstallation)
+	if err := validateOperationStateTransitions(after, replay); err == nil {
+		t.Fatal("old terminal job was replayed to rewrite resource state")
+	}
+	afterInstallation.Resources[0].PublicationRecord.LastJobID = "job_" + strings.Repeat("f", 64)
+	after.Entries["installations/current"] = encode(afterInstallation)
+	if err := validateOperationStateTransitions(before, after); err == nil {
+		t.Fatal("resource operation state accepted a mismatched job identity")
+	}
+}
+
 func unavailableProof(t *testing.T) (*Admitter, persist.UnavailableProof, *locks.Manager) {
 	t.Helper()
 	lockRoot := t.TempDir()
@@ -433,9 +627,18 @@ func unavailableProof(t *testing.T) (*Admitter, persist.UnavailableProof, *locks
 	return admitter, proof, manager
 }
 
+func absentSafetySnapshot() []safety.MarkerSnapshot {
+	return []safety.MarkerSnapshot{
+		{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent},
+		{Kind: safety.MarkerContraction, State: safety.SnapshotAbsent},
+		{Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent},
+		{Kind: safety.MarkerEdgeOneExpiry, State: safety.SnapshotAbsent},
+	}
+}
+
 func openSafetyState() safety.State {
 	state := safety.EmptyState()
-	state.Resources = []safety.ResourceSafety{{ResourceID: "app-one", State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner")}}
+	state.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner")}}
 	return state
 }
 
@@ -445,7 +648,7 @@ func testRegistry(t *testing.T) *Registry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry, err := NewRegistry([]Registration{{Operation: Publish, Owner: "publication", Results: table}})
+	registry, err := NewRegistry([]Registration{{Operation: Publish, Owner: "publication", Results: table}, {Operation: AutomaticReconciliation, Owner: "startup-recovery", Results: table}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -453,20 +656,30 @@ func testRegistry(t *testing.T) *Registry {
 }
 
 func operationPlanSpec(now time.Time) plans.Spec {
-	return plans.Spec{Operation: "publish", Target: plans.Target{Kind: plans.TargetResource, ID: "app-one"}, ActorIdentity: "session-one", Config: plans.DigestBinding{Applicable: true, Digest: testDigest("config")}, Applied: plans.DigestBinding{Applicable: true, Digest: testDigest("applied")}, Evidence: []plans.Evidence{{Kind: "config", Identity: "app-one", Generation: 1, Digest: testDigest("evidence"), ObservedAt: now}}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
+	return plans.Spec{Operation: "publish", Target: plans.Target{Kind: plans.TargetResource, ID: "res_00000000000000000000000000000001"}, ActorIdentity: "session-one", Config: plans.DigestBinding{Applicable: true, Digest: testDigest("config")}, Applied: plans.DigestBinding{Applicable: true, Digest: testDigest("applied")}, Evidence: []plans.Evidence{{Kind: "config", Identity: "res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("evidence"), ObservedAt: now}}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
 }
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }
-func testOperationInstallation() domain.Installation {
+func operationStateInstallation() domain.Installation {
 	return domain.Installation{
-		SchemaVersion:  domain.InstallationSchemaVersion,
-		InstallationID: "ins_00000000000000000000000000000001",
-		Management: domain.ManagementAuthority{
-			Address: "127.23.45.67",
-			Port:    23456,
-		},
+		SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001",
+		Management: domain.ManagementAuthority{Address: "127.23.45.67", Port: 23456},
+		Resources: []domain.AppResource{{
+			ID: "res_00000000000000000000000000000001", Name: "App", Lifecycle: domain.LifecycleActive,
+			CurrentConfigDigest: testDigest("config"),
+			Target:              domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation}},
+			Publication:         domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.com", AccessMode: domain.AppAccessPublic}},
+			PublicationRecord:   domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 2},
+			ManagedProcess:      &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedStopped},
+		}},
 	}
+}
+
+func testOperationInstallation() domain.Installation {
+	installation := operationStateInstallation()
+	installation.Resources[0].CurrentConfigDigest = testDigest("operation-config")
+	return installation
 }
 func newOperationStores(t *testing.T) (*persist.Store, *locks.Manager, *locks.Lease, *MutationSet) {
 	t.Helper()

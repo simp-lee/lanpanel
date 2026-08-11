@@ -17,12 +17,30 @@ import (
 	"time"
 )
 
-const SchemaVersion = "lanpanel.job.v1"
+const (
+	SchemaVersion         = "lanpanel.job.v1"
+	MaximumModifiedPaths  = 64
+	MaximumPostconditions = 32
+)
 
 var (
-	ErrMissing = errors.New("job is missing")
-	idPattern  = regexp.MustCompile(`^job_[0-9a-f]{64}$`)
-	refPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	ErrMissing        = errors.New("job is missing")
+	idPattern         = regexp.MustCompile(`^job_[0-9a-f]{64}$`)
+	refPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	errorCodePattern  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	allowedErrorCodes = map[string]struct{}{
+		"activation_contracted":       {},
+		"binding_refresh_failed":      {},
+		"confirmation_invalid":        {},
+		"confirmation_rejected":       {},
+		"exact_reconciliation_closed": {},
+		"normal_revision_changed":     {},
+		"plan_consumption_rejected":   {},
+		"planless_start_rejected":     {},
+		"safety_authority_changed":    {},
+		"safety_recheck_unavailable":  {},
+		"safety_refresh_failed":       {},
+	}
 )
 
 type Status string
@@ -117,7 +135,7 @@ func Register(normal *persist.Store) error {
 	if normal.NamespaceRegistered("jobs") {
 		return nil
 	}
-	return normal.RegisterNamespace("jobs", validateEntry, validateJobTransition)
+	return normal.RegisterCanonicalNamespace("jobs", "jobs.v1", validateEntry, validateJobTransition)
 }
 func validateEntry(key string, raw json.RawMessage) error {
 	record, err := decode(raw)
@@ -143,6 +161,12 @@ func validateJobTransition(_ string, before, after json.RawMessage) error {
 	oldRecord, err := decode(before)
 	if err != nil {
 		return err
+	}
+	if len(after) == 0 {
+		if oldRecord.Status != StatusTerminal {
+			return fmt.Errorf("only a terminal job may be pruned")
+		}
+		return nil
 	}
 	newRecord, err := decode(after)
 	if err != nil {
@@ -269,12 +293,15 @@ func Validate(record Record) error {
 	if record.SchemaVersion != SchemaVersion || !idPattern.MatchString(record.ID) || !validRef(record.Operation) || !validRef(record.Target) || !validRef(record.ActorIdentity) || record.StartedAt.IsZero() {
 		return fmt.Errorf("job identity is invalid")
 	}
+	if len(record.ModifiedPaths) > MaximumModifiedPaths || len(record.Postconditions) > MaximumPostconditions {
+		return fmt.Errorf("job evidence exceeds the bounded retention shape")
+	}
 	if !pathsEqual(record.ModifiedPaths, canonicalPaths(record.ModifiedPaths)) || !postconditionsEqual(record.Postconditions, canonicalPostconditions(record.Postconditions)) {
 		return fmt.Errorf("job evidence is not canonical")
 	}
 	for _, path := range record.ModifiedPaths {
-		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-			return fmt.Errorf("job modified path is not clean and absolute")
+		if len(path) > 512 || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("job modified path is not bounded, clean, and absolute")
 		}
 	}
 	for _, condition := range record.Postconditions {
@@ -294,8 +321,9 @@ func Validate(record Record) error {
 		if record.Result == ResultSucceeded && record.ErrorCode != "" {
 			return fmt.Errorf("succeeded job cannot contain an error")
 		}
-		if record.Result != ResultSucceeded && !validRef(record.ErrorCode) {
-			return fmt.Errorf("non-success job requires a redacted error code")
+		_, allowedErrorCode := allowedErrorCodes[record.ErrorCode]
+		if record.Result != ResultSucceeded && (!errorCodePattern.MatchString(record.ErrorCode) || !allowedErrorCode) {
+			return fmt.Errorf("non-success job requires a closed redacted error code")
 		}
 		if (record.Result == ResultSucceeded || record.Result == ResultFailed) && !allPostconditions(record.Postconditions, PostconditionVerified) {
 			return fmt.Errorf("succeeded or restored-failure job requires verified postconditions")

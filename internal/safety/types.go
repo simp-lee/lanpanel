@@ -65,6 +65,7 @@ type ChallengePending struct {
 
 type Reactivating struct {
 	Generation       uint64           `json:"generation"`
+	PriorGeneration  uint64           `json:"prior_generation"`
 	PlanID           string           `json:"plan_id"`
 	CandidateDigest  string           `json:"candidate_digest"`
 	CandidateBundle  string           `json:"candidate_bundle"`
@@ -77,6 +78,7 @@ type Reactivating struct {
 
 type HeadscaleReactivating struct {
 	Generation            uint64           `json:"generation"`
+	PriorGeneration       uint64           `json:"prior_generation"`
 	PlanID                string           `json:"plan_id"`
 	ControlGeneration     uint64           `json:"control_generation"`
 	CertificateGeneration uint64           `json:"certificate_generation"`
@@ -109,24 +111,26 @@ const (
 )
 
 type ResourceSafety struct {
-	ResourceID        string            `json:"resource_id"`
-	State             ResourceState     `json:"state"`
-	Ownership         OwnershipState    `json:"ownership"`
-	OwnershipDigest   string            `json:"ownership_digest"`
-	StickyUnpublished *GenerationMarker `json:"sticky_unpublished,omitempty"`
-	Closing           *GenerationMarker `json:"closing,omitempty"`
-	Contraction       *GenerationMarker `json:"contraction,omitempty"`
-	CertificateExpiry *DeadlineMarker   `json:"certificate_expiry,omitempty"`
-	EdgeOne           EdgeOneSafety     `json:"edgeone"`
-	ChallengePending  *ChallengePending `json:"challenge_pending,omitempty"`
-	Reactivating      *Reactivating     `json:"reactivating,omitempty"`
-	DeletionTombstone string            `json:"deletion_tombstone,omitempty"`
+	ResourceID         string            `json:"resource_id"`
+	GenerationSequence uint64            `json:"generation_sequence"`
+	State              ResourceState     `json:"state"`
+	Ownership          OwnershipState    `json:"ownership"`
+	OwnershipDigest    string            `json:"ownership_digest"`
+	StickyUnpublished  *GenerationMarker `json:"sticky_unpublished,omitempty"`
+	Closing            *GenerationMarker `json:"closing,omitempty"`
+	Contraction        *GenerationMarker `json:"contraction,omitempty"`
+	CertificateExpiry  *DeadlineMarker   `json:"certificate_expiry,omitempty"`
+	EdgeOne            EdgeOneSafety     `json:"edgeone"`
+	ChallengePending   *ChallengePending `json:"challenge_pending,omitempty"`
+	Reactivating       *Reactivating     `json:"reactivating,omitempty"`
+	DeletionTombstone  string            `json:"deletion_tombstone,omitempty"`
 }
 
 type HeadscaleSafety struct {
-	CertificateExpiry *DeadlineMarker        `json:"certificate_expiry,omitempty"`
-	ChallengePending  *ChallengePending      `json:"challenge_pending,omitempty"`
-	Reactivating      *HeadscaleReactivating `json:"reactivating,omitempty"`
+	GenerationSequence uint64                 `json:"generation_sequence,omitempty"`
+	CertificateExpiry  *DeadlineMarker        `json:"certificate_expiry,omitempty"`
+	ChallengePending   *ChallengePending      `json:"challenge_pending,omitempty"`
+	Reactivating       *HeadscaleReactivating `json:"reactivating,omitempty"`
 }
 
 type TransitionMarker struct {
@@ -258,6 +262,7 @@ type State struct {
 	UpgradePending              *TransitionMarker `json:"upgrade_pending,omitempty"`
 	BackupQuiescence            *BackupQuiescence `json:"backup_quiescence,omitempty"`
 	BackupTransition            *BackupTransition `json:"backup_transition,omitempty"`
+	StopFenceSequence           uint64            `json:"stop_fence_sequence"`
 	StopFence                   *StopFence        `json:"stop_fence,omitempty"`
 	Headscale                   HeadscaleSafety   `json:"headscale"`
 	Resources                   []ResourceSafety  `json:"resources"`

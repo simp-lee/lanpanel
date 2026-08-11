@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -22,6 +23,10 @@ const maxStateBytes = 2 << 20
 
 var ErrSafetyStateMissing = errors.New("independent safety state is missing")
 
+type OwnershipAuthority interface {
+	InventoryAuthority() (map[string]string, bool, error)
+}
+
 type StoreConfig struct {
 	RootPath      string
 	StagingPath   string
@@ -29,6 +34,15 @@ type StoreConfig struct {
 	Owner         filetxn.Owner
 	Emergency     *EmergencyStore
 	LockAuthority locks.Authority
+	Ownership     OwnershipAuthority
+}
+
+type OwnershipConvergenceProof struct {
+	ResourceID   string
+	IntentRef    string
+	Generation   uint64
+	BeforeDigest string
+	AfterDigest  string
 }
 
 type ReactivationConvergenceProof struct {
@@ -78,6 +92,7 @@ type GlobalConvergenceProof struct {
 type StopFenceConvergenceProof struct {
 	Kind                   StopFenceKind
 	FenceGeneration        uint64
+	FenceDigest            string
 	JournalRef             string
 	InventoryDigest        string
 	OwnedGraphDigest       string
@@ -93,6 +108,7 @@ type StopFenceConvergenceProof struct {
 }
 
 type TransitionProof struct {
+	Ownership    *OwnershipConvergenceProof
 	Reactivation *ReactivationConvergenceProof
 	Headscale    *HeadscaleConvergenceProof
 	Closing      *ClosingConvergenceProof
@@ -106,6 +122,36 @@ type Store struct {
 	txn      *filetxn.Store
 	rootFD   int
 	rootStat unix.Stat_t
+}
+
+// ReserveEmergencyStopFenceGeneration durably allocates the next emergency
+// generation before a non-contraction normal stop fence may be committed.
+func ReserveEmergencyStopFenceGeneration(lease *locks.Lease, emergency *EmergencyStore, role ClearRole, kind StopFenceKind, reservationDigest string, expectedNormalSequence uint64) (EmergencyState, error) {
+	if lease == nil || emergency == nil || kind == StopFenceContraction || role != stopFenceWriter(kind) || !isDigest(reservationDigest) {
+		return EmergencyState{}, fmt.Errorf("emergency stop-fence reservation authority is invalid")
+	}
+	current, err := emergency.Authority()
+	if err != nil {
+		return EmergencyState{}, err
+	}
+	if current.StopFence != nil {
+		return EmergencyState{}, fmt.Errorf("emergency stop fence is already active")
+	}
+	if current.StopFenceSequence == expectedNormalSequence+1 && current.ReservedStopFenceKind == kind && current.ReservedStopFenceDigest == reservationDigest {
+		return current, nil
+	}
+	if current.StopFenceSequence != expectedNormalSequence {
+		return EmergencyState{}, fmt.Errorf("emergency stop-fence reservation does not match expected normal high-water")
+	}
+	next := current
+	next.Sequence++
+	next.StopFenceSequence++
+	next.ReservedStopFenceKind = kind
+	next.ReservedStopFenceDigest = reservationDigest
+	if err := emergency.Commit(lease, role, current.Sequence, next); err != nil {
+		return EmergencyState{}, err
+	}
+	return next, nil
 }
 
 func OpenStore(config StoreConfig) (*Store, error) {
@@ -187,6 +233,9 @@ func (store *Store) read(requireAuthority bool) (State, error) {
 	}
 	state.Checksum = checksum
 	if requireAuthority {
+		if err := validateOwnershipAuthority(state, store.config.Ownership); err != nil {
+			return State{}, err
+		}
 		authority, err := store.config.Emergency.Authority()
 		if err != nil {
 			return State{}, err
@@ -209,7 +258,7 @@ func (store *Store) Initialize(ctx context.Context, lease *locks.Lease) (filetxn
 	if authority.NormalInitialized {
 		return filetxn.Result{}, fmt.Errorf("normal safety state was already initialized; missing state requires recovery")
 	}
-	if authority.StopFence != nil || authority.GlobalClose.Phase != GlobalCloseNone {
+	if authority.StopFence != nil || authority.StopFenceSequence != 0 || authority.ReservedStopFenceKind != "" || authority.GlobalClose.Phase != GlobalCloseNone {
 		return filetxn.Result{}, fmt.Errorf("cannot initialize normal safety state while emergency authority is active")
 	}
 	nextAuthority := authority
@@ -221,6 +270,10 @@ func (store *Store) Initialize(ctx context.Context, lease *locks.Lease) (filetxn
 	state := EmptyState()
 	state.AuthoritySequence = nextAuthority.Sequence
 	state.GlobalClose = nextAuthority.GlobalClose
+	state.StopFenceSequence = nextAuthority.StopFenceSequence
+	if err := validateOwnershipAuthority(state, store.config.Ownership); err != nil {
+		return filetxn.Result{}, fmt.Errorf("initialize safety ownership authority: %w", err)
+	}
 	return store.persist(ctx, state, filetxn.CreateOnly)
 }
 
@@ -242,14 +295,26 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err != nil {
 		return filetxn.Result{}, err
 	}
-	if next.AuthoritySequence != authority.Sequence || next.GlobalClose != authority.GlobalClose {
+	if next.AuthoritySequence != authority.Sequence || next.GlobalClose != authority.GlobalClose || next.StopFenceSequence != authority.StopFenceSequence {
 		return filetxn.Result{}, fmt.Errorf("normal safety state does not bind the current emergency generation authority")
 	}
-	if authority.StopFence != nil && !normalFenceMatchesEmergency(next.StopFence, *authority.StopFence) {
-		return filetxn.Result{}, fmt.Errorf("normal safety state omits or mismatches the current emergency stop authority")
+	if next.StopFence != nil {
+		projected := authority.StopFence != nil && normalFenceMatchesEmergency(next.StopFence, *authority.StopFence)
+		reserved := authority.StopFence == nil && authority.ReservedStopFenceKind == next.StopFence.Kind && authority.ReservedStopFenceDigest == StopFenceDigest(*next.StopFence) && authority.StopFenceSequence == next.StopFence.FenceGeneration
+		if !projected && !reserved {
+			return filetxn.Result{}, fmt.Errorf("normal safety fence does not match current emergency reservation")
+		}
+	} else if authority.StopFence != nil {
+		return filetxn.Result{}, fmt.Errorf("normal safety state omits current emergency stop authority")
 	}
-	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && !globalProofMatchesEmergency(proof.GlobalClose, authority.ClearProof) {
-		return filetxn.Result{}, fmt.Errorf("normal global clear proof does not match emergency authority")
+	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone {
+		inventoryDigest, err := readOwnershipInventoryDigest(store.config.Ownership)
+		if err != nil {
+			return filetxn.Result{}, err
+		}
+		if proof.GlobalClose == nil || proof.GlobalClose.InventoryDigest != inventoryDigest || !globalProofMatchesEmergency(proof.GlobalClose, authority.ClearProof) {
+			return filetxn.Result{}, fmt.Errorf("normal global clear proof does not match emergency and ownership authority")
+		}
 	}
 	next.SchemaVersion = SchemaVersion
 	next.Resources = canonicalResources(next.Resources)
@@ -258,6 +323,9 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 		return filetxn.Result{}, err
 	}
 	if err := validateTransition(role, current, next, proof); err != nil {
+		return filetxn.Result{}, err
+	}
+	if err := validateOwnershipAuthority(next, store.config.Ownership); err != nil {
 		return filetxn.Result{}, err
 	}
 	return store.persist(ctx, next, filetxn.ReplaceOnly)
@@ -278,12 +346,81 @@ func (store *Store) persist(ctx context.Context, state State, disposition filetx
 	return store.txn.Put(ctx, filetxn.Request{Path: store.config.StatePath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maxStateBytes}, data, disposition)
 }
 
+func readOwnershipInventoryDigest(authority OwnershipAuthority) (string, error) {
+	if authority == nil {
+		return "", fmt.Errorf("independent ownership authority is missing")
+	}
+	records, complete, err := authority.InventoryAuthority()
+	if err != nil {
+		return "", fmt.Errorf("read ownership authority: %w", err)
+	}
+	if !complete {
+		return "", fmt.Errorf("ownership authority inventory is incomplete")
+	}
+	return OwnershipInventoryDigest(records), nil
+}
+
+func validateOwnershipAuthority(state State, authority OwnershipAuthority) error {
+	if authority == nil {
+		return fmt.Errorf("independent ownership authority is missing")
+	}
+	records, complete, err := authority.InventoryAuthority()
+	if err != nil {
+		return fmt.Errorf("read ownership authority: %w", err)
+	}
+	if !complete {
+		return fmt.Errorf("ownership authority inventory is incomplete")
+	}
+	inventoryDigest := OwnershipInventoryDigest(records)
+	if state.StopFence != nil && state.StopFence.InventoryDigest != inventoryDigest {
+		return fmt.Errorf("stop fence inventory digest does not match exact ownership authority")
+	}
+	for _, resource := range state.Resources {
+		digest, present := records[resource.ResourceID]
+		if present {
+			if digest != resource.OwnershipDigest {
+				return fmt.Errorf("resource %q safety and ownership digests are one-sided", resource.ResourceID)
+			}
+			delete(records, resource.ResourceID)
+			continue
+		}
+		return fmt.Errorf("resource %q has no complete ownership record", resource.ResourceID)
+	}
+	if len(records) != 0 {
+		return fmt.Errorf("ownership record inventory has no matching closed safety identity")
+	}
+	return nil
+}
+
+// OwnershipInventoryDigest canonically binds the complete ownership identity inventory.
+func OwnershipInventoryDigest(records map[string]string) string {
+	keys := make([]string, 0, len(records))
+	for key := range records {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	hash := sha256.New()
+	for _, key := range keys {
+		hash.Write([]byte(key))
+		hash.Write([]byte{0})
+		hash.Write([]byte(records[key]))
+		hash.Write([]byte{0})
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
+}
+
 func matchAuthority(state State, authority EmergencyState) error {
-	if state.AuthoritySequence != authority.Sequence || state.GlobalClose != authority.GlobalClose {
+	if state.AuthoritySequence != authority.Sequence || state.GlobalClose != authority.GlobalClose || state.StopFenceSequence != authority.StopFenceSequence {
 		return fmt.Errorf("normal and emergency safety authority are one-sided")
 	}
-	if authority.StopFence != nil && !normalFenceMatchesEmergency(state.StopFence, *authority.StopFence) {
-		return fmt.Errorf("normal safety state omits or mismatches emergency stop authority")
+	if state.StopFence != nil {
+		projected := authority.StopFence != nil && normalFenceMatchesEmergency(state.StopFence, *authority.StopFence)
+		reserved := authority.StopFence == nil && authority.ReservedStopFenceKind == state.StopFence.Kind && authority.ReservedStopFenceDigest == StopFenceDigest(*state.StopFence) && authority.StopFenceSequence == state.StopFence.FenceGeneration
+		if !projected && !reserved {
+			return fmt.Errorf("normal safety fence mismatches emergency reservation")
+		}
+	} else if authority.StopFence != nil {
+		return fmt.Errorf("normal safety state omits emergency stop authority")
 	}
 	return nil
 }
@@ -345,7 +482,7 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			return fmt.Errorf("only contraction or maintenance-begin owns global close creation")
 		}
 	}
-	if err := validateStopFenceTransition(role, current.StopFence, next.StopFence, proof.StopFence, next); err != nil {
+	if err := validateStopFenceTransition(role, current, next, proof.StopFence); err != nil {
 		return err
 	}
 	for _, transition := range []struct {
@@ -449,17 +586,27 @@ func validateMaintenanceCompound(role ClearRole, current, next State) error {
 	return nil
 }
 
-func validateStopFenceTransition(role ClearRole, before, after *StopFence, proof *StopFenceConvergenceProof, next State) error {
+func validateStopFenceTransition(role ClearRole, current, next State, proof *StopFenceConvergenceProof) error {
+	before, after := current.StopFence, next.StopFence
+	if next.StopFenceSequence < current.StopFenceSequence {
+		return fmt.Errorf("stop fence generation sequence regressed")
+	}
 	if reflect.DeepEqual(before, after) {
+		if next.StopFenceSequence != current.StopFenceSequence {
+			return fmt.Errorf("stop fence generation sequence changed without a new fence")
+		}
 		return nil
 	}
 	if before == nil {
-		if after == nil || role != stopFenceOwner(after.Kind) {
-			return fmt.Errorf("wrong stop fence writer")
+		if after == nil || role != stopFenceWriter(after.Kind) || next.StopFenceSequence != current.StopFenceSequence+1 || after.FenceGeneration != next.StopFenceSequence {
+			return fmt.Errorf("wrong or replayed stop fence writer generation")
 		}
 		return nil
 	}
 	if after == nil {
+		if next.StopFenceSequence != current.StopFenceSequence {
+			return fmt.Errorf("stop fence clear rewrote its retained generation sequence")
+		}
 		if err := AuthorizeClear(role, ClearStopFence, before.Kind); err != nil {
 			return err
 		}
@@ -468,16 +615,16 @@ func validateStopFenceTransition(role ClearRole, before, after *StopFence, proof
 		}
 		return nil
 	}
-	if before.Kind != after.Kind || !sameStopFenceBinding(*before, *after) {
-		return fmt.Errorf("stop fence kind and binding are immutable")
+	if next.StopFenceSequence != current.StopFenceSequence || before.Kind != after.Kind || !sameStopFenceBinding(*before, *after) {
+		return fmt.Errorf("stop fence kind, generation, and binding are immutable")
 	}
-	if role != stopFenceOwner(before.Kind) {
+	if role != stopFenceWriter(before.Kind) {
 		return fmt.Errorf("wrong stop fence update writer")
 	}
 	return nil
 }
 
-func stopFenceOwner(kind StopFenceKind) ClearRole {
+func stopFenceWriter(kind StopFenceKind) ClearRole {
 	switch kind {
 	case StopFenceContraction:
 		return RoleContraction
@@ -490,7 +637,7 @@ func stopFenceOwner(kind StopFenceKind) ClearRole {
 	case StopFenceMaintenanceTransition:
 		return RoleMaintenance
 	case StopFenceGenerationUpgrade:
-		return RoleUpgradeRecovery
+		return RoleUpgrade
 	default:
 		return ""
 	}
@@ -505,6 +652,9 @@ func sameStopFenceBinding(left, right StopFence) bool {
 }
 
 func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, proof *HeadscaleConvergenceProof) error {
+	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, headscaleGenerations(before), headscaleGenerations(after)); err != nil {
+		return fmt.Errorf("Headscale: %w", err)
+	}
 	if !reflect.DeepEqual(before.CertificateExpiry, after.CertificateExpiry) {
 		if after.CertificateExpiry == nil {
 			if role != RolePublish {
@@ -524,8 +674,8 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 		if role != RolePublish {
 			return fmt.Errorf("wrong Headscale reactivation writer")
 		}
-		if before.Reactivating != nil && after.Reactivating != nil && after.Reactivating.Generation <= before.Reactivating.Generation {
-			return fmt.Errorf("Headscale reactivation replacement requires fresh generation")
+		if after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
+			return fmt.Errorf("Headscale reactivation does not bind the exact prior generation")
 		}
 	}
 	if (before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.Reactivating != nil && after.Reactivating == nil) && !validHeadscaleProof(before, after, proof) {
@@ -535,14 +685,19 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 }
 
 func validateResourceTransition(role ClearRole, before, after ResourceSafety, proof TransitionProof) error {
+	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, resourceGenerations(before), resourceGenerations(after)); err != nil {
+		return err
+	}
 	if before.State != after.State || before.DeletionTombstone != after.DeletionTombstone {
 		if role != RoleDelete {
 			return fmt.Errorf("wrong deletion writer")
 		}
 	}
 	if before.Ownership != after.Ownership || before.OwnershipDigest != after.OwnershipDigest {
-		if role != RoleOwnershipContraction || before.Ownership != OwnershipOwned || after.Ownership != OwnershipOrphan || before.OwnershipDigest != after.OwnershipDigest {
-			return fmt.Errorf("ownership authority may only contract an exact owned identity to ownership_orphan")
+		orphanContraction := role == RoleOwnershipContraction && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOrphan && before.OwnershipDigest == after.OwnershipDigest
+		activationRebind := role == RoleOwnershipActivation && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipConvergenceProof(before, after, proof.Ownership)
+		if !orphanContraction && !activationRebind {
+			return fmt.Errorf("ownership authority transition lacks exact contraction or activation proof")
 		}
 	}
 	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction, RoleMaintenanceBegin); err != nil {
@@ -572,7 +727,7 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
 		return err
 	}
-	if err := reactivationTransition(role, before.Reactivating, after.Reactivating); err != nil {
+	if err := reactivationTransition(role, before.GenerationSequence, before.Reactivating, after.Reactivating); err != nil {
 		return err
 	}
 	if before.Reactivating != nil && after.Reactivating == nil && role == RolePublish && !validReactivationProof(before, after, proof.Reactivation) {
@@ -585,6 +740,30 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 		if role == RoleDelete && !validDeleteProof(before, proof.Delete) {
 			return fmt.Errorf("base marker delete clear lacks deletion convergence proof")
 		}
+	}
+	return nil
+}
+
+func validateMonotonicGenerationSequence(beforeSequence, afterSequence uint64, before, after map[string]uint64) error {
+	maximum := beforeSequence
+	seenFresh := map[uint64]bool{}
+	for kind, generation := range after {
+		if generation == before[kind] {
+			continue
+		}
+		if generation <= beforeSequence {
+			return fmt.Errorf("%s generation %d does not exceed retained sequence %d", kind, generation, beforeSequence)
+		}
+		if seenFresh[generation] {
+			return fmt.Errorf("fresh generation %d is reused in one transition", generation)
+		}
+		seenFresh[generation] = true
+		if generation > maximum {
+			maximum = generation
+		}
+	}
+	if afterSequence != maximum {
+		return fmt.Errorf("generation sequence is %d, want exact high-water %d", afterSequence, maximum)
 	}
 	return nil
 }
@@ -639,21 +818,25 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 	}
 	return nil
 }
-func reactivationTransition(role ClearRole, before, after *Reactivating) error {
+func reactivationTransition(role ClearRole, priorGeneration uint64, before, after *Reactivating) error {
 	if reflect.DeepEqual(before, after) {
 		return nil
 	}
 	if role != RolePublish {
 		return fmt.Errorf("wrong reactivation writer")
 	}
-	if before != nil && after != nil && after.Generation <= before.Generation {
-		return fmt.Errorf("reactivation replacement requires a fresh generation")
+	if after != nil && (after.PriorGeneration != priorGeneration || after.Generation != priorGeneration+1) {
+		return fmt.Errorf("reactivation does not bind the exact prior generation")
 	}
 	return nil
 }
 
 func baseMarkersRemoved(before, after ResourceSafety) bool {
 	return before.StickyUnpublished != nil && after.StickyUnpublished == nil || before.Contraction != nil && after.Contraction == nil || before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.EdgeOne.Expiry != nil && after.EdgeOne.Expiry == nil
+}
+
+func validOwnershipConvergenceProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {
+	return proof != nil && after.Reactivating != nil && proof.ResourceID == before.ResourceID && proof.IntentRef == after.Reactivating.PlanID && proof.Generation == after.Reactivating.Generation && proof.BeforeDigest == before.OwnershipDigest && proof.AfterDigest == after.OwnershipDigest && isDigest(proof.BeforeDigest) && isDigest(proof.AfterDigest)
 }
 
 func validReactivationProof(before, after ResourceSafety, proof *ReactivationConvergenceProof) bool {
@@ -687,7 +870,7 @@ func validGlobalClearProof(current State, proof *GlobalConvergenceProof) bool {
 }
 
 func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenceProof) bool {
-	if proof == nil || proof.Kind != fence.Kind || proof.FenceGeneration != fence.FenceGeneration || proof.InventoryDigest != fence.InventoryDigest || proof.OwnedGraphDigest != fence.OwnedGraphDigest || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NoAppDisk || !proof.WorkersDrained || !proof.ListenersClosed || !proof.RuntimeClosed || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) {
+	if proof == nil || proof.Kind != fence.Kind || proof.FenceGeneration != fence.FenceGeneration || proof.FenceDigest != StopFenceDigest(fence) || proof.InventoryDigest != fence.InventoryDigest || proof.OwnedGraphDigest != fence.OwnedGraphDigest || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NoAppDisk || !proof.WorkersDrained || !proof.ListenersClosed || !proof.RuntimeClosed || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) {
 		return false
 	}
 	for _, resource := range next.Resources {
@@ -714,6 +897,16 @@ func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenc
 	return proof.JournalRef == journal
 }
 
+// StopFenceDigest binds every immutable fence identity and observation field.
+func StopFenceDigest(fence StopFence) string {
+	data, err := json.Marshal(fence)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func transitionGeneration(marker *TransitionMarker) uint64 {
 	if marker == nil {
 		return 0
@@ -735,7 +928,7 @@ func backupTransitionGeneration(marker *BackupTransition) uint64 {
 
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh:
 		return true
 	default:
 		return false
@@ -754,7 +947,7 @@ func stateChecksum(state State) (string, error) {
 }
 
 func validateStoreConfig(config StoreConfig) error {
-	if config.Emergency == nil || !config.LockAuthority.Valid() || config.Emergency.LockAuthority() != config.LockAuthority {
+	if config.Emergency == nil || config.Ownership == nil || !config.LockAuthority.Valid() || config.Emergency.LockAuthority() != config.LockAuthority {
 		return fmt.Errorf("normal safety store requires the shared emergency generation authority")
 	}
 	if config.Owner.UID != uint32(os.Geteuid()) || config.Owner.GID != uint32(os.Getegid()) {

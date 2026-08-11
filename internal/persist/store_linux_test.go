@@ -148,6 +148,97 @@ func TestVersionedNormalTransaction(t *testing.T) {
 		}
 	})
 
+	t.Run("readable_store_with_failed_durable_admission_issues_one_use_proof", func(t *testing.T) {
+		armed := false
+		fault := func(point filetxn.Point) error {
+			if armed && point == filetxn.PointBeforeWrite {
+				armed = false
+				return errors.New("state filesystem became unwritable")
+			}
+			return nil
+		}
+		root := t.TempDir()
+		_ = os.Chmod(root, 0o700)
+		staging := filepath.Join(root, "staging")
+		if err := os.Mkdir(staging, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		lockRoot := t.TempDir()
+		_ = os.Chmod(lockRoot, 0o700)
+		owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+		manager, err := locks.Open(locks.Config{RootPath: lockRoot, Owner: owner.UID, Group: owner.GID, Mode: 0o700})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer manager.Close()
+		admission, err := manager.Acquire(context.Background(), locks.MutationAdmission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admission.Release()
+		store, err := Open(Config{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "normal.json"), Owner: owner, Fault: fault, LockAuthority: manager.Authority()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		validator := func(string, json.RawMessage) error { return nil }
+		for namespace, owner := range map[string]string{"plans": "plans.v1", "jobs": "jobs.v1", "intents": "operations.intents.v1", "children": "operations.children.v1", "journals": "operations.journals.v1"} {
+			if err := store.RegisterCanonicalNamespace(namespace, owner, validator, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.RegisterCanonicalDocumentValidator("operations.links.v1", func(Document) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RegisterCanonicalDocumentTransitionValidator("operations.resource_transitions.v1", func(Document, Document) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RegisterCanonicalDocumentTransitionValidator("plans.retention.v1", func(Document, Document) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SealSchema(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Initialize(context.Background(), admission); err != nil {
+			t.Fatal(err)
+		}
+		armed = true
+		if _, _, err := store.Update(context.Background(), admission, 1, func(*Transaction) error { return nil }); err == nil {
+			t.Fatal("unrelated failed normal write was reported as success")
+		}
+		if _, err := store.ProveUnavailable(); err == nil {
+			t.Fatal("unrelated failed normal write opened the no-job exception")
+		}
+		armed = true
+		if _, _, err := store.Update(context.Background(), admission, 1, func(transaction *Transaction) error {
+			if err := transaction.Create("jobs/job-one", json.RawMessage(`{"id":"job-one"}`)); err != nil {
+				return err
+			}
+			return transaction.Create("intents/job-one", json.RawMessage(`{"job_id":"job-one","phase":"reserved"}`))
+		}); err == nil {
+			t.Fatal("failed durable admission write was reported as success")
+		}
+		if document, err := store.Read(); err != nil || document.Revision != 1 {
+			t.Fatalf("readable normal store after failed write = %#v, %v", document, err)
+		}
+		proof, err := store.ProveUnavailable()
+		if err != nil || !store.ValidateUnavailable(proof) {
+			t.Fatalf("failed durable admission proof = %#v, %v", proof, err)
+		}
+		if store.ValidateUnavailable(proof) {
+			t.Fatal("durable admission failure proof was reusable")
+		}
+		if _, err := store.ProveUnavailable(); err == nil {
+			t.Fatal("one failed write minted more than one exception proof")
+		}
+		if _, _, err := store.Update(context.Background(), admission, 1, func(*Transaction) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ProveUnavailable(); err == nil {
+			t.Fatal("successful normal write did not clear failed-admission proof")
+		}
+	})
+
 	t.Run("namespace_changed_latches_writes_until_explicit_reconcile", func(t *testing.T) {
 		armed := false
 		fault := func(point filetxn.Point) error {

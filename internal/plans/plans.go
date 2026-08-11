@@ -22,6 +22,7 @@ import (
 const SchemaVersion = "lanpanel.plan.v1"
 const MaximumLifetime = 10 * time.Minute
 const MaximumEvidenceAge = 10 * time.Minute
+const MaximumRecords = 512
 
 var (
 	ErrMissing  = errors.New("Plan is missing")
@@ -136,7 +137,12 @@ func (store *Store) Create(ctx context.Context, lease *locks.Lease, expectedRevi
 	if err := Validate(plan, now); err != nil {
 		return Plan{}, err
 	}
-	_, _, err = store.normal.Update(ctx, lease, expectedRevision, func(transaction *persist.Transaction) error { return Put(transaction, plan) })
+	_, _, err = store.normal.Update(ctx, lease, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneExpiredForCreate(transaction, now); err != nil {
+			return err
+		}
+		return Put(transaction, plan)
+	})
 	if err != nil {
 		return Plan{}, err
 	}
@@ -152,10 +158,15 @@ func (store *Store) Read(id string) (Plan, error) {
 }
 
 func Register(normal *persist.Store) error {
-	if normal.NamespaceRegistered("plans") {
+	if !normal.NamespaceRegistered("plans") {
+		if err := normal.RegisterCanonicalNamespace("plans", "plans.v1", validateEntry, validatePlanTransition); err != nil {
+			return err
+		}
+	}
+	if normal.DocumentTransitionOwnerRegistered("plans.retention.v1") {
 		return nil
 	}
-	return normal.RegisterNamespace("plans", validateEntry, validatePlanTransition)
+	return normal.RegisterCanonicalDocumentTransitionValidator("plans.retention.v1", validateRetentionTransition)
 }
 func validateEntry(key string, raw json.RawMessage) error {
 	plan, err := decode(raw)
@@ -181,6 +192,12 @@ func validatePlanTransition(_ string, before, after json.RawMessage) error {
 	oldPlan, err := decode(before)
 	if err != nil {
 		return err
+	}
+	if len(after) == 0 {
+		if oldPlan.ReservedAt != nil && oldPlan.ConsumedAt == nil && oldPlan.RejectedAt == nil {
+			return fmt.Errorf("a reserved nonterminal Plan cannot be pruned")
+		}
+		return nil
 	}
 	newPlan, err := decode(after)
 	if err != nil {
@@ -227,7 +244,115 @@ func validatePlanTransition(_ string, before, after json.RawMessage) error {
 	return nil
 }
 
+func pruneExpiredForCreate(transaction *persist.Transaction, now time.Time) error {
+	if len(transaction.Keys("plans")) < MaximumRecords {
+		return nil
+	}
+	type expiredPlan struct {
+		key       string
+		expiresAt time.Time
+	}
+	expired := []expiredPlan{}
+	for _, key := range transaction.Keys("plans") {
+		raw, _ := transaction.Get(key)
+		plan, err := decode(raw)
+		if err != nil {
+			return err
+		}
+		if plan.ReservedAt == nil && plan.ConsumedAt == nil && plan.RejectedAt == nil && !plan.ExpiresAt.After(now) {
+			expired = append(expired, expiredPlan{key: key, expiresAt: plan.ExpiresAt})
+		}
+	}
+	if len(expired) == 0 {
+		return fmt.Errorf("Plan retention limit %d is reached with no expired unreserved Plan", MaximumRecords)
+	}
+	sort.Slice(expired, func(left, right int) bool {
+		if expired[left].expiresAt.Equal(expired[right].expiresAt) {
+			return expired[left].key < expired[right].key
+		}
+		return expired[left].expiresAt.Before(expired[right].expiresAt)
+	})
+	return transaction.Delete(expired[0].key)
+}
+
+func validateRetentionTransition(before, after persist.Document) error {
+	created := []Plan{}
+	for _, key := range persist.EntryKeys(after, "plans") {
+		if _, existed := before.Entries[key]; existed {
+			continue
+		}
+		plan, err := decode(after.Entries[key])
+		if err != nil {
+			return err
+		}
+		created = append(created, plan)
+	}
+	type candidate struct {
+		id        string
+		expiresAt time.Time
+	}
+	expiredCandidates := []candidate{}
+	deletedUnreserved := map[string]bool{}
+	for _, key := range persist.EntryKeys(before, "plans") {
+		if _, retained := after.Entries[key]; retained {
+			continue
+		}
+		plan, err := decode(before.Entries[key])
+		if err != nil {
+			return err
+		}
+		if plan.ReservedAt != nil {
+			jobID := plan.ReservedByJob
+			if plan.ConsumedAt != nil {
+				jobID = plan.ConsumedByJob
+			} else if plan.RejectedAt != nil {
+				jobID = plan.RejectedByJob
+			}
+			if _, intentRetained := after.Entries["intents/"+jobID]; intentRetained {
+				return fmt.Errorf("Plan retention cannot detach an operation graph")
+			}
+			continue
+		}
+		deletedUnreserved[plan.ID] = true
+	}
+	if len(deletedUnreserved) == 0 {
+		return nil
+	}
+	if len(created) != 1 || len(persist.EntryKeys(before, "plans")) < MaximumRecords {
+		return fmt.Errorf("unreserved Plans may be pruned only for bounded replacement")
+	}
+	cutoff := created[0].CreatedAt
+	for _, key := range persist.EntryKeys(before, "plans") {
+		plan, err := decode(before.Entries[key])
+		if err != nil {
+			return err
+		}
+		if plan.ReservedAt == nil && plan.ConsumedAt == nil && plan.RejectedAt == nil && !plan.ExpiresAt.After(cutoff) {
+			expiredCandidates = append(expiredCandidates, candidate{id: plan.ID, expiresAt: plan.ExpiresAt})
+		}
+	}
+	sort.Slice(expiredCandidates, func(left, right int) bool {
+		if expiredCandidates[left].expiresAt.Equal(expiredCandidates[right].expiresAt) {
+			return expiredCandidates[left].id < expiredCandidates[right].id
+		}
+		return expiredCandidates[left].expiresAt.Before(expiredCandidates[right].expiresAt)
+	})
+	required := len(persist.EntryKeys(before, "plans")) + len(created) - MaximumRecords
+	if len(deletedUnreserved) != required || required > len(expiredCandidates) {
+		return fmt.Errorf("expired Plan retention is not the exact bounded overflow")
+	}
+	for index := 0; index < required; index++ {
+		if !deletedUnreserved[expiredCandidates[index].id] {
+			return fmt.Errorf("expired Plan retention did not prune the oldest authority")
+		}
+	}
+	return nil
+}
+
 func Put(transaction *persist.Transaction, plan Plan) error {
+	if len(transaction.Keys("plans")) >= MaximumRecords {
+		return fmt.Errorf("Plan retention limit %d is reached", MaximumRecords)
+	}
 	if _, exists := transaction.Get(key(plan.ID)); exists {
 		return fmt.Errorf("Plan ID collision")
 	}
@@ -432,6 +557,15 @@ func canonicalEvidence(values []Evidence) []Evidence {
 	})
 	return result
 }
+func ValidateBindingFreshness(binding Binding, now time.Time) error {
+	for _, evidence := range binding.Evidence {
+		if !validEvidence(evidence) || evidence.ObservedAt.After(now) || now.Sub(evidence.ObservedAt) > MaximumEvidenceAge {
+			return fmt.Errorf("Plan prerequisite evidence is stale or invalid")
+		}
+	}
+	return nil
+}
+
 func SameBindingIdentity(left, right Binding) bool {
 	left.Evidence = canonicalEvidence(left.Evidence)
 	right.Evidence = canonicalEvidence(right.Evidence)

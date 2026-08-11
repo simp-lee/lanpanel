@@ -18,6 +18,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/safety"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -27,15 +28,24 @@ import (
 type Type string
 
 const (
-	Publish           Type = "publish"
-	Unpublish         Type = "unpublish"
-	CloseAll          Type = "close_all"
-	EmergencyCloseAll Type = "emergency_close_all"
-	CertificateExpiry Type = "certificate_expiry"
-	EdgeOneExpiry     Type = "edgeone_expiry"
-	Maintenance       Type = "maintenance"
-	Upgrade           Type = "upgrade"
-	BackupEnter       Type = "backup_enter"
+	Publish                 Type = "publish"
+	Unpublish               Type = "unpublish"
+	CloseAll                Type = "close_all"
+	EmergencyCloseAll       Type = "emergency_close_all"
+	CertificateExpiry       Type = "certificate_expiry"
+	EdgeOneExpiry           Type = "edgeone_expiry"
+	Maintenance             Type = "maintenance"
+	Upgrade                 Type = "upgrade"
+	BackupEnter             Type = "backup_enter"
+	AutomaticReconciliation Type = "automatic_exact_journal_reconciliation"
+	StartupContraction      Type = "startup_activation_contraction"
+)
+
+const (
+	maximumTerminalOperationGraphs = 256
+	maximumActiveOperationGraphs   = 64
+	maximumChildrenPerJob          = 32
+	maximumJournalResources        = 256
 )
 
 type Phase string
@@ -62,7 +72,16 @@ type SafetyBinding struct {
 	CandidateDigest      string    `json:"candidate_digest,omitempty"`
 	CandidateBundle      string    `json:"candidate_bundle,omitempty"`
 }
+type AdmissionSource string
+
+const (
+	AdmissionPlan    AdmissionSource = "plan"
+	AdmissionTimer   AdmissionSource = "timer"
+	AdmissionStartup AdmissionSource = "startup"
+)
+
 type ConsumptionSnapshot struct {
+	Source             AdmissionSource     `json:"source"`
 	Config             plans.DigestBinding `json:"config"`
 	Applied            plans.DigestBinding `json:"applied"`
 	Evidence           []plans.Evidence    `json:"evidence"`
@@ -71,17 +90,19 @@ type ConsumptionSnapshot struct {
 	SafetyDigest       string              `json:"safety_digest"`
 }
 type Reservation struct {
-	SchemaVersion    string               `json:"schema_version"`
-	JobID            string               `json:"job_id"`
-	PlanID           string               `json:"plan_id"`
-	Operation        Type                 `json:"operation"`
-	Target           string               `json:"target"`
-	Phase            Phase                `json:"phase"`
-	SafetyDigest     string               `json:"safety_digest"`
-	SafetyBinding    SafetyBinding        `json:"safety_binding"`
-	CreatedAt        time.Time            `json:"created_at"`
-	IntentGeneration uint64               `json:"intent_generation,omitempty"`
-	Consumption      *ConsumptionSnapshot `json:"consumption,omitempty"`
+	SchemaVersion       string               `json:"schema_version"`
+	JobID               string               `json:"job_id"`
+	PlanID              string               `json:"plan_id,omitempty"`
+	AdmissionSource     AdmissionSource      `json:"admission_source"`
+	Operation           Type                 `json:"operation"`
+	Target              string               `json:"target"`
+	Phase               Phase                `json:"phase"`
+	SafetyDigest        string               `json:"safety_digest"`
+	JournalSafetyDigest string               `json:"journal_safety_digest,omitempty"`
+	SafetyBinding       SafetyBinding        `json:"safety_binding"`
+	CreatedAt           time.Time            `json:"created_at"`
+	IntentGeneration    uint64               `json:"intent_generation,omitempty"`
+	Consumption         *ConsumptionSnapshot `json:"consumption,omitempty"`
 }
 type ChildState string
 
@@ -98,15 +119,22 @@ const (
 )
 
 type ChildRecord struct {
-	SchemaVersion string       `json:"schema_version"`
-	ID            string       `json:"id"`
-	JobID         string       `json:"job_id"`
-	Profile       string       `json:"profile"`
-	State         ChildState   `json:"state"`
-	SubmittedAt   time.Time    `json:"submitted_at"`
-	TerminalAt    *time.Time   `json:"terminal_at,omitempty"`
-	Outcome       ChildOutcome `json:"outcome,omitempty"`
-	ResultDigest  string       `json:"result_digest,omitempty"`
+	SchemaVersion    string       `json:"schema_version"`
+	ID               string       `json:"id"`
+	JobID            string       `json:"job_id"`
+	InstallationID   string       `json:"installation_id"`
+	Operation        Type         `json:"operation"`
+	Target           string       `json:"target"`
+	IntentGeneration uint64       `json:"intent_generation"`
+	Profile          string       `json:"profile"`
+	InputDigest      string       `json:"input_digest"`
+	ArtifactDigest   string       `json:"artifact_digest"`
+	Deadline         time.Time    `json:"deadline"`
+	State            ChildState   `json:"state"`
+	SubmittedAt      time.Time    `json:"submitted_at"`
+	TerminalAt       *time.Time   `json:"terminal_at,omitempty"`
+	Outcome          ChildOutcome `json:"outcome,omitempty"`
+	ResultDigest     string       `json:"result_digest,omitempty"`
 }
 type JournalKind string
 
@@ -133,6 +161,7 @@ type JournalRecord struct {
 	Deadline           time.Time    `json:"deadline"`
 	ArtifactDigest     string       `json:"artifact_digest"`
 	SafetyMarkerDigest string       `json:"safety_marker_digest"`
+	ResourceIDs        []string     `json:"resource_ids,omitempty"`
 	ChildIDs           []string     `json:"child_ids"`
 	Phase              JournalPhase `json:"phase"`
 }
@@ -142,6 +171,7 @@ type AdmitRequest struct {
 	Target           string
 	ActorIdentity    string
 	PlanID           string
+	Source           AdmissionSource
 	SafetyBinding    SafetyBinding
 	ExpectedRevision uint64
 }
@@ -201,16 +231,19 @@ func NewAdmitter(normal *persist.Store, safetyStore SafetyReader, options Option
 		if err := jobs.Register(normal); err != nil {
 			return nil, err
 		}
-		if err := normal.RegisterNamespace("intents", validateIntentEntry, validateIntentTransition); err != nil {
+		if err := normal.RegisterCanonicalNamespace("intents", "operations.intents.v1", validateIntentEntry, validateIntentTransition); err != nil {
 			return nil, err
 		}
-		if err := normal.RegisterNamespace("children", validateChildEntry, validateChildTransition); err != nil {
+		if err := normal.RegisterCanonicalNamespace("children", "operations.children.v1", validateChildEntry, validateChildTransition); err != nil {
 			return nil, err
 		}
-		if err := normal.RegisterNamespace("journals", validateJournalEntry, validateJournalTransition); err != nil {
+		if err := normal.RegisterCanonicalNamespace("journals", "operations.journals.v1", validateJournalEntry, validateJournalTransition); err != nil {
 			return nil, err
 		}
-		if err := normal.RegisterDocumentValidator(validateLinks); err != nil {
+		if err := normal.RegisterCanonicalDocumentValidator("operations.links.v1", validateLinks); err != nil {
+			return nil, err
+		}
+		if err := normal.RegisterCanonicalDocumentTransitionValidator("operations.resource_transitions.v1", validateOperationStateTransitions); err != nil {
 			return nil, err
 		}
 		if err := normal.SealSchema(); err != nil {
@@ -329,6 +362,12 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if _, registered := admitter.registry.Registration(request.Operation); !registered {
 		return jobs.Record{}, fmt.Errorf("operation owner and result branches are not registered")
 	}
+	if err := validateAdmissionSource(request.Operation, request.Source, request.PlanID); err != nil {
+		return jobs.Record{}, err
+	}
+	if err := validateSafetyTargetBinding(request); err != nil {
+		return jobs.Record{}, err
+	}
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return jobs.Record{}, err
@@ -344,13 +383,34 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, CreatedAt: observedNow}
+	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
+		active, err := activeGraphCount(transaction)
+		if err != nil {
+			return err
+		}
+		if active >= maximumActiveOperationGraphs {
+			return fmt.Errorf("active operation graph limit %d is reached", maximumActiveOperationGraphs)
+		}
+		if !isContraction(request.Operation) {
+			for _, key := range transaction.Keys("intents") {
+				raw, _ := transaction.Get(key)
+				existing, err := decodeReservation(raw)
+				if err != nil {
+					return err
+				}
+				if existing.Target == request.Target && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+					return fmt.Errorf("target already has a nonterminal expansion authority")
+				}
+			}
+		}
 		if err := jobs.Put(transaction, record); err != nil {
 			return err
 		}
-		if _, err := plans.Reserve(transaction, request.PlanID, record.ID, string(request.Operation), request.Target, request.ActorIdentity, observedNow); err != nil {
-			return err
+		if request.Source == AdmissionPlan {
+			if _, err := plans.Reserve(transaction, request.PlanID, record.ID, string(request.Operation), request.Target, request.ActorIdentity, observedNow); err != nil {
+				return err
+			}
 		}
 		if _, exists := transaction.Get(reservationKey(record.ID)); exists {
 			return fmt.Errorf("operation reservation collision")
@@ -393,6 +453,9 @@ func (admitter *Admitter) rejectReservation(ctx context.Context, admission *lock
 		default:
 		}
 		_, _, err := admitter.normal.Update(ctx, admission, expectedRevision, func(transaction *persist.Transaction) error {
+			if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+				return err
+			}
 			record, err := jobs.Load(transaction, jobID)
 			if err != nil {
 				return err
@@ -408,8 +471,10 @@ func (admitter *Admitter) rejectReservation(ctx context.Context, admission *lock
 			if err != nil {
 				return err
 			}
-			if _, err := plans.Reject(transaction, reservation.PlanID, jobID, observedNow); err != nil {
-				return err
+			if reservation.AdmissionSource == AdmissionPlan {
+				if _, err := plans.Reject(transaction, reservation.PlanID, jobID, observedNow); err != nil {
+					return err
+				}
 			}
 			reservation.Phase = PhaseRejected
 			raw, err := persist.EncodeEntry(reservation)
@@ -440,8 +505,8 @@ func (admitter *Admitter) rejectReservation(ctx context.Context, admission *lock
 // resource mutation lock and then the shared exposure lock. Plan consumption,
 // running-job transition, and immutable local phase intent commit atomically.
 func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, request ConsumeRequest) (Reservation, error) {
-	if mutation == nil || !mutation.Active() || exposure == nil || !exposure.Holds(locks.Exposure) {
-		return Reservation{}, fmt.Errorf("mutation then exposure locks are required")
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
 	}
 	observedNow, timeErr := admitter.trustedNow()
 	if timeErr != nil {
@@ -464,6 +529,9 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 	}
 	if document.Revision != request.ExpectedRevision {
 		return reject("normal_revision_changed", persist.ErrRevision)
+	}
+	if reservationView.AdmissionSource != AdmissionPlan {
+		return Reservation{}, fmt.Errorf("operation reservation is not Plan-bound")
 	}
 	plan, err := plans.LoadEntries(document.Entries, reservationView.PlanID)
 	if err != nil {
@@ -507,8 +575,8 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 		if err := authorize(reservation.Operation, state, reservation.SafetyBinding, true, observedNow); err != nil {
 			return err
 		}
-		if request.IntentGeneration == 0 {
-			return fmt.Errorf("phase intent generation is required")
+		if request.IntentGeneration != request.ExpectedRevision+1 {
+			return fmt.Errorf("phase intent generation must equal the fresh normal-state revision")
 		}
 		if string(reservation.Operation) != binding.Operation || reservation.Target != planTarget(binding.Target) {
 			return fmt.Errorf("Plan does not match the reserved operation target")
@@ -529,7 +597,7 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 		}
 		reservation.Phase = PhaseLocalIntent
 		reservation.IntentGeneration = request.IntentGeneration
-		reservation.Consumption = &ConsumptionSnapshot{Config: binding.Config, Applied: binding.Applied, Evidence: append([]plans.Evidence(nil), binding.Evidence...), ConfirmationDigest: confirmationDigest, ConfirmedAt: observedNow, SafetyDigest: digest}
+		reservation.Consumption = &ConsumptionSnapshot{Source: AdmissionPlan, Config: binding.Config, Applied: binding.Applied, Evidence: append([]plans.Evidence(nil), binding.Evidence...), ConfirmationDigest: confirmationDigest, ConfirmedAt: observedNow, SafetyDigest: digest}
 		raw, err := persist.EncodeEntry(reservation)
 		if err != nil {
 			return err
@@ -546,18 +614,108 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 	return result, err
 }
 
-func markRemoteWait(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
-	if mutation == nil || !mutation.Active() || exposure == nil || !exposure.Holds(locks.Exposure) {
-		return Reservation{}, fmt.Errorf("mutation then exposure locks are required")
+// BeginPlanless starts a previously admitted timer or startup operation only
+// after mutation→exposure acquisition. It records the same immutable local
+// intent boundary as Plan consumption without fabricating a UI Plan.
+func (admitter *Admitter) BeginPlanless(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, request ConsumeRequest) (Reservation, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return Reservation{}, err
+	}
+	reject := func(code string, cause error) (Reservation, error) {
+		if rejectErr := admitter.rejectReservation(ctx, exposure, request.ExpectedRevision, request.JobID, code); rejectErr != nil {
+			return Reservation{}, fmt.Errorf("%v; terminalization failed: %w", cause, rejectErr)
+		}
+		return Reservation{}, cause
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return reject("safety_refresh_failed", err)
+	}
+	digest, err := safetyDigest(state)
+	if err != nil {
+		return Reservation{}, err
 	}
 	var result Reservation
-	_, _, err := normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+	_, _, err = admitter.normal.Update(ctx, exposure, request.ExpectedRevision, func(transaction *persist.Transaction) error {
+		reservation, err := loadReservation(transaction, request.JobID)
+		if err != nil {
+			return err
+		}
+		if reservation.AdmissionSource != AdmissionTimer && reservation.AdmissionSource != AdmissionStartup {
+			return fmt.Errorf("operation reservation is not a timer or startup admission")
+		}
+		if reservation.Phase != PhaseReserved || mutation.Target() != reservation.Target {
+			return fmt.Errorf("operation reservation is already consumed or target-mismatched")
+		}
+		if request.IntentGeneration != request.ExpectedRevision+1 {
+			return fmt.Errorf("phase intent generation must equal the fresh normal-state revision")
+		}
+		if reservation.SafetyDigest != digest {
+			return fmt.Errorf("independent safety authority changed after admission")
+		}
+		if err := authorize(reservation.Operation, state, reservation.SafetyBinding, true, observedNow); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, reservation.JobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Start(record)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		reservation.Phase = PhaseLocalIntent
+		reservation.IntentGeneration = request.IntentGeneration
+		reservation.Consumption = &ConsumptionSnapshot{Source: reservation.AdmissionSource, ConfirmationDigest: planlessAdmissionDigest(reservation, digest), ConfirmedAt: observedNow, SafetyDigest: digest}
+		raw, err := persist.EncodeEntry(reservation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(reservation.JobID), raw); err != nil {
+			return err
+		}
+		result = reservation
+		return nil
+	})
+	if err != nil && !errors.Is(err, persist.ErrRecoveryRequired) {
+		return reject("planless_start_rejected", err)
+	}
+	return result, err
+}
+
+func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
+	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return Reservation{}, err
+	}
+	intentView, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if mutation.Target() != intentView.Target {
+		return Reservation{}, fmt.Errorf("remote wait mutation target does not match immutable intent")
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return Reservation{}, err
+	}
+	var result Reservation
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		reservation, err := loadReservation(transaction, jobID)
 		if err != nil {
 			return err
 		}
-		if reservation.Phase != PhaseLocalIntent {
-			return fmt.Errorf("remote wait requires a local phase intent")
+		if reservation.Phase != PhaseLocalIntent || reservation.AdmissionSource != AdmissionPlan {
+			return fmt.Errorf("remote wait requires a Plan-bound local phase intent")
 		}
 		reservation.Phase = PhaseRemoteWait
 		raw, err := persist.EncodeEntry(reservation)
@@ -573,8 +731,8 @@ func markRemoteWait(ctx context.Context, normal *persist.Store, mutation *Mutati
 	return result, err
 }
 
-func EnterRemoteWait(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
-	reservation, err := markRemoteWait(ctx, normal, mutation, exposure, expectedRevision, jobID)
+func (admitter *Admitter) EnterRemoteWait(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
+	reservation, err := admitter.markRemoteWait(ctx, mutation, exposure, expectedRevision, jobID)
 	releaseErr := ReleaseExposure(mutation, exposure)
 	return reservation, errors.Join(err, releaseErr)
 }
@@ -627,6 +785,9 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 	if err != nil {
 		return fail(err)
 	}
+	if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
+		return fail(err)
+	}
 	if planTarget(binding.Target) != intent.Target || binding.ActorIdentity != record.ActorIdentity {
 		return fail(fmt.Errorf("operation target or actor binding changed during remote wait"))
 	}
@@ -660,46 +821,165 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 	return result, mutation, exposure, nil
 }
 
-func ReserveChild(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord) error {
-	return writeChild(ctx, normal, mutation, exposure, expectedRevision, child, true)
-}
-func TransitionChild(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord) error {
-	return writeChild(ctx, normal, mutation, exposure, expectedRevision, child, false)
-}
-func writeChild(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord, create bool) error {
-	if mutation == nil || !mutation.Active() || exposure == nil || !exposure.Holds(locks.Exposure) {
-		return fmt.Errorf("child write requires mutation then exposure locks")
+// ReserveChild records a submitted child under the short-lived admission lock
+// before any child may be launched. It intentionally does not accept mutation
+// or exposure leases.
+func (admitter *Admitter) ReserveChild(ctx context.Context, admission *locks.Lease, expectedRevision uint64, child ChildRecord) error {
+	if admitter == nil || admission == nil || admission.Authority() != admitter.normal.LockAuthority() || !admission.Holds(locks.MutationAdmission) || child.State != ChildSubmitted {
+		return fmt.Errorf("child reservation requires the authoritative mutation-admission lock")
 	}
-	_, _, err := normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intentView, err := loadReservationEntries(document.Entries, child.JobID)
+	if err != nil {
+		return err
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, admission, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, child.JobID)
 		if err != nil {
 			return err
 		}
 		if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered {
-			return fmt.Errorf("child may be submitted only from a locked local phase")
+			return fmt.Errorf("child reservation requires an active durable local intent")
+		}
+		if err := validateChildAgainstIntent(transaction, child, intent); err != nil {
+			return err
+		}
+		linkedChildren := 0
+		for _, key := range transaction.Keys("children") {
+			raw, _ := transaction.Get(key)
+			var existing ChildRecord
+			if err := decodeStrict(raw, &existing); err != nil {
+				return err
+			}
+			if existing.JobID == child.JobID {
+				linkedChildren++
+			}
+		}
+		if linkedChildren >= maximumChildrenPerJob {
+			return fmt.Errorf("child reservation limit %d is reached", maximumChildrenPerJob)
 		}
 		raw, err := persist.EncodeEntry(child)
 		if err != nil {
 			return err
 		}
-		if create {
-			return transaction.Create("children/"+child.ID, raw)
+		return transaction.Create("children/"+child.ID, raw)
+	})
+	return err
+}
+func (admitter *Admitter) TransitionChild(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord) error {
+	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("child transition requires authoritative mutation then exposure locks")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intentView, err := loadReservationEntries(document.Entries, child.JobID)
+	if err != nil {
+		return err
+	}
+	if mutation.Target() != intentView.Target {
+		return fmt.Errorf("child transition mutation target does not match immutable intent")
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, child.JobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered {
+			return fmt.Errorf("child transition requires an active locked local phase")
+		}
+		if err := validateChildAgainstIntent(transaction, child, intent); err != nil {
+			return err
+		}
+		raw, err := persist.EncodeEntry(child)
+		if err != nil {
+			return err
 		}
 		return transaction.Replace("children/"+child.ID, raw)
 	})
 	return err
 }
-func PutJournal(ctx context.Context, normal *persist.Store, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, journal JournalRecord, create bool) error {
-	if mutation == nil || !mutation.Active() || exposure == nil || !exposure.Holds(locks.Exposure) {
-		return fmt.Errorf("journal write requires mutation then exposure locks")
+
+func validateChildAgainstIntent(transaction *persist.Transaction, child ChildRecord, intent Reservation) error {
+	installation, err := loadInstallation(transaction)
+	if err != nil {
+		return err
 	}
-	_, _, err := normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+	if child.InstallationID != installation.InstallationID || child.Operation != intent.Operation || child.Target != intent.Target || child.IntentGeneration != intent.IntentGeneration || !child.Deadline.Equal(intent.SafetyBinding.Deadline) {
+		return fmt.Errorf("child identity does not exactly match installation, operation, target, generation, and deadline authority")
+	}
+	return nil
+}
+func (admitter *Admitter) PutJournal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, journal JournalRecord, create bool) error {
+	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("journal write requires authoritative mutation then exposure locks")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intentView, err := loadReservationEntries(document.Entries, journal.JobID)
+	if err != nil {
+		return err
+	}
+	if mutation.Target() != intentView.Target {
+		return fmt.Errorf("journal mutation target does not match immutable intent")
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, journal.JobID)
 		if err != nil {
 			return err
 		}
 		if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered {
 			return fmt.Errorf("journal writes require an active local intent phase")
+		}
+		markerDigest, err := safetyBindingDigest(intent.SafetyBinding)
+		if err != nil {
+			return err
+		}
+		journal.SafetyMarkerDigest = markerDigest
+		if intent.Consumption == nil || !journal.Deadline.Equal(intent.SafetyBinding.Deadline) {
+			return fmt.Errorf("journal deadline does not match immutable intent authority")
+		}
+		if create {
+			if intent.JournalSafetyDigest != "" {
+				return fmt.Errorf("operation intent already binds a journal safety authority")
+			}
+			intent.JournalSafetyDigest = markerDigest
+			intentRaw, err := persist.EncodeEntry(intent)
+			if err != nil {
+				return err
+			}
+			if err := transaction.Replace(reservationKey(intent.JobID), intentRaw); err != nil {
+				return err
+			}
+		} else if intent.JournalSafetyDigest != markerDigest {
+			return fmt.Errorf("journal safety authority changed")
+		}
+		if create {
+			for _, key := range transaction.Keys("journals") {
+				raw, _ := transaction.Get(key)
+				var existing JournalRecord
+				if err := decodeStrict(raw, &existing); err != nil {
+					return err
+				}
+				if existing.JobID == journal.JobID {
+					return fmt.Errorf("operation already has its single exact journal")
+				}
+			}
 		}
 		raw, err := persist.EncodeEntry(journal)
 		if err != nil {
@@ -744,6 +1024,96 @@ func InventoryEmpty(document persist.Document, exceptJob string) (bool, error) {
 	return true, nil
 }
 
+func activeGraphCount(transaction *persist.Transaction) (int, error) {
+	active := 0
+	for _, key := range transaction.Keys("intents") {
+		raw, _ := transaction.Get(key)
+		intent, err := decodeReservation(raw)
+		if err != nil {
+			return 0, err
+		}
+		if intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			active++
+		}
+	}
+	return active, nil
+}
+
+func pruneTerminalGraphs(transaction *persist.Transaction, keep int) error {
+	if keep < 0 {
+		return fmt.Errorf("terminal graph retention bound is invalid")
+	}
+	type terminalGraph struct {
+		intent Reservation
+		ended  time.Time
+	}
+	graphs := []terminalGraph{}
+	for _, key := range transaction.Keys("intents") {
+		raw, _ := transaction.Get(key)
+		intent, err := decodeReservation(raw)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			continue
+		}
+		record, err := jobs.Load(transaction, intent.JobID)
+		if err != nil {
+			return fmt.Errorf("terminal graph job authority: %w", err)
+		}
+		if record.EndedAt == nil {
+			return fmt.Errorf("terminal graph job authority has no end time")
+		}
+		graphs = append(graphs, terminalGraph{intent: intent, ended: *record.EndedAt})
+	}
+	sort.Slice(graphs, func(i, j int) bool {
+		if graphs[i].ended.Equal(graphs[j].ended) {
+			return graphs[i].intent.JobID < graphs[j].intent.JobID
+		}
+		return graphs[i].ended.Before(graphs[j].ended)
+	})
+	remove := len(graphs) - keep
+	for index := 0; index < remove; index++ {
+		intent := graphs[index].intent
+		for _, namespace := range []string{"children", "journals"} {
+			for _, key := range transaction.Keys(namespace) {
+				raw, _ := transaction.Get(key)
+				linkedJob := ""
+				if namespace == "children" {
+					var child ChildRecord
+					if err := decodeStrict(raw, &child); err != nil {
+						return err
+					}
+					linkedJob = child.JobID
+				} else {
+					var journal JournalRecord
+					if err := decodeStrict(raw, &journal); err != nil {
+						return err
+					}
+					linkedJob = journal.JobID
+				}
+				if linkedJob == intent.JobID {
+					if err := transaction.Delete(key); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if intent.PlanID != "" {
+			if err := transaction.Delete("plans/" + intent.PlanID); err != nil {
+				return err
+			}
+		}
+		if err := transaction.Delete("jobs/" + intent.JobID); err != nil {
+			return err
+		}
+		if err := transaction.Delete(reservationKey(intent.JobID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, error) {
 	for _, key := range transaction.Keys("children") {
 		raw, _ := transaction.Get(key)
@@ -769,15 +1139,63 @@ func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, e
 }
 
 func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string) (jobs.Record, error) {
-	if mutation == nil || !mutation.Active() || exposure == nil || !exposure.Holds(locks.Exposure) {
-		return jobs.Record{}, fmt.Errorf("job completion requires mutation then exposure locks")
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("job completion requires authoritative mutation then exposure locks")
 	}
 	observedNow, timeErr := admitter.trustedNow()
 	if timeErr != nil {
 		return jobs.Record{}, timeErr
 	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	if document.Revision != expectedRevision {
+		return jobs.Record{}, persist.ErrRevision
+	}
+	intentView, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	if mutation.Target() != intentView.Target {
+		return jobs.Record{}, fmt.Errorf("completion mutation target does not match immutable intent")
+	}
+	recordView, err := jobs.LoadEntries(document.Entries, jobID)
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	currentSafetyDigest, err := safetyDigest(state)
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	if intentView.Consumption == nil || intentView.Operation == Publish && currentSafetyDigest != intentView.Consumption.SafetyDigest {
+		return jobs.Record{}, fmt.Errorf("operation safety authority changed before terminal commit")
+	}
+	if err := authorize(intentView.Operation, state, intentView.SafetyBinding, true, observedNow); err != nil {
+		return jobs.Record{}, err
+	}
+	if intentView.AdmissionSource == AdmissionPlan {
+		binding, err := admitter.bindings.CurrentBinding(intentView.Operation, intentView.Target, observedNow)
+		if err != nil {
+			return jobs.Record{}, err
+		}
+		if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
+			return jobs.Record{}, err
+		}
+		snapshot := plans.Binding{Operation: string(intentView.Operation), Target: binding.Target, ActorIdentity: recordView.ActorIdentity, Config: intentView.Consumption.Config, Applied: intentView.Consumption.Applied, Evidence: intentView.Consumption.Evidence}
+		if planTarget(binding.Target) != intentView.Target || !plans.SameBindingIdentity(binding, snapshot) {
+			return jobs.Record{}, fmt.Errorf("Plan-derived binding changed before terminal commit")
+		}
+	}
 	var completed jobs.Record
-	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
 		intent, err := loadReservation(transaction, jobID)
 		if err != nil {
 			return err
@@ -830,26 +1248,69 @@ func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease,
 	return completed, err
 }
 
+func (admitter *Admitter) validateFreshAuthority(document persist.Document, intent Reservation) error {
+	if intent.Consumption == nil {
+		return fmt.Errorf("operation has no consumed immutable authority")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return err
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return err
+	}
+	currentDigest, err := safetyDigest(state)
+	if err != nil {
+		return err
+	}
+	if !isContraction(intent.Operation) && currentDigest != intent.Consumption.SafetyDigest {
+		return fmt.Errorf("contraction or safety transition preempted operation authority")
+	}
+	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil {
+		return err
+	}
+	if intent.AdmissionSource != AdmissionPlan {
+		return nil
+	}
+	record, err := jobs.LoadEntries(document.Entries, intent.JobID)
+	if err != nil {
+		return err
+	}
+	binding, err := admitter.bindings.CurrentBinding(intent.Operation, intent.Target, observedNow)
+	if err != nil {
+		return err
+	}
+	if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
+		return err
+	}
+	snapshot := plans.Binding{Operation: string(intent.Operation), Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
+	if planTarget(binding.Target) != intent.Target || !plans.SameBindingIdentity(binding, snapshot) {
+		return fmt.Errorf("Plan-derived binding changed after intent commit")
+	}
+	return nil
+}
+
 func authorize(operation Type, state safety.State, binding SafetyBinding, consuming bool, now time.Time) error {
 	if !validType(operation) || operation == EmergencyCloseAll {
 		return fmt.Errorf("operation is unsupported for normal admission")
 	}
-	if state.MaintenancePending != nil || state.UpgradePending != nil || (state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported) || state.BackupQuiescence != nil {
-		return fmt.Errorf("maintenance, upgrade, or backup marker admits no ordinary job")
-	}
-	if state.StopFence != nil {
-		return fmt.Errorf("stop fence blocks operation admission")
-	}
+	contraction := isContraction(operation)
 	if operation == CertificateExpiry || operation == EdgeOneExpiry {
-		if !validExpiryBinding(operation, state, binding) {
-			return fmt.Errorf("expiry contraction authority binding is stale or absent")
+		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
+			return fmt.Errorf("expiry contraction authority binding is stale, absent, or not due")
 		}
 	}
-	if state.DependencyTransitionPending != nil {
-		if (operation == CertificateExpiry || operation == EdgeOneExpiry) && binding.DependencyGeneration == state.DependencyTransitionPending.Generation {
-			return nil
+	if operation == StartupContraction && !validStartupBinding(state, binding) {
+		return fmt.Errorf("startup contraction authority binding is stale or absent")
+	}
+	if state.MaintenancePending != nil || state.UpgradePending != nil || (state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported) || state.BackupQuiescence != nil || state.StopFence != nil {
+		if !contraction {
+			return fmt.Errorf("independent fence blocks expansion but not contraction")
 		}
-		return fmt.Errorf("dependency transition blocks operation admission")
+	}
+	if state.DependencyTransitionPending != nil && !contraction {
+		return fmt.Errorf("dependency transition blocks expansion admission")
 	}
 	if operation == Publish {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone {
@@ -893,6 +1354,42 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	return nil
 }
+func isContraction(operation Type) bool {
+	switch operation {
+	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
+		return true
+	default:
+		return false
+	}
+}
+
+func validStartupBinding(state safety.State, binding SafetyBinding) bool {
+	if binding.IntentGeneration == 0 {
+		return false
+	}
+	if binding.ResourceID == "headscale" {
+		if state.Headscale.ChallengePending != nil {
+			return state.Headscale.ChallengePending.Generation == binding.IntentGeneration && state.Headscale.ChallengePending.PlanID == binding.PlanID && state.Headscale.ChallengePending.BootstrapIdentity == binding.CandidateDigest && binding.CandidateBundle == ""
+		}
+		if state.Headscale.Reactivating != nil {
+			return state.Headscale.Reactivating.Generation == binding.IntentGeneration && state.Headscale.Reactivating.PlanID == binding.PlanID && state.Headscale.Reactivating.CandidateDigest == binding.CandidateDigest && state.Headscale.Reactivating.CandidateBundle == binding.CandidateBundle
+		}
+		return false
+	}
+	for _, resource := range state.Resources {
+		if resource.ResourceID != binding.ResourceID {
+			continue
+		}
+		if resource.ChallengePending != nil {
+			return resource.ChallengePending.Generation == binding.IntentGeneration && resource.ChallengePending.PlanID == binding.PlanID && resource.ChallengePending.BootstrapIdentity == binding.CandidateDigest && binding.CandidateBundle == ""
+		}
+		if resource.Reactivating != nil {
+			return resource.Reactivating.Generation == binding.IntentGeneration && resource.Reactivating.PlanID == binding.PlanID && resource.Reactivating.CandidateDigest == binding.CandidateDigest && resource.Reactivating.CandidateBundle == binding.CandidateBundle
+		}
+	}
+	return false
+}
+
 func validExpiryBinding(operation Type, state safety.State, binding SafetyBinding) bool {
 	for _, resource := range state.Resources {
 		if resource.ResourceID != binding.ResourceID {
@@ -913,7 +1410,7 @@ func validExpiryBinding(operation Type, state safety.State, binding SafetyBindin
 
 // AuthorizeStateIndependentContraction is the closed no-normal-store exception.
 // It grants no normal-state or job write authority.
-func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, state safety.State, binding SafetyBinding, unavailable persist.UnavailableProof, exposure *locks.Lease, commitAuthority func() error) error {
+func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, binding SafetyBinding, unavailable persist.UnavailableProof, exposure *locks.Lease, commitAuthority func() error) error {
 	if admitter == nil {
 		return fmt.Errorf("state-independent authority is nil")
 	}
@@ -925,7 +1422,11 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, s
 		return fmt.Errorf("state-independent contraction requires exposure-locked authority commit")
 	}
 	if !admitter.normal.ValidateUnavailable(unavailable) {
-		return fmt.Errorf("state-independent contraction requires proven normal-store unavailability")
+		return fmt.Errorf("state-independent contraction requires proven normal-store unavailability or a failed durable admission write")
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return fmt.Errorf("read independent safety authority: %w", err)
 	}
 	switch operation {
 	case EmergencyCloseAll:
@@ -936,10 +1437,30 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, s
 		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
 			return fmt.Errorf("state-independent expiry binding is stale or not due")
 		}
+	case StartupContraction:
+		if !validStartupBinding(state, binding) {
+			return fmt.Errorf("state-independent startup contraction binding is stale")
+		}
 	default:
 		return fmt.Errorf("operation is not a state-independent contraction exception")
 	}
 	return commitAuthority()
+}
+
+func authoritativeOperationLeases(normal *persist.Store, mutation *MutationLease, exposure *locks.Lease) bool {
+	return normal != nil && mutation != nil && mutation.Active() && mutation.Authority() == normal.LockAuthority() && exposure != nil && exposure.Authority() == normal.LockAuthority() && exposure.Holds(locks.Exposure)
+}
+
+func loadInstallation(transaction *persist.Transaction) (domain.Installation, error) {
+	raw, present := transaction.Get("installations/current")
+	if !present {
+		return domain.Installation{}, fmt.Errorf("installation authority is missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return domain.Installation{}, fmt.Errorf("installation authority: %w", err)
+	}
+	return installation, nil
 }
 
 func loadReservation(transaction *persist.Transaction, jobID string) (Reservation, error) {
@@ -981,6 +1502,12 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	if len(after) == 0 {
+		if oldValue.Phase != PhaseTerminal && oldValue.Phase != PhaseRejected {
+			return fmt.Errorf("only a terminal operation intent may be pruned")
+		}
+		return nil
+	}
 	newValue, err := decodeReservation(after)
 	if err != nil {
 		return err
@@ -990,14 +1517,18 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	newValue.Phase = ""
 	oldGeneration, newGeneration := oldValue.IntentGeneration, newValue.IntentGeneration
 	oldConsumption, newConsumption := oldValue.Consumption, newValue.Consumption
+	oldJournalSafety, newJournalSafety := oldValue.JournalSafetyDigest, newValue.JournalSafetyDigest
 	oldValue.IntentGeneration = 0
 	newValue.IntentGeneration = 0
 	oldValue.Consumption = nil
 	newValue.Consumption = nil
+	oldValue.JournalSafetyDigest = ""
+	newValue.JournalSafetyDigest = ""
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("immutable operation intent binding was rewritten")
 	}
-	valid := oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
+	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != ""
+	valid := journalBindingOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
 	if !valid {
 		return fmt.Errorf("operation intent phase transition is invalid")
 	}
@@ -1009,6 +1540,9 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	}
 	if oldConsumption != nil && !reflect.DeepEqual(oldConsumption, newConsumption) {
 		return fmt.Errorf("consumption snapshot was rewritten")
+	}
+	if oldJournalSafety != "" && newJournalSafety != oldJournalSafety || newJournalSafety != "" && !exactDigest(newJournalSafety) {
+		return fmt.Errorf("journal safety binding was rewritten or is invalid")
 	}
 	return nil
 }
@@ -1039,8 +1573,8 @@ func validateChildEntry(key string, raw json.RawMessage) error {
 }
 
 func validateChildRecord(value ChildRecord) error {
-	if value.SchemaVersion != "lanpanel.child.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.Profile) || value.SubmittedAt.IsZero() {
-		return fmt.Errorf("child reservation is invalid")
+	if value.SchemaVersion != "lanpanel.child.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.InstallationID) || !validType(value.Operation) || !validIdentityRef(value.Target) || value.IntentGeneration == 0 || !validIdentityRef(value.Profile) || !exactDigest(value.InputDigest) || !exactDigest(value.ArtifactDigest) || value.Deadline.IsZero() || value.SubmittedAt.IsZero() || value.Deadline.Before(value.SubmittedAt) {
+		return fmt.Errorf("child reservation identity is invalid")
 	}
 	if value.State != ChildSubmitted && value.State != ChildRunning && value.State != ChildTerminal {
 		return fmt.Errorf("child state is invalid")
@@ -1066,6 +1600,12 @@ func validateChildTransition(_ string, before, after json.RawMessage) error {
 	var oldValue, newValue ChildRecord
 	if err := decodeStrict(before, &oldValue); err != nil {
 		return err
+	}
+	if len(after) == 0 {
+		if oldValue.State != ChildTerminal {
+			return fmt.Errorf("only a terminal child may be pruned")
+		}
+		return nil
 	}
 	if err := decodeStrict(after, &newValue); err != nil {
 		return err
@@ -1108,12 +1648,32 @@ func validateJournalRecord(value JournalRecord) error {
 		}
 	} else if value.Kind == JournalAppContraction {
 		switch value.Operation {
-		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry:
+		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
 		default:
 			return fmt.Errorf("App contraction journal operation is not allowed")
 		}
 	} else {
 		return fmt.Errorf("operation journal kind is not allowed")
+	}
+	if len(value.ResourceIDs) > maximumJournalResources || !sort.StringsAreSorted(value.ResourceIDs) {
+		return fmt.Errorf("journal affected-resource inventory is unbounded or noncanonical")
+	}
+	for index, resourceID := range value.ResourceIDs {
+		if !validIdentityRef(resourceID) || index != 0 && value.ResourceIDs[index-1] == resourceID {
+			return fmt.Errorf("journal affected-resource inventory is invalid")
+		}
+	}
+	if value.Kind == JournalAppContraction {
+		exactApp := len(value.ResourceIDs) == 1 && value.Target == "resource/"+value.ResourceIDs[0]
+		exactCloseAll := value.Operation == CloseAll && len(value.ResourceIDs) != 0 && value.Target == string(plans.TargetInstallation)
+		if !exactApp && !exactCloseAll {
+			return fmt.Errorf("App contraction journal does not exactly identify its affected resources")
+		}
+	} else if len(value.ResourceIDs) != 0 {
+		return fmt.Errorf("non-ingress journal unexpectedly identifies App resources")
+	}
+	if len(value.ChildIDs) == 0 || len(value.ChildIDs) > maximumChildrenPerJob {
+		return fmt.Errorf("journal child inventory is empty or unbounded")
 	}
 	for index, childID := range value.ChildIDs {
 		if !validIdentityRef(childID) || index > 0 && value.ChildIDs[index-1] >= childID {
@@ -1136,6 +1696,12 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 	var oldValue, newValue JournalRecord
 	if err := decodeStrict(before, &oldValue); err != nil {
 		return err
+	}
+	if len(after) == 0 {
+		if oldValue.Phase != JournalTerminal {
+			return fmt.Errorf("only a terminal journal may be pruned")
+		}
+		return nil
 	}
 	if err := decodeStrict(after, &newValue); err != nil {
 		return err
@@ -1165,6 +1731,7 @@ func decodeStrict(raw json.RawMessage, value any) error {
 
 func validateLinks(document persist.Document) error {
 	intents := map[string]Reservation{}
+	terminalGraphs := 0
 	for _, key := range persist.EntryKeys(document, "intents") {
 		raw := document.Entries[key]
 		intent, err := decodeReservation(raw)
@@ -1176,28 +1743,36 @@ func validateLinks(document persist.Document) error {
 		if err != nil {
 			return fmt.Errorf("intent job link: %w", err)
 		}
-		plan, err := plans.LoadEntries(document.Entries, intent.PlanID)
-		if err != nil {
-			return fmt.Errorf("intent Plan link: %w", err)
+		var plan plans.Plan
+		if intent.AdmissionSource == AdmissionPlan {
+			plan, err = plans.LoadEntries(document.Entries, intent.PlanID)
+			if err != nil {
+				return fmt.Errorf("intent Plan link: %w", err)
+			}
 		}
 		switch intent.Phase {
 		case PhaseReserved:
-			if record.Status != jobs.StatusReserved || plan.ConsumedAt != nil || plan.ReservedByJob != record.ID {
-				return fmt.Errorf("reserved intent links inconsistent job or Plan")
+			if record.Status != jobs.StatusReserved || intent.AdmissionSource == AdmissionPlan && (plan.ConsumedAt != nil || plan.ReservedByJob != record.ID) {
+				return fmt.Errorf("reserved intent links inconsistent job or admission authority")
 			}
 		case PhaseLocalIntent, PhaseRemoteWait, PhaseReentered:
-			if record.Status != jobs.StatusRunning || plan.ConsumedAt == nil || plan.ConsumedByJob != record.ID {
-				return fmt.Errorf("active intent links inconsistent job or Plan")
+			if record.Status != jobs.StatusRunning || intent.AdmissionSource == AdmissionPlan && (plan.ConsumedAt == nil || plan.ConsumedByJob != record.ID) {
+				return fmt.Errorf("active intent links inconsistent job or admission authority")
 			}
 		case PhaseRejected:
-			if record.Status != jobs.StatusTerminal || plan.RejectedAt == nil || plan.RejectedByJob != record.ID {
-				return fmt.Errorf("rejected intent links inconsistent job or Plan")
+			if record.Status != jobs.StatusTerminal || intent.AdmissionSource == AdmissionPlan && (plan.RejectedAt == nil || plan.RejectedByJob != record.ID) {
+				return fmt.Errorf("rejected intent links inconsistent job or admission authority")
 			}
+			terminalGraphs++
 		case PhaseTerminal:
-			if record.Status != jobs.StatusTerminal || plan.ConsumedAt == nil {
-				return fmt.Errorf("terminal intent links inconsistent job or Plan")
+			if record.Status != jobs.StatusTerminal || intent.AdmissionSource == AdmissionPlan && plan.ConsumedAt == nil {
+				return fmt.Errorf("terminal intent links inconsistent job or admission authority")
 			}
+			terminalGraphs++
 		}
+	}
+	if terminalGraphs > maximumTerminalOperationGraphs {
+		return fmt.Errorf("terminal operation graph retention exceeds %d", maximumTerminalOperationGraphs)
 	}
 	for _, key := range persist.EntryKeys(document, "jobs") {
 		record, err := jobs.LoadEntries(document.Entries, strings.TrimPrefix(key, "jobs/"))
@@ -1208,8 +1783,23 @@ func validateLinks(document persist.Document) error {
 			return fmt.Errorf("job %q has no operation intent", record.ID)
 		}
 	}
+	childKeys := persist.EntryKeys(document, "children")
+	journalKeys := persist.EntryKeys(document, "journals")
+	var installationID string
+	if len(childKeys) != 0 || len(journalKeys) != 0 {
+		raw, present := document.Entries["installations/current"]
+		if !present {
+			return fmt.Errorf("child or journal has no installation authority")
+		}
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return fmt.Errorf("child or journal installation authority: %w", err)
+		}
+		installationID = installation.InstallationID
+	}
 	childrenByJob := map[string][]string{}
-	for _, key := range persist.EntryKeys(document, "children") {
+	children := map[string]ChildRecord{}
+	for _, key := range childKeys {
 		var child ChildRecord
 		if err := decodeStrict(document.Entries[key], &child); err != nil {
 			return err
@@ -1218,27 +1808,19 @@ func validateLinks(document persist.Document) error {
 		if !ok {
 			return fmt.Errorf("child reservation has no matching operation intent")
 		}
+		if child.InstallationID != installationID || child.Operation != intent.Operation || child.Target != intent.Target || child.IntentGeneration != intent.IntentGeneration || !child.Deadline.Equal(intent.SafetyBinding.Deadline) {
+			return fmt.Errorf("child does not exactly match installation and operation intent authority")
+		}
 		if (intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected) && child.State != ChildTerminal {
 			return fmt.Errorf("terminal intent retains nonterminal child")
 		}
+		children[child.ID] = child
 		childrenByJob[child.JobID] = append(childrenByJob[child.JobID], child.ID)
 	}
 	for jobID := range childrenByJob {
 		sort.Strings(childrenByJob[jobID])
 	}
-	journalKeys := persist.EntryKeys(document, "journals")
-	var installationID string
-	if len(journalKeys) != 0 {
-		raw, present := document.Entries["installations/current"]
-		if !present {
-			return fmt.Errorf("journal has no installation authority")
-		}
-		installation, err := domain.DecodeInstallation(raw)
-		if err != nil {
-			return fmt.Errorf("journal installation authority: %w", err)
-		}
-		installationID = installation.InstallationID
-	}
+	journalByJob := map[string]string{}
 	for _, key := range journalKeys {
 		var journal JournalRecord
 		if err := decodeStrict(document.Entries[key], &journal); err != nil {
@@ -1251,11 +1833,26 @@ func validateLinks(document persist.Document) error {
 		if !ok {
 			return fmt.Errorf("journal has no matching operation intent")
 		}
-		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) {
+		if _, duplicate := journalByJob[journal.JobID]; duplicate {
+			return fmt.Errorf("operation intent has more than one journal authority")
+		}
+		journalByJob[journal.JobID] = journal.ID
+		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.SafetyMarkerDigest != intent.JournalSafetyDigest || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) {
 			return fmt.Errorf("journal installation, operation, target, generation, or child inventory does not match its authorities")
+		}
+		for _, childID := range journal.ChildIDs {
+			child := children[childID]
+			if child.ArtifactDigest != journal.ArtifactDigest || !child.Deadline.Equal(journal.Deadline) {
+				return fmt.Errorf("journal artifact or deadline does not match exact child %q", childID)
+			}
 		}
 		if (intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected) && journal.Phase != JournalTerminal {
 			return fmt.Errorf("terminal intent retains nonterminal journal")
+		}
+	}
+	for jobID, intent := range intents {
+		if intent.JournalSafetyDigest != "" && journalByJob[jobID] == "" {
+			return fmt.Errorf("operation intent binds missing journal authority")
 		}
 	}
 	for _, key := range persist.EntryKeys(document, "plans") {
@@ -1273,8 +1870,211 @@ func validateLinks(document persist.Document) error {
 	return nil
 }
 
+func validateOperationStateTransitions(before, after persist.Document) error {
+	if err := validateOperationRetentionTransition(before, after); err != nil {
+		return err
+	}
+	beforeRaw, beforePresent := before.Entries["installations/current"]
+	afterRaw, afterPresent := after.Entries["installations/current"]
+	if !beforePresent || !afterPresent || string(beforeRaw) == string(afterRaw) {
+		return nil
+	}
+	oldInstallation, err := domain.DecodeInstallation(beforeRaw)
+	if err != nil {
+		return err
+	}
+	newInstallation, err := domain.DecodeInstallation(afterRaw)
+	if err != nil {
+		return err
+	}
+	oldResources := map[string]domain.AppResource{}
+	for _, resource := range oldInstallation.Resources {
+		oldResources[resource.ID] = resource
+	}
+	for _, resource := range newInstallation.Resources {
+		oldResource, existed := oldResources[resource.ID]
+		if !existed || protectedResourceStateEqual(oldResource, resource) {
+			delete(oldResources, resource.ID)
+			continue
+		}
+		if resource.PublicationRecord.UnpublishedGeneration < oldResource.PublicationRecord.UnpublishedGeneration {
+			return fmt.Errorf("resource %q unpublished generation regressed", resource.ID)
+		}
+		if resource.PublicationRecord.State == domain.PublicationUnpublished && oldResource.PublicationRecord.State != domain.PublicationUnpublished && resource.PublicationRecord.UnpublishedGeneration <= oldResource.PublicationRecord.UnpublishedGeneration {
+			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
+		}
+		jobID := resource.PublicationRecord.LastJobID
+		if jobID == "" {
+			return fmt.Errorf("resource %q operation-owned state changed without a durable job binding", resource.ID)
+		}
+		beforeIntent, err := loadReservationEntries(before.Entries, jobID)
+		if err != nil {
+			return fmt.Errorf("resource %q has no active before-intent authority: %w", resource.ID, err)
+		}
+		intent, err := loadReservationEntries(after.Entries, jobID)
+		if err != nil {
+			return fmt.Errorf("resource %q state intent: %w", resource.ID, err)
+		}
+		targetMatches := intent.Target == "resource/"+resource.ID || intent.Operation == CloseAll && intent.Target == string(plans.TargetInstallation)
+		if intent.Operation == AutomaticReconciliation && strings.HasPrefix(intent.Target, "journal/") {
+			journal, err := loadJournalEntries(after.Entries, strings.TrimPrefix(intent.Target, "journal/"))
+			if err == nil {
+				targetMatches = slices.Contains(journal.ResourceIDs, resource.ID)
+			}
+		}
+		if !targetMatches {
+			return fmt.Errorf("resource %q state changed under a mismatched operation target", resource.ID)
+		}
+		if beforeIntent.Phase != PhaseLocalIntent && beforeIntent.Phase != PhaseReentered || intent.Phase != PhaseTerminal {
+			return fmt.Errorf("resource %q state and job result must commit atomically from a locked local phase", resource.ID)
+		}
+		if !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) {
+			return fmt.Errorf("resource %q last operation does not match its immutable intent", resource.ID)
+		}
+		beforeRecord, err := jobs.LoadEntries(before.Entries, jobID)
+		if err != nil {
+			return err
+		}
+		record, err := jobs.LoadEntries(after.Entries, jobID)
+		if err != nil {
+			return err
+		}
+		if beforeRecord.Status != jobs.StatusRunning || record.Status != jobs.StatusTerminal || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
+			return fmt.Errorf("resource %q state does not match an atomic running-to-terminal job result", resource.ID)
+		}
+		if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
+			return fmt.Errorf("resource %q: %w", resource.ID, err)
+		}
+		delete(oldResources, resource.ID)
+	}
+	if len(oldResources) != 0 {
+		return fmt.Errorf("resource state cannot disappear outside its typed deletion operation")
+	}
+	return nil
+}
+
+func validateOperationResourceDelta(before, after domain.AppResource, operation Type) error {
+	if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.ManagedProcess, after.ManagedProcess) {
+		return fmt.Errorf("operation %q does not own lifecycle or managed-process state", operation)
+	}
+	switch operation {
+	case Publish:
+		return nil
+	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction, Maintenance:
+		if after.PublicationRecord.State != domain.PublicationUnpublished || after.PublicationRecord.UnpublishedGeneration <= before.PublicationRecord.UnpublishedGeneration {
+			return fmt.Errorf("contraction operation did not commit unpublished state with a fresh generation")
+		}
+		return nil
+	default:
+		return fmt.Errorf("operation %q has no resource-state delta authority", operation)
+	}
+}
+
+func validateOperationRetentionTransition(before, after persist.Document) error {
+	for _, namespace := range []string{"jobs", "children", "journals"} {
+		for _, key := range persist.EntryKeys(before, namespace) {
+			if _, retained := after.Entries[key]; retained {
+				continue
+			}
+			jobID := strings.TrimPrefix(key, namespace+"/")
+			if namespace == "children" {
+				var child ChildRecord
+				if err := decodeStrict(before.Entries[key], &child); err != nil {
+					return err
+				}
+				jobID = child.JobID
+			} else if namespace == "journals" {
+				var journal JournalRecord
+				if err := decodeStrict(before.Entries[key], &journal); err != nil {
+					return err
+				}
+				jobID = journal.JobID
+			}
+			if _, intentRetained := after.Entries[reservationKey(jobID)]; intentRetained {
+				return fmt.Errorf("operation retention cannot detach %s from its intent graph", namespace)
+			}
+		}
+	}
+	type graph struct {
+		jobID   string
+		endedAt time.Time
+	}
+	terminalBefore := []graph{}
+	deleted := map[string]bool{}
+	becomingTerminal := 0
+	for _, key := range persist.EntryKeys(before, "intents") {
+		jobID := strings.TrimPrefix(key, "intents/")
+		intent, err := loadReservationEntries(before.Entries, jobID)
+		if err != nil {
+			return err
+		}
+		afterIntent, afterPresent, err := persist.DecodeEntry[Reservation](after, key)
+		if err != nil {
+			return err
+		}
+		terminal := intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected
+		if terminal {
+			record, err := jobs.LoadEntries(before.Entries, jobID)
+			if err != nil {
+				return err
+			}
+			if record.EndedAt == nil {
+				return fmt.Errorf("terminal retention job authority has no end time")
+			}
+			terminalBefore = append(terminalBefore, graph{jobID: jobID, endedAt: *record.EndedAt})
+			if !afterPresent {
+				deleted[jobID] = true
+			}
+			continue
+		}
+		if afterPresent && (afterIntent.Phase == PhaseTerminal || afterIntent.Phase == PhaseRejected) {
+			becomingTerminal++
+		}
+	}
+	required := len(terminalBefore) + becomingTerminal - maximumTerminalOperationGraphs
+	if required < 0 {
+		required = 0
+	}
+	if len(deleted) != required {
+		return fmt.Errorf("terminal graph retention deleted %d graphs; exact oldest overflow is %d", len(deleted), required)
+	}
+	sort.Slice(terminalBefore, func(left, right int) bool {
+		if terminalBefore[left].endedAt.Equal(terminalBefore[right].endedAt) {
+			return terminalBefore[left].jobID < terminalBefore[right].jobID
+		}
+		return terminalBefore[left].endedAt.Before(terminalBefore[right].endedAt)
+	})
+	for index := 0; index < required; index++ {
+		if !deleted[terminalBefore[index].jobID] {
+			return fmt.Errorf("terminal graph retention did not delete the oldest graph")
+		}
+	}
+	return nil
+}
+
+func protectedResourceStateEqual(left, right domain.AppResource) bool {
+	return left.Lifecycle == right.Lifecycle && reflect.DeepEqual(left.PublicationRecord, right.PublicationRecord) && reflect.DeepEqual(left.ManagedProcess, right.ManagedProcess)
+}
+
+func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool {
+	switch operation {
+	case Publish:
+		return code == domain.OperationPublish
+	case Unpublish, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
+		return code == domain.OperationUnpublish
+	case CloseAll:
+		return code == domain.OperationCloseAll
+	case Maintenance:
+		return code == domain.OperationMaintenance
+	case BackupEnter:
+		return code == domain.OperationBackupEnter
+	default:
+		return string(code) == string(operation)
+	}
+}
+
 func validateReservation(value Reservation) error {
-	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || value.PlanID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) {
+	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
 		return fmt.Errorf("operation reservation is invalid")
 	}
 	if value.Phase != PhaseReserved && value.Phase != PhaseLocalIntent && value.Phase != PhaseRemoteWait && value.Phase != PhaseRejected && value.Phase != PhaseReentered && value.Phase != PhaseTerminal {
@@ -1287,7 +2087,7 @@ func validateReservation(value Reservation) error {
 		if value.Consumption != nil {
 			return fmt.Errorf("unconsumed operation has consumption snapshot")
 		}
-	} else if value.Consumption == nil || !digest(value.Consumption.ConfirmationDigest) || !digest(value.Consumption.SafetyDigest) || value.Consumption.ConfirmedAt.IsZero() {
+	} else if value.Consumption == nil || value.Consumption.Source != value.AdmissionSource || !digest(value.Consumption.ConfirmationDigest) || !digest(value.Consumption.SafetyDigest) || value.Consumption.ConfirmedAt.IsZero() {
 		return fmt.Errorf("operation consumption snapshot is incomplete")
 	}
 	return nil
@@ -1295,11 +2095,84 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, Upgrade, BackupEnter:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
 		return true
 	}
 	return false
 }
+
+func validateSafetyTargetBinding(request AdmitRequest) error {
+	kind, identity, _ := strings.Cut(request.Target, "/")
+	switch kind {
+	case string(plans.TargetResource):
+		if identity == "" || request.SafetyBinding.ResourceID != identity {
+			return fmt.Errorf("operation target does not match resource safety authority")
+		}
+	case string(plans.TargetHeadscale):
+		if identity == "" || request.SafetyBinding.ResourceID != "headscale" {
+			return fmt.Errorf("Headscale target does not match safety authority")
+		}
+	case string(plans.TargetInstallation):
+		if identity != "" || request.SafetyBinding.ResourceID != "" {
+			return fmt.Errorf("installation target has unrelated resource safety authority")
+		}
+	default:
+		if request.Operation != AutomaticReconciliation || kind != "journal" || identity == "" {
+			return fmt.Errorf("operation target kind is invalid")
+		}
+	}
+	binding := request.SafetyBinding
+	activationBound := binding.PlanID != "" || binding.IntentGeneration != 0 || binding.CandidateDigest != "" || binding.CandidateBundle != ""
+	if activationBound {
+		planBound := request.Source == AdmissionPlan && binding.PlanID == request.PlanID && exactDigest(binding.CandidateBundle)
+		startupBound := request.Operation == StartupContraction && request.Source == AdmissionStartup && (binding.CandidateBundle == "" || exactDigest(binding.CandidateBundle))
+		exactCandidate := validIdentityRef(binding.PlanID) && binding.IntentGeneration != 0 && exactDigest(binding.CandidateDigest)
+		if !exactCandidate || !planBound && !startupBound {
+			return fmt.Errorf("activation safety identity does not match Plan or startup contraction authority")
+		}
+	}
+	return nil
+}
+
+func validateAdmissionSource(operation Type, source AdmissionSource, planID string) error {
+	switch source {
+	case AdmissionPlan:
+		if planID == "" {
+			return fmt.Errorf("Plan admission requires a Plan identity")
+		}
+		switch operation {
+		case Publish, Unpublish, CloseAll, Maintenance, BackupEnter:
+		default:
+			return fmt.Errorf("operation is not valid for Plan admission")
+		}
+	case AdmissionTimer:
+		if planID != "" || operation != CertificateExpiry && operation != EdgeOneExpiry && operation != AutomaticReconciliation {
+			return fmt.Errorf("timer admission is not authorized for operation")
+		}
+	case AdmissionStartup:
+		if planID != "" || operation != AutomaticReconciliation && operation != StartupContraction {
+			return fmt.Errorf("startup admission is not authorized for operation")
+		}
+	default:
+		return fmt.Errorf("operation admission source is unsupported")
+	}
+	return nil
+}
+func safetyBindingDigest(binding SafetyBinding) (string, error) {
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func planlessAdmissionDigest(reservation Reservation, safetyDigest string) string {
+	value := strings.Join([]string{string(reservation.AdmissionSource), string(reservation.Operation), reservation.Target, reservation.JobID, safetyDigest}, "\x00")
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func safetyDigest(state safety.State) (string, error) {
 	copy := state
 	copy.Checksum = ""
@@ -1376,7 +2249,7 @@ func (admitter *Admitter) FencedHandoff(ctx context.Context, admission *locks.Le
 	if !empty {
 		return fmt.Errorf("fenced handoff inventory is not empty")
 	}
-	mutation, exposure, err := mutationSet.AcquireExposure(ctx, target, manager)
+	mutation, exposure, err := mutationSet.acquireExposureForHandoff(ctx, target, manager)
 	if err != nil {
 		return err
 	}

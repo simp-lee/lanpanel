@@ -29,6 +29,9 @@ func TestImmutablePlans(t *testing.T) {
 			t.Fatal(err)
 		}
 		binding := bindingFor(plan)
+		if err := ValidateBindingFreshness(binding, now.Add(MaximumEvidenceAge+time.Second)); err == nil {
+			t.Fatal("phase-boundary binding accepted stale prerequisite evidence")
+		}
 		stale := binding
 		stale.Config.Digest = digestFor("changed")
 		if err := Match(plan, binding, now.Add(-time.Second)); err == nil {

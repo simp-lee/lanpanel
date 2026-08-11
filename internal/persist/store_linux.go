@@ -30,6 +30,14 @@ const SchemaVersion = "lanpanel.normal.v1"
 const maxDocumentBytes = 8 << 20
 
 var (
+	canonicalNamespaceOwners = map[string]string{
+		"installations": "persist.installations.v1",
+		"plans":         "plans.v1",
+		"jobs":          "jobs.v1",
+		"intents":       "operations.intents.v1",
+		"children":      "operations.children.v1",
+		"journals":      "operations.journals.v1",
+	}
 	ErrMissing          = errors.New("normal state is missing")
 	ErrRevision         = errors.New("normal state revision mismatch")
 	ErrRecoveryRequired = errors.New("normal state transaction requires reconciliation")
@@ -62,10 +70,13 @@ func (store *Store) ValidateUnavailable(proof UnavailableProof) bool {
 	if proof.store != store || proof.authority != store.config.LockAuthority || proof.device != uint64(store.rootStat.Dev) || proof.inode != store.rootStat.Ino || !store.schemaSealed || proof.epoch == 0 || proof.epoch != store.proofEpoch {
 		return false
 	}
-	if !store.uncertain {
+	if !store.uncertain && !store.writeUnavailable {
 		if _, err := store.readLocked(); err == nil {
 			return false
 		}
+	}
+	if store.writeUnavailable && !store.uncertain {
+		store.writeUnavailable = false
 	}
 	store.proofEpoch++
 	return true
@@ -73,13 +84,16 @@ func (store *Store) ValidateUnavailable(proof UnavailableProof) bool {
 func (store *Store) SealSchema() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	required := []string{"installations", "plans", "jobs", "intents", "children", "journals"}
-	for _, namespace := range required {
-		if store.validators[namespace] == nil {
-			return fmt.Errorf("normal store schema registry omits %q", namespace)
+	for namespace, owner := range canonicalNamespaceOwners {
+		if store.validators[namespace] == nil || store.namespaceOwners[namespace] != owner {
+			return fmt.Errorf("normal store schema registry omits canonical owner for %q", namespace)
 		}
 	}
-	if len(store.validators) != len(required) || len(store.documentValidators) == 0 {
+	transitionOwners := map[string]bool{}
+	for _, owner := range store.documentTransitionValidatorOwners {
+		transitionOwners[owner] = true
+	}
+	if len(store.validators) != len(canonicalNamespaceOwners) || len(store.documentValidators) != 1 || len(store.documentTransitionValidators) != 2 || store.documentValidatorOwners[0] != "operations.links.v1" || !transitionOwners["operations.resource_transitions.v1"] || !transitionOwners["plans.retention.v1"] {
 		return fmt.Errorf("normal store schema registry is not canonical")
 	}
 	store.schemaSealed = true
@@ -91,9 +105,9 @@ func (store *Store) ProveUnavailable() (UnavailableProof, error) {
 	if !store.schemaSealed {
 		return UnavailableProof{}, fmt.Errorf("normal store schema is not sealed")
 	}
-	if !store.uncertain {
+	if !store.uncertain && !store.writeUnavailable {
 		if _, err := store.readLocked(); err == nil {
-			return UnavailableProof{}, fmt.Errorf("normal store is available")
+			return UnavailableProof{}, fmt.Errorf("normal store is available and no durable admission write has failed")
 		}
 	}
 	store.proofEpoch++
@@ -127,6 +141,13 @@ func (transaction *Transaction) Replace(key string, value json.RawMessage) error
 	transaction.entries[key] = append(json.RawMessage(nil), value...)
 	return nil
 }
+func (transaction *Transaction) Delete(key string) error {
+	if _, exists := transaction.entries[key]; !exists {
+		return fmt.Errorf("normal entry %q is missing", key)
+	}
+	delete(transaction.entries, key)
+	return nil
+}
 func (transaction *Transaction) Keys(namespace string) []string {
 	prefix := namespace + "/"
 	result := []string{}
@@ -142,19 +163,25 @@ func (transaction *Transaction) Keys(namespace string) []string {
 type NamespaceValidator func(key string, value json.RawMessage) error
 type TransitionValidator func(key string, before, after json.RawMessage) error
 type DocumentValidator func(Document) error
+type DocumentTransitionValidator func(before, after Document) error
 
 type Store struct {
-	mu                 sync.Mutex
-	config             Config
-	txn                *filetxn.Store
-	rootFD             int
-	rootStat           unix.Stat_t
-	validators         map[string]NamespaceValidator
-	transitions        map[string]TransitionValidator
-	documentValidators []DocumentValidator
-	uncertain          bool
-	schemaSealed       bool
-	proofEpoch         uint64
+	mu                                sync.Mutex
+	config                            Config
+	txn                               *filetxn.Store
+	rootFD                            int
+	rootStat                          unix.Stat_t
+	validators                        map[string]NamespaceValidator
+	transitions                       map[string]TransitionValidator
+	namespaceOwners                   map[string]string
+	documentValidators                []DocumentValidator
+	documentValidatorOwners           []string
+	documentTransitionValidators      []DocumentTransitionValidator
+	documentTransitionValidatorOwners []string
+	uncertain                         bool
+	writeUnavailable                  bool
+	schemaSealed                      bool
+	proofEpoch                        uint64
 }
 
 func Open(config Config) (*Store, error) {
@@ -170,10 +197,21 @@ func Open(config Config) (*Store, error) {
 		_ = unix.Close(rootFD)
 		return nil, err
 	}
-	return &Store{config: config, txn: txn, rootFD: rootFD, rootStat: rootStat, validators: map[string]NamespaceValidator{"installations": validateInstallationEntry}, transitions: map[string]TransitionValidator{"installations": validateInstallationTransition}}, nil
+	return &Store{config: config, txn: txn, rootFD: rootFD, rootStat: rootStat, validators: map[string]NamespaceValidator{"installations": validateInstallationEntry}, transitions: map[string]TransitionValidator{"installations": validateInstallationTransition}, namespaceOwners: map[string]string{"installations": canonicalNamespaceOwners["installations"]}}, nil
 }
 
 func (store *Store) RegisterNamespace(namespace string, validator NamespaceValidator, transition TransitionValidator) error {
+	return store.registerNamespace(namespace, "", validator, transition)
+}
+
+func (store *Store) RegisterCanonicalNamespace(namespace, owner string, validator NamespaceValidator, transition TransitionValidator) error {
+	if canonicalNamespaceOwners[namespace] != owner {
+		return fmt.Errorf("normal namespace %q canonical owner is invalid", namespace)
+	}
+	return store.registerNamespace(namespace, owner, validator, transition)
+}
+
+func (store *Store) registerNamespace(namespace, owner string, validator NamespaceValidator, transition TransitionValidator) error {
 	if namespace == "" || strings.Contains(namespace, "/") || validator == nil {
 		return fmt.Errorf("normal namespace registration is invalid")
 	}
@@ -186,6 +224,7 @@ func (store *Store) RegisterNamespace(namespace string, validator NamespaceValid
 		return fmt.Errorf("normal namespace %q is already registered", namespace)
 	}
 	store.validators[namespace] = validator
+	store.namespaceOwners[namespace] = owner
 	if transition != nil {
 		store.transitions[namespace] = transition
 	}
@@ -197,6 +236,17 @@ func (store *Store) NamespaceRegistered(namespace string) bool {
 	return store.validators[namespace] != nil
 }
 func (store *Store) RegisterDocumentValidator(validator DocumentValidator) error {
+	return store.registerDocumentValidator("", validator)
+}
+
+func (store *Store) RegisterCanonicalDocumentValidator(owner string, validator DocumentValidator) error {
+	if owner != "operations.links.v1" {
+		return fmt.Errorf("normal document validator canonical owner is invalid")
+	}
+	return store.registerDocumentValidator(owner, validator)
+}
+
+func (store *Store) registerDocumentValidator(owner string, validator DocumentValidator) error {
 	if validator == nil {
 		return fmt.Errorf("normal document validator is nil")
 	}
@@ -206,6 +256,48 @@ func (store *Store) RegisterDocumentValidator(validator DocumentValidator) error
 		return fmt.Errorf("normal schema registry is sealed")
 	}
 	store.documentValidators = append(store.documentValidators, validator)
+	store.documentValidatorOwners = append(store.documentValidatorOwners, owner)
+	return nil
+}
+
+func (store *Store) DocumentTransitionOwnerRegistered(owner string) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, existing := range store.documentTransitionValidatorOwners {
+		if existing == owner {
+			return true
+		}
+	}
+	return false
+}
+
+func (store *Store) RegisterDocumentTransitionValidator(validator DocumentTransitionValidator) error {
+	return store.registerDocumentTransitionValidator("", validator)
+}
+
+func (store *Store) RegisterCanonicalDocumentTransitionValidator(owner string, validator DocumentTransitionValidator) error {
+	if owner != "operations.resource_transitions.v1" && owner != "plans.retention.v1" {
+		return fmt.Errorf("normal document transition validator canonical owner is invalid")
+	}
+	return store.registerDocumentTransitionValidator(owner, validator)
+}
+
+func (store *Store) registerDocumentTransitionValidator(owner string, validator DocumentTransitionValidator) error {
+	if validator == nil {
+		return fmt.Errorf("normal document transition validator is nil")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.schemaSealed {
+		return fmt.Errorf("normal schema registry is sealed")
+	}
+	for _, existing := range store.documentTransitionValidatorOwners {
+		if owner != "" && existing == owner {
+			return fmt.Errorf("normal document transition owner %q is already registered", owner)
+		}
+	}
+	store.documentTransitionValidators = append(store.documentTransitionValidators, validator)
+	store.documentTransitionValidatorOwners = append(store.documentTransitionValidatorOwners, owner)
 	return nil
 }
 
@@ -232,7 +324,7 @@ func (store *Store) Initialize(ctx context.Context, lease *locks.Lease) (filetxn
 		return filetxn.Result{}, ErrRecoveryRequired
 	}
 	document := Document{SchemaVersion: SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{}}
-	return store.persist(ctx, document, filetxn.CreateOnly)
+	return store.persist(ctx, document, filetxn.CreateOnly, false)
 }
 
 func (store *Store) Read() (Document, error) {
@@ -252,6 +344,7 @@ func (store *Store) Reconcile() (Document, error) {
 		return Document{}, err
 	}
 	store.uncertain = false
+	store.writeUnavailable = false
 	return document, nil
 }
 
@@ -288,7 +381,12 @@ func (store *Store) Update(ctx context.Context, lease *locks.Lease, expectedRevi
 		return Document{}, filetxn.Result{}, err
 	}
 	next := Document{SchemaVersion: SchemaVersion, Revision: current.Revision + 1, Entries: entries}
-	result, err := store.persist(ctx, next, filetxn.ReplaceOnly)
+	for _, validator := range store.documentTransitionValidators {
+		if err := validator(current, next); err != nil {
+			return Document{}, filetxn.Result{}, err
+		}
+	}
+	result, err := store.persist(ctx, next, filetxn.ReplaceOnly, isDurableAdmissionDelta(current.Entries, entries))
 	if err != nil {
 		return Document{}, result, err
 	}
@@ -391,7 +489,7 @@ func (store *Store) readLocked() (Document, error) {
 	return document, nil
 }
 
-func (store *Store) persist(ctx context.Context, document Document, disposition filetxn.Disposition) (filetxn.Result, error) {
+func (store *Store) persist(ctx context.Context, document Document, disposition filetxn.Disposition, failedAdmissionProofEligible bool) (filetxn.Result, error) {
 	if err := store.revalidateRoot(); err != nil {
 		return filetxn.Result{}, err
 	}
@@ -416,11 +514,19 @@ func (store *Store) persist(ctx context.Context, document Document, disposition 
 	metadata := filetxn.Metadata{Owner: store.config.Owner, Mode: 0o600}
 	result, err := store.txn.Put(ctx, filetxn.Request{Path: store.config.StatePath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maxDocumentBytes}, data, disposition)
 	if err == nil {
+		store.writeUnavailable = false
 		return result, nil
+	}
+	if disposition == filetxn.ReplaceOnly && failedAdmissionProofEligible && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		// Only an actual failed write of one new reserved job+intent pair opens
+		// the one-use no-normal-store contraction exception.
+		store.writeUnavailable = true
+		store.proofEpoch++
 	}
 	if result.State == filetxn.StateDurable {
 		loaded, readErr := store.readLocked()
 		if readErr == nil && loaded.Revision == document.Revision && loaded.Checksum == document.Checksum {
+			store.writeUnavailable = false
 			return result, nil
 		}
 		store.uncertain = true
@@ -431,6 +537,32 @@ func (store *Store) persist(ctx context.Context, document Document, disposition 
 		return result, fmt.Errorf("%w: %v", ErrRecoveryRequired, err)
 	}
 	return result, err
+}
+
+func isDurableAdmissionDelta(before, after map[string]json.RawMessage) bool {
+	for key, raw := range after {
+		jobID, ok := strings.CutPrefix(key, "intents/")
+		if !ok || jobID == "" {
+			continue
+		}
+		if _, existed := before[key]; existed {
+			continue
+		}
+		if _, jobExisted := before["jobs/"+jobID]; jobExisted {
+			continue
+		}
+		if _, jobCreated := after["jobs/"+jobID]; !jobCreated {
+			continue
+		}
+		var intent struct {
+			JobID string `json:"job_id"`
+			Phase string `json:"phase"`
+		}
+		if err := json.Unmarshal(raw, &intent); err == nil && intent.JobID == jobID && intent.Phase == "reserved" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateDocument(document Document) error {
@@ -480,7 +612,15 @@ func (store *Store) validateEntryTransitions(before, after map[string]json.RawMe
 	for key, oldValue := range before {
 		newValue, exists := after[key]
 		if !exists {
-			return fmt.Errorf("normal entry %q cannot be deleted", key)
+			namespace, _, _ := strings.Cut(key, "/")
+			validator := store.transitions[namespace]
+			if validator == nil {
+				return fmt.Errorf("normal entry %q is immutable and cannot be deleted", key)
+			}
+			if err := validator(key, oldValue, nil); err != nil {
+				return err
+			}
+			continue
 		}
 		if string(oldValue) == string(newValue) {
 			continue
@@ -492,6 +632,11 @@ func (store *Store) validateEntryTransitions(before, after map[string]json.RawMe
 		}
 		if err := validator(key, oldValue, newValue); err != nil {
 			return err
+		}
+		if namespace == "installations" && len(store.documentTransitionValidators) == 0 {
+			if err := rejectUnownedInstallationStateChange(oldValue, newValue); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -532,10 +677,10 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 		oldResources[resource.ID] = resource
 	}
 	for _, resource := range newValue.Resources {
-		if old, exists := oldResources[resource.ID]; exists {
-			if old.Lifecycle != resource.Lifecycle || !reflect.DeepEqual(old.PublicationRecord, resource.PublicationRecord) || !reflect.DeepEqual(old.ManagedProcess, resource.ManagedProcess) {
-				return fmt.Errorf("resource %q lifecycle, applied publication, and process state require an operation intent", resource.ID)
-			}
+		if _, exists := oldResources[resource.ID]; exists {
+			// Operation-owned lifecycle/publication/process transitions are
+			// authorized by the canonical document-transition validator, which
+			// can inspect the matching immutable job and intent atomically.
 			delete(oldResources, resource.ID)
 		} else if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration == 0 || resource.PublicationRecord.LastAppliedDigest != nil || resource.PublicationRecord.LastAppliedBundle != nil || resource.PublicationRecord.EffectiveSecurity != nil || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.RuntimeObservation != nil || resource.PublicationRecord.LastOperation != "" || resource.PublicationRecord.LastOperationResult != "" || resource.PublicationRecord.LastJobID != "" || resource.ManagedProcess != nil && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.RuntimeObservation != nil) {
 			return fmt.Errorf("new resource must start active, unpublished, unapplied, and stopped with a generation")
@@ -546,6 +691,28 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 	}
 	return nil
 }
+func rejectUnownedInstallationStateChange(before, after json.RawMessage) error {
+	oldValue, err := decodeInstallation(before)
+	if err != nil {
+		return err
+	}
+	newValue, err := decodeInstallation(after)
+	if err != nil {
+		return err
+	}
+	oldResources := map[string]domain.AppResource{}
+	for _, resource := range oldValue.Resources {
+		oldResources[resource.ID] = resource
+	}
+	for _, resource := range newValue.Resources {
+		old, exists := oldResources[resource.ID]
+		if exists && (old.Lifecycle != resource.Lifecycle || !reflect.DeepEqual(old.PublicationRecord, resource.PublicationRecord) || !reflect.DeepEqual(old.ManagedProcess, resource.ManagedProcess)) {
+			return fmt.Errorf("resource %q lifecycle, applied publication, and process state require an operation intent", resource.ID)
+		}
+	}
+	return nil
+}
+
 func decodeInstallation(value json.RawMessage) (domain.Installation, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(value)))
 	decoder.DisallowUnknownFields()

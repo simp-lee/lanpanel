@@ -56,14 +56,17 @@ func Check(input GuardInput) Decision {
 	if err := Validate(input.State); err != nil {
 		return Decision{Priority: PriorityStopFence, Reason: "invalid independent safety state: " + err.Error()}
 	}
-	if input.Action == ActionContraction || input.Action == ActionReadOnly {
-		return Decision{Allowed: true, Priority: effectivePriority(input.State, input.ResourceID), Reason: "contraction-safe action"}
+	if input.Action == ActionContraction {
+		return Decision{Allowed: true, Priority: effectivePriority(input.State, input.ResourceID, input.Now), Reason: "contraction-safe action"}
 	}
 	if input.Now.IsZero() {
 		return Decision{Priority: PriorityStopFence, Reason: "guard observation time is required"}
 	}
+	if input.Action == ActionReadOnly {
+		return Decision{Allowed: true, Priority: effectivePriority(input.State, input.ResourceID, input.Now), Reason: "read-only action"}
+	}
 	resource := findResource(input.State, input.ResourceID)
-	priority := effectivePriority(input.State, input.ResourceID)
+	priority := effectivePriority(input.State, input.ResourceID, input.Now)
 	if input.State.StopFence != nil {
 		return Decision{Priority: priority, Reason: "stop fence blocks expansion"}
 	}
@@ -146,7 +149,7 @@ func checkHeadscaleReactivate(input GuardInput) Decision {
 	return Decision{Allowed: true, Priority: PriorityReactivating, Reason: "exact Headscale control and certificate reactivation candidate is allowed"}
 }
 
-func effectivePriority(state State, resourceID string) EffectivePriority {
+func effectivePriority(state State, resourceID string, now time.Time) EffectivePriority {
 	if state.StopFence != nil {
 		return PriorityStopFence
 	}
@@ -169,13 +172,13 @@ func effectivePriority(state State, resourceID string) EffectivePriority {
 	if resource.State == ResourceDeleting || resource.Ownership == OwnershipOrphan {
 		return PriorityDeletingOrOrphan
 	}
-	if resource.ChallengePending != nil {
+	if resource.ChallengePending != nil && snapshotMatches(resource.ChallengePending.BaseMarkers, resource) && resource.EdgeOne.Expiry == nil && !edgeDeadlineExpired(resource, now) {
 		return PriorityChallenge
 	}
-	if resource.Reactivating != nil {
+	if resource.Reactivating != nil && snapshotMatches(resource.Reactivating.BaseMarkers, resource) && future(resource.Reactivating.CertificateUntil, now) && future(resource.Reactivating.ACLUntil, now) {
 		return PriorityReactivating
 	}
-	if hasBaseMarker(resource) {
+	if hasBaseMarker(resource) || edgeDeadlineExpired(resource, now) || resource.ChallengePending != nil || resource.Reactivating != nil {
 		return PriorityBaseContraction
 	}
 	return PriorityPublished
@@ -297,6 +300,7 @@ const (
 	RoleGlobalCloseConvergence  ClearRole = "global_close_convergence"
 	RoleJournalConvergence      ClearRole = "journal_convergence"
 	RoleOwnershipContraction    ClearRole = "ownership_contraction"
+	RoleOwnershipActivation     ClearRole = "ownership_activation"
 	RoleUpgradeRecovery         ClearRole = "upgrade_recovery"
 	RoleMaintenance             ClearRole = "maintenance"
 	RoleMaintenanceBegin        ClearRole = "maintenance_begin"

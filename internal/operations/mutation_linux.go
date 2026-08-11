@@ -32,9 +32,10 @@ type MutationSet struct {
 	closed   atomic.Bool
 }
 type MutationLease struct {
-	fd       int
-	target   string
-	released atomic.Bool
+	fd        int
+	target    string
+	authority locks.Authority
+	released  atomic.Bool
 }
 
 func OpenMutationSet(config MutationConfig) (*MutationSet, error) {
@@ -70,9 +71,21 @@ func (set *MutationSet) Close() error {
 }
 
 // AcquireExposure fixes the only normal-operation order: resource mutation
-// first, then the installation exposure lock.
+// first, then the installation exposure lock. Ordinary operations must have
+// released the short-lived admission lock before entering this phase.
 func (set *MutationSet) AcquireExposure(ctx context.Context, target string, manager *locks.Manager) (*MutationLease, *locks.Lease, error) {
-	if set == nil || set.closed.Load() || manager == nil || manager.Authority() != set.config.Authority || manager.Held(locks.Exposure) || target == "" || target != strings.TrimSpace(target) {
+	return set.acquireExposure(ctx, target, manager, false)
+}
+
+// acquireExposureForHandoff is reserved for the fenced maintenance, upgrade,
+// and backup handoff that deliberately retains admission until its fence is
+// committed.
+func (set *MutationSet) acquireExposureForHandoff(ctx context.Context, target string, manager *locks.Manager) (*MutationLease, *locks.Lease, error) {
+	return set.acquireExposure(ctx, target, manager, true)
+}
+
+func (set *MutationSet) acquireExposure(ctx context.Context, target string, manager *locks.Manager, admissionHandoff bool) (*MutationLease, *locks.Lease, error) {
+	if set == nil || set.closed.Load() || manager == nil || manager.Authority() != set.config.Authority || manager.Held(locks.Exposure) || (!admissionHandoff && manager.Held(locks.MutationAdmission)) || target == "" || target != strings.TrimSpace(target) {
 		return nil, nil, fmt.Errorf("mutation lock request is invalid")
 	}
 	if err := set.revalidate(); err != nil {
@@ -109,7 +122,7 @@ func (set *MutationSet) AcquireExposure(ctx context.Context, target string, mana
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-	mutation := &MutationLease{fd: fd, target: target}
+	mutation := &MutationLease{fd: fd, target: target, authority: set.config.Authority}
 	exposure, err := manager.Acquire(ctx, locks.Exposure)
 	if err != nil {
 		_ = mutation.Release()
@@ -125,6 +138,12 @@ func (lease *MutationLease) Target() string {
 		return ""
 	}
 	return lease.target
+}
+func (lease *MutationLease) Authority() locks.Authority {
+	if lease == nil || !lease.Active() {
+		return locks.Authority{}
+	}
+	return lease.authority
 }
 func (lease *MutationLease) Release() error {
 	if lease == nil || !lease.released.CompareAndSwap(false, true) {

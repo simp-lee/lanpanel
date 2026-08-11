@@ -19,11 +19,25 @@ func TestSafetySchemaContract(t *testing.T) {
 				state := EmptyState()
 				state.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
 				fence := validStopFence(kind)
+				state.StopFenceSequence = fence.FenceGeneration
 				if kind == StopFenceMaintenanceTransition {
 					state.MaintenancePending = validTransition(1)
 				}
 				if kind == StopFenceGenerationUpgrade {
 					state.UpgradePending = validTransition(1)
+				}
+				switch kind {
+				case StopFenceIngressActivation:
+					fence.Scope = FenceScope{Kind: "app", ResourceID: "app-one"}
+					fence.SafetyGenerations = append(fence.SafetyGenerations, MarkerGeneration{Kind: "reactivating", Generation: 2})
+					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Reactivating: &Reactivating{Generation: 2, PriorGeneration: 1, PlanID: "intent", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Unix(500, 0).UTC(), ACLUntil: time.Unix(500, 0).UTC()}}}
+				case StopFenceCertificateActivation:
+					fence.Scope = FenceScope{Kind: "app", ResourceID: "app-one"}
+					fence.SafetyGenerations = append(fence.SafetyGenerations, MarkerGeneration{Kind: "certificate_expiry", Generation: 1})
+					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), CertificateExpiry: &DeadlineMarker{Generation: 1, Deadline: time.Unix(200, 0).UTC(), Binding: "certificate"}}}
+				case StopFenceEdgeOneRefresh:
+					fence.Scope = FenceScope{Kind: "app", ResourceID: "app-one"}
+					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), EdgeOne: EdgeOneSafety{RefreshJournal: "journal", Deadline: time.Unix(200, 0).UTC()}}}
 				}
 				state.StopFence = &fence
 				if err := Validate(state); err != nil {
@@ -40,16 +54,28 @@ func TestSafetySchemaContract(t *testing.T) {
 		state := EmptyState()
 		state.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
 		fence := validStopFence(StopFenceContraction)
+		state.StopFenceSequence = fence.FenceGeneration
 		fence.Kind = StopFenceKind("unknown")
 		state.StopFence = &fence
 		if err := Validate(state); err == nil {
 			t.Fatal("Validate() accepted unknown fence kind")
 		}
 		fence = validStopFence(StopFenceContraction)
+		state.StopFenceSequence = fence.FenceGeneration
 		fence.SafetyGenerations[0].Generation = 2
 		state.StopFence = &fence
 		if err := Validate(state); err == nil {
 			t.Fatal("Validate() accepted stop fence bound to stale safety generation")
+		}
+		state = EmptyState()
+		state.GlobalClose.Generation = 9
+		fence = validStopFence(StopFenceContraction)
+		state.StopFenceSequence = fence.FenceGeneration
+		fence.SafetyGenerations = []MarkerGeneration{{Kind: "global_close", Generation: 9}}
+		fence.Contraction.Authorities = []MarkerGeneration{{Kind: "global_close", Generation: 9}}
+		state.StopFence = &fence
+		if err := Validate(state); err == nil {
+			t.Fatal("Validate() accepted retained inactive global generation as contraction authority")
 		}
 	})
 
@@ -110,6 +136,7 @@ func TestMaintenanceCompoundTransitionsAreAtomicAndNarrow(t *testing.T) {
 		next.Resources = append([]ResourceSafety(nil), current.Resources...)
 		next.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
 		next.MaintenancePending = validTransition(1)
+		next.Resources[0].GenerationSequence = 1
 		next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "maintenance"}
 		if err := validateTransition(RoleMaintenance, current, next, TransitionProof{}); err == nil {
 			t.Fatal("ordinary maintenance role created initial marker without atomic closure")
@@ -146,9 +173,10 @@ func TestMaintenanceCompoundTransitionsAreAtomicAndNarrow(t *testing.T) {
 func TestSafetyConvergenceProofs(t *testing.T) {
 	t.Run("closing_normalizes_to_exact_unpublished_generation", func(t *testing.T) {
 		current := EmptyState()
-		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Closing: &GenerationMarker{Kind: MarkerClosing, Generation: 3, Reason: "close"}}}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 3, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Closing: &GenerationMarker{Kind: MarkerClosing, Generation: 3, Reason: "close"}}}
 		next := current
 		next.Resources = append([]ResourceSafety(nil), current.Resources...)
+		next.Resources[0].GenerationSequence = 4
 		next.Resources[0].Closing = nil
 		next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 4, Reason: "closed"}
 		if err := validateTransition(RoleContraction, current, next, TransitionProof{}); err == nil {
@@ -162,12 +190,13 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 	t.Run("stop_clear_binds_every_unpublished_generation", func(t *testing.T) {
 		current := EmptyState()
 		current.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
-		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 2, Reason: "closed"}}}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 2, Reason: "closed"}}}
 		fence := validStopFence(StopFenceContraction)
+		current.StopFenceSequence = fence.FenceGeneration
 		current.StopFence = &fence
 		next := current
 		next.StopFence = nil
-		proof := &StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: digest("closure"), AllChildrenExited: true, AllAppsUnpublished: true, NginxTestPassed: true}
+		proof := &StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, FenceDigest: StopFenceDigest(fence), InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: digest("closure"), AllChildrenExited: true, AllAppsUnpublished: true, NginxTestPassed: true}
 		proof.UnpublishedGenerations = map[string]uint64{"app-a": 2}
 		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: proof}); err == nil {
 			t.Fatal("stop fence cleared without disk, worker, listener, and runtime closure")
@@ -178,6 +207,11 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 		proof.RuntimeClosed = true
 		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: proof}); err != nil {
 			t.Fatalf("stop convergence: %v", err)
+		}
+		replay := next
+		replay.StopFence = &fence
+		if err := validateTransition(RoleContraction, next, replay, TransitionProof{}); err == nil {
+			t.Fatal("cleared stop-fence generation was reused")
 		}
 		orphanCurrent := current
 		orphanCurrent.Resources = append([]ResourceSafety(nil), current.Resources...)
@@ -192,7 +226,7 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 	t.Run("global_close_remains_while_ownership_orphan_exists", func(t *testing.T) {
 		current := EmptyState()
 		current.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 3}
-		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOrphan, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 4, Reason: "closed"}}}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 4, State: ResourceActive, Ownership: OwnershipOrphan, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 4, Reason: "closed"}}}
 		proof := &GlobalConvergenceProof{Generation: 3, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), UnpublishedGenerations: map[string]uint64{"app-a": 4}, NginxTestPassed: true, RuntimeClosed: true}
 		if validGlobalClearProof(current, proof) {
 			t.Fatal("global close convergence accepted an ownership orphan")
@@ -200,8 +234,9 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 	})
 	t.Run("headscale_expiry_clear_requires_matching_reactivation", func(t *testing.T) {
 		current := EmptyState()
+		current.Headscale.GenerationSequence = 4
 		current.Headscale.CertificateExpiry = &DeadlineMarker{Generation: 4, Deadline: time.Now().UTC().Add(-time.Minute), Binding: "certificate"}
-		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PlanID: "plan", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		next := current
 		next.Headscale.CertificateExpiry = nil
 		next.Headscale.Reactivating = nil
@@ -215,10 +250,41 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 	})
 }
 
+func TestSafetyGenerationHighWaterPreventsMarkerReuse(t *testing.T) {
+	now := time.Now().UTC()
+	current := EmptyState()
+	current.Resources = []ResourceSafety{{
+		ResourceID: "app-a", GenerationSequence: 4, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"),
+		StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 3, Reason: "closed"},
+		Reactivating:      &Reactivating{Generation: 4, PriorGeneration: 3, PlanID: "plan", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotPresent, Generation: 3}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: now.Add(time.Hour), ACLUntil: now.Add(time.Hour)},
+	}}
+	cleared := current
+	cleared.Resources = append([]ResourceSafety(nil), current.Resources...)
+	cleared.Resources[0].StickyUnpublished = nil
+	cleared.Resources[0].Reactivating = nil
+	proof := &ReactivationConvergenceProof{ResourceID: "app-a", PlanID: "plan", Generation: 4, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), RuntimeClosureDigest: digest("closure")}
+	if err := validateTransition(RolePublish, current, cleared, TransitionProof{Reactivation: proof}); err != nil {
+		t.Fatalf("clear exact reactivation: %v", err)
+	}
+	reused := cleared
+	reused.Resources = append([]ResourceSafety(nil), cleared.Resources...)
+	reused.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 3, Reason: "reused"}
+	if err := validateTransition(RoleContraction, cleared, reused, TransitionProof{}); err == nil {
+		t.Fatal("cleared marker generation was reused")
+	}
+	fresh := cleared
+	fresh.Resources = append([]ResourceSafety(nil), cleared.Resources...)
+	fresh.Resources[0].GenerationSequence = 5
+	fresh.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 5, Reason: "fresh"}
+	if err := validateTransition(RoleContraction, cleared, fresh, TransitionProof{}); err != nil {
+		t.Fatalf("fresh marker generation rejected: %v", err)
+	}
+}
+
 func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 	t.Run("ownership_can_only_contract_to_orphan", func(t *testing.T) {
 		current := EmptyState()
-		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
 		next := current
 		next.Resources = append([]ResourceSafety(nil), current.Resources...)
 		next.Resources[0].Ownership = OwnershipOrphan
@@ -244,7 +310,7 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 
 	t.Run("delete_cannot_erase_active_or_orphan_safety_identity", func(t *testing.T) {
 		current := EmptyState()
-		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
 		next := current
 		next.Resources = nil
 		proof := &DeleteConvergenceProof{ResourceID: "app-a", OwnershipDigest: digest("owner"), RuntimeClosureDigest: digest("closure")}
@@ -275,6 +341,7 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 
 		current = EmptyState()
 		upgrade := validStopFence(StopFenceGenerationUpgrade)
+		current.StopFenceSequence = upgrade.FenceGeneration
 		current.StopFence = &upgrade
 		next = current
 		contraction := validStopFence(StopFenceContraction)
@@ -284,7 +351,8 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 		}
 
 		current = EmptyState()
-		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PlanID: "headscale", ControlGeneration: 1, CertificateGeneration: 1, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		current.Headscale.GenerationSequence = 1
+		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: "headscale", ControlGeneration: 1, CertificateGeneration: 1, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		next = current
 		next.Headscale.Reactivating = nil
 		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
@@ -322,7 +390,7 @@ func TestSafetyPriorityAndGuardContract(t *testing.T) {
 				state := base
 				state.Resources = append([]ResourceSafety(nil), base.Resources...)
 				tc.mutate(&state)
-				got := effectivePriority(state, resourceID)
+				got := effectivePriority(state, resourceID, time.Now().UTC())
 				if got != tc.want {
 					t.Fatalf("priority=%q want %q", got, tc.want)
 				}
@@ -355,6 +423,7 @@ func TestSafetyPriorityAndGuardContract(t *testing.T) {
 		resource = &state.Resources[0]
 		resource.ChallengePending = nil
 		resource.Reactivating = validAppReactivating(resource.StickyUnpublished)
+		resource.GenerationSequence = resource.Reactivating.Generation
 		decision = Check(GuardInput{State: state, Action: ActionReactivate, ResourceID: resource.ResourceID, CandidateDigest: resource.Reactivating.CandidateDigest, PlanID: resource.Reactivating.PlanID, Generation: resource.Reactivating.Generation, CandidateBundle: resource.Reactivating.CandidateBundle, Now: now})
 		if !decision.Allowed {
 			t.Fatalf("reactivation decision=%#v", decision)
@@ -389,14 +458,16 @@ func TestSafetyPriorityAndGuardContract(t *testing.T) {
 		}
 		challenge := *state.Resources[0].ChallengePending
 		challenge.BaseMarkers = []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}
+		state.Headscale.GenerationSequence = challenge.Generation
 		state.Headscale.ChallengePending = &challenge
 		headscale := Check(GuardInput{State: state, Action: ActionHeadscaleChallenge, CandidateDigest: state.Headscale.ChallengePending.BootstrapIdentity, PlanID: state.Headscale.ChallengePending.PlanID, Generation: state.Headscale.ChallengePending.Generation, Now: time.Now().UTC()})
 		if !headscale.Allowed {
 			t.Fatalf("Headscale challenge blocked by App-only global close: %#v", headscale)
 		}
 		state.Headscale.ChallengePending = nil
+		state.Headscale.GenerationSequence = 4
 		state.Headscale.CertificateExpiry = &DeadlineMarker{Generation: 4, Deadline: time.Now().UTC().Add(-time.Minute), Binding: "headscale-cert"}
-		state.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PlanID: "headscale-reactivate", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("headscale-candidate"), CandidateBundle: digest("headscale-bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		state.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "headscale-reactivate", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("headscale-candidate"), CandidateBundle: digest("headscale-bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		headscale = Check(GuardInput{State: state, Action: ActionHeadscaleReactivate, CandidateDigest: state.Headscale.Reactivating.CandidateDigest, CandidateBundle: state.Headscale.Reactivating.CandidateBundle, PlanID: state.Headscale.Reactivating.PlanID, Generation: state.Headscale.Reactivating.Generation, ControlGeneration: 7, CertificateGeneration: 4, Now: time.Now().UTC()})
 		if !headscale.Allowed {
 			t.Fatalf("matching Headscale reactivation blocked: %#v", headscale)
@@ -418,6 +489,54 @@ func TestSafetyPriorityAndGuardContract(t *testing.T) {
 			t.Fatal("duplicate guard registration passed")
 		}
 	})
+}
+
+func TestSafetyOwnershipAuthorityIsExactAndFailClosed(t *testing.T) {
+	state := EmptyState()
+	state.Resources = []ResourceSafety{{ResourceID: "app-one", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner")}}
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{"app-one": digest("owner")}); err != nil {
+		t.Fatalf("matching ownership authority rejected: %v", err)
+	}
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{}); err == nil {
+		t.Fatal("owned safety identity survived a missing ownership record")
+	}
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{"app-one": digest("different")}); err == nil {
+		t.Fatal("one-sided ownership digest was accepted")
+	}
+	state.Resources[0].Ownership = OwnershipOrphan
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{}); err == nil {
+		t.Fatal("missing exact ownership inventory was accepted as an orphan")
+	}
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{"app-one": digest("owner")}); err != nil {
+		t.Fatalf("record-backed orphan authority was rejected: %v", err)
+	}
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{"foreign": digest("foreign")}); err == nil {
+		t.Fatal("unrepresented ownership record was omitted from safety inventory")
+	}
+	state.Resources[0].Ownership = OwnershipOwned
+	fence := validStopFence(StopFenceContraction)
+	state.StopFenceSequence = fence.FenceGeneration
+	state.StopFence = &fence
+	if err := validateOwnershipAuthority(state, testOwnershipAuthority{"app-one": digest("owner")}); err == nil {
+		t.Fatal("stop fence accepted an inventory digest not derived from exact ownership authority")
+	}
+	state.StopFence = nil
+
+	before := EmptyState()
+	before.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Reactivating: &Reactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().Add(time.Hour), ACLUntil: time.Now().Add(time.Hour)}}}
+	after := before
+	after.Resources = append([]ResourceSafety(nil), before.Resources...)
+	after.Resources[0].OwnershipDigest = digest("expanded-owner")
+	proof := &OwnershipConvergenceProof{ResourceID: "app-one", IntentRef: "plan", Generation: 2, BeforeDigest: digest("owner"), AfterDigest: digest("expanded-owner")}
+	if err := validateTransition(RoleOwnershipActivation, before, after, TransitionProof{Ownership: proof}); err != nil {
+		t.Fatalf("journal-bound owned-to-owned rebind rejected: %v", err)
+	}
+	if err := validateOwnershipAuthority(after, testOwnershipAuthority{"app-one": digest("expanded-owner")}); err != nil {
+		t.Fatalf("rebound safety did not converge with ownership inventory: %v", err)
+	}
+	if err := validateTransition(RoleOwnershipActivation, before, after, TransitionProof{}); err == nil {
+		t.Fatal("ownership digest changed without exact activation proof")
+	}
 }
 
 func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
@@ -456,7 +575,7 @@ func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
 		if err != nil || persisted.Checksum == "" || persisted.GlobalClose.Phase != GlobalCloseEmergency {
 			t.Fatalf("Read()=%#v,%v", persisted, err)
 		}
-		emergencyProof := EmergencyClearProof{Generation: 1, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
+		emergencyProof := EmergencyClearProof{Generation: 1, InventoryDigest: OwnershipInventoryDigest(map[string]string{}), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
 		clearedAuthority := EmergencyState{Sequence: 4, NormalInitialized: true, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}, ClearProof: &emergencyProof}
 		if err := emergency.Commit(lease, RoleGlobalCloseConvergence, 3, clearedAuthority); err != nil {
 			t.Fatal(err)
@@ -490,19 +609,35 @@ func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
 func TestEmergencyGlobalAndFenceAuthoritiesConvergeSequentially(t *testing.T) {
 	global := GlobalClose{Phase: GlobalCloseEmergency, Generation: 1}
 	fence := validEmergencyFenceForTest(1, 2)
-	current := EmergencyState{Sequence: 2, GlobalClose: global, StopFence: &fence}
-	proof := &EmergencyClearProof{Generation: 1, StopFenceGeneration: 2, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
-	fenceCleared := EmergencyState{Sequence: 3, GlobalClose: global, ClearProof: proof}
+	current := EmergencyState{Sequence: 2, StopFenceSequence: 2, ReservedStopFenceKind: StopFenceContraction, GlobalClose: global, StopFence: &fence}
+	proof := &EmergencyClearProof{Generation: 1, StopFenceGeneration: 2, StopFenceDigest: EmergencyFenceDigest(fence), InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
+	fenceCleared := EmergencyState{Sequence: 3, StopFenceSequence: 2, ReservedStopFenceKind: StopFenceContraction, GlobalClose: global, ClearProof: proof}
 	if !validEmergencyTransition(RoleJournalConvergence, current, fenceCleared) {
 		t.Fatal("journal convergence could not clear a fence while preserving global close")
 	}
-	globalCleared := EmergencyState{Sequence: 4, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}, ClearProof: proof}
+	globalCleared := EmergencyState{Sequence: 4, StopFenceSequence: 2, ReservedStopFenceKind: StopFenceContraction, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}, ClearProof: proof}
 	if !validEmergencyTransition(RoleGlobalCloseConvergence, fenceCleared, globalCleared) {
 		t.Fatal("global convergence could not clear global close after fence convergence")
 	}
 }
 
 func TestEmergencyBackingSurvivesSlotCorruptionAndCommitsWithoutAllocation(t *testing.T) {
+	t.Run("non_contraction_fence_reserves_emergency_high_water", func(t *testing.T) {
+		store, manager, lease, _ := newEmergencyStore(t, nil)
+		defer closeEmergencyStore(t, store, manager, lease)
+		reserved, err := ReserveEmergencyStopFenceGeneration(lease, store, RoleIngressActivation, StopFenceIngressActivation, digest("fence-reservation"), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reserved.StopFenceSequence != 1 || reserved.ReservedStopFenceKind != StopFenceIngressActivation || reserved.StopFence != nil {
+			t.Fatalf("reserved emergency fence authority = %#v", reserved)
+		}
+		retry, err := ReserveEmergencyStopFenceGeneration(lease, store, RoleIngressActivation, StopFenceIngressActivation, digest("fence-reservation"), 0)
+		if err != nil || retry.Sequence != reserved.Sequence || retry.StopFenceSequence != reserved.StopFenceSequence {
+			t.Fatalf("exact reservation retry allocated a new generation: %#v, %v", retry, err)
+		}
+	})
+
 	t.Run("slot_recovery_and_zero_allocation_commit", func(t *testing.T) {
 		store, manager, lease, path := newEmergencyStore(t, nil)
 		defer closeEmergencyStore(t, store, manager, lease)
@@ -516,8 +651,8 @@ func TestEmergencyBackingSurvivesSlotCorruptionAndCommitsWithoutAllocation(t *te
 		if err := store.Commit(lease, RoleContraction, 2, EmergencyState{Sequence: 3, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}}); !errors.Is(err, ErrEmergencyState) {
 			t.Fatalf("wrong clear role error = %v", err)
 		}
-		fence := validEmergencyFenceForTest(1, 2)
-		second := EmergencyState{Sequence: 3, GlobalClose: first.GlobalClose, StopFence: &fence}
+		fence := validEmergencyFenceForTest(1, 1)
+		second := EmergencyState{Sequence: 3, StopFenceSequence: 1, ReservedStopFenceKind: StopFenceContraction, GlobalClose: first.GlobalClose, StopFence: &fence}
 		if err := store.Commit(lease, RoleContraction, 2, second); err != nil {
 			t.Fatal(err)
 		}
@@ -715,13 +850,17 @@ func validAppReactivating(sticky *GenerationMarker) *Reactivating {
 	if sticky != nil {
 		snapshots[0] = MarkerSnapshot{Kind: MarkerStickyUnpublished, State: SnapshotPresent, Generation: sticky.Generation}
 	}
+	priorGeneration := uint64(0)
+	if sticky != nil {
+		priorGeneration = sticky.Generation
+	}
 	now := time.Now().UTC()
-	return &Reactivating{Generation: 1, PlanID: "plan", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: snapshots, CertificateUntil: now.Add(time.Hour), ACLUntil: now.Add(time.Hour)}
+	return &Reactivating{Generation: priorGeneration + 1, PriorGeneration: priorGeneration, PlanID: "plan", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: snapshots, CertificateUntil: now.Add(time.Hour), ACLUntil: now.Add(time.Hour)}
 }
 
 func stateWithResource() State {
 	snapshots := []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotPresent, Generation: 1}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}
-	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Host: "app.example.com", TokenPath: "/var/lib/lanpanel/token", Webroot: "/var/lib/lanpanel/webroot", BootstrapIdentity: digest("bootstrap"), BaseMarkers: append([]MarkerSnapshot(nil), snapshots...)}}}}
+	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Host: "app.example.com", TokenPath: "/var/lib/lanpanel/token", Webroot: "/var/lib/lanpanel/webroot", BootstrapIdentity: digest("bootstrap"), BaseMarkers: append([]MarkerSnapshot(nil), snapshots...)}}}}
 }
 
 func validTransition(generation uint64) *TransitionMarker {
@@ -733,6 +872,16 @@ func digest(seed string) string {
 		sum = strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 	}
 	return "sha256:" + sum
+}
+
+type testOwnershipAuthority map[string]string
+
+func (authority testOwnershipAuthority) InventoryAuthority() (map[string]string, bool, error) {
+	copy := make(map[string]string, len(authority))
+	for id, digest := range authority {
+		copy[id] = digest
+	}
+	return copy, true, nil
 }
 
 func newSafetyStore(t *testing.T) (*Store, *EmergencyStore, *locks.Manager, *locks.Lease) {
@@ -756,7 +905,7 @@ func newSafetyStore(t *testing.T) (*Store, *EmergencyStore, *locks.Manager, *loc
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenStore(StoreConfig{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: lease.Authority()})
+	store, err := OpenStore(StoreConfig{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: lease.Authority(), Ownership: testOwnershipAuthority{}})
 	if err != nil {
 		t.Fatal(err)
 	}

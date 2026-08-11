@@ -40,6 +40,29 @@ func TestDurableJobResultContract(t *testing.T) {
 		}
 	})
 
+	t.Run("terminal_evidence_is_bounded_and_error_codes_are_closed", func(t *testing.T) {
+		now := time.Unix(1700000000, 0).UTC()
+		record, err := NewReserved(Spec{Operation: "publish", Target: "resource/app-one", ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{2}, 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err = Start(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completion := Completion{Result: ResultFailed, Postconditions: []Postcondition{{Kind: "mutation_not_started", Status: PostconditionVerified, Identity: "app-one"}}, ErrorCode: "sentinel_secret_value"}
+		if _, err := Finish(record, completion, now.Add(time.Second)); err == nil {
+			t.Fatal("arbitrary secret-shaped error text entered durable job history")
+		}
+		completion.ErrorCode = "activation_contracted"
+		for index := 0; index <= MaximumModifiedPaths; index++ {
+			completion.ModifiedPaths = append(completion.ModifiedPaths, "/var/lib/lanpanel/path-"+string(rune('a'+index)))
+		}
+		if _, err := Finish(record, completion, now.Add(time.Second)); err == nil {
+			t.Fatal("unbounded modified-path evidence entered durable job history")
+		}
+	})
+
 	t.Run("entropy_failure_prevents_job_creation", func(t *testing.T) {
 		if _, err := NewReserved(Spec{Operation: "publish", Target: "resource/app", ActorIdentity: "session"}, time.Now(), errorReader{}); err == nil {
 			t.Fatal("job ID entropy failure was ignored")

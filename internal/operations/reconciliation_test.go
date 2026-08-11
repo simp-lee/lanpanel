@@ -28,11 +28,12 @@ func TestExactJournalReconciliationIsClosedAndFailClosed(t *testing.T) {
 		Kind:               JournalAppContraction,
 		Operation:          Publish,
 		InstallationID:     testOperationInstallation().InstallationID,
-		Target:             "resource/app-one",
+		Target:             "resource/res_00000000000000000000000000000001",
 		Generation:         7,
 		Deadline:           now.Add(time.Hour),
 		ArtifactDigest:     testDigest("artifact"),
 		SafetyMarkerDigest: testDigest("marker"),
+		ResourceIDs:        []string{"res_00000000000000000000000000000001"},
 		ChildIDs:           []string{"child-one"},
 		Phase:              JournalActive,
 	}
@@ -46,6 +47,7 @@ func TestExactJournalReconciliationIsClosedAndFailClosed(t *testing.T) {
 	local := base
 	local.Kind = JournalNonIngressLocalCommit
 	local.Operation = Maintenance
+	local.ResourceIDs = nil
 	local.Phase = JournalTerminal
 	decision, err = decideExactReconciliation(reconciliationDocument(t, local, []ChildRecord{child}), local.ID, observation)
 	if err != nil || decision.Action != ReconcileFinalizeNonIngressCommit || decision.Target != local.Target {
@@ -124,6 +126,13 @@ func reconciliationDocument(t *testing.T, journal JournalRecord, children []Chil
 	put(reservationKey(journal.JobID), reconciliationIntent(journal, now))
 	put("journals/"+journal.ID, journal)
 	for _, child := range children {
+		child.InstallationID = journal.InstallationID
+		child.Operation = journal.Operation
+		child.Target = journal.Target
+		child.IntentGeneration = journal.Generation
+		child.InputDigest = testDigest("input")
+		child.ArtifactDigest = journal.ArtifactDigest
+		child.Deadline = journal.Deadline
 		put("children/"+child.ID, child)
 	}
 	return persist.Document{SchemaVersion: "lanpanel.normal.v1", Revision: 1, Entries: entries}
@@ -131,16 +140,19 @@ func reconciliationDocument(t *testing.T, journal JournalRecord, children []Chil
 
 func reconciliationIntent(journal JournalRecord, now time.Time) Reservation {
 	return Reservation{
-		SchemaVersion:    "lanpanel.operation.reservation.v1",
-		JobID:            journal.JobID,
-		PlanID:           "plan-one",
-		Operation:        journal.Operation,
-		Target:           journal.Target,
-		Phase:            PhaseLocalIntent,
-		SafetyDigest:     testDigest("safety"),
-		CreatedAt:        now,
-		IntentGeneration: journal.Generation,
+		SchemaVersion:       "lanpanel.operation.reservation.v1",
+		JobID:               journal.JobID,
+		PlanID:              "plan-one",
+		AdmissionSource:     AdmissionPlan,
+		Operation:           journal.Operation,
+		Target:              journal.Target,
+		Phase:               PhaseLocalIntent,
+		SafetyDigest:        testDigest("safety"),
+		JournalSafetyDigest: journal.SafetyMarkerDigest,
+		CreatedAt:           now,
+		IntentGeneration:    journal.Generation,
 		Consumption: &ConsumptionSnapshot{
+			Source:             AdmissionPlan,
 			ConfirmationDigest: testDigest("confirmation"),
 			ConfirmedAt:        now,
 			SafetyDigest:       testDigest("safety"),

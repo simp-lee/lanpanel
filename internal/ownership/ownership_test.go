@@ -53,6 +53,23 @@ func TestOwnershipEvidenceContract(t *testing.T) {
 		if _, err := store.Write(context.Background(), lease, WriterRole("other"), 0, record); err == nil {
 			t.Fatal("Write() with unknown writer succeeded")
 		}
+		otherRoot := t.TempDir()
+		if err := os.Chmod(otherRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		otherManager, err := locks.Open(locks.Config{RootPath: otherRoot, Owner: store.config.Owner.UID, Group: store.config.Owner.GID, Mode: 0o700})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer otherManager.Close()
+		otherLease, err := otherManager.Acquire(context.Background(), locks.Exposure)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer otherLease.Release()
+		if _, err := store.Write(context.Background(), otherLease, ActivationWriter, 0, record); err == nil {
+			t.Fatal("Write() accepted an exposure lease from another installation authority")
+		}
 	})
 
 	t.Run("corrupt_or_symlink_record_is_never_inventory_authority", func(t *testing.T) {
@@ -163,7 +180,7 @@ func newTestStore(t *testing.T) (*Store, *locks.Manager, *locks.Lease, Record) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := Open(Config{RootPath: root, StagingPath: staging, RecordsPath: records, Owner: owner, Policy: Policy{ManagedRoots: []string{managed}}})
+	store, err := Open(Config{RootPath: root, StagingPath: staging, RecordsPath: records, Owner: owner, Policy: Policy{ManagedRoots: []string{managed}}, LockAuthority: manager.Authority()})
 	if err != nil {
 		t.Fatal(err)
 	}

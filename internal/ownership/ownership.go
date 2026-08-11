@@ -76,11 +76,12 @@ type WriterRole string
 const ActivationWriter WriterRole = "activation_writer"
 
 type Config struct {
-	RootPath    string
-	StagingPath string
-	RecordsPath string
-	Owner       filetxn.Owner
-	Policy      Policy
+	RootPath      string
+	StagingPath   string
+	RecordsPath   string
+	Owner         filetxn.Owner
+	Policy        Policy
+	LockAuthority locks.Authority
 }
 
 type Store struct {
@@ -127,7 +128,7 @@ func Open(config Config) (*Store, error) {
 func (store *Store) Close() error { return errors.Join(store.txn.Close(), unix.Close(store.recordsFD)) }
 
 func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRole, expectedRevision uint64, record Record) (filetxn.Result, error) {
-	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
+	if lease == nil || lease.Authority() != store.config.LockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("ownership write requires the shared exposure lock")
 	}
 	if role != ActivationWriter {
@@ -197,6 +198,21 @@ func (store *Store) Read(resourceID string) (Record, error) {
 		return Record{}, fmt.Errorf("invalid resource ID")
 	}
 	return store.readFile(resourceID + ".json")
+}
+
+// InventoryAuthority returns the complete checksum authority used by the
+// independent safety tree. Any invalid record makes the inventory incomplete;
+// callers must contract rather than infer or narrow it.
+func (store *Store) InventoryAuthority() (map[string]string, bool, error) {
+	inventory, err := store.Inventory()
+	if err != nil {
+		return nil, false, err
+	}
+	result := make(map[string]string, len(inventory.Records))
+	for _, record := range inventory.Records {
+		result[record.ResourceID] = record.Checksum
+	}
+	return result, inventory.Complete, nil
 }
 
 func (store *Store) Inventory() (Inventory, error) {
@@ -398,6 +414,9 @@ func (store *Store) validateDirectories() error {
 func validateConfig(config Config) error {
 	if config.Owner.UID != uint32(os.Geteuid()) || config.Owner.GID != uint32(os.Getegid()) {
 		return fmt.Errorf("ownership tree must be helper-owned")
+	}
+	if !config.LockAuthority.Valid() {
+		return fmt.Errorf("ownership store requires the installation lock authority")
 	}
 	for label, path := range map[string]string{"root": config.RootPath, "staging": config.StagingPath, "records": config.RecordsPath} {
 		if path == "" || path != strings.TrimSpace(path) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
