@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit
+.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/child ./internal/domain ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/persist ./internal/plans ./internal/reservations ./internal/roles ./internal/safety
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/child ./internal/dependencies ./internal/domain ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/persist ./internal/plans ./internal/release ./internal/reservations ./internal/roles ./internal/safety
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/preflight ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/ui internal/uistate internal/verify internal/workflow
 
@@ -66,4 +66,8 @@ ga-helper-boundary-audit:
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"([^" ]*/)?(sh|bash|dash)"|"([^" ]*/)?(sudo|doas|pkexec|su)"' internal cmd; then echo 'shell or sudo-like executable remains in production' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -n -E 'Command|Arguments|Argv|Unit|Path' internal/helperproto/types.go; then echo 'generic command, unit, argv, or path entered helper request schema' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit
+ga-release-identity-selftest:
+	$(GO) test -count=1 ./internal/release ./internal/dependencies
+	@set -eu; if grep -R -n -Ei --include='*.go' --exclude='*_test.go' 'ed25519|signature|signing[_-]token|key[_-]id' internal/release internal/dependencies; then echo 'signing ceremony entered checksum-only release identity' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest
