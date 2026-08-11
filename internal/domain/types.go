@@ -1,5 +1,5 @@
-// Package domain defines the small shared P0 contract used by CLI renderers,
-// workflow results, diagnostics, exposure summaries, UI state, and UI pages.
+// Package domain defines shared typed contracts. DecodeInstallation is the
+// sole installation-owned Community GA schema and rejects every other shape.
 package domain
 
 import (

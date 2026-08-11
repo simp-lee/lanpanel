@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy p0-static-audit e2e-production-ui-smoke e2e e2e-walkthrough e2e-walkthrough-all p0-release-gate
+.PHONY: build test vet lint check tidy ga-test-cases ga-test-cases-selftest p0-static-audit e2e-production-ui-smoke e2e e2e-walkthrough e2e-walkthrough-all p0-release-gate
 
 GO ?= go
 PKGS ?= ./...
@@ -26,6 +26,14 @@ lint:
 
 tidy:
 	$(GO) mod tidy
+
+ga-test-cases:
+	@test -n "$(SCOPE)" || { echo "SCOPE must name one exact implementing step" >&2; exit 2; }
+	$(GO) run ./internal/qualification/cases/cmd/ga-test-cases -scope "$(SCOPE)" -go "$(GO)" -- $(PKGS)
+
+ga-test-cases-selftest:
+	$(GO) test -count=1 ./internal/qualification/cases
+	$(GO) run ./internal/qualification/cases/cmd/ga-test-cases -scope S1 -go "$(GO)" -- ./internal/domain ./internal/reservations ./internal/qualification/cases >/dev/null
 
 check: build test vet p0-static-audit
 
