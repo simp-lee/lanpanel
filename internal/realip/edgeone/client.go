@@ -9,9 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"lanpanel/internal/realip"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 )
@@ -195,111 +193,6 @@ func Authorization(secretID string, secretKey string, now time.Time, payload []b
 	secretSigning := hmacSHA256(secretService, []byte("tc3_request"))
 	signature := hex.EncodeToString(hmacSHA256(secretSigning, []byte(stringToSign)))
 	return fmt.Sprintf("%s Credential=%s/%s, SignedHeaders=%s, Signature=%s", AlgorithmTC3HMACSHA256, secretID, credentialScope, signedHeaders, signature), nil
-}
-
-func BuildState(profileName string, zoneID string, info *OriginACLInfo, domains []string, now time.Time) (realip.State, error) {
-	profileName = strings.TrimSpace(profileName)
-	zoneID = strings.TrimSpace(zoneID)
-	if profileName == "" {
-		return realip.State{}, fmt.Errorf("EdgeOne realip profile name is required")
-	}
-	if zoneID == "" {
-		return realip.State{}, fmt.Errorf("EdgeOne zone_id is required for profile %s", profileName)
-	}
-	if info == nil {
-		return realip.State{}, fmt.Errorf("OriginACLInfo is missing for profile %s", profileName)
-	}
-	status := strings.TrimSpace(info.Status)
-	switch status {
-	case OriginACLStatusOnline, OriginACLStatusUpdating:
-	default:
-		return realip.State{}, fmt.Errorf("OriginACLInfo.Status for profile %s must be online or updating, got %q", profileName, info.Status)
-	}
-	if info.CurrentOriginACL == nil {
-		return realip.State{}, fmt.Errorf("CurrentOriginACL is missing for profile %s", profileName)
-	}
-	if status == OriginACLStatusUpdating && info.NextOriginACL == nil {
-		return realip.State{}, fmt.Errorf("NextOriginACL is required when OriginACLInfo.Status is updating for profile %s", profileName)
-	}
-	currentAddresses := originACLAddresses(info.CurrentOriginACL)
-	if len(currentAddresses) == 0 {
-		return realip.State{}, fmt.Errorf("CurrentOriginACL.EntireAddresses is empty for profile %s", profileName)
-	}
-	missingDomains := realip.MissingL7HostCoverage(domains, info.L7Hosts)
-	if len(missingDomains) > 0 {
-		return realip.State{}, fmt.Errorf("OriginACLInfo.L7Hosts does not cover app domains for profile %s: %s", profileName, strings.Join(missingDomains, ", "))
-	}
-	currentCIDRs, err := realip.CanonicalCIDRs(currentAddresses)
-	if err != nil {
-		return realip.State{}, fmt.Errorf("validate current EdgeOne origin ACL for profile %s: %w", profileName, err)
-	}
-	nextCIDRs := []string(nil)
-	trustedInput := append([]string(nil), currentCIDRs...)
-	if info.NextOriginACL != nil {
-		nextAddresses := originACLAddresses(info.NextOriginACL)
-		if len(nextAddresses) == 0 {
-			return realip.State{}, fmt.Errorf("NextOriginACL.EntireAddresses is empty for profile %s", profileName)
-		}
-		nextCIDRs, err = realip.CanonicalCIDRs(nextAddresses)
-		if err != nil {
-			return realip.State{}, fmt.Errorf("validate next EdgeOne origin ACL for profile %s: %w", profileName, err)
-		}
-		trustedInput = append(trustedInput, nextCIDRs...)
-	}
-	trustedCIDRs, err := realip.CanonicalCIDRs(trustedInput)
-	if err != nil {
-		return realip.State{}, fmt.Errorf("validate trusted EdgeOne origin ACL set for profile %s: %w", profileName, err)
-	}
-	l7Hosts := append([]string(nil), info.L7Hosts...)
-	slices.Sort(l7Hosts)
-	return realip.State{
-		ProfileName:       profileName,
-		Provider:          "edgeone",
-		ZoneID:            zoneID,
-		OriginACLStatus:   status,
-		OriginACLFamily:   strings.TrimSpace(info.OriginACLFamily),
-		CurrentVersion:    strings.TrimSpace(info.CurrentOriginACL.Version),
-		CurrentActiveTime: strings.TrimSpace(info.CurrentOriginACL.ActiveTime),
-		NextVersion:       originACLVersion(info.NextOriginACL),
-		NextActiveTime:    originACLActiveTime(info.NextOriginACL),
-		PlannedActiveTime: originACLPlannedActiveTime(info.NextOriginACL),
-		L7Hosts:           l7Hosts,
-		CurrentCIDRs:      currentCIDRs,
-		NextCIDRs:         nextCIDRs,
-		TrustedCIDRs:      trustedCIDRs,
-		UpdatedAt:         now.UTC(),
-	}, nil
-}
-
-func originACLAddresses(acl *OriginACL) []string {
-	if acl == nil {
-		return nil
-	}
-	addresses := make([]string, 0, len(acl.EntireAddresses.IPv4)+len(acl.EntireAddresses.IPv6))
-	addresses = append(addresses, acl.EntireAddresses.IPv4...)
-	addresses = append(addresses, acl.EntireAddresses.IPv6...)
-	return addresses
-}
-
-func originACLVersion(acl *OriginACL) string {
-	if acl == nil {
-		return ""
-	}
-	return strings.TrimSpace(acl.Version)
-}
-
-func originACLActiveTime(acl *OriginACL) string {
-	if acl == nil {
-		return ""
-	}
-	return strings.TrimSpace(acl.ActiveTime)
-}
-
-func originACLPlannedActiveTime(acl *OriginACL) string {
-	if acl == nil {
-		return ""
-	}
-	return strings.TrimSpace(acl.PlannedActiveTime)
 }
 
 func sha256Hex(data []byte) string {

@@ -1,5 +1,0 @@
-version: 2.0.10
-source: https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js
-sha256: 71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de
-checked_at: 2026-06-22
-note: htmx v4 is beta; P0 vendors the current stable 2.x asset locally.

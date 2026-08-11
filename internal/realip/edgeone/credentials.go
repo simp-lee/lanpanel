@@ -3,7 +3,6 @@ package edgeone
 import (
 	"fmt"
 	"io/fs"
-	"lanpanel/internal/realip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -273,16 +272,5 @@ func fileSysUintField(info fs.FileInfo, fieldNames ...string) (uint64, bool) {
 		return uint64(value), true
 	default:
 		return 0, false
-	}
-}
-
-func ProfileConfig(name string, zoneID string, envFile string, refreshInterval string, domains []string) realip.ProfileConfig {
-	return realip.ProfileConfig{
-		Name:            strings.TrimSpace(name),
-		Provider:        "edgeone",
-		ZoneID:          strings.TrimSpace(zoneID),
-		EnvFile:         strings.TrimSpace(envFile),
-		RefreshInterval: strings.TrimSpace(refreshInterval),
-		Domains:         append([]string(nil), domains...),
 	}
 }

@@ -1,68 +1,17 @@
-name: Release
+name: Release publication disabled
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release:
-    name: Build and publish release assets
+  release-disabled:
+    name: Refuse incomplete release publication
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Verify closed role dispatcher
-        run: make check
-
-      - name: Build Linux binaries
-        shell: bash
+      - name: Release gate is not implemented
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            output="dist/lanpanel_linux_${arch}"
-            GOOS=linux GOARCH="${arch}" CGO_ENABLED=0 \
-              go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "${output}" ./cmd/lanpanel
-          done
-
-      - name: Generate checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum lanpanel_linux_* > checksums.txt
-
-      - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: "dist/*"
-
-      - name: Create GitHub release and upload assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" dist/* \
-              --title "${GITHUB_REF_NAME}" \
-              --generate-notes \
-              --verify-tag
-          fi
+          echo "Release publication remains disabled until the S31 final asset gate is implemented." >&2
+          exit 1

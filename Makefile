@@ -1,6 +1,13 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit
+.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit
+
+# S2 HEAD-derived disposition: tests inherit their package disposition; every
+# legacy template/tree is deleted, while the named packages remain for their
+# owning in-place GA rewrite.
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/domain ./internal/filetxn ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/persist ./internal/plans ./internal/reservations ./internal/roles ./internal/safety
+GA_REWRITE_PACKAGES := ./internal/acme ./internal/preflight ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
+GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/ui internal/uistate internal/verify internal/workflow
 
 GO ?= go
 PKGS ?= ./...
@@ -31,8 +38,20 @@ ga-cli-absence-audit:
 	$(GO) test -count=1 ./cmd/lanpanel ./internal/roles
 	@test ! -d internal/cli && test ! -d internal/output && test ! -d internal/prompt
 	@tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; $(GO) run ./cmd/lanpanel --help >"$$tmp"; ! grep -Eiq 'deploy|status|verify|init|app|--config|--format|json|yaml|generic|alias|migration' "$$tmp"
-	@! git grep -I -Eq '(^|[[:space:]`])lanpanel[[:space:]]+(deploy|status|verify|init|app|ui)([[:space:]`]|$$)' -- README.md README.zh-CN.md docs cmd deploy '*.go'
-	@! git grep -I -Eiq 'v1alpha|alpha migration' -- deploy
+	@! git grep -I -Eq '(^|[[:space:]`])lanpanel[[:space:]]+(deploy|status|verify|init|app|ui)([[:space:]`]|$$)' -- README.md README.zh-CN.md docs cmd '*.go'
+	@set -eu; if grep -R -n -Ei --include='*.go' --exclude='*_test.go' 'v1alpha|alpha migration' internal cmd; then echo 'alpha production schema remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@! git grep -I -Eiq 'internal/(cli|output|prompt)' -- '*.go' '*.md' '*.yml' '*.yaml'
 
-check: build test vet ga-contract-audit ga-cli-absence-audit
+ga-legacy-closure-audit:
+	@set -eu; for path in $(GA_DELETE_TREES); do test ! -e "$$path" || { echo "legacy path remains: $$path" >&2; exit 1; }; done
+	@set -eu; actual=$$($(GO) list ./... | sed 's#^lanpanel/#./#' | sort); expected=$$(printf '%s\n' $(GA_FOUNDATION_PACKAGES) $(GA_REWRITE_PACKAGES) | sort); test "$$actual" = "$$expected" || { printf 'package disposition mismatch\nactual:\n%s\nexpected:\n%s\n' "$$actual" "$$expected" >&2; exit 1; }
+	@set -eu; for path in internal/acme/doc.go internal/preflight/doc.go internal/realip/doc.go internal/realip/edgeone/doc.go internal/realiprender/doc.go internal/resource/doc.go; do grep -Fq 'GA rewrite owner:' "$$path"; done
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'ShellCommand|ActorSourceCLI|v1alpha|lanpanel\.instance\.v1|LoadOrCreateInstance|ResourceTypePrivate|AmbientCredentialsSupported|normalizeProviderAlias|ValidateDNSProviderEnvironment|SupportedDNSProviderEnvFileVars' internal cmd; then echo 'legacy schema or management shim remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+	@test -z "$$(find internal cmd \( -name '*.tmpl' -o -name '*.sh' \) -type f -print)"
+
+ga-release-disabled-audit:
+	@grep -Fq 'workflow_dispatch:' .github/workflows/release.yml
+	@grep -Fq 'Release publication remains disabled until the S31 final asset gate is implemented.' .github/workflows/release.yml
+	@set -eu; if grep -n -E 'tags:|contents:[[:space:]]*write|arm64|gh release|attest-build-provenance|dist/' .github/workflows/release.yml; then echo 'release publication path remains enabled' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit
