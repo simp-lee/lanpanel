@@ -441,7 +441,7 @@ func TestEmergencyBackingSurvivesSlotCorruptionAndCommitsWithoutAllocation(t *te
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{})
+		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{LockAuthority: lease.Authority()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -484,7 +484,7 @@ func TestEmergencyWriteInterruptionLeavesAValidCompleteSlot(t *testing.T) {
 			t.Fatalf("Commit error=%v", err)
 		}
 		closeEmergencyStore(t, store, manager, lease)
-		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{})
+		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{LockAuthority: lease.Authority()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -499,7 +499,7 @@ func TestEmergencyBackingReloadsAcrossInstancesAndNeverDowngradesToInactiveSlot(
 	t.Run("fresh_multi_instance_authority_and_no_runtime_recreate", func(t *testing.T) {
 		store, manager, lease, path := newEmergencyStore(t, nil)
 		owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
-		second, err := OpenEmergency(path, owner, EmergencyOptions{})
+		second, err := OpenEmergency(path, owner, EmergencyOptions{LockAuthority: lease.Authority()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -527,11 +527,11 @@ func TestEmergencyBackingReloadsAcrossInstancesAndNeverDowngradesToInactiveSlot(
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenEmergency(path, owner, EmergencyOptions{}); err == nil {
+		if _, err := OpenEmergency(path, owner, EmergencyOptions{LockAuthority: lease.Authority()}); err == nil {
 			t.Fatal("OpenEmergency downgraded from corrupt active slot to inactive baseline")
 		}
 		missing := filepath.Join(filepath.Dir(path), "missing.slots")
-		if _, err := OpenEmergency(missing, owner, EmergencyOptions{}); err == nil {
+		if _, err := OpenEmergency(missing, owner, EmergencyOptions{LockAuthority: lease.Authority()}); err == nil {
 			t.Fatal("runtime OpenEmergency created missing backing")
 		}
 	})
@@ -554,7 +554,7 @@ func TestEmergencyBackingRejectsTotalCorruptionAndPoisonsAmbiguousWriter(t *test
 			t.Fatalf("second Commit() error = %v", err)
 		}
 		closeEmergencyStore(t, store, manager, lease)
-		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{})
+		reopened, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{LockAuthority: lease.Authority()})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -577,7 +577,7 @@ func TestEmergencyBackingRejectsTotalCorruptionAndPoisonsAmbiguousWriter(t *test
 		if err := file.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{}); err == nil {
+		if _, err := OpenEmergency(path, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}, EmergencyOptions{LockAuthority: lease.Authority()}); err == nil {
 			t.Fatal("OpenEmergency accepted two invalid slots")
 		}
 	})
@@ -656,11 +656,11 @@ func newSafetyStore(t *testing.T) (*Store, *EmergencyStore, *locks.Manager, *loc
 	if err != nil {
 		t.Fatal(err)
 	}
-	emergency, err := CreateEmergency(filepath.Join(root, "emergency.slots"), owner, EmergencyOptions{})
+	emergency, err := CreateEmergency(filepath.Join(root, "emergency.slots"), owner, EmergencyOptions{LockAuthority: lease.Authority()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenStore(StoreConfig{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "state.json"), Owner: owner, Emergency: emergency})
+	store, err := OpenStore(StoreConfig{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: lease.Authority()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func newEmergencyStore(t *testing.T, fault func(EmergencyPoint) error) (*Emergen
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "emergency.slots")
-	store, err := CreateEmergency(path, owner, EmergencyOptions{Fault: fault})
+	store, err := CreateEmergency(path, owner, EmergencyOptions{Fault: fault, LockAuthority: lease.Authority()})
 	if err != nil {
 		t.Fatal(err)
 	}

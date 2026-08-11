@@ -36,6 +36,15 @@ var (
 	}{}
 )
 
+type Authority struct {
+	device uint64
+	inode  uint64
+	owner  uint32
+	group  uint32
+}
+
+func (authority Authority) Valid() bool { return authority.inode != 0 }
+
 type Config struct {
 	RootPath string
 	Owner    uint32
@@ -176,6 +185,27 @@ func (manager *Manager) finishAcquire(kind Kind, lease *Lease) {
 	if lease != nil {
 		manager.held[kind] = lease
 	}
+}
+
+func (manager *Manager) Authority() Authority {
+	if manager == nil {
+		return Authority{}
+	}
+	return Authority{device: uint64(manager.rootStat.Dev), inode: manager.rootStat.Ino, owner: manager.owner, group: manager.group}
+}
+func (manager *Manager) Held(kind Kind) bool {
+	if manager == nil {
+		return false
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return manager.held[kind] != nil || manager.acquiring[kind]
+}
+func (lease *Lease) Authority() Authority {
+	if lease == nil || lease.manager == nil {
+		return Authority{}
+	}
+	return lease.manager.Authority()
 }
 
 func (lease *Lease) Kind() Kind {

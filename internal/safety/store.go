@@ -23,11 +23,12 @@ const maxStateBytes = 2 << 20
 var ErrSafetyStateMissing = errors.New("independent safety state is missing")
 
 type StoreConfig struct {
-	RootPath    string
-	StagingPath string
-	StatePath   string
-	Owner       filetxn.Owner
-	Emergency   *EmergencyStore
+	RootPath      string
+	StagingPath   string
+	StatePath     string
+	Owner         filetxn.Owner
+	Emergency     *EmergencyStore
+	LockAuthority locks.Authority
 }
 
 type ReactivationConvergenceProof struct {
@@ -123,6 +124,12 @@ func OpenStore(config StoreConfig) (*Store, error) {
 	return &Store{config: config, txn: txn, rootFD: rootFD, rootStat: rootStat}, nil
 }
 
+func (store *Store) LockAuthority() locks.Authority {
+	if store == nil {
+		return locks.Authority{}
+	}
+	return store.config.LockAuthority
+}
 func (store *Store) Close() error { return errors.Join(store.txn.Close(), unix.Close(store.rootFD)) }
 
 func (store *Store) Read() (State, error) { return store.read(true) }
@@ -188,7 +195,7 @@ func (store *Store) read(requireAuthority bool) (State, error) {
 }
 
 func (store *Store) Initialize(ctx context.Context, lease *locks.Lease) (filetxn.Result, error) {
-	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
+	if lease == nil || lease.Authority() != store.config.LockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("safety initialization requires the shared exposure lock")
 	}
 	authority, err := store.config.Emergency.Authority()
@@ -214,7 +221,7 @@ func (store *Store) Initialize(ctx context.Context, lease *locks.Lease) (filetxn
 }
 
 func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRole, expectedRevision uint64, next State, proof TransitionProof) (filetxn.Result, error) {
-	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
+	if lease == nil || lease.Authority() != store.config.LockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("safety commit requires the shared exposure lock")
 	}
 	if !validRole(role) {
@@ -352,7 +359,8 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			return fmt.Errorf("maintenance creation requires atomic maintenance-begin authority")
 		}
 		if !reflect.DeepEqual(transition.before, transition.after) && role != transition.owner {
-			compound := transition.name == "maintenance_pending" && (role == RoleMaintenanceBegin || role == RoleMaintenanceToDependency) || transition.name == "dependency_transition_pending" && role == RoleMaintenanceToDependency
+			repairCompound := role == RoleRepair && current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition && next.StopFence == nil && current.MaintenancePending != nil && next.MaintenancePending == nil
+			compound := transition.name == "maintenance_pending" && (role == RoleMaintenanceBegin || role == RoleMaintenanceToDependency || repairCompound) || transition.name == "dependency_transition_pending" && (role == RoleMaintenanceToDependency || repairCompound)
 			if !compound {
 				return fmt.Errorf("role %q does not own %s transition", role, transition.name)
 			}
@@ -423,6 +431,15 @@ func validateMaintenanceCompound(role ClearRole, current, next State) error {
 		}
 		if next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef {
 			return fmt.Errorf("maintenance-to-dependency identity does not bind the completed maintenance target")
+		}
+	case RoleRepair:
+		if current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition {
+			if current.MaintenancePending == nil || next.MaintenancePending != nil || next.StopFence != nil {
+				return fmt.Errorf("maintenance repair must atomically clear its transition and stop fence")
+			}
+			if next.DependencyTransitionPending != nil && (next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef) {
+				return fmt.Errorf("maintenance repair target branch is not bound to the exact target")
+			}
 		}
 	}
 	return nil
@@ -685,6 +702,9 @@ func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenc
 		journal = fence.EdgeOneRefresh.JournalRef
 	}
 	if fence.Transition != nil {
+		if proof.RuntimeClosureDigest != fence.Transition.RuntimeClosureDigest {
+			return false
+		}
 		journal = fence.Transition.JournalRef
 	}
 	return proof.JournalRef == journal
@@ -730,7 +750,7 @@ func stateChecksum(state State) (string, error) {
 }
 
 func validateStoreConfig(config StoreConfig) error {
-	if config.Emergency == nil {
+	if config.Emergency == nil || !config.LockAuthority.Valid() || config.Emergency.LockAuthority() != config.LockAuthority {
 		return fmt.Errorf("normal safety store requires the shared emergency generation authority")
 	}
 	if config.Owner.UID != uint32(os.Geteuid()) || config.Owner.GID != uint32(os.Getegid()) {

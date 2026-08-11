@@ -73,7 +73,10 @@ const (
 	EmergencyAfterSlotSync  EmergencyPoint = "after_slot_sync"
 )
 
-type EmergencyOptions struct{ Fault func(EmergencyPoint) error }
+type EmergencyOptions struct {
+	Fault         func(EmergencyPoint) error
+	LockAuthority locks.Authority
+}
 
 type EmergencyCommitter struct {
 	store            *EmergencyStore
@@ -83,23 +86,24 @@ type EmergencyCommitter struct {
 }
 
 type EmergencyStore struct {
-	mu           sync.Mutex
-	fd           int
-	dirFD        int
-	fileStat     unix.Stat_t
-	dirStat      unix.Stat_t
-	path         string
-	pathCString  []byte
-	dirCString   []byte
-	owner        filetxn.Owner
-	current      EmergencyState
-	currentFence EmergencyStopFence
-	currentClear EmergencyClearProof
-	slot         [emergencySlotSize]byte
-	readSlots    [2][emergencySlotSize]byte
-	fault        func(EmergencyPoint) error
-	poisoned     bool
-	closed       bool
+	mu            sync.Mutex
+	fd            int
+	dirFD         int
+	fileStat      unix.Stat_t
+	dirStat       unix.Stat_t
+	path          string
+	pathCString   []byte
+	dirCString    []byte
+	owner         filetxn.Owner
+	lockAuthority locks.Authority
+	current       EmergencyState
+	currentFence  EmergencyStopFence
+	currentClear  EmergencyClearProof
+	slot          [emergencySlotSize]byte
+	readSlots     [2][emergencySlotSize]byte
+	fault         func(EmergencyPoint) error
+	poisoned      bool
+	closed        bool
 }
 
 func CreateEmergency(path string, owner filetxn.Owner, options EmergencyOptions) (*EmergencyStore, error) {
@@ -114,7 +118,7 @@ func openEmergency(path string, owner filetxn.Owner, options EmergencyOptions, c
 	if path == "" || path != strings.TrimSpace(path) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("emergency backing path must be clean and absolute")
 	}
-	if owner.UID != uint32(os.Geteuid()) || owner.GID != uint32(os.Getegid()) {
+	if owner.UID != uint32(os.Geteuid()) || owner.GID != uint32(os.Getegid()) || !options.LockAuthority.Valid() {
 		return nil, fmt.Errorf("emergency backing must be helper-owned")
 	}
 	directory := filepath.Dir(path)
@@ -138,7 +142,7 @@ func openEmergency(path string, owner filetxn.Owner, options EmergencyOptions, c
 		_ = unix.Close(dirFD)
 		return nil, err
 	}
-	store := &EmergencyStore{fd: fd, dirFD: dirFD, dirStat: stat, path: path, pathCString: append([]byte(path), 0), dirCString: append([]byte(filepath.Dir(path)), 0), owner: owner, fault: options.Fault}
+	store := &EmergencyStore{fd: fd, dirFD: dirFD, dirStat: stat, path: path, pathCString: append([]byte(path), 0), dirCString: append([]byte(filepath.Dir(path)), 0), owner: owner, lockAuthority: options.LockAuthority, fault: options.Fault}
 	if err := store.validateFile(); err != nil {
 		_ = store.closeDescriptors()
 		return nil, err
@@ -197,6 +201,12 @@ func (store *EmergencyStore) Current() EmergencyState {
 	return state
 }
 
+func (store *EmergencyStore) LockAuthority() locks.Authority {
+	if store == nil {
+		return locks.Authority{}
+	}
+	return store.lockAuthority
+}
 func (store *EmergencyStore) Authority() (EmergencyState, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -218,7 +228,7 @@ func (store *EmergencyStore) Authority() (EmergencyState, error) {
 }
 
 func (store *EmergencyStore) PrepareCommit(lease *locks.Lease) (*EmergencyCommitter, error) {
-	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
+	if lease == nil || lease.Authority() != store.lockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return nil, ErrEmergencyState
 	}
 	store.mu.Lock()
