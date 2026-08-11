@@ -42,6 +42,22 @@ func Ledger() []Row {
 		fixtureRow("R1.7.stale_conflict_transaction", "R1.7", "A generation-stale conflict transaction cannot commit", "reservations.stale_transaction", "./internal/reservations", "TestConflictRegistry/stale_transaction_is_rejected"),
 		fixtureRow("R5.1.stable_conflict_owner", "R5.1", "Conflict ownership derives from immutable resource ID rather than name or filename", "reservations.stable_owner", "./internal/reservations", "TestConflictRegistry/stable_owner_is_not_derived_from_name_or_filename"),
 
+		stepFixtureRow("S2", "R8.4.clean_absolute_path", "R8.4", "Managed path validation rejects unclean and out-of-root paths", "filetxn.clean_absolute_path", "./internal/filetxn", "TestNoFollowMetadataAndBoundaryValidation/unclean_and_outside_paths"),
+		stepFixtureRow("S2", "R8.4.no_follow_components", "R8.4", "Managed path validation rejects symbolic-link path components", "filetxn.no_follow_components", "./internal/filetxn", "TestNoFollowMetadataAndBoundaryValidation/symlink_parent"),
+		stepFixtureRow("S2", "R2.13.regular_single_link_target", "R2.13", "Managed file transactions reject symbolic-link and multiply-linked targets", "filetxn.regular_single_link_target", "./internal/filetxn", "TestNoFollowMetadataAndBoundaryValidation/symlink_and_hardlink_targets/hardlink"),
+		stepFixtureRow("S2", "R2.13.same_mount_boundary", "R2.13", "Managed file traversal rejects a mount crossing even when rooted at slash", "filetxn.mount_boundary", "./internal/filetxn", "TestNoFollowMetadataAndBoundaryValidation/mount_crossing"),
+		stepFixtureRow("S2", "R7.13.atomic_file_lifecycle", "R7.13", "Create, replacement, and removal reach durable atomic states without residual tombstones", "filetxn.atomic_lifecycle", "./internal/filetxn", "TestAtomicFileLifecycle/create_replace_remove"),
+		stepFixtureRow("S2", "R7.13.concurrent_identity_fence", "R7.13", "Concurrent target replacement is rejected without activating the staged object", "filetxn.concurrent_identity_fence", "./internal/filetxn", "TestCreateAndReplaceRejectConcurrentTargetChanges/replace"),
+		stepFixtureRow("S2", "R2.13.bounded_file_operations", "R2.13", "File transactions enforce content bounds, dispositions, and cancellation", "filetxn.bounded_operations", "./internal/filetxn", "TestPutEnforcesSizeDispositionAndCancellation/bounded_input_and_operation"),
+		stepFixtureRow("S2", "R8.3.protected_secret_staging", "R8.3", "Final-mode staged content remains behind a helper-owned 0700 directory until commit", "filetxn.protected_staging", "./internal/filetxn", "TestProtectedStagingDirectory/keeps_final_file_behind_owner_only_parent"),
+		stepFixtureRow("S2", "R2.13.staging_reread", "R2.13", "A verified staging object reaches the post-reread fault boundary without target mutation", "filetxn.staging_reread", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/after_verify"),
+		stepFixtureRow("S2", "R10.15.filetxn_write_failure", "R10.15", "An injected staging write failure leaves the target unchanged and identifiable inert staging", "filetxn.write_failure", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/before_write"),
+		stepFixtureRow("S2", "R10.15.filetxn_chmod_failure", "R10.15", "An injected staging metadata failure leaves the target unchanged and identifiable inert staging", "filetxn.chmod_failure", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/before_metadata"),
+		stepFixtureRow("S2", "R10.15.filetxn_fsync_failure", "R10.15", "An injected staging fsync failure leaves the target unchanged and identifiable inert staging", "filetxn.fsync_failure", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/before_file_sync"),
+		stepFixtureRow("S2", "R10.15.filetxn_rename_failure", "R10.15", "An injected rename failure leaves the target unchanged and verified inert staging", "filetxn.rename_failure", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/before_rename"),
+		stepFixtureRow("S2", "R10.15.filetxn_post_rename_crash", "R10.15", "An interruption after rename reports a namespace-changed state and preserves an identifiable tombstone", "filetxn.post_rename_crash", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/after_rename"),
+		stepFixtureRow("S2", "R10.15.filetxn_durable_crash", "R10.15", "An interruption after directory synchronization reports a durable state", "filetxn.durable_crash", "./internal/filetxn", "TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging/after_directory_sync"),
+
 		fixtureRow("R10.10.atomic_ledger_rows", "R10.10", "The clause ledger rejects duplicate, malformed, and non-atomic rows", "qualification.atomic_ledger_rows", "./internal/qualification/cases", "TestLedgerContract/atomic_rows_validate"),
 		fixtureRow("R10.10.parent_only_selectors", "R10.10", "Parent-only clause, scope, and test selectors are rejected", "qualification.parent_selectors_rejected", "./internal/qualification/cases", "TestLedgerContract/parent_only_selectors_are_rejected"),
 		fixtureRow("R10.10.package_ownership", "R10.10", "Focused execution rejects a ledger package omitted from PKGS", "qualification.package_ownership", "./internal/qualification/cases", "TestRunnerContract/missing_package_is_rejected"),
@@ -51,11 +67,15 @@ func Ledger() []Row {
 }
 
 func fixtureRow(clauseID, requirement, behavior, caseID, pkg, test string) Row {
+	return stepFixtureRow("S1", clauseID, requirement, behavior, caseID, pkg, test)
+}
+
+func stepFixtureRow(step, clauseID, requirement, behavior, caseID, pkg, test string) Row {
 	return Row{
 		SourceAnchor:     ".pi-work/requirements.md#" + requirement,
 		ClauseID:         clauseID,
 		Behavior:         behavior,
-		ImplementingStep: "S1",
+		ImplementingStep: step,
 		CaseID:           caseID,
 		Package:          pkg,
 		Test:             test,
