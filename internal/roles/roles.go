@@ -12,6 +12,7 @@ type Name string
 
 const (
 	UI             Name = "ui"
+	ChildExecutor  Name = "child-executor"
 	Helper         Name = "helper"
 	StartupGuard   Name = "startup-guard"
 	ReloadGuard    Name = "reload-guard"
@@ -23,7 +24,7 @@ const (
 )
 
 var fixed = map[Name]struct{}{
-	UI: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, Installer: {},
+	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, Installer: {},
 	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {},
 }
 

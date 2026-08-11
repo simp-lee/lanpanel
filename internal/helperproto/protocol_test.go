@@ -1,0 +1,210 @@
+package helperproto
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTypedProtocolRejectsQueueingAndGenericSecrets(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationCredentialImport, Target: "credential/basic-one", IntentGeneration: 4, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
+	var wire bytes.Buffer
+	secret := []byte("sentinel-secret")
+	if err := WriteRequest(&wire, request, secret); err != nil {
+		t.Fatal(err)
+	}
+	got, framedSecret, err := ReadRequest(&wire)
+	if err != nil || got != request || framedSecret == nil {
+		t.Fatalf("ReadRequest()=%#v,%#v,%v", got, framedSecret, err)
+	}
+	seen := ""
+	if err := framedSecret.Use(func(value []byte) error {
+		seen = string(value)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seen != string(secret) || framedSecret.Present() {
+		t.Fatal("secret was not delivered once and destroyed")
+	}
+	if err := WriteRequest(&bytes.Buffer{}, Request{Operation: OperationNginxTest}, secret); err == nil {
+		t.Fatal("generic non-secret request accepted a secret frame")
+	}
+
+	var queued bytes.Buffer
+	first := request
+	first.Operation = OperationCredentialImport
+	if err := WriteRequest(&queued, first, secret); err != nil {
+		t.Fatal(err)
+	}
+	// Replace the required secret frame kind with request. The decoder must not
+	// accept a queued generic request in its place.
+	value := queued.Bytes()
+	firstFrameLength := frameHeaderBytes + int(binary.BigEndian.Uint32(value[8:12]))
+	value[firstFrameLength+4] = byte(frameRequest)
+	if _, _, err := ReadRequest(&queued); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("queued request error=%v", err)
+	}
+}
+
+func TestOneTimeOutputSecretIsOutsideGenericResponse(t *testing.T) {
+	secret, err := NewOutputSecret([]byte("generated-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "request-one", Code: ResponseSucceeded, ResultDigest: digest("result")}
+	var wire bytes.Buffer
+	if err := WriteResponse(&wire, OperationManagedBasicGenerate, response, secret); err != nil {
+		t.Fatal(err)
+	}
+	encoded := append([]byte(nil), wire.Bytes()...)
+	genericLength := frameHeaderBytes + int(binary.BigEndian.Uint32(encoded[8:12]))
+	if bytes.Contains(encoded[:genericLength], []byte("generated-password")) {
+		t.Fatal("output secret entered generic response JSON")
+	}
+	got, output, err := ReadResponse(bytes.NewReader(encoded), OperationManagedBasicGenerate)
+	if err != nil || got != response || output == nil {
+		t.Fatalf("ReadResponse()=%#v,%#v,%v", got, output, err)
+	}
+	seen := ""
+	if err := output.Use(func(value []byte) error { seen = string(value); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if seen != "generated-password" || output.Present() {
+		t.Fatal("one-time output secret was not consumed and destroyed")
+	}
+
+	rejected := Response{SchemaVersion: SchemaVersion, RequestID: "request-two", Code: ResponseRejected, ErrorCode: "authority_rejected"}
+	wire.Reset()
+	if err := WriteResponse(&wire, OperationManagedBasicGenerate, rejected, nil); err != nil {
+		t.Fatalf("write rejected secret-output response: %v", err)
+	}
+	got, output, err = ReadResponse(&wire, OperationManagedBasicGenerate)
+	if err != nil || got != rejected || output != nil {
+		t.Fatalf("rejected secret-output response=%#v,%#v,%v", got, output, err)
+	}
+}
+
+func TestTruncatedFrameClearsAllocatedPayload(t *testing.T) {
+	payload := []byte("sentinel-secret")
+	var complete bytes.Buffer
+	if err := writeFrame(&complete, frameSecret, payload, maxSecretBytes); err != nil {
+		t.Fatal(err)
+	}
+	reader := &capturingTruncatedReader{header: append([]byte(nil), complete.Bytes()[:frameHeaderBytes]...), fragment: payload[:8]}
+	if _, err := readFrame(reader, frameSecret, maxSecretBytes); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("truncated secret frame error=%v", err)
+	}
+	if len(reader.destination) != len(payload) {
+		t.Fatalf("captured payload bytes=%d want %d", len(reader.destination), len(payload))
+	}
+	for _, value := range reader.destination {
+		if value != 0 {
+			t.Fatal("truncated protocol payload was not cleared")
+		}
+	}
+}
+
+func TestProtocolRequiresCanonicalBoundedTypedJSON(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationNginxTest, Target: "installation", IntentGeneration: 2, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
+	var wire bytes.Buffer
+	if err := WriteRequest(&wire, request, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, secret, err := ReadRequest(&wire)
+	if err != nil || got != request || secret != nil {
+		t.Fatalf("ReadRequest()=%#v,%#v,%v", got, secret, err)
+	}
+	if err := ValidateRequest(got, now); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte(`{"schema_version":"lanpanel.helper.request.v1","request_id":"one","request_id":"two","operation":"nginx_test","target":"installation","intent_generation":2,"deadline":"2030-01-01T00:00:00Z","input_digest":"` + digest("input") + `"}`)
+	wire.Reset()
+	if err := writeFrame(&wire, frameRequest, payload, maxRequestBytes); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadRequest(&wire); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("duplicate-field error=%v", err)
+	}
+
+	oversize := make([]byte, frameHeaderBytes)
+	copy(oversize, frameMagic[:])
+	oversize[4] = byte(frameRequest)
+	binary.BigEndian.PutUint32(oversize[8:12], maxRequestBytes+1)
+	if _, _, err := ReadRequest(bytes.NewReader(oversize)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("oversize frame error=%v", err)
+	}
+}
+
+func TestCallerOperationMatrixIsClosed(t *testing.T) {
+	if Authorized(CallerTimer, OperationPackageTransaction) || Authorized(CallerTimer, OperationCertificateIssue) || Authorized(CallerRecovery, OperationNginxReload) || Authorized(Caller("foreign"), OperationContractionClose) {
+		t.Fatal("caller crossed the fixed helper operation matrix")
+	}
+	if !Authorized(CallerTimer, OperationCertificateRenew) || !Authorized(CallerRecovery, OperationStartupContraction) || !Authorized(CallerUI, OperationPackageTransaction) {
+		t.Fatal("fixed helper operation matrix omitted an exact caller")
+	}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationNginxTest, Target: strings.Repeat("x", 257), IntentGeneration: 1, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}
+	if err := ValidateRequest(request, time.Now()); err == nil {
+		t.Fatal("unbounded helper target was accepted")
+	}
+	request.Target = "installation"
+	request.Deadline = time.Now().Add(2 * time.Minute)
+	if err := ValidateRequest(request, time.Now()); err == nil {
+		t.Fatal("helper request exceeded its release-fixed operation deadline")
+	}
+	request.Deadline = time.Now().Add(time.Minute)
+	request.Target = "service/ssh.service"
+	request.Operation = OperationSystemdTransition
+	if err := ValidateRequest(request, time.Now()); err == nil {
+		t.Fatal("caller-selected systemd unit entered helper schema")
+	}
+	request.Target = "resource/../../etc/shadow"
+	request.Operation = OperationManagedFileCommit
+	if err := ValidateRequest(request, time.Now()); err == nil {
+		t.Fatal("caller-selected path entered helper schema")
+	}
+	for operation, target := range map[Operation]string{
+		OperationAdminTokenRotate: "installation",
+		OperationPreauthKeyCreate: "headscale",
+	} {
+		policy, known := PolicyFor(operation)
+		if !known || !policy.SecretOutput || !Authorized(CallerUI, operation) || Authorized(CallerTimer, operation) || Authorized(CallerRecovery, operation) {
+			t.Fatalf("one-time secret operation %q has an invalid policy", operation)
+		}
+		request.Operation = operation
+		request.Target = target
+		if err := ValidateRequest(request, time.Now()); err != nil {
+			t.Fatalf("one-time secret operation %q is invalid: %v", operation, err)
+		}
+	}
+}
+
+type capturingTruncatedReader struct {
+	header      []byte
+	fragment    []byte
+	destination []byte
+	readHeader  bool
+}
+
+func (reader *capturingTruncatedReader) Read(destination []byte) (int, error) {
+	if !reader.readHeader {
+		reader.readHeader = true
+		return copy(destination, reader.header), nil
+	}
+	if reader.destination == nil {
+		reader.destination = destination
+		return copy(destination, reader.fragment), io.ErrUnexpectedEOF
+	}
+	return 0, io.EOF
+}
+
+func digest(seed string) string {
+	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
+}
