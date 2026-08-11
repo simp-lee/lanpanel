@@ -72,7 +72,7 @@ func MainStatusWithOptions(ctx context.Context, configPath string, options Statu
 				{Label: "config path", Value: configPath},
 				{Label: "happy path", Value: "init -> deploy -> verify"},
 			}, []string{
-				fmt.Sprintf("Run 'lanpanel init --config %s' to generate a starter config.", configPath),
+				fmt.Sprintf("Create the configuration for %s from the Management UI.", configPath),
 			}), nil
 		}
 		return StatusResult{}, fmt.Errorf("stat config file: %w", err)
@@ -84,7 +84,7 @@ func MainStatusWithOptions(ctx context.Context, configPath string, options Statu
 			{Label: "config path", Value: configPath},
 			{Label: "details", Value: err.Error()},
 		}, []string{
-			fmt.Sprintf("Fix the config at %s and rerun 'lanpanel verify --config %s'.", configPath, configPath),
+			fmt.Sprintf("Fix the configuration at %s and retry verification from the Management UI.", configPath),
 		}), nil
 	}
 	statusFields := func(extra ...domain.ResultField) []domain.ResultField {
@@ -104,8 +104,8 @@ func MainStatusWithOptions(ctx context.Context, configPath string, options Statu
 			domain.ResultField{Label: "checkpoint path", Value: checkpointPath},
 			domain.ResultField{Label: "stale context", Value: "checkpoint data has no desired-state fingerprint; lanpanel will ignore that recovery data on the next deploy"},
 		), []string{
-			fmt.Sprintf("Use 'lanpanel deploy --config %s' to regenerate recovery state for the current runtime asset set.", configPath),
-			fmt.Sprintf("Use 'lanpanel verify --config %s' to inspect runtime readiness.", configPath),
+			fmt.Sprintf("Regenerate recovery state for %s from the Management UI.", configPath),
+			fmt.Sprintf("Inspect runtime readiness for %s from the Management UI.", configPath),
 		}), nil
 	}
 	if checkpoint.HasDeployContext() && strings.TrimSpace(checkpoint.DesiredStateDigest) != "" {
@@ -121,8 +121,8 @@ func MainStatusWithOptions(ctx context.Context, configPath string, options Statu
 				domain.ResultField{Label: "checkpoint path", Value: checkpointPath},
 				domain.ResultField{Label: "stale context", Value: "config changed since the recorded deploy context was saved; lanpanel will ignore that recovery data on the next deploy"},
 			), []string{
-				fmt.Sprintf("Use 'lanpanel deploy --config %s' to record a fresh recovery point for the current runtime asset set.", configPath),
-				fmt.Sprintf("Use 'lanpanel verify --config %s' to re-run runtime asset and onboarding readiness checks.", configPath),
+				fmt.Sprintf("Record a fresh recovery point for %s from the Management UI.", configPath),
+				fmt.Sprintf("Re-run runtime and onboarding readiness checks for %s from the Management UI.", configPath),
 			}), nil
 		}
 	}
@@ -152,21 +152,21 @@ func MainStatusWithOptions(ctx context.Context, configPath string, options Statu
 
 	if checkpoint.CurrentCheckpoint != "" {
 		return newStatusResult(configPath, "deploy-checkpoint", domain.JobStatusUnknown, domain.DiagnosticStatusNotApplicable, "config is valid; resumable deploy checkpoint is available", statusFields(checkpointFields...), []string{
-			fmt.Sprintf("Use 'lanpanel deploy --config %s' to resume from the recorded host checkpoint.", configPath),
-			fmt.Sprintf("Use 'lanpanel verify --config %s' to inspect runtime readiness.", configPath),
+			fmt.Sprintf("Resume the recorded host checkpoint for %s from the Management UI.", configPath),
+			fmt.Sprintf("Inspect runtime readiness for %s from the Management UI.", configPath),
 		}), nil
 	}
 
 	if len(checkpoint.CompletedCheckpoints) > 0 || len(checkpoint.ModifiedPaths) > 0 || len(checkpoint.ActivationHistory) > 0 {
 		return newStatusResult(configPath, "deploy-history", domain.JobStatusSucceeded, domain.DiagnosticStatusNotApplicable, "config is valid; last deploy context is available", statusFields(checkpointFields...), []string{
-			fmt.Sprintf("Use 'lanpanel deploy --config %s' to apply the current runtime asset set again.", configPath),
-			fmt.Sprintf("Use 'lanpanel verify --config %s' to inspect runtime readiness and client-version requirements.", configPath),
+			fmt.Sprintf("Apply the current runtime asset set for %s again from the Management UI.", configPath),
+			fmt.Sprintf("Inspect runtime readiness and client-version requirements for %s from the Management UI.", configPath),
 		}), nil
 	}
 
 	return newStatusResult(configPath, "config-ready", domain.JobStatusSucceeded, domain.DiagnosticStatusNotApplicable, "config file is present and valid; no persisted deploy context yet", statusFields(checkpointFields...), []string{
-		fmt.Sprintf("Use 'lanpanel deploy --config %s' to apply the current runtime asset set.", configPath),
-		fmt.Sprintf("Use 'lanpanel verify --config %s' for runtime asset and onboarding readiness checks.", configPath),
+		fmt.Sprintf("Apply the current runtime asset set for %s from the Management UI.", configPath),
+		fmt.Sprintf("Run runtime and onboarding readiness checks for %s from the Management UI.", configPath),
 	}), nil
 }
 

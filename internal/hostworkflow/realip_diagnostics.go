@@ -80,7 +80,7 @@ func RealIPDiagnosticsWithOptions(ctx context.Context, appConfigPath string, pro
 	permissions := options.DetectPermissions()
 	if !permissions.IsRoot {
 		result := realIPDiagnosticsOperation("blocked", domain.JobStatusFailed, domain.DiagnosticStatusFail, "app realip diagnostics preflight found 1 failed check", []domain.ResultField{{Label: "check permissions", Value: permissionDetail("app realip diagnostics", permissions)}}, retryCommand)
-		return RealIPDiagnosticsResult{Operation: result, OutputStatus: "blocked", NextSteps: []string{"Rerun with sudo lanpanel app realip diagnostics --config <app-config> --profile <name>."}}, fmt.Errorf("app realip diagnostics: %s", result.Summary)
+		return RealIPDiagnosticsResult{Operation: result, OutputStatus: "blocked", NextSteps: []string{"Retry RealIP diagnostics from the Management UI."}}, fmt.Errorf("app realip diagnostics: %s", result.Summary)
 	}
 
 	names, err := appsvc.NewRealIPProfileNames(profileName, appconfig.RealIPProviderEdgeOne, "")

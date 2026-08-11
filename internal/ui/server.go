@@ -565,7 +565,7 @@ func isMultipartForm(r *http.Request) bool {
 func (server *Server) requireRoot(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !server.options.UnsafeAllowNonRootWritesForTest && currentEUID() != 0 {
-			http.Error(w, "write operations require sudo lanpanel ui", http.StatusForbidden)
+			http.Error(w, "write operations require the supervised Management UI role", http.StatusForbidden)
 			return
 		}
 		next(w, r)
@@ -575,7 +575,7 @@ func (server *Server) requireRoot(next http.HandlerFunc) http.HandlerFunc {
 func (server *Server) requireRootForWriteJob(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !server.options.UnsafeAllowNonRootWritesForTest && jobOperationRequiresRoot(formValue(r, "operation")) && currentEUID() != 0 {
-			http.Error(w, "write operations require sudo lanpanel ui", http.StatusForbidden)
+			http.Error(w, "write operations require the supervised Management UI role", http.StatusForbidden)
 			return
 		}
 		next(w, r)

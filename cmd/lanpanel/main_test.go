@@ -2,150 +2,47 @@ package main
 
 import (
 	"bytes"
-	"lanpanel/internal/config"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func runCLI(t *testing.T, args ...string) (string, string, error) {
-	t.Helper()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
+func runBinary(args ...string) (string, string, error) {
+	var stdout, stderr bytes.Buffer
 	err := run(args, &stdout, &stderr)
 	return stdout.String(), stderr.String(), err
 }
 
-func TestRun_HelpOutput(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{name: "no args"},
-		{name: "help command", args: []string{"help"}},
-		{name: "short help flag", args: []string{"-h"}},
-		{name: "long help flag", args: []string{"--help"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			stdout, stderr, err := runCLI(t, tt.args...)
-			if err != nil {
-				t.Fatalf("run() error = %v", err)
+func TestBinaryHelpHasNoManagementInterface(t *testing.T) {
+	t.Run("help_omits_management_commands", func(t *testing.T) {
+		for _, args := range [][]string{nil, {"help"}, {"-h"}, {"--help"}} {
+			stdout, stderr, err := runBinary(args...)
+			if err != nil || stderr != "" {
+				t.Fatalf("run(%v)=(%q,%q,%v)", args, stdout, stderr, err)
 			}
-			if stderr != "" {
-				t.Fatalf("stderr = %q, want empty", stderr)
-			}
-			for _, want := range []string{
-				"lanpanel manages init, deploy, verify, status, and app workflows.",
-				"Happy path:",
-				"lanpanel init",
-				"lanpanel deploy",
-				"lanpanel verify",
-				"app      Manage additional app deployments.",
-			} {
-				if !strings.Contains(stdout, want) {
-					t.Fatalf("stdout = %q, want substring %q", stdout, want)
+			for _, forbidden := range []string{"deploy", "status", "verify", "init", "app", "--config", "--format", "json", "yaml", "generic", "alias", "migration"} {
+				if strings.Contains(strings.ToLower(stdout), forbidden) {
+					t.Fatalf("help exposes %q: %s", forbidden, stdout)
 				}
 			}
-		})
-	}
+		}
+	})
 }
 
-func TestRun_VersionOutput(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{name: "version command", args: []string{"version"}},
-		{name: "version flag", args: []string{"--version"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			stdout, stderr, err := runCLI(t, tt.args...)
-			if err != nil {
-				t.Fatalf("run() error = %v", err)
+func TestBinaryVersionAndClosedDispatch(t *testing.T) {
+	t.Run("version", func(t *testing.T) {
+		for _, argument := range []string{"version", "--version"} {
+			stdout, stderr, err := runBinary(argument)
+			if err != nil || stderr != "" || stdout != "lanpanel dev\n" {
+				t.Fatalf("version=(%q,%q,%v)", stdout, stderr, err)
 			}
-			if stdout != "lanpanel dev\n" {
-				t.Fatalf("stdout = %q, want %q", stdout, "lanpanel dev\n")
+		}
+	})
+	t.Run("obsolete_inputs_rejected", func(t *testing.T) {
+		for _, args := range [][]string{{"deploy"}, {"status"}, {"ui"}, {"--role", "helper"}, {"legacy-deploy"}, {"config.yaml"}} {
+			stdout, _, err := runBinary(args...)
+			if err == nil || stdout != "" {
+				t.Fatalf("obsolete or unavailable entry %v was accepted", args)
 			}
-			if stderr != "" {
-				t.Fatalf("stderr = %q, want empty", stderr)
-			}
-		})
-	}
-}
-
-func TestRun_InitWritesExampleConfig(t *testing.T) {
-	t.Parallel()
-
-	configPath := filepath.Join(t.TempDir(), "lanpanel.yaml")
-	stdout, stderr, err := runCLI(t, "init", "--config", configPath)
-	if err != nil {
-		t.Fatalf("run() error = %v", err)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr = %q, want empty", stderr)
-	}
-	if !strings.Contains(stdout, "lanpanel init: wrote example config") {
-		t.Fatalf("stdout = %q, want init summary", stdout)
-	}
-	if !strings.Contains(stdout, configPath) {
-		t.Fatalf("stdout = %q, want config path %q", stdout, configPath)
-	}
-
-	if _, err := config.LoadFile(configPath); err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-}
-
-func TestRun_StatusMissingConfig(t *testing.T) {
-	t.Parallel()
-
-	configPath := filepath.Join(t.TempDir(), "missing.yaml")
-	stdout, stderr, err := runCLI(t, "status", "--config", configPath)
-	if err != nil {
-		t.Fatalf("run() error = %v", err)
-	}
-	if stderr != "" {
-		t.Fatalf("stderr = %q, want empty", stderr)
-	}
-	if !strings.Contains(stdout, "lanpanel status: no config file found") {
-		t.Fatalf("stdout = %q, want missing-config summary", stdout)
-	}
-	if !strings.Contains(stdout, "lanpanel init --config "+configPath) {
-		t.Fatalf("stdout = %q, want init hint", stdout)
-	}
-}
-
-func TestRun_UnknownCommand(t *testing.T) {
-	t.Parallel()
-
-	stdout, stderr, err := runCLI(t, "unknown")
-	if err == nil {
-		t.Fatal("run() error = nil, want non-nil")
-	}
-	if err.Error() != "unknown command \"unknown\"" {
-		t.Fatalf("error = %q, want %q", err.Error(), "unknown command \"unknown\"")
-	}
-	if stdout != "" {
-		t.Fatalf("stdout = %q, want empty", stdout)
-	}
-	if !strings.Contains(stderr, "Commands:") {
-		t.Fatalf("stderr = %q, want help output", stderr)
-	}
-	if !strings.Contains(stderr, "deploy   Run preflight checks and apply the Headscale, Nginx, TLS, service, and onboarding workflow.") {
-		t.Fatalf("stderr = %q, want deploy summary", stderr)
-	}
+		}
+	})
 }

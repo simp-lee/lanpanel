@@ -846,21 +846,12 @@ func TestWriteFileRejectsOtherWritableParent(t *testing.T) {
 	}
 }
 
-func TestExampleYAMLMatchesPublicTemplate(t *testing.T) {
+func TestGeneratedExampleYAMLIsValid(t *testing.T) {
 	t.Parallel()
 
 	got, err := ExampleYAML()
 	if err != nil {
 		t.Fatalf("ExampleYAML() error = %v", err)
-	}
-
-	want, err := os.ReadFile(filepath.Join("..", "..", "deploy", "config", "lanpanel.yaml.example"))
-	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
-	}
-
-	if string(got) != string(want) {
-		t.Fatalf("ExampleYAML() mismatch\n got:\n%s\nwant:\n%s", got, want)
 	}
 
 	cfg, err := LoadBytes(got)

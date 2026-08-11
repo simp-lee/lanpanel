@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
-	"lanpanel/internal/cli"
+	"lanpanel/internal/roles"
 	"os"
 )
 
@@ -16,6 +16,10 @@ func main() {
 	}
 }
 
-func run(args []string, stdout io.Writer, stderr io.Writer) error {
-	return cli.Execute(args, stdout, stderr, version)
+func run(args []string, stdout, stderr io.Writer) error {
+	registry, err := roles.NewRegistry(nil)
+	if err != nil {
+		return err
+	}
+	return registry.Dispatch(args, stdout, stderr, version)
 }

@@ -80,7 +80,7 @@ func BuildReport(cfg appconfig.Config, inputs Inputs) Report {
 	if inputs.Permissions.IsRoot {
 		add("permissions", StatusPass, "Current command has root privileges")
 	} else {
-		add("permissions", StatusFail, "app deploy requires root privileges", "Rerun with sudo lanpanel app deploy.")
+		add("permissions", StatusFail, "app deploy requires root privileges", "Retry App publication from the Management UI.")
 	}
 
 	for _, domain := range cfg.App.Domains {
@@ -226,7 +226,7 @@ func addAppListenCheck(checks *[]Check, ready bool, detail string) {
 		Status:  StatusFail,
 		Summary: summary,
 		Remediations: []string{
-			"Free the conflicting app.listen address, or stop the unmanaged service before rerunning sudo lanpanel app deploy.",
+			"Free the conflicting app.listen address, or stop the unmanaged service before retrying from the Management UI.",
 		},
 	})
 }
@@ -308,13 +308,13 @@ func addPortChecks(checks *[]Check, ports []preflight.PortBinding) {
 		*checks = append(*checks, Check{ID: id, Status: status, Summary: summary, Remediations: compact(remediations)})
 	}
 	if len(ports) == 0 {
-		add("ports", StatusFail, "Could not confirm 80/tcp and 443/tcp port usage", "Confirm ss is executable on the host, then rerun sudo lanpanel app deploy.")
+		add("ports", StatusFail, "Could not confirm 80/tcp and 443/tcp port usage", "Confirm the listener probe is available, then retry from the Management UI.")
 		return
 	}
 	for _, required := range []int{80, 443} {
 		bindings := findPortBindings(ports, required, "tcp")
 		if len(bindings) == 0 {
-			add(fmt.Sprintf("port:%d/tcp", required), StatusFail, fmt.Sprintf("Missing %d/tcp port usage probe result", required), "Rerun sudo lanpanel app deploy and confirm port usage probing is complete.")
+			add(fmt.Sprintf("port:%d/tcp", required), StatusFail, fmt.Sprintf("Missing %d/tcp port usage probe result", required), "Retry from the Management UI and confirm port usage probing is complete.")
 			continue
 		}
 		blockingProcesses := []string{}

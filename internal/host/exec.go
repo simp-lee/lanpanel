@@ -1,4 +1,4 @@
-// Package host provides host execution and file mutation primitives for lanpanel deployments.
+// Package host provides host execution and file mutation primitives.
 package host
 
 import (

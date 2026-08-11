@@ -57,10 +57,10 @@ func TestStageRuntimeRendersProfileArtifacts(t *testing.T) {
 	if !strings.Contains(content["templates/realip/refresh.timer.tmpl"], "OnUnitActiveSec=3600s") || strings.Contains(content["templates/realip/refresh.timer.tmpl"], "3600000000000ns") {
 		t.Fatalf("refresh timer missing interval\n%s", content["templates/realip/refresh.timer.tmpl"])
 	}
-	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "/usr/local/bin/lanpanel app realip refresh --config /etc/lanpanel/lanpanel-app.yaml --profile edgeone-prod") {
-		t.Fatalf("refresh service missing command\n%s", content["templates/realip/refresh.service.tmpl"])
+	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "ExecStart=/usr/local/bin/lanpanel timer") {
+		t.Fatalf("refresh service missing closed timer role\n%s", content["templates/realip/refresh.service.tmpl"])
 	}
-	if strings.Contains(content["templates/realip/refresh.service.tmpl"], "--confirmation") {
+	if strings.Contains(content["templates/realip/refresh.service.tmpl"], "--") {
 		t.Fatalf("refresh service must not embed manual confirmation\n%s", content["templates/realip/refresh.service.tmpl"])
 	}
 	if !strings.Contains(content["templates/realip/refresh.service.tmpl"], "TimeoutStartSec=2min") {

@@ -1,2 +1,2 @@
-// Package appsvc plans app-specific host resources for lanpanel app deployments.
+// Package appsvc plans App-specific managed host resources.
 package appsvc

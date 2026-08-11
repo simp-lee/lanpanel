@@ -525,7 +525,7 @@ func (store Store) RecoverInterrupted() error {
 				continue
 			}
 			record.Status = domain.JobStatusInterrupted
-			record.ErrorSummary = "job was interrupted while lanpanel ui was not running"
+			record.ErrorSummary = "job was interrupted while the supervised Management UI role was not running"
 			record.ConfigSnapshotRef = explicitConfigSnapshotRef(record.ConfigSnapshotRef)
 			record.RetryCommand = interruptedRetryCommand(record)
 			if err := store.SaveRecord(record); err != nil {

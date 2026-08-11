@@ -61,7 +61,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 		Operation:    "writing /etc/headscale/config.yaml",
 		Impact:       "deploy cannot continue until runtime config is installed",
 		Remediation:  []string{"Check filesystem permissions and rerun deploy."},
-		RetryCommand: "lanpanel deploy --config lanpanel.yaml",
+		RetryCommand: "Management UI",
 	}.Snapshot())
 
 	if err := store.Save(checkpoint); err != nil {
@@ -99,7 +99,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	if len(loaded.LastFailure.Remediation) != 1 || loaded.LastFailure.Remediation[0] != "Check filesystem permissions and rerun deploy." {
 		t.Fatalf("LastFailure.Remediation = %v, want persisted remediation", loaded.LastFailure.Remediation)
 	}
-	if loaded.LastFailure.RetryCommand != "lanpanel deploy --config lanpanel.yaml" {
+	if loaded.LastFailure.RetryCommand != "Management UI" {
 		t.Fatalf("LastFailure.RetryCommand = %q, want persisted retry command", loaded.LastFailure.RetryCommand)
 	}
 	if loaded.UpdatedAt.IsZero() {

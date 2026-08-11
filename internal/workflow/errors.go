@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"lanpanel/internal/domain"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -128,6 +129,9 @@ func summarizeCause(err error) string {
 }
 
 func ShellCommand(args ...string) string {
+	if slices.Contains(args, "lanpanel") {
+		return "Management UI"
+	}
 	parts := make([]string, 0, len(args))
 	for _, arg := range args {
 		parts = append(parts, shellQuote(arg))

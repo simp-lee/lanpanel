@@ -2,8 +2,6 @@ package appconfig
 
 import (
 	"fmt"
-	"lanpanel/internal/assets"
-	"lanpanel/internal/config"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +9,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
-
-const exampleAssetPath = "config/lanpanel-app.yaml.example"
 
 func (c Config) ExportYAML() ([]byte, error) {
 	if err := c.ValidateForExposurePlan(); err != nil {
@@ -36,17 +32,7 @@ func (c Config) WriteFile(path string) error {
 	return nil
 }
 
-func ExampleYAML() ([]byte, error) {
-	data, err := assets.NewLoader().Read(exampleAssetPath)
-	if err != nil {
-		return nil, err
-	}
-	data = []byte(strings.Replace(string(data), `arch: "amd64"`, fmt.Sprintf(`arch: "%s"`, config.DefaultPlatformArch()), 1))
-	if _, err := LoadBytes(data); err != nil {
-		return nil, fmt.Errorf("embedded app example config is invalid: %w", err)
-	}
-	return data, nil
-}
+func ExampleYAML() ([]byte, error) { return ExampleConfig().ExportYAML() }
 
 func WriteExampleFile(path string) error {
 	data, err := ExampleYAML()

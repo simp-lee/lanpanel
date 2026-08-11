@@ -169,6 +169,9 @@ func progressEvents(kind domain.JobKind, status domain.DiagnosticStatus) []workf
 
 func retryWithConfirmations(command string, confirmations []string) string {
 	command = strings.TrimSpace(command)
+	if command == "Management UI" {
+		return command
+	}
 	for _, confirmation := range confirmations {
 		confirmation = strings.TrimSpace(confirmation)
 		if confirmation != "" {

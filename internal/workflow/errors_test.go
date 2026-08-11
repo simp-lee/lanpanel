@@ -16,7 +16,7 @@ func TestFailureSnapshotFormatsUserReadableFields(t *testing.T) {
 			"Check package mirror reachability or switch to a verified offline package.",
 			"Confirm the configured package checksum matches the artifact you expect to install.",
 		},
-		RetryCommand: "lanpanel deploy --config lanpanel.yaml",
+		RetryCommand: "Management UI",
 		Cause:        errors.New("apt-get install headscale exited with status 100\nraw shell spew that should stay hidden"),
 	}
 
@@ -38,7 +38,7 @@ func TestFailureSnapshotFormatsUserReadableFields(t *testing.T) {
 	if len(nextSteps) != 3 {
 		t.Fatalf("len(nextSteps) = %d, want 3", len(nextSteps))
 	}
-	if nextSteps[2] != "Retry after remediation: lanpanel deploy --config lanpanel.yaml" {
+	if nextSteps[2] != "Retry after remediation: Management UI" {
 		t.Fatalf("retry step = %q, want retry command", nextSteps[2])
 	}
 	if failure.Error() != snapshot.SummaryText() {
@@ -56,7 +56,7 @@ func TestFailureSnapshotCarriesSerializableUserContext(t *testing.T) {
 		Remediation: []string{
 			"Check the destination directory permissions.",
 		},
-		RetryCommand: "lanpanel deploy --config lanpanel.yaml",
+		RetryCommand: "Management UI",
 		Cause:        errors.New("write failed\nraw shell spew"),
 	}
 
@@ -70,16 +70,16 @@ func TestFailureSnapshotCarriesSerializableUserContext(t *testing.T) {
 	if len(snapshot.Remediation) != 1 || snapshot.Remediation[0] != "Check the destination directory permissions." {
 		t.Fatalf("Remediation = %v, want serialized remediation", snapshot.Remediation)
 	}
-	if snapshot.RetryCommand != "lanpanel deploy --config lanpanel.yaml" {
+	if snapshot.RetryCommand != "Management UI" {
 		t.Fatalf("RetryCommand = %q, want serialized retry command", snapshot.RetryCommand)
 	}
 }
 
-func TestShellCommandQuotesUnsafeArguments(t *testing.T) {
+func TestShellCommandRoutesManagementActionsToUI(t *testing.T) {
 	t.Parallel()
 
-	got := ShellCommand("lanpanel", "deploy", "--config", "/tmp/lan panel/a;touch x.yaml", "quote'path")
-	want := "lanpanel deploy --config '/tmp/lan panel/a;touch x.yaml' 'quote'\\''path'"
+	got := ShellCommand("lanpanel", "obsolete")
+	want := "Management UI"
 	if got != want {
 		t.Fatalf("ShellCommand() = %q, want %q", got, want)
 	}

@@ -26,18 +26,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Set up Node for E2E
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install runtime fixture dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y apache2-utils nginx
-
-      - name: P0 release gate
-        run: make p0-release-gate
+      - name: Verify closed role dispatcher
+        run: make check
 
       - name: Build Linux binaries
         shell: bash

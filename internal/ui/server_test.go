@@ -367,7 +367,7 @@ func TestWriteRouteRequiresRootAfterCSRF(t *testing.T) {
 	if post.Code != http.StatusForbidden {
 		t.Fatalf("write route status = %d body = %q, want 403", post.Code, post.Body.String())
 	}
-	if !strings.Contains(post.Body.String(), "write operations require sudo lanpanel ui") {
+	if !strings.Contains(post.Body.String(), "write operations require the supervised Management UI role") {
 		t.Fatalf("write route body = %q, want root requirement", post.Body.String())
 	}
 }
@@ -669,7 +669,7 @@ func TestRecordBackgroundJobFailurePreservesPersistedResultFields(t *testing.T) 
 	persisted.ModifiedPaths = []string{"/etc/lanpanel/lanpanel.yaml"}
 	persisted.ConfigSnapshotRef = "/var/lib/lanpanel/ui-state/jobs/job/config-snapshots/main-config.yaml"
 	persisted.ResourceIDs = []string{"res_00112233445566778899aabbccddeeff"}
-	persisted.RetryCommand = "lanpanel verify --config /etc/lanpanel/lanpanel.yaml"
+	persisted.RetryCommand = "Management UI"
 	if err := server.state.SaveRecord(persisted); err != nil {
 		t.Fatalf("SaveRecord() error = %v", err)
 	}
@@ -714,13 +714,13 @@ func TestMarkPreparedJobFailedPersistsTerminalRecord(t *testing.T) {
 		Actor:             actor,
 		CheckpointRef:     domain.ActivationRef{Kind: domain.ActivationRefCheckpoint, Path: filepath.Join(server.options.StateDir, "lanpanel-app.checkpoint.json"), Digest: "sha256:test"},
 		ConfigSnapshotRef: "not_applicable",
-		RetryCommand:      "lanpanel verify --config lanpanel.yaml",
+		RetryCommand:      "Management UI",
 	})
 	if err != nil {
 		t.Fatalf("CreateJob() error = %v", err)
 	}
 
-	if err := server.markPreparedJobFailed(record, jobOperation{kind: domain.JobKindVerify, retryCommand: "lanpanel verify --config lanpanel.yaml"}, errors.New("attach job lock failed")); err != nil {
+	if err := server.markPreparedJobFailed(record, jobOperation{kind: domain.JobKindVerify, retryCommand: "Management UI"}, errors.New("attach job lock failed")); err != nil {
 		t.Fatalf("markPreparedJobFailed() error = %v", err)
 	}
 	loaded, err := server.state.LoadRecord(record.ID)
@@ -760,7 +760,7 @@ func TestJobsPagePollsHistoryFragment(t *testing.T) {
 		},
 		CheckpointRef:     domain.ActivationRef{Kind: domain.ActivationRefCheckpoint, Path: filepath.Join(server.options.StateDir, "lanpanel-app.checkpoint.json"), Digest: "sha256:test"},
 		ConfigSnapshotRef: "not_applicable",
-		RetryCommand:      "sudo lanpanel app deploy --config lanpanel-app.yaml --confirmation origin-protection-manual",
+		RetryCommand:      "Management UI",
 	})
 	if err != nil {
 		t.Fatalf("CreateJob() error = %v", err)
@@ -1833,8 +1833,8 @@ func TestRunJobDelegatesHostChangingOperationsToHostWorkflow(t *testing.T) {
 		if record.CheckpointRef.Kind != domain.ActivationRefCheckpoint || record.CheckpointRef.Path == "" {
 			t.Fatalf("%s CheckpointRef = %#v, want JSON checkpoint", tt.operation, record.CheckpointRef)
 		}
-		if tt.operation == "realip_refresh" && !strings.Contains(record.RetryCommand, "--config "+appConfigPath) {
-			t.Fatalf("%s RetryCommand = %q, want app config path", tt.operation, record.RetryCommand)
+		if record.RetryCommand != "Management UI" {
+			t.Fatalf("%s RetryCommand = %q", tt.operation, record.RetryCommand)
 		}
 		if !hostWorkflow.hasCall(tt.wantCall) {
 			t.Fatalf("%s host workflow calls = %v, missing %q", tt.operation, hostWorkflow.calls, tt.wantCall)

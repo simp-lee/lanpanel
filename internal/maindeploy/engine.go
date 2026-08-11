@@ -477,7 +477,7 @@ func runDeployCommandResult(configPath string) (deployCommandResult, error) {
 				},
 				RetryCommand: deployRetryCommand(options.configPath),
 			}, []string{
-				fmt.Sprintf("Run 'lanpanel init --config %s' to generate a starter config.", options.configPath),
+				fmt.Sprintf("Create the configuration for %s from the Management UI.", options.configPath),
 			}), nil
 		}
 		return deployCommandResult{}, fmt.Errorf("stat config file: %w", err)
@@ -495,7 +495,7 @@ func runDeployCommandResult(configPath string) (deployCommandResult, error) {
 			},
 			RetryCommand: deployRetryCommand(options.configPath),
 		}, []string{
-			fmt.Sprintf("Fix the config at %s and rerun 'lanpanel deploy --config %s'.", options.configPath, options.configPath),
+			fmt.Sprintf("Fix the configuration at %s and retry from the Management UI.", options.configPath),
 		}), nil
 	}
 
@@ -1124,7 +1124,7 @@ func runDeployCommandResult(configPath string) (deployCommandResult, error) {
 				Step:         "verify runtime assets",
 				Operation:    verifyReport.Summary(),
 				Impact:       "lanpanel cannot call the deployment ready until static runtime checks pass",
-				Remediation:  []string{"Run 'lanpanel verify' to inspect failed checks, fix the config or templates, and rerun deploy."},
+				Remediation:  []string{"Inspect failed checks in the Management UI, fix the configuration or templates, and retry."},
 				RetryCommand: deployRetryCommand(options.configPath),
 				Cause:        fmt.Errorf("%s", verify.SummarizeChecks(verifyReport.Checks)),
 			})
@@ -1175,9 +1175,9 @@ func runDeployCommandResult(configPath string) (deployCommandResult, error) {
 		RetryCommand:  deployRetryCommand(options.configPath),
 		Progress:      operationProgressEvents(domain.JobKindDeploy, "main deploy host workflow started", domain.DiagnosticStatusPass, "main deploy host workflow finished"),
 	}, []string{
-		fmt.Sprintf("Use 'lanpanel status --config %s' to inspect persisted deploy context.", options.configPath),
-		fmt.Sprintf("Use 'lanpanel verify --config %s' to re-run runtime asset and onboarding readiness checks.", options.configPath),
-		"Open 'lanpanel ui' through an SSH tunnel and use Headscale onboarding to create a short-lived one-time preauth key handoff.",
+		fmt.Sprintf("Inspect persisted context for %s in the Management UI.", options.configPath),
+		fmt.Sprintf("Re-run runtime and onboarding readiness checks for %s in the Management UI.", options.configPath),
+		"Open the Management UI through its authenticated access path and use Headscale onboarding to create a short-lived one-time preauth key handoff.",
 	}), nil
 }
 

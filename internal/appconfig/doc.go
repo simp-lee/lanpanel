@@ -1,2 +1,2 @@
-// Package appconfig owns the standalone lanpanel app configuration contract.
+// Package appconfig owns the managed App configuration contract.
 package appconfig

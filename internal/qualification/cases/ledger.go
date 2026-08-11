@@ -108,6 +108,12 @@ func Ledger() []Row {
 		stepFixtureRow("S4", "R7.9.fenced_handoff_inventory", "R7.9", "Admission-retaining maintenance, upgrade, and backup handoff rechecks canonical empty inventory under ordered locks", "operations.fenced_handoff", "./internal/operations", "TestOperationAdmissionContract/admission_retaining_handoff_rechecks_empty_inventory"),
 		stepFixtureRow("S4", "R7.10.exhaustive_result_registry", "R7.10", "Operation owners register every distinct result branch and cannot conflate partial with unknown", "operations.result_registry", "./internal/operations", "TestOperationResultBranchTable/exhaustive_results_keep_partial_and_unknown_distinct"),
 
+		stepFixtureRow("S5", "R3.5.binary_management_absence", "R3.5", "Binary help omits every management command, data format, generic role, alias, and migration entry", "roles.binary_absence", "./cmd/lanpanel", "TestBinaryHelpHasNoManagementInterface/help_omits_management_commands"),
+		stepFixtureRow("S5", "R3.5.obsolete_inputs_rejected", "R3.5", "Former management commands, generic role flags, aliases, YAML paths, and unwired roles reject before dispatch", "roles.obsolete_inputs", "./cmd/lanpanel", "TestBinaryVersionAndClosedDispatch/obsolete_inputs_rejected"),
+		stepFixtureRow("S5", "R8.5.closed_same_binary_roles", "R8.5", "Only complete handlers for release-fixed same-binary roles can enter the dispatcher", "roles.closed_registry", "./internal/roles", "TestDispatcherExposesOnlyCompleteFixedRoles/fixed_complete_handlers_only"),
+
+		stepFixtureRow("S5", "R1.1.fixed_role_census", "R1.1", "The same-binary role allowlist fixes UI, helper, timer, relay, guards, installer, upgrade, and recovery roles", "roles.fixed_census", "./internal/roles", "TestFixedRoleCensus/release_fixed_roles"),
+
 		fixtureRow("R10.10.atomic_ledger_rows", "R10.10", "The clause ledger rejects duplicate, malformed, and non-atomic rows", "qualification.atomic_ledger_rows", "./internal/qualification/cases", "TestLedgerContract/atomic_rows_validate"),
 		fixtureRow("R10.10.parent_only_selectors", "R10.10", "Parent-only clause, scope, and test selectors are rejected", "qualification.parent_selectors_rejected", "./internal/qualification/cases", "TestLedgerContract/parent_only_selectors_are_rejected"),
 		fixtureRow("R10.10.package_ownership", "R10.10", "Focused execution rejects a ledger package omitted from PKGS", "qualification.package_ownership", "./internal/qualification/cases", "TestRunnerContract/missing_package_is_rejected"),

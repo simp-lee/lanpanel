@@ -228,8 +228,8 @@ func TestRunPreAuthKeyCreateRequiresHeadscaleCreator(t *testing.T) {
 	if result.Kind != domain.JobKindPreAuthKeyCreate || result.Status != domain.JobStatusFailed {
 		t.Fatalf("RunPreAuthKeyCreate() result = %#v, want typed failed preauth result", result)
 	}
-	if result.RetryCommand != "sudo lanpanel ui" {
-		t.Fatalf("RetryCommand = %q, want sudo lanpanel ui", result.RetryCommand)
+	if result.RetryCommand != "Management UI" {
+		t.Fatalf("RetryCommand = %q, want Management UI", result.RetryCommand)
 	}
 	if !progressContains(result.Progress, "preauth key handoff failed") {
 		t.Fatalf("Progress = %#v, want failed handoff progress", result.Progress)
@@ -247,8 +247,8 @@ func TestRunPreAuthKeyCreateRejectsLongTTLBeforeCreator(t *testing.T) {
 	if result.Kind != domain.JobKindPreAuthKeyCreate || result.Status != domain.JobStatusFailed {
 		t.Fatalf("RunPreAuthKeyCreate() result = %#v, want typed failed preauth result", result)
 	}
-	if result.RetryCommand != "sudo lanpanel ui" {
-		t.Fatalf("RetryCommand = %q, want sudo lanpanel ui", result.RetryCommand)
+	if result.RetryCommand != "Management UI" {
+		t.Fatalf("RetryCommand = %q, want Management UI", result.RetryCommand)
 	}
 	if !progressContains(result.Progress, "preauth key handoff failed") {
 		t.Fatalf("Progress = %#v, want failed handoff progress", result.Progress)
@@ -420,7 +420,7 @@ func TestOperationRetryCommandsQuoteUnsafeArguments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunMainDeploy() error = %v", err)
 	}
-	if mainResult.RetryCommand != "sudo lanpanel deploy --config '"+mainPath+"'" {
+	if mainResult.RetryCommand != "Management UI" {
 		t.Fatalf("RetryCommand = %q", mainResult.RetryCommand)
 	}
 
@@ -432,7 +432,7 @@ func TestOperationRetryCommandsQuoteUnsafeArguments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunAppDeploy() error = %v", err)
 	}
-	if appResult.RetryCommand != "sudo lanpanel app deploy --config '"+appPath+"'" {
+	if appResult.RetryCommand != "Management UI" {
 		t.Fatalf("RetryCommand = %q", appResult.RetryCommand)
 	}
 	if appResult.ExposurePlan == nil || appResult.ExposurePlan.Resource.ID == "" {
@@ -534,7 +534,7 @@ func TestRunRealIPValidateReferenceReturnsTypedResult(t *testing.T) {
 	if got, ok := fieldValue(result.Fields, "domains"); !ok || got != "app.example.com" {
 		t.Fatalf("domains field = %q, %v; want trimmed domain", got, ok)
 	}
-	if result.RetryCommand != "lanpanel app realip validate-reference --profile edgeone-prod --app first --path "+path {
+	if result.RetryCommand != "Management UI" {
 		t.Fatalf("RetryCommand = %q", result.RetryCommand)
 	}
 	if len(result.Diagnostics) == 0 || result.Diagnostics[0].Status != domain.DiagnosticStatusPass {
@@ -1290,7 +1290,7 @@ func TestStatusAndRealIPDiagnosticsDelegateHostWorkflow(t *testing.T) {
 	if hostWorkflow.mainStatusPath != "/tmp/lanpanel.yaml" {
 		t.Fatalf("RunMainStatus() host path = %q, want /tmp/lanpanel.yaml", hostWorkflow.mainStatusPath)
 	}
-	if statusResult.Kind != domain.JobKindStatus || statusResult.RetryCommand != "lanpanel status --config /tmp/lanpanel.yaml" {
+	if statusResult.Kind != domain.JobKindStatus || statusResult.RetryCommand != "Management UI" {
 		t.Fatalf("RunMainStatus() result = %#v, want status kind and retry command", statusResult)
 	}
 
@@ -1301,7 +1301,7 @@ func TestStatusAndRealIPDiagnosticsDelegateHostWorkflow(t *testing.T) {
 	if hostWorkflow.realIPDiagnosticsPath != "/tmp/lanpanel-app.yaml" || hostWorkflow.realIPDiagnosticsProfile != "edgeone-prod" {
 		t.Fatalf("RunRealIPDiagnostics() host args = %q %q, want app config and profile", hostWorkflow.realIPDiagnosticsPath, hostWorkflow.realIPDiagnosticsProfile)
 	}
-	if diagnosticsResult.Kind != domain.JobKindRealIPDiagnostics || diagnosticsResult.RetryCommand != "sudo lanpanel app realip diagnostics --config /tmp/lanpanel-app.yaml --profile edgeone-prod" {
+	if diagnosticsResult.Kind != domain.JobKindRealIPDiagnostics || diagnosticsResult.RetryCommand != "Management UI" {
 		t.Fatalf("RunRealIPDiagnostics() result = %#v, want diagnostics kind and retry command", diagnosticsResult)
 	}
 }

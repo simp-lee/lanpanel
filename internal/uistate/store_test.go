@@ -723,7 +723,7 @@ func TestStoreRecoverInterruptedPreservesExistingRetryCommand(t *testing.T) {
 		Actor:         testActor(),
 		CheckpointRef: testCheckpointRef(),
 		ModifiedPaths: []string{"/tmp/lan panel/main.yaml"},
-		RetryCommand:  "sudo lanpanel deploy --config /etc/lanpanel/lanpanel.yaml",
+		RetryCommand:  "Management UI",
 	})
 	if err != nil {
 		t.Fatalf("CreateJob() error = %v", err)
@@ -735,7 +735,7 @@ func TestStoreRecoverInterruptedPreservesExistingRetryCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRecord() error = %v", err)
 	}
-	want := "sudo lanpanel deploy --config /etc/lanpanel/lanpanel.yaml"
+	want := "Management UI"
 	if loaded.RetryCommand != want {
 		t.Fatalf("RetryCommand = %q, want %q", loaded.RetryCommand, want)
 	}
@@ -1195,7 +1195,7 @@ func TestStoreRedactsPersistedRecordReferenceFields(t *testing.T) {
 		Actor:             testActor(),
 		CheckpointRef:     domain.ActivationRef{Kind: domain.ActivationRefCheckpoint, Path: "/var/lib/lanpanel/token abc123/checkpoint.json"},
 		ModifiedPaths:     []string{"/etc/lanpanel/password hunter2"},
-		RetryCommand:      "lanpanel deploy --token abc123",
+		RetryCommand:      "Management UI token abc123",
 		ConfigSnapshotRef: "preauth opaque",
 		ResultSummary:     "proxy http://proxy-user:proxy-pass@proxy.invalid:8080/path",
 	})
@@ -1314,7 +1314,7 @@ func TestRedactTextMasksAuthHeadersAndPreauthKeys(t *testing.T) {
 	if strings.Contains(spacedColon, "Basic") || strings.Contains(spacedColon, "payload") {
 		t.Fatalf("RedactText() = %q", spacedColon)
 	}
-	opaque := RedactText("lanpanel deploy --token abc123 password hunter2 authkey xyz preauth opaque")
+	opaque := RedactText("Management UI token abc123 password hunter2 authkey xyz preauth opaque")
 	for _, leaked := range []string{"abc123", "hunter2", "xyz", "opaque"} {
 		if strings.Contains(opaque, leaked) {
 			t.Fatalf("RedactText() = %q, leaked %q", opaque, leaked)

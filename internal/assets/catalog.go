@@ -10,7 +10,6 @@ type Role string
 
 const (
 	RoleReference     Role = "reference"
-	RoleConfigExample Role = "config-example"
 	RoleDocumentation Role = "documentation"
 	RoleRuntime       Role = "runtime"
 )
@@ -39,8 +38,6 @@ type Asset struct {
 }
 
 var catalog = []Asset{
-	{SourcePath: "config/lanpanel-app.yaml.example", Role: RoleConfigExample, ContentMode: ContentModeCopy},
-	{SourcePath: "config/lanpanel.yaml.example", Role: RoleConfigExample, ContentMode: ContentModeCopy},
 	{SourcePath: "templates/app/goaccess-logrotate.tmpl", Role: RoleRuntime, ContentMode: ContentModeRender},
 	{SourcePath: "templates/app/goaccess.conf.tmpl", Role: RoleRuntime, ContentMode: ContentModeRender},
 	{SourcePath: "templates/app/goaccess.service.tmpl", Role: RoleRuntime, ContentMode: ContentModeRender},

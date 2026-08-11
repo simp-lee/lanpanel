@@ -1536,6 +1536,9 @@ func (ctx Context) exposurePlanOptions(configPath string, operation domain.Expos
 
 func retryCommandWithConfirmations(retryCommand string, confirmations []string) string {
 	retryCommand = strings.TrimSpace(retryCommand)
+	if retryCommand == "Management UI" {
+		return retryCommand
+	}
 	for _, confirmation := range confirmations {
 		confirmation = strings.TrimSpace(confirmation)
 		if confirmation == "" {

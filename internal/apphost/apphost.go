@@ -1802,6 +1802,9 @@ func saveAppHostCheckpointSuccess(store state.Store, checkpoint *state.Checkpoin
 
 func retryCommandWithConfirmations(retryCommand string, confirmations []string) string {
 	retryCommand = strings.TrimSpace(retryCommand)
+	if retryCommand == "Management UI" {
+		return retryCommand
+	}
 	for _, confirmation := range confirmations {
 		confirmation = strings.TrimSpace(confirmation)
 		if confirmation == "" {
@@ -1940,7 +1943,7 @@ func runAppDeploy(ctx Context, options appOptions) (result Result, returnErr err
 			Status:    "failed",
 			Summary:   staticReport.Summary(),
 			Fields:    []domain.ResultField{{Label: "checks", Value: appverify.SummarizeChecks(staticReport.Checks)}},
-			NextSteps: []string{"Run 'lanpanel app verify' first, then fix the failed static checks."},
+			NextSteps: []string{"Run the Management UI verification first, then fix the failed static checks."},
 		})
 	}
 	checkpointDigest, err := appCheckpointDesiredStateDigest(staged)
@@ -2791,7 +2794,7 @@ func appDeployRootRequiredResponse(permissions preflight.PermissionState) comman
 		Status:    "blocked",
 		Summary:   "app deploy preflight found 1 failed check",
 		Fields:    []domain.ResultField{{Label: "check permissions", Value: detail}},
-		NextSteps: []string{"Rerun with sudo lanpanel app deploy and the same flags."},
+		NextSteps: []string{"Retry the operation from the Management UI with the same settings."},
 	}
 }
 
@@ -2943,7 +2946,7 @@ func loadAppConfigForResponse(path string, command string) (appconfig.Config, co
 				Summary: "App config file not found",
 				Fields:  []domain.ResultField{{Label: "config path", Value: path}},
 				NextSteps: []string{
-					fmt.Sprintf("Run 'lanpanel app init --config %s' to generate an example config.", path),
+					fmt.Sprintf("Create the App configuration for %s from the Management UI.", path),
 				},
 			}, false
 		}
@@ -4134,7 +4137,7 @@ func refreshDeployedRealIPProfile(ctx stdcontext.Context, profileName string, ap
 		return realip.State{}, realip.ProfileConfig{}, appsvc.RealIPProfileNames{}, err
 	}
 	if err := validateDeployedRealIPRefreshService(names.RefreshServicePath, realIPManagedMarker(profileName, appconfig.RealIPProviderEdgeOne), profileName, appConfigPath); err != nil {
-		return realip.State{}, realip.ProfileConfig{}, appsvc.RealIPProfileNames{}, fmt.Errorf("deployed realip refresh service is not bound to app config %s; rerun sudo lanpanel app deploy --config %s to intentionally change the refresh service binding: %w", appConfigPath, appConfigPath, err)
+		return realip.State{}, realip.ProfileConfig{}, appsvc.RealIPProfileNames{}, fmt.Errorf("deployed realip refresh service is not bound to App config %s; update the binding from the Management UI: %w", appConfigPath, err)
 	}
 	profile, err = readDeployedRealIPProfileFn(names.MetadataPath)
 	if err != nil {
@@ -4899,7 +4902,7 @@ func appRealIPRefreshRootRequiredResponse(permissions preflight.PermissionState)
 		Status:    "blocked",
 		Summary:   "app realip refresh preflight found 1 failed check",
 		Fields:    []domain.ResultField{{Label: "check permissions", Value: detail}},
-		NextSteps: []string{"Rerun with sudo lanpanel app realip refresh --config <app-config> --profile <name> --confirmation " + appOriginProtectionManualConfirmation + "."},
+		NextSteps: []string{"Retry RealIP refresh from the Management UI with confirmation " + appOriginProtectionManualConfirmation + "."},
 	}
 }
 
@@ -4973,7 +4976,7 @@ func AppRuntimeHostChecksStep(cfg appconfig.Config) string {
 }
 
 func appDeployRuntimeVerifyStep(configPath string, cfg appconfig.Config) string {
-	return fmt.Sprintf("Run 'lanpanel app verify --config %s' to recheck static config and templates; then use %s to verify host runtime state.", configPath, appRuntimeHostCheckTools(cfg))
+	return fmt.Sprintf("Recheck %s from the Management UI; then use %s to verify host runtime state.", configPath, appRuntimeHostCheckTools(cfg))
 }
 
 func AppDeployRuntimeVerifyStep(configPath string, cfg appconfig.Config) string {
@@ -5647,7 +5650,7 @@ func detectAppDNSCredentialState(cfg appconfig.Config) (bool, bool, string) {
 
 	env := nonEmptyEnvironmentByKey()
 	if providerInfo.LegoCode == "route53" && route53RawSecretEnvironmentPresent(env) && strings.TrimSpace(env["AWS_SHARED_CREDENTIALS_FILE"]) == "" {
-		return true, false, "Detected Route53 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in the current environment, but lanpanel app deploy will not pass raw AWS secrets through sudo or systemd. Use dns01.env_file for DNS-01 deploy and renewal."
+		return true, false, "Detected Route53 AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY in the current environment, but App publication will not pass raw AWS secrets to child services. Use dns01.env_file for DNS-01 publication and renewal."
 	}
 	if providerInfo.AmbientCredentialsSupported {
 		detail := fmt.Sprintf("Using lego ambient credential chain for DNS provider %q; confirm deploy and %s run with the same host identity.", providerInfo.LegoCode, cfg.App.Name+"-lego-renew.service")
@@ -6829,7 +6832,7 @@ func appDeployFailureWithFieldsPathsPlan(summary string, err error, fields []dom
 		ModifiedPaths: append([]string(nil), modifiedPaths...),
 		RetryCommand:  retryCommand,
 		Progress:      operationProgressEvents(domain.JobKindAppDeploy, "app deploy host workflow started", domain.DiagnosticStatusFail, "app deploy host workflow failed"),
-	}, []string{"Fix the error and rerun the same lanpanel app deploy command."})
+	}, []string{"Fix the error and retry the same operation from the Management UI."})
 	return result, fmt.Errorf("app deploy: %s: %w", summary, err)
 }
 
