@@ -135,7 +135,6 @@ const (
 	OperationPublish                 OperationCode = "publish"
 	OperationUnpublish               OperationCode = "unpublish"
 	OperationCloseAll                OperationCode = "close_all"
-	OperationRepair                  OperationCode = "repair"
 	OperationProcessStart            OperationCode = "process_start"
 	OperationProcessStop             OperationCode = "process_stop"
 	OperationUnpublishAndStop        OperationCode = "unpublish_and_stop"
@@ -371,7 +370,7 @@ func ParseOperationCode(value string) (OperationCode, error) {
 		OperationConnectorAuthKeyDiscard, OperationConnectorLogin,
 		OperationConnectorDisconnect, OperationConnectorRebind, OperationResourceCreate,
 		OperationResourceUpdate, OperationResourceDelete, OperationPublish,
-		OperationUnpublish, OperationCloseAll, OperationRepair, OperationProcessStart,
+		OperationUnpublish, OperationCloseAll, OperationProcessStart,
 		OperationProcessStop, OperationUnpublishAndStop, OperationHeadscaleUserCreate,
 		OperationHeadscaleUserList, OperationPreauthKeyCreate, OperationPreauthKeyList,
 		OperationPreauthKeyRevoke, OperationDeviceList, OperationDeviceExpire,
@@ -391,7 +390,7 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 	}
 	allowed := false
 	switch operation {
-	case OperationPlan, OperationStatus, OperationDiagnostics, OperationRepair:
+	case OperationPlan, OperationStatus, OperationDiagnostics:
 		allowed = target.Kind == OperationTargetInstallation || target.Kind == OperationTargetResource
 	case OperationResourceUpdate, OperationResourceDelete, OperationPublish, OperationUnpublish,
 		OperationProcessStart, OperationProcessStop, OperationUnpublishAndStop,

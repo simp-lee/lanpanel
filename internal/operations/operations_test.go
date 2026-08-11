@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
@@ -117,15 +118,24 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err := TransitionChild(context.Background(), normal, mutationLease, exposure, 5, child); err != nil {
 			t.Fatal(err)
 		}
-		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: "provider", Generation: 1, Phase: JournalPrepared}
-		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 6, journal, true); err != nil {
+		rawInstallation, err := persist.EncodeEntry(testOperationInstallation())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := normal.Update(context.Background(), exposure, 6, func(transaction *persist.Transaction) error {
+			return transaction.Create("installations/current", rawInstallation)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: JournalAppContraction, Operation: Publish, InstallationID: testOperationInstallation().InstallationID, Target: "resource/app-one", Generation: 1, Deadline: now.Add(time.Hour), ArtifactDigest: testDigest("artifact"), SafetyMarkerDigest: testDigest("marker"), ChildIDs: []string{"child-one"}, Phase: JournalPrepared}
+		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 7, journal, true); err != nil {
 			t.Fatal(err)
 		}
 		journal.Phase = JournalActive
-		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 7, journal, false); err != nil {
+		if err := PutJournal(context.Background(), normal, mutationLease, exposure, 8, journal, false); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := EnterRemoteWait(context.Background(), normal, mutationLease, exposure, 8, record.ID); err != nil {
+		if _, err := EnterRemoteWait(context.Background(), normal, mutationLease, exposure, 9, record.ID); err != nil {
 			t.Fatal(err)
 		}
 		contraction, err := manager.Acquire(context.Background(), locks.Exposure)
@@ -133,25 +143,34 @@ func TestOperationAdmissionContract(t *testing.T) {
 			t.Fatalf("remote wait retained exposure lock: %v", err)
 		}
 		_ = contraction.Release()
-		reentered, reentryMutation, reentryExposure, err := admitter.Reenter(context.Background(), mutation, manager, 9, record.ID)
+		reentered, reentryMutation, reentryExposure, err := admitter.Reenter(context.Background(), mutation, manager, 10, record.ID)
 		if err != nil || reentered.Phase != PhaseReentered {
 			t.Fatalf("Reenter()=%#v,%v", reentered, err)
 		}
 		stamp := now.Add(time.Second)
 		child.State = ChildTerminal
 		child.TerminalAt = &stamp
-		if err := TransitionChild(context.Background(), normal, reentryMutation, reentryExposure, 10, child); err != nil {
+		child.Outcome = ChildSucceeded
+		child.ResultDigest = testDigest("child-result")
+		if err := TransitionChild(context.Background(), normal, reentryMutation, reentryExposure, 11, child); err != nil {
 			t.Fatal(err)
 		}
 		journal.Phase = JournalTerminal
-		if err := PutJournal(context.Background(), normal, reentryMutation, reentryExposure, 11, journal, false); err != nil {
+		if err := PutJournal(context.Background(), normal, reentryMutation, reentryExposure, 12, journal, false); err != nil {
 			t.Fatal(err)
 		}
-		completed, err := admitter.Complete(context.Background(), reentryMutation, reentryExposure, 12, record.ID, "complete", nil, []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: "app-one"}}, "")
+		decision, err := admitter.DecideExactReconciliation(reentryExposure, journal.ID, ExactReconciliationObservation{Deadline: journal.Deadline, ArtifactDigest: journal.ArtifactDigest, SafetyMarkerDigest: journal.SafetyMarkerDigest})
+		if err != nil || decision.Action != ReconcileContractApp || decision.Target != journal.Target {
+			t.Fatalf("DecideExactReconciliation() = %#v, %v", decision, err)
+		}
+		if _, err := admitter.DecideExactReconciliation(nil, journal.ID, ExactReconciliationObservation{}); err == nil {
+			t.Fatal("exact reconciliation read without exposure authority")
+		}
+		completed, err := admitter.Complete(context.Background(), reentryMutation, reentryExposure, 13, record.ID, "complete", nil, []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: "app-one"}}, "")
 		if err != nil || completed.Result != jobs.ResultSucceeded {
 			t.Fatalf("Complete()=%#v,%v", completed, err)
 		}
-		if _, _, err := normal.Update(context.Background(), reentryExposure, 13, func(transaction *persist.Transaction) error {
+		if _, _, err := normal.Update(context.Background(), reentryExposure, 14, func(transaction *persist.Transaction) error {
 			rewritten := completed
 			rewritten.Postconditions[0].Identity = "other"
 			return jobs.Replace(transaction, rewritten)
@@ -243,12 +262,11 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		state = safety.EmptyState()
 		state.StopFence = &safety.StopFence{Kind: safety.StopFenceContraction, FenceGeneration: 7}
-		state.MaintenancePending = &safety.TransitionMarker{Generation: 1}
-		if err := authorize(Repair, state, SafetyBinding{StopFenceKind: safety.StopFenceContraction, StopFenceGeneration: 7}, false, time.Now()); err != nil {
-			t.Fatalf("exact maintenance stop-fence Repair binding rejected: %v", err)
+		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
+			t.Fatal("normal admission crossed a stop fence")
 		}
-		if err := authorize(Repair, state, SafetyBinding{StopFenceKind: safety.StopFenceContraction, StopFenceGeneration: 8}, false, time.Now()); err == nil {
-			t.Fatal("stale Repair binding accepted")
+		if validType(Type("startup_recovery")) {
+			t.Fatal("startup reconciliation was exposed through normal Plan admission")
 		}
 		state = safety.EmptyState()
 		state.DependencyTransitionPending = &safety.TransitionMarker{Generation: 3}
@@ -285,14 +303,14 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, edge, SafetyBinding{ResourceID: "app-one", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
-		if err := independent.AuthorizeStateIndependentContraction(StartupRecovery, safety.EmptyState(), SafetyBinding{RecoveryGeneration: 1}, fresh(), exposure, func() error { return nil }); err != nil {
-			t.Fatal(err)
+		if err := independent.AuthorizeStateIndependentContraction(Type("startup_recovery"), safety.EmptyState(), SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
+			t.Fatal("startup callback bypassed exact-journal reconciliation")
 		}
 		if err := independent.AuthorizeStateIndependentContraction(Publish, safety.EmptyState(), SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
 			t.Fatal("publish entered state-independent exception")
 		}
 		_, otherProof, _ := unavailableProof(t)
-		if err := independent.AuthorizeStateIndependentContraction(StartupRecovery, safety.EmptyState(), SafetyBinding{RecoveryGeneration: 1}, otherProof, exposure, func() error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, state, SafetyBinding{ResourceID: "app-one", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, otherProof, exposure, func() error { return nil }); err == nil {
 			t.Fatal("unavailability proof from another store was accepted")
 		}
 	})
@@ -439,6 +457,16 @@ func operationPlanSpec(now time.Time) plans.Spec {
 }
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
+}
+func testOperationInstallation() domain.Installation {
+	return domain.Installation{
+		SchemaVersion:  domain.InstallationSchemaVersion,
+		InstallationID: "ins_00000000000000000000000000000001",
+		Management: domain.ManagementAuthority{
+			Address: "127.23.45.67",
+			Port:    23456,
+		},
+	}
 }
 func newOperationStores(t *testing.T) (*persist.Store, *locks.Manager, *locks.Lease, *MutationSet) {
 	t.Helper()

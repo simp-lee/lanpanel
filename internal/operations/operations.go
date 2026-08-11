@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
@@ -30,10 +31,8 @@ const (
 	Unpublish         Type = "unpublish"
 	CloseAll          Type = "close_all"
 	EmergencyCloseAll Type = "emergency_close_all"
-	Repair            Type = "repair"
 	CertificateExpiry Type = "certificate_expiry"
 	EdgeOneExpiry     Type = "edgeone_expiry"
-	StartupRecovery   Type = "startup_recovery"
 	Maintenance       Type = "maintenance"
 	Upgrade           Type = "upgrade"
 	BackupEnter       Type = "backup_enter"
@@ -51,26 +50,17 @@ const (
 )
 
 type SafetyBinding struct {
-	GlobalGeneration        uint64               `json:"global_generation,omitempty"`
-	StopFenceKind           safety.StopFenceKind `json:"stop_fence_kind,omitempty"`
-	StopFenceGeneration     uint64               `json:"stop_fence_generation,omitempty"`
-	DependencyGeneration    uint64               `json:"dependency_generation,omitempty"`
-	ExpiryKind              string               `json:"expiry_kind,omitempty"`
-	ExpiryGeneration        uint64               `json:"expiry_generation,omitempty"`
-	ResourceID              string               `json:"resource_id,omitempty"`
-	OwnershipDigest         string               `json:"ownership_digest,omitempty"`
-	Deadline                time.Time            `json:"deadline"`
-	ProposedGeneration      uint64               `json:"proposed_generation,omitempty"`
-	RecoveryGeneration      uint64               `json:"recovery_generation,omitempty"`
-	PlanID                  string               `json:"plan_id,omitempty"`
-	IntentGeneration        uint64               `json:"intent_generation,omitempty"`
-	CandidateDigest         string               `json:"candidate_digest,omitempty"`
-	CandidateBundle         string               `json:"candidate_bundle,omitempty"`
-	MaintenanceGeneration   uint64               `json:"maintenance_generation,omitempty"`
-	CurrentEnvelope         string               `json:"current_envelope,omitempty"`
-	TargetEnvelope          string               `json:"target_envelope,omitempty"`
-	RuntimeClosureDigest    string               `json:"runtime_closure_digest,omitempty"`
-	GenerationClosureDigest string               `json:"generation_closure_digest,omitempty"`
+	GlobalGeneration     uint64    `json:"global_generation,omitempty"`
+	DependencyGeneration uint64    `json:"dependency_generation,omitempty"`
+	ExpiryKind           string    `json:"expiry_kind,omitempty"`
+	ExpiryGeneration     uint64    `json:"expiry_generation,omitempty"`
+	ResourceID           string    `json:"resource_id,omitempty"`
+	Deadline             time.Time `json:"deadline"`
+	ProposedGeneration   uint64    `json:"proposed_generation,omitempty"`
+	PlanID               string    `json:"plan_id,omitempty"`
+	IntentGeneration     uint64    `json:"intent_generation,omitempty"`
+	CandidateDigest      string    `json:"candidate_digest,omitempty"`
+	CandidateBundle      string    `json:"candidate_bundle,omitempty"`
 }
 type ConsumptionSnapshot struct {
 	Config             plans.DigestBinding `json:"config"`
@@ -95,36 +85,56 @@ type Reservation struct {
 }
 type ChildState string
 
+type ChildOutcome string
+
 const (
 	ChildSubmitted ChildState = "submitted"
 	ChildRunning   ChildState = "running"
 	ChildTerminal  ChildState = "terminal"
+
+	ChildSucceeded ChildOutcome = "succeeded"
+	ChildFailed    ChildOutcome = "failed"
+	ChildUnknown   ChildOutcome = "unknown"
 )
 
 type ChildRecord struct {
-	SchemaVersion string     `json:"schema_version"`
-	ID            string     `json:"id"`
-	JobID         string     `json:"job_id"`
-	Profile       string     `json:"profile"`
-	State         ChildState `json:"state"`
-	SubmittedAt   time.Time  `json:"submitted_at"`
-	TerminalAt    *time.Time `json:"terminal_at,omitempty"`
+	SchemaVersion string       `json:"schema_version"`
+	ID            string       `json:"id"`
+	JobID         string       `json:"job_id"`
+	Profile       string       `json:"profile"`
+	State         ChildState   `json:"state"`
+	SubmittedAt   time.Time    `json:"submitted_at"`
+	TerminalAt    *time.Time   `json:"terminal_at,omitempty"`
+	Outcome       ChildOutcome `json:"outcome,omitempty"`
+	ResultDigest  string       `json:"result_digest,omitempty"`
 }
+type JournalKind string
+
 type JournalPhase string
 
 const (
+	JournalNonIngressLocalCommit JournalKind = "non_ingress_local_commit"
+	JournalAppContraction        JournalKind = "app_contraction"
+
 	JournalPrepared JournalPhase = "prepared"
 	JournalActive   JournalPhase = "active"
 	JournalTerminal JournalPhase = "terminal"
 )
 
 type JournalRecord struct {
-	SchemaVersion string       `json:"schema_version"`
-	ID            string       `json:"id"`
-	JobID         string       `json:"job_id"`
-	Kind          string       `json:"kind"`
-	Generation    uint64       `json:"generation"`
-	Phase         JournalPhase `json:"phase"`
+	SchemaVersion      string       `json:"schema_version"`
+	ID                 string       `json:"id"`
+	JobID              string       `json:"job_id"`
+	Kind               JournalKind  `json:"kind"`
+	Operation          Type         `json:"operation"`
+	InstallationID     string       `json:"installation_id"`
+	Target             string       `json:"target"`
+	Generation         uint64       `json:"generation"`
+	Deadline           time.Time    `json:"deadline"`
+	ArtifactDigest     string       `json:"artifact_digest"`
+	SafetyMarkerDigest string       `json:"safety_marker_digest"`
+	ChildIDs           []string     `json:"child_ids"`
+	Phase              JournalPhase `json:"phase"`
 }
 
 type AdmitRequest struct {
@@ -824,17 +834,11 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	if !validType(operation) || operation == EmergencyCloseAll {
 		return fmt.Errorf("operation is unsupported for normal admission")
 	}
-	if state.StopFence != nil && operation == Repair && validRepairBinding(state, binding) {
-		return nil
-	}
 	if state.MaintenancePending != nil || state.UpgradePending != nil || (state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported) || state.BackupQuiescence != nil {
 		return fmt.Errorf("maintenance, upgrade, or backup marker admits no ordinary job")
 	}
 	if state.StopFence != nil {
 		return fmt.Errorf("stop fence blocks operation admission")
-	}
-	if operation == Repair && !validRepairBinding(state, binding) {
-		return fmt.Errorf("Repair authority binding is stale or absent")
 	}
 	if operation == CertificateExpiry || operation == EdgeOneExpiry {
 		if !validExpiryBinding(operation, state, binding) {
@@ -889,27 +893,6 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	return nil
 }
-func validRepairBinding(state safety.State, binding SafetyBinding) bool {
-	if state.StopFence != nil {
-		if state.StopFence.Kind == safety.StopFenceGenerationUpgrade || binding.StopFenceKind != state.StopFence.Kind || binding.StopFenceGeneration != state.StopFence.FenceGeneration {
-			return false
-		}
-		if state.StopFence.Kind == safety.StopFenceMaintenanceTransition {
-			fence := state.StopFence.Transition
-			return state.MaintenancePending != nil && fence != nil && binding.MaintenanceGeneration == state.MaintenancePending.Generation && binding.CurrentEnvelope == fence.CurrentEnvelope && binding.TargetEnvelope == fence.TargetEnvelope && binding.RuntimeClosureDigest == fence.RuntimeClosureDigest && binding.GenerationClosureDigest == fence.GenerationClosureDigest
-		}
-		return true
-	}
-	if state.GlobalClose.Phase != safety.GlobalCloseNone {
-		return binding.GlobalGeneration == state.GlobalClose.Generation
-	}
-	for _, resource := range state.Resources {
-		if resource.ResourceID == binding.ResourceID && resource.Ownership == safety.OwnershipOrphan && resource.OwnershipDigest == binding.OwnershipDigest {
-			return true
-		}
-	}
-	return false
-}
 func validExpiryBinding(operation Type, state safety.State, binding SafetyBinding) bool {
 	for _, resource := range state.Resources {
 		if resource.ResourceID != binding.ResourceID {
@@ -952,10 +935,6 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, s
 	case CertificateExpiry, EdgeOneExpiry:
 		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
 			return fmt.Errorf("state-independent expiry binding is stale or not due")
-		}
-	case StartupRecovery:
-		if binding.RecoveryGeneration == 0 {
-			return fmt.Errorf("startup recovery generation is required")
 		}
 	default:
 		return fmt.Errorf("operation is not a state-independent contraction exception")
@@ -1053,13 +1032,22 @@ func validateChildEntry(key string, raw json.RawMessage) error {
 	if err := decodeStrict(raw, &value); err != nil {
 		return err
 	}
-	if key != "children/"+value.ID || value.SchemaVersion != "lanpanel.child.v1" || value.ID == "" || value.JobID == "" || value.Profile == "" || value.SubmittedAt.IsZero() {
+	if key != "children/"+value.ID {
+		return fmt.Errorf("child reservation key does not match ID")
+	}
+	return validateChildRecord(value)
+}
+
+func validateChildRecord(value ChildRecord) error {
+	if value.SchemaVersion != "lanpanel.child.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.Profile) || value.SubmittedAt.IsZero() {
 		return fmt.Errorf("child reservation is invalid")
 	}
 	if value.State != ChildSubmitted && value.State != ChildRunning && value.State != ChildTerminal {
 		return fmt.Errorf("child state is invalid")
 	}
-	if (value.State == ChildTerminal) != (value.TerminalAt != nil) {
+	terminal := value.State == ChildTerminal
+	validOutcome := value.Outcome == ChildSucceeded || value.Outcome == ChildFailed || value.Outcome == ChildUnknown
+	if terminal != (value.TerminalAt != nil) || terminal != validOutcome || terminal != exactDigest(value.ResultDigest) || terminal && value.TerminalAt.Before(value.SubmittedAt) {
 		return fmt.Errorf("child terminal evidence is inconsistent")
 	}
 	return nil
@@ -1087,6 +1075,10 @@ func validateChildTransition(_ string, before, after json.RawMessage) error {
 	newValue.State = ""
 	oldValue.TerminalAt = nil
 	newValue.TerminalAt = nil
+	oldValue.Outcome = ""
+	newValue.Outcome = ""
+	oldValue.ResultDigest = ""
+	newValue.ResultDigest = ""
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("child identity was rewritten")
 	}
@@ -1100,8 +1092,33 @@ func validateJournalEntry(key string, raw json.RawMessage) error {
 	if err := decodeStrict(raw, &value); err != nil {
 		return err
 	}
-	if key != "journals/"+value.ID || value.SchemaVersion != "lanpanel.journal.v1" || value.ID == "" || value.JobID == "" || value.Kind == "" || value.Generation == 0 || (value.Phase != JournalPrepared && value.Phase != JournalActive && value.Phase != JournalTerminal) {
-		return fmt.Errorf("operation journal is invalid")
+	if key != "journals/"+value.ID {
+		return fmt.Errorf("operation journal key does not match ID")
+	}
+	return validateJournalRecord(value)
+}
+
+func validateJournalRecord(value JournalRecord) error {
+	if value.SchemaVersion != "lanpanel.journal.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.InstallationID) || !validIdentityRef(value.Target) || value.Generation == 0 || value.Deadline.IsZero() || !exactDigest(value.ArtifactDigest) || !exactDigest(value.SafetyMarkerDigest) || (value.Phase != JournalPrepared && value.Phase != JournalActive && value.Phase != JournalTerminal) {
+		return fmt.Errorf("operation journal identity is invalid")
+	}
+	if value.Kind == JournalNonIngressLocalCommit {
+		if value.Operation != Maintenance && value.Operation != BackupEnter {
+			return fmt.Errorf("non-ingress journal operation is not allowed")
+		}
+	} else if value.Kind == JournalAppContraction {
+		switch value.Operation {
+		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry:
+		default:
+			return fmt.Errorf("App contraction journal operation is not allowed")
+		}
+	} else {
+		return fmt.Errorf("operation journal kind is not allowed")
+	}
+	for index, childID := range value.ChildIDs {
+		if !validIdentityRef(childID) || index > 0 && value.ChildIDs[index-1] >= childID {
+			return fmt.Errorf("operation journal child identities are not canonical")
+		}
 	}
 	return nil
 }
@@ -1191,6 +1208,7 @@ func validateLinks(document persist.Document) error {
 			return fmt.Errorf("job %q has no operation intent", record.ID)
 		}
 	}
+	childrenByJob := map[string][]string{}
 	for _, key := range persist.EntryKeys(document, "children") {
 		var child ChildRecord
 		if err := decodeStrict(document.Entries[key], &child); err != nil {
@@ -1203,15 +1221,38 @@ func validateLinks(document persist.Document) error {
 		if (intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected) && child.State != ChildTerminal {
 			return fmt.Errorf("terminal intent retains nonterminal child")
 		}
+		childrenByJob[child.JobID] = append(childrenByJob[child.JobID], child.ID)
 	}
-	for _, key := range persist.EntryKeys(document, "journals") {
+	for jobID := range childrenByJob {
+		sort.Strings(childrenByJob[jobID])
+	}
+	journalKeys := persist.EntryKeys(document, "journals")
+	var installationID string
+	if len(journalKeys) != 0 {
+		raw, present := document.Entries["installations/current"]
+		if !present {
+			return fmt.Errorf("journal has no installation authority")
+		}
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return fmt.Errorf("journal installation authority: %w", err)
+		}
+		installationID = installation.InstallationID
+	}
+	for _, key := range journalKeys {
 		var journal JournalRecord
 		if err := decodeStrict(document.Entries[key], &journal); err != nil {
+			return err
+		}
+		if err := validateJournalRecord(journal); err != nil {
 			return err
 		}
 		intent, ok := intents[journal.JobID]
 		if !ok {
 			return fmt.Errorf("journal has no matching operation intent")
+		}
+		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) {
+			return fmt.Errorf("journal installation, operation, target, generation, or child inventory does not match its authorities")
 		}
 		if (intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected) && journal.Phase != JournalTerminal {
 			return fmt.Errorf("terminal intent retains nonterminal journal")
@@ -1254,7 +1295,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, Repair, CertificateExpiry, EdgeOneExpiry, StartupRecovery, Maintenance, Upgrade, BackupEnter:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, Upgrade, BackupEnter:
 		return true
 	}
 	return false
@@ -1270,6 +1311,24 @@ func safetyDigest(state safety.State) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 func digest(value string) bool { return len(value) == 71 && strings.HasPrefix(value, "sha256:") }
+func exactDigest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value[len("sha256:"):])
+	return err == nil
+}
+func validIdentityRef(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x21 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
 func planTarget(target plans.Target) string {
 	if target.ID == "" {
 		return string(target.Kind)

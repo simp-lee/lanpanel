@@ -294,8 +294,9 @@ func validAction(action Action) bool {
 type ClearRole string
 
 const (
-	RoleGlobalCloseRepair       ClearRole = "global_close_repair"
-	RoleRepair                  ClearRole = "repair"
+	RoleGlobalCloseConvergence  ClearRole = "global_close_convergence"
+	RoleJournalConvergence      ClearRole = "journal_convergence"
+	RoleOwnershipContraction    ClearRole = "ownership_contraction"
 	RoleUpgradeRecovery         ClearRole = "upgrade_recovery"
 	RoleMaintenance             ClearRole = "maintenance"
 	RoleMaintenanceBegin        ClearRole = "maintenance_begin"
@@ -331,12 +332,12 @@ func AuthorizeClear(role ClearRole, target ClearTarget, fenceKind StopFenceKind)
 	allowed := false
 	switch target {
 	case ClearGlobalClose:
-		allowed = role == RoleGlobalCloseRepair
+		allowed = role == RoleGlobalCloseConvergence
 	case ClearStopFence:
 		if fenceKind == StopFenceGenerationUpgrade {
 			allowed = role == RoleUpgradeRecovery
 		} else {
-			allowed = role == RoleRepair
+			allowed = role == RoleJournalConvergence
 		}
 	case ClearMaintenance:
 		allowed = role == RoleMaintenance

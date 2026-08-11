@@ -445,7 +445,7 @@ func TestInstallationSchema(t *testing.T) {
 			"admin_token_rotate", "headscale_certificate_reissue", "dependency_upload", "dependency_import", "maintenance",
 			"backup_enter", "backup_preparing_abort", "backup_exit", "restore_evidence_import", "restore_cutover",
 			"connector_verify", "connector_auth_key_import", "connector_auth_key_adopt", "connector_auth_key_discard", "connector_login", "connector_disconnect", "connector_rebind",
-			"resource_create", "resource_update", "resource_delete", "publish", "unpublish", "close_all", "repair", "process_start", "process_stop", "unpublish_and_stop",
+			"resource_create", "resource_update", "resource_delete", "publish", "unpublish", "close_all", "process_start", "process_stop", "unpublish_and_stop",
 			"headscale_user_create", "headscale_user_list", "preauth_key_create", "preauth_key_list", "preauth_key_revoke", "device_list", "device_expire",
 			"managed_basic_create", "managed_basic_rotate", "managed_basic_delete", "edgeone_diagnostics", "edgeone_refresh", "job_list", "job_detail", "session_logout",
 		} {
@@ -453,7 +453,7 @@ func TestInstallationSchema(t *testing.T) {
 				t.Fatalf("ParseOperationCode(%q) error = %v", operation, err)
 			}
 		}
-		for _, operation := range []string{"shell", "mode_incompatible", "license_check", "", " publish"} {
+		for _, operation := range []string{"repair", "fix_host", "shell", "mode_incompatible", "license_check", "", " publish"} {
 			if _, err := ParseOperationCode(operation); err == nil {
 				t.Fatalf("ParseOperationCode(%q) error = nil", operation)
 			}
@@ -466,8 +466,6 @@ func TestInstallationSchema(t *testing.T) {
 			target    OperationTarget
 		}{
 			{OperationDeploy, OperationTarget{Kind: OperationTargetInstallation}},
-			{OperationRepair, OperationTarget{Kind: OperationTargetInstallation}},
-			{OperationRepair, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
 			{OperationPlan, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
 			{OperationPublish, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
 			{OperationManagedBasicRotate, OperationTarget{Kind: OperationTargetCredential, ID: "cred_00000000000000000000000000000001"}},

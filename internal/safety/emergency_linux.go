@@ -397,10 +397,10 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 	if current.GlobalClose.Phase == GlobalCloseNone && next.GlobalClose.Phase != GlobalCloseNone && (role != RoleContraction || next.GlobalClose.Generation <= current.GlobalClose.Generation || !sameEmergencyClearProof(current.ClearProof, next.ClearProof)) {
 		return false
 	}
-	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase != GlobalCloseNone && (role != RoleContraction || next.GlobalClose.Generation != current.GlobalClose.Generation) {
+	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase != GlobalCloseNone && current.GlobalClose != next.GlobalClose && (role != RoleContraction || next.GlobalClose.Generation != current.GlobalClose.Generation) {
 		return false
 	}
-	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && (role != RoleGlobalCloseRepair || next.GlobalClose.Generation != current.GlobalClose.Generation || !validEmergencyClearProof(next.ClearProof, current)) {
+	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && (role != RoleGlobalCloseConvergence || next.GlobalClose.Generation != current.GlobalClose.Generation || !validEmergencyClearProof(next.ClearProof, current)) {
 		return false
 	}
 	if current.GlobalClose.Phase == GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && !sameEmergencyClearProof(current.ClearProof, next.ClearProof) {
@@ -421,10 +421,16 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 	if current.StopFence == nil && next.StopFence != nil && role != RoleContraction {
 		return false
 	}
-	if current.StopFence != nil && next.StopFence == nil && (role != RoleRepair || !validEmergencyClearProof(next.ClearProof, current)) {
-		return false
+	if current.StopFence != nil && next.StopFence == nil {
+		expectedRole := RoleJournalConvergence
+		if current.StopFence.Kind == StopFenceGenerationUpgrade {
+			expectedRole = RoleUpgradeRecovery
+		}
+		if role != expectedRole || !validEmergencyClearProof(next.ClearProof, current) {
+			return false
+		}
 	}
-	if current.StopFence != nil && next.StopFence != nil && (role != RoleContraction || !sameEmergencyFenceBinding(*current.StopFence, *next.StopFence)) {
+	if current.StopFence != nil && next.StopFence != nil && *current.StopFence != *next.StopFence && (role != RoleContraction || !sameEmergencyFenceBinding(*current.StopFence, *next.StopFence)) {
 		return false
 	}
 	return true

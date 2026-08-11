@@ -86,7 +86,7 @@ func TestSafetySchemaContract(t *testing.T) {
 			target ClearTarget
 			kind   StopFenceKind
 		}{
-			{RoleGlobalCloseRepair, ClearGlobalClose, ""}, {RoleRepair, ClearStopFence, StopFenceContraction},
+			{RoleGlobalCloseConvergence, ClearGlobalClose, ""}, {RoleJournalConvergence, ClearStopFence, StopFenceContraction},
 			{RoleUpgradeRecovery, ClearStopFence, StopFenceGenerationUpgrade}, {RoleMaintenance, ClearMaintenance, ""},
 			{RoleUpgrade, ClearDependencyTransition, ""}, {RoleBackup, ClearBackup, ""},
 			{RolePublish, ClearBaseContraction, ""}, {RoleDelete, ClearDeletionTombstone, ""}, {RoleChallenge, ClearChallenge, ""},
@@ -129,6 +129,17 @@ func TestMaintenanceCompoundTransitionsAreAtomicAndNarrow(t *testing.T) {
 		if err := validateTransition(RoleMaintenanceToDependency, next, converted, TransitionProof{}); err != nil {
 			t.Fatalf("maintenance conversion: %v", err)
 		}
+		fenced := next
+		stop := validStopFence(StopFenceMaintenanceTransition)
+		fenced.StopFence = &stop
+		fenced.DependencyTransitionPending = validTransition(9)
+		reconciled := fenced
+		reconciled.StopFence = nil
+		reconciled.MaintenancePending = nil
+		reconciled.DependencyTransitionPending = nil
+		if err := validateMaintenanceCompound(RoleJournalConvergence, fenced, reconciled); err == nil {
+			t.Fatal("journal convergence erased an unrelated dependency transition")
+		}
 	})
 }
 
@@ -157,12 +168,34 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 		next := current
 		next.StopFence = nil
 		proof := &StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: digest("closure"), AllChildrenExited: true, AllAppsUnpublished: true, NginxTestPassed: true}
-		if err := validateTransition(RoleRepair, current, next, TransitionProof{StopFence: proof}); err == nil {
-			t.Fatal("stop fence cleared without per-App generations")
-		}
 		proof.UnpublishedGenerations = map[string]uint64{"app-a": 2}
-		if err := validateTransition(RoleRepair, current, next, TransitionProof{StopFence: proof}); err != nil {
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: proof}); err == nil {
+			t.Fatal("stop fence cleared without disk, worker, listener, and runtime closure")
+		}
+		proof.NoAppDisk = true
+		proof.WorkersDrained = true
+		proof.ListenersClosed = true
+		proof.RuntimeClosed = true
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: proof}); err != nil {
 			t.Fatalf("stop convergence: %v", err)
+		}
+		orphanCurrent := current
+		orphanCurrent.Resources = append([]ResourceSafety(nil), current.Resources...)
+		orphanCurrent.Resources[0].Ownership = OwnershipOrphan
+		orphanNext := orphanCurrent
+		orphanNext.Resources = append([]ResourceSafety(nil), orphanCurrent.Resources...)
+		orphanNext.StopFence = nil
+		if err := validateTransition(RoleJournalConvergence, orphanCurrent, orphanNext, TransitionProof{StopFence: proof}); err == nil {
+			t.Fatal("stop fence cleared while ownership orphan remained")
+		}
+	})
+	t.Run("global_close_remains_while_ownership_orphan_exists", func(t *testing.T) {
+		current := EmptyState()
+		current.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 3}
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOrphan, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 4, Reason: "closed"}}}
+		proof := &GlobalConvergenceProof{Generation: 3, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), UnpublishedGenerations: map[string]uint64{"app-a": 4}, NginxTestPassed: true, RuntimeClosed: true}
+		if validGlobalClearProof(current, proof) {
+			t.Fatal("global close convergence accepted an ownership orphan")
 		}
 	})
 	t.Run("headscale_expiry_clear_requires_matching_reactivation", func(t *testing.T) {
@@ -183,13 +216,61 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 }
 
 func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
+	t.Run("ownership_can_only_contract_to_orphan", func(t *testing.T) {
+		current := EmptyState()
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+		next := current
+		next.Resources = append([]ResourceSafety(nil), current.Resources...)
+		next.Resources[0].Ownership = OwnershipOrphan
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
+			t.Fatal("journal convergence classified an ownership orphan")
+		}
+		if err := validateTransition(RoleOwnershipContraction, current, next, TransitionProof{}); err != nil {
+			t.Fatalf("ownership contraction: %v", err)
+		}
+		reopened := next
+		reopened.Resources = append([]ResourceSafety(nil), next.Resources...)
+		reopened.Resources[0].Ownership = OwnershipOwned
+		if err := validateTransition(RoleOwnershipContraction, next, reopened, TransitionProof{}); err == nil {
+			t.Fatal("ownership contraction adopted an orphan")
+		}
+		changed := next
+		changed.Resources = append([]ResourceSafety(nil), next.Resources...)
+		changed.Resources[0].OwnershipDigest = digest("replacement")
+		if err := validateTransition(RoleOwnershipContraction, next, changed, TransitionProof{}); err == nil {
+			t.Fatal("ownership contraction rewrote orphan identity")
+		}
+	})
+
+	t.Run("delete_cannot_erase_active_or_orphan_safety_identity", func(t *testing.T) {
+		current := EmptyState()
+		current.Resources = []ResourceSafety{{ResourceID: "app-a", State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+		next := current
+		next.Resources = nil
+		proof := &DeleteConvergenceProof{ResourceID: "app-a", OwnershipDigest: digest("owner"), RuntimeClosureDigest: digest("closure")}
+		if err := validateTransition(RoleDelete, current, next, TransitionProof{Delete: proof}); err == nil {
+			t.Fatal("delete removed an active resource without a tombstone")
+		}
+		current.Resources[0].State = ResourceDeleting
+		current.Resources[0].DeletionTombstone = "tombstone-one"
+		current.Resources[0].Ownership = OwnershipOrphan
+		proof.TombstoneRef = current.Resources[0].DeletionTombstone
+		if err := validateTransition(RoleDelete, current, next, TransitionProof{Delete: proof}); err == nil {
+			t.Fatal("delete removed an ownership orphan")
+		}
+		current.Resources[0].Ownership = OwnershipOwned
+		if err := validateTransition(RoleDelete, current, next, TransitionProof{Delete: proof}); err != nil {
+			t.Fatalf("closed tombstoned owned delete: %v", err)
+		}
+	})
+
 	t.Run("wrong_role_and_binding_replacement", func(t *testing.T) {
 		current := stateWithResource()
 		next := current
 		next.Resources = append([]ResourceSafety(nil), current.Resources...)
 		next.Resources[0].StickyUnpublished = nil
-		if err := validateTransition(RoleRepair, current, next, TransitionProof{}); err == nil {
-			t.Fatal("Repair cleared a publish-owned contraction marker")
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
+			t.Fatal("journal convergence cleared a publish-owned contraction marker")
 		}
 
 		current = EmptyState()
@@ -198,16 +279,16 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 		next = current
 		contraction := validStopFence(StopFenceContraction)
 		next.StopFence = &contraction
-		if err := validateTransition(RoleRepair, current, next, TransitionProof{}); err == nil {
-			t.Fatal("Repair downgraded generation-upgrade stop fence")
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
+			t.Fatal("journal convergence downgraded generation-upgrade stop fence")
 		}
 
 		current = EmptyState()
 		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PlanID: "headscale", ControlGeneration: 1, CertificateGeneration: 1, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		next = current
 		next.Headscale.Reactivating = nil
-		if err := validateTransition(RoleRepair, current, next, TransitionProof{}); err == nil {
-			t.Fatal("Repair cleared Headscale reactivation")
+		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
+			t.Fatal("journal convergence cleared Headscale reactivation")
 		}
 	})
 }
@@ -377,7 +458,7 @@ func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
 		}
 		emergencyProof := EmergencyClearProof{Generation: 1, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
 		clearedAuthority := EmergencyState{Sequence: 4, NormalInitialized: true, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}, ClearProof: &emergencyProof}
-		if err := emergency.Commit(lease, RoleGlobalCloseRepair, 3, clearedAuthority); err != nil {
+		if err := emergency.Commit(lease, RoleGlobalCloseConvergence, 3, clearedAuthority); err != nil {
 			t.Fatal(err)
 		}
 		cleared := persisted
@@ -388,7 +469,7 @@ func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
 		if _, err := store.Commit(context.Background(), lease, RoleContraction, persisted.Revision, cleared, TransitionProof{GlobalClose: globalProof}); err == nil {
 			t.Fatal("wrong role cleared global close")
 		}
-		if _, err := store.Commit(context.Background(), lease, RoleGlobalCloseRepair, persisted.Revision, cleared, TransitionProof{GlobalClose: globalProof}); err != nil {
+		if _, err := store.Commit(context.Background(), lease, RoleGlobalCloseConvergence, persisted.Revision, cleared, TransitionProof{GlobalClose: globalProof}); err != nil {
 			t.Fatalf("authorized clear error=%v", err)
 		}
 		if _, err := store.Commit(context.Background(), lease, RoleContraction, cleared.Revision, cleared, TransitionProof{}); err == nil {
@@ -404,6 +485,21 @@ func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {
 			t.Fatal("Initialize recreated previously initialized missing state")
 		}
 	})
+}
+
+func TestEmergencyGlobalAndFenceAuthoritiesConvergeSequentially(t *testing.T) {
+	global := GlobalClose{Phase: GlobalCloseEmergency, Generation: 1}
+	fence := validEmergencyFenceForTest(1, 2)
+	current := EmergencyState{Sequence: 2, GlobalClose: global, StopFence: &fence}
+	proof := &EmergencyClearProof{Generation: 1, StopFenceGeneration: 2, InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
+	fenceCleared := EmergencyState{Sequence: 3, GlobalClose: global, ClearProof: proof}
+	if !validEmergencyTransition(RoleJournalConvergence, current, fenceCleared) {
+		t.Fatal("journal convergence could not clear a fence while preserving global close")
+	}
+	globalCleared := EmergencyState{Sequence: 4, GlobalClose: GlobalClose{Phase: GlobalCloseNone, Generation: 1}, ClearProof: proof}
+	if !validEmergencyTransition(RoleGlobalCloseConvergence, fenceCleared, globalCleared) {
+		t.Fatal("global convergence could not clear global close after fence convergence")
+	}
 }
 
 func TestEmergencyBackingSurvivesSlotCorruptionAndCommitsWithoutAllocation(t *testing.T) {

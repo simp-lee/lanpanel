@@ -73,10 +73,7 @@ type Policy struct {
 
 type WriterRole string
 
-const (
-	ActivationWriter WriterRole = "activation_writer"
-	RepairWriter     WriterRole = "repair_writer"
-)
+const ActivationWriter WriterRole = "activation_writer"
 
 type Config struct {
 	RootPath    string
@@ -133,11 +130,11 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("ownership write requires the shared exposure lock")
 	}
-	if role != ActivationWriter && role != RepairWriter {
+	if role != ActivationWriter {
 		return filetxn.Result{}, fmt.Errorf("ownership writer role %q is not authorized", role)
 	}
-	if role != RepairWriter && record.State != Owned {
-		return filetxn.Result{}, fmt.Errorf("only Plan-bound Repair may write an ownership orphan")
+	if record.State != Owned {
+		return filetxn.Result{}, fmt.Errorf("ownership_orphan is a derived read-only classification")
 	}
 	record.SchemaVersion = SchemaVersion
 	record.Checksum = ""
@@ -169,7 +166,7 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 		if current.Revision != expectedRevision {
 			return filetxn.Result{}, fmt.Errorf("ownership revision changed: current=%d expected=%d", current.Revision, expectedRevision)
 		}
-		if role != RepairWriter && !preservesInventory(current, record) {
+		if !preservesInventory(current, record) {
 			return filetxn.Result{}, fmt.Errorf("activation ownership update must preserve the complete prior inventory")
 		}
 		disposition = filetxn.ReplaceOnly
@@ -193,24 +190,6 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 		Parents:  filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700},
 		Existing: &metadata, New: metadata, MaxBytes: maxRecordBytes,
 	}, data, disposition)
-}
-
-func (store *Store) Delete(ctx context.Context, lease *locks.Lease, role WriterRole, resourceID string) (filetxn.Result, error) {
-	if lease == nil || lease.Kind() != locks.Exposure || lease.Validate() != nil {
-		return filetxn.Result{}, fmt.Errorf("ownership delete requires the shared exposure lock")
-	}
-	if role != RepairWriter {
-		return filetxn.Result{}, fmt.Errorf("only Plan-bound Repair may delete ownership evidence")
-	}
-	if !resourceIDPattern.MatchString(resourceID) {
-		return filetxn.Result{}, fmt.Errorf("invalid resource ID")
-	}
-	metadata := filetxn.Metadata{Owner: store.config.Owner, Mode: 0o600}
-	return store.txn.Remove(ctx, filetxn.Request{
-		Path:     filepath.Join(store.config.RecordsPath, resourceID+".json"),
-		Parents:  filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700},
-		Existing: &metadata,
-	})
 }
 
 func (store *Store) Read(resourceID string) (Record, error) {
@@ -299,8 +278,8 @@ func Validate(record Record, policy Policy) error {
 	if record.Revision == 0 || !resourceIDPattern.MatchString(record.ResourceID) {
 		return fmt.Errorf("ownership revision and resource ID are required")
 	}
-	if record.State != Owned && record.State != OwnershipOrphaned {
-		return fmt.Errorf("ownership state %q is unsupported", record.State)
+	if record.State != Owned {
+		return fmt.Errorf("persisted ownership state %q is unsupported", record.State)
 	}
 	if len(record.Paths) == 0 && len(record.Listeners) == 0 {
 		return fmt.Errorf("ownership record must identify at least one path or listener")

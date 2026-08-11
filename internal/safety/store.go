@@ -84,6 +84,10 @@ type StopFenceConvergenceProof struct {
 	RuntimeClosureDigest   string
 	AllChildrenExited      bool
 	AllAppsUnpublished     bool
+	NoAppDisk              bool
+	WorkersDrained         bool
+	ListenersClosed        bool
+	RuntimeClosed          bool
 	NginxTestPassed        bool
 	UnpublishedGenerations map[string]uint64
 }
@@ -359,8 +363,8 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			return fmt.Errorf("maintenance creation requires atomic maintenance-begin authority")
 		}
 		if !reflect.DeepEqual(transition.before, transition.after) && role != transition.owner {
-			repairCompound := role == RoleRepair && current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition && next.StopFence == nil && current.MaintenancePending != nil && next.MaintenancePending == nil
-			compound := transition.name == "maintenance_pending" && (role == RoleMaintenanceBegin || role == RoleMaintenanceToDependency || repairCompound) || transition.name == "dependency_transition_pending" && (role == RoleMaintenanceToDependency || repairCompound)
+			reconciliationCompound := role == RoleJournalConvergence && current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition && next.StopFence == nil && current.MaintenancePending != nil && next.MaintenancePending == nil && current.DependencyTransitionPending == nil
+			compound := transition.name == "maintenance_pending" && (role == RoleMaintenanceBegin || role == RoleMaintenanceToDependency || reconciliationCompound) || transition.name == "dependency_transition_pending" && (role == RoleMaintenanceToDependency || reconciliationCompound)
 			if !compound {
 				return fmt.Errorf("role %q does not own %s transition", role, transition.name)
 			}
@@ -432,13 +436,13 @@ func validateMaintenanceCompound(role ClearRole, current, next State) error {
 		if next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef {
 			return fmt.Errorf("maintenance-to-dependency identity does not bind the completed maintenance target")
 		}
-	case RoleRepair:
+	case RoleJournalConvergence:
 		if current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition {
-			if current.MaintenancePending == nil || next.MaintenancePending != nil || next.StopFence != nil {
-				return fmt.Errorf("maintenance repair must atomically clear its transition and stop fence")
+			if current.MaintenancePending == nil || current.DependencyTransitionPending != nil || next.MaintenancePending != nil || next.StopFence != nil {
+				return fmt.Errorf("exact maintenance reconciliation must atomically clear its transition and stop fence")
 			}
 			if next.DependencyTransitionPending != nil && (next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef) {
-				return fmt.Errorf("maintenance repair target branch is not bound to the exact target")
+				return fmt.Errorf("exact maintenance reconciliation target branch is not bound to the exact target")
 			}
 		}
 	}
@@ -537,8 +541,8 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 		}
 	}
 	if before.Ownership != after.Ownership || before.OwnershipDigest != after.OwnershipDigest {
-		if role != RoleRepair {
-			return fmt.Errorf("wrong ownership writer")
+		if role != RoleOwnershipContraction || before.Ownership != OwnershipOwned || after.Ownership != OwnershipOrphan || before.OwnershipDigest != after.OwnershipDigest {
+			return fmt.Errorf("ownership authority may only contract an exact owned identity to ownership_orphan")
 		}
 	}
 	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction, RoleMaintenanceBegin); err != nil {
@@ -667,7 +671,7 @@ func validHeadscaleProof(before, after HeadscaleSafety, proof *HeadscaleConverge
 }
 
 func validDeleteProof(before ResourceSafety, proof *DeleteConvergenceProof) bool {
-	return proof != nil && proof.ResourceID == before.ResourceID && proof.TombstoneRef == before.DeletionTombstone && proof.OwnershipDigest == before.OwnershipDigest && isDigest(proof.RuntimeClosureDigest)
+	return proof != nil && before.State == ResourceDeleting && before.Ownership == OwnershipOwned && validRef(before.DeletionTombstone) && proof.ResourceID == before.ResourceID && proof.TombstoneRef == before.DeletionTombstone && proof.OwnershipDigest == before.OwnershipDigest && isDigest(proof.RuntimeClosureDigest)
 }
 
 func validGlobalClearProof(current State, proof *GlobalConvergenceProof) bool {
@@ -675,7 +679,7 @@ func validGlobalClearProof(current State, proof *GlobalConvergenceProof) bool {
 		return false
 	}
 	for _, resource := range current.Resources {
-		if resource.StickyUnpublished == nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
+		if resource.Ownership == OwnershipOrphan || resource.StickyUnpublished == nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
 			return false
 		}
 	}
@@ -683,11 +687,11 @@ func validGlobalClearProof(current State, proof *GlobalConvergenceProof) bool {
 }
 
 func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenceProof) bool {
-	if proof == nil || proof.Kind != fence.Kind || proof.FenceGeneration != fence.FenceGeneration || proof.InventoryDigest != fence.InventoryDigest || proof.OwnedGraphDigest != fence.OwnedGraphDigest || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) {
+	if proof == nil || proof.Kind != fence.Kind || proof.FenceGeneration != fence.FenceGeneration || proof.InventoryDigest != fence.InventoryDigest || proof.OwnedGraphDigest != fence.OwnedGraphDigest || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NoAppDisk || !proof.WorkersDrained || !proof.ListenersClosed || !proof.RuntimeClosed || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) {
 		return false
 	}
 	for _, resource := range next.Resources {
-		if resource.StickyUnpublished == nil || resource.ChallengePending != nil || resource.Reactivating != nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
+		if resource.Ownership == OwnershipOrphan || resource.StickyUnpublished == nil || resource.ChallengePending != nil || resource.Reactivating != nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
 			return false
 		}
 	}
@@ -731,7 +735,7 @@ func backupTransitionGeneration(marker *BackupTransition) uint64 {
 
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseRepair, RoleRepair, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh:
 		return true
 	default:
 		return false

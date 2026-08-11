@@ -145,9 +145,14 @@ func BuildClaims(installation domain.Installation) ([]Claim, error) {
 	sharedIngress := false
 	if installation.Headscale != nil {
 		owner := installationOwner + ":headscale:" + installation.Headscale.ID
+		controlDomain := Claim{Kind: KindExactDomain, Value: installation.Headscale.ControlDomain, Owner: owner}
+		magicDNS := Claim{Kind: KindMagicDNSNamespace, Value: installation.Headscale.MagicDNSNamespace, Owner: owner}
+		if domainsOverlap(controlDomain.Value, magicDNS.Value) {
+			return nil, ConflictError{Left: controlDomain, Right: magicDNS}
+		}
 		claims = append(claims,
-			Claim{Kind: KindExactDomain, Value: installation.Headscale.ControlDomain, Owner: owner},
-			Claim{Kind: KindMagicDNSNamespace, Value: installation.Headscale.MagicDNSNamespace, Owner: owner},
+			controlDomain,
+			magicDNS,
 			Claim{Kind: KindListener, Value: listenerValue("udp", 3478), Owner: owner},
 		)
 		for _, path := range installation.Headscale.ManagedPaths {

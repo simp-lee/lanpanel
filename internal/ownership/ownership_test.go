@@ -2,7 +2,6 @@ package ownership
 
 import (
 	"context"
-	"errors"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/locks"
 	"os"
@@ -31,11 +30,12 @@ func TestOwnershipEvidenceContract(t *testing.T) {
 			t.Fatalf("Classify() = %#v", orphan)
 		}
 		orphan.Revision++
-		if _, err := store.Write(context.Background(), lease, ActivationWriter, 1, orphan); err == nil {
-			t.Fatal("activation writer accepted orphan")
+		if _, err := store.Write(context.Background(), lease, ActivationWriter, 1, orphan); err == nil || !strings.Contains(err.Error(), "derived read-only") {
+			t.Fatalf("Write(derived orphan) error = %v", err)
 		}
-		if _, err := store.Write(context.Background(), lease, RepairWriter, 1, orphan); err != nil {
-			t.Fatalf("repair orphan Write() error = %v", err)
+		persisted, err := store.Read(record.ResourceID)
+		if err != nil || persisted.State != Owned || persisted.Revision != 1 {
+			t.Fatalf("Read() after rejected orphan write = %#v, %v", persisted, err)
 		}
 	})
 
@@ -134,23 +134,6 @@ func TestOwnershipEvidenceContract(t *testing.T) {
 		}
 	})
 
-	t.Run("only_repair_deletes_owned_evidence", func(t *testing.T) {
-		store, manager, lease, record := newTestStore(t)
-		defer closeTestStore(t, store, manager, lease)
-		if _, err := store.Write(context.Background(), lease, ActivationWriter, 0, record); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := store.Delete(context.Background(), lease, ActivationWriter, record.ResourceID); err == nil {
-			t.Fatal("activation writer deleted ownership")
-		}
-		result, err := store.Delete(context.Background(), lease, RepairWriter, record.ResourceID)
-		if err != nil || result.State != filetxn.StateDurable {
-			t.Fatalf("Delete() = %#v, %v", result, err)
-		}
-		if _, err := store.Read(record.ResourceID); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("Read(deleted) error = %v", err)
-		}
-	})
 }
 
 func newTestStore(t *testing.T) (*Store, *locks.Manager, *locks.Lease, Record) {

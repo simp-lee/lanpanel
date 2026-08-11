@@ -17,6 +17,11 @@ func TestConflictRegistry(t *testing.T) {
 		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
 			t.Fatalf("BuildClaims(overlapping MagicDNS) error = %v", err)
 		}
+		installation = validInstallation()
+		installation.Headscale.ControlDomain = "control.tail.example.net"
+		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
+			t.Fatalf("BuildClaims(control domain inside own MagicDNS namespace) error = %v", err)
+		}
 	})
 
 	t.Run("exact_domain_collision_is_rejected", func(t *testing.T) {

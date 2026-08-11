@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-test-cases ga-test-cases-selftest ga-cli-absence-audit
+.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit
 
 GO ?= go
 PKGS ?= ./...
@@ -22,13 +22,10 @@ lint:
 tidy:
 	$(GO) mod tidy
 
-ga-test-cases:
-	@test -n "$(SCOPE)" || { echo "SCOPE must name one exact implementing step" >&2; exit 2; }
-	$(GO) run ./internal/qualification/cases/cmd/ga-test-cases -scope "$(SCOPE)" -go "$(GO)" -- $(PKGS)
-
-ga-test-cases-selftest:
-	$(GO) test -count=1 ./internal/qualification/cases
-	$(GO) run ./internal/qualification/cases/cmd/ga-test-cases -scope S1 -go "$(GO)" -- ./internal/domain ./internal/reservations ./internal/qualification/cases >/dev/null
+ga-contract-audit:
+	@test ! -d internal/qualification/cases
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'OperationRepair|RepairWriter|RoleRepair|RoleGlobalCloseRepair|repair_writer|global_close_repair|"(repair|fix_host|fix-host)"' internal cmd; then echo 'generic repair authority remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'ClauseID|clause_id|RowsForScope|ga-test-cases|per[_-]clause' internal cmd; then echo 'per-clause runner remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
 ga-cli-absence-audit:
 	$(GO) test -count=1 ./cmd/lanpanel ./internal/roles
@@ -38,4 +35,4 @@ ga-cli-absence-audit:
 	@! git grep -I -Eiq 'v1alpha|alpha migration' -- deploy
 	@! git grep -I -Eiq 'internal/(cli|output|prompt)' -- '*.go' '*.md' '*.yml' '*.yaml'
 
-check: build test vet ga-cli-absence-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit
