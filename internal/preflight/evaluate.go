@@ -42,7 +42,8 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("systemd", observed.Systemd.Available && observed.Systemd.Identity != "", "systemd runtime and identity", observed.Systemd.Identity)
 	add("apt", observed.APT.Available && observed.APT.Identity != "", "apt capability and identity", observed.APT.Identity)
 	add("dpkg", observed.DPKG.Available && observed.DPKG.Identity != "", "dpkg capability and identity", observed.DPKG.Identity)
-	add("package_state", observed.Packages.Ready && observed.Packages.Identity != "", "apt/dpkg state is ready", observed.Packages.Identity+"/"+observed.Packages.Reason)
+	packageExact := observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == request.Profile.NginxVersion && observed.Packages.PackageSnapshotDigest == request.Profile.PackageSnapshotDigest
+	add("package_state", packageExact, "apt/dpkg state and exact release package profile are ready", observed.Packages.Identity+"/"+observed.Packages.SystemdVersion+"/"+observed.Packages.NginxVersion+"/"+observed.Packages.PackageSnapshotDigest+"/"+observed.Packages.Reason)
 
 	if len(observed.DNS) != len(request.Domains) {
 		add("dns", false, "complete exact DNS observations", fmt.Sprintf("observed=%d/required=%d", len(observed.DNS), len(request.Domains)))
@@ -117,13 +118,17 @@ func canonicalDNS(values []DNSObservation) []DNSObservation {
 }
 
 func validateExpansionRequest(request ExpansionRequest) error {
-	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !validProfileAuthority(request.Profile) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
+	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !refPattern.MatchString(request.Profile.SystemdVersion) || !refPattern.MatchString(request.Profile.NginxVersion) || !validDigest(request.Profile.PackageSnapshotDigest) || !validProfileAuthority(request.Profile) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
 		return fmt.Errorf("expansion preflight request identity or profile is invalid")
 	}
 	switch request.Scope {
 	case ExpansionBootstrap:
-		if request.TemporaryPort != 0 || len(request.Domains) != 0 || len(request.PublicAddresses) != 0 || len(request.BootstrapListeners) == 0 {
+		if request.TemporaryPort != 0 || len(request.Domains) != 0 || len(request.PublicAddresses) != 0 || len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Protocol != "tcp" || request.BootstrapListeners[0].Purpose != "management" {
 			return fmt.Errorf("bootstrap preflight scope is invalid")
+		}
+		address, err := netip.ParseAddr(request.BootstrapListeners[0].Address)
+		if err != nil || !address.Is4() || !address.IsLoopback() || address.IsUnspecified() || request.BootstrapListeners[0].Port < 49152 {
+			return fmt.Errorf("bootstrap Management authority is not an exact 127/8 high port")
 		}
 	case ExpansionDomainHTTPS:
 		if request.TemporaryPort != 0 || len(request.Domains) == 0 || len(request.BootstrapListeners) != 0 {

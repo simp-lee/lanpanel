@@ -602,6 +602,21 @@ type VerifiedQualificationManifest struct {
 	digest string
 }
 
+func (verified *VerifiedQualificationManifest) Value() QualificationManifest {
+	if verified == nil {
+		return QualificationManifest{}
+	}
+	value := verified.value
+	value.Effects = append([]QualificationEffect(nil), verified.value.Effects...)
+	return value
+}
+func (verified *VerifiedQualificationManifest) Digest() string {
+	if verified == nil {
+		return ""
+	}
+	return verified.digest
+}
+
 func DecodeQualificationManifest(data []byte, expectedDigest string) (*VerifiedQualificationManifest, error) {
 	if !ValidDigest(expectedDigest) || DigestBytes(data) != expectedDigest {
 		return nil, fmt.Errorf("qualification manifest differs from its protected expected digest")
@@ -637,6 +652,7 @@ type QualificationObservation struct {
 	Operation             string
 	ManifestDigest        string
 	BeforeInventoryDigest string
+	ObservedAt            time.Time
 	Profile               OSProfile
 	Effect                QualificationEffect
 }
@@ -654,7 +670,7 @@ func AuthorizeCandidateInstall(candidate *VerifiedCandidateRelease, manifest *Ve
 			break
 		}
 	}
-	if err != nil || !effectMatched || authority.RunID != candidate.envelope.value.EdgeOne.RunID || observed.RunID != authority.RunID || observed.HostFingerprint != authority.AuthorizedHostFingerprint || observed.CaseID != authority.CaseID || observed.Operation != authority.Operation || observed.ManifestDigest != manifest.digest || observed.BeforeInventoryDigest != authority.BeforeInventoryDigest || profileDigest != authority.TargetProfileDigest || !reflect.DeepEqual(observed.Profile, *candidate.envelope.value.QualificationTarget) || authority.CandidateEnvelopeDigest != candidate.envelope.digest || authority.BinaryDigest != candidate.envelope.value.Binary.Digest || authority.SourceTreeDigest != candidate.envelope.value.SourceTreeDigest {
+	if err != nil || !sameUTCSecond(observed.ObservedAt) || observed.ObservedAt.Before(authority.CreatedAt) || !effectMatched || authority.RunID != candidate.envelope.value.EdgeOne.RunID || observed.RunID != authority.RunID || observed.HostFingerprint != authority.AuthorizedHostFingerprint || observed.CaseID != authority.CaseID || observed.Operation != authority.Operation || observed.ManifestDigest != manifest.digest || observed.BeforeInventoryDigest != authority.BeforeInventoryDigest || profileDigest != authority.TargetProfileDigest || !reflect.DeepEqual(observed.Profile, *candidate.envelope.value.QualificationTarget) || authority.CandidateEnvelopeDigest != candidate.envelope.digest || authority.BinaryDigest != candidate.envelope.value.Binary.Digest || authority.SourceTreeDigest != candidate.envelope.value.SourceTreeDigest {
 		return fmt.Errorf("qualification candidate install authority, effect, or observation mismatched")
 	}
 	return nil
@@ -666,6 +682,8 @@ type FinalInstallObservation struct {
 	EnvelopeDigest   string
 	BinaryDigest     string
 	SourceTreeDigest string
+	HostFingerprint  string
+	ObservedAt       time.Time
 	Profile          OSProfile
 }
 
@@ -675,7 +693,7 @@ func AuthorizeFinalInstall(final *VerifiedFinalRelease, observed FinalInstallObs
 	}
 	profileDigest, err := ProfileDigest(observed.Profile)
 	supportedDigest, supportedErr := ProfileDigest(final.envelope.value.SupportedProfiles[0].Profile)
-	if err != nil || supportedErr != nil || profileDigest != supportedDigest || observed.ReleaseTag != final.envelope.value.ReleaseTag || observed.ManifestDigest != final.manifest.digest || observed.EnvelopeDigest != final.envelope.digest || observed.BinaryDigest != final.envelope.value.Binary.Digest || observed.SourceTreeDigest != final.envelope.value.SourceTreeDigest {
+	if err != nil || supportedErr != nil || profileDigest != supportedDigest || !refPattern.MatchString(observed.HostFingerprint) || !sameUTCSecond(observed.ObservedAt) || observed.ReleaseTag != final.envelope.value.ReleaseTag || observed.ManifestDigest != final.manifest.digest || observed.EnvelopeDigest != final.envelope.digest || observed.BinaryDigest != final.envelope.value.Binary.Digest || observed.SourceTreeDigest != final.envelope.value.SourceTreeDigest {
 		return fmt.Errorf("os_profile_live_unqualified")
 	}
 	return nil

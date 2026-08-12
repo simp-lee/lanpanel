@@ -24,6 +24,7 @@ const (
 	ProfileAPTOfflineTransaction ProfileID = "apt_offline_transaction"
 	ProfileDPKGTransaction       ProfileID = "dpkg_transaction"
 	ProfileSystemctl             ProfileID = "systemctl"
+	ProfileSystemctlBootstrap    ProfileID = "systemctl_bootstrap"
 	ProfileNginxTest             ProfileID = "nginx_test"
 	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
 	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
@@ -112,7 +113,7 @@ type Profile struct {
 }
 
 var catalog = map[ProfileID]Profile{
-	ProfileSystemdSysusers: {ID: ProfileSystemdSysusers, Executable: "/usr/bin/systemd-sysusers", Arguments: []string{"/etc/lanpanel/sysusers.conf"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemdSysusers: {ID: ProfileSystemdSysusers, Executable: "/usr/bin/systemd-sysusers", Arguments: []string{"/etc/lanpanel-sysusers.conf"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileNginxTest:       {ID: ProfileNginxTest, Executable: "/usr/sbin/nginx", Arguments: []string{"-t", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 6, 7, 10, 12}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	// The remaining profiles are deliberately unavailable until their owning
 	// component supplies its release-fixed argv, identity, chroot, and network
@@ -123,6 +124,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileAPTOfflineTransaction: {ID: ProfileAPTOfflineTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNoSockets, RootTCB: true},
 	ProfileDPKGTransaction:       {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", Arguments: []string{"--audit"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: packageCapabilities(), Timeout: 2 * time.Minute, MaximumOutputBytes: 256 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctl:             {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlBootstrap:    {ID: ProfileSystemctlBootstrap, Executable: "/usr/bin/systemctl", Arguments: []string{"enable", "--now", "lanpanel-management.socket", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},

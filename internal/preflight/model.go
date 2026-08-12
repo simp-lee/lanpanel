@@ -71,10 +71,13 @@ type ProfileAuthority struct {
 }
 
 type ExpectedProfile struct {
-	ID           string           `json:"id"`
-	VersionID    string           `json:"version_id"`
-	Architecture string           `json:"architecture"`
-	Authority    ProfileAuthority `json:"authority"`
+	ID                    string           `json:"id"`
+	VersionID             string           `json:"version_id"`
+	Architecture          string           `json:"architecture"`
+	SystemdVersion        string           `json:"systemd_version"`
+	NginxVersion          string           `json:"nginx_version"`
+	PackageSnapshotDigest string           `json:"package_snapshot_digest"`
+	Authority             ProfileAuthority `json:"authority"`
 }
 
 type ListenerRequirement struct {
@@ -141,9 +144,12 @@ type ComponentObservation struct {
 }
 
 type PackageObservation struct {
-	Ready    bool   `json:"ready"`
-	Identity string `json:"identity"`
-	Reason   string `json:"reason,omitempty"`
+	Ready                 bool   `json:"ready"`
+	Identity              string `json:"identity"`
+	SystemdVersion        string `json:"systemd_version"`
+	NginxVersion          string `json:"nginx_version"`
+	PackageSnapshotDigest string `json:"package_snapshot_digest"`
+	Reason                string `json:"reason,omitempty"`
 }
 
 type DNSObservation struct {

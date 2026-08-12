@@ -128,7 +128,7 @@ func TestCandidateInstallRequiresVerifiedBytesManifestAndObservation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed := QualificationObservation{RunID: manifest.RunID, HostFingerprint: manifest.AuthorizedHostFingerprint, CaseID: manifest.CaseID, Operation: manifest.Operation, ManifestDigest: DigestBytes(manifestBytes), BeforeInventoryDigest: manifest.BeforeInventoryDigest, Profile: *profile, Effect: manifest.Effects[0]}
+	observed := QualificationObservation{RunID: manifest.RunID, HostFingerprint: manifest.AuthorizedHostFingerprint, CaseID: manifest.CaseID, Operation: manifest.Operation, ManifestDigest: DigestBytes(manifestBytes), BeforeInventoryDigest: manifest.BeforeInventoryDigest, ObservedAt: manifest.CreatedAt, Profile: *profile, Effect: manifest.Effects[0]}
 	if err := AuthorizeCandidateInstall(candidate, verifiedManifest, observed); err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestFinalInstallRequiresCompleteRootedChainAndExactObservedProfile(t *testi
 	candidate := buildCandidate(t)
 	final := buildFinal(t, candidate, ResolutionNotAffected)
 	profile := final.envelope.value.SupportedProfiles[0].Profile
-	observed := FinalInstallObservation{ReleaseTag: final.envelope.value.ReleaseTag, ManifestDigest: final.manifest.digest, EnvelopeDigest: final.envelope.digest, BinaryDigest: final.envelope.value.Binary.Digest, SourceTreeDigest: final.envelope.value.SourceTreeDigest, Profile: profile}
+	observed := FinalInstallObservation{ReleaseTag: final.envelope.value.ReleaseTag, ManifestDigest: final.manifest.digest, EnvelopeDigest: final.envelope.digest, BinaryDigest: final.envelope.value.Binary.Digest, SourceTreeDigest: final.envelope.value.SourceTreeDigest, HostFingerprint: "host-one", ObservedAt: time.Unix(1_700_000_000, 0).UTC(), Profile: profile}
 	if err := AuthorizeFinalInstall(final, observed); err != nil {
 		t.Fatal(err)
 	}

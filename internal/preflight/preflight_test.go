@@ -250,7 +250,7 @@ func TestPreflightAuthorityRejectsStaleWrongScopeOrTarget(t *testing.T) {
 func expansionRequest(scope ExpansionScope) ExpansionRequest {
 	return ExpansionRequest{
 		Scope: scope, Target: "resource/res_00000000000000000000000000000001", Generation: 7,
-		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", Authority: ProfileAuthority{Kind: FinalSupportedProfile, Digest: "sha256:" + strings.Repeat("a", 64), LiveQualified: true}},
+		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64), Authority: ProfileAuthority{Kind: FinalSupportedProfile, Digest: "sha256:" + strings.Repeat("a", 64), LiveQualified: true}},
 		Domains: []string{"app.example.test"}, ManagedPaths: []ManagedPathRequirement{{Path: "/var/lib/lanpanel/apps/app-one", Kind: ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}}, Disks: []DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1024}}, LastTrustedWall: time.Unix(1_699_999_000, 0).UTC(),
 	}
 }
@@ -268,7 +268,7 @@ func passingExpansionObservations(request ExpansionRequest, now time.Time) Expan
 	for index, disk := range request.Disks {
 		disks[index] = DiskObservation{Path: disk.Path, Device: uint64(index + 1), AvailableBytes: disk.MinimumAvailableBytes}
 	}
-	return ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", Platform: PlatformInfo{ID: request.Profile.ID, VersionID: request.Profile.VersionID}, Clock: ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: ComponentObservation{Available: true, Identity: "systemd/1"}, APT: ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: PackageObservation{Ready: true, Identity: "sha256:" + strings.Repeat("b", 64)}, DNS: dns, ListenerInventoryComplete: true, Paths: paths, Disks: disks}
+	return ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", Platform: PlatformInfo{ID: request.Profile.ID, VersionID: request.Profile.VersionID}, Clock: ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: ComponentObservation{Available: true, Identity: "systemd/1"}, APT: ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: PackageObservation{Ready: true, Identity: "sha256:" + strings.Repeat("b", 64), SystemdVersion: request.Profile.SystemdVersion, NginxVersion: request.Profile.NginxVersion, PackageSnapshotDigest: request.Profile.PackageSnapshotDigest}, DNS: dns, ListenerInventoryComplete: true, Paths: paths, Disks: disks}
 }
 
 func findingByCode(values []Finding, code string) (Finding, bool) {

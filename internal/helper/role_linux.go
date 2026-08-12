@@ -75,7 +75,7 @@ func RunRole(args []string) error {
 
 func readIdentityConfig() (identityConfig, error) {
 	parent := filepath.Dir(FixedIdentityConfigPath)
-	if err := validateRootParentChain(parent, 0, 0o700); err != nil {
+	if err := validateRootParentChain(parent, 0, 0o711); err != nil {
 		return identityConfig{}, fmt.Errorf("helper identity parent chain: %w", err)
 	}
 	parentFD, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -84,8 +84,8 @@ func readIdentityConfig() (identityConfig, error) {
 	}
 	defer unix.Close(parentFD)
 	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Uid != 0 || parentStat.Gid != 0 || parentStat.Mode&0o777 != 0o700 {
-		return identityConfig{}, fmt.Errorf("helper identity parent is not root-owned mode 0700")
+	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Uid != 0 || parentStat.Gid != 0 || parentStat.Mode&0o777 != 0o711 {
+		return identityConfig{}, fmt.Errorf("helper identity parent is not root-owned mode 0711")
 	}
 	fd, err := unix.Openat(parentFD, filepath.Base(FixedIdentityConfigPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {

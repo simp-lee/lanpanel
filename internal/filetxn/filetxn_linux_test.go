@@ -213,19 +213,17 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("mount crossing", func(t *testing.T) {
+	t.Run("safe mount traversal", func(t *testing.T) {
 		rootFD, _, err := openAbsoluteDirectory("/")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer syscall.Close(rootFD)
 		procFD, err := openComponent(rootFD, "proc")
-		if procFD >= 0 {
-			_ = syscall.Close(procFD)
+		if err != nil {
+			t.Fatalf("safe no-follow mount traversal: %v", err)
 		}
-		if err == nil || !errors.Is(err, syscall.EXDEV) {
-			t.Fatalf("openComponent(proc) error = %v, want EXDEV", err)
-		}
+		_ = syscall.Close(procFD)
 	})
 }
 

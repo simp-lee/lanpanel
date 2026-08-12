@@ -155,7 +155,7 @@ func Open(config Config, options Options) (*Store, error) {
 		_ = unix.Close(rootFD)
 		return nil, fmt.Errorf("staging path must be a descendant of the transaction root")
 	}
-	stagingFD, stagingStat, err := openDirectoryTree(rootFD, rootStat, stagingRelative, config.StagingParents)
+	stagingFD, stagingStat, err := openDirectoryTreeAllowMounts(rootFD, stagingRelative, config.StagingParents)
 	if err != nil {
 		_ = unix.Close(rootFD)
 		return nil, fmt.Errorf("open staging directory %s: %w", config.StagingPath, err)
@@ -204,7 +204,11 @@ func (store *Store) Put(ctx context.Context, request Request, data []byte, dispo
 		return result, txError("", result, err)
 	}
 	defer unix.Close(parentFD)
-	existing, exists, err := inspectTarget(parentFD, base, uint64(store.rootStat.Dev), request.Existing)
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(parentFD, &parentStat); err != nil {
+		return result, txError("", result, err)
+	}
+	existing, exists, err := inspectTarget(parentFD, base, uint64(parentStat.Dev), request.Existing)
 	if err != nil {
 		return result, txError("", result, err)
 	}
@@ -265,7 +269,7 @@ func (store *Store) Put(ctx context.Context, request Request, data []byte, dispo
 		return result, txError(PointAfterFileSync, result, fmt.Errorf("close staging file: %w", err))
 	}
 	open = false
-	staging, err := verifyFile(store.stagingFD, name, uint64(store.rootStat.Dev), request.New, request.MaxBytes, data)
+	staging, err := verifyFile(store.stagingFD, name, uint64(store.stagingStat.Dev), request.New, request.MaxBytes, data)
 	if err != nil {
 		return result, txError(PointAfterVerify, result, err)
 	}
@@ -280,6 +284,9 @@ func (store *Store) Put(ctx context.Context, request Request, data []byte, dispo
 	}
 	if err := revalidateIdentity(store.stagingFD, name, staging); err != nil {
 		return result, txError(PointBeforeRename, result, fmt.Errorf("staging identity changed: %w", err))
+	}
+	if uint64(parentStat.Dev) != uint64(store.stagingStat.Dev) {
+		return result, txError(PointBeforeRename, result, fmt.Errorf("target and staging directories are on different filesystems"))
 	}
 
 	afterRename := func() error { return store.check(ctx, PointAfterRename) }
@@ -342,7 +349,11 @@ func (store *Store) Read(ctx context.Context, request Request) ([]byte, error) {
 		return nil, err
 	}
 	defer unix.Close(parentFD)
-	before, exists, err := inspectTarget(parentFD, base, uint64(store.rootStat.Dev), request.Existing)
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(parentFD, &parentStat); err != nil {
+		return nil, err
+	}
+	before, exists, err := inspectTarget(parentFD, base, uint64(parentStat.Dev), request.Existing)
 	if err != nil {
 		return nil, err
 	}
@@ -391,7 +402,11 @@ func (store *Store) Remove(ctx context.Context, request Request) (Result, error)
 		return result, txError("", result, err)
 	}
 	defer unix.Close(parentFD)
-	existing, exists, err := inspectTarget(parentFD, base, uint64(store.rootStat.Dev), request.Existing)
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(parentFD, &parentStat); err != nil {
+		return result, txError("", result, err)
+	}
+	existing, exists, err := inspectTarget(parentFD, base, uint64(parentStat.Dev), request.Existing)
 	if err != nil {
 		return result, txError("", result, err)
 	}
@@ -487,7 +502,7 @@ func (store *Store) revalidateProtectedPaths() error {
 	if err != nil {
 		return fmt.Errorf("revalidate staging path: %w", err)
 	}
-	freshStagingFD, freshStaging, err := openDirectoryTree(freshRootFD, freshRoot, stagingRelative, store.stagingParents)
+	freshStagingFD, freshStaging, err := openDirectoryTreeAllowMounts(freshRootFD, stagingRelative, store.stagingParents)
 	if err != nil {
 		return fmt.Errorf("reopen staging directory: %w", err)
 	}
@@ -541,10 +556,6 @@ func (store *Store) openParent(target string, policy DirectoryPolicy) (int, stri
 			_ = unix.Close(fd)
 			return -1, "", err
 		}
-		if uint64(stat.Dev) != uint64(store.rootStat.Dev) {
-			_ = unix.Close(fd)
-			return -1, "", fmt.Errorf("parent component %s crosses a filesystem", component)
-		}
 		if err := validateDirectoryStat(stat, policy); err != nil {
 			_ = unix.Close(fd)
 			return -1, "", fmt.Errorf("parent component %s: %w", component, err)
@@ -572,6 +583,32 @@ func openAbsoluteDirectory(path string) (int, unix.Stat_t, error) {
 	if err := unix.Fstat(fd, &stat); err != nil {
 		_ = unix.Close(fd)
 		return -1, unix.Stat_t{}, err
+	}
+	return fd, stat, nil
+}
+
+func openDirectoryTreeAllowMounts(rootFD int, relative string, policy DirectoryPolicy) (int, unix.Stat_t, error) {
+	fd, err := unix.Dup(rootFD)
+	if err != nil {
+		return -1, unix.Stat_t{}, err
+	}
+	unix.CloseOnExec(fd)
+	var stat unix.Stat_t
+	for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
+		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return -1, unix.Stat_t{}, openErr
+		}
+		fd = next
+		if err := unix.Fstat(fd, &stat); err != nil {
+			_ = unix.Close(fd)
+			return -1, unix.Stat_t{}, err
+		}
+		if err := validateDirectoryStat(stat, policy); err != nil {
+			_ = unix.Close(fd)
+			return -1, unix.Stat_t{}, err
+		}
 	}
 	return fd, stat, nil
 }
@@ -610,10 +647,7 @@ func openDirectoryTree(rootFD int, rootStat unix.Stat_t, relative string, policy
 }
 
 func openComponent(parentFD int, component string) (int, error) {
-	return unix.Openat2(parentFD, component, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV,
-	})
+	return unix.Openat2(parentFD, component, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS})
 }
 
 func inspectTarget(parentFD int, base string, rootDev uint64, expected *Metadata) (unix.Stat_t, bool, error) {
@@ -908,6 +942,9 @@ func validateConfig(config Config) error {
 	}
 	if config.Staging.Owner.UID != uint32(os.Geteuid()) || config.Staging.Owner.GID != uint32(os.Getegid()) {
 		return fmt.Errorf("staging directory must be owned by the helper identity %d:%d", os.Geteuid(), os.Getegid())
+	}
+	if config.RootPath == "/" && config.Root != (Metadata{Owner: Owner{UID: 0, GID: 0}, Mode: 0o755}) {
+		return fmt.Errorf("filesystem-root transaction requires exact root-owned mode 0755 authority")
 	}
 	if err := validateDirectoryPolicy(config.StagingParents); err != nil {
 		return fmt.Errorf("staging parent policy: %w", err)

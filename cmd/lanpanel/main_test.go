@@ -38,7 +38,7 @@ func TestBinaryVersionAndClosedDispatch(t *testing.T) {
 		}
 	})
 	t.Run("obsolete_inputs_rejected", func(t *testing.T) {
-		for _, args := range [][]string{{"deploy"}, {"status"}, {"ui"}, {"--role", "helper"}, {"legacy-deploy"}, {"config.yaml"}} {
+		for _, args := range [][]string{{"deploy"}, {"status"}, {"ui", "manage"}, {"--role", "helper"}, {"legacy-deploy"}, {"config.yaml"}} {
 			stdout, _, err := runBinary(args...)
 			if err == nil || stdout != "" {
 				t.Fatalf("obsolete or unavailable entry %v was accepted", args)

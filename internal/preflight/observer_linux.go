@@ -5,6 +5,8 @@ package preflight
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +52,112 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
 	return &LinuxObserver{paths: paths, packageRead: packageRead, now: now}
+}
+
+// ObserveBootstrapReadiness provides the installer's fixed read-only package
+// readiness observation without exposing a package mutation entrypoint.
+func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) {
+	configuration := []struct {
+		path string
+		dir  bool
+	}{
+		{"/etc/apt/apt.conf", false}, {"/etc/apt/apt.conf.d", true}, {"/etc/apt/auth.conf", false}, {"/etc/apt/auth.conf.d", true},
+		{"/etc/apt/sources.list", false}, {"/etc/apt/sources.list.d", true}, {"/etc/dpkg/dpkg.cfg", false}, {"/etc/dpkg/dpkg.cfg.d", true},
+	}
+	hasher := sha256.New()
+	for _, entry := range configuration {
+		if err := ctx.Err(); err != nil {
+			return PackageObservation{}, err
+		}
+		values, err := readBootstrapConfig(entry.path, entry.dir)
+		if err != nil {
+			return PackageObservation{}, err
+		}
+		for _, value := range values {
+			lower := strings.ToLower(string(value))
+			if strings.Contains(lower, "pre-invoke") || strings.Contains(lower, "post-invoke") || strings.Contains(lower, "proxy") || strings.Contains(lower, "chroot-directory") || strings.Contains(lower, "admindir") || strings.Contains(lower, "root") && strings.Contains(lower, "::") {
+				return PackageObservation{Reason: "ambient_apt_dpkg_override"}, nil
+			}
+			_, _ = hasher.Write(value)
+		}
+	}
+	status, err := readSafeBoundedFile("/var/lib/dpkg/status", 32<<20, true)
+	if err != nil {
+		return PackageObservation{}, err
+	}
+	systemdVersion, nginxVersion := "", ""
+	for _, paragraph := range strings.Split(strings.TrimSpace(string(status)), "\n\n") {
+		state, name, version, architecture := "", "", "", ""
+		for _, line := range strings.Split(paragraph, "\n") {
+			switch {
+			case strings.HasPrefix(line, "Status:"):
+				state = strings.TrimSpace(strings.TrimPrefix(line, "Status:"))
+			case strings.HasPrefix(line, "Package:"):
+				name = strings.TrimSpace(strings.TrimPrefix(line, "Package:"))
+			case strings.HasPrefix(line, "Version:"):
+				version = strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
+			case strings.HasPrefix(line, "Architecture:"):
+				architecture = strings.TrimSpace(strings.TrimPrefix(line, "Architecture:"))
+			}
+		}
+		if state != "" && state != "install ok installed" && state != "deinstall ok config-files" && state != "purge ok not-installed" {
+			return PackageObservation{Reason: "dpkg_partial_state"}, nil
+		}
+		if state == "install ok installed" {
+			if name == "systemd" {
+				systemdVersion = version
+			}
+			if name == "nginx" || name == "nginx-core" {
+				nginxVersion = version
+			}
+			fmt.Fprintf(hasher, "%s=%s@%s\n", name, version, architecture)
+		}
+	}
+	_, _ = hasher.Write(status)
+	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	return PackageObservation{Ready: systemdVersion != "" && nginxVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
+}
+
+func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
+	if !directory {
+		data, err := readSafeBoundedFile(path, 1<<20, true)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return [][]byte{append([]byte(path+"\x00"), data...)}, nil
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
+		return nil, fmt.Errorf("APT/dpkg configuration directory is unsafe")
+	}
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(entries, func(left, right os.DirEntry) int { return strings.Compare(left.Name(), right.Name()) })
+	result := make([][]byte, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return nil, fmt.Errorf("APT/dpkg configuration contains nested directory")
+		}
+		data, err := readSafeBoundedFile(filepath.Join(path, entry.Name()), 1<<20, true)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, append([]byte(filepath.Join(path, entry.Name())+"\x00"), data...))
+	}
+	return result, nil
 }
 
 func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request ExpansionRequest) (ExpansionObservations, error) {

@@ -46,12 +46,12 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	}
 	now := time.Unix(1_700_000_000, 0).UTC()
 	observer := newTestLinuxObserver(LinuxPaths{OSRelease: osRelease, SystemdRoot: systemd, APTExecutable: apt, DPKGExecutable: dpkg, TCP: tcp, TCP6: tcp6, UDP: udp, UDP6: udp6}, func(context.Context) (PackageObservation, error) {
-		return PackageObservation{Ready: true, Identity: "packages/ready"}, nil
+		return PackageObservation{Ready: true, Identity: "packages/ready", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64)}, nil
 	}, func() time.Time { return now })
 	request := expansionRequest(ExpansionBootstrap)
 	request.Target = "installation"
 	request.Domains = nil
-	request.BootstrapListeners = []ListenerRequirement{{Protocol: "tcp", Address: "127.0.0.1", Port: 23456, Purpose: "management"}}
+	request.BootstrapListeners = []ListenerRequirement{{Protocol: "tcp", Address: "127.0.0.1", Port: 52345, Purpose: "management"}}
 	request.ManagedPaths = []ManagedPathRequirement{{Path: managed, Kind: ManagedPathDirectory, OwnerUID: uint32(os.Geteuid()), OwnerGID: uint32(os.Getegid()), RequiredMode: 0o700, MaximumMode: 0o700}}
 	request.Disks = []DiskRequirement{{Path: managed, MinimumAvailableBytes: 1}}
 	observed, err := observer.ObserveExpansion(context.Background(), request)
