@@ -16,6 +16,7 @@ import (
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
 	"reflect"
 	"slices"
@@ -178,10 +179,12 @@ type AdmitRequest struct {
 	ExpectedRevision uint64
 }
 type ConsumeRequest struct {
-	JobID             string
-	ExpectedRevision  uint64
-	IntentGeneration  uint64
-	ConfirmationProof string
+	JobID                string
+	ExpectedRevision     uint64
+	IntentGeneration     uint64
+	ConfirmationProof    string
+	ContractionRequest   *preflight.ContractionRequest
+	ContractionPreflight *preflight.Result
 }
 type SafetyReader interface {
 	Read() (safety.State, error)
@@ -554,6 +557,9 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 	if !digest(confirmationDigest) {
 		return reject("confirmation_invalid", fmt.Errorf("confirmation verifier returned invalid digest"))
 	}
+	if err := requirePreflightEvidence(reservationView.Operation, reservationView.Target, binding.Evidence, observedNow); err != nil {
+		return reject("preflight_rejected", err)
+	}
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return reject("safety_refresh_failed", err)
@@ -640,6 +646,22 @@ func (admitter *Admitter) BeginPlanless(ctx context.Context, mutation *MutationL
 	digest, err := safetyDigest(state)
 	if err != nil {
 		return Reservation{}, err
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return Reservation{}, err
+	}
+	reservationView, err := loadReservationEntries(document.Entries, request.JobID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if requiresContractionPreflight(reservationView.Operation) {
+		if request.ContractionRequest == nil || request.ContractionPreflight == nil || request.ContractionRequest.Kind != contractionKind(reservationView.Operation) || request.ContractionRequest.Target != reservationView.Target || request.ContractionRequest.Generation != contractionGeneration(reservationView) {
+			return reject("preflight_rejected", fmt.Errorf("planless contraction requires exact typed closure preflight"))
+		}
+		if err := preflight.RequireContractionResultForRequest(*request.ContractionPreflight, *request.ContractionRequest, observedNow); err != nil {
+			return reject("preflight_rejected", err)
+		}
 	}
 	var result Reservation
 	_, _, err = admitter.normal.Update(ctx, exposure, request.ExpectedRevision, func(transaction *persist.Transaction) error {
@@ -1356,6 +1378,56 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	return nil
 }
+func contractionKind(operation Type) preflight.ContractionKind {
+	switch operation {
+	case CloseAll, EmergencyCloseAll:
+		return preflight.ContractionCloseAll
+	case CertificateExpiry, EdgeOneExpiry:
+		return preflight.ContractionExpiry
+	case StartupContraction:
+		return preflight.ContractionStartup
+	default:
+		return preflight.ContractionUnpublish
+	}
+}
+
+func contractionGeneration(reservation Reservation) uint64 {
+	if reservation.Operation == EmergencyCloseAll || reservation.Operation == CloseAll {
+		if reservation.SafetyBinding.ProposedGeneration != 0 {
+			return reservation.SafetyBinding.ProposedGeneration
+		}
+		return reservation.SafetyBinding.GlobalGeneration
+	}
+	if reservation.SafetyBinding.ExpiryGeneration != 0 {
+		return reservation.SafetyBinding.ExpiryGeneration
+	}
+	return reservation.SafetyBinding.IntentGeneration
+}
+
+func requirePreflightEvidence(operation Type, target string, evidence []plans.Evidence, now time.Time) error {
+	switch operation {
+	case Publish:
+		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionDomainHTTPS, preflight.ExpansionTemporaryHTTP}, target, evidence, now)
+	case PackageTransaction:
+		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, target, evidence, now)
+	case Unpublish:
+		return preflight.RequireContractionPlanEvidence([]preflight.ContractionKind{preflight.ContractionUnpublish}, target, evidence, now)
+	case CloseAll:
+		return preflight.RequireContractionPlanEvidence([]preflight.ContractionKind{preflight.ContractionCloseAll}, target, evidence, now)
+	default:
+		return nil
+	}
+}
+
+func requiresContractionPreflight(operation Type) bool {
+	switch operation {
+	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, StartupContraction:
+		return true
+	default:
+		return false
+	}
+}
+
 func isContraction(operation Type) bool {
 	switch operation {
 	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
@@ -1412,7 +1484,7 @@ func validExpiryBinding(operation Type, state safety.State, binding SafetyBindin
 
 // AuthorizeStateIndependentContraction is the closed no-normal-store exception.
 // It grants no normal-state or job write authority.
-func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, binding SafetyBinding, unavailable persist.UnavailableProof, exposure *locks.Lease, commitAuthority func() error) error {
+func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, binding SafetyBinding, contractionRequest preflight.ContractionRequest, preflightResult preflight.Result, unavailable persist.UnavailableProof, exposure *locks.Lease, commitAuthority func(fallbackStop bool) error) error {
 	if admitter == nil {
 		return fmt.Errorf("state-independent authority is nil")
 	}
@@ -1425,6 +1497,19 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 	}
 	if !admitter.normal.ValidateUnavailable(unavailable) {
 		return fmt.Errorf("state-independent contraction requires proven normal-store unavailability or a failed durable admission write")
+	}
+	preflightKind := map[Type]preflight.ContractionKind{EmergencyCloseAll: preflight.ContractionEmergency, CertificateExpiry: preflight.ContractionExpiry, EdgeOneExpiry: preflight.ContractionExpiry, StartupContraction: preflight.ContractionStartup}[operation]
+	expectedGeneration := binding.ExpiryGeneration
+	if operation == EmergencyCloseAll {
+		expectedGeneration = binding.ProposedGeneration
+	} else if operation == StartupContraction {
+		expectedGeneration = binding.IntentGeneration
+	}
+	if contractionRequest.Kind != preflightKind || contractionRequest.Target != stateIndependentTarget(operation, binding) || contractionRequest.Generation != expectedGeneration {
+		return fmt.Errorf("state-independent contraction request does not match safety authority")
+	}
+	if err := preflight.RequireContractionResultForRequest(preflightResult, contractionRequest, now); err != nil {
+		return fmt.Errorf("state-independent contraction preflight: %w", err)
 	}
 	state, err := admitter.safety.Read()
 	if err != nil {
@@ -1446,7 +1531,14 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 	default:
 		return fmt.Errorf("operation is not a state-independent contraction exception")
 	}
-	return commitAuthority()
+	return commitAuthority(contractionRequest.FallbackStop)
+}
+
+func stateIndependentTarget(operation Type, binding SafetyBinding) string {
+	if operation == EmergencyCloseAll {
+		return "installation"
+	}
+	return "resource/" + binding.ResourceID
 }
 
 func authoritativeOperationLeases(normal *persist.Store, mutation *MutationLease, exposure *locks.Lease) bool {

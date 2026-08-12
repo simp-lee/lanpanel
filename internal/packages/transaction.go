@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lanpanel/internal/child"
+	"lanpanel/internal/preflight"
 )
 
 type JournalPhase string
@@ -119,7 +120,7 @@ type Engine struct {
 	Now             func() time.Time
 }
 
-func (engine Engine) Execute(ctx context.Context, plan Plan) (Journal, error) {
+func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult preflight.Result) (Journal, error) {
 	if engine.Journals == nil || engine.Executor == nil || engine.MonitorRequired && engine.Monitor == nil {
 		return Journal{}, fmt.Errorf("package transaction dependencies are incomplete")
 	}
@@ -130,7 +131,11 @@ func (engine Engine) Execute(ctx context.Context, plan Plan) (Journal, error) {
 	if engine.Now != nil {
 		now = engine.Now
 	}
-	deadline := now().Add(plan.TotalTimeout)
+	observedNow := now().UTC()
+	if err := preflight.RequireExpansionResult(preflightResult, []preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, "installation", plan.IntentGeneration, observedNow); err != nil {
+		return Journal{}, fmt.Errorf("package transaction expansion preflight: %w", err)
+	}
+	deadline := observedNow.Add(plan.TotalTimeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 

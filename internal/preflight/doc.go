@@ -1,5 +1,6 @@
-// Package preflight retains only read-only parsing algorithms pending the S7
-// GA rewrite. It exposes no deploy, mutation, sudo, or management entrypoint.
+// Package preflight provides the shared read-only host observations and typed
+// short-lived authorities required before access expansion or safe contraction.
+// It exposes no mutation, privilege elevation, command, or management entrypoint.
 //
 // GA rewrite owner: S7.
 package preflight

@@ -11,6 +11,7 @@ import (
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
@@ -362,6 +363,9 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
 			t.Fatal("normal admission crossed a stop fence")
 		}
+		if !isContraction(AutomaticReconciliation) || requiresContractionPreflight(AutomaticReconciliation) {
+			t.Fatal("automatic reconciliation lost contraction-safe authorization or gained unrelated preflight")
+		}
 		if err := validateAdmissionSource(StartupContraction, AdmissionPlan, "plan"); err == nil {
 			t.Fatal("startup contraction was exposed through Plan admission")
 		}
@@ -404,32 +408,47 @@ func TestOperationAdmissionContract(t *testing.T) {
 			return proof
 		}
 		independentSafety.state = state
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
+		expiryRequest, expiryPreflight := contractionPreflight(preflight.ContractionExpiry, "resource/res_00000000000000000000000000000001", 4, time.Now().UTC())
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, expiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
 			t.Fatal(err)
+		}
+		wrongGeneration := expiryPreflight
+		wrongGeneration.Generation++
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, wrongGeneration, fresh(), exposure, func(bool) error { return nil }); err == nil {
+			t.Fatal("state-independent contraction accepted mismatched safety generation")
 		}
 		emergency := safety.EmptyState()
 		independentSafety.state = emergency
-		if err := independent.AuthorizeStateIndependentContraction(EmergencyCloseAll, SafetyBinding{GlobalGeneration: 0, ProposedGeneration: 1}, fresh(), exposure, func() error { return nil }); err != nil {
+		emergencyRequest, emergencyPreflight := contractionPreflight(preflight.ContractionEmergency, "installation", 1, time.Now().UTC())
+		fallbackCalled := false
+		emergencyRequest.FallbackStop = true
+		emergencyPreflight.RequestDigest, _ = preflight.ContractionRequestDigest(emergencyRequest)
+		if err := independent.AuthorizeStateIndependentContraction(EmergencyCloseAll, SafetyBinding{GlobalGeneration: 0, ProposedGeneration: 1}, emergencyRequest, emergencyPreflight, fresh(), exposure, func(fallback bool) error { fallbackCalled = fallback; return nil }); err != nil {
 			t.Fatal(err)
+		}
+		if !fallbackCalled {
+			t.Fatal("fallback-stop authority was not delivered to the contraction owner")
 		}
 		edge := safety.EmptyState()
 		edge.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 5, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), EdgeOne: safety.EdgeOneSafety{Expiry: &safety.DeadlineMarker{Generation: 5, Deadline: deadline, Binding: "edgeone"}}}}
 		independentSafety.state = edge
-		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, fresh(), exposure, func() error { return nil }); err != nil {
+		edgeExpiryRequest, edgeExpiryPreflight := contractionPreflight(preflight.ContractionExpiry, "resource/res_00000000000000000000000000000001", 5, time.Now().UTC())
+		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, edgeExpiryRequest, edgeExpiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		startup := safety.EmptyState()
 		startup.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 6, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), Reactivating: &safety.Reactivating{Generation: 6, PriorGeneration: 5, PlanID: "plan", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle"), BaseMarkers: absentSafetySnapshot(), CertificateUntil: time.Now().Add(time.Hour), ACLUntil: time.Now().Add(time.Hour)}}}
 		independentSafety.state = startup
-		if err := independent.AuthorizeStateIndependentContraction(StartupContraction, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan", IntentGeneration: 6, CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle")}, fresh(), exposure, func() error { return nil }); err != nil {
+		startupRequest, startupPreflight := contractionPreflight(preflight.ContractionStartup, "resource/res_00000000000000000000000000000001", 6, time.Now().UTC())
+		if err := independent.AuthorizeStateIndependentContraction(StartupContraction, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan", IntentGeneration: 6, CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle")}, startupRequest, startupPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
 			t.Fatalf("startup contraction was rejected: %v", err)
 		}
-		if err := independent.AuthorizeStateIndependentContraction(Publish, SafetyBinding{}, fresh(), exposure, func() error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(Publish, SafetyBinding{}, startupRequest, startupPreflight, fresh(), exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("publish entered state-independent exception")
 		}
 		_, otherProof, _ := unavailableProof(t)
 		independentSafety.state = state
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, otherProof, exposure, func() error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, expiryPreflight, otherProof, exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("unavailability proof from another store was accepted")
 		}
 	})
@@ -491,6 +510,25 @@ func TestOperationAdmissionContract(t *testing.T) {
 			t.Fatal("nonterminal inventory was accepted")
 		}
 	})
+}
+
+func TestOperationPreflightEvidenceSeparatesExpansionAndContraction(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	target := "resource/res_00000000000000000000000000000001"
+	expansion := []plans.Evidence{{Kind: preflight.ExpansionEvidencePrefix + string(preflight.ExpansionDomainHTTPS), Identity: target, Generation: 1, Digest: testDigest("expansion"), ObservedAt: now}}
+	if err := requirePreflightEvidence(Publish, target, expansion, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePreflightEvidence(Unpublish, target, expansion, now); err == nil {
+		t.Fatal("unpublish accepted expansion prerequisites instead of closure authority")
+	}
+	contraction := []plans.Evidence{{Kind: preflight.ContractionEvidencePrefix + string(preflight.ContractionUnpublish), Identity: target, Generation: 2, Digest: testDigest("contraction"), ObservedAt: now}}
+	if err := requirePreflightEvidence(Unpublish, target, contraction, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := requirePreflightEvidence(Publish, target, contraction, now); err == nil {
+		t.Fatal("publish accepted contraction-only evidence")
+	}
 }
 
 func TestOperationResultBranchTable(t *testing.T) {
@@ -627,6 +665,13 @@ func unavailableProof(t *testing.T) (*Admitter, persist.UnavailableProof, *locks
 	return admitter, proof, manager
 }
 
+func contractionPreflight(kind preflight.ContractionKind, target string, generation uint64, now time.Time) (preflight.ContractionRequest, preflight.Result) {
+	request := preflight.ContractionRequest{Kind: kind, Target: target, Generation: generation, OwnershipInventoryDigest: testDigest("ownership"), ClosureAuthorityDigest: testDigest("closure")}
+	digest, _ := preflight.ContractionRequestDigest(request)
+	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(kind), Target: target, Generation: generation, RequestDigest: digest, Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "closure_authority", Disposition: preflight.FindingPassed, Summary: "exact contraction authority passed", Identity: "fixture"}}}
+	return request, result
+}
+
 func absentSafetySnapshot() []safety.MarkerSnapshot {
 	return []safety.MarkerSnapshot{
 		{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent},
@@ -656,7 +701,10 @@ func testRegistry(t *testing.T) *Registry {
 }
 
 func operationPlanSpec(now time.Time) plans.Spec {
-	return plans.Spec{Operation: "publish", Target: plans.Target{Kind: plans.TargetResource, ID: "res_00000000000000000000000000000001"}, ActorIdentity: "session-one", Config: plans.DigestBinding{Applicable: true, Digest: testDigest("config")}, Applied: plans.DigestBinding{Applicable: true, Digest: testDigest("applied")}, Evidence: []plans.Evidence{{Kind: "config", Identity: "res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("evidence"), ObservedAt: now}}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
+	return plans.Spec{Operation: "publish", Target: plans.Target{Kind: plans.TargetResource, ID: "res_00000000000000000000000000000001"}, ActorIdentity: "session-one", Config: plans.DigestBinding{Applicable: true, Digest: testDigest("config")}, Applied: plans.DigestBinding{Applicable: true, Digest: testDigest("applied")}, Evidence: []plans.Evidence{
+		{Kind: "config", Identity: "res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("evidence"), ObservedAt: now},
+		{Kind: preflight.ExpansionEvidencePrefix + string(preflight.ExpansionDomainHTTPS), Identity: "resource/res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("preflight"), ObservedAt: now},
+	}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
 }
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)

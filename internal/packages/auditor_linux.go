@@ -73,6 +73,38 @@ func (auditor *LinuxAuditor) AuditPackages(ctx context.Context, plan Plan) (Audi
 	return Audit{Configuration: configuration, Repositories: repositories, DPKG: dpkg, Before: runtime, NoAutostart: policy}, nil
 }
 
+// PreflightReadiness reuses the exact no-follow APT/dpkg inventory and parser
+// used by package execution without starting a child or changing host state.
+func (auditor *LinuxAuditor) PreflightReadiness(ctx context.Context, repositories []Repository) (string, error) {
+	if auditor == nil || auditor.launcher == nil {
+		return "", fmt.Errorf("package auditor is unavailable")
+	}
+	plan := Plan{Repositories: append([]Repository(nil), repositories...)}
+	configuration, observedRepositories, err := auditor.readConfiguration(ctx, plan)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateAPTConfiguration(configuration, observedRepositories, repositories); err != nil {
+		return "", err
+	}
+	dpkg, _, packages, err := auditor.readDPKG(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateDPKGReady(dpkg); err != nil {
+		return "", err
+	}
+	identity, err := digestValue(struct {
+		Configuration []ObservedConfig
+		Repositories  []ObservedRepository
+		Packages      []InstalledPackage
+	}{configuration, observedRepositories, packages})
+	if err != nil {
+		return "", err
+	}
+	return identity, nil
+}
+
 func (auditor *LinuxAuditor) ObservePackages(ctx context.Context, plan Plan) (Postcondition, error) {
 	_, installed, systemPackages, err := auditor.readDPKG(ctx, plan.Packages)
 	if err != nil {

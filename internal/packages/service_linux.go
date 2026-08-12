@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helperproto"
+	"lanpanel/internal/preflight"
 )
 
 const (
@@ -26,11 +28,13 @@ const (
 )
 
 type Service struct {
-	files   *filetxn.Store
-	journal *FileJournalStore
-	auditor *LinuxAuditor
-	engine  Engine
-	owner   filetxn.Owner
+	files    *filetxn.Store
+	journal  *FileJournalStore
+	auditor  *LinuxAuditor
+	engine   Engine
+	owner    filetxn.Owner
+	planRoot string
+	mu       sync.Mutex
 }
 
 func OpenFixedService() (*Service, error) {
@@ -69,7 +73,7 @@ func OpenFixedService() (*Service, error) {
 	}
 	stager := &ArtifactStager{Files: transactionFiles, Launcher: launcher}
 	executor := &HostExecutor{Auditor: auditor, Stager: stager, Files: transactionFiles, Masks: masks, Launcher: launcher}
-	service := &Service{files: files, journal: journals, auditor: auditor, owner: owner}
+	service := &Service{files: files, journal: journals, auditor: auditor, owner: owner, planRoot: FixedPackagePlanRoot}
 	service.engine = Engine{Journals: journals, Executor: executor, Monitor: NewLinuxMonitor(), MonitorRequired: false, Now: func() time.Time { return time.Now().UTC() }}
 	pending, err := journals.Pending(context.Background())
 	if err != nil {
@@ -89,16 +93,24 @@ func (service *Service) Close() error {
 }
 
 func (service *Service) ValidateRequest(ctx context.Context, request helperproto.Request) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	_, err := service.loadPlan(ctx, request)
 	return err
 }
 
 func (service *Service) Execute(ctx context.Context, request helperproto.Request) (string, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	plan, err := service.loadPlan(ctx, request)
 	if err != nil {
 		return "", err
 	}
-	journal, err := service.engine.Execute(ctx, plan)
+	preflightResult, err := service.loadPreflight(ctx, request, plan)
+	if err != nil {
+		return "", err
+	}
+	journal, err := service.engine.Execute(ctx, plan, preflightResult)
 	if err != nil {
 		return "", err
 	}
@@ -108,6 +120,40 @@ func (service *Service) Execute(ctx context.Context, request helperproto.Request
 	}
 	digest := sha256.Sum256(encoded)
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func (service *Service) loadPreflight(ctx context.Context, request helperproto.Request, plan Plan) (preflight.Result, error) {
+	if service == nil || service.files == nil {
+		return preflight.Result{}, fmt.Errorf("package preflight authority is unavailable")
+	}
+	if service.planRoot == "" {
+		return preflight.Result{}, fmt.Errorf("package preflight plan root is missing")
+	}
+	path := filepath.Join(service.planRoot, request.InputDigest[len("sha256:"):]+".preflight.json")
+	metadata := filetxn.Metadata{Owner: service.owner, Mode: 0o600}
+	data, err := service.files.Read(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{service.owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maximumJournalBytes})
+	if err != nil {
+		return preflight.Result{}, fmt.Errorf("read exact package preflight: %w", err)
+	}
+	var result preflight.Result
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return preflight.Result{}, fmt.Errorf("decode package preflight")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return preflight.Result{}, fmt.Errorf("package preflight has trailing data")
+	}
+	canonical, err := json.Marshal(result)
+	if err != nil || !bytes.Equal(canonical, data) || preflight.RequireExpansionResult(result, []preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, "installation", plan.IntentGeneration, time.Now().UTC()) != nil {
+		return preflight.Result{}, fmt.Errorf("package preflight is noncanonical, stale, or intent-mismatched")
+	}
+	resultDigest, err := result.Digest()
+	if err != nil || resultDigest != plan.PreflightDigest || result.RequestDigest != plan.PreflightRequestDigest {
+		return preflight.Result{}, fmt.Errorf("package Plan does not bind exact preflight result and request")
+	}
+	return result, nil
 }
 
 func (service *Service) loadPlan(ctx context.Context, request helperproto.Request) (Plan, error) {
@@ -126,7 +172,10 @@ func (service *Service) loadPlan(ctx context.Context, request helperproto.Reques
 	if len(digest) != len("sha256:")+64 {
 		return Plan{}, fmt.Errorf("package Plan digest is invalid")
 	}
-	path := filepath.Join(FixedPackagePlanRoot, digest[len("sha256:"):]+".json")
+	if service.planRoot == "" {
+		return Plan{}, fmt.Errorf("package Plan root is missing")
+	}
+	path := filepath.Join(service.planRoot, digest[len("sha256:"):]+".json")
 	metadata := filetxn.Metadata{Owner: service.owner, Mode: 0o600}
 	data, err := service.files.Read(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{service.owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maximumJournalBytes})
 	if err != nil {

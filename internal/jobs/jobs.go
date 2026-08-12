@@ -37,6 +37,7 @@ var (
 		"normal_revision_changed":     {},
 		"plan_consumption_rejected":   {},
 		"planless_start_rejected":     {},
+		"preflight_rejected":          {},
 		"safety_authority_changed":    {},
 		"safety_recheck_unavailable":  {},
 		"safety_refresh_failed":       {},

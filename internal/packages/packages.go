@@ -84,6 +84,8 @@ type Plan struct {
 	TotalTimeout            time.Duration          `json:"total_timeout"`
 	NoNetwork               bool                   `json:"no_network"`
 	NoAutostartPolicyDigest string                 `json:"no_autostart_policy_digest"`
+	PreflightDigest         string                 `json:"preflight_digest"`
+	PreflightRequestDigest  string                 `json:"preflight_request_digest"`
 	Authority               QualificationAuthority `json:"authority"`
 }
 
@@ -187,8 +189,8 @@ func ValidatePlan(plan Plan) error {
 	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(plan.OSProfileDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
 		return fmt.Errorf("package transaction identity, bounds, or OS profile are invalid")
 	}
-	if !digestPattern.MatchString(plan.NoAutostartPolicyDigest) {
-		return fmt.Errorf("package no-autostart policy identity is invalid")
+	if !digestPattern.MatchString(plan.NoAutostartPolicyDigest) || !strings.HasPrefix(plan.PreflightDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightDigest, "sha256:")) || !strings.HasPrefix(plan.PreflightRequestDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightRequestDigest, "sha256:")) {
+		return fmt.Errorf("package no-autostart or shared preflight identity is invalid")
 	}
 	if err := sources.ValidateProxy(plan.Proxy); err != nil {
 		return err

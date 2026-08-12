@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lanpanel/internal/child"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/sources"
 )
 
@@ -113,13 +114,34 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 	}
 }
 
+func TestPackageTransactionRequiresFreshSharedExpansionPreflight(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	engine, result := testEngine(&memoryJournals{}, executor, &fakeMonitor{})
+	blocked := result
+	blocked.Allowed = false
+	blocked.Findings[0].Disposition = preflight.FindingBlocked
+	if _, err := engine.Execute(context.Background(), plan, blocked); err == nil {
+		t.Fatal("package transaction ran without allowed shared expansion preflight")
+	}
+	result.Target = "resource/other"
+	if _, err := engine.Execute(context.Background(), plan, result); err == nil {
+		t.Fatal("package transaction accepted target-mismatched preflight")
+	}
+	engine, result = testEngine(&memoryJournals{}, executor, &fakeMonitor{})
+	engine.Now = func() time.Time { return result.ValidUntil.Add(time.Nanosecond) }
+	if _, err := engine.Execute(context.Background(), plan, result); err == nil {
+		t.Fatal("package transaction accepted stale preflight")
+	}
+}
+
 func TestPackageTransactionJournalsMasksMonitorsAndUsesTypedChild(t *testing.T) {
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
 	journals := &memoryJournals{}
 	monitor := &fakeMonitor{}
-	engine := Engine{Journals: journals, Executor: executor, Monitor: monitor, Now: func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }}
-	journal, err := engine.Execute(context.Background(), plan)
+	engine, result := testEngine(journals, executor, monitor)
+	journal, err := engine.Execute(context.Background(), plan, result)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +161,8 @@ func TestPackageTransactionPreservesPreparedJournalAcrossMaskCommitFault(t *test
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
 	journals := &memoryJournals{failAt: JournalMasksApplied}
-	engine := Engine{Journals: journals, Executor: executor, Monitor: &fakeMonitor{}}
-	journal, err := engine.Execute(context.Background(), plan)
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
 	if err == nil || journal.Phase != JournalMasking || len(journal.Masks) != 1 || len(executor.unmasked) != 0 || !reflect.DeepEqual(journal.Prior, executor.audit.Before) {
 		t.Fatalf("journal=%#v unmasked=%v error=%v", journal, executor.unmasked, err)
 	}
@@ -151,8 +173,8 @@ func TestPackageTransactionPreservesPartialJournalAndMasksOnTimeout(t *testing.T
 	executor := newFakeExecutor(plan)
 	executor.runErr = context.DeadlineExceeded
 	journals := &memoryJournals{}
-	engine := Engine{Journals: journals, Executor: executor, Monitor: &fakeMonitor{}}
-	journal, err := engine.Execute(context.Background(), plan)
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
 	if err == nil || journal.Phase != JournalChildTerminal || journal.ErrorCode != "package_child_interrupted" || len(executor.unmasked) != 0 {
 		t.Fatalf("journal=%#v unmasked=%v error=%v", journal, executor.unmasked, err)
 	}
@@ -163,14 +185,20 @@ func TestPackageTransactionPreservesPartialJournalAndMasksOnBypass(t *testing.T)
 	executor := newFakeExecutor(plan)
 	journals := &memoryJournals{}
 	monitor := &fakeMonitor{terminal: errors.New("new listener observed")}
-	engine := Engine{Journals: journals, Executor: executor, Monitor: monitor}
-	journal, err := engine.Execute(context.Background(), plan)
+	engine, result := testEngine(journals, executor, monitor)
+	journal, err := engine.Execute(context.Background(), plan, result)
 	if err == nil || journal.Phase != JournalChildTerminal || journal.ErrorCode != "unit_or_listener_bypass" || len(executor.unmasked) != 0 {
 		t.Fatalf("journal=%#v unmasked=%v error=%v", journal, executor.unmasked, err)
 	}
 	if !slices.Contains(maskNames(journal.Masks), "nginx.service") {
 		t.Fatal("partial journal lost the retained no-start mask")
 	}
+}
+
+func testEngine(journals JournalStore, executor Executor, monitor Monitor) (Engine, preflight.Result) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + strings.Repeat("6", 64), Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "ready", Disposition: preflight.FindingPassed, Summary: "shared expansion preflight passed", Identity: "fixture"}}}
+	return Engine{Journals: journals, Executor: executor, Monitor: monitor, Now: func() time.Time { return now }}, result
 }
 
 func testPlan(t *testing.T, mode Mode) Plan {
@@ -199,7 +227,7 @@ func testPlan(t *testing.T, mode Mode) Plan {
 	}
 	plan := Plan{
 		TransactionID: "pkg_" + strings.Repeat("1", 64), JobID: "job_" + strings.Repeat("2", 64), IntentGeneration: 1, Deadline: time.Unix(2_000_000_000, 0).UTC(), OSProfileDigest: strings.Repeat("a", 64), Mode: mode, Packages: packages, FirstNginxInstall: true,
-		LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoNetwork: noNetwork, NoAutostartPolicyDigest: strings.Repeat("9", 64),
+		LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoNetwork: noNetwork, NoAutostartPolicyDigest: strings.Repeat("9", 64), PreflightDigest: "sha256:" + strings.Repeat("6", 64), PreflightRequestDigest: "sha256:" + strings.Repeat("6", 64),
 		Authority: QualificationAuthority{Kind: QualificationCandidate, EnvelopeDigest: strings.Repeat("d", 64), BinaryDigest: strings.Repeat("e", 64), RunID: "run-1", ManifestDigest: strings.Repeat("7", 64), HostFingerprint: "host/fingerprint", CaseID: "package-install", Operation: "package_transaction", TargetOSProfileDigest: strings.Repeat("a", 64), FrozenClosureDigest: closure},
 	}
 	if mode == DistroRepository {
