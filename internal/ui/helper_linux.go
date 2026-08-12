@@ -70,7 +70,11 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	if operation == helperproto.OperationAdminTokenReconcile {
 		requestDeadline = time.Now().UTC().Add(30 * time.Second)
 	}
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: "installation", IntentGeneration: 1, Deadline: requestDeadline, InputDigest: InputDigest(string(operation) + "/" + nonce), Action: action}
+	target := "installation"
+	if action != nil && action.TargetKind == "resource" && action.TargetID != "" {
+		target = "resource/" + action.TargetID
+	}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: target, IntentGeneration: 1, Deadline: requestDeadline, InputDigest: InputDigest(string(operation) + "/" + nonce), Action: action}
 	if action != nil {
 		request.InputDigest, err = helperproto.ApplicationInputDigest(request)
 		if err != nil {

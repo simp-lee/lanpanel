@@ -173,6 +173,8 @@ func validProfileAuthority(profile ExpectedProfile) bool {
 func requiredListeners(request ExpansionRequest) []ListenerRequirement {
 	requirements := append([]ListenerRequirement(nil), request.BootstrapListeners...)
 	switch request.Scope {
+	case ExpansionBootstrap:
+		requirements = append(requirements, ListenerRequirement{Protocol: "tcp", Address: "0.0.0.0", Port: 80, Purpose: "nginx_http"}, ListenerRequirement{Protocol: "tcp", Address: "0.0.0.0", Port: 443, Purpose: "nginx_https"})
 	case ExpansionDomainHTTPS:
 		requirements = append(requirements, ListenerRequirement{Protocol: "tcp", Address: "0.0.0.0", Port: 80, Purpose: "app_http"}, ListenerRequirement{Protocol: "tcp", Address: "0.0.0.0", Port: 443, Purpose: "app_https"})
 	case ExpansionTemporaryHTTP:

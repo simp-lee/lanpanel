@@ -38,6 +38,28 @@ func TestExpansionPreflightUsesExactScopeAndResponsibilities(t *testing.T) {
 	}
 }
 
+func TestBootstrapRequiresManagementAndClosedNginxListeners(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	request := expansionRequest(ExpansionBootstrap)
+	request.Target = "installation"
+	request.Domains = nil
+	request.BootstrapListeners = []ListenerRequirement{{Protocol: "tcp", Address: "127.23.45.67", Port: 52345, Purpose: "management"}}
+	observed := passingExpansionObservations(request, now)
+	result, err := EvaluateExpansion(request, observed)
+	if err != nil || !result.Allowed {
+		t.Fatalf("bootstrap result=%#v error=%v", result, err)
+	}
+	listener, ok := findingByCode(result.Findings, "listeners")
+	if !ok || !strings.Contains(listener.Identity, "127.23.45.67") || !strings.Contains(listener.Identity, "00080") || !strings.Contains(listener.Identity, "00443") {
+		t.Fatalf("bootstrap listener authority=%#v", listener)
+	}
+	observed.Listeners = []ListenerObservation{{Protocol: "tcp", Address: "0.0.0.0", Port: 443, SocketInode: 91}}
+	result, err = EvaluateExpansion(request, observed)
+	if err != nil || result.Allowed {
+		t.Fatalf("bootstrap accepted occupied Nginx listener: %#v error=%v", result, err)
+	}
+}
+
 func TestNonBootstrapScopesRejectExtraListenerRequirements(t *testing.T) {
 	request := expansionRequest(ExpansionTemporaryHTTP)
 	request.Domains = nil

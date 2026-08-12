@@ -636,6 +636,49 @@ func TestOperationResultBranchTable(t *testing.T) {
 	})
 }
 
+func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	beforeInstallation := operationStateInstallation()
+	beforeInstallation.Resources[0].PublicationRecord.State = domain.PublicationPublished
+	bundle := domain.PublicationBundle{ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
+	beforeInstallation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
+	beforeInstallation.Resources[0].PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Unpublish), Target: "resource/" + beforeInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: "plan-one", AdmissionSource: AdmissionPlan, Operation: Unpublish, Target: "resource/" + beforeInstallation.Resources[0].ID, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	encode := func(value any) json.RawMessage {
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(beforeInstallation), reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+	afterInstallation := beforeInstallation
+	afterInstallation.Resources = append([]domain.AppResource(nil), beforeInstallation.Resources...)
+	afterInstallation.Resources[0].PublicationRecord.State = domain.PublicationUnpublished
+	afterInstallation.Resources[0].PublicationRecord.UnpublishedGeneration = 3
+	afterInstallation.Resources[0].PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: now.Format(time.RFC3339), Reason: "closing_may_be_live"}
+	afterInstallation.Resources[0].PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: record.ID, Operation: string(Unpublish), Generation: 3, ClosureAuthorityDigest: testDigest("closure"), Prior: &bundle}
+	afterIntent := intent
+	afterIntent.ContractionDigest = testDigest("closure")
+	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(afterInstallation), reservationKey(record.ID): encode(afterIntent), "jobs/" + record.ID: encode(running)}}
+	if err := validateOperationStateTransitions(before, after); err != nil {
+		t.Fatalf("running contraction state rejected: %v", err)
+	}
+	unsafe := afterInstallation
+	unsafe.Resources = append([]domain.AppResource(nil), afterInstallation.Resources...)
+	unsafe.Resources[0].PublicationRecord.ContractionIntent = nil
+	unsafeDocument := after
+	unsafeDocument.Entries = map[string]json.RawMessage{"installations/current": encode(unsafe), reservationKey(record.ID): encode(afterIntent), "jobs/" + record.ID: encode(running)}
+	if err := validateOperationStateTransitions(after, unsafeDocument); err == nil {
+		t.Fatal("running contraction lost authority before terminal runtime evidence")
+	}
+}
+
 func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()

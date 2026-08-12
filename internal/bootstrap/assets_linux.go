@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/safety"
@@ -44,14 +45,19 @@ func renderArtifacts(journal Journal) (map[string][]byte, error) {
 	}
 	authority := fmt.Sprintf("%s:%d", journal.Authority.Address, journal.Authority.Port)
 	socketGeneration := journal.GenerationID
+	nginxPaths := nginx.FixedPaths()
+	if journal.Paths != FixedPaths() {
+		nginxPaths = testNginxPaths(journal.Paths)
+	}
 	artifacts := map[string][]byte{
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-management.socket"): []byte("[Unit]\nDescription=LanPanel reserved Management authority\nBefore=lanpanel-ui.service\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\nListenStream=" + authority + "\nFileDescriptorName=lanpanel-management-" + socketGeneration + "\nSocketMode=0600\nRemoveOnStop=no\nService=lanpanel-ui.service\n\n[Install]\nWantedBy=sockets.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-ui.service"):        []byte(serviceUnit("LanPanel Management UI", accounts[identity.RoleUI], binary+" ui", "LANPANEL_SOCKET_GENERATION="+socketGeneration, "lanpanel-management.socket")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-runtime.service"):   []byte("[Unit]\nDescription=LanPanel volatile runtime directory\nBefore=lanpanel-helper.service lanpanel-management.socket\n\n[Service]\nType=oneshot\nExecStart=" + binary + " runtime-guard\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Service]\nType=simple\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /run/lanpanel /etc/lanpanel /etc/systemd/system /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /run/lanpanel /etc/lanpanel /etc/systemd/system /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.service"):     []byte(serviceUnit("LanPanel timer dispatcher", accounts[identity.RoleTimer], binary+" timer", "", "")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.timer"):       []byte("[Unit]\nDescription=LanPanel persistent timer\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=" + fixedTimerPeriod + "\nPersistent=true\nUnit=lanpanel-timer.service\n\n[Install]\nWantedBy=timers.target\n"),
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):  []byte(serviceUnit("LanPanel startup recovery", accounts[identity.RoleRecovery], binary+" startup-guard", "", "")),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):  []byte("[Unit]\nDescription=LanPanel startup contraction recovery\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-helper.service\nRequires=lanpanel-helper.service\nBefore=lanpanel-nginx.service\n\n[Service]\nType=oneshot\nExecStart=" + binary + " fenced-recovery\nUser=" + fmt.Sprint(accounts[identity.RoleRecovery].UID) + "\nGroup=" + fmt.Sprint(accounts[identity.RoleRecovery].GID) + "\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nUMask=0077\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service"):     []byte("[Unit]\nDescription=LanPanel closed Nginx master\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=network.target lanpanel-helper.service lanpanel-recovery.service\nRequires=lanpanel-helper.service lanpanel-recovery.service\nConflicts=nginx.service\n\n[Service]\nType=simple\nPIDFile=" + nginxPaths.PIDPath + "\nExecStart=" + binary + " startup-guard\nExecReload=" + binary + " reload-guard\nExecStop=" + binary + " reload-guard stop\nTimeoutStartSec=60s\nTimeoutStopSec=60s\nKillMode=control-group\nRestart=no\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=" + nginxPaths.ConfigRoot + " " + nginxPaths.StateRoot + " " + filepath.Dir(nginxPaths.PIDPath) + " " + nginxPaths.AuditPath + " /var/lib/lanpanel/locks /var/lib/lanpanel/safety /var/lib/lanpanel/state /var/lib/lanpanel/ownership\nCapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE\nAmbientCapabilities=\n\n[Install]\nWantedBy=multi-user.target\n"),
 	}
 	return artifacts, nil
 }

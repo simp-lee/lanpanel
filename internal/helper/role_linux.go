@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/application"
+	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/packages"
@@ -48,11 +49,13 @@ func RunRole(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
-	if err := application.ReconcileAdminTokenRotation(context.Background(), fingerprint); err != nil {
-		return fmt.Errorf("reconcile admin token rotation: %w", err)
+	rotationRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
+	if err := reconcileStartupContraction(context.Background()); err != nil {
+		return err
 	}
 	var packageMu sync.Mutex
 	var tokenMu sync.Mutex
+	contractionPlans := newEmergencyPlanStore()
 	withPackageService := func(use func(*packages.Service) error) error {
 		packageMu.Lock()
 		defer packageMu.Unlock()
@@ -71,6 +74,37 @@ func RunRole(args []string) error {
 	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("application request carried secret")
+		}
+		if request.Action.Operation == "close_all" || request.Action.Operation == "unpublish" {
+			service, normalErr := application.OpenFixed()
+			if normalErr == nil {
+				operation := domain.OperationCloseAll
+				target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
+				if request.Action.Operation == "unpublish" {
+					operation = domain.OperationUnpublish
+					target = domain.OperationTarget{Kind: domain.OperationTargetResource, ID: request.Action.TargetID}
+				}
+				plan, createErr := service.CreatePlan(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.PlanPayload{Operation: operation, Target: target})
+				closeErr := service.Close()
+				if createErr != nil || closeErr != nil {
+					return ExecutionResult{}, errors.Join(createErr, closeErr)
+				}
+				return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: request.Action.Operation, TargetKind: request.Action.TargetKind, TargetID: request.Action.TargetID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+			}
+			if request.Action.Operation == "unpublish" {
+				return ExecutionResult{}, fmt.Errorf("normal unpublish authority is unavailable")
+			}
+			plan, planErr := contractionPlans.Create(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration})
+			if planErr != nil {
+				return ExecutionResult{}, planErr
+			}
+			return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.ConfirmationDigest, Operation: "close_all", TargetKind: "installation", ExposureSummary: "closes_all_app_origin_ingress", Prerequisites: "emergency_authenticated_destructive_confirmation", ExpiresAt: plan.ExpiresAt}}, nil
+		}
+		tokenMu.Lock()
+		recoveryErr := rotationRecoveryErr
+		tokenMu.Unlock()
+		if recoveryErr != nil {
+			return ExecutionResult{}, fmt.Errorf("normal application authority is degraded")
 		}
 		service, err := application.OpenFixed()
 		if err != nil {
@@ -140,6 +174,9 @@ func RunRole(args []string) error {
 	rotateHandler := AdminTokenRotateHandler(authRevalidate, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		tokenMu.Lock()
 		defer tokenMu.Unlock()
+		if rotationRecoveryErr != nil {
+			return ExecutionResult{}, fmt.Errorf("admin token rotation recovery is unresolved")
+		}
 		if secret != nil || request.Action == nil || request.Action.Operation != "admin_token_rotate" || request.Action.TargetKind != "installation" {
 			return ExecutionResult{}, fmt.Errorf("admin token rotation input is invalid")
 		}
@@ -228,18 +265,115 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		if err := application.ReconcileAdminTokenRotation(ctx, fingerprint); err != nil {
+			rotationRecoveryErr = err
 			return ExecutionResult{}, err
 		}
+		rotationRecoveryErr = nil
 		fingerprint, err = secrets.CurrentAdminTokenFingerprint()
 		return ExecutionResult{ResultDigest: fingerprint}, err
+	})
+	contractionHandler := ContractionCloseHandler(func(ctx context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		validTarget := request.Action != nil && (request.Target == "installation" && request.Action.Operation == "close_all" || request.Target == "resource/"+request.Action.TargetID && request.Action.Operation == "unpublish")
+		if caller != helperproto.CallerUI || !validTarget {
+			return fmt.Errorf("close-all caller is unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("close-all request carried secret")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}
+		var normalExecution *application.CloseAllExecution
+		var normalErr error
+		if request.Action.Operation == "unpublish" {
+			normalExecution, normalErr = application.BeginUnpublish(ctx, actor, domain.OperationTarget{Kind: domain.OperationTargetResource, ID: request.Action.TargetID}, application.ConfirmationPayload{PlanID: request.Action.PlanID, Confirmation: request.Action.Confirmation})
+		} else {
+			normalExecution, normalErr = application.BeginCloseAll(ctx, actor, application.ConfirmationPayload{PlanID: request.Action.PlanID, Confirmation: request.Action.Confirmation})
+		}
+		if normalErr == nil {
+			inventoryDigest := normalExecution.Inventory.Digest
+			result, runErr := normalExecution.Run(ctx)
+			action := &helperproto.ActionResult{ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
+			if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
+				if runErr != nil {
+					return ExecutionResult{}, runErr
+				}
+				return ExecutionResult{ResultDigest: inventoryDigest, Action: action}, nil
+			}
+			if runErr != nil {
+				return ExecutionResult{}, runErr
+			}
+			return ExecutionResult{ResultDigest: result.ClosureDigest, Action: action}, nil
+		}
+		if request.Action.Operation == "unpublish" {
+			return ExecutionResult{}, normalErr
+		}
+		plan, err := contractionPlans.Consume(request.Action.PlanID, request.Action.ActorIdentity, request.Action.ActorGeneration, request.Action.Confirmation, time.Now().UTC())
+		if err != nil {
+			return ExecutionResult{}, fmt.Errorf("normal and emergency close-all authority rejected")
+		}
+		service, err := contraction.OpenEmergency(ctx)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer service.Close()
+		result, runErr := service.Run(ctx, plan.GlobalGeneration, plan.InventoryDigest)
+		action := &helperproto.ActionResult{ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
+		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
+			return ExecutionResult{ResultDigest: plan.InventoryDigest, Action: action}, nil
+		}
+		if runErr != nil {
+			return ExecutionResult{}, runErr
+		}
+		return ExecutionResult{ResultDigest: result.ClosureDigest, Action: action}, nil
+	})
+	startupHandler := StartupContractionHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerRecovery || request.Target != "installation" || request.Action != nil {
+			return fmt.Errorf("startup contraction caller is unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("startup contraction carried secret")
+		}
+		if normal, normalErr := application.OpenFixed(); normalErr == nil {
+			allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+			_ = normal.Close()
+			if guardErr == nil && allowed {
+				return ExecutionResult{ResultDigest: request.InputDigest}, nil
+			}
+		}
+		service, err := contraction.OpenEmergency(ctx)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer service.Close()
+		snapshot, err := service.Snapshot()
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		if recoverErr := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); recoverErr == nil {
+			return ExecutionResult{ResultDigest: snapshot.Inventory.Digest}, nil
+		}
+		result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
+		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
+			return ExecutionResult{ResultDigest: snapshot.Inventory.Digest}, nil
+		}
+		if runErr != nil {
+			return ExecutionResult{}, runErr
+		}
+		return ExecutionResult{ResultDigest: result.ClosureDigest}, nil
 	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("Management profile request carried secret")
 		}
-		return ExecutionResult{ResultDigest: profileDigest(managementProfile())}, nil
+		tokenMu.Lock()
+		profile := managementProfileWithRecovery(rotationRecoveryErr)
+		tokenMu.Unlock()
+		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}
@@ -248,9 +382,39 @@ func RunRole(args []string) error {
 		return err
 	}
 	defer listener.Close()
+	if err := notifyReady(); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	return server.Serve(ctx, listener)
+}
+
+func reconcileStartupContraction(ctx context.Context) error {
+	if normal, err := application.OpenFixed(); err == nil {
+		allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+		_ = normal.Close()
+		if guardErr == nil && allowed {
+			return nil
+		}
+	}
+	service, err := contraction.OpenEmergency(ctx)
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	snapshot, err := service.Snapshot()
+	if err != nil {
+		return err
+	}
+	if err := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); err == nil {
+		return nil
+	}
+	result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
+	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
+		return nil
+	}
+	return runErr
 }
 
 func ReadIdentityConfig() (IdentityConfig, error) {

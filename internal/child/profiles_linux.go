@@ -25,7 +25,14 @@ const (
 	ProfileDPKGTransaction       ProfileID = "dpkg_transaction"
 	ProfileSystemctl             ProfileID = "systemctl"
 	ProfileSystemctlBootstrap    ProfileID = "systemctl_bootstrap"
+	ProfileSystemctlNginxStart   ProfileID = "systemctl_nginx_start"
+	ProfileSystemctlNginxReload  ProfileID = "systemctl_nginx_reload"
+	ProfileSystemctlNginxStop    ProfileID = "systemctl_nginx_stop"
+	ProfileNginxStart            ProfileID = "nginx_start"
 	ProfileNginxTest             ProfileID = "nginx_test"
+	ProfileNginxDump             ProfileID = "nginx_dump"
+	ProfileNginxReloadSignal     ProfileID = "nginx_reload_signal"
+	ProfileNginxQuitSignal       ProfileID = "nginx_quit_signal"
 	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
 	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
 	ProfileLego                  ProfileID = "lego"
@@ -48,6 +55,7 @@ type NetworkPolicy string
 
 const (
 	NetworkHostQualified NetworkPolicy = "host_qualified"
+	NetworkUnixOnly      NetworkPolicy = "host_unix_only"
 	NetworkNone          NetworkPolicy = "none"
 	NetworkNoSockets     NetworkPolicy = "none_no_sockets"
 	NetworkProviderOnly  NetworkPolicy = "provider_only"
@@ -109,12 +117,17 @@ type Profile struct {
 	MaximumOutputBytes     int
 	MaximumFileBytes       uint64
 	RootTCB                bool
+	PersistentDaemon       bool
 	Complete               bool
 }
 
 var catalog = map[ProfileID]Profile{
-	ProfileSystemdSysusers: {ID: ProfileSystemdSysusers, Executable: "/usr/bin/systemd-sysusers", Arguments: []string{"/etc/lanpanel-sysusers.conf"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileNginxTest:       {ID: ProfileNginxTest, Executable: "/usr/sbin/nginx", Arguments: []string{"-t", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 6, 7, 10, 12}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemdSysusers:   {ID: ProfileSystemdSysusers, Executable: "/usr/bin/systemd-sysusers", Arguments: []string{"/etc/lanpanel-sysusers.conf"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileNginxStart:        {ID: ProfileNginxStart, Executable: "/usr/sbin/nginx", Arguments: []string{"-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/", "-g", "daemon off;"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkHostQualified, AllowedCapabilities: []int{0, 1, 5, 6, 7, 10}, RootTCB: true, PersistentDaemon: true, Complete: true},
+	ProfileNginxTest:         {ID: ProfileNginxTest, Executable: "/usr/sbin/nginx", Arguments: []string{"-t", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 6, 7, 10}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileNginxDump:         {ID: ProfileNginxDump, Executable: "/usr/sbin/nginx", Arguments: []string{"-T", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 6, 7, 10}, Timeout: 30 * time.Second, MaximumOutputBytes: 1 << 20, RootTCB: true, Complete: true},
+	ProfileNginxReloadSignal: {ID: ProfileNginxReloadSignal, Executable: "/usr/sbin/nginx", Arguments: []string{"-s", "reload", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 5, 6, 7, 10}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileNginxQuitSignal:   {ID: ProfileNginxQuitSignal, Executable: "/usr/sbin/nginx", Arguments: []string{"-s", "quit", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 5, 6, 7, 10}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	// The remaining profiles are deliberately unavailable until their owning
 	// component supplies its release-fixed argv, identity, chroot, and network
 	// qualification. There is no root or generic-exec fallback.
@@ -123,8 +136,11 @@ var catalog = map[ProfileID]Profile{
 	ProfileAPTTransaction:        {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
 	ProfileAPTOfflineTransaction: {ID: ProfileAPTOfflineTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNoSockets, RootTCB: true},
 	ProfileDPKGTransaction:       {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", Arguments: []string{"--audit"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: packageCapabilities(), Timeout: 2 * time.Minute, MaximumOutputBytes: 256 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctl:             {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctlBootstrap:    {ID: ProfileSystemctlBootstrap, Executable: "/usr/bin/systemctl", Arguments: []string{"enable", "--now", "lanpanel-runtime.service", "lanpanel-management.socket", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctl:             {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlBootstrap:    {ID: ProfileSystemctlBootstrap, Executable: "/usr/bin/systemctl", Arguments: []string{"enable", "--now", "lanpanel-runtime.service", "lanpanel-management.socket", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxStart:   {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxReload:  {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},
@@ -256,7 +272,7 @@ func packageCapabilities() []int {
 }
 
 func validateProfile(profile Profile) error {
-	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 || profile.MaximumFileBytes > 4<<30 {
+	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 || profile.MaximumFileBytes > 4<<30 || profile.PersistentDaemon && (profile.ID != ProfileNginxStart || !profile.RootTCB || profile.Timeout != 0 || profile.MaximumFileBytes != 0) {
 		return fmt.Errorf("external child profile shape is invalid")
 	}
 	for _, argument := range profile.Arguments {
@@ -273,7 +289,7 @@ func validateProfile(profile Profile) error {
 		if len(profile.AllowedAddressFamilies) != 0 {
 			return fmt.Errorf("no-socket child cannot allow an address family")
 		}
-	} else if profile.Network == NetworkNone {
+	} else if profile.Network == NetworkNone || profile.Network == NetworkUnixOnly {
 		if !slices.IsSorted(profile.AllowedAddressFamilies) || len(profile.AllowedAddressFamilies) == 0 {
 			return fmt.Errorf("no-network child lacks an exact address-family policy")
 		}

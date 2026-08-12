@@ -97,9 +97,10 @@ type Issue struct {
 }
 
 type Inventory struct {
-	Records  []Record
-	Issues   []Issue
-	Complete bool
+	Records         []Record
+	FallbackRecords []Record
+	Issues          []Issue
+	Complete        bool
 }
 
 func Open(config Config) (*Store, error) {
@@ -253,6 +254,7 @@ func (store *Store) Inventory() (Inventory, error) {
 		}
 		inventory.Records = append(inventory.Records, record)
 	}
+	inventory.FallbackRecords = append([]Record(nil), inventory.Records...)
 	invalid := map[string]bool{}
 	for left := 0; left < len(inventory.Records); left++ {
 		for right := left + 1; right < len(inventory.Records); right++ {

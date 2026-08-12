@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-playwright-auth
+.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/ui
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/closure ./internal/contraction ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/ui
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
@@ -76,6 +76,14 @@ ga-preflight-contraction-integration:
 	@grep -Fq 'RequireExpansionPlanEvidence' internal/operations/operations.go
 	@grep -Fq 'RequireContractionPlanEvidence' internal/operations/operations.go
 
+ga-nginx-contraction-integration:
+	$(GO) test -count=1 ./internal/nginx ./internal/nginxguard ./internal/contraction ./internal/closure ./internal/preflight ./internal/safety ./internal/ownership
+	@grep -Fq 'worker_shutdown_timeout 10s' internal/nginx/graph.go
+	@grep -Fq 'default_server' internal/nginx/graph.go
+	@grep -Fq 'ProfileNginxStart' internal/nginxguard/role_linux.go
+	@grep -Fq 'PersistStopFence' internal/contraction/engine.go
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command|os\.StartProcess|sudo|doas|pkexec' internal/nginx internal/nginxguard internal/contraction internal/closure; then echo 'Nginx contraction escaped fixed child authority' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+
 ga-playwright-action-boundary:
 	$(GO) test -count=1 ./internal/application ./internal/secrets ./internal/ui
 	@grep -Fq 'action_unavailable' internal/application/catalog.go
@@ -103,4 +111,4 @@ ga-forbidden-utility-audit:
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command(Context)?\([^\n]*(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)' internal cmd; then echo 'forbidden download, archive, hash, TLS, or file utility remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' '"/[^"[:space:]]*/(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)"' internal cmd; then echo 'forbidden fixed child utility entered production profile' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit

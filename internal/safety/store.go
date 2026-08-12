@@ -112,6 +112,7 @@ type TransitionProof struct {
 	Reactivation *ReactivationConvergenceProof
 	Headscale    *HeadscaleConvergenceProof
 	Closing      *ClosingConvergenceProof
+	Closings     map[string]ClosingConvergenceProof
 	Delete       *DeleteConvergenceProof
 	GlobalClose  *GlobalConvergenceProof
 	StopFence    *StopFenceConvergenceProof
@@ -183,6 +184,45 @@ func (store *Store) LockAuthority() locks.Authority {
 func (store *Store) Close() error { return errors.Join(store.txn.Close(), unix.Close(store.rootFD)) }
 
 func (store *Store) Read() (State, error) { return store.read(true) }
+
+// ReadForContraction retains checksum and emergency high-water validation but
+// deliberately does not treat a damaged ownership tree as authority to narrow
+// ingress. The caller must force fallback stop when ownership is incomplete.
+func (store *Store) ReadForRecovery(exposure *locks.Lease) (State, error) {
+	if exposure == nil || exposure.Authority() != store.config.LockAuthority || !exposure.Holds(locks.Exposure) {
+		return State{}, fmt.Errorf("recovery safety read requires exposure lock")
+	}
+	state, err := store.read(false)
+	if err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func (store *Store) ReadForContraction(exposure *locks.Lease) (State, error) {
+	if exposure == nil || exposure.Authority() != store.config.LockAuthority || !exposure.Holds(locks.Exposure) {
+		return State{}, fmt.Errorf("degraded safety read requires the shared exposure lock")
+	}
+	state, err := store.read(false)
+	if err != nil {
+		return State{}, err
+	}
+	authority, err := store.config.Emergency.Authority()
+	if err != nil {
+		return State{}, err
+	}
+	if err := matchAuthority(state, authority); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func (store *Store) EmergencyAuthority() (EmergencyState, error) {
+	if store == nil || store.config.Emergency == nil {
+		return EmergencyState{}, fmt.Errorf("emergency authority is unavailable")
+	}
+	return store.config.Emergency.Authority()
+}
 
 func (store *Store) read(requireAuthority bool) (State, error) {
 	if err := store.revalidateRoot(); err != nil {
@@ -429,6 +469,9 @@ func globalProofMatchesEmergency(normal *GlobalConvergenceProof, emergency *Emer
 	return normal != nil && emergency != nil && normal.Generation == emergency.Generation && normal.InventoryDigest == emergency.InventoryDigest && normal.OwnedGraphDigest == emergency.OwnedGraphDigest && normal.RuntimeClosureDigest == emergency.RuntimeClosureDigest && normal.NginxTestPassed == emergency.NginxTestPassed && normal.RuntimeClosed == emergency.RuntimeClosed
 }
 
+func FenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence) bool {
+	return normalFenceMatchesEmergency(normal, emergency)
+}
 func normalFenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence) bool {
 	if normal == nil || normal.Kind != StopFenceContraction || normal.Contraction == nil {
 		return false
@@ -685,7 +728,12 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 }
 
 func validateResourceTransition(role ClearRole, before, after ResourceSafety, proof TransitionProof) error {
-	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, resourceGenerations(before), resourceGenerations(after)); err != nil {
+	beforeGenerations := resourceGenerations(before)
+	if before.Closing != nil && after.Closing == nil && after.StickyUnpublished != nil && after.StickyUnpublished.Generation == before.Closing.Generation {
+		delete(beforeGenerations, "closing")
+		beforeGenerations["sticky_unpublished"] = before.Closing.Generation
+	}
+	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, beforeGenerations, resourceGenerations(after)); err != nil {
 		return err
 	}
 	if before.State != after.State || before.DeletionTombstone != after.DeletionTombstone {
@@ -706,8 +754,15 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if err := markerTransition(role, before.Closing, after.Closing, RoleContraction, ClearClosing); err != nil {
 		return err
 	}
-	if before.Closing != nil && after.Closing == nil && !validClosingProof(before, after, proof.Closing) {
-		return fmt.Errorf("closing normalization lacks exact unpublished convergence proof")
+	if before.Closing != nil && after.Closing == nil {
+		closingProof := proof.Closing
+		if value, ok := proof.Closings[before.ResourceID]; ok {
+			copy := value
+			closingProof = &copy
+		}
+		if !validClosingProof(before, after, closingProof) {
+			return fmt.Errorf("closing normalization lacks exact unpublished convergence proof")
+		}
 	}
 	if err := markerTransition(role, before.Contraction, after.Contraction, RoleContraction, ClearBaseContraction); err != nil {
 		return err
@@ -810,6 +865,9 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 	if reflect.DeepEqual(before, after) {
 		return nil
 	}
+	if role == RoleContraction && before != nil && after == nil {
+		return nil
+	}
 	if role != RoleChallenge {
 		return fmt.Errorf("wrong challenge writer")
 	}
@@ -820,6 +878,9 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 }
 func reactivationTransition(role ClearRole, priorGeneration uint64, before, after *Reactivating) error {
 	if reflect.DeepEqual(before, after) {
+		return nil
+	}
+	if role == RoleContraction && before != nil && after == nil {
 		return nil
 	}
 	if role != RolePublish {
@@ -845,7 +906,7 @@ func validReactivationProof(before, after ResourceSafety, proof *ReactivationCon
 }
 
 func validClosingProof(before, after ResourceSafety, proof *ClosingConvergenceProof) bool {
-	return proof != nil && before.Closing != nil && after.StickyUnpublished != nil && proof.ResourceID == before.ResourceID && proof.ClosingGeneration == before.Closing.Generation && proof.UnpublishedGeneration == after.StickyUnpublished.Generation && proof.OwnershipDigest == before.OwnershipDigest && isDigest(proof.RuntimeClosureDigest)
+	return proof != nil && before.Closing != nil && after.Closing == nil && after.StickyUnpublished != nil && after.StickyUnpublished.Generation == before.Closing.Generation && proof.ResourceID == before.ResourceID && proof.ClosingGeneration == before.Closing.Generation && proof.UnpublishedGeneration == after.StickyUnpublished.Generation && proof.OwnershipDigest == before.OwnershipDigest && isDigest(proof.RuntimeClosureDigest)
 }
 
 func validHeadscaleProof(before, after HeadscaleSafety, proof *HeadscaleConvergenceProof) bool {

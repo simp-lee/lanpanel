@@ -87,7 +87,7 @@ var policies = map[Operation]Policy{
 	OperationTailscaleAdmin:       {Callers: []Caller{CallerUI}},
 	OperationGoAccessProbe:        {Callers: []Caller{CallerUI}},
 	OperationManagedBasicGenerate: {Callers: []Caller{CallerUI}, SecretOutput: true},
-	OperationContractionClose:     {Callers: []Caller{CallerUI, CallerTimer, CallerRecovery}},
+	OperationContractionClose:     {Callers: []Caller{CallerUI}},
 	OperationStartupContraction:   {Callers: []Caller{CallerRecovery}},
 }
 
@@ -104,15 +104,19 @@ type ActionPayload struct {
 	Confirmation    string `json:"confirmation,omitempty"`
 }
 type ActionResult struct {
-	PlanID          string    `json:"plan_id,omitempty"`
-	Confirmation    string    `json:"confirmation,omitempty"`
-	JobID           string    `json:"job_id,omitempty"`
-	Operation       string    `json:"operation,omitempty"`
-	TargetKind      string    `json:"target_kind,omitempty"`
-	TargetID        string    `json:"target_id,omitempty"`
-	ExposureSummary string    `json:"exposure_summary,omitempty"`
-	Prerequisites   string    `json:"prerequisites,omitempty"`
-	ExpiresAt       time.Time `json:"expires_at,omitzero"`
+	PlanID             string    `json:"plan_id,omitempty"`
+	Confirmation       string    `json:"confirmation,omitempty"`
+	JobID              string    `json:"job_id,omitempty"`
+	Operation          string    `json:"operation,omitempty"`
+	TargetKind         string    `json:"target_kind,omitempty"`
+	TargetID           string    `json:"target_id,omitempty"`
+	ExposureSummary    string    `json:"exposure_summary,omitempty"`
+	Prerequisites      string    `json:"prerequisites,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at,omitzero"`
+	ContractionOutcome string    `json:"contraction_outcome,omitempty"`
+	AccessClosed       bool      `json:"access_closed,omitempty"`
+	SharedIngressDown  bool      `json:"shared_ingress_down,omitempty"`
+	AccessMayRemain    bool      `json:"access_may_remain,omitempty"`
 }
 type Request struct {
 	SchemaVersion    string         `json:"schema_version"`
@@ -171,10 +175,13 @@ func ValidateRequest(request Request, now time.Time) error {
 	if request.SchemaVersion != SchemaVersion || !known || !refPattern.MatchString(request.RequestID) || !validOperationTarget(request.Operation, request.Target) || request.IntentGeneration == 0 || request.Deadline.IsZero() || !request.Deadline.After(now) || request.Deadline.Sub(now) > maximum || !digestPattern.MatchString(request.InputDigest) {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
-	if (request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate) != (request.Action != nil) {
+	if (request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose) != (request.Action != nil) {
 		return fmt.Errorf("helper action payload shape is invalid")
 	}
-	if request.Action != nil && (!validAction(*request.Action) || request.Operation == OperationAdminTokenRotate && (request.Action.Operation != "admin_token_rotate" || request.Action.TargetKind != "installation" || request.Action.TargetID != "" || request.Action.PlanID == "" || request.Action.Confirmation != "rotate") || request.Operation == OperationApplicationPlan && (request.Action.Operation != "admin_token_rotate" || request.Action.TargetKind != "installation" || request.Action.TargetID != "" || request.Action.PlanID != "" || request.Action.Confirmation != "")) {
+	planAction := request.Operation == OperationApplicationPlan && ((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "" || request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "") && request.Action.PlanID == "" && request.Action.Confirmation == ""
+	rotationAction := request.Operation == OperationAdminTokenRotate && request.Action.Operation == "admin_token_rotate" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.PlanID != "" && request.Action.Confirmation == "rotate"
+	contractionAction := request.Operation == OperationContractionClose && ((request.Action.Operation == "close_all" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.Confirmation == "close") || (request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Action.Confirmation == "unpublish")) && request.Action.PlanID != ""
+	if request.Action != nil && (!validAction(*request.Action) || !planAction && !rotationAction && !contractionAction) {
 		return fmt.Errorf("helper action payload is invalid")
 	}
 	if request.Action != nil {
@@ -189,7 +196,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate {
+	if request.Action == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -220,8 +227,12 @@ func validOperationTarget(operation Operation, target string) bool {
 		return exactID && (kind == "resource" || kind == "credential" || kind == "certificate")
 	case OperationAccountCreate:
 		return target == "installation" || exactID && (kind == "resource" || kind == "service")
-	case OperationApplicationPlan, OperationPackageTransaction, OperationSystemdTransition, OperationNginxTest, OperationNginxReload, OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationAdminTokenRotate, OperationAdminTokenReconcile:
+	case OperationApplicationPlan:
+		return target == "installation" || exactID && kind == "resource"
+	case OperationPackageTransaction, OperationSystemdTransition, OperationNginxTest, OperationNginxReload, OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationAdminTokenRotate, OperationAdminTokenReconcile:
 		return target == "installation"
+	case OperationContractionClose:
+		return target == "installation" || exactID && kind == "resource"
 	case OperationCredentialImport, OperationCredentialAdopt:
 		return exactID && kind == "credential"
 	case OperationCertificateIssue, OperationCertificateRenew:
@@ -234,10 +245,21 @@ func validOperationTarget(operation Operation, target string) bool {
 		return target == "connector"
 	case OperationManagedBasicGenerate:
 		return exactID && kind == "credential"
-	case OperationContractionClose:
-		return target == "installation" || target == "headscale" || exactID && kind == "resource"
 	case OperationStartupContraction:
-		return target == "headscale" || exactID && kind == "resource"
+		return target == "installation" || target == "headscale" || exactID && kind == "resource"
+	default:
+		return false
+	}
+}
+
+func validContractionOutcome(outcome string, accessClosed, sharedDown, mayRemain bool) bool {
+	switch outcome {
+	case "succeeded":
+		return accessClosed && !sharedDown && !mayRemain
+	case "partial":
+		return accessClosed && sharedDown && !mayRemain
+	case "unknown":
+		return !accessClosed && mayRemain
 	default:
 		return false
 	}
@@ -258,12 +280,16 @@ func ValidateResponse(operation Operation, response Response) error {
 		}
 		switch operation {
 		case OperationApplicationPlan:
-			if response.Action == nil || !refPattern.MatchString(response.Action.PlanID) || !digestPattern.MatchString(response.Action.Confirmation) || response.Action.JobID != "" || response.Action.Operation != "admin_token_rotate" || response.Action.TargetKind != "installation" || response.Action.TargetID != "" || !refPattern.MatchString(response.Action.ExposureSummary) || !refPattern.MatchString(response.Action.Prerequisites) || response.Action.ExpiresAt.IsZero() {
+			if response.Action == nil || !refPattern.MatchString(response.Action.PlanID) || !digestPattern.MatchString(response.Action.Confirmation) || response.Action.JobID != "" || response.Action.Operation != "admin_token_rotate" && response.Action.Operation != "close_all" && response.Action.Operation != "unpublish" || (response.Action.Operation == "unpublish") != (response.Action.TargetKind == "resource" && response.Action.TargetID != "") || response.Action.Operation != "unpublish" && (response.Action.TargetKind != "installation" || response.Action.TargetID != "") || !refPattern.MatchString(response.Action.ExposureSummary) || !refPattern.MatchString(response.Action.Prerequisites) || response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain {
 				return fmt.Errorf("application Plan response shape is invalid")
 			}
 		case OperationAdminTokenRotate:
-			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() {
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain {
 				return fmt.Errorf("admin token response shape is invalid")
+			}
+		case OperationContractionClose:
+			if response.Action == nil || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.JobID != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || !validContractionOutcome(response.Action.ContractionOutcome, response.Action.AccessClosed, response.Action.SharedIngressDown, response.Action.AccessMayRemain) {
+				return fmt.Errorf("contraction response shape is invalid")
 			}
 		default:
 			if response.Action != nil {

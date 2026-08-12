@@ -17,13 +17,21 @@ import (
 )
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessProbe, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxTest, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessProbe, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
 	nginx, err := ResolveProfile(ProfileNginxTest, Identities{})
-	if err != nil || !nginx.Complete || nginx.Executable != "/usr/sbin/nginx" || !reflect.DeepEqual(nginx.Arguments, []string{"-t", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}) || !nginx.RootTCB || nginx.Network != NetworkNone {
+	if err != nil || !nginx.Complete || nginx.Executable != "/usr/sbin/nginx" || !reflect.DeepEqual(nginx.Arguments, []string{"-t", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}) || !nginx.RootTCB || nginx.Network != NetworkUnixOnly {
 		t.Fatalf("Nginx profile=%#v error=%v", nginx, err)
+	}
+	start, err := ResolveProfile(ProfileNginxStart, Identities{})
+	if err != nil || !start.PersistentDaemon || start.Timeout != 0 || !reflect.DeepEqual(start.Arguments, []string{"-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/", "-g", "daemon off;"}) {
+		t.Fatalf("persistent Nginx profile=%#v error=%v", start, err)
+	}
+	stop, err := ResolveProfile(ProfileSystemctlNginxStop, Identities{})
+	if err != nil || !stop.Complete || !reflect.DeepEqual(stop.Arguments, []string{"stop", "lanpanel-nginx.service"}) || !reflect.DeepEqual(stop.AllowedAddressFamilies, []int{1}) {
+		t.Fatalf("Nginx stop profile=%#v error=%v", stop, err)
 	}
 	htpasswd, err := ResolveProfile(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 1200, GID: 1200}})
 	if err != nil || htpasswd.Complete {
@@ -31,6 +39,21 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	}
 	if _, err := ResolveProfile(ProfileID("shell"), Identities{}); err == nil {
 		t.Fatal("unknown arbitrary executable profile was accepted")
+	}
+}
+
+func TestNginxProfilesFitFixedUnitCapabilityBoundary(t *testing.T) {
+	unitCapabilities := []int{0, 1, 5, 6, 7, 8, 10}
+	for _, id := range []ProfileID{ProfileNginxStart, ProfileNginxTest, ProfileNginxDump, ProfileNginxReloadSignal, ProfileNginxQuitSignal} {
+		profile, err := ResolveProfile(id, Identities{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, capability := range profile.AllowedCapabilities {
+			if !slices.Contains(unitCapabilities, capability) {
+				t.Fatalf("%s capability %d exceeds unit boundary", id, capability)
+			}
+		}
 	}
 }
 
@@ -87,6 +110,9 @@ func TestLauncherHasNoNonRootOrIncompleteFallback(t *testing.T) {
 		if _, err := launcher.Run(context.Background(), ProfileNginxTest, nil); err == nil {
 			t.Fatal("non-root caller launched a privileged child")
 		}
+	}
+	if _, err := launcher.Run(context.Background(), ProfileNginxStart, nil); err == nil {
+		t.Fatal("persistent daemon crossed the bounded one-shot launcher")
 	}
 	if err := ExecuteBootstrap([]string{"/bin/sh"}); err == nil {
 		t.Fatal("child bootstrap accepted argv-selected executable")

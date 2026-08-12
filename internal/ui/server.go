@@ -86,7 +86,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	securityHeaders(writer)
-	if request.Host != s.config.Authority || request.URL.RawQuery != "" || request.URL.RawPath != "" {
+	actionQuery := request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, "/api/actions/unpublish") && request.URL.Query().Has("resource_id") && len(request.URL.Query()) == 1
+	if request.Host != s.config.Authority || request.URL.RawQuery != "" && !actionQuery || request.URL.RawPath != "" {
 		reject(writer, http.StatusMisdirectedRequest)
 		return
 	}
@@ -132,7 +133,7 @@ func (s *Server) shell(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(writer, `<!doctype html><html><head><meta charset="utf-8"><title>LanPanel</title><link rel="stylesheet" href="/assets/app.8d13f0c2.css"></head><body><main><h1>LanPanel</h1><p id="fingerprint">`+template.HTMLEscapeString(s.config.InstallationFingerprint)+`</p><form id="login" method="post" action="/login" enctype="application/x-www-form-urlencoded"><label>Admin token<input name="token" type="password" autocomplete="current-password"></label><button>Login</button></form><button id="rotate" hidden>Rotate admin token</button><button id="logout" hidden>Logout</button><p id="status"></p></main><script src="/assets/app.1b6c82e4.js" defer></script></body></html>`)
+	_, _ = io.WriteString(writer, `<!doctype html><html><head><meta charset="utf-8"><title>LanPanel</title><link rel="stylesheet" href="/assets/app.8d13f0c2.css"></head><body><main><h1>LanPanel</h1><p id="fingerprint">`+template.HTMLEscapeString(s.config.InstallationFingerprint)+`</p><form id="login" method="post" action="/login" enctype="application/x-www-form-urlencoded"><label>Admin token<input name="token" type="password" autocomplete="current-password"></label><button>Login</button></form><button id="close-all" hidden>Close all App ingress</button><button id="rotate" hidden>Rotate admin token</button><button id="logout" hidden>Logout</button><p id="status"></p></main><script src="/assets/app.1b6c82e4.js" defer></script></body></html>`)
 }
 func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 	contentType, ok := exactHeader(request, "Content-Type")
@@ -305,7 +306,15 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
-	if operation != domain.OperationAdminTokenRotate || s.config.Actions == nil {
+	if operation == domain.OperationUnpublish {
+		resourceID, ok := firstExact(request.URL.Query()["resource_id"])
+		if !ok {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		target = domain.OperationTarget{Kind: domain.OperationTargetResource, ID: resourceID}
+	}
+	if operation != domain.OperationAdminTokenRotate && operation != domain.OperationCloseAll && operation != domain.OperationUnpublish || s.config.Actions == nil {
 		reject(writer, http.StatusNotFound)
 		return
 	}
@@ -334,22 +343,45 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	}
 	defer clear(data)
 	var payload application.ConfirmationPayload
-	if decodeExactJSON(data, &payload) != nil || payload.PlanID == "" || payload.Confirmation != "rotate" {
+	confirmation := "rotate"
+	if operation == domain.OperationCloseAll {
+		confirmation = "close"
+	} else if operation == domain.OperationUnpublish {
+		confirmation = "unpublish"
+	}
+	if decodeExactJSON(data, &payload) != nil || payload.PlanID == "" || payload.Confirmation != confirmation {
 		reject(writer, http.StatusBadRequest)
 		return
 	}
 	result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
 	if err != nil {
-		reconcileCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		reply, reconcileErr := HelperAdminTokenReconcile(reconcileCtx)
-		cancel()
-		current := reply.Digest
-		if reconcileErr != nil || current == "" {
-			s.config.Sessions.InvalidateFingerprint("unavailable")
-		} else {
-			s.config.Sessions.RequireFingerprint(current)
+		if operation == domain.OperationAdminTokenRotate {
+			reconcileCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			reply, reconcileErr := HelperAdminTokenReconcile(reconcileCtx)
+			cancel()
+			current := reply.Digest
+			if reconcileErr != nil || current == "" {
+				s.config.Sessions.InvalidateFingerprint("unavailable")
+			} else {
+				s.config.Sessions.RequireFingerprint(current)
+			}
 		}
 		reject(writer, http.StatusServiceUnavailable)
+		return
+	}
+	if operation == domain.OperationCloseAll || operation == domain.OperationUnpublish {
+		contraction, ok := result.Payload.(application.ContractionResult)
+		if !ok || contraction.Outcome == "" {
+			reject(writer, http.StatusServiceUnavailable)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(struct {
+			Outcome           string `json:"outcome"`
+			AccessClosed      bool   `json:"access_closed"`
+			SharedIngressDown bool   `json:"shared_ingress_down"`
+			AccessMayRemain   bool   `json:"access_may_remain"`
+		}{contraction.Outcome, contraction.AccessClosed, contraction.SharedIngressDown, contraction.AccessMayRemain})
 		return
 	}
 	rotation, ok := result.Payload.(application.RotationResult)
@@ -473,4 +505,4 @@ func decodeExactJSON(payload []byte, destination any) error {
 }
 
 const appCSS = "body{font-family:sans-serif;max-width:48rem;margin:4rem auto}label,input{display:block}"
-const appJS = `(()=>{"use strict";let proof=sessionStorage.getItem("lp.proof")||"",csrf=sessionStorage.getItem("lp.csrf")||"";const status=document.getElementById("status"),login=document.getElementById("login"),logout=document.getElementById("logout"),rotate=document.getElementById("rotate");const clear=()=>{proof="";csrf="";sessionStorage.clear();status.textContent="";logout.hidden=true;rotate.hidden=true;login.hidden=false};login.addEventListener("submit",async event=>{event.preventDefault();const input=login.elements.token,body=new URLSearchParams({token:input.value});input.value="";const response=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});if(!response.ok){status.textContent="Authentication failed";return}const value=await response.json();proof=value.proof;csrf=value.csrf;sessionStorage.setItem("lp.proof",proof);sessionStorage.setItem("lp.csrf",csrf);status.textContent="Authenticated";login.hidden=true;logout.hidden=false;rotate.hidden=false});rotate.addEventListener("click",async()=>{const h={"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf,"Content-Type":"application/json"},pr=await fetch("/api/actions/admin_token_rotate/plan",{method:"POST",headers:h,body:"{}"});if(!pr.ok){status.textContent="Rotation Plan failed";return}const p=await pr.json();if(!confirm("Review: "+p.operation+" for "+p.target_kind+". "+p.exposure_summary+". "+p.prerequisites+". Expires "+p.expires_at+". Continue?"))return;const r=await fetch("/api/actions/admin_token_rotate",{method:"POST",headers:h,body:JSON.stringify({plan_id:p.plan_id,confirmation:"rotate"})});if(!r.ok){status.textContent="Rotation failed";return}const v=await r.json();proof="";csrf="";sessionStorage.clear();logout.hidden=true;rotate.hidden=true;login.hidden=false;status.textContent="New admin token: "+v.token;});logout.addEventListener("click",async()=>{try{await fetch("/api/logout",{method:"POST",headers:{"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf}})}finally{clear();history.replaceState(null,"","/");location.replace("/")}});addEventListener("pagehide",clear);addEventListener("pageshow",event=>{if(event.persisted){clear();location.replace("/")}})})();`
+const appJS = `(()=>{"use strict";let proof=sessionStorage.getItem("lp.proof")||"",csrf=sessionStorage.getItem("lp.csrf")||"";const status=document.getElementById("status"),login=document.getElementById("login"),logout=document.getElementById("logout"),rotate=document.getElementById("rotate"),closeAll=document.getElementById("close-all");const clear=()=>{proof="";csrf="";sessionStorage.clear();status.textContent="";logout.hidden=true;rotate.hidden=true;closeAll.hidden=true;login.hidden=false};login.addEventListener("submit",async event=>{event.preventDefault();const input=login.elements.token,body=new URLSearchParams({token:input.value});input.value="";const response=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});if(!response.ok){status.textContent="Authentication failed";return}const value=await response.json();proof=value.proof;csrf=value.csrf;sessionStorage.setItem("lp.proof",proof);sessionStorage.setItem("lp.csrf",csrf);status.textContent="Authenticated";login.hidden=true;logout.hidden=false;rotate.hidden=false;closeAll.hidden=false});closeAll.addEventListener("click",async()=>{const h={"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf,"Content-Type":"application/json"},pr=await fetch("/api/actions/close_all/plan",{method:"POST",headers:h,body:"{}"});if(!pr.ok){status.textContent="Close-all Plan failed";return}const p=await pr.json();if(!confirm("Review: "+p.operation+" for "+p.target_kind+". "+p.exposure_summary+". "+p.prerequisites+". Expires "+p.expires_at+". Continue?"))return;const r=await fetch("/api/actions/close_all",{method:"POST",headers:h,body:JSON.stringify({plan_id:p.plan_id,confirmation:"close"})});if(!r.ok){status.textContent="Close-all failed";return}const v=await r.json();status.textContent=v.access_may_remain?"Unknown: App access may remain":v.shared_ingress_down?"App access closed; shared ingress is down":"All App origin ingress closed";});rotate.addEventListener("click",async()=>{const h={"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf,"Content-Type":"application/json"},pr=await fetch("/api/actions/admin_token_rotate/plan",{method:"POST",headers:h,body:"{}"});if(!pr.ok){status.textContent="Rotation Plan failed";return}const p=await pr.json();if(!confirm("Review: "+p.operation+" for "+p.target_kind+". "+p.exposure_summary+". "+p.prerequisites+". Expires "+p.expires_at+". Continue?"))return;const r=await fetch("/api/actions/admin_token_rotate",{method:"POST",headers:h,body:JSON.stringify({plan_id:p.plan_id,confirmation:"rotate"})});if(!r.ok){status.textContent="Rotation failed";return}const v=await r.json();proof="";csrf="";sessionStorage.clear();logout.hidden=true;rotate.hidden=true;closeAll.hidden=true;login.hidden=false;status.textContent="New admin token: "+v.token;});logout.addEventListener("click",async()=>{try{await fetch("/api/logout",{method:"POST",headers:{"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf}})}finally{clear();history.replaceState(null,"","/");location.replace("/")}});addEventListener("pagehide",clear);addEventListener("pageshow",event=>{if(event.persisted){clear();location.replace("/")}})})();`

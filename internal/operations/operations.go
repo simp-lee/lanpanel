@@ -102,12 +102,18 @@ type Reservation struct {
 	Phase               Phase                `json:"phase"`
 	SafetyDigest        string               `json:"safety_digest"`
 	JournalSafetyDigest string               `json:"journal_safety_digest,omitempty"`
+	ContractionDigest   string               `json:"contraction_digest,omitempty"`
 	SecretFingerprint   string               `json:"secret_fingerprint,omitempty"`
 	SecretCommitted     bool                 `json:"secret_committed,omitempty"`
 	SafetyBinding       SafetyBinding        `json:"safety_binding"`
 	CreatedAt           time.Time            `json:"created_at"`
 	IntentGeneration    uint64               `json:"intent_generation,omitempty"`
 	Consumption         *ConsumptionSnapshot `json:"consumption,omitempty"`
+}
+
+type ContractionCommit struct {
+	ClosureAuthorityDigest string
+	UnpublishedGenerations map[string]uint64
 }
 type ChildState string
 
@@ -192,6 +198,9 @@ type ConsumeRequest struct {
 type SafetyReader interface {
 	Read() (safety.State, error)
 	LockAuthority() locks.Authority
+}
+type DegradedContractionSafetyReader interface {
+	ReadForContraction(*locks.Lease) (safety.State, error)
 }
 type BindingReader interface {
 	CurrentBinding(Type, string, time.Time) (plans.Binding, error)
@@ -1127,6 +1136,19 @@ func (admitter *Admitter) PutJournal(ctx context.Context, mutation *MutationLeas
 	return err
 }
 
+func HasPendingContraction(document persist.Document) (bool, error) {
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return false, err
+		}
+		if isContraction(intent.Operation) && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered || intent.Phase == PhaseRemoteWait) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func InventoryEmpty(document persist.Document, exceptJob string) (bool, error) {
 	for _, key := range persist.EntryKeys(document, "jobs") {
 		record, err := jobs.LoadEntries(document.Entries, strings.TrimPrefix(key, "jobs/"))
@@ -1272,6 +1294,113 @@ func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, e
 	return true, nil
 }
 
+// CommitContractionState atomically makes every affected App sticky-unpublished
+// while leaving the job running. Runtime closure happens only after this
+// durable boundary, so restart/reconciliation cannot infer or reopen prior
+// ingress from normal state.
+func (admitter *Admitter) CommitContractionState(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ContractionCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(commit.ClosureAuthorityDigest) || len(commit.UnpublishedGenerations) > maximumJournalResources {
+		return fmt.Errorf("contraction state commit requires exact bounded authority")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intentView, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return err
+	}
+	if mutation.Target() != intentView.Target || intentView.Phase != PhaseLocalIntent && intentView.Phase != PhaseReentered || !isContraction(intentView.Operation) || intentView.ContractionDigest != "" {
+		return fmt.Errorf("contraction state intent is not active or was already committed")
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered || intent.ContractionDigest != "" || !isContraction(intent.Operation) {
+			return fmt.Errorf("contraction state intent changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		remaining := make(map[string]uint64, len(commit.UnpublishedGenerations))
+		for id, generation := range commit.UnpublishedGenerations {
+			if !validIdentityRef(id) || generation == 0 {
+				return fmt.Errorf("contraction generation inventory is invalid")
+			}
+			remaining[id] = generation
+		}
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			generation, affected := remaining[resource.ID]
+			if !affected {
+				continue
+			}
+			if generation <= resource.PublicationRecord.UnpublishedGeneration {
+				return fmt.Errorf("resource %q contraction generation did not advance", resource.ID)
+			}
+			prior := resource.PublicationRecord.LastAppliedBundle
+			var candidate *domain.PublicationBundle
+			if resource.PublicationRecord.ActivationIntent != nil {
+				value := resource.PublicationRecord.ActivationIntent.Candidate
+				candidate = &value
+				if resource.PublicationRecord.ActivationIntent.Prior != nil {
+					prior = resource.PublicationRecord.ActivationIntent.Prior
+				}
+			}
+			resource.PublicationRecord.State = domain.PublicationUnpublished
+			resource.PublicationRecord.UnpublishedGeneration = generation
+			resource.PublicationRecord.ActivationIntent = nil
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: intent.Consumption.ConfirmedAt.UTC().Format(time.RFC3339), Reason: "closing_may_be_live"}
+			resource.PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: intent.JobID, Operation: string(intent.Operation), Generation: generation, ClosureAuthorityDigest: commit.ClosureAuthorityDigest, Prior: cloneBundle(prior), Candidate: cloneBundle(candidate)}
+			delete(remaining, resource.ID)
+		}
+		if len(remaining) != 0 {
+			return fmt.Errorf("contraction affected resource is absent from installation")
+		}
+		rawInstallation, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", rawInstallation); err != nil {
+			return err
+		}
+		intent.ContractionDigest = commit.ClosureAuthorityDigest
+		rawIntent, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(jobID), rawIntent)
+	})
+	return err
+}
+
+func cloneBundle(value *domain.PublicationBundle) *domain.PublicationBundle {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.ManagedPaths = append([]string(nil), value.ManagedPaths...)
+	copy.CredentialIDs = append([]string(nil), value.CredentialIDs...)
+	copy.Listeners = append([]domain.BundleListenerIdentity(nil), value.Listeners...)
+	if value.DomainHTTPS != nil {
+		domainCopy := *value.DomainHTTPS
+		domainCopy.ExactDomains = append([]string(nil), value.DomainHTTPS.ExactDomains...)
+		domainCopy.Static.RouteIdentities = append([]string(nil), value.DomainHTTPS.Static.RouteIdentities...)
+		copy.DomainHTTPS = &domainCopy
+	}
+	if value.TemporaryHTTP != nil {
+		temporaryCopy := *value.TemporaryHTTP
+		copy.TemporaryHTTP = &temporaryCopy
+	}
+	return &copy
+}
+
 func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string) (jobs.Record, error) {
 	return admitter.CompleteWithSecret(ctx, mutation, exposure, expectedRevision, jobID, branchName, paths, postconditions, errorCode, nil)
 }
@@ -1312,10 +1441,14 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 	if intentView.Consumption == nil || intentView.Operation == Publish && currentSafetyDigest != intentView.Consumption.SafetyDigest {
 		return jobs.Record{}, fmt.Errorf("operation safety authority changed before terminal commit")
 	}
-	if err := authorize(intentView.Operation, state, intentView.SafetyBinding, true, observedNow); err != nil {
+	if intentView.ContractionDigest == "" {
+		if err := authorize(intentView.Operation, state, intentView.SafetyBinding, true, observedNow); err != nil {
+			return jobs.Record{}, err
+		}
+	} else if err := validateCommittedContractionAuthority(document, state, intentView); err != nil {
 		return jobs.Record{}, err
 	}
-	if intentView.AdmissionSource == AdmissionPlan {
+	if intentView.AdmissionSource == AdmissionPlan && intentView.ContractionDigest == "" {
 		binding, err := admitter.bindings.CurrentBinding(intentView.Operation, intentView.Target, observedNow)
 		if err != nil {
 			return jobs.Record{}, err
@@ -1347,6 +1480,41 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 		if !terminal {
 			return fmt.Errorf("operation child or journal remains nonterminal")
 		}
+		if intent.ContractionDigest != "" {
+			rawInstallation, present := transaction.Get("installations/current")
+			if !present {
+				return fmt.Errorf("contraction installation authority is missing")
+			}
+			installation, err := domain.DecodeInstallation(rawInstallation)
+			if err != nil {
+				return err
+			}
+			affected := 0
+			for index := range installation.Resources {
+				resource := &installation.Resources[index]
+				contraction := resource.PublicationRecord.ContractionIntent
+				if contraction == nil || contraction.JobID != intent.JobID {
+					continue
+				}
+				if contraction.ClosureAuthorityDigest != intent.ContractionDigest || contraction.Generation != resource.PublicationRecord.UnpublishedGeneration || contraction.Operation != string(intent.Operation) {
+					return fmt.Errorf("contraction terminalization identity changed")
+				}
+				resource.PublicationRecord.ContractionIntent = nil
+				resource.PublicationRecord.LastOperation = contractionOperationCode(intent.Operation)
+				resource.PublicationRecord.LastJobID = intent.JobID
+				affected++
+			}
+			if affected == 0 && (intent.Operation != CloseAll || len(installation.Resources) != 0) {
+				return fmt.Errorf("contraction terminalization has no affected resource")
+			}
+			rawInstallation, err = persist.EncodeEntry(installation)
+			if err != nil {
+				return err
+			}
+			if err := transaction.Replace("installations/current", rawInstallation); err != nil {
+				return err
+			}
+		}
 		registration, ok := admitter.registry.Registration(intent.Operation)
 		if !ok {
 			return fmt.Errorf("operation owner has no result branch registry")
@@ -1363,6 +1531,31 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 		record, err := jobs.Load(transaction, jobID)
 		if err != nil {
 			return err
+		}
+		if intent.ContractionDigest != "" {
+			rawInstallation, _ := transaction.Get("installations/current")
+			installation, decodeErr := domain.DecodeInstallation(rawInstallation)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			for index := range installation.Resources {
+				resource := &installation.Resources[index]
+				if resource.PublicationRecord.LastJobID == intent.JobID {
+					resource.PublicationRecord.LastOperationResult = domain.OperationResult(branch.Result)
+					if branch.Result == jobs.ResultSucceeded || branch.Result == jobs.ResultPartial {
+						resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: observedNow.Format(time.RFC3339), Reason: "access_closed"}
+					} else {
+						resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: observedNow.Format(time.RFC3339), Reason: "access_may_remain"}
+					}
+				}
+			}
+			rawInstallation, encodeErr := persist.EncodeEntry(installation)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if err := transaction.Replace("installations/current", rawInstallation); err != nil {
+				return err
+			}
 		}
 		record, err = jobs.Finish(record, jobs.Completion{Result: branch.Result, ModifiedPaths: paths, Postconditions: postconditions, ErrorCode: errorCode, SecretResult: secretResult}, observedNow)
 		if err != nil {
@@ -1448,6 +1641,11 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	if state.DependencyTransitionPending != nil && !contraction {
 		return fmt.Errorf("dependency transition blocks expansion admission")
+	}
+	if operation == CloseAll {
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || binding.GlobalGeneration != state.GlobalClose.Generation || binding.ProposedGeneration != state.GlobalClose.Generation+1 {
+			return fmt.Errorf("close-all global generation binding is stale or active")
+		}
 	}
 	if operation == Publish {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone {
@@ -1626,7 +1824,14 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 	}
 	state, err := admitter.safety.Read()
 	if err != nil {
-		return fmt.Errorf("read independent safety authority: %w", err)
+		degraded, ok := admitter.safety.(DegradedContractionSafetyReader)
+		if !ok {
+			return fmt.Errorf("read independent safety authority: %w", err)
+		}
+		state, err = degraded.ReadForContraction(exposure)
+		if err != nil {
+			return fmt.Errorf("read degraded contraction safety authority: %w", err)
+		}
 	}
 	switch operation {
 	case EmergencyCloseAll:
@@ -1725,6 +1930,7 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	oldGeneration, newGeneration := oldValue.IntentGeneration, newValue.IntentGeneration
 	oldConsumption, newConsumption := oldValue.Consumption, newValue.Consumption
 	oldJournalSafety, newJournalSafety := oldValue.JournalSafetyDigest, newValue.JournalSafetyDigest
+	oldContractionDigest, newContractionDigest := oldValue.ContractionDigest, newValue.ContractionDigest
 	oldSecretFingerprint, newSecretFingerprint := oldValue.SecretFingerprint, newValue.SecretFingerprint
 	oldSecretCommitted, newSecretCommitted := oldValue.SecretCommitted, newValue.SecretCommitted
 	oldValue.IntentGeneration = 0
@@ -1733,6 +1939,8 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	newValue.Consumption = nil
 	oldValue.JournalSafetyDigest = ""
 	newValue.JournalSafetyDigest = ""
+	oldValue.ContractionDigest = ""
+	newValue.ContractionDigest = ""
 	oldValue.SecretFingerprint = ""
 	newValue.SecretFingerprint = ""
 	oldValue.SecretCommitted = false
@@ -1740,10 +1948,11 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("immutable operation intent binding was rewritten")
 	}
-	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != "" && oldSecretFingerprint == newSecretFingerprint
-	secretBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == "" && exactDigest(newSecretFingerprint) && !oldSecretCommitted && !newSecretCommitted && oldJournalSafety == newJournalSafety
-	secretCommitOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == newSecretFingerprint && exactDigest(newSecretFingerprint) && !oldSecretCommitted && newSecretCommitted && oldJournalSafety == newJournalSafety
-	valid := journalBindingOnly || secretBindingOnly || secretCommitOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
+	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != "" && oldContractionDigest == newContractionDigest && oldSecretFingerprint == newSecretFingerprint
+	contractionBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldContractionDigest == "" && exactDigest(newContractionDigest) && oldJournalSafety == newJournalSafety && oldSecretFingerprint == newSecretFingerprint
+	secretBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == "" && exactDigest(newSecretFingerprint) && !oldSecretCommitted && !newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest
+	secretCommitOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == newSecretFingerprint && exactDigest(newSecretFingerprint) && !oldSecretCommitted && newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest
+	valid := journalBindingOnly || contractionBindingOnly || secretBindingOnly || secretCommitOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
 	if !valid {
 		return fmt.Errorf("operation intent phase transition is invalid")
 	}
@@ -1758,6 +1967,9 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	}
 	if oldJournalSafety != "" && newJournalSafety != oldJournalSafety || newJournalSafety != "" && !exactDigest(newJournalSafety) {
 		return fmt.Errorf("journal safety binding was rewritten or is invalid")
+	}
+	if oldContractionDigest != "" && newContractionDigest != oldContractionDigest || newContractionDigest != "" && !exactDigest(newContractionDigest) {
+		return fmt.Errorf("contraction authority binding was rewritten or is invalid")
 	}
 	if oldSecretFingerprint != "" && newSecretFingerprint != oldSecretFingerprint || newSecretFingerprint != "" && !exactDigest(newSecretFingerprint) || oldSecretCommitted && !newSecretCommitted || newSecretCommitted && newSecretFingerprint == "" {
 		return fmt.Errorf("secret commit binding was rewritten or is invalid")
@@ -2126,6 +2338,11 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
 		}
 		jobID := resource.PublicationRecord.LastJobID
+		if resource.PublicationRecord.ContractionIntent != nil {
+			jobID = resource.PublicationRecord.ContractionIntent.JobID
+		} else if oldResource.PublicationRecord.ContractionIntent != nil {
+			jobID = oldResource.PublicationRecord.ContractionIntent.JobID
+		}
 		if jobID == "" {
 			return fmt.Errorf("resource %q operation-owned state changed without a durable job binding", resource.ID)
 		}
@@ -2137,7 +2354,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if err != nil {
 			return fmt.Errorf("resource %q state intent: %w", resource.ID, err)
 		}
-		targetMatches := intent.Target == "resource/"+resource.ID || intent.Operation == CloseAll && intent.Target == string(plans.TargetInstallation)
+		targetMatches := intent.Target == "resource/"+resource.ID || (intent.Operation == CloseAll || intent.Operation == StartupContraction) && intent.Target == string(plans.TargetInstallation)
 		if intent.Operation == AutomaticReconciliation && strings.HasPrefix(intent.Target, "journal/") {
 			journal, err := loadJournalEntries(after.Entries, strings.TrimPrefix(intent.Target, "journal/"))
 			if err == nil {
@@ -2147,12 +2364,6 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if !targetMatches {
 			return fmt.Errorf("resource %q state changed under a mismatched operation target", resource.ID)
 		}
-		if beforeIntent.Phase != PhaseLocalIntent && beforeIntent.Phase != PhaseReentered || intent.Phase != PhaseTerminal {
-			return fmt.Errorf("resource %q state and job result must commit atomically from a locked local phase", resource.ID)
-		}
-		if !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) {
-			return fmt.Errorf("resource %q last operation does not match its immutable intent", resource.ID)
-		}
 		beforeRecord, err := jobs.LoadEntries(before.Entries, jobID)
 		if err != nil {
 			return err
@@ -2161,11 +2372,31 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if err != nil {
 			return err
 		}
-		if beforeRecord.Status != jobs.StatusRunning || record.Status != jobs.StatusTerminal || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
-			return fmt.Errorf("resource %q state does not match an atomic running-to-terminal job result", resource.ID)
-		}
-		if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
-			return fmt.Errorf("resource %q: %w", resource.ID, err)
+		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
+		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		ordinaryTerminal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		switch {
+		case beginningContraction:
+			contraction := resource.PublicationRecord.ContractionIntent
+			if contraction.JobID != intent.JobID || contraction.Operation != string(intent.Operation) || contraction.Generation != resource.PublicationRecord.UnpublishedGeneration || contraction.ClosureAuthorityDigest != intent.ContractionDigest || resource.PublicationRecord.LastOperation != oldResource.PublicationRecord.LastOperation || resource.PublicationRecord.LastOperationResult != oldResource.PublicationRecord.LastOperationResult {
+				return fmt.Errorf("resource %q running contraction identity does not match its durable intent", resource.ID)
+			}
+			if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
+				return fmt.Errorf("resource %q: %w", resource.ID, err)
+			}
+		case terminalContraction:
+			if oldResource.PublicationRecord.ContractionIntent.JobID != intent.JobID || oldResource.PublicationRecord.ContractionIntent.ClosureAuthorityDigest != intent.ContractionDigest || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != oldResource.PublicationRecord.UnpublishedGeneration || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) || !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) {
+				return fmt.Errorf("resource %q contraction result does not match its running authority", resource.ID)
+			}
+		case ordinaryTerminal:
+			if !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
+				return fmt.Errorf("resource %q state does not match an atomic terminal job result", resource.ID)
+			}
+			if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
+				return fmt.Errorf("resource %q: %w", resource.ID, err)
+			}
+		default:
+			return fmt.Errorf("resource %q state changed outside an authorized operation phase", resource.ID)
 		}
 		delete(oldResources, resource.ID)
 	}
@@ -2175,6 +2406,49 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	return nil
 }
 
+func validateCommittedContractionAuthority(document persist.Document, state safety.State, intent Reservation) error {
+	installation, err := loadInstallationEntries(document.Entries)
+	if err != nil {
+		return err
+	}
+	affected := 0
+	for _, resource := range installation.Resources {
+		contraction := resource.PublicationRecord.ContractionIntent
+		if contraction == nil || contraction.JobID != intent.JobID {
+			continue
+		}
+		if contraction.ClosureAuthorityDigest != intent.ContractionDigest || contraction.Operation != string(intent.Operation) || contraction.Generation != resource.PublicationRecord.UnpublishedGeneration {
+			return fmt.Errorf("committed contraction identity changed before terminalization")
+		}
+		var safetyResource *safety.ResourceSafety
+		for index := range state.Resources {
+			if state.Resources[index].ResourceID == resource.ID {
+				safetyResource = &state.Resources[index]
+				break
+			}
+		}
+		if safetyResource == nil || (safetyResource.Closing == nil || safetyResource.Closing.Generation != contraction.Generation) && (safetyResource.StickyUnpublished == nil || safetyResource.StickyUnpublished.Generation != contraction.Generation) && state.StopFence == nil {
+			return fmt.Errorf("committed contraction safety generation is absent")
+		}
+		affected++
+	}
+	if affected == 0 && (intent.Operation != CloseAll || len(installation.Resources) != 0) {
+		return fmt.Errorf("committed contraction has no affected App")
+	}
+	if intent.Operation == CloseAll && state.GlobalClose.Generation != intent.SafetyBinding.ProposedGeneration {
+		return fmt.Errorf("committed close-all global generation changed")
+	}
+	return nil
+}
+
+func loadInstallationEntries(entries map[string]json.RawMessage) (domain.Installation, error) {
+	raw, present := entries["installations/current"]
+	if !present {
+		return domain.Installation{}, fmt.Errorf("installation authority is missing")
+	}
+	return domain.DecodeInstallation(raw)
+}
+
 func validateOperationResourceDelta(before, after domain.AppResource, operation Type) error {
 	if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.ManagedProcess, after.ManagedProcess) {
 		return fmt.Errorf("operation %q does not own lifecycle or managed-process state", operation)
@@ -2182,7 +2456,12 @@ func validateOperationResourceDelta(before, after domain.AppResource, operation 
 	switch operation {
 	case Publish:
 		return nil
-	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction, Maintenance:
+	case StartupContraction:
+		if after.PublicationRecord.State != domain.PublicationUnpublished || after.PublicationRecord.UnpublishedGeneration < before.PublicationRecord.UnpublishedGeneration || after.PublicationRecord.UnpublishedGeneration == before.PublicationRecord.UnpublishedGeneration && before.PublicationRecord.State != domain.PublicationUnpublished {
+			return fmt.Errorf("startup contraction did not preserve or advance exact unpublished state")
+		}
+		return nil
+	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, Maintenance:
 		if after.PublicationRecord.State != domain.PublicationUnpublished || after.PublicationRecord.UnpublishedGeneration <= before.PublicationRecord.UnpublishedGeneration {
 			return fmt.Errorf("contraction operation did not commit unpublished state with a fresh generation")
 		}
@@ -2278,6 +2557,13 @@ func protectedResourceStateEqual(left, right domain.AppResource) bool {
 	return left.Lifecycle == right.Lifecycle && reflect.DeepEqual(left.PublicationRecord, right.PublicationRecord) && reflect.DeepEqual(left.ManagedProcess, right.ManagedProcess)
 }
 
+func contractionOperationCode(operation Type) domain.OperationCode {
+	if operation == CloseAll {
+		return domain.OperationCloseAll
+	}
+	return domain.OperationUnpublish
+}
+
 func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool {
 	switch operation {
 	case Publish:
@@ -2296,7 +2582,7 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 }
 
 func validateReservation(value Reservation) error {
-	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
+	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
 		return fmt.Errorf("operation reservation is invalid")
 	}
 	if value.Phase != PhaseReserved && value.Phase != PhaseLocalIntent && value.Phase != PhaseRemoteWait && value.Phase != PhaseRejected && value.Phase != PhaseReentered && value.Phase != PhaseTerminal {

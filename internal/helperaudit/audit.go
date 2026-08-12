@@ -44,7 +44,8 @@ func Run(root string) error {
 		}
 	}
 	fileSet := token.NewFileSet()
-	commandCalls, unixExecCalls := 0, 0
+	commandCalls := 0
+	unixExecCalls := map[string]int{}
 	for _, path := range files {
 		file, err := parser.ParseFile(fileSet, path, nil, 0)
 		if err != nil {
@@ -94,8 +95,9 @@ func Run(root string) error {
 						return false
 					}
 				case "unix.Exec":
-					unixExecCalls++
-					if len(value.Args) != 3 || expressionName(value.Args[0]) != "profile.Executable" {
+					function := enclosingFunction(file, value.Pos())
+					unixExecCalls[function]++
+					if (function != "ExecuteBootstrap" && function != "ExecutePersistentProfile") || len(value.Args) != 3 || expressionName(value.Args[0]) != "profile.Executable" {
 						err = fmt.Errorf("profile exec shape is not exact")
 						return false
 					}
@@ -110,8 +112,8 @@ func Run(root string) error {
 			return err
 		}
 	}
-	if commandCalls != 1 || unixExecCalls != 1 {
-		return fmt.Errorf("child executor call census is command=%d exec=%d", commandCalls, unixExecCalls)
+	if commandCalls != 1 || unixExecCalls["ExecuteBootstrap"] != 1 || unixExecCalls["ExecutePersistentProfile"] != 1 || len(unixExecCalls) != 2 {
+		return fmt.Errorf("child executor call census is command=%d exec=%v", commandCalls, unixExecCalls)
 	}
 	return auditRequestFields(filepath.Join(root, "internal", "helperproto", "types.go"))
 }
@@ -147,6 +149,16 @@ func auditRequestFields(path string) error {
 		}
 	}
 	return fmt.Errorf("helper request schema is missing")
+}
+
+func enclosingFunction(file *ast.File, position token.Pos) string {
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Body != nil && function.Body.Pos() <= position && position < function.Body.End() {
+			return function.Name.Name
+		}
+	}
+	return ""
 }
 
 func selectorName(expression ast.Expr) string {

@@ -98,15 +98,61 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	helperUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service")])
+	for _, required := range []string{"Type=notify", "NotifyAccess=main"} {
+		if !strings.Contains(helperUnit, required) {
+			t.Fatalf("helper unit omitted %q: %s", required, helperUnit)
+		}
+	}
 	socket := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-management.socket")])
 	if !strings.Contains(socket, "ListenStream=127.41.42.43:52345") || !strings.Contains(socket, "FileDescriptorName=lanpanel-management-"+journal.GenerationID) || !strings.Contains(socket, "RemoveOnStop=no") {
 		t.Fatalf("socket=%s", socket)
+	}
+	recoveryUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service")])
+	for _, required := range []string{"Type=oneshot", "Before=lanpanel-nginx.service", "Requires=lanpanel-helper.service", "RestrictAddressFamilies=AF_UNIX", "RemainAfterExit=yes"} {
+		if !strings.Contains(recoveryUnit, required) {
+			t.Fatalf("recovery unit omitted %q: %s", required, recoveryUnit)
+		}
+	}
+	nginxUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service")])
+	for _, required := range []string{"Type=simple", "Requires=lanpanel-helper.service lanpanel-recovery.service", "After=network.target lanpanel-helper.service lanpanel-recovery.service", "ExecStart=" + journal.Paths.BinaryPath + " startup-guard", "ExecReload=" + journal.Paths.BinaryPath + " reload-guard", "ExecStop=" + journal.Paths.BinaryPath + " reload-guard stop", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE"} {
+		if !strings.Contains(nginxUnit, required) {
+			t.Fatalf("Nginx unit omitted %q: %s", required, nginxUnit)
+		}
+	}
+	for _, forbidden := range []string{"Type=forking", "CAP_SYS_ADMIN", "CAP_NET_ADMIN"} {
+		if strings.Contains(nginxUnit, forbidden) {
+			t.Fatalf("Nginx unit contains %q: %s", forbidden, nginxUnit)
+		}
 	}
 	ui := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-ui.service")])
 	for _, forbidden := range []string{"PartOf=", "BindsTo=", "lanpanel-timer.service", "nginx", "headscale"} {
 		if strings.Contains(ui, forbidden) {
 			t.Fatalf("UI couples independent role through %q", forbidden)
 		}
+	}
+}
+
+func TestVendorNginxMaskIsExactAndPersistent(t *testing.T) {
+	root := t.TempDir()
+	if err := installVendorNginxMask(root); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "nginx.service")
+	if err := verifyVendorNginxMask(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := installVendorNginxMask(root); err != nil {
+		t.Fatalf("exact mask retry failed: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("foreign"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := installVendorNginxMask(root); err == nil {
+		t.Fatal("foreign vendor unit was replaced by a mask")
 	}
 }
 

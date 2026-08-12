@@ -80,6 +80,9 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if !profile.Complete {
 		return Result{}, fmt.Errorf("external child profile is unavailable until its complete confinement is qualified")
 	}
+	if profile.PersistentDaemon {
+		return Result{}, fmt.Errorf("persistent daemon profile requires direct PID1 supervision")
+	}
 	if len(input) > profile.MaximumInputBytes || profile.MaximumInputBytes == 0 && len(input) != 0 {
 		return Result{}, fmt.Errorf("external child input exceeds its fixed profile")
 	}
@@ -179,6 +182,27 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	return result, nil
 }
 
+// ExecutePersistentProfile replaces a fixed systemd guard with its one
+// qualified persistent daemon. PID1 retains direct supervision; the generic
+// one-shot launcher, timeout, and process-group teardown are not involved.
+func ExecutePersistentProfile(profileID ProfileID) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("persistent child execution requires root")
+	}
+	profile, err := ResolveProfile(profileID, Identities{})
+	if err != nil || !profile.Complete || !profile.PersistentDaemon {
+		return fmt.Errorf("persistent child profile is unavailable")
+	}
+	if err := verifyRootExecutable(profile.Executable); err != nil {
+		return err
+	}
+	if err := applyProfile(profile, false); err != nil {
+		return err
+	}
+	argv := append([]string{profile.Executable}, profile.Arguments...)
+	return unix.Exec(profile.Executable, argv, profile.Environment)
+}
+
 // ExecuteBootstrap is the release-fixed child-executor role. It accepts no
 // argv-controlled executable or flags; the root helper supplies a typed profile
 // over inherited fd 3 and optional bounded stdin over fd 4.
@@ -236,10 +260,10 @@ func applyProfile(profile Profile, hasInput bool) error {
 			return fmt.Errorf("child no-network namespace did not change")
 		}
 	}
-	if profile.Network != NetworkNone && profile.Network != NetworkNoSockets && profile.Network != NetworkHostQualified && profile.Network != NetworkProviderOnly && profile.Network != NetworkLocalAPIOnly {
+	if profile.Network != NetworkNone && profile.Network != NetworkNoSockets && profile.Network != NetworkUnixOnly && profile.Network != NetworkHostQualified && profile.Network != NetworkProviderOnly && profile.Network != NetworkLocalAPIOnly {
 		return fmt.Errorf("child network profile is unsupported")
 	}
-	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets {
+	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets || profile.Network == NetworkUnixOnly {
 		if err := installAddressFamilyFilter(profile.AllowedAddressFamilies); err != nil {
 			return err
 		}
@@ -285,18 +309,22 @@ func applyProfile(profile Profile, hasInput bool) error {
 	if err := assertAppliedIdentity(profile); err != nil {
 		return err
 	}
-	cpuSeconds := uint64(profile.Timeout/time.Second) + 1
-	maximumFileBytes := profile.MaximumFileBytes
-	if maximumFileBytes == 0 {
-		maximumFileBytes = uint64(profile.MaximumOutputBytes + profile.MaximumInputBytes + 4096)
+	limits := map[int]unix.Rlimit{unix.RLIMIT_CORE: {Cur: 0, Max: 0}}
+	if profile.PersistentDaemon {
+		limits[unix.RLIMIT_NOFILE] = unix.Rlimit{Cur: 65536, Max: 65536}
+		limits[unix.RLIMIT_NPROC] = unix.Rlimit{Cur: 1024, Max: 1024}
+	} else {
+		cpuSeconds := uint64(profile.Timeout/time.Second) + 1
+		maximumFileBytes := profile.MaximumFileBytes
+		if maximumFileBytes == 0 {
+			maximumFileBytes = uint64(profile.MaximumOutputBytes + profile.MaximumInputBytes + 4096)
+		}
+		limits[unix.RLIMIT_CPU] = unix.Rlimit{Cur: cpuSeconds, Max: cpuSeconds}
+		limits[unix.RLIMIT_FSIZE] = unix.Rlimit{Cur: maximumFileBytes, Max: maximumFileBytes}
+		limits[unix.RLIMIT_NOFILE] = unix.Rlimit{Cur: 32, Max: 32}
+		limits[unix.RLIMIT_NPROC] = unix.Rlimit{Cur: 32, Max: 32}
 	}
-	for resource, limit := range map[int]unix.Rlimit{
-		unix.RLIMIT_CPU:    {Cur: cpuSeconds, Max: cpuSeconds},
-		unix.RLIMIT_CORE:   {Cur: 0, Max: 0},
-		unix.RLIMIT_FSIZE:  {Cur: maximumFileBytes, Max: maximumFileBytes},
-		unix.RLIMIT_NOFILE: {Cur: 32, Max: 32},
-		unix.RLIMIT_NPROC:  {Cur: 32, Max: 32},
-	} {
+	for resource, limit := range limits {
 		if err := unix.Setrlimit(resource, &limit); err != nil {
 			return fmt.Errorf("set child resource limit: %w", err)
 		}

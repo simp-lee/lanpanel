@@ -6,6 +6,7 @@ import (
 	"lanpanel/internal/bootstrap"
 	"lanpanel/internal/child"
 	"lanpanel/internal/helper"
+	"lanpanel/internal/nginxguard"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/roles"
 	"os"
@@ -42,8 +43,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		{Name: roles.Installer, Handler: func(args []string, stdout, _ io.Writer) error { return bootstrap.RunInstallerRole(args, stdout) }},
 		{Name: roles.UI, Handler: bootstrap.RunUIRole},
 		{Name: roles.Timer, Handler: requireCommitted},
-		{Name: roles.StartupGuard, Handler: requireCommitted},
-		{Name: roles.ReloadGuard, Handler: requireCommitted},
+		{Name: roles.FencedRecovery, Handler: func(args []string, _, _ io.Writer) error {
+			if err := bootstrap.RequireCommitted(bootstrap.FixedPaths()); err != nil {
+				return err
+			}
+			return helper.RunFencedRecovery(args)
+		}},
+		{Name: roles.StartupGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunStartupGuard(args) }},
+		{Name: roles.ReloadGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunReloadGuard(args) }},
 		{Name: roles.RuntimeGuard, Handler: func(args []string, _, _ io.Writer) error { return bootstrap.RunRuntimeGuard(args) }},
 	})
 	if err != nil {

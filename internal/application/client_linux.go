@@ -19,6 +19,12 @@ type RotationResult struct {
 	JobID       string
 	Token       []byte
 }
+type ContractionResult struct {
+	Outcome           string
+	AccessClosed      bool
+	SharedIngressDown bool
+	AccessMayRemain   bool
+}
 
 func HelperService(client HelperClient) (*Service, error) {
 	if client == nil {
@@ -42,5 +48,16 @@ func HelperService(client HelperClient) (*Service, error) {
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: RotationResult{reply.Digest, reply.Action.JobID, reply.Secret}}, nil
 	})
-	return New([]Registration{plan, rotate})
+	contractionAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		payload := call.Payload.(ConfirmationPayload)
+		reply, err := client(ctx, helperproto.OperationContractionClose, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation})
+		if err != nil || reply.Action == nil || reply.Action.ContractionOutcome == "" || len(reply.Secret) != 0 {
+			clear(reply.Secret)
+			return Result{}, fmt.Errorf("close-all contraction failed")
+		}
+		return Result{Operation: call.Operation, Target: call.Target, Payload: ContractionResult{Outcome: reply.Action.ContractionOutcome, AccessClosed: reply.Action.AccessClosed, SharedIngressDown: reply.Action.SharedIngressDown, AccessMayRemain: reply.Action.AccessMayRemain}}, nil
+	}
+	closeAll, _ := RegisterAction("close_all", ConfirmationPayload{}, true, false, contractionAction)
+	unpublish, _ := RegisterAction("unpublish", ConfirmationPayload{}, true, false, contractionAction)
+	return New([]Registration{plan, rotate, closeAll, unpublish})
 }

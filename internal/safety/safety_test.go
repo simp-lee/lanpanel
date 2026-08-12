@@ -176,13 +176,12 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 		current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 3, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Closing: &GenerationMarker{Kind: MarkerClosing, Generation: 3, Reason: "close"}}}
 		next := current
 		next.Resources = append([]ResourceSafety(nil), current.Resources...)
-		next.Resources[0].GenerationSequence = 4
 		next.Resources[0].Closing = nil
-		next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 4, Reason: "closed"}
+		next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 3, Reason: "closed"}
 		if err := validateTransition(RoleContraction, current, next, TransitionProof{}); err == nil {
 			t.Fatal("closing cleared without convergence proof")
 		}
-		proof := &ClosingConvergenceProof{ResourceID: "app-a", ClosingGeneration: 3, UnpublishedGeneration: 4, OwnershipDigest: digest("owner"), RuntimeClosureDigest: digest("closure")}
+		proof := &ClosingConvergenceProof{ResourceID: "app-a", ClosingGeneration: 3, UnpublishedGeneration: 3, OwnershipDigest: digest("owner"), RuntimeClosureDigest: digest("closure")}
 		if err := validateTransition(RoleContraction, current, next, TransitionProof{Closing: proof}); err != nil {
 			t.Fatalf("closing convergence: %v", err)
 		}

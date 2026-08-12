@@ -21,14 +21,15 @@ const (
 	fixedLockRoot           = "/var/lib/lanpanel/locks"
 )
 
-func managementProfile() string {
+func managementProfile() string { return managementProfileWithRecovery(nil) }
+func managementProfileWithRecovery(recoveryErr error) string {
 	manager, err := locks.Open(locks.Config{RootPath: fixedLockRoot, Owner: 0, Group: 0, Mode: 0o700})
 	if err != nil {
 		return "unavailable"
 	}
 	defer manager.Close()
 	if validateIndependentAuthority(manager) != nil {
-		return "unavailable"
+		return "emergency"
 	}
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	store, err := persist.Open(persist.Config{RootPath: fixedNormalStateRoot, StagingPath: fixedNormalStateStaging, StatePath: fixedNormalStatePath, Owner: owner, LockAuthority: manager.Authority()})
@@ -37,9 +38,9 @@ func managementProfile() string {
 	}
 	defer store.Close()
 	if err := operations.Register(store); err != nil {
-		return "unavailable"
+		return "emergency"
 	}
-	if _, err := store.Read(); err != nil {
+	if _, err := store.Read(); err != nil || recoveryErr != nil {
 		return "emergency"
 	}
 	return "normal"

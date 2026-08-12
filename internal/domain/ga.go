@@ -258,10 +258,20 @@ type PublicationRecord struct {
 	LastAppliedBundle     *PublicationBundle         `json:"last_applied_bundle,omitempty"`
 	EffectiveSecurity     *EffectiveSecurityIdentity `json:"effective_security,omitempty"`
 	ActivationIntent      *ActivationIntent          `json:"activation_intent,omitempty"`
+	ContractionIntent     *ContractionIntent         `json:"contraction_intent,omitempty"`
 	RuntimeObservation    *RuntimeObservation        `json:"runtime_observation,omitempty"`
 	LastOperation         OperationCode              `json:"last_operation,omitempty"`
 	LastOperationResult   OperationResult            `json:"last_operation_result,omitempty"`
 	LastJobID             string                     `json:"last_job_id,omitempty"`
+}
+
+type ContractionIntent struct {
+	JobID                  string             `json:"job_id"`
+	Operation              string             `json:"operation"`
+	Generation             uint64             `json:"generation"`
+	ClosureAuthorityDigest string             `json:"closure_authority_digest"`
+	Prior                  *PublicationBundle `json:"prior,omitempty"`
+	Candidate              *PublicationBundle `json:"candidate,omitempty"`
 }
 
 type PublicationBundle struct {
@@ -774,8 +784,29 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 			return fmt.Errorf("effective_security.effective_deadline must be RFC3339: %w", err)
 		}
 	}
+	if record.ContractionIntent != nil {
+		intent := record.ContractionIntent
+		if record.State != PublicationUnpublished || record.ActivationIntent != nil || intent.JobID == "" || intent.JobID != strings.TrimSpace(intent.JobID) || strings.ContainsAny(intent.JobID, "\r\n") || intent.Generation != record.UnpublishedGeneration || !validSHA256Digest(intent.ClosureAuthorityDigest) {
+			return fmt.Errorf("contraction_intent requires exact unpublished job, generation, and closure authority")
+		}
+		switch intent.Operation {
+		case "publish", "unpublish", "close_all", "certificate_expiry", "edgeone_expiry", "automatic_exact_journal_reconciliation", "startup_activation_contraction":
+		default:
+			return fmt.Errorf("contraction_intent operation %q is unsupported", intent.Operation)
+		}
+		for name, bundle := range map[string]*PublicationBundle{"prior": intent.Prior, "candidate": intent.Candidate} {
+			if bundle != nil {
+				if err := validateBundle(*bundle, bundle.Kind); err != nil {
+					return fmt.Errorf("contraction_intent.%s: %w", name, err)
+				}
+			}
+		}
+	}
 	switch record.State {
 	case PublicationPublished:
+		if record.ContractionIntent != nil {
+			return fmt.Errorf("published state must not retain contraction_intent")
+		}
 		if record.LastAppliedBundle == nil {
 			return fmt.Errorf("published state requires last applied identity")
 		}
@@ -795,6 +826,9 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 			return fmt.Errorf("unpublished state must not contain activation_intent")
 		}
 	case PublicationActivating:
+		if record.ContractionIntent != nil {
+			return fmt.Errorf("activating state must not retain contraction_intent")
+		}
 		if record.ActivationIntent == nil {
 			return fmt.Errorf("activating state requires activation_intent")
 		}

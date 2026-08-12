@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"os"
@@ -184,9 +185,37 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			}
 			defer clear(token)
 		}
+		var defaultCertificate nginx.DefaultCertificate
+		var certificateErr error
+		certificatePath := filepath.Join(journal.Paths.InstallationRoot, "default-rejection.crt")
+		privateKeyPath := filepath.Join(journal.Paths.InstallationRoot, "default-rejection.key")
+		if certificatePEM, readErr := readCommittedArtifact(certificatePath, nginx.MaximumGraphFileSize, 0o644); readErr == nil {
+			privateKeyPEM, keyErr := readCommittedArtifact(privateKeyPath, nginx.MaximumGraphFileSize, 0o600)
+			if keyErr != nil {
+				return fmt.Errorf("committed default rejection certificate is one-sided: %w", keyErr)
+			}
+			defaultCertificate, certificateErr = nginx.ParseDefaultCertificate(certificatePEM, privateKeyPEM)
+			wantDNS, _ := nginx.ExpectedDefaultDNSName(journal.InstallationID)
+			if certificateErr != nil || defaultCertificate.DNSName != wantDNS {
+				return fmt.Errorf("committed default rejection certificate is foreign")
+			}
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return readErr
+		} else {
+			currentTime := time.Now().UTC()
+			if request.Now != nil {
+				currentTime = request.Now().UTC()
+			}
+			defaultCertificate, certificateErr = nginx.GenerateDefaultCertificate(journal.InstallationID, request.Random, currentTime)
+			if certificateErr != nil {
+				return certificateErr
+			}
+		}
 		members := []filetxn.DirectoryMember{
 			{Name: "admin-token", Data: token, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 			{Name: "bundle.json", Data: bundleBytes, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: MaximumJournalBytes},
+			{Name: "default-rejection.crt", Data: defaultCertificate.CertificatePEM, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644, Maximum: nginx.MaximumGraphFileSize},
+			{Name: "default-rejection.key", Data: defaultCertificate.PrivateKeyPEM, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: nginx.MaximumGraphFileSize},
 			{Name: "host-fingerprint", Data: []byte(journal.Release.HostFingerprint), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 			{Name: "os-profile.digest", Data: []byte(journal.Release.ProfileDigest), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 			{Name: "release-envelope.digest", Data: []byte(journal.Release.EnvelopeDigest), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
@@ -201,6 +230,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return fmt.Errorf("installation bundle is foreign or incomplete: %w", err)
 		}
 		journal.ArtifactDigests["installation_bundle"] = directoryIdentity.Digest
+		journal.ArtifactDigests["default_rejection_certificate"] = digestBytes(defaultCertificate.CertificatePEM)
 		if err := advance(PhaseBundleCommitted); err != nil {
 			return err
 		}
@@ -278,6 +308,15 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 	}
 	if journal.Phase == PhaseStoresInitialized {
+		if err := installNginxBaseline(ctx, &journal); err != nil {
+			return err
+		}
+		if journal.Paths == FixedPaths() {
+			if err := installVendorNginxMask(journal.Paths.SystemdRoot); err != nil {
+				return err
+			}
+			journal.ArtifactDigests[filepath.Join(journal.Paths.SystemdRoot, "nginx.service")] = digestBytes([]byte("/dev/null"))
+		}
 		artifacts, err := renderArtifacts(journal)
 		if err != nil {
 			return err
@@ -379,7 +418,11 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 
 func createBootstrapDirectories(journal Journal) error {
 	owner := filetxn.Owner{UID: 0, GID: 0}
-	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn")} {
+	nginxPaths := nginx.FixedPaths()
+	if journal.Paths != FixedPaths() {
+		nginxPaths = testNginxPaths(journal.Paths)
+	}
+	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot, filepath.Dir(nginxPaths.AuditPath)} {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
 			return err
 		}
@@ -390,6 +433,103 @@ func createBootstrapDirectories(journal Journal) error {
 	ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
 	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, filetxn.Owner{UID: 0, GID: ui.GID}, 0o710); err != nil {
 		return err
+	}
+	return nil
+}
+
+func testNginxPaths(paths Paths) nginx.Paths {
+	return nginx.Paths{ConfigRoot: filepath.Join(paths.PersistentRoot, "etc-nginx"), StateRoot: filepath.Join(paths.PersistentRoot, "nginx"), AuditPath: filepath.Join(paths.PersistentRoot, "log", "nginx-rejections.log"), CertificatePath: filepath.Join(paths.InstallationRoot, "default-rejection.crt"), PrivateKeyPath: filepath.Join(paths.InstallationRoot, "default-rejection.key"), PIDPath: filepath.Join(paths.RuntimeRoot, "nginx.pid")}
+}
+
+func installNginxBaseline(ctx context.Context, journal *Journal) error {
+	paths := nginx.FixedPaths()
+	if journal == nil {
+		return fmt.Errorf("bootstrap journal is missing")
+	}
+	if journal.Paths != FixedPaths() {
+		paths = testNginxPaths(journal.Paths)
+	} else if err := rejectForeignNginxAuthority(); err != nil {
+		return err
+	}
+	certificatePEM, err := readCommittedArtifact(paths.CertificatePath, nginx.MaximumGraphFileSize, 0o644)
+	if err != nil {
+		return err
+	}
+	privateKeyPEM, err := readCommittedArtifact(paths.PrivateKeyPath, nginx.MaximumGraphFileSize, 0o600)
+	if err != nil {
+		return err
+	}
+	certificate, err := nginx.ParseDefaultCertificate(certificatePEM, privateKeyPEM)
+	if err != nil {
+		return err
+	}
+	wantDNS, _ := nginx.ExpectedDefaultDNSName(journal.InstallationID)
+	if certificate.DNSName != wantDNS {
+		return fmt.Errorf("default rejection certificate does not bind installation identity")
+	}
+	baseline, err := nginx.RenderBaseline(paths, journal.InstallationID, journal.GenerationID, certificate.Fingerprint)
+	if err != nil {
+		return err
+	}
+	for path, data := range baseline.Files {
+		if err := putOrVerifyTargetFile(ctx, path, data, 0o600); err != nil {
+			return err
+		}
+		// Main and sanitizer are immutable release assets. The manifest and
+		// rejection audit are mutable authorities verified by nginx.Audit.
+		if path == paths.MainPath() || path == paths.SanitizerPath() {
+			journal.ArtifactDigests[path] = digestBytes(data)
+		}
+	}
+	_, err = nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
+	return err
+}
+
+func verifyVendorNginxMask(path string) error {
+	target, err := os.Readlink(path)
+	if err != nil || target != "/dev/null" {
+		return fmt.Errorf("vendor Nginx unit is not exactly masked")
+	}
+	return nil
+}
+func installVendorNginxMask(systemdRoot string) error {
+	path := filepath.Join(systemdRoot, "nginx.service")
+	if target, err := os.Readlink(path); err == nil {
+		if target == "/dev/null" {
+			return nil
+		}
+		return fmt.Errorf("foreign Nginx unit mask target")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Symlink("/dev/null", path); err != nil {
+		return err
+	}
+	dir, err := os.Open(systemdRoot)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func rejectForeignNginxAuthority() error {
+	for _, path := range []string{"/etc/nginx/sites-enabled/default", "/etc/systemd/system/nginx.service.d", "/run/systemd/system.control/nginx.service", "/run/systemd/system.control/nginx.service.d", "/run/systemd/transient/nginx.service", "/run/systemd/transient/nginx.service.d", "/run/systemd/system.attached/nginx.service", "/run/systemd/system.attached/nginx.service.d", "/run/systemd/generator.early/nginx.service", "/run/systemd/generator.early/nginx.service.d", "/run/systemd/system/nginx.service", "/run/systemd/system/nginx.service.d", "/run/systemd/generator/nginx.service", "/run/systemd/generator/nginx.service.d", "/usr/local/lib/systemd/system/nginx.service", "/usr/local/lib/systemd/system/nginx.service.d", "/run/systemd/generator.late/nginx.service", "/run/systemd/generator.late/nginx.service.d"} {
+		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("foreign Nginx site or unit authority exists at %q", path)
+		}
+	}
+	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(table)
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) > 3 && fields[3] == "0A" && (strings.HasSuffix(fields[1], ":0050") || strings.HasSuffix(fields[1], ":01BB")) {
+				return fmt.Errorf("foreign listener already owns required Nginx port")
+			}
+		}
 	}
 	return nil
 }
@@ -448,7 +588,12 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, request
 
 func scanExistingEvidence(paths Paths) ([]string, error) {
 	candidates := []string{paths.CommitPath, paths.StartupAuthority, paths.PersistentRoot, paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, filepath.Dir(paths.BinaryPath)}
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service"} {
+	nginxPaths := nginx.FixedPaths()
+	if paths != FixedPaths() {
+		nginxPaths = testNginxPaths(paths)
+	}
+	candidates = append(candidates, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath)
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		candidates = append(candidates, filepath.Join(paths.SystemdRoot, name))
 	}
 	result := []string{}
@@ -516,7 +661,7 @@ func verifyPrecommitArtifacts(journal Journal) error {
 		name    string
 		mode    uint32
 		maximum int64
-	}{{"admin-token", 0o600, 4096}, {"bundle.json", 0o600, MaximumJournalBytes}, {"host-fingerprint", 0o600, 4096}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
+	}{{"admin-token", 0o600, 4096}, {"bundle.json", 0o600, MaximumJournalBytes}, {"default-rejection.crt", 0o644, nginx.MaximumGraphFileSize}, {"default-rejection.key", 0o600, nginx.MaximumGraphFileSize}, {"host-fingerprint", 0o600, 4096}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
 		if _, err := readCommittedArtifact(filepath.Join(journal.Paths.InstallationRoot, member.name), member.maximum, member.mode); err != nil {
 			return err
 		}
@@ -526,6 +671,19 @@ func verifyPrecommitArtifacts(journal Journal) error {
 	}
 	for path, digest := range journal.ArtifactDigests {
 		if path == "release_binary" || path == "installation_bundle" {
+			continue
+		}
+		if path == "default_rejection_certificate" {
+			data, err := readCommittedArtifact(filepath.Join(journal.Paths.InstallationRoot, "default-rejection.crt"), nginx.MaximumGraphFileSize, 0o644)
+			if err != nil || digestBytes(data) != digest {
+				return fmt.Errorf("default rejection certificate differs")
+			}
+			continue
+		}
+		if path == filepath.Join(journal.Paths.SystemdRoot, "nginx.service") {
+			if digest != digestBytes([]byte("/dev/null")) || verifyVendorNginxMask(path) != nil {
+				return fmt.Errorf("vendor Nginx unit mask differs")
+			}
 			continue
 		}
 		maximum := int64(256 << 20)
@@ -557,13 +715,26 @@ func verifyCommittedBundle(paths Paths, journal Journal, commit Commit) error {
 		name    string
 		mode    uint32
 		maximum int64
-	}{{"admin-token", 0o600, 4096}, {"host-fingerprint", 0o600, 4096}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
+	}{{"admin-token", 0o600, 4096}, {"default-rejection.crt", 0o644, nginx.MaximumGraphFileSize}, {"default-rejection.key", 0o600, nginx.MaximumGraphFileSize}, {"host-fingerprint", 0o600, 4096}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
 		if _, err := readCommittedArtifact(filepath.Join(paths.InstallationRoot, member.name), member.maximum, member.mode); err != nil {
 			return err
 		}
 	}
 	for path, digest := range journal.ArtifactDigests {
 		if path == "release_binary" || path == "installation_bundle" {
+			continue
+		}
+		if path == "default_rejection_certificate" {
+			data, err := readCommittedArtifact(filepath.Join(paths.InstallationRoot, "default-rejection.crt"), nginx.MaximumGraphFileSize, 0o644)
+			if err != nil || digestBytes(data) != digest {
+				return fmt.Errorf("default rejection certificate differs")
+			}
+			continue
+		}
+		if path == filepath.Join(paths.SystemdRoot, "nginx.service") {
+			if digest != digestBytes([]byte("/dev/null")) || verifyVendorNginxMask(path) != nil {
+				return fmt.Errorf("vendor Nginx unit mask differs")
+			}
 			continue
 		}
 		data, err := readCommittedArtifact(path, 256<<20, 0o755)

@@ -1,0 +1,684 @@
+// Package nginx owns LanPanel's closed Nginx configuration graph.
+package nginx
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"lanpanel/internal/filetxn"
+	"math/big"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	ManifestSchema       = "lanpanel.nginx.graph.v1"
+	DefaultWorkerTimeout = 10 * time.Second
+	MaximumGraphEntries  = 1024
+	MaximumGraphFileSize = 4 << 20
+	MainFileName         = "nginx.conf"
+	SanitizerFileName    = "header-sanitizer.conf"
+	ManifestFileName     = "graph.json"
+	AppsDirectory        = "apps-enabled"
+	ChallengesDirectory  = "challenges-enabled"
+	ControlDirectory     = "control-enabled"
+	TemporaryDirectory   = "temporary-enabled"
+	AuditMarker          = "# lanpanel rejection audit\n"
+)
+
+var resourcePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+
+type Paths struct {
+	ConfigRoot      string
+	StateRoot       string
+	AuditPath       string
+	CertificatePath string
+	PrivateKeyPath  string
+	PIDPath         string
+}
+
+func FixedPaths() Paths {
+	return Paths{
+		ConfigRoot:      "/etc/lanpanel/nginx",
+		StateRoot:       "/var/lib/lanpanel/nginx",
+		AuditPath:       "/var/log/lanpanel/nginx-rejections.log",
+		CertificatePath: "/var/lib/lanpanel/installation/default-rejection.crt",
+		PrivateKeyPath:  "/var/lib/lanpanel/installation/default-rejection.key",
+		PIDPath:         "/run/lanpanel/nginx.pid",
+	}
+}
+
+func (paths Paths) MainPath() string      { return filepath.Join(paths.ConfigRoot, MainFileName) }
+func (paths Paths) SanitizerPath() string { return filepath.Join(paths.ConfigRoot, SanitizerFileName) }
+func (paths Paths) ManifestPath() string  { return filepath.Join(paths.ConfigRoot, ManifestFileName) }
+func (paths Paths) StagingPath() string   { return filepath.Join(paths.ConfigRoot, ".lanpanel-filetxn") }
+
+type EntryKind string
+
+const (
+	EntryApp       EntryKind = "app"
+	EntryChallenge EntryKind = "challenge"
+	EntryControl   EntryKind = "control"
+	EntryTemporary EntryKind = "temporary"
+)
+
+type Entry struct {
+	Kind       EntryKind `json:"kind"`
+	ResourceID string    `json:"resource_id,omitempty"`
+	Relative   string    `json:"relative"`
+	Digest     string    `json:"digest"`
+	Domains    []string  `json:"domains,omitempty"`
+	Listeners  []string  `json:"listeners,omitempty"`
+	Generation uint64    `json:"generation"`
+}
+
+type Manifest struct {
+	SchemaVersion          string  `json:"schema_version"`
+	InstallationID         string  `json:"installation_id"`
+	GenerationID           string  `json:"generation_id"`
+	DefaultCertFingerprint string  `json:"default_certificate_fingerprint"`
+	MainDigest             string  `json:"main_digest"`
+	SanitizerDigest        string  `json:"sanitizer_digest"`
+	Entries                []Entry `json:"entries"`
+}
+
+type Baseline struct {
+	Files    map[string][]byte
+	Manifest Manifest
+}
+
+type DefaultCertificate struct {
+	CertificatePEM []byte
+	PrivateKeyPEM  []byte
+	Fingerprint    string
+	DNSName        string
+}
+
+func GenerateDefaultCertificate(installationID string, random io.Reader, now time.Time) (DefaultCertificate, error) {
+	if !validRef(installationID) || now.IsZero() {
+		return DefaultCertificate{}, fmt.Errorf("default rejection certificate authority is invalid")
+	}
+	if random == nil {
+		random = rand.Reader
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), random)
+	if err != nil {
+		return DefaultCertificate{}, fmt.Errorf("generate default rejection key: %w", err)
+	}
+	serialBytes := make([]byte, 16)
+	if _, err := io.ReadFull(random, serialBytes); err != nil {
+		return DefaultCertificate{}, fmt.Errorf("generate default rejection serial: %w", err)
+	}
+	serialBytes[0] |= 0x80
+	serial := new(big.Int).SetBytes(serialBytes)
+	dnsName, _ := ExpectedDefaultDNSName(installationID)
+	template := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: dnsName, Organization: []string{"LanPanel default rejection"}},
+		DNSNames:              []string{dnsName},
+		NotBefore:             now.UTC().Add(-5 * time.Minute),
+		NotAfter:              now.UTC().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(random, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return DefaultCertificate{}, fmt.Errorf("create default rejection certificate: %w", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return DefaultCertificate{}, err
+	}
+	fingerprint := sha256.Sum256(der)
+	return DefaultCertificate{
+		CertificatePEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		PrivateKeyPEM:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+		Fingerprint:    "sha256:" + hex.EncodeToString(fingerprint[:]),
+		DNSName:        dnsName,
+	}, nil
+}
+
+func ExpectedDefaultDNSName(installationID string) (string, error) {
+	if !validRef(installationID) {
+		return "", fmt.Errorf("installation identity is invalid")
+	}
+	nameSum := sha256.Sum256([]byte("lanpanel-default-rejection\x00" + installationID))
+	return hex.EncodeToString(nameSum[:16]) + ".lanpanel.invalid", nil
+}
+
+func ParseDefaultCertificate(certificatePEM, privateKeyPEM []byte) (DefaultCertificate, error) {
+	certificateBlock, rest := pem.Decode(certificatePEM)
+	if certificateBlock == nil || certificateBlock.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		return DefaultCertificate{}, fmt.Errorf("default rejection certificate PEM is invalid")
+	}
+	certificate, err := x509.ParseCertificate(certificateBlock.Bytes)
+	if err != nil || certificate.IsCA || certificate.SerialNumber == nil || certificate.SerialNumber.Sign() <= 0 || len(certificate.DNSNames) != 1 || !validDefaultDNSName(certificate.DNSNames[0]) || certificate.Subject.CommonName != certificate.DNSNames[0] || len(certificate.ExtKeyUsage) != 1 || certificate.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth || certificate.KeyUsage != x509.KeyUsageDigitalSignature || certificate.NotAfter.Before(certificate.NotBefore) || certificate.CheckSignature(certificate.SignatureAlgorithm, certificate.RawTBSCertificate, certificate.Signature) != nil {
+		return DefaultCertificate{}, fmt.Errorf("default rejection certificate identity is invalid")
+	}
+	keyBlock, rest := pem.Decode(privateKeyPEM)
+	if keyBlock == nil || keyBlock.Type != "PRIVATE KEY" || len(bytes.TrimSpace(rest)) != 0 {
+		return DefaultCertificate{}, fmt.Errorf("default rejection private key PEM is invalid")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	key, keyOK := parsed.(*ecdsa.PrivateKey)
+	publicKey, publicOK := certificate.PublicKey.(*ecdsa.PublicKey)
+	if err != nil || !keyOK || !publicOK || key.Curve != elliptic.P256() || key.PublicKey.X.Cmp(publicKey.X) != 0 || key.PublicKey.Y.Cmp(publicKey.Y) != 0 {
+		return DefaultCertificate{}, fmt.Errorf("default rejection certificate and key do not match")
+	}
+	fingerprint := sha256.Sum256(certificate.Raw)
+	return DefaultCertificate{CertificatePEM: append([]byte(nil), certificatePEM...), PrivateKeyPEM: append([]byte(nil), privateKeyPEM...), Fingerprint: "sha256:" + hex.EncodeToString(fingerprint[:]), DNSName: certificate.DNSNames[0]}, nil
+}
+
+func RenderBaseline(paths Paths, installationID, generationID, certificateFingerprint string) (Baseline, error) {
+	if err := validatePaths(paths); err != nil || !validRef(installationID) || !validRef(generationID) || !validDigest(certificateFingerprint) {
+		return Baseline{}, fmt.Errorf("baseline Nginx graph authority is invalid: %w", err)
+	}
+	main := []byte(renderMain(paths))
+	sanitizer := []byte(renderSanitizer())
+	manifest := Manifest{
+		SchemaVersion: ManifestSchema, InstallationID: installationID, GenerationID: generationID,
+		DefaultCertFingerprint: certificateFingerprint, MainDigest: digest(main), SanitizerDigest: digest(sanitizer), Entries: []Entry{},
+	}
+	manifestBytes, err := EncodeManifest(manifest)
+	if err != nil {
+		return Baseline{}, err
+	}
+	return Baseline{Files: map[string][]byte{paths.MainPath(): main, paths.SanitizerPath(): sanitizer, paths.ManifestPath(): manifestBytes, paths.AuditPath: []byte(AuditMarker)}, Manifest: manifest}, nil
+}
+
+func EncodeManifest(manifest Manifest) ([]byte, error) {
+	manifest.Entries = canonicalEntries(manifest.Entries)
+	if err := ValidateManifest(manifest); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func DecodeManifest(data []byte) (Manifest, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var manifest Manifest
+	if err := decoder.Decode(&manifest); err != nil {
+		return Manifest{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Manifest{}, fmt.Errorf("Nginx graph manifest has trailing data")
+	}
+	canonical, err := EncodeManifest(manifest)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return Manifest{}, fmt.Errorf("Nginx graph manifest is noncanonical")
+	}
+	return manifest, nil
+}
+
+func ValidateManifest(manifest Manifest) error {
+	if manifest.SchemaVersion != ManifestSchema || !validRef(manifest.InstallationID) || !validRef(manifest.GenerationID) || !validDigest(manifest.DefaultCertFingerprint) || !validDigest(manifest.MainDigest) || !validDigest(manifest.SanitizerDigest) || len(manifest.Entries) > MaximumGraphEntries {
+		return fmt.Errorf("Nginx graph manifest identity is invalid")
+	}
+	if !entriesEqual(manifest.Entries, canonicalEntries(manifest.Entries)) {
+		return fmt.Errorf("Nginx graph entries are noncanonical")
+	}
+	seenPath := map[string]bool{}
+	seenDomain := map[string]string{}
+	seenListener := map[string]string{}
+	for _, entry := range manifest.Entries {
+		if !validEntry(entry) || seenPath[entry.Relative] {
+			return fmt.Errorf("Nginx graph entry is invalid or duplicated")
+		}
+		seenPath[entry.Relative] = true
+		for _, domain := range entry.Domains {
+			if owner := seenDomain[domain]; owner != "" && owner != entry.ResourceID {
+				return fmt.Errorf("Nginx domain %q belongs to multiple resources", domain)
+			}
+			seenDomain[domain] = entry.ResourceID
+		}
+		for _, listener := range entry.Listeners {
+			if owner := seenListener[listener]; owner != "" && owner != entry.ResourceID {
+				return fmt.Errorf("Nginx listener %q belongs to multiple resources", listener)
+			}
+			seenListener[listener] = entry.ResourceID
+		}
+	}
+	return nil
+}
+
+func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
+	if err := validatePaths(paths); err != nil {
+		return Manifest{}, err
+	}
+	if paths == FixedPaths() {
+		for _, root := range []string{paths.ConfigRoot, paths.StateRoot, paths.CertificatePath, paths.PrivateKeyPath, paths.AuditPath, paths.PIDPath} {
+			if err := validateParentChain(root); err != nil {
+				return Manifest{}, err
+			}
+		}
+	}
+	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory), paths.StateRoot} {
+		if err := validateDirectory(directory, owner); err != nil {
+			return Manifest{}, err
+		}
+	}
+	manifestBytes, err := readRegular(paths.ManifestPath(), owner, 0o600, MaximumGraphFileSize)
+	if err != nil {
+		return Manifest{}, err
+	}
+	manifest, err := DecodeManifest(manifestBytes)
+	if err != nil {
+		return Manifest{}, err
+	}
+	main, err := readRegular(paths.MainPath(), owner, 0o600, MaximumGraphFileSize)
+	if err != nil || digest(main) != manifest.MainDigest || string(main) != renderMain(paths) {
+		return Manifest{}, fmt.Errorf("Nginx main config differs from the closed graph")
+	}
+	sanitizer, err := readRegular(paths.SanitizerPath(), owner, 0o600, MaximumGraphFileSize)
+	if err != nil || digest(sanitizer) != manifest.SanitizerDigest || string(sanitizer) != renderSanitizer() {
+		return Manifest{}, fmt.Errorf("Nginx sanitizer differs from the closed graph")
+	}
+	certificatePEM, err := readRegular(paths.CertificatePath, owner, 0o644, MaximumGraphFileSize)
+	if err != nil {
+		return Manifest{}, err
+	}
+	privateKeyPEM, err := readRegular(paths.PrivateKeyPath, owner, 0o600, MaximumGraphFileSize)
+	if err != nil {
+		return Manifest{}, err
+	}
+	certificate, err := ParseDefaultCertificate(certificatePEM, privateKeyPEM)
+	expectedDNS, dnsErr := ExpectedDefaultDNSName(manifest.InstallationID)
+	if err != nil || dnsErr != nil || certificate.Fingerprint != manifest.DefaultCertFingerprint || certificate.DNSName != expectedDNS {
+		return Manifest{}, fmt.Errorf("Nginx default rejection certificate fingerprint differs")
+	}
+	if err := validateAuditSink(paths.AuditPath, owner); err != nil {
+		return Manifest{}, err
+	}
+	rootEntries, err := os.ReadDir(paths.ConfigRoot)
+	if err != nil {
+		return Manifest{}, err
+	}
+	allowedRoot := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, TemporaryDirectory: true}
+	for _, item := range rootEntries {
+		if !allowedRoot[item.Name()] {
+			return Manifest{}, fmt.Errorf("foreign Nginx root graph entry %q", item.Name())
+		}
+	}
+	want := map[string]Entry{}
+	for _, entry := range manifest.Entries {
+		want[entry.Relative] = entry
+		data, err := readRegular(filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative)), owner, 0o600, MaximumGraphFileSize)
+		if err != nil || digest(data) != entry.Digest || validateEntryConfig(entry, data) != nil {
+			return Manifest{}, fmt.Errorf("Nginx graph entry %q differs from its manifest", entry.Relative)
+		}
+	}
+	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
+		entries, err := os.ReadDir(filepath.Join(paths.ConfigRoot, directory))
+		if err != nil {
+			return Manifest{}, err
+		}
+		for _, item := range entries {
+			relative := filepath.ToSlash(filepath.Join(directory, item.Name()))
+			if item.IsDir() || !want[relative].valid() {
+				return Manifest{}, fmt.Errorf("foreign Nginx include graph entry %q", relative)
+			}
+		}
+	}
+	staging, err := os.ReadDir(paths.StagingPath())
+	if err != nil || len(staging) != 0 {
+		return Manifest{}, fmt.Errorf("Nginx graph staging is not empty")
+	}
+	return manifest, nil
+}
+
+// Contract removes only manifest-bound App/challenge/temporary entries. It
+// never restores an enable after the caller has persisted contraction authority.
+func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs []string) (Manifest, []string, error) {
+	manifest, err := Audit(paths, owner)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	selected := map[string]bool{}
+	for _, id := range resourceIDs {
+		if !resourcePattern.MatchString(id) || selected[id] {
+			return Manifest{}, nil, fmt.Errorf("Nginx contraction resource inventory is invalid")
+		}
+		selected[id] = true
+	}
+	if len(selected) == 0 {
+		return manifest, []string{}, nil
+	}
+	txn, err := filetxn.Open(filetxn.Config{RootPath: paths.ConfigRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingPath: paths.StagingPath(), Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}}, filetxn.Options{})
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	defer txn.Close()
+	kept := make([]Entry, 0, len(manifest.Entries))
+	removed := []string{}
+	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
+	for _, entry := range manifest.Entries {
+		if !selected[entry.ResourceID] || entry.Kind == EntryControl {
+			kept = append(kept, entry)
+			continue
+		}
+		path := filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative))
+		result, removeErr := txn.Remove(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize})
+		if removeErr != nil || result.State != filetxn.StateDurable {
+			return Manifest{}, removed, fmt.Errorf("remove Nginx graph entry %q without rollback: %w", entry.Relative, removeErr)
+		}
+		removed = append(removed, path)
+	}
+	manifest.Entries = kept
+	data, err := EncodeManifest(manifest)
+	if err != nil {
+		return Manifest{}, removed, err
+	}
+	result, err := txn.Put(ctx, filetxn.Request{Path: paths.ManifestPath(), Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize}, data, filetxn.ReplaceOnly)
+	if err != nil || result.State != filetxn.StateDurable {
+		return Manifest{}, removed, fmt.Errorf("commit contracted Nginx graph manifest: %w", err)
+	}
+	contracted, err := Audit(paths, owner)
+	return contracted, removed, err
+}
+
+func renderMain(paths Paths) string {
+	return "user www-data;\n" +
+		"worker_processes auto;\n" +
+		"pid " + paths.PIDPath + ";\n" +
+		"error_log stderr notice;\n" +
+		"worker_shutdown_timeout 10s;\n" +
+		"events { worker_connections 1024; }\n" +
+		"http {\n" +
+		"  server_tokens off;\n" +
+		"  access_log off;\n" +
+		"  include " + paths.SanitizerPath() + ";\n" +
+		"  log_format lanpanel_rejection '$msec $remote_addr $server_port $ssl_server_name $host $status $http_x_lanpanel_closure_id';\n" +
+		"  server {\n" +
+		"    listen 80 default_server;\n" +
+		"    listen [::]:80 default_server;\n" +
+		"    server_name _;\n" +
+		"    access_log " + paths.AuditPath + " lanpanel_rejection;\n" +
+		"    add_header X-LanPanel-Rejection default always;\n" +
+		"    return 421;\n" +
+		"  }\n" +
+		"  server {\n" +
+		"    listen 443 ssl default_server;\n" +
+		"    listen [::]:443 ssl default_server;\n" +
+		"    server_name _;\n" +
+		"    ssl_certificate " + paths.CertificatePath + ";\n" +
+		"    ssl_certificate_key " + paths.PrivateKeyPath + ";\n" +
+		"    ssl_protocols TLSv1.2 TLSv1.3;\n" +
+		"    access_log " + paths.AuditPath + " lanpanel_rejection;\n" +
+		"    add_header X-LanPanel-Rejection default always;\n" +
+		"    return 421;\n" +
+		"  }\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, ControlDirectory, "*.conf") + ";\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, ChallengesDirectory, "*.conf") + ";\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, AppsDirectory, "*.conf") + ";\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, TemporaryDirectory, "*.conf") + ";\n" +
+		"}\n"
+}
+
+func renderSanitizer() string {
+	headers := []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port", "X-Real-IP", "X-Client-IP", "X-Cluster-Client-IP", "X-Original-Forwarded-For", "CF-Connecting-IP", "True-Client-IP", "EO-Connecting-IP", "EO-Client-IP", "X-LanPanel-Closure-ID"}
+	var output strings.Builder
+	output.WriteString("# release-owned fixed identity-header sanitizer\n")
+	for _, header := range headers {
+		fmt.Fprintf(&output, "proxy_set_header %s \"\";\n", header)
+	}
+	output.WriteString("proxy_set_header X-Real-IP $remote_addr;\n")
+	output.WriteString("proxy_set_header X-Forwarded-For $remote_addr;\n")
+	output.WriteString("proxy_set_header X-Forwarded-Host $host;\n")
+	output.WriteString("proxy_set_header X-Forwarded-Proto $scheme;\n")
+	return output.String()
+}
+
+func HeaderSanitizer() string { return renderSanitizer() }
+
+func DomainSNIGuard(domains []string) (string, error) {
+	if len(domains) == 0 || len(domains) > 256 {
+		return "", fmt.Errorf("domain SNI guard requires an exact bounded domain set")
+	}
+	copyDomains := append([]string(nil), domains...)
+	sort.Strings(copyDomains)
+	for index, domain := range copyDomains {
+		if !validDomain(domain) || index > 0 && copyDomains[index-1] == domain {
+			return "", fmt.Errorf("domain SNI guard contains invalid or duplicate domain")
+		}
+	}
+	quoted := make([]string, len(copyDomains))
+	for index, domain := range copyDomains {
+		quoted[index] = regexp.QuoteMeta(domain)
+	}
+	return "if ($ssl_server_name !~ ^(?:" + strings.Join(quoted, "|") + ")$) { return 421; }\n", nil
+}
+
+func (entry Entry) valid() bool { return validEntry(entry) }
+func validEntry(entry Entry) bool {
+	if entry.Generation == 0 || !validDigest(entry.Digest) || filepath.IsAbs(entry.Relative) || filepath.Clean(entry.Relative) != entry.Relative || strings.Contains(entry.Relative, "\\") || filepath.Ext(entry.Relative) != ".conf" {
+		return false
+	}
+	prefix := strings.Split(entry.Relative, string(filepath.Separator))[0]
+	switch entry.Kind {
+	case EntryApp:
+		if prefix != AppsDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) == 0 {
+			return false
+		}
+	case EntryChallenge:
+		if prefix != ChallengesDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) != 1 {
+			return false
+		}
+	case EntryControl:
+		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 {
+			return false
+		}
+	case EntryTemporary:
+		if prefix != TemporaryDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) != 0 || len(entry.Listeners) != 1 {
+			return false
+		}
+	default:
+		return false
+	}
+	for index, domain := range entry.Domains {
+		if !validDomain(domain) || index > 0 && entry.Domains[index-1] >= domain {
+			return false
+		}
+	}
+	for index, listener := range entry.Listeners {
+		if !validRef(listener) || index > 0 && entry.Listeners[index-1] >= listener {
+			return false
+		}
+	}
+	return true
+}
+
+func entriesEqual(left, right []Entry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Kind != right[index].Kind || left[index].ResourceID != right[index].ResourceID || left[index].Relative != right[index].Relative || left[index].Digest != right[index].Digest || left[index].Generation != right[index].Generation || !slices.Equal(left[index].Domains, right[index].Domains) || !slices.Equal(left[index].Listeners, right[index].Listeners) {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalEntries(entries []Entry) []Entry {
+	result := append([]Entry(nil), entries...)
+	for index := range result {
+		result[index].Domains = append([]string(nil), result[index].Domains...)
+		result[index].Listeners = append([]string(nil), result[index].Listeners...)
+		sort.Strings(result[index].Domains)
+		sort.Strings(result[index].Listeners)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].Relative < result[right].Relative })
+	if result == nil {
+		return []Entry{}
+	}
+	return result
+}
+
+func validatePaths(paths Paths) error {
+	for name, path := range map[string]string{"config": paths.ConfigRoot, "state": paths.StateRoot, "audit": paths.AuditPath, "certificate": paths.CertificatePath, "private_key": paths.PrivateKeyPath, "pid": paths.PIDPath} {
+		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
+			return fmt.Errorf("Nginx %s path is invalid", name)
+		}
+	}
+	return nil
+}
+
+func validateParentChain(path string) error {
+	current := filepath.Dir(path)
+	for {
+		var stat unix.Stat_t
+		if err := unix.Lstat(current, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
+			return fmt.Errorf("Nginx graph parent %q is unsafe", current)
+		}
+		if current == "/" {
+			return nil
+		}
+		current = filepath.Dir(current)
+	}
+}
+
+// RenderClosedEntry is the only S11 entry renderer. It deliberately emits an
+// inert include while binding every declared identity. Later typed publication
+// and control renderers replace this closed representation; Audit never accepts
+// free-form Nginx directives as an entry implementation.
+func RenderClosedEntry(entry Entry) ([]byte, error) {
+	if !validEntry(entry) {
+		return nil, fmt.Errorf("Nginx graph entry authority is invalid")
+	}
+	binding := struct {
+		Kind       EntryKind `json:"kind"`
+		ResourceID string    `json:"resource_id,omitempty"`
+		Relative   string    `json:"relative"`
+		Domains    []string  `json:"domains,omitempty"`
+		Listeners  []string  `json:"listeners,omitempty"`
+		Generation uint64    `json:"generation"`
+	}{entry.Kind, entry.ResourceID, entry.Relative, entry.Domains, entry.Listeners, entry.Generation}
+	data, err := json.Marshal(binding)
+	if err != nil {
+		return nil, err
+	}
+	return []byte("# lanpanel closed graph entry v1\n# " + string(data) + "\n"), nil
+}
+
+func validateEntryConfig(entry Entry, data []byte) error {
+	expected, err := RenderClosedEntry(entry)
+	if err != nil || !bytes.Equal(data, expected) {
+		return fmt.Errorf("Nginx graph entry is not its exact closed rendering")
+	}
+	return nil
+}
+
+func validateDirectory(path string, owner filetxn.Owner) error {
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != owner.UID || stat.Gid != owner.GID {
+		return fmt.Errorf("Nginx graph directory %q is unsafe", path)
+	}
+	return nil
+}
+
+func readRegular(path string, owner filetxn.Owner, mode fs.FileMode, maximum int64) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("wrap Nginx graph descriptor")
+	}
+	defer file.Close()
+	var before, after unix.Stat_t
+	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Mode&0o7777 != uint32(mode.Perm()) || before.Uid != owner.UID || before.Gid != owner.GID || before.Nlink != 1 || before.Size <= 0 || before.Size > maximum {
+		return nil, fmt.Errorf("Nginx graph file %q has unsafe metadata", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil || int64(len(data)) != before.Size || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim {
+		return nil, fmt.Errorf("Nginx graph file %q changed while read", path)
+	}
+	return data, nil
+}
+
+func validateAuditSink(path string, owner filetxn.Owner) error {
+	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Nlink != 1 {
+		return fmt.Errorf("Nginx rejection audit sink is unsafe")
+	}
+	return nil
+}
+
+func digest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+func validDigest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value[7:])
+	return err == nil
+}
+func validRef(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= 256 && !strings.ContainsAny(value, "\x00\r\n")
+}
+func validDefaultDNSName(value string) bool {
+	if !strings.HasSuffix(value, ".lanpanel.invalid") || strings.Count(value, ".") != 2 {
+		return false
+	}
+	prefix := strings.TrimSuffix(value, ".lanpanel.invalid")
+	if len(prefix) != 32 || strings.ToLower(prefix) != prefix {
+		return false
+	}
+	_, err := hex.DecodeString(prefix)
+	return err == nil
+}
+
+func validDomain(value string) bool {
+	if value == "" || value != strings.ToLower(value) || len(value) > 253 || strings.ContainsAny(value, "*:/ ") {
+		return false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || len(part) > 63 || part[0] == '-' || part[len(part)-1] == '-' {
+			return false
+		}
+		for _, character := range part {
+			if character != '-' && (character < 'a' || character > 'z') && (character < '0' || character > '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
