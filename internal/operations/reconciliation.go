@@ -434,7 +434,7 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 		ResourceIDs:        append([]string(nil), journal.ResourceIDs...),
 	}
 	switch journal.Kind {
-	case JournalNonIngressLocalCommit:
+	case JournalNonIngressLocalCommit, JournalPackageTransaction:
 		if journal.Phase != JournalTerminal || len(journal.ChildIDs) == 0 || !allSucceeded {
 			return ExactReconciliationDecision{}, fmt.Errorf("non-ingress local commit lacks a terminal successful child result")
 		}

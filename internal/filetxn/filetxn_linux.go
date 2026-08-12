@@ -325,6 +325,54 @@ func (store *Store) Put(ctx context.Context, request Request, data []byte, dispo
 	return result, nil
 }
 
+func (store *Store) Read(ctx context.Context, request Request) ([]byte, error) {
+	if request.Existing == nil || request.Path == "" || request.MaxBytes <= 0 || request.MaxBytes > MaximumContentBytes || validateMetadata(*request.Existing) != nil || validateDirectoryPolicy(request.Parents) != nil {
+		return nil, fmt.Errorf("file transaction read request is invalid")
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.closed {
+		return nil, fmt.Errorf("file transaction store is closed")
+	}
+	if err := store.revalidateProtectedPaths(); err != nil {
+		return nil, err
+	}
+	parentFD, base, err := store.openParent(request.Path, request.Parents)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(parentFD)
+	before, exists, err := inspectTarget(parentFD, base, uint64(store.rootStat.Dev), request.Existing)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fs.ErrNotExist
+	}
+	fd, err := unix.Openat(parentFD, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), base)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("file transaction read descriptor is invalid")
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, request.MaxBytes+1))
+	if err != nil || int64(len(data)) > request.MaxBytes {
+		return nil, fmt.Errorf("file transaction read is unavailable or oversized")
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil || compareIdentity(after, before) != nil || after.Size != int64(len(data)) || after.Mtim != before.Mtim {
+		return nil, fmt.Errorf("file transaction target changed while reading")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 func (store *Store) Remove(ctx context.Context, request Request) (Result, error) {
 	result := Result{TargetPath: request.Path, State: StateUnchanged}
 	if err := validateRemoveRequest(request); err != nil {

@@ -35,6 +35,7 @@ const (
 	CertificateExpiry       Type = "certificate_expiry"
 	EdgeOneExpiry           Type = "edgeone_expiry"
 	Maintenance             Type = "maintenance"
+	PackageTransaction      Type = "package_transaction"
 	Upgrade                 Type = "upgrade"
 	BackupEnter             Type = "backup_enter"
 	AutomaticReconciliation Type = "automatic_exact_journal_reconciliation"
@@ -142,6 +143,7 @@ type JournalPhase string
 
 const (
 	JournalNonIngressLocalCommit JournalKind = "non_ingress_local_commit"
+	JournalPackageTransaction    JournalKind = "package_transaction"
 	JournalAppContraction        JournalKind = "app_contraction"
 
 	JournalPrepared JournalPhase = "prepared"
@@ -1646,6 +1648,10 @@ func validateJournalRecord(value JournalRecord) error {
 		if value.Operation != Maintenance && value.Operation != BackupEnter {
 			return fmt.Errorf("non-ingress journal operation is not allowed")
 		}
+	} else if value.Kind == JournalPackageTransaction {
+		if value.Operation != PackageTransaction || value.Target != string(plans.TargetInstallation) || len(value.ResourceIDs) != 0 {
+			return fmt.Errorf("package journal operation or target is invalid")
+		}
 	} else if value.Kind == JournalAppContraction {
 		switch value.Operation {
 		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
@@ -2095,7 +2101,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
 		return true
 	}
 	return false
@@ -2141,7 +2147,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("Plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, Maintenance, BackupEnter:
+		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, BackupEnter:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}

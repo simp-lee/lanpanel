@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -16,7 +17,7 @@ import (
 )
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessProbe, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxTest, ProfileSystemctl, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessProbe, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxTest, ProfileSystemctl, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -30,6 +31,47 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	}
 	if _, err := ResolveProfile(ProfileID("shell"), Identities{}); err == nil {
 		t.Fatal("unknown arbitrary executable profile was accepted")
+	}
+}
+
+func TestPackageInvocationsDeriveOnlyExactAPTArguments(t *testing.T) {
+	invocation := Invocation{Package: &PackageInvocation{TransactionID: "pkg_" + strings.Repeat("a", 64), LockWaitSeconds: 30, Packages: []PackageArgument{
+		{Name: "apache2-utils", Version: "2.4.62-1", Digest: strings.Repeat("b", 64), Bytes: 1024, MaximumInstalledFileBytes: 8 << 20},
+		{Name: "nginx", Version: "1.22.1-9", Digest: strings.Repeat("c", 64), Bytes: 2048, MaximumInstalledFileBytes: 16 << 20},
+	}}}
+	distro, err := ResolveInvocation(ProfileAPTTransaction, Identities{}, invocation)
+	if err != nil || !distro.Complete || distro.Network != NetworkHostQualified || !slices.Contains(distro.Arguments, "nginx=1.22.1-9") {
+		t.Fatalf("distro profile=%#v error=%v", distro, err)
+	}
+	offlineInvocation := invocation
+	offlinePackage := *invocation.Package
+	offlineInvocation.Package = &offlinePackage
+	offlineInvocation.Package.Staged = true
+	offline, err := ResolveInvocation(ProfileAPTOfflineTransaction, Identities{}, offlineInvocation)
+	wantPath := "/var/lib/lanpanel/packages/staging/" + invocation.Package.TransactionID + "/" + strings.Repeat("c", 64) + ".deb"
+	if err != nil || !offline.Complete || offline.Network != NetworkNoSockets || !slices.Contains(offline.Arguments, "--no-download") || !slices.Contains(offline.Arguments, wantPath) {
+		t.Fatalf("offline profile=%#v error=%v", offline, err)
+	}
+	bad := invocation
+	copyPackage := *invocation.Package
+	bad.Package = &copyPackage
+	bad.Package.Packages = append([]PackageArgument(nil), invocation.Package.Packages...)
+	bad.Package.Packages[0].Name = "--option"
+	if _, err := ResolveInvocation(ProfileAPTTransaction, Identities{}, bad); err == nil {
+		t.Fatal("package flag injection was accepted")
+	}
+}
+
+func TestFixedProfilesContainNoForbiddenUtilityExecutable(t *testing.T) {
+	forbidden := map[string]bool{"curl": true, "wget": true, "sha256sum": true, "tar": true, "unzip": true, "openssl": true, "install": true, "cp": true, "mv": true, "rm": true, "ln": true, "chmod": true, "chown": true}
+	for _, id := range FixedProfileIDs() {
+		profile, err := ResolveProfile(id, Identities{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if forbidden[filepath.Base(profile.Executable)] {
+			t.Fatalf("forbidden utility executable in %s: %s", id, profile.Executable)
+		}
 	}
 }
 
@@ -66,6 +108,17 @@ func TestExecutableValidationRejectsLinksAndWritablePaths(t *testing.T) {
 	}
 	if err := verifyRootExecutable(link); err == nil {
 		t.Fatal("symlink executable was accepted")
+	}
+}
+
+func TestNoNetworkProfilesDenyINETAndAllowOnlyUnixSockets(t *testing.T) {
+	profile, err := ResolveInvocation(ProfileAPTOfflineTransaction, Identities{}, Invocation{Package: &PackageInvocation{TransactionID: "pkg_" + strings.Repeat("a", 64), LockWaitSeconds: 30, Staged: true, Packages: []PackageArgument{{Name: "nginx", Version: "1.22.1-9", Digest: strings.Repeat("b", 64), Bytes: 1024, MaximumInstalledFileBytes: 8 << 20}}}})
+	if err != nil || profile.Network != NetworkNoSockets || len(profile.AllowedAddressFamilies) != 0 {
+		t.Fatalf("offline profile=%#v error=%v", profile, err)
+	}
+	filter, err := addressFamilyFilter(profile.AllowedAddressFamilies)
+	if err != nil || len(filter) != 4 || filter[2].K&uint32(syscall.EAFNOSUPPORT) == 0 {
+		t.Fatalf("address-family filter=%#v error=%v", filter, err)
 	}
 }
 
@@ -122,6 +175,16 @@ func TestProcessGroupStatParsingIsExact(t *testing.T) {
 		if _, _, err := parseProcStat(malformed); err == nil {
 			t.Fatalf("malformed process stat was accepted: %q", malformed)
 		}
+	}
+}
+
+func TestAPTSimulationReturnsOnlyCanonicalExactChanges(t *testing.T) {
+	changes, err := parseAPTSimulation([]byte("Reading package lists...\nInst nginx (1.22.1-9 Debian [amd64])\nInst apache2-utils (2.4.62-1 Debian [amd64])\nConf nginx (1.22.1-9 Debian [amd64])\n"))
+	if err != nil || len(changes) != 2 || changes[0].Name != "apache2-utils" || changes[1].Version != "1.22.1-9" {
+		t.Fatalf("changes=%#v error=%v", changes, err)
+	}
+	if _, err := parseAPTSimulation([]byte("Remv nginx [1.22.1]\n")); err == nil {
+		t.Fatal("APT simulation removal was accepted")
 	}
 }
 

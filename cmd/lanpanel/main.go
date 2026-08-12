@@ -5,13 +5,18 @@ import (
 	"io"
 	"lanpanel/internal/child"
 	"lanpanel/internal/helper"
+	"lanpanel/internal/packages"
 	"lanpanel/internal/roles"
 	"os"
+	"path/filepath"
 )
 
 var version = "dev"
 
 func main() {
+	if filepath.Base(os.Args[0]) == "policy-rc.d" {
+		os.Exit(packages.NoAutostartExitCode(os.Args[1:]))
+	}
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/helperproto"
+	"lanpanel/internal/packages"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -37,7 +39,27 @@ func RunRole(args []string) error {
 	if err != nil {
 		return err
 	}
-	server, err := NewServer(config.Identities, nil, Options{})
+	packageService, err := packages.OpenFixedService()
+	if err != nil {
+		return fmt.Errorf("open fixed package transaction service: %w", err)
+	}
+	defer packageService.Close()
+	packageHandler := PackageTransactionHandler(
+		func(ctx context.Context, caller helperproto.Caller, request helperproto.Request) error {
+			if caller != helperproto.CallerUI {
+				return fmt.Errorf("package transaction caller is unauthorized")
+			}
+			return packageService.ValidateRequest(ctx, request)
+		},
+		func(ctx context.Context, caller helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+			if caller != helperproto.CallerUI || secret != nil {
+				return ExecutionResult{}, fmt.Errorf("package transaction execution authority is invalid")
+			}
+			digest, err := packageService.Execute(ctx, request)
+			return ExecutionResult{ResultDigest: digest}, err
+		},
+	)
+	server, err := NewServer(config.Identities, []Registration{packageHandler}, Options{})
 	if err != nil {
 		return err
 	}

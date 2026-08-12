@@ -7,7 +7,9 @@ package child
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,16 +17,19 @@ import (
 type ProfileID string
 
 const (
-	ProfileSystemdSysusers ProfileID = "systemd_sysusers"
-	ProfileAPTTransaction  ProfileID = "apt_transaction"
-	ProfileDPKGTransaction ProfileID = "dpkg_transaction"
-	ProfileSystemctl       ProfileID = "systemctl"
-	ProfileNginxTest       ProfileID = "nginx_test"
-	ProfileHeadscaleAdmin  ProfileID = "headscale_admin"
-	ProfileGoAccessProbe   ProfileID = "goaccess_probe"
-	ProfileLego            ProfileID = "lego"
-	ProfileHTPasswd        ProfileID = "htpasswd"
-	ProfileTailscaleAdmin  ProfileID = "tailscale_admin"
+	ProfileSystemdSysusers       ProfileID = "systemd_sysusers"
+	ProfileAPTDownload           ProfileID = "apt_download"
+	ProfileAPTSimulate           ProfileID = "apt_simulate"
+	ProfileAPTTransaction        ProfileID = "apt_transaction"
+	ProfileAPTOfflineTransaction ProfileID = "apt_offline_transaction"
+	ProfileDPKGTransaction       ProfileID = "dpkg_transaction"
+	ProfileSystemctl             ProfileID = "systemctl"
+	ProfileNginxTest             ProfileID = "nginx_test"
+	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
+	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
+	ProfileLego                  ProfileID = "lego"
+	ProfileHTPasswd              ProfileID = "htpasswd"
+	ProfileTailscaleAdmin        ProfileID = "tailscale_admin"
 )
 
 type IdentityKind string
@@ -43,6 +48,7 @@ type NetworkPolicy string
 const (
 	NetworkHostQualified NetworkPolicy = "host_qualified"
 	NetworkNone          NetworkPolicy = "none"
+	NetworkNoSockets     NetworkPolicy = "none_no_sockets"
 	NetworkProviderOnly  NetworkPolicy = "provider_only"
 	NetworkLocalAPIOnly  NetworkPolicy = "local_api_only"
 )
@@ -61,22 +67,48 @@ type Identities struct {
 	TailscaleOperator Identity
 }
 
+type PackageChange struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type PackageArgument struct {
+	Name                      string `json:"name"`
+	Version                   string `json:"version"`
+	Digest                    string `json:"digest"`
+	Bytes                     int64  `json:"bytes"`
+	MaximumInstalledFileBytes int64  `json:"maximum_installed_file_bytes"`
+}
+
+type Invocation struct {
+	Package *PackageInvocation `json:"package,omitempty"`
+}
+
+type PackageInvocation struct {
+	TransactionID   string            `json:"transaction_id"`
+	LockWaitSeconds uint32            `json:"lock_wait_seconds"`
+	Staged          bool              `json:"staged"`
+	Packages        []PackageArgument `json:"packages"`
+}
+
 type Profile struct {
-	ID                  ProfileID
-	Executable          string
-	Arguments           []string
-	Environment         []string
-	IdentityKind        IdentityKind
-	UID                 uint32
-	GID                 uint32
-	Chroot              string
-	Network             NetworkPolicy
-	AllowedCapabilities []int
-	Timeout             time.Duration
-	MaximumInputBytes   int
-	MaximumOutputBytes  int
-	RootTCB             bool
-	Complete            bool
+	ID                     ProfileID
+	Executable             string
+	Arguments              []string
+	Environment            []string
+	IdentityKind           IdentityKind
+	UID                    uint32
+	GID                    uint32
+	Chroot                 string
+	Network                NetworkPolicy
+	AllowedAddressFamilies []int
+	AllowedCapabilities    []int
+	Timeout                time.Duration
+	MaximumInputBytes      int
+	MaximumOutputBytes     int
+	MaximumFileBytes       uint64
+	RootTCB                bool
+	Complete               bool
 }
 
 var catalog = map[ProfileID]Profile{
@@ -85,14 +117,17 @@ var catalog = map[ProfileID]Profile{
 	// The remaining profiles are deliberately unavailable until their owning
 	// component supplies its release-fixed argv, identity, chroot, and network
 	// qualification. There is no root or generic-exec fallback.
-	ProfileAPTTransaction:  {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
-	ProfileDPKGTransaction: {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
-	ProfileSystemctl:       {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
-	ProfileHeadscaleAdmin:  {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
-	ProfileGoAccessProbe:   {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
-	ProfileLego:            {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},
-	ProfileHTPasswd:        {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNone},
-	ProfileTailscaleAdmin:  {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
+	ProfileAPTDownload:           {ID: ProfileAPTDownload, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
+	ProfileAPTSimulate:           {ID: ProfileAPTSimulate, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
+	ProfileAPTTransaction:        {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
+	ProfileAPTOfflineTransaction: {ID: ProfileAPTOfflineTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNoSockets, RootTCB: true},
+	ProfileDPKGTransaction:       {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", Arguments: []string{"--audit"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: packageCapabilities(), Timeout: 2 * time.Minute, MaximumOutputBytes: 256 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctl:             {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
+	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
+	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},
+	ProfileHTPasswd:              {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNone},
+	ProfileTailscaleAdmin:        {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
 }
 
 func FixedProfileIDs() []ProfileID {
@@ -132,6 +167,11 @@ func ResolveProfile(id ProfileID, identities Identities) (Profile, error) {
 	}
 	profile.Arguments = append([]string(nil), profile.Arguments...)
 	profile.Environment = append([]string(nil), profile.Environment...)
+	if profile.Network == NetworkNone && len(profile.AllowedAddressFamilies) == 0 {
+		profile.AllowedAddressFamilies = []int{1}
+	} else {
+		profile.AllowedAddressFamilies = append([]int(nil), profile.AllowedAddressFamilies...)
+	}
 	profile.AllowedCapabilities = append([]int(nil), profile.AllowedCapabilities...)
 	if err := validateProfile(profile); err != nil {
 		return Profile{}, err
@@ -139,8 +179,82 @@ func ResolveProfile(id ProfileID, identities Identities) (Profile, error) {
 	return profile, nil
 }
 
+var (
+	packageTransactionPattern = regexp.MustCompile(`^pkg_[0-9a-f]{64}$`)
+	packageNamePattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{0,127}$`)
+	packageVersionPattern     = regexp.MustCompile(`^[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+	packageDigestPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+func ResolveInvocation(id ProfileID, identities Identities, invocation Invocation) (Profile, error) {
+	profile, err := ResolveProfile(id, identities)
+	if err != nil {
+		return Profile{}, err
+	}
+	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
+		if invocation.Package != nil {
+			return Profile{}, fmt.Errorf("external child profile rejects package invocation")
+		}
+		return profile, nil
+	}
+	if invocation.Package == nil || !packageTransactionPattern.MatchString(invocation.Package.TransactionID) || invocation.Package.LockWaitSeconds == 0 || invocation.Package.LockWaitSeconds > 300 || len(invocation.Package.Packages) == 0 || len(invocation.Package.Packages) > 256 || (id == ProfileAPTDownload || id == ProfileAPTTransaction) && invocation.Package.Staged || id == ProfileAPTOfflineTransaction && !invocation.Package.Staged {
+		return Profile{}, fmt.Errorf("package child invocation authority is invalid")
+	}
+	arguments := []string{
+		"-c", "/var/lib/lanpanel/packages/transactions/" + invocation.Package.TransactionID + "/apt.conf",
+		"-o", "APT::Get::Assume-Yes=true",
+		"-o", "APT::Install-Recommends=false",
+		"-o", "APT::Install-Suggests=false",
+		"-o", "APT::Get::AllowUnauthenticated=false",
+		"-o", "Acquire::AllowInsecureRepositories=false",
+		"-o", "Dpkg::Use-Pty=0",
+		"-o", "DPkg::Options::=--force-confold",
+		"-o", "DPkg::Lock::Timeout=" + strconv.FormatUint(uint64(invocation.Package.LockWaitSeconds), 10),
+		"--no-remove",
+	}
+	if id == ProfileAPTDownload {
+		arguments = append(arguments, "--download-only")
+	} else if id == ProfileAPTSimulate {
+		arguments = append(arguments, "--simulate", "--no-download")
+	} else if id == ProfileAPTOfflineTransaction {
+		arguments = append(arguments, "--no-download")
+	}
+	arguments = append(arguments, "install")
+	previous := ""
+	maximumFileBytes := int64(64 << 20)
+	for _, pkg := range invocation.Package.Packages {
+		if !packageNamePattern.MatchString(pkg.Name) || !packageVersionPattern.MatchString(pkg.Version) || !packageDigestPattern.MatchString(pkg.Digest) || pkg.Bytes <= 0 || pkg.Bytes > 4<<30 || pkg.MaximumInstalledFileBytes <= 0 || pkg.MaximumInstalledFileBytes > 4<<30 || previous != "" && strings.Compare(previous, pkg.Name) >= 0 {
+			return Profile{}, fmt.Errorf("package child closure is invalid, duplicated, or unsorted")
+		}
+		if id == ProfileAPTOfflineTransaction || id == ProfileAPTSimulate && invocation.Package.Staged {
+			arguments = append(arguments, "/var/lib/lanpanel/packages/staging/"+invocation.Package.TransactionID+"/"+pkg.Digest+".deb")
+		} else {
+			arguments = append(arguments, pkg.Name+"="+pkg.Version)
+		}
+		maximumFileBytes = max(maximumFileBytes, pkg.Bytes, pkg.MaximumInstalledFileBytes)
+		previous = pkg.Name
+	}
+	profile.Arguments = arguments
+	profile.Environment = []string{"APT_LISTCHANGES_FRONTEND=none", "DEBIAN_FRONTEND=noninteractive", "LANG=C", "LC_ALL=C"}
+	if id != ProfileAPTSimulate {
+		profile.AllowedCapabilities = packageCapabilities()
+	}
+	profile.Timeout = 30 * time.Minute
+	profile.MaximumOutputBytes = 1 << 20
+	profile.MaximumFileBytes = uint64(maximumFileBytes)
+	profile.Complete = true
+	if err := validateProfile(profile); err != nil {
+		return Profile{}, err
+	}
+	return profile, nil
+}
+
+func packageCapabilities() []int {
+	return []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 18, 27, 29, 31}
+}
+
 func validateProfile(profile Profile) error {
-	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 {
+	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 || profile.MaximumFileBytes > 4<<30 {
 		return fmt.Errorf("external child profile shape is invalid")
 	}
 	for _, argument := range profile.Arguments {
@@ -151,6 +265,20 @@ func validateProfile(profile Profile) error {
 	for _, value := range profile.Environment {
 		if len(value) > 1024 || strings.ContainsAny(value, "\x00\r\n") || !strings.Contains(value, "=") {
 			return fmt.Errorf("external child clean environment is invalid")
+		}
+	}
+	if profile.Network == NetworkNoSockets {
+		if len(profile.AllowedAddressFamilies) != 0 {
+			return fmt.Errorf("no-socket child cannot allow an address family")
+		}
+	} else if profile.Network == NetworkNone {
+		if !slices.IsSorted(profile.AllowedAddressFamilies) || len(profile.AllowedAddressFamilies) == 0 {
+			return fmt.Errorf("no-network child lacks an exact address-family policy")
+		}
+		for _, family := range profile.AllowedAddressFamilies {
+			if family != 1 {
+				return fmt.Errorf("no-network child address family is outside the AF_UNIX closure")
+			}
 		}
 	}
 	if !profile.RootTCB && profile.Complete && (profile.UID == 0 || profile.GID == 0 || profile.Chroot == "" || len(profile.AllowedCapabilities) != 0) {

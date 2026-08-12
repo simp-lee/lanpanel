@@ -3,6 +3,7 @@
 package child
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -16,11 +17,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,16 +40,18 @@ type Launcher struct {
 }
 
 type Result struct {
-	ExitCode     int
-	StdoutDigest string
-	StderrDigest string
-	OutputCutOff bool
+	ExitCode       int
+	StdoutDigest   string
+	StderrDigest   string
+	OutputCutOff   bool
+	PackageChanges []PackageChange
 }
 
 type bootstrapInstruction struct {
 	SchemaVersion string     `json:"schema_version"`
 	ProfileID     ProfileID  `json:"profile_id"`
 	Identities    Identities `json:"identities"`
+	Invocation    Invocation `json:"invocation"`
 	HasInput      bool       `json:"has_input"`
 }
 
@@ -58,13 +63,17 @@ func NewLauncher(selfExecutable string, identities Identities) (*Launcher, error
 }
 
 func (launcher *Launcher) Run(ctx context.Context, profileID ProfileID, input []byte) (Result, error) {
+	return launcher.RunInvocation(ctx, profileID, Invocation{}, input)
+}
+
+func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID, invocation Invocation, input []byte) (Result, error) {
 	if launcher == nil || os.Geteuid() != 0 {
 		return Result{}, fmt.Errorf("external child launch requires the root helper")
 	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	profile, err := ResolveProfile(profileID, launcher.identities)
+	profile, err := ResolveInvocation(profileID, launcher.identities, invocation)
 	if err != nil {
 		return Result{}, err
 	}
@@ -80,7 +89,7 @@ func (launcher *Launcher) Run(ctx context.Context, profileID ProfileID, input []
 	if err := verifyRootExecutable(profile.Executable); err != nil {
 		return Result{}, fmt.Errorf("external child executable: %w", err)
 	}
-	instruction := bootstrapInstruction{SchemaVersion: bootstrapSchema, ProfileID: profileID, Identities: launcher.identities, HasInput: len(input) != 0}
+	instruction := bootstrapInstruction{SchemaVersion: bootstrapSchema, ProfileID: profileID, Identities: launcher.identities, Invocation: invocation, HasInput: len(input) != 0}
 	instructionBytes, err := json.Marshal(instruction)
 	if err != nil || len(instructionBytes) > maximumBootstrapBytes {
 		return Result{}, fmt.Errorf("encode child bootstrap instruction")
@@ -101,7 +110,7 @@ func (launcher *Launcher) Run(ctx context.Context, profileID ProfileID, input []
 	command.Env = []string{}
 	command.ExtraFiles = []*os.File{instructionRead, inputRead}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	stdout := newDigestWriter(profile.MaximumOutputBytes)
+	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
 	if err := ctx.Err(); err != nil {
@@ -155,7 +164,15 @@ func (launcher *Launcher) Run(ctx context.Context, profileID ProfileID, input []
 	if command.ProcessState != nil {
 		exitCode = command.ProcessState.ExitCode()
 	}
-	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff()}
+	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
+	if profileID == ProfileAPTSimulate && exitCode == 0 && !result.OutputCutOff {
+		changes, parseErr := parseAPTSimulation(stdout.Bytes())
+		if parseErr != nil {
+			terminalErr = errors.Join(terminalErr, parseErr)
+		} else {
+			result.PackageChanges = changes
+		}
+	}
 	if terminalErr != nil || waitErr != nil || writeErr != nil || groupErr != nil {
 		return result, errors.Join(terminalErr, waitErr, writeErr, groupErr, fmt.Errorf("external child failed with redacted exit status %d", result.ExitCode))
 	}
@@ -189,7 +206,7 @@ func ExecuteBootstrap(args []string) error {
 	if err != nil || !bytes.Equal(canonical, payload) || instruction.SchemaVersion != bootstrapSchema {
 		return fmt.Errorf("child bootstrap profile is noncanonical")
 	}
-	profile, err := ResolveProfile(instruction.ProfileID, instruction.Identities)
+	profile, err := ResolveInvocation(instruction.ProfileID, instruction.Identities, instruction.Invocation)
 	if err != nil || !profile.Complete {
 		return fmt.Errorf("child bootstrap profile is unavailable")
 	}
@@ -205,7 +222,7 @@ func ExecuteBootstrap(args []string) error {
 
 func applyProfile(profile Profile, hasInput bool) error {
 	originalNetwork := ""
-	if profile.Network == NetworkNone {
+	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets {
 		var err error
 		originalNetwork, err = os.Readlink("/proc/self/ns/net")
 		if err != nil {
@@ -219,8 +236,13 @@ func applyProfile(profile Profile, hasInput bool) error {
 			return fmt.Errorf("child no-network namespace did not change")
 		}
 	}
-	if profile.Network != NetworkNone && profile.Network != NetworkHostQualified && profile.Network != NetworkProviderOnly && profile.Network != NetworkLocalAPIOnly {
+	if profile.Network != NetworkNone && profile.Network != NetworkNoSockets && profile.Network != NetworkHostQualified && profile.Network != NetworkProviderOnly && profile.Network != NetworkLocalAPIOnly {
 		return fmt.Errorf("child network profile is unsupported")
+	}
+	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets {
+		if err := installAddressFamilyFilter(profile.AllowedAddressFamilies); err != nil {
+			return err
+		}
 	}
 	if profile.Chroot != "" {
 		if err := unix.Chroot(profile.Chroot); err != nil {
@@ -264,10 +286,14 @@ func applyProfile(profile Profile, hasInput bool) error {
 		return err
 	}
 	cpuSeconds := uint64(profile.Timeout/time.Second) + 1
+	maximumFileBytes := profile.MaximumFileBytes
+	if maximumFileBytes == 0 {
+		maximumFileBytes = uint64(profile.MaximumOutputBytes + profile.MaximumInputBytes + 4096)
+	}
 	for resource, limit := range map[int]unix.Rlimit{
 		unix.RLIMIT_CPU:    {Cur: cpuSeconds, Max: cpuSeconds},
 		unix.RLIMIT_CORE:   {Cur: 0, Max: 0},
-		unix.RLIMIT_FSIZE:  {Cur: uint64(profile.MaximumOutputBytes + profile.MaximumInputBytes + 4096), Max: uint64(profile.MaximumOutputBytes + profile.MaximumInputBytes + 4096)},
+		unix.RLIMIT_FSIZE:  {Cur: maximumFileBytes, Max: maximumFileBytes},
 		unix.RLIMIT_NOFILE: {Cur: 32, Max: 32},
 		unix.RLIMIT_NPROC:  {Cur: 32, Max: 32},
 	} {
@@ -293,6 +319,43 @@ func applyProfile(profile Profile, hasInput bool) error {
 	}
 	if err := unix.CloseRange(3, ^uint(0), 0); err != nil {
 		return fmt.Errorf("close inherited child descriptors: %w", err)
+	}
+	return nil
+}
+
+func addressFamilyFilter(allowed []int) ([]unix.SockFilter, error) {
+	if len(allowed) == 0 {
+		return []unix.SockFilter{
+			{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+			{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_SOCKET), Jt: 0, Jf: 1},
+			{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EAFNOSUPPORT)},
+			{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)},
+		}, nil
+	}
+	if len(allowed) != 1 || allowed[0] != unix.AF_UNIX {
+		return nil, fmt.Errorf("no-network child address-family policy is invalid")
+	}
+	return []unix.SockFilter{
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_SOCKET), Jt: 0, Jf: 3},
+		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
+		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.AF_UNIX), Jt: 1, Jf: 0},
+		{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EAFNOSUPPORT)},
+		{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)},
+	}, nil
+}
+
+func installAddressFamilyFilter(allowed []int) error {
+	filter, err := addressFamilyFilter(allowed)
+	if err != nil {
+		return err
+	}
+	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("set no-new-privileges before address-family filter: %w", err)
+	}
+	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)), 0, 0); err != nil {
+		return fmt.Errorf("install no-network child address-family filter: %w", err)
 	}
 	return nil
 }
@@ -493,10 +556,13 @@ type digestWriter struct {
 	written int
 	maximum int
 	cutoff  bool
+	capture bool
+	bytes   []byte
 }
 
-func newDigestWriter(maximum int) *digestWriter {
-	return &digestWriter{hash: sha256.New(), maximum: maximum}
+func newDigestWriter(maximum int, capture ...bool) *digestWriter {
+	keep := len(capture) == 1 && capture[0]
+	return &digestWriter{hash: sha256.New(), maximum: maximum, capture: keep}
 }
 
 func (writer *digestWriter) Write(value []byte) (int, error) {
@@ -506,12 +572,18 @@ func (writer *digestWriter) Write(value []byte) (int, error) {
 		remaining := writer.maximum - writer.written
 		if remaining > 0 {
 			_, _ = writer.hash.Write(value[:remaining])
+			if writer.capture {
+				writer.bytes = append(writer.bytes, value[:remaining]...)
+			}
 			writer.written += remaining
 		}
 		writer.cutoff = true
 		return remaining, errOutputLimit
 	}
 	_, _ = writer.hash.Write(value)
+	if writer.capture {
+		writer.bytes = append(writer.bytes, value...)
+	}
 	writer.written += len(value)
 	return len(value), nil
 }
@@ -520,10 +592,55 @@ func (writer *digestWriter) Digest() string {
 	defer writer.mu.Unlock()
 	return "sha256:" + hex.EncodeToString(writer.hash.Sum(nil))
 }
+func (writer *digestWriter) Bytes() []byte {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return append([]byte(nil), writer.bytes...)
+}
 func (writer *digestWriter) CutOff() bool {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return writer.cutoff
+}
+
+func parseAPTSimulation(output []byte) ([]PackageChange, error) {
+	changes := []PackageChange{}
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Remv ") || strings.HasPrefix(line, "Purg ") {
+			return nil, fmt.Errorf("APT simulation contains a removal")
+		}
+		if !strings.HasPrefix(line, "Inst ") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, "Inst ")
+		name, detail, found := strings.Cut(rest, " ")
+		if !found || !packageNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("APT simulation package identity is invalid")
+		}
+		detail = strings.TrimSpace(detail)
+		if !strings.HasPrefix(detail, "(") {
+			return nil, fmt.Errorf("APT simulation package version is missing")
+		}
+		version, _, found := strings.Cut(strings.TrimPrefix(detail, "("), " ")
+		version = strings.TrimSuffix(version, ")")
+		if !found && !strings.HasSuffix(detail, ")") || !packageVersionPattern.MatchString(version) {
+			return nil, fmt.Errorf("APT simulation package version is invalid")
+		}
+		changes = append(changes, PackageChange{Name: name, Version: version})
+	}
+	if err := scanner.Err(); err != nil || len(changes) == 0 || len(changes) > 256 {
+		return nil, fmt.Errorf("APT simulation output is missing, malformed, or unbounded")
+	}
+	slices.SortFunc(changes, func(left, right PackageChange) int { return strings.Compare(left.Name, right.Name) })
+	for index := 1; index < len(changes); index++ {
+		if changes[index-1].Name == changes[index].Name {
+			return nil, fmt.Errorf("APT simulation contains duplicate package change")
+		}
+	}
+	return changes, nil
 }
 
 func ParseExitCode(value string) (int, error) {

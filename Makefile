@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest
+.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/child ./internal/dependencies ./internal/domain ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/persist ./internal/plans ./internal/release ./internal/reservations ./internal/roles ./internal/safety
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/archive ./internal/child ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/sources
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/preflight ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/ui internal/uistate internal/verify internal/workflow
 
@@ -70,4 +70,10 @@ ga-release-identity-selftest:
 	$(GO) test -count=1 ./internal/release ./internal/dependencies
 	@set -eu; if grep -R -n -Ei --include='*.go' --exclude='*_test.go' 'ed25519|signature|signing[_-]token|key[_-]id' internal/release internal/dependencies; then echo 'signing ceremony entered checksum-only release identity' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest
+ga-forbidden-utility-audit:
+	$(GO) test -count=1 ./internal/sources ./internal/download ./internal/archive ./internal/packages ./internal/filetxn ./internal/child
+	@grep -Fq 'PackageTransactionHandler' internal/helper/role_linux.go
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command(Context)?\([^\n]*(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)' internal cmd; then echo 'forbidden download, archive, hash, TLS, or file utility remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' '"/[^"[:space:]]*/(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)"' internal cmd; then echo 'forbidden fixed child utility entered production profile' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit
