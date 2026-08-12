@@ -44,6 +44,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		{Name: roles.Timer, Handler: requireCommitted},
 		{Name: roles.StartupGuard, Handler: requireCommitted},
 		{Name: roles.ReloadGuard, Handler: requireCommitted},
+		{Name: roles.RuntimeGuard, Handler: func(args []string, _, _ io.Writer) error { return bootstrap.RunRuntimeGuard(args) }},
 	})
 	if err != nil {
 		return err

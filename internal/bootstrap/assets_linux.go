@@ -45,9 +45,10 @@ func renderArtifacts(journal Journal) (map[string][]byte, error) {
 	authority := fmt.Sprintf("%s:%d", journal.Authority.Address, journal.Authority.Port)
 	socketGeneration := journal.GenerationID
 	artifacts := map[string][]byte{
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-management.socket"): []byte("[Unit]\nDescription=LanPanel reserved Management authority\nBefore=lanpanel-ui.service\n\n[Socket]\nListenStream=" + authority + "\nFileDescriptorName=lanpanel-management-" + socketGeneration + "\nSocketMode=0600\nRuntimeDirectory=lanpanel\nRuntimeDirectoryMode=0711\nRemoveOnStop=no\nService=lanpanel-ui.service\n\n[Install]\nWantedBy=sockets.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-management.socket"): []byte("[Unit]\nDescription=LanPanel reserved Management authority\nBefore=lanpanel-ui.service\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\nListenStream=" + authority + "\nFileDescriptorName=lanpanel-management-" + socketGeneration + "\nSocketMode=0600\nRemoveOnStop=no\nService=lanpanel-ui.service\n\n[Install]\nWantedBy=sockets.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-ui.service"):        []byte(serviceUnit("LanPanel Management UI", accounts[identity.RoleUI], binary+" ui", "LANPANEL_SOCKET_GENERATION="+socketGeneration, "lanpanel-management.socket")),
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /run/lanpanel /etc/lanpanel /etc/systemd/system /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-runtime.service"):   []byte("[Unit]\nDescription=LanPanel volatile runtime directory\nBefore=lanpanel-helper.service lanpanel-management.socket\n\n[Service]\nType=oneshot\nExecStart=" + binary + " runtime-guard\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Service]\nType=simple\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /run/lanpanel /etc/lanpanel /etc/systemd/system /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.service"):     []byte(serviceUnit("LanPanel timer dispatcher", accounts[identity.RoleTimer], binary+" timer", "", "")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.timer"):       []byte("[Unit]\nDescription=LanPanel persistent timer\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=" + fixedTimerPeriod + "\nPersistent=true\nUnit=lanpanel-timer.service\n\n[Install]\nWantedBy=timers.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):  []byte(serviceUnit("LanPanel startup recovery", accounts[identity.RoleRecovery], binary+" startup-guard", "", "")),
@@ -69,7 +70,11 @@ func serviceUnit(description string, account identity.AccountIdentity, command, 
 	if socket != "" {
 		output.WriteString("Sockets=lanpanel-management.socket\n")
 	}
-	output.WriteString("NoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nLockPersonality=yes\nRestrictRealtime=yes\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n")
+	output.WriteString("NoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nLockPersonality=yes\nRestrictRealtime=yes\nUMask=0077\n")
+	if socket != "" {
+		output.WriteString("RestrictAddressFamilies=AF_INET AF_UNIX\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\n")
+	}
+	output.WriteString("Restart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n")
 	return output.String()
 }
 
@@ -124,18 +129,20 @@ func targetStaging(path string) (string, error) {
 	return staging, err
 }
 func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32, mode os.FileMode) error {
-	staging, err := targetStaging(path)
-	if err != nil {
+	parent := filepath.Dir(path)
+	staging := filepath.Join(parent, ".lanpanel-filetxn")
+	if _, err := ensureDirectory(staging, filetxn.Owner{UID: 0, GID: 0}, 0o700); err != nil {
 		return err
 	}
-	owner := filetxn.Owner{UID: 0, GID: gid}
-	store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{{UID: 0, GID: 0}}, AllowedMode: 0o755}}, filetxn.Options{})
+	root := filetxn.Owner{UID: 0, GID: 0}
+	parents := filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{root, {UID: 0, GID: gid}}, AllowedMode: 0o755}
+	store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: root, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: root, Mode: 0o700}, StagingParents: parents}, filetxn.Options{})
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	metadata := filetxn.Metadata{Owner: owner, Mode: mode}
-	_, err = store.Put(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{{UID: 0, GID: 0}}, AllowedMode: 0o755}, Existing: &metadata, New: metadata, MaxBytes: int64(len(data))}, data, filetxn.CreateOnly)
+	metadata := filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: gid}, Mode: mode}
+	_, err = store.Put(ctx, filetxn.Request{Path: path, Parents: parents, Existing: &metadata, New: metadata, MaxBytes: int64(len(data))}, data, filetxn.CreateOnly)
 	return err
 }
 

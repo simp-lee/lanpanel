@@ -26,6 +26,9 @@ type Operation string
 const (
 	OperationManagedFileCommit    Operation = "managed_file_commit"
 	OperationAccountCreate        Operation = "account_create"
+	OperationAdminTokenVerify     Operation = "admin_token_verify"
+	OperationAdminTokenSource     Operation = "admin_token_source_status"
+	OperationManagementProfile    Operation = "management_profile_status"
 	OperationAdminTokenRotate     Operation = "admin_token_rotate"
 	OperationPackageTransaction   Operation = "package_transaction"
 	OperationSystemdTransition    Operation = "systemd_transition"
@@ -57,6 +60,9 @@ type Policy struct {
 var policies = map[Operation]Policy{
 	OperationManagedFileCommit:    {Callers: []Caller{CallerUI}},
 	OperationAccountCreate:        {Callers: []Caller{CallerUI}},
+	OperationAdminTokenVerify:     {Callers: []Caller{CallerUI}, SecretInput: true},
+	OperationAdminTokenSource:     {Callers: []Caller{CallerUI}},
+	OperationManagementProfile:    {Callers: []Caller{CallerUI}},
 	OperationAdminTokenRotate:     {Callers: []Caller{CallerUI}, SecretOutput: true},
 	OperationPackageTransaction:   {Callers: []Caller{CallerUI}},
 	OperationSystemdTransition:    {Callers: []Caller{CallerUI}},
@@ -158,7 +164,7 @@ func validOperationTarget(operation Operation, target string) bool {
 		return exactID && (kind == "resource" || kind == "credential" || kind == "certificate")
 	case OperationAccountCreate:
 		return target == "installation" || exactID && (kind == "resource" || kind == "service")
-	case OperationPackageTransaction, OperationSystemdTransition, OperationNginxTest, OperationNginxReload, OperationAdminTokenRotate:
+	case OperationPackageTransaction, OperationSystemdTransition, OperationNginxTest, OperationNginxReload, OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationAdminTokenRotate:
 		return target == "installation"
 	case OperationCredentialImport, OperationCredentialAdopt:
 		return exactID && kind == "credential"

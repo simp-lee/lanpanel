@@ -40,7 +40,7 @@ func observeHostFingerprint() (string, error) {
 
 func observeBeforeInventory(paths Paths) (string, error) {
 	roots := []string{paths.Journal, paths.StartupAuthority, paths.CommitPath, paths.PersistentRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath}
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service"} {
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service"} {
 		roots = append(roots, filepath.Join(paths.SystemdRoot, name))
 	}
 	sort.Strings(roots)

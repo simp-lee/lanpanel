@@ -3,17 +3,21 @@
 package bootstrap
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/session"
+	"lanpanel/internal/ui"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
-// RunUIRole is the reserved resident Management role. S9 will attach the
-// authenticated HTTP server to this already verified inherited listener.
+// RunUIRole starts the fixed non-root Management service on its generation-bound inherited listener.
 func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if len(args) != 0 || stdout == nil || stderr == nil {
 		return fmt.Errorf("UI role requires its fixed service invocation")
@@ -21,46 +25,57 @@ func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if err := RequireCommitted(FixedPaths()); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(FixedPaths().StartupAuthority)
+	startup, err := ReadPublicStartupAuthority(FixedPaths())
 	if err != nil {
 		return err
-	}
-	var startup struct {
-		SchemaVersion  string                       `json:"schema_version"`
-		AttemptID      string                       `json:"attempt_id"`
-		InstallationID string                       `json:"installation_id"`
-		GenerationID   string                       `json:"generation_id"`
-		Management     identity.ManagementAuthority `json:"management_authority"`
-		CommitDigest   string                       `json:"commit_digest"`
-	}
-	if decodeCanonical(data, &startup) != nil || startup.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateGenerationID(startup.GenerationID) {
-		return fmt.Errorf("UI startup authority is invalid")
 	}
 	listener, err := InheritedManagementListener(startup.Management, startup.GenerationID)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	for {
-		if tcp, ok := listener.(*net.TCPListener); ok {
-			_ = tcp.SetDeadline(time.Now().Add(time.Second))
+	verifier := ui.HelperVerifier{}
+	fingerprint := "unavailable"
+	for attempt := 0; attempt < 50; attempt++ {
+		value, sourceErr := verifier.Source(context.Background())
+		if sourceErr == nil {
+			fingerprint = value
+			break
 		}
-		connection, err := listener.Accept()
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			if errors.Is(err, os.ErrClosed) {
-				return nil
-			}
-			return err
+		time.Sleep(100 * time.Millisecond)
+	}
+	if fingerprint == "unavailable" {
+		return fmt.Errorf("admin token source is unavailable")
+	}
+	sessions, err := session.New(fingerprint, session.Options{})
+	if err != nil {
+		return err
+	}
+	installationFingerprint, err := identity.Fingerprint(startup.InstallationID)
+	if err != nil {
+		return err
+	}
+	server, err := ui.New(ui.Config{Listener: listener, Authority: net.JoinHostPort(startup.Management.Address, fmt.Sprintf("%d", startup.Management.Port)), InstallationFingerprint: installationFingerprint, Verifier: verifier, Sessions: sessions, Profile: ui.FixedProfileProvider{}})
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	result := make(chan error, 1)
+	go func() { result <- server.Serve() }()
+	select {
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		serveErr := server.Shutdown(shutdown)
+		if errors.Is(serveErr, net.ErrClosed) || errors.Is(serveErr, os.ErrClosed) {
+			return nil
 		}
-		_ = connection.SetDeadline(time.Now().Add(time.Second))
-		buffer := make([]byte, 4)
-		read, _ := connection.Read(buffer)
-		if string(buffer[:read]) == "PING" {
-			_, _ = connection.Write([]byte("LPUI " + startup.GenerationID + "\n"))
+		return serveErr
+	case serveErr := <-result:
+		if errors.Is(serveErr, net.ErrClosed) || errors.Is(serveErr, os.ErrClosed) {
+			return nil
 		}
-		_ = connection.Close()
+		return serveErr
 	}
 }

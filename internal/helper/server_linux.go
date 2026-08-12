@@ -60,6 +60,15 @@ func ManagedFileCommitHandler(r Revalidator, e Executor) Registration {
 func AccountCreateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAccountCreate, r, e)
 }
+func AdminTokenVerifyHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationAdminTokenVerify, r, e)
+}
+func AdminTokenSourceHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationAdminTokenSource, r, e)
+}
+func ManagementProfileHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationManagementProfile, r, e)
+}
 func AdminTokenRotateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenRotate, r, e)
 }

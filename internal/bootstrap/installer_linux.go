@@ -217,9 +217,6 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err != nil {
 			return err
 		}
-		if _, err := ensureDirectory(filepath.Dir(journal.Paths.StartupAuthority), filetxn.Owner{UID: 0, GID: 0}, 0o710); err != nil {
-			return err
-		}
 		if _, err := ensureDirectory(filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), filetxn.Owner{UID: 0, GID: 0}, 0o700); err != nil {
 			return err
 		}
@@ -258,6 +255,13 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 	}
 	if journal.Phase == PhaseAccountsVerified {
+		uiIdentity, ok := identity.IdentityFor(journal.Accounts, identity.RoleUI)
+		if !ok || uiIdentity.GID == 0 {
+			return fmt.Errorf("UI account authority is missing")
+		}
+		if _, err := ensureDirectory(filepath.Dir(journal.Paths.StartupAuthority), filetxn.Owner{UID: 0, GID: uiIdentity.GID}, 0o710); err != nil {
+			return err
+		}
 		if err := createBootstrapDirectories(journal); err != nil {
 			return err
 		}
@@ -384,7 +388,7 @@ func createBootstrapDirectories(journal Journal) error {
 		return err
 	}
 	ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
-	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, filetxn.Owner{UID: 0, GID: ui.GID}, 0o711); err != nil {
+	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, filetxn.Owner{UID: 0, GID: ui.GID}, 0o710); err != nil {
 		return err
 	}
 	return nil
@@ -444,7 +448,7 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, request
 
 func scanExistingEvidence(paths Paths) ([]string, error) {
 	candidates := []string{paths.CommitPath, paths.StartupAuthority, paths.PersistentRoot, paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, filepath.Dir(paths.BinaryPath)}
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service"} {
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service"} {
 		candidates = append(candidates, filepath.Join(paths.SystemdRoot, name))
 	}
 	result := []string{}
@@ -460,40 +464,47 @@ func scanExistingEvidence(paths Paths) ([]string, error) {
 
 // RequireCommitted is called by every installed non-installer role before it
 // reads state, creates a socket, or performs a mutation.
-func requirePublicStartupAuthority(paths Paths) error {
+type StartupAuthority struct {
+	SchemaVersion  string                       `json:"schema_version"`
+	AttemptID      string                       `json:"attempt_id"`
+	InstallationID string                       `json:"installation_id"`
+	GenerationID   string                       `json:"generation_id"`
+	Management     identity.ManagementAuthority `json:"management_authority"`
+	CommitDigest   string                       `json:"commit_digest"`
+}
+
+func ReadPublicStartupAuthority(paths Paths) (StartupAuthority, error) {
+	var value StartupAuthority
 	if paths.PersistentRoot == "" {
 		paths = FixedPaths()
 	}
 	fd, err := unix.Open(paths.StartupAuthority, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("bootstrap startup authority is unavailable")
+		return value, fmt.Errorf("bootstrap startup authority is unavailable")
 	}
 	file := os.NewFile(uintptr(fd), "startup-authority")
 	if file == nil {
 		_ = unix.Close(fd)
-		return fmt.Errorf("bootstrap startup authority descriptor is unavailable")
+		return value, fmt.Errorf("bootstrap startup authority descriptor is unavailable")
 	}
 	defer file.Close()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Mode&0o777 != 0o640 || stat.Size <= 0 || stat.Size > MaximumJournalBytes {
-		return fmt.Errorf("bootstrap startup authority identity is unsafe")
+		return value, fmt.Errorf("bootstrap startup authority identity is unsafe")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, MaximumJournalBytes+1))
 	if err != nil || int64(len(data)) != stat.Size {
-		return fmt.Errorf("bootstrap startup authority read failed")
-	}
-	var value struct {
-		SchemaVersion  string                       `json:"schema_version"`
-		AttemptID      string                       `json:"attempt_id"`
-		InstallationID string                       `json:"installation_id"`
-		GenerationID   string                       `json:"generation_id"`
-		Management     identity.ManagementAuthority `json:"management_authority"`
-		CommitDigest   string                       `json:"commit_digest"`
+		return value, fmt.Errorf("bootstrap startup authority read failed")
 	}
 	if decodeCanonical(data, &value) != nil || value.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || identity.ValidateManagementAuthority(value.Management) != nil || !release.ValidDigest(value.CommitDigest) {
-		return fmt.Errorf("bootstrap startup authority is invalid")
+		return value, fmt.Errorf("bootstrap startup authority is invalid")
 	}
-	return nil
+	return value, nil
+}
+
+func requirePublicStartupAuthority(paths Paths) error {
+	_, err := ReadPublicStartupAuthority(paths)
+	return err
 }
 
 func verifyPrecommitArtifacts(journal Journal) error {

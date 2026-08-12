@@ -16,6 +16,7 @@ const (
 	Helper             Name = "helper"
 	StartupGuard       Name = "startup-guard"
 	ReloadGuard        Name = "reload-guard"
+	RuntimeGuard       Name = "runtime-guard"
 	Installer          Name = "installer"
 	Upgrade            Name = "upgrade"
 	FencedRecovery     Name = "fenced-recovery"
@@ -25,7 +26,7 @@ const (
 )
 
 var fixed = map[Name]struct{}{
-	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, Installer: {},
+	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
 	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, PackageNoAutostart: {},
 }
 

@@ -1,13 +1,13 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration
+.PHONY: build test vet lint check tidy ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-playwright-auth
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/archive ./internal/bootstrap ./internal/child ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/sources
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/archive ./internal/bootstrap ./internal/child ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/session ./internal/sources ./internal/ui
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
-GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/ui internal/uistate internal/verify internal/workflow
+GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
 GO ?= go
 PKGS ?= ./...
@@ -76,6 +76,14 @@ ga-preflight-contraction-integration:
 	@grep -Fq 'RequireExpansionPlanEvidence' internal/operations/operations.go
 	@grep -Fq 'RequireContractionPlanEvidence' internal/operations/operations.go
 
+ga-playwright-auth:
+	$(GO) test -count=1 ./internal/ui ./internal/session ./internal/bootstrap
+	LANPANEL_CHROMIUM_PATH="$${LANPANEL_CHROMIUM_PATH:-$${HOME}/.cache/ms-playwright/chromium-1181/chrome-linux/chrome}" npm run test:auth
+	@grep -Fq 'Content-Security-Policy' internal/ui/server.go
+	@grep -Fq 'Cache-Control' internal/ui/server.go
+	@grep -Fq 'WebSocketSubprotocol' internal/ui/server.go
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'serviceWorker|unsafe-inline|unsafe-eval|Request\.Cookie\(|FormValue\(' internal/ui; then echo 'Management browser boundary is unsafe' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+
 ga-bootstrap-integration:
 	$(GO) test -count=1 ./internal/bootstrap ./internal/identity ./internal/preflight ./internal/roles ./cmd/lanpanel
 	@grep -Fq 'ListenStream=' internal/bootstrap/assets_linux.go
@@ -90,4 +98,4 @@ ga-forbidden-utility-audit:
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command(Context)?\([^\n]*(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)' internal cmd; then echo 'forbidden download, archive, hash, TLS, or file utility remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' '"/[^"[:space:]]*/(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)"' internal cmd; then echo 'forbidden fixed child utility entered production profile' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-forbidden-utility-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-playwright-auth ga-forbidden-utility-audit
