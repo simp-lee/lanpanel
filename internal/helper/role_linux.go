@@ -9,13 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/application"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/packages"
+	"lanpanel/internal/secrets"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,7 +44,15 @@ func RunRole(args []string) error {
 	if err != nil {
 		return err
 	}
+	fingerprint, err := secrets.CurrentAdminTokenFingerprint()
+	if err != nil {
+		return fmt.Errorf("read admin token before helper recovery: %w", err)
+	}
+	if err := application.ReconcileAdminTokenRotation(context.Background(), fingerprint); err != nil {
+		return fmt.Errorf("reconcile admin token rotation: %w", err)
+	}
 	var packageMu sync.Mutex
+	var tokenMu sync.Mutex
 	withPackageService := func(use func(*packages.Service) error) error {
 		packageMu.Lock()
 		defer packageMu.Unlock()
@@ -51,6 +63,31 @@ func RunRole(args []string) error {
 		defer service.Close()
 		return use(service)
 	}
+	applicationHandler := ApplicationPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("application caller invalid")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("application request carried secret")
+		}
+		service, err := application.OpenFixed()
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer service.Close()
+		operation, err := domain.ParseOperationCode(request.Action.Operation)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		target := domain.OperationTarget{Kind: domain.OperationTargetKind(request.Action.TargetKind), ID: request.Action.TargetID}
+		plan, err := service.CreatePlan(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.PlanPayload{Operation: operation, Target: target})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: plan.Operation, TargetKind: string(plan.Target.Kind), TargetID: plan.Target.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+	})
 	packageHandler := PackageTransactionHandler(
 		func(ctx context.Context, caller helperproto.Caller, request helperproto.Request) error {
 			if caller != helperproto.CallerUI {
@@ -100,13 +137,109 @@ func RunRole(args []string) error {
 		clear(source)
 		return ExecutionResult{ResultDigest: fingerprint}, err
 	})
+	rotateHandler := AdminTokenRotateHandler(authRevalidate, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		tokenMu.Lock()
+		defer tokenMu.Unlock()
+		if secret != nil || request.Action == nil || request.Action.Operation != "admin_token_rotate" || request.Action.TargetKind != "installation" {
+			return ExecutionResult{}, fmt.Errorf("admin token rotation input is invalid")
+		}
+		rotation, err := application.BeginAdminTokenRotation(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.ConfirmationPayload{PlanID: request.Action.PlanID, Confirmation: request.Action.Confirmation})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer func() { _ = rotation.Close() }()
+		candidate, err := secrets.GenerateAdminToken(secrets.AdminTokenOptions{})
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, terminalErr := rotation.Fail(cleanupCtx, false, ""); terminalErr != nil {
+				return ExecutionResult{}, fmt.Errorf("admin token generation failed and terminalization failed: %v: %w", err, terminalErr)
+			}
+			return ExecutionResult{}, err
+		}
+		// Plaintext generation occurs only after BeginAdminTokenRotation durably reserved and consumed the Plan/job/intent.
+		fingerprint, err := candidate.Fingerprint()
+		if err != nil {
+			candidate.Destroy()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, terminalErr := rotation.Fail(cleanupCtx, false, ""); terminalErr != nil {
+				return ExecutionResult{}, fmt.Errorf("admin token fingerprint failed and terminalization failed: %v: %w", err, terminalErr)
+			}
+			return ExecutionResult{}, err
+		}
+		if err := rotation.BindFingerprint(ctx, fingerprint); err != nil {
+			candidate.Destroy()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, terminalErr := rotation.Fail(cleanupCtx, false, ""); terminalErr != nil {
+				return ExecutionResult{}, fmt.Errorf("admin token binding failed and terminalization failed: %v: %w", err, terminalErr)
+			}
+			return ExecutionResult{}, err
+		}
+		commit, err := secrets.CommitAdminToken(candidate, secrets.AdminTokenOptions{ExpectedFingerprint: rotation.PriorFingerprint()})
+		if err != nil {
+			if commit.Value != nil {
+				commit.Value.Destroy()
+			}
+			return ExecutionResult{}, err
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := rotation.MarkCommitted(cleanupCtx, commit.Fingerprint); err != nil {
+			cancel()
+			commit.Value.Destroy()
+			return ExecutionResult{}, fmt.Errorf("mark admin token committed: %w", err)
+		}
+		if err := secrets.FinalizeAdminToken(rotation.PriorFingerprint(), commit.Fingerprint); err != nil {
+			cancel()
+			commit.Value.Destroy()
+			return ExecutionResult{}, fmt.Errorf("finalize admin token: %w", err)
+		}
+		job, err := rotation.Finish(cleanupCtx, commit.Fingerprint)
+		cancel()
+		if err != nil {
+			commit.Value.Destroy()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, terminalErr := rotation.Fail(cleanupCtx, true, commit.Fingerprint); terminalErr != nil {
+				return ExecutionResult{}, fmt.Errorf("admin token success and failure terminalization both failed: %v: %w", err, terminalErr)
+			}
+			return ExecutionResult{}, fmt.Errorf("admin token committed but success terminalization failed: %w", err)
+		}
+		var output *helperproto.Secret
+		err = commit.Value.Use(func(value []byte) error {
+			var createErr error
+			output, createErr = helperproto.NewOutputSecret(value)
+			return createErr
+		})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: commit.Fingerprint, Secret: output, Action: &helperproto.ActionResult{JobID: job.ID}}, nil
+	})
+	reconcileHandler := AdminTokenReconcileHandler(authRevalidate, func(ctx context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("admin token reconciliation carried secret")
+		}
+		tokenMu.Lock()
+		defer tokenMu.Unlock()
+		fingerprint, err := secrets.CurrentAdminTokenFingerprint()
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		if err := application.ReconcileAdminTokenRotation(ctx, fingerprint); err != nil {
+			return ExecutionResult{}, err
+		}
+		fingerprint, err = secrets.CurrentAdminTokenFingerprint()
+		return ExecutionResult{ResultDigest: fingerprint}, err
+	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("Management profile request carried secret")
 		}
 		return ExecutionResult{ResultDigest: profileDigest(managementProfile())}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{packageHandler, verifyHandler, sourceHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}

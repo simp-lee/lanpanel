@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/operations"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/safety"
@@ -35,6 +36,9 @@ func managementProfile() string {
 		return "emergency"
 	}
 	defer store.Close()
+	if err := operations.Register(store); err != nil {
+		return "unavailable"
+	}
 	if _, err := store.Read(); err != nil {
 		return "emergency"
 	}

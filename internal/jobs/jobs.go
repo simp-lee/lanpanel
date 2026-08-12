@@ -27,20 +27,25 @@ var (
 	ErrMissing        = errors.New("job is missing")
 	idPattern         = regexp.MustCompile(`^job_[0-9a-f]{64}$`)
 	refPattern        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	digestPattern     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	errorCodePattern  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	allowedErrorCodes = map[string]struct{}{
-		"activation_contracted":       {},
-		"binding_refresh_failed":      {},
-		"confirmation_invalid":        {},
-		"confirmation_rejected":       {},
-		"exact_reconciliation_closed": {},
-		"normal_revision_changed":     {},
-		"plan_consumption_rejected":   {},
-		"planless_start_rejected":     {},
-		"preflight_rejected":          {},
-		"safety_authority_changed":    {},
-		"safety_recheck_unavailable":  {},
-		"safety_refresh_failed":       {},
+		"activation_contracted":            {},
+		"admin_token_delivery_failed":      {},
+		"admin_token_rotation_failed":      {},
+		"admin_token_rotation_interrupted": {},
+		"admin_token_source_unknown":       {},
+		"binding_refresh_failed":           {},
+		"confirmation_invalid":             {},
+		"confirmation_rejected":            {},
+		"exact_reconciliation_closed":      {},
+		"normal_revision_changed":          {},
+		"plan_consumption_rejected":        {},
+		"planless_start_rejected":          {},
+		"preflight_rejected":               {},
+		"safety_authority_changed":         {},
+		"safety_recheck_unavailable":       {},
+		"safety_refresh_failed":            {},
 	}
 )
 
@@ -75,6 +80,13 @@ type Postcondition struct {
 	Status   PostconditionStatus `json:"status"`
 	Identity string              `json:"identity"`
 }
+type SecretResult struct {
+	Kind              string `json:"kind"`
+	ObjectID          string `json:"object_id"`
+	Fingerprint       string `json:"fingerprint"`
+	DeliveryAttempted bool   `json:"delivery_attempted"`
+	Remedy            string `json:"remedy"`
+}
 type Record struct {
 	SchemaVersion  string          `json:"schema_version"`
 	ID             string          `json:"id"`
@@ -88,6 +100,7 @@ type Record struct {
 	ModifiedPaths  []string        `json:"modified_paths"`
 	Postconditions []Postcondition `json:"postconditions"`
 	ErrorCode      string          `json:"error_code,omitempty"`
+	SecretResult   *SecretResult   `json:"secret_result,omitempty"`
 }
 type Spec struct{ Operation, Target, ActorIdentity string }
 type Completion struct {
@@ -95,6 +108,7 @@ type Completion struct {
 	ModifiedPaths  []string
 	Postconditions []Postcondition
 	ErrorCode      string
+	SecretResult   *SecretResult
 }
 type Options struct {
 	Now    func() time.Time
@@ -181,12 +195,14 @@ func validateJobTransition(_ string, before, after json.RawMessage) error {
 	oldRecord.ModifiedPaths = nil
 	oldRecord.Postconditions = nil
 	oldRecord.ErrorCode = ""
+	oldRecord.SecretResult = nil
 	newRecord.Status = ""
 	newRecord.EndedAt = nil
 	newRecord.Result = ""
 	newRecord.ModifiedPaths = nil
 	newRecord.Postconditions = nil
 	newRecord.ErrorCode = ""
+	newRecord.SecretResult = nil
 	if !reflect.DeepEqual(oldRecord, newRecord) {
 		return fmt.Errorf("job identity was rewritten")
 	}
@@ -284,6 +300,7 @@ func Finish(record Record, completion Completion, now time.Time) (Record, error)
 	record.ModifiedPaths = canonicalPaths(completion.ModifiedPaths)
 	record.Postconditions = canonicalPostconditions(completion.Postconditions)
 	record.ErrorCode = completion.ErrorCode
+	record.SecretResult = completion.SecretResult
 	if err := Validate(record); err != nil {
 		return Record{}, err
 	}
@@ -312,7 +329,7 @@ func Validate(record Record) error {
 	}
 	switch record.Status {
 	case StatusReserved, StatusRunning:
-		if record.EndedAt != nil || record.Result != "" || len(record.ModifiedPaths) != 0 || len(record.Postconditions) != 0 || record.ErrorCode != "" {
+		if record.EndedAt != nil || record.Result != "" || len(record.ModifiedPaths) != 0 || len(record.Postconditions) != 0 || record.ErrorCode != "" || record.SecretResult != nil {
 			return fmt.Errorf("nonterminal job contains terminal evidence")
 		}
 	case StatusTerminal:
@@ -335,10 +352,38 @@ func Validate(record Record) error {
 		if record.Result == ResultUnknown && !hasPostcondition(record.Postconditions, PostconditionUnobserved) {
 			return fmt.Errorf("unknown job requires an unobserved critical postcondition")
 		}
+		if record.SecretResult != nil && validateSecretResult(record.Operation, *record.SecretResult) != nil {
+			return fmt.Errorf("job secret result is invalid")
+		}
 	default:
 		return fmt.Errorf("job status is unsupported")
 	}
 	return nil
+}
+
+func validateSecretResult(operation string, value SecretResult) error {
+	if !refPattern.MatchString(value.Kind) || !refPattern.MatchString(value.ObjectID) || !digestPattern.MatchString(value.Fingerprint) || !value.DeliveryAttempted {
+		return fmt.Errorf("secret result identity is incomplete")
+	}
+	if operation == "admin_token_rotate" {
+		if value.Kind != "admin_token" || value.Remedy != "read_protected_source" {
+			return fmt.Errorf("admin token remedy is invalid")
+		}
+		return nil
+	}
+	if operation == "preauth_key_create" {
+		if value.Kind != "preauth_key" || value.Remedy != "revoke_and_create" {
+			return fmt.Errorf("preauth key remedy is invalid")
+		}
+		return nil
+	}
+	if operation == "managed_basic_create" || operation == "managed_basic_rotate" {
+		if value.Kind != "managed_basic" || value.Remedy != "rotate_again" {
+			return fmt.Errorf("Managed Basic remedy is invalid")
+		}
+		return nil
+	}
+	return fmt.Errorf("operation cannot carry secret result")
 }
 
 func Nonterminal(entries map[string]json.RawMessage) ([]Record, error) {

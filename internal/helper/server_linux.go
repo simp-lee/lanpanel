@@ -36,6 +36,7 @@ type Revalidator func(context.Context, helperproto.Caller, helperproto.Request) 
 type ExecutionResult struct {
 	ResultDigest string
 	Secret       *helperproto.Secret
+	Action       *helperproto.ActionResult
 }
 
 type Executor func(context.Context, helperproto.Caller, helperproto.Request, *helperproto.Secret) (ExecutionResult, error)
@@ -54,6 +55,9 @@ func newRegistration(operation helperproto.Operation, revalidate Revalidator, ex
 	return Registration{operation: operation, handler: handler{revalidate: revalidate, execute: execute}}
 }
 
+func ApplicationPlanHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationApplicationPlan, r, e)
+}
 func ManagedFileCommitHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagedFileCommit, r, e)
 }
@@ -71,6 +75,9 @@ func ManagementProfileHandler(r Revalidator, e Executor) Registration {
 }
 func AdminTokenRotateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenRotate, r, e)
+}
+func AdminTokenReconcileHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationAdminTokenReconcile, r, e)
 }
 func PackageTransactionHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationPackageTransaction, r, e)
@@ -276,7 +283,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			}
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
-		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest}
+		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action}
 		if err := helperproto.WriteResponse(connection, request.Operation, response, result.Secret); err != nil {
 			return err
 		}

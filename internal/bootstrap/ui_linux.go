@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/application"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/session"
 	"lanpanel/internal/ui"
@@ -55,7 +56,11 @@ func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	server, err := ui.New(ui.Config{Listener: listener, Authority: net.JoinHostPort(startup.Management.Address, fmt.Sprintf("%d", startup.Management.Port)), InstallationFingerprint: installationFingerprint, Verifier: verifier, Sessions: sessions, Profile: ui.FixedProfileProvider{}})
+	actions, err := application.HelperService(ui.HelperApplicationRequest)
+	if err != nil {
+		return err
+	}
+	server, err := ui.New(ui.Config{Listener: listener, Authority: net.JoinHostPort(startup.Management.Address, fmt.Sprintf("%d", startup.Management.Port)), InstallationFingerprint: installationFingerprint, Verifier: verifier, Sessions: sessions, Profile: ui.FixedProfileProvider{}, Actions: actions})
 	if err != nil {
 		return err
 	}

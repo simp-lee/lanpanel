@@ -121,7 +121,7 @@ func auditRequestFields(path string) error {
 	if err != nil {
 		return err
 	}
-	allowed := map[string]bool{"SchemaVersion": true, "RequestID": true, "Operation": true, "Target": true, "IntentGeneration": true, "Deadline": true, "InputDigest": true}
+	allowed := map[string]bool{"SchemaVersion": true, "RequestID": true, "Operation": true, "Target": true, "IntentGeneration": true, "Deadline": true, "InputDigest": true, "Action": true}
 	for _, declaration := range file.Decls {
 		general, ok := declaration.(*ast.GenDecl)
 		if !ok {

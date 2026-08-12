@@ -3,22 +3,26 @@ package ui
 import (
 	"context"
 	"fmt"
+	"lanpanel/internal/application"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/helperproto"
 	"lanpanel/internal/session"
 	"net"
 	"os"
 	"testing"
+	"time"
 )
 
-type playwrightVerifier struct{}
+type playwrightVerifier struct{ fingerprint *string }
 
-func (playwrightVerifier) Verify(_ context.Context, value []byte) (string, error) {
-	if string(value) != "admin" {
+func (value playwrightVerifier) Verify(_ context.Context, token []byte) (string, error) {
+	if string(token) != "admin" && string(token) != "new-admin-token" {
 		return "", fmt.Errorf("invalid token")
 	}
-	return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
+	return *value.fingerprint, nil
 }
-func (playwrightVerifier) Source(context.Context) (string, error) {
-	return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil
+func (value playwrightVerifier) Source(context.Context) (string, error) {
+	return *value.fingerprint, nil
 }
 
 type playwrightProfile struct{}
@@ -34,11 +38,26 @@ func TestPlaywrightFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority := listener.Addr().String()
-	manager, err := session.New("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", session.Options{})
+	fingerprint := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	manager, err := session.New(fingerprint, session.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: playwrightVerifier{}, Sessions: manager, Profile: playwrightProfile{}})
+	actions, err := application.HelperService(func(_ context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
+		switch operation {
+		case helperproto.OperationApplicationPlan:
+			return application.HelperReply{Digest: InputDigest("plan"), Action: &helperproto.ActionResult{PlanID: "plan-fixture", Confirmation: InputDigest("confirmation"), Operation: string(domain.OperationAdminTokenRotate), TargetKind: string(domain.OperationTargetInstallation), ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_destructive_confirmation", ExpiresAt: time.Now().Add(time.Minute)}}, nil
+		case helperproto.OperationAdminTokenRotate:
+			fingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+			return application.HelperReply{Digest: fingerprint, Action: &helperproto.ActionResult{JobID: "job-fixture"}, Secret: []byte("new-admin-token")}, nil
+		default:
+			return application.HelperReply{}, fmt.Errorf("unsupported fixture operation %q", operation)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: playwrightVerifier{&fingerprint}, Sessions: manager, Profile: playwrightProfile{}, Actions: actions})
 	if err != nil {
 		t.Fatal(err)
 	}

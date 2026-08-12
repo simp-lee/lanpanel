@@ -90,6 +90,23 @@ func TestOneTimeOutputSecretIsOutsideGenericResponse(t *testing.T) {
 	}
 }
 
+func TestApplicationResponseShapeIsOperationBound(t *testing.T) {
+	plan := Response{SchemaVersion: SchemaVersion, RequestID: "request-plan", Code: ResponseSucceeded, ResultDigest: digest("result"), Action: &ActionResult{PlanID: "plan-one", Confirmation: digest("confirmation"), Operation: "admin_token_rotate", TargetKind: "installation", ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_confirmation", ExpiresAt: time.Now().Add(time.Minute)}}
+	if err := ValidateResponse(OperationApplicationPlan, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateResponse(OperationAdminTokenRotate, plan); err == nil {
+		t.Fatal("Plan response entered rotation operation")
+	}
+	rotation := Response{SchemaVersion: SchemaVersion, RequestID: "request-rotate", Code: ResponseSucceeded, ResultDigest: digest("result"), Action: &ActionResult{JobID: "job-one"}}
+	if err := ValidateResponse(OperationAdminTokenRotate, rotation); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateResponse(OperationNginxTest, rotation); err == nil {
+		t.Fatal("action result entered unrelated operation")
+	}
+}
+
 func TestTruncatedFrameClearsAllocatedPayload(t *testing.T) {
 	payload := []byte("sentinel-secret")
 	var complete bytes.Buffer
@@ -143,6 +160,25 @@ func TestProtocolRequiresCanonicalBoundedTypedJSON(t *testing.T) {
 	}
 }
 
+func TestApplicationPayloadIsOperationBound(t *testing.T) {
+	now := time.Now()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-action", Operation: OperationApplicationPlan, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute)}
+	request.Action = &ActionPayload{Operation: "admin_token_rotate", TargetKind: "installation", ActorIdentity: "session", ActorGeneration: 1}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatal(err)
+	}
+	request.Action.ActorGeneration++
+	if err := ValidateRequest(request, now); err == nil {
+		t.Fatal("application payload changed without invalidating its digest")
+	}
+	request.Action.ActorGeneration--
+	request.Operation = OperationNginxTest
+	if err := ValidateRequest(request, now); err == nil {
+		t.Fatal("application payload entered unrelated operation")
+	}
+}
+
 func TestCallerOperationMatrixIsClosed(t *testing.T) {
 	if Authorized(CallerTimer, OperationPackageTransaction) || Authorized(CallerTimer, OperationCertificateIssue) || Authorized(CallerRecovery, OperationNginxReload) || Authorized(Caller("foreign"), OperationContractionClose) {
 		t.Fatal("caller crossed the fixed helper operation matrix")
@@ -180,6 +216,12 @@ func TestCallerOperationMatrixIsClosed(t *testing.T) {
 		}
 		request.Operation = operation
 		request.Target = target
+		if operation == OperationAdminTokenRotate {
+			request.Action = &ActionPayload{Operation: "admin_token_rotate", TargetKind: "installation", ActorIdentity: "session", ActorGeneration: 1, PlanID: "plan-one", Confirmation: "rotate"}
+			request.InputDigest, _ = ApplicationInputDigest(request)
+		} else {
+			request.Action = nil
+		}
 		if err := ValidateRequest(request, time.Now()); err != nil {
 			t.Fatalf("one-time secret operation %q is invalid: %v", operation, err)
 		}

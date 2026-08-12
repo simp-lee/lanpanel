@@ -13,7 +13,8 @@ import (
 type FixedProfileProvider struct{}
 
 func (FixedProfileProvider) Current(ctx context.Context) (Profile, error) {
-	digest, err := helperRequest(ctx, helperproto.OperationManagementProfile, nil)
+	reply, err := helperExchange(ctx, helperproto.OperationManagementProfile, nil, nil)
+	digest := reply.Digest
 	if err != nil {
 		return ProfileEmergency, err
 	}

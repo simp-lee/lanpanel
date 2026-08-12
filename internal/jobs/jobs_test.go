@@ -3,9 +3,20 @@ package jobs
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestSecretResultRejectsReplayableContent(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	record, _ := NewReserved(Spec{Operation: "admin_token_rotate", Target: "installation", ActorIdentity: "session"}, now, bytes.NewReader(make([]byte, 32)))
+	record, _ = Start(record)
+	record, err := Finish(record, Completion{Result: ResultSucceeded, Postconditions: []Postcondition{{Kind: "admin_token_source", Status: PostconditionVerified, Identity: "sha256:" + strings.Repeat("a", 64)}}, SecretResult: &SecretResult{Kind: "admin_token", ObjectID: "installation", Fingerprint: "plaintext-secret", DeliveryAttempted: true, Remedy: "read_protected_source"}}, now)
+	if err == nil || record.ID != "" {
+		t.Fatal("replayable secret result accepted")
+	}
+}
 
 func TestDurableJobResultContract(t *testing.T) {
 	t.Run("terminal_results_are_closed_and_noninterchangeable", func(t *testing.T) {

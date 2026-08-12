@@ -151,6 +151,7 @@ func (m *Manager) Logout(principal Principal) {
 	m.mu.Unlock()
 	closeSockets(sockets)
 }
+func (m *Manager) CommitTokenRotation(fingerprint string) { m.InvalidateFingerprint(fingerprint) }
 func (m *Manager) InvalidateFingerprint(fingerprint string) {
 	m.mu.Lock()
 	sockets := m.invalidateLocked(fingerprint)

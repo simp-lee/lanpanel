@@ -50,6 +50,15 @@ func (secret *Secret) Use(consumer func([]byte) error) error {
 	return consumer(secret.value)
 }
 
+func (secret *Secret) OutputCopy() ([]byte, error) {
+	if secret == nil || len(secret.value) == 0 {
+		return nil, fmt.Errorf("secret frame unavailable")
+	}
+	value := append([]byte(nil), secret.value...)
+	secret.Destroy()
+	return value, nil
+}
+
 func (secret *Secret) Destroy() {
 	if secret == nil {
 		return
@@ -119,7 +128,7 @@ func WriteResponse(writer io.Writer, operation Operation, response Response, sec
 	if !known || wantsSecret != (secret != nil && secret.Present()) {
 		return fmt.Errorf("helper response secret shape is invalid")
 	}
-	if err := ValidateResponse(response); err != nil {
+	if err := ValidateResponse(operation, response); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(response)
@@ -148,7 +157,7 @@ func ReadResponse(reader io.Reader, operation Operation) (Response, *Secret, err
 	if err := decodeCanonical(payload, &response); err != nil {
 		return Response{}, nil, err
 	}
-	if err := ValidateResponse(response); err != nil {
+	if err := ValidateResponse(operation, response); err != nil {
 		return Response{}, nil, err
 	}
 	if !policy.SecretOutput || response.Code != ResponseSucceeded {

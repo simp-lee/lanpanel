@@ -61,6 +61,79 @@ func (store *changingSafety) Read() (safety.State, error) {
 
 func (store *fakeSafety) Read() (safety.State, error) { return store.state, store.err }
 
+func TestSecretFingerprintBindingIsDurableAndImmutable(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer normal.Close()
+	defer mutationSet.Close()
+	defer manager.Close()
+	planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{1}, 64))})
+	spec := plans.Spec{Operation: string(AdminTokenRotate), Target: plans.Target{Kind: plans.TargetInstallation}, ActorIdentity: "ui/session-one/generation/1", Config: plans.DigestBinding{}, Applied: plans.DigestBinding{}, Evidence: []plans.Evidence{}, ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_confirmation"}
+	plan, err := planStore.Create(context.Background(), admission, 1, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+	table, err := NewBranchTable([]ResultBranch{{"complete", jobs.ResultSucceeded, jobs.PostconditionVerified}, {"no_effect", jobs.ResultFailed, jobs.PostconditionVerified}, {"known_residual", jobs.ResultPartial, jobs.PostconditionKnown}, {"executor_died", jobs.ResultInterrupted, jobs.PostconditionKnown}, {"source_unknown", jobs.ResultUnknown, jobs.PostconditionUnobserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry([]Registration{{Operation: AdminTokenRotate, Owner: "admin-token", Results: table}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{2}, 64)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: AdminTokenRotate, Target: "installation", ActorIdentity: plan.ActorIdentity, PlanID: plan.ID, Source: AdmissionPlan, ExpectedRevision: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), "installation", manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admitter.ConsumePlan(context.Background(), mutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := testDigest("secret")
+	if err := admitter.BindSecretFingerprint(context.Background(), mutation, exposure, 4, record.ID, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, found, err := FindPendingSecretIntent(document, AdminTokenRotate, "installation")
+	if err != nil || !found || pending.Fingerprint != fingerprint || pending.Phase != PhaseLocalIntent {
+		t.Fatalf("pending=%#v found=%t err=%v", pending, found, err)
+	}
+	if err := admitter.BindSecretFingerprint(context.Background(), mutation, exposure, 5, record.ID, testDigest("other")); err == nil {
+		t.Fatal("secret fingerprint rebound")
+	}
+	if err := admitter.MarkSecretCommitted(context.Background(), mutation, exposure, 5, record.ID, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	document, err = normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, found, err = FindPendingSecretIntent(document, AdminTokenRotate, "installation")
+	if err != nil || !found || !pending.Committed {
+		t.Fatalf("committed pending=%#v found=%t err=%v", pending, found, err)
+	}
+	if err := admitter.MarkSecretCommitted(context.Background(), mutation, exposure, 6, record.ID, fingerprint); err == nil {
+		t.Fatal("secret commit marked twice")
+	}
+	if err := ReleaseExposure(mutation, exposure); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOperationAdmissionContract(t *testing.T) {
 	t.Run("reservation_consumption_and_remote_wait_release_locks", func(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()

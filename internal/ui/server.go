@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"lanpanel/internal/application"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/session"
 	"net"
 	"net/http"
@@ -47,6 +49,7 @@ type Config struct {
 	Verifier                           TokenVerifier
 	Sessions                           *session.Manager
 	Profile                            ProfileProvider
+	Actions                            *application.Service
 }
 type Server struct {
 	config  Config
@@ -117,6 +120,8 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.current(writer, request)
 	case request.Method == http.MethodGet && request.URL.Path == "/api/events":
 		s.events(writer, request)
+	case request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, "/api/actions/"):
+		s.action(writer, request)
 	default:
 		reject(writer, http.StatusNotFound)
 	}
@@ -127,7 +132,7 @@ func (s *Server) shell(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(writer, `<!doctype html><html><head><meta charset="utf-8"><title>LanPanel</title><link rel="stylesheet" href="/assets/app.8d13f0c2.css"></head><body><main><h1>LanPanel</h1><p id="fingerprint">`+template.HTMLEscapeString(s.config.InstallationFingerprint)+`</p><form id="login" method="post" action="/login" enctype="application/x-www-form-urlencoded"><label>Admin token<input name="token" type="password" autocomplete="current-password"></label><button>Login</button></form><button id="logout" hidden>Logout</button><p id="status"></p></main><script src="/assets/app.1b6c82e4.js" defer></script></body></html>`)
+	_, _ = io.WriteString(writer, `<!doctype html><html><head><meta charset="utf-8"><title>LanPanel</title><link rel="stylesheet" href="/assets/app.8d13f0c2.css"></head><body><main><h1>LanPanel</h1><p id="fingerprint">`+template.HTMLEscapeString(s.config.InstallationFingerprint)+`</p><form id="login" method="post" action="/login" enctype="application/x-www-form-urlencoded"><label>Admin token<input name="token" type="password" autocomplete="current-password"></label><button>Login</button></form><button id="rotate" hidden>Rotate admin token</button><button id="logout" hidden>Logout</button><p id="status"></p></main><script src="/assets/app.1b6c82e4.js" defer></script></body></html>`)
 }
 func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 	contentType, ok := exactHeader(request, "Content-Type")
@@ -149,15 +154,15 @@ func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 	}
 	token := []byte(values.Get("token"))
 	defer clear(token)
-	s.barrier.RLock()
+	s.barrier.Lock()
 	fingerprint, err := s.config.Verifier.Verify(request.Context(), token)
 	if err != nil {
-		s.barrier.RUnlock()
+		s.barrier.Unlock()
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
 	credentials, err := s.config.Sessions.Issue(s.origin(), fingerprint)
-	s.barrier.RUnlock()
+	s.barrier.Unlock()
 	if err != nil {
 		reject(writer, http.StatusServiceUnavailable)
 		return
@@ -167,6 +172,8 @@ func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 	_ = json.NewEncoder(writer).Encode(map[string]string{"proof": credentials.Proof, "csrf": credentials.CSRF})
 }
 func (s *Server) current(writer http.ResponseWriter, request *http.Request) {
+	s.barrier.RLock()
+	defer s.barrier.RUnlock()
 	s.output.Lock()
 	defer s.output.Unlock()
 	principal, ok := s.authenticate(request, false)
@@ -184,6 +191,8 @@ func (s *Server) current(writer http.ResponseWriter, request *http.Request) {
 	_ = json.NewEncoder(writer).Encode(map[string]any{"authenticated": true, "profile": profile, "emergency_actions": profile == ProfileEmergency})
 }
 func (s *Server) logout(writer http.ResponseWriter, request *http.Request) {
+	s.barrier.RLock()
+	defer s.barrier.RUnlock()
 	s.output.Lock()
 	defer s.output.Unlock()
 	if !exactOrigin(request, s.origin()) {
@@ -236,26 +245,35 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	clear(payload)
+	s.barrier.RLock()
 	fingerprint, err := s.config.Verifier.Source(request.Context())
 	if err != nil {
 		s.config.Sessions.InvalidateFingerprint("unavailable")
+		s.barrier.RUnlock()
 		return
 	}
 	if !s.config.Sessions.RequireFingerprint(fingerprint) {
+		s.barrier.RUnlock()
 		return
 	}
 	principal, err := s.config.Sessions.AuthenticateSocket(selector, frame.Proof, s.origin(), fingerprint)
 	if err != nil {
+		s.barrier.RUnlock()
 		return
 	}
 	managed := &socket{connection: connection}
 	if s.config.Sessions.Attach(principal, managed) != nil {
+		s.barrier.RUnlock()
 		return
 	}
+	s.barrier.RUnlock()
 	defer s.config.Sessions.Detach(principal, managed)
 	sendContext, sendCancel := context.WithTimeout(request.Context(), 5*time.Second)
 	defer sendCancel()
-	if s.config.Sessions.Send(principal, fingerprint, func() error { return managed.Write(sendContext, []byte(`{"type":"ready"}`)) }) != nil {
+	s.barrier.RLock()
+	sendErr := s.config.Sessions.Send(principal, fingerprint, func() error { return managed.Write(sendContext, []byte(`{"type":"ready"}`)) })
+	s.barrier.RUnlock()
+	if sendErr != nil {
 		return
 	}
 	for {
@@ -269,6 +287,98 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 }
+func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
+	controller := http.NewResponseController(writer)
+	_ = controller.SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	if !exactOrigin(request, s.origin()) {
+		reject(writer, http.StatusForbidden)
+		return
+	}
+	pathValue := strings.TrimPrefix(request.URL.Path, "/api/actions/")
+	planRoute := strings.HasSuffix(pathValue, "/plan")
+	if planRoute {
+		pathValue = strings.TrimSuffix(pathValue, "/plan")
+	}
+	operation, err := domain.ParseOperationCode(pathValue)
+	if err != nil {
+		reject(writer, http.StatusNotFound)
+		return
+	}
+	target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
+	if operation != domain.OperationAdminTokenRotate || s.config.Actions == nil {
+		reject(writer, http.StatusNotFound)
+		return
+	}
+	s.barrier.Lock()
+	defer s.barrier.Unlock()
+	principal, ok := s.authenticate(request, true)
+	if !ok {
+		reject(writer, http.StatusUnauthorized)
+		return
+	}
+	if planRoute {
+		result, invokeErr := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: domain.OperationPlan, Target: target, Payload: application.PlanPayload{Operation: operation, Target: target}})
+		if invokeErr != nil {
+			reject(writer, http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(result.Payload)
+		return
+	}
+	request.Body = http.MaxBytesReader(writer, request.Body, 4096)
+	data, err := io.ReadAll(request.Body)
+	if err != nil {
+		reject(writer, http.StatusBadRequest)
+		return
+	}
+	defer clear(data)
+	var payload application.ConfirmationPayload
+	if decodeExactJSON(data, &payload) != nil || payload.PlanID == "" || payload.Confirmation != "rotate" {
+		reject(writer, http.StatusBadRequest)
+		return
+	}
+	result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
+	if err != nil {
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		reply, reconcileErr := HelperAdminTokenReconcile(reconcileCtx)
+		cancel()
+		current := reply.Digest
+		if reconcileErr != nil || current == "" {
+			s.config.Sessions.InvalidateFingerprint("unavailable")
+		} else {
+			s.config.Sessions.RequireFingerprint(current)
+		}
+		reject(writer, http.StatusServiceUnavailable)
+		return
+	}
+	rotation, ok := result.Payload.(application.RotationResult)
+	if !ok || rotation.JobID == "" || len(rotation.Token) == 0 {
+		reject(writer, http.StatusServiceUnavailable)
+		return
+	}
+	defer clear(rotation.Token)
+	current, sourceErr := s.config.Verifier.Source(request.Context())
+	if sourceErr != nil || current != rotation.Fingerprint {
+		if sourceErr != nil {
+			s.config.Sessions.InvalidateFingerprint("unavailable")
+		} else {
+			s.config.Sessions.CommitTokenRotation(current)
+		}
+		reject(writer, http.StatusServiceUnavailable)
+		return
+	}
+	s.config.Sessions.CommitTokenRotation(rotation.Fingerprint)
+	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(struct {
+		JobID string `json:"job_id"`
+		Token string `json:"token"`
+	}{rotation.JobID, string(rotation.Token)}); err != nil {
+		return
+	}
+}
+
 func (s *Server) authenticate(request *http.Request, mutation bool) (session.Principal, bool) {
 	if presentOriginInvalid(request, s.origin()) {
 		return session.Principal{}, false
@@ -363,4 +473,4 @@ func decodeExactJSON(payload []byte, destination any) error {
 }
 
 const appCSS = "body{font-family:sans-serif;max-width:48rem;margin:4rem auto}label,input{display:block}"
-const appJS = `(()=>{"use strict";let proof=sessionStorage.getItem("lp.proof")||"",csrf=sessionStorage.getItem("lp.csrf")||"";const status=document.getElementById("status"),login=document.getElementById("login"),logout=document.getElementById("logout");const clear=()=>{proof="";csrf="";sessionStorage.clear();status.textContent="";logout.hidden=true;login.hidden=false};login.addEventListener("submit",async event=>{event.preventDefault();const input=login.elements.token,body=new URLSearchParams({token:input.value});input.value="";const response=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});if(!response.ok){status.textContent="Authentication failed";return}const value=await response.json();proof=value.proof;csrf=value.csrf;sessionStorage.setItem("lp.proof",proof);sessionStorage.setItem("lp.csrf",csrf);status.textContent="Authenticated";login.hidden=true;logout.hidden=false});logout.addEventListener("click",async()=>{try{await fetch("/api/logout",{method:"POST",headers:{"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf}})}finally{clear();history.replaceState(null,"","/");location.replace("/")}});addEventListener("pagehide",clear);addEventListener("pageshow",event=>{if(event.persisted){clear();location.replace("/")}})})();`
+const appJS = `(()=>{"use strict";let proof=sessionStorage.getItem("lp.proof")||"",csrf=sessionStorage.getItem("lp.csrf")||"";const status=document.getElementById("status"),login=document.getElementById("login"),logout=document.getElementById("logout"),rotate=document.getElementById("rotate");const clear=()=>{proof="";csrf="";sessionStorage.clear();status.textContent="";logout.hidden=true;rotate.hidden=true;login.hidden=false};login.addEventListener("submit",async event=>{event.preventDefault();const input=login.elements.token,body=new URLSearchParams({token:input.value});input.value="";const response=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body});if(!response.ok){status.textContent="Authentication failed";return}const value=await response.json();proof=value.proof;csrf=value.csrf;sessionStorage.setItem("lp.proof",proof);sessionStorage.setItem("lp.csrf",csrf);status.textContent="Authenticated";login.hidden=true;logout.hidden=false;rotate.hidden=false});rotate.addEventListener("click",async()=>{const h={"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf,"Content-Type":"application/json"},pr=await fetch("/api/actions/admin_token_rotate/plan",{method:"POST",headers:h,body:"{}"});if(!pr.ok){status.textContent="Rotation Plan failed";return}const p=await pr.json();if(!confirm("Review: "+p.operation+" for "+p.target_kind+". "+p.exposure_summary+". "+p.prerequisites+". Expires "+p.expires_at+". Continue?"))return;const r=await fetch("/api/actions/admin_token_rotate",{method:"POST",headers:h,body:JSON.stringify({plan_id:p.plan_id,confirmation:"rotate"})});if(!r.ok){status.textContent="Rotation failed";return}const v=await r.json();proof="";csrf="";sessionStorage.clear();logout.hidden=true;rotate.hidden=true;login.hidden=false;status.textContent="New admin token: "+v.token;});logout.addEventListener("click",async()=>{try{await fetch("/api/logout",{method:"POST",headers:{"X-LanPanel-Session-Proof":proof,"X-LanPanel-CSRF":csrf}})}finally{clear();history.replaceState(null,"","/");location.replace("/")}});addEventListener("pagehide",clear);addEventListener("pageshow",event=>{if(event.persisted){clear();location.replace("/")}})})();`

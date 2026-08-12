@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"lanpanel/internal/application"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/helperproto"
 	"net"
@@ -17,28 +18,38 @@ import (
 type HelperVerifier struct{}
 
 func (HelperVerifier) Verify(ctx context.Context, token []byte) (string, error) {
-	return helperRequest(ctx, helperproto.OperationAdminTokenVerify, token)
+	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenVerify, nil, token)
+	clear(reply.Secret)
+	return reply.Digest, err
 }
 func (HelperVerifier) Source(ctx context.Context) (string, error) {
-	return helperRequest(ctx, helperproto.OperationAdminTokenSource, nil)
+	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenSource, nil, nil)
+	clear(reply.Secret)
+	return reply.Digest, err
 }
-func helperRequest(ctx context.Context, operation helperproto.Operation, secret []byte) (string, error) {
+func HelperApplicationRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
+	return helperExchange(ctx, operation, &payload, nil)
+}
+func HelperAdminTokenReconcile(ctx context.Context) (application.HelperReply, error) {
+	return helperExchange(ctx, helperproto.OperationAdminTokenReconcile, nil, nil)
+}
+func helperExchange(ctx context.Context, operation helperproto.Operation, action *helperproto.ActionPayload, secret []byte) (application.HelperReply, error) {
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "unix", helper.FixedSocketPath)
 	if err != nil {
-		return "", err
+		return application.HelperReply{}, err
 	}
 	defer connection.Close()
-	deadline := time.Now().Add(10 * time.Second)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
+	deadline := time.Now().Add(75 * time.Second)
+	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
+		deadline = value
 	}
 	if err := connection.SetDeadline(deadline); err != nil {
-		return "", err
+		return application.HelperReply{}, err
 	}
 	unixConnection, ok := connection.(*net.UnixConn)
 	if !ok {
-		return "", fmt.Errorf("helper connection is not Unix")
+		return application.HelperReply{}, fmt.Errorf("helper connection is not Unix")
 	}
 	raw, _ := unixConnection.SyscallConn()
 	var credential *unix.Ucred
@@ -47,24 +58,41 @@ func helperRequest(ctx context.Context, operation helperproto.Operation, secret 
 		credential, socketErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
 	})
 	if socketErr != nil || credential == nil || credential.Uid != 0 {
-		return "", fmt.Errorf("helper peer is not root")
+		return application.HelperReply{}, fmt.Errorf("helper peer is not root")
 	}
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
-		return "", fmt.Errorf("helper request entropy failed")
+		return application.HelperReply{}, fmt.Errorf("helper request entropy failed")
 	}
 	defer clear(random)
 	nonce := hex.EncodeToString(random)
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: "installation", IntentGeneration: 1, Deadline: time.Now().UTC().Add(time.Minute), InputDigest: InputDigest(string(operation) + "/" + nonce)}
+	requestDeadline := time.Now().UTC().Add(time.Minute)
+	if operation == helperproto.OperationAdminTokenReconcile {
+		requestDeadline = time.Now().UTC().Add(30 * time.Second)
+	}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: "installation", IntentGeneration: 1, Deadline: requestDeadline, InputDigest: InputDigest(string(operation) + "/" + nonce), Action: action}
+	if action != nil {
+		request.InputDigest, err = helperproto.ApplicationInputDigest(request)
+		if err != nil {
+			return application.HelperReply{}, err
+		}
+	}
 	if err := helperproto.WriteRequest(connection, request, secret); err != nil {
-		return "", err
+		return application.HelperReply{}, err
 	}
 	response, responseSecret, err := helperproto.ReadResponse(connection, operation)
+	if err != nil || response.RequestID != request.RequestID || response.Code != helperproto.ResponseSucceeded {
+		if responseSecret != nil {
+			responseSecret.Destroy()
+		}
+		return application.HelperReply{}, fmt.Errorf("helper request rejected")
+	}
+	var output []byte
 	if responseSecret != nil {
-		responseSecret.Destroy()
+		output, err = responseSecret.OutputCopy()
+		if err != nil {
+			return application.HelperReply{}, err
+		}
 	}
-	if err != nil || response.Code != helperproto.ResponseSucceeded {
-		return "", fmt.Errorf("helper authentication rejected")
-	}
-	return response.ResultDigest, nil
+	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Secret: output}, nil
 }

@@ -37,6 +37,7 @@ const (
 	EdgeOneExpiry           Type = "edgeone_expiry"
 	Maintenance             Type = "maintenance"
 	PackageTransaction      Type = "package_transaction"
+	AdminTokenRotate        Type = "admin_token_rotate"
 	Upgrade                 Type = "upgrade"
 	BackupEnter             Type = "backup_enter"
 	AutomaticReconciliation Type = "automatic_exact_journal_reconciliation"
@@ -101,6 +102,8 @@ type Reservation struct {
 	Phase               Phase                `json:"phase"`
 	SafetyDigest        string               `json:"safety_digest"`
 	JournalSafetyDigest string               `json:"journal_safety_digest,omitempty"`
+	SecretFingerprint   string               `json:"secret_fingerprint,omitempty"`
+	SecretCommitted     bool                 `json:"secret_committed,omitempty"`
 	SafetyBinding       SafetyBinding        `json:"safety_binding"`
 	CreatedAt           time.Time            `json:"created_at"`
 	IntentGeneration    uint64               `json:"intent_generation,omitempty"`
@@ -230,28 +233,7 @@ func NewAdmitter(normal *persist.Store, safetyStore SafetyReader, options Option
 		random = rand.Reader
 	}
 	if !normal.SchemaSealed() {
-		if err := plans.Register(normal); err != nil {
-			return nil, err
-		}
-		if err := jobs.Register(normal); err != nil {
-			return nil, err
-		}
-		if err := normal.RegisterCanonicalNamespace("intents", "operations.intents.v1", validateIntentEntry, validateIntentTransition); err != nil {
-			return nil, err
-		}
-		if err := normal.RegisterCanonicalNamespace("children", "operations.children.v1", validateChildEntry, validateChildTransition); err != nil {
-			return nil, err
-		}
-		if err := normal.RegisterCanonicalNamespace("journals", "operations.journals.v1", validateJournalEntry, validateJournalTransition); err != nil {
-			return nil, err
-		}
-		if err := normal.RegisterCanonicalDocumentValidator("operations.links.v1", validateLinks); err != nil {
-			return nil, err
-		}
-		if err := normal.RegisterCanonicalDocumentTransitionValidator("operations.resource_transitions.v1", validateOperationStateTransitions); err != nil {
-			return nil, err
-		}
-		if err := normal.SealSchema(); err != nil {
+		if err := Register(normal); err != nil {
 			return nil, err
 		}
 	}
@@ -275,6 +257,43 @@ func NewAdmitter(normal *persist.Store, safetyStore SafetyReader, options Option
 		admitter.lastTrusted = observed
 	}
 	return admitter, nil
+}
+
+func Register(normal *persist.Store) error {
+	if normal == nil {
+		return fmt.Errorf("normal operation store is nil")
+	}
+	if err := plans.Register(normal); err != nil {
+		return err
+	}
+	if err := jobs.Register(normal); err != nil {
+		return err
+	}
+	if !normal.NamespaceRegistered("intents") {
+		if err := normal.RegisterCanonicalNamespace("intents", "operations.intents.v1", validateIntentEntry, validateIntentTransition); err != nil {
+			return err
+		}
+	}
+	if !normal.NamespaceRegistered("children") {
+		if err := normal.RegisterCanonicalNamespace("children", "operations.children.v1", validateChildEntry, validateChildTransition); err != nil {
+			return err
+		}
+	}
+	if !normal.NamespaceRegistered("journals") {
+		if err := normal.RegisterCanonicalNamespace("journals", "operations.journals.v1", validateJournalEntry, validateJournalTransition); err != nil {
+			return err
+		}
+	}
+	if !normal.SchemaSealed() {
+		if err := normal.RegisterCanonicalDocumentValidator("operations.links.v1", validateLinks); err != nil {
+			return err
+		}
+		if err := normal.RegisterCanonicalDocumentTransitionValidator("operations.resource_transitions.v1", validateOperationStateTransitions); err != nil {
+			return err
+		}
+		return normal.SealSchema()
+	}
+	return nil
 }
 
 func (admitter *Admitter) trustedNow() (time.Time, error) {
@@ -444,6 +463,13 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 		return record, fmt.Errorf("reservation rejected because independent safety authority changed")
 	}
 	return record, nil
+}
+
+func (admitter *Admitter) RejectReservation(ctx context.Context, admission *locks.Lease, expectedRevision uint64, jobID, code string) error {
+	if admission == nil || !admission.Holds(locks.MutationAdmission) {
+		return fmt.Errorf("reservation rejection requires the mutation-admission lock")
+	}
+	return admitter.rejectReservation(ctx, admission, expectedRevision, jobID, code)
 }
 
 func (admitter *Admitter) rejectReservation(ctx context.Context, admission *locks.Lease, expectedRevision uint64, jobID, code string) error {
@@ -896,6 +922,90 @@ func (admitter *Admitter) ReserveChild(ctx context.Context, admission *locks.Lea
 	})
 	return err
 }
+func (admitter *Admitter) BindSecretFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, fingerprint string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(fingerprint) {
+		return fmt.Errorf("secret fingerprint binding requires exact authority")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intentView, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return err
+	}
+	if mutation.Target() != intentView.Target || intentView.Operation != AdminTokenRotate || intentView.Phase != PhaseLocalIntent || intentView.SecretFingerprint != "" {
+		return fmt.Errorf("secret fingerprint intent is invalid")
+	}
+	if err := admitter.validateFreshAuthority(document, intentView); err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != AdminTokenRotate || intent.Phase != PhaseLocalIntent || intent.SecretFingerprint != "" {
+			return fmt.Errorf("secret fingerprint is already bound or intent changed")
+		}
+		intent.SecretFingerprint = fingerprint
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(jobID), raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) MarkSecretCommitted(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, fingerprint string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(fingerprint) {
+		return fmt.Errorf("secret commit marker requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != AdminTokenRotate || intent.Phase != PhaseLocalIntent || intent.SecretFingerprint != fingerprint || intent.SecretCommitted {
+			return fmt.Errorf("secret commit marker does not match immutable intent")
+		}
+		intent.SecretCommitted = true
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(jobID), raw)
+	})
+	return err
+}
+
+type PendingSecretIntent struct {
+	JobID, PlanID, Target, Fingerprint string
+	Phase                              Phase
+	Committed                          bool
+}
+
+func FindPendingSecretIntent(document persist.Document, operation Type, target string) (PendingSecretIntent, bool, error) {
+	var result PendingSecretIntent
+	found := false
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return PendingSecretIntent{}, false, err
+		}
+		if intent.Operation != operation || intent.Target != target || intent.Phase == PhaseTerminal || intent.Phase == PhaseRejected {
+			continue
+		}
+		if found {
+			return PendingSecretIntent{}, false, fmt.Errorf("multiple pending secret intents")
+		}
+		result = PendingSecretIntent{JobID: intent.JobID, PlanID: intent.PlanID, Target: intent.Target, Fingerprint: intent.SecretFingerprint, Phase: intent.Phase, Committed: intent.SecretCommitted}
+		found = true
+	}
+	return result, found, nil
+}
+
 func (admitter *Admitter) TransitionChild(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord) error {
 	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return fmt.Errorf("child transition requires authoritative mutation then exposure locks")
@@ -1163,6 +1273,9 @@ func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, e
 }
 
 func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string) (jobs.Record, error) {
+	return admitter.CompleteWithSecret(ctx, mutation, exposure, expectedRevision, jobID, branchName, paths, postconditions, errorCode, nil)
+}
+func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string, secretResult *jobs.SecretResult) (jobs.Record, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return jobs.Record{}, fmt.Errorf("job completion requires authoritative mutation then exposure locks")
 	}
@@ -1251,7 +1364,7 @@ func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease,
 		if err != nil {
 			return err
 		}
-		record, err = jobs.Finish(record, jobs.Completion{Result: branch.Result, ModifiedPaths: paths, Postconditions: postconditions, ErrorCode: errorCode}, observedNow)
+		record, err = jobs.Finish(record, jobs.Completion{Result: branch.Result, ModifiedPaths: paths, Postconditions: postconditions, ErrorCode: errorCode, SecretResult: secretResult}, observedNow)
 		if err != nil {
 			return err
 		}
@@ -1612,17 +1725,25 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	oldGeneration, newGeneration := oldValue.IntentGeneration, newValue.IntentGeneration
 	oldConsumption, newConsumption := oldValue.Consumption, newValue.Consumption
 	oldJournalSafety, newJournalSafety := oldValue.JournalSafetyDigest, newValue.JournalSafetyDigest
+	oldSecretFingerprint, newSecretFingerprint := oldValue.SecretFingerprint, newValue.SecretFingerprint
+	oldSecretCommitted, newSecretCommitted := oldValue.SecretCommitted, newValue.SecretCommitted
 	oldValue.IntentGeneration = 0
 	newValue.IntentGeneration = 0
 	oldValue.Consumption = nil
 	newValue.Consumption = nil
 	oldValue.JournalSafetyDigest = ""
 	newValue.JournalSafetyDigest = ""
+	oldValue.SecretFingerprint = ""
+	newValue.SecretFingerprint = ""
+	oldValue.SecretCommitted = false
+	newValue.SecretCommitted = false
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("immutable operation intent binding was rewritten")
 	}
-	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != ""
-	valid := journalBindingOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
+	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != "" && oldSecretFingerprint == newSecretFingerprint
+	secretBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == "" && exactDigest(newSecretFingerprint) && !oldSecretCommitted && !newSecretCommitted && oldJournalSafety == newJournalSafety
+	secretCommitOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == newSecretFingerprint && exactDigest(newSecretFingerprint) && !oldSecretCommitted && newSecretCommitted && oldJournalSafety == newJournalSafety
+	valid := journalBindingOnly || secretBindingOnly || secretCommitOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
 	if !valid {
 		return fmt.Errorf("operation intent phase transition is invalid")
 	}
@@ -1637,6 +1758,9 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	}
 	if oldJournalSafety != "" && newJournalSafety != oldJournalSafety || newJournalSafety != "" && !exactDigest(newJournalSafety) {
 		return fmt.Errorf("journal safety binding was rewritten or is invalid")
+	}
+	if oldSecretFingerprint != "" && newSecretFingerprint != oldSecretFingerprint || newSecretFingerprint != "" && !exactDigest(newSecretFingerprint) || oldSecretCommitted && !newSecretCommitted || newSecretCommitted && newSecretFingerprint == "" {
+		return fmt.Errorf("secret commit binding was rewritten or is invalid")
 	}
 	return nil
 }
@@ -2172,7 +2296,7 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 }
 
 func validateReservation(value Reservation) error {
-	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
+	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
 		return fmt.Errorf("operation reservation is invalid")
 	}
 	if value.Phase != PhaseReserved && value.Phase != PhaseLocalIntent && value.Phase != PhaseRemoteWait && value.Phase != PhaseRejected && value.Phase != PhaseReentered && value.Phase != PhaseTerminal {
@@ -2180,6 +2304,9 @@ func validateReservation(value Reservation) error {
 	}
 	if value.Phase != PhaseReserved && value.Phase != PhaseRejected && value.IntentGeneration == 0 {
 		return fmt.Errorf("operation intent generation is missing")
+	}
+	if value.SecretFingerprint != "" && (value.Phase == PhaseReserved || value.Phase == PhaseRejected || value.Consumption == nil) || value.SecretCommitted && value.SecretFingerprint == "" {
+		return fmt.Errorf("secret commit authority precedes durable local intent")
 	}
 	if value.Phase == PhaseReserved || value.Phase == PhaseRejected {
 		if value.Consumption != nil {
@@ -2193,7 +2320,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
 		return true
 	}
 	return false
@@ -2239,7 +2366,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("Plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, BackupEnter:
+		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, BackupEnter:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}

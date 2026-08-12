@@ -51,6 +51,23 @@ func TestSessionExpiryAndEntropyFailure(t *testing.T) {
 		t.Fatal("expired session accepted")
 	}
 }
+func TestStalePrincipalCannotSurviveTokenRotation(t *testing.T) {
+	manager, _ := New("fp", Options{Random: bytes.NewReader(make([]byte, 96))})
+	defer manager.Close()
+	credentials, _ := manager.Issue("origin", "fp")
+	principal, err := manager.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, "origin", "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.CommitTokenRotation("fp2")
+	if err := manager.Attach(principal, &socket{}); err == nil {
+		t.Fatal("stale generation attached after rotation")
+	}
+	if _, err := manager.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, "origin", "fp2", true); err == nil {
+		t.Fatal("old session survived rotation")
+	}
+}
+
 func TestRestartDoesNotReissueCredentials(t *testing.T) {
 	manager, _ := New("fp", Options{Random: bytes.NewReader(make([]byte, 96))})
 	defer manager.Close()
