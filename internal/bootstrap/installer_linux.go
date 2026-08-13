@@ -101,7 +101,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 		if err := verifyResumeInventory(journal); err != nil {
 			return err
 		}
-		if journal.Release != releaseIdentity || journal.Paths != paths || journal.SafetyGeneration != preflightRequest.Generation || journal.PreflightDigest != preflightDigest || !reflect.DeepEqual(journal.PreflightRequest, preflightRequest) {
+		if !reflect.DeepEqual(journal.Release, releaseIdentity) || journal.Paths != paths || journal.SafetyGeneration != preflightRequest.Generation || journal.PreflightDigest != preflightDigest || !reflect.DeepEqual(journal.PreflightRequest, preflightRequest) {
 			return fmt.Errorf("existing bootstrap attempt belongs to different exact authority")
 		}
 		return resume(ctx, store, journal, request, nil, strict)
@@ -167,7 +167,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		return nil
 	}
 	if journal.Phase == PhasePrepared {
-		if _, err := ensureDirectory(journal.Paths.PersistentRoot, filetxn.Owner{UID: 0, GID: 0}, 0o700); err != nil {
+		if _, err := ensureDirectory(journal.Paths.PersistentRoot, filetxn.Owner{UID: 0, GID: 0}, 0o711); err != nil {
 			return err
 		}
 		fingerprint, _ := identity.Fingerprint(journal.InstallationID)
@@ -211,17 +211,22 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 				return certificateErr
 			}
 		}
+		confinementBytes, confinementErr := release.MarshalCanonical(journal.Release.Profile.ManagedConfinement)
+		if confinementErr != nil {
+			return confinementErr
+		}
 		members := []filetxn.DirectoryMember{
 			{Name: "admin-token", Data: token, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 			{Name: "bundle.json", Data: bundleBytes, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: MaximumJournalBytes},
 			{Name: "default-rejection.crt", Data: defaultCertificate.CertificatePEM, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644, Maximum: nginx.MaximumGraphFileSize},
 			{Name: "default-rejection.key", Data: defaultCertificate.PrivateKeyPEM, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: nginx.MaximumGraphFileSize},
 			{Name: "host-fingerprint", Data: []byte(journal.Release.HostFingerprint), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
+			{Name: "managed-confinement.json", Data: confinementBytes, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 64 << 10},
 			{Name: "os-profile.digest", Data: []byte(journal.Release.ProfileDigest), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 			{Name: "release-envelope.digest", Data: []byte(journal.Release.EnvelopeDigest), Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
 		}
 		slices.SortFunc(members, func(left, right filetxn.DirectoryMember) int { return strings.Compare(left.Name, right.Name) })
-		bundleRequest := filetxn.DirectoryRequest{ParentPath: filepath.Dir(journal.Paths.InstallationRoot), Parent: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o700}, TargetName: filepath.Base(journal.Paths.InstallationRoot), Directory: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o711}, Members: members}
+		bundleRequest := filetxn.DirectoryRequest{ParentPath: filepath.Dir(journal.Paths.InstallationRoot), Parent: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o711}, TargetName: filepath.Base(journal.Paths.InstallationRoot), Directory: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o711}, Members: members}
 		directoryIdentity, err := filetxn.CommitNewDirectory(ctx, bundleRequest)
 		if errors.Is(err, os.ErrExist) {
 			directoryIdentity, err = filetxn.VerifyDirectory(bundleRequest)
@@ -593,7 +598,7 @@ func scanExistingEvidence(paths Paths) ([]string, error) {
 		nginxPaths = testNginxPaths(paths)
 	}
 	candidates = append(candidates, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath)
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		candidates = append(candidates, filepath.Join(paths.SystemdRoot, name))
 	}
 	result := []string{}
@@ -661,7 +666,7 @@ func verifyPrecommitArtifacts(journal Journal) error {
 		name    string
 		mode    uint32
 		maximum int64
-	}{{"admin-token", 0o600, 4096}, {"bundle.json", 0o600, MaximumJournalBytes}, {"default-rejection.crt", 0o644, nginx.MaximumGraphFileSize}, {"default-rejection.key", 0o600, nginx.MaximumGraphFileSize}, {"host-fingerprint", 0o600, 4096}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
+	}{{"admin-token", 0o600, 4096}, {"bundle.json", 0o600, MaximumJournalBytes}, {"default-rejection.crt", 0o644, nginx.MaximumGraphFileSize}, {"default-rejection.key", 0o600, nginx.MaximumGraphFileSize}, {"host-fingerprint", 0o600, 4096}, {"managed-confinement.json", 0o600, 64 << 10}, {"os-profile.digest", 0o600, 4096}, {"release-envelope.digest", 0o600, 4096}} {
 		if _, err := readCommittedArtifact(filepath.Join(journal.Paths.InstallationRoot, member.name), member.maximum, member.mode); err != nil {
 			return err
 		}

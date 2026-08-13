@@ -46,6 +46,7 @@ func Run(root string) error {
 	fileSet := token.NewFileSet()
 	commandCalls := 0
 	unixExecCalls := map[string]int{}
+	managedExecCalls := 0
 	for _, path := range files {
 		file, err := parser.ParseFile(fileSet, path, nil, 0)
 		if err != nil {
@@ -83,8 +84,16 @@ func Run(root string) error {
 				if !spawnCalls[name] {
 					return true
 				}
+				if relative == "internal/process/managed_exec_linux.go" {
+					if name != "unix.Exec" || enclosingFunction(file, value.Pos()) != "Execute" || len(value.Args) != 3 || expressionName(value.Args[0]) != "authority.Service.Executable" {
+						err = fmt.Errorf("managed executor exec shape is not exact")
+						return false
+					}
+					managedExecCalls++
+					return true
+				}
 				if relative != "internal/child/executor_linux.go" {
-					err = fmt.Errorf("process API %s escaped child executor in %s", name, relative)
+					err = fmt.Errorf("process API %s escaped fixed executors in %s", name, relative)
 					return false
 				}
 				switch name {
@@ -112,8 +121,8 @@ func Run(root string) error {
 			return err
 		}
 	}
-	if commandCalls != 1 || unixExecCalls["ExecuteBootstrap"] != 1 || unixExecCalls["ExecutePersistentProfile"] != 1 || len(unixExecCalls) != 2 {
-		return fmt.Errorf("child executor call census is command=%d exec=%v", commandCalls, unixExecCalls)
+	if commandCalls != 1 || unixExecCalls["ExecuteBootstrap"] != 1 || unixExecCalls["ExecutePersistentProfile"] != 1 || len(unixExecCalls) != 2 || managedExecCalls != 1 {
+		return fmt.Errorf("fixed executor call census is command=%d child_exec=%v managed_exec=%d", commandCalls, unixExecCalls, managedExecCalls)
 	}
 	return auditRequestFields(filepath.Join(root, "internal", "helperproto", "types.go"))
 }
@@ -123,7 +132,7 @@ func auditRequestFields(path string) error {
 	if err != nil {
 		return err
 	}
-	allowed := map[string]bool{"SchemaVersion": true, "RequestID": true, "Operation": true, "Target": true, "IntentGeneration": true, "Deadline": true, "InputDigest": true, "Action": true}
+	allowed := map[string]bool{"SchemaVersion": true, "RequestID": true, "Operation": true, "Target": true, "IntentGeneration": true, "Deadline": true, "InputDigest": true, "Action": true, "Resource": true}
 	for _, declaration := range file.Decls {
 		general, ok := declaration.(*ast.GenDecl)
 		if !ok {
@@ -174,15 +183,18 @@ func selectorName(expression ast.Expr) string {
 }
 
 func expressionName(expression ast.Expr) string {
-	selector, ok := expression.(*ast.SelectorExpr)
-	if !ok {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		prefix := expressionName(value.X)
+		if prefix == "" {
+			return ""
+		}
+		return prefix + "." + value.Sel.Name
+	default:
 		return ""
 	}
-	identifier, ok := selector.X.(*ast.Ident)
-	if !ok {
-		return ""
-	}
-	return identifier.Name + "." + selector.Sel.Name
 }
 
 func stringLiteral(expression ast.Expr) string {

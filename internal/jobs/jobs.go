@@ -39,10 +39,14 @@ var (
 		"confirmation_invalid":             {},
 		"confirmation_rejected":            {},
 		"exact_reconciliation_closed":      {},
+		"interrupted_lifecycle_contracted": {},
 		"normal_revision_changed":          {},
 		"plan_consumption_rejected":        {},
 		"planless_start_rejected":          {},
+		"process_lifecycle_not_started":    {},
 		"preflight_rejected":               {},
+		"resource_create_not_started":      {},
+		"resource_update_not_started":      {},
 		"safety_authority_changed":         {},
 		"safety_recheck_unavailable":       {},
 		"safety_refresh_failed":            {},
@@ -244,6 +248,7 @@ func Replace(transaction *persist.Transaction, record Record) error {
 	}
 	return transaction.Replace(key(record.ID), raw)
 }
+func IsComplete(record Record) bool { return record.Status == StatusTerminal }
 func LoadEntries(entries map[string]json.RawMessage, id string) (Record, error) {
 	if !idPattern.MatchString(id) {
 		return Record{}, fmt.Errorf("invalid job ID")

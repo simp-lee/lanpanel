@@ -18,22 +18,25 @@ import (
 type HelperVerifier struct{}
 
 func (HelperVerifier) Verify(ctx context.Context, token []byte) (string, error) {
-	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenVerify, nil, token)
+	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenVerify, nil, nil, token)
 	clear(reply.Secret)
 	return reply.Digest, err
 }
 func (HelperVerifier) Source(ctx context.Context) (string, error) {
-	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenSource, nil, nil)
+	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenSource, nil, nil, nil)
 	clear(reply.Secret)
 	return reply.Digest, err
 }
 func HelperApplicationRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
-	return helperExchange(ctx, operation, &payload, nil)
+	return helperExchange(ctx, operation, &payload, nil, nil)
+}
+func HelperResourceRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ResourcePayload, target string) (application.HelperReply, error) {
+	return helperExchange(ctx, operation, nil, &payload, nil, target)
 }
 func HelperAdminTokenReconcile(ctx context.Context) (application.HelperReply, error) {
-	return helperExchange(ctx, helperproto.OperationAdminTokenReconcile, nil, nil)
+	return helperExchange(ctx, helperproto.OperationAdminTokenReconcile, nil, nil, nil)
 }
-func helperExchange(ctx context.Context, operation helperproto.Operation, action *helperproto.ActionPayload, secret []byte) (application.HelperReply, error) {
+func helperExchange(ctx context.Context, operation helperproto.Operation, action *helperproto.ActionPayload, resource *helperproto.ResourcePayload, secret []byte, explicitTarget ...string) (application.HelperReply, error) {
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "unix", helper.FixedSocketPath)
 	if err != nil {
@@ -74,8 +77,11 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	if action != nil && action.TargetKind == "resource" && action.TargetID != "" {
 		target = "resource/" + action.TargetID
 	}
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: target, IntentGeneration: 1, Deadline: requestDeadline, InputDigest: InputDigest(string(operation) + "/" + nonce), Action: action}
-	if action != nil {
+	if len(explicitTarget) == 1 {
+		target = explicitTarget[0]
+	}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "auth-" + nonce, Operation: operation, Target: target, IntentGeneration: 1, Deadline: requestDeadline, InputDigest: InputDigest(string(operation) + "/" + nonce), Action: action, Resource: resource}
+	if action != nil || resource != nil {
 		request.InputDigest, err = helperproto.ApplicationInputDigest(request)
 		if err != nil {
 			return application.HelperReply{}, err
@@ -98,5 +104,5 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 			return application.HelperReply{}, err
 		}
 	}
-	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Secret: output}, nil
+	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Resource: response.Resource, Secret: output}, nil
 }

@@ -71,13 +71,25 @@ type ProfileAuthority struct {
 }
 
 type ExpectedProfile struct {
-	ID                    string           `json:"id"`
-	VersionID             string           `json:"version_id"`
-	Architecture          string           `json:"architecture"`
-	SystemdVersion        string           `json:"systemd_version"`
-	NginxVersion          string           `json:"nginx_version"`
-	PackageSnapshotDigest string           `json:"package_snapshot_digest"`
-	Authority             ProfileAuthority `json:"authority"`
+	ID                    string                    `json:"id"`
+	VersionID             string                    `json:"version_id"`
+	Architecture          string                    `json:"architecture"`
+	SystemdVersion        string                    `json:"systemd_version"`
+	NginxVersion          string                    `json:"nginx_version"`
+	PackageSnapshotDigest string                    `json:"package_snapshot_digest"`
+	ManagedConfinement    ManagedConfinementProfile `json:"managed_confinement"`
+	Authority             ProfileAuthority          `json:"authority"`
+}
+
+type ManagedConfinementProfile struct {
+	SchemaVersion         string   `json:"schema_version"`
+	KernelRelease         string   `json:"kernel_release"`
+	CgroupMode            string   `json:"cgroup_mode"`
+	BindListenPolicy      string   `json:"bind_listen_policy"`
+	ConnectPolicy         string   `json:"connect_policy"`
+	FilesystemPolicy      string   `json:"filesystem_policy"`
+	ProtectedDestinations []string `json:"protected_destinations"`
+	QualificationDigest   string   `json:"qualification_digest"`
 }
 
 type ListenerRequirement struct {

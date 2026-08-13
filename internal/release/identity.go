@@ -30,13 +30,25 @@ type AssetIdentity struct {
 }
 
 type OSProfile struct {
-	ID                    string `json:"id"`
-	Family                string `json:"family"`
-	Release               string `json:"release"`
-	Architecture          string `json:"architecture"`
-	SystemdVersion        string `json:"systemd_version"`
-	NginxVersion          string `json:"nginx_version"`
-	PackageSnapshotDigest string `json:"package_snapshot_digest"`
+	ID                    string             `json:"id"`
+	Family                string             `json:"family"`
+	Release               string             `json:"release"`
+	Architecture          string             `json:"architecture"`
+	SystemdVersion        string             `json:"systemd_version"`
+	NginxVersion          string             `json:"nginx_version"`
+	PackageSnapshotDigest string             `json:"package_snapshot_digest"`
+	ManagedConfinement    ConfinementProfile `json:"managed_confinement"`
+}
+
+type ConfinementProfile struct {
+	SchemaVersion         string   `json:"schema_version"`
+	KernelRelease         string   `json:"kernel_release"`
+	CgroupMode            string   `json:"cgroup_mode"`
+	BindListenPolicy      string   `json:"bind_listen_policy"`
+	ConnectPolicy         string   `json:"connect_policy"`
+	FilesystemPolicy      string   `json:"filesystem_policy"`
+	ProtectedDestinations []string `json:"protected_destinations"`
+	QualificationDigest   string   `json:"qualification_digest"`
 }
 
 type QualificationStatus struct {
@@ -473,8 +485,22 @@ func validateAsset(asset AssetIdentity) error {
 }
 
 func validateOSProfile(profile OSProfile) error {
-	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) || !ValidDigest(profile.PackageSnapshotDigest) {
-		return fmt.Errorf("OS profile is not an exact Debian/Ubuntu amd64 identity")
+	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) || !ValidDigest(profile.PackageSnapshotDigest) || validateConfinementProfile(profile.ManagedConfinement) != nil {
+		return fmt.Errorf("OS profile is not an exact Debian/Ubuntu amd64 identity with qualified managed-process confinement")
+	}
+	return nil
+}
+
+func validateConfinementProfile(profile ConfinementProfile) error {
+	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || !concreteVersionPattern.MatchString(profile.KernelRelease) || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !ValidDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
+		return fmt.Errorf("managed-process confinement profile is unqualified")
+	}
+	previous := ""
+	for _, destination := range profile.ProtectedDestinations {
+		if destination == "" || strings.ContainsAny(destination, "\x00\r\n") || previous != "" && strings.Compare(previous, destination) >= 0 {
+			return fmt.Errorf("managed-process protected destinations are noncanonical")
+		}
+		previous = destination
 	}
 	return nil
 }

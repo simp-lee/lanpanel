@@ -42,6 +42,10 @@ const (
 	BackupEnter             Type = "backup_enter"
 	AutomaticReconciliation Type = "automatic_exact_journal_reconciliation"
 	StartupContraction      Type = "startup_activation_contraction"
+	ResourceCreate          Type = "resource_create"
+	ResourceUpdate          Type = "resource_update"
+	ProcessStart            Type = "process_start"
+	ProcessStop             Type = "process_stop"
 )
 
 const (
@@ -81,6 +85,7 @@ const (
 	AdmissionPlan    AdmissionSource = "plan"
 	AdmissionTimer   AdmissionSource = "timer"
 	AdmissionStartup AdmissionSource = "startup"
+	AdmissionUI      AdmissionSource = "authenticated_ui"
 )
 
 type ConsumptionSnapshot struct {
@@ -114,6 +119,17 @@ type Reservation struct {
 type ContractionCommit struct {
 	ClosureAuthorityDigest string
 	UnpublishedGenerations map[string]uint64
+}
+
+type ResourceCreateCommit struct {
+	Resource domain.AppResource
+}
+
+type ProcessStateCommit struct {
+	ResourceID  string
+	Requested   domain.ProcessRequestedState
+	Applied     *domain.ProcessBundle
+	Observation domain.RuntimeObservation
 }
 type ChildState string
 
@@ -654,6 +670,67 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 	if err != nil && !errors.Is(err, persist.ErrRecoveryRequired) {
 		return reject("plan_consumption_rejected", err)
 	}
+	return result, err
+}
+
+// BeginUI starts a previously admitted authenticated non-Plan UI mutation.
+// It is limited to S12 resource/process operations and commits the same durable
+// local intent boundary before host or installation-state mutation.
+func (admitter *Admitter) BeginUI(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, request ConsumeRequest) (Reservation, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return Reservation{}, err
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return Reservation{}, err
+	}
+	digest, err := safetyDigest(state)
+	if err != nil {
+		return Reservation{}, err
+	}
+	var result Reservation
+	_, _, err = admitter.normal.Update(ctx, exposure, request.ExpectedRevision, func(transaction *persist.Transaction) error {
+		reservation, err := loadReservation(transaction, request.JobID)
+		if err != nil {
+			return err
+		}
+		if reservation.AdmissionSource != AdmissionUI || reservation.Phase != PhaseReserved || mutation.Target() != reservation.Target {
+			return fmt.Errorf("operation reservation is not authenticated-UI or target-matched")
+		}
+		if request.IntentGeneration != request.ExpectedRevision+1 || reservation.SafetyDigest != digest {
+			return fmt.Errorf("authenticated UI phase generation or safety authority changed")
+		}
+		if err := authorize(reservation.Operation, state, reservation.SafetyBinding, true, observedNow); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, reservation.JobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Start(record)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		reservation.Phase = PhaseLocalIntent
+		reservation.IntentGeneration = request.IntentGeneration
+		reservation.Consumption = &ConsumptionSnapshot{Source: AdmissionUI, ConfirmationDigest: planlessAdmissionDigest(reservation, digest), ConfirmedAt: observedNow, SafetyDigest: digest}
+		raw, err := persist.EncodeEntry(reservation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(reservation.JobID), raw); err != nil {
+			return err
+		}
+		result = reservation
+		return nil
+	})
 	return result, err
 }
 
@@ -1380,6 +1457,257 @@ func (admitter *Admitter) CommitContractionState(ctx context.Context, mutation *
 	return err
 }
 
+func (admitter *Admitter) ValidateActive(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, jobID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("operation validation requires authoritative locks")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return err
+	}
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return err
+	}
+	if mutation.Target() != intent.Target || intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered {
+		return fmt.Errorf("operation intent is not active")
+	}
+	return admitter.validateFreshAuthority(document, intent)
+}
+
+func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ResourceCreateCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Resource.ID == "" {
+		return fmt.Errorf("resource creation commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ResourceCreate || intent.AdmissionSource != AdmissionUI || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != commit.Resource.ID || mutation.Target() != intent.Target {
+			return fmt.Errorf("resource creation intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		installation.Resources = append(installation.Resources, commit.Resource)
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitResourceUpdate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.AppResource) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.ID == "" {
+		return fmt.Errorf("resource update commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ResourceUpdate || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != candidate.ID || mutation.Target() != intent.Target {
+			return fmt.Errorf("resource update intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			if installation.Resources[index].ID == candidate.ID {
+				prior := installation.Resources[index]
+				candidate.PublicationRecord = prior.PublicationRecord
+				if candidate.ManagedProcess == nil || prior.ManagedProcess == nil {
+					return fmt.Errorf("resource update managed process is absent")
+				}
+				candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
+				candidate.ManagedProcess.Applied = cloneProcessBundle(prior.ManagedProcess.Applied)
+				candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
+				candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
+				candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
+				candidate.ManagedProcess.LastJobID = prior.ManagedProcess.LastJobID
+				installation.Resources[index] = candidate
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("resource update target disappeared")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitProcessState(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ProcessStateCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.ResourceID == "" || commit.Observation.ObservedAt == "" {
+		return fmt.Errorf("process state commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if (intent.Operation != ProcessStart && intent.Operation != ProcessStop) || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != commit.ResourceID || mutation.Target() != intent.Target {
+			return fmt.Errorf("process state intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != commit.ResourceID {
+				continue
+			}
+			if resource.ManagedProcess == nil {
+				return fmt.Errorf("resource has no managed process")
+			}
+			resource.ManagedProcess.Requested = commit.Requested
+			resource.ManagedProcess.Applied = cloneProcessBundle(commit.Applied)
+			resource.ManagedProcess.RuntimeObservation = &commit.Observation
+			resource.ManagedProcess.LastOperation = domain.OperationProcessStart
+			if intent.Operation == ProcessStop {
+				resource.ManagedProcess.LastOperation = domain.OperationProcessStop
+			}
+			resource.ManagedProcess.LastJobID = intent.JobID
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("process resource disappeared")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func CompleteInterruptedLifecycle(transaction *persist.Transaction, jobID string, now time.Time) error {
+	intent, err := loadReservation(transaction, jobID)
+	if err != nil {
+		return err
+	}
+	record, err := jobs.Load(transaction, jobID)
+	if err != nil {
+		return err
+	}
+	if record.Status != jobs.StatusRunning {
+		return fmt.Errorf("interrupted lifecycle job not running")
+	}
+	record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "interrupted_lifecycle_contracted", Status: jobs.PostconditionKnown, Identity: jobID}}, ErrorCode: "interrupted_lifecycle_contracted"}, now)
+	if err != nil {
+		return err
+	}
+	if err := jobs.Replace(transaction, record); err != nil {
+		return err
+	}
+	intent.Phase = PhaseTerminal
+	raw, err := persist.EncodeEntry(intent)
+	if err != nil {
+		return err
+	}
+	return transaction.Replace(reservationKey(jobID), raw)
+}
+func PendingResourceUpdates(document persist.Document) ([]Reservation, error) {
+	result := []Reservation{}
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return nil, err
+		}
+		if intent.Operation == ResourceUpdate && (intent.Phase == PhaseReserved || intent.Phase == PhaseLocalIntent) {
+			result = append(result, intent)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].JobID < result[j].JobID })
+	return result, nil
+}
+func FindResourceUpdateAuthority(document persist.Document, jobID, resourceID string) (Reservation, error) {
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if intent.Operation != ResourceUpdate || intent.AdmissionSource != AdmissionUI || intent.Target != "resource/"+resourceID || intent.SafetyBinding.ResourceID != resourceID || (intent.Phase != PhaseReserved && intent.Phase != PhaseLocalIntent && intent.Phase != PhaseTerminal) {
+		return Reservation{}, fmt.Errorf("resource update recovery authority mismatched")
+	}
+	return intent, nil
+}
+
+func PendingProcessLifecycles(document persist.Document) ([]Reservation, error) {
+	result := []Reservation{}
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return nil, err
+		}
+		if (intent.Operation == ProcessStart || intent.Operation == ProcessStop) && (intent.Phase == PhaseReserved || intent.Phase == PhaseLocalIntent) {
+			result = append(result, intent)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].JobID < result[j].JobID })
+	return result, nil
+}
+
+func FindProcessLifecycleAuthority(document persist.Document, jobID, resourceID string) (Reservation, error) {
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if (intent.Operation != ProcessStart && intent.Operation != ProcessStop) || intent.AdmissionSource != AdmissionUI || intent.Target != "resource/"+resourceID || intent.SafetyBinding.ResourceID != resourceID || (intent.Phase != PhaseReserved && intent.Phase != PhaseLocalIntent) {
+		return Reservation{}, fmt.Errorf("process lifecycle recovery authority mismatched")
+	}
+	return intent, nil
+}
+
+func PendingResourceCreates(document persist.Document) ([]Reservation, error) {
+	result := []Reservation{}
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return nil, err
+		}
+		if intent.Operation == ResourceCreate && (intent.Phase == PhaseReserved || intent.Phase == PhaseLocalIntent) {
+			result = append(result, intent)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].JobID < result[j].JobID })
+	return result, nil
+}
+
+func FindResourceCreateAuthority(document persist.Document, jobID, resourceID string) (Reservation, error) {
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if intent.Operation != ResourceCreate || intent.AdmissionSource != AdmissionUI || intent.Target != string(plans.TargetInstallation) || intent.SafetyBinding.ResourceID != resourceID || intent.Phase != PhaseLocalIntent && intent.Phase != PhaseTerminal {
+		return Reservation{}, fmt.Errorf("resource create recovery authority mismatched")
+	}
+	return intent, nil
+}
+
+func cloneProcessBundle(value *domain.ProcessBundle) *domain.ProcessBundle {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.WritePathIdentities = append([]string(nil), value.WritePathIdentities...)
+	copy.EndpointSocketUnits = append([]string(nil), value.EndpointSocketUnits...)
+	copy.ManagedPaths = append([]string(nil), value.ManagedPaths...)
+	return &copy
+}
+
 func cloneBundle(value *domain.PublicationBundle) *domain.PublicationBundle {
 	if value == nil {
 		return nil
@@ -1532,6 +1860,101 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 		if err != nil {
 			return err
 		}
+		if intent.Operation == ResourceCreate && branch.Result == jobs.ResultSucceeded {
+			rawInstallation, present := transaction.Get("installations/current")
+			if !present {
+				return fmt.Errorf("resource creation installation authority is missing")
+			}
+			installation, decodeErr := domain.DecodeInstallation(rawInstallation)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			found := false
+			for index := range installation.Resources {
+				resource := &installation.Resources[index]
+				if resource.ID != intent.SafetyBinding.ResourceID {
+					continue
+				}
+				resource.PublicationRecord.LastOperation = domain.OperationResourceCreate
+				resource.PublicationRecord.LastOperationResult = domain.OperationResult(branch.Result)
+				resource.PublicationRecord.LastJobID = intent.JobID
+				found = true
+			}
+			if !found {
+				return fmt.Errorf("created resource disappeared before terminal commit")
+			}
+			rawInstallation, encodeErr := persist.EncodeEntry(installation)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if err := transaction.Replace("installations/current", rawInstallation); err != nil {
+				return err
+			}
+		}
+		if intent.Operation == ResourceUpdate {
+			rawInstallation, present := transaction.Get("installations/current")
+			if !present {
+				return fmt.Errorf("resource update installation authority missing")
+			}
+			installation, decodeErr := domain.DecodeInstallation(rawInstallation)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			found := false
+			for index := range installation.Resources {
+				resource := &installation.Resources[index]
+				if resource.ID == intent.SafetyBinding.ResourceID {
+					resource.PublicationRecord.LastOperation = domain.OperationResourceUpdate
+					resource.PublicationRecord.LastOperationResult = domain.OperationResult(branch.Result)
+					resource.PublicationRecord.LastJobID = intent.JobID
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("updated resource disappeared before terminal commit")
+			}
+			encoded, encodeErr := persist.EncodeEntry(installation)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if err := transaction.Replace("installations/current", encoded); err != nil {
+				return err
+			}
+		}
+		if intent.Operation == ProcessStart || intent.Operation == ProcessStop {
+			rawInstallation, present := transaction.Get("installations/current")
+			if !present {
+				return fmt.Errorf("process installation authority is missing")
+			}
+			installation, decodeErr := domain.DecodeInstallation(rawInstallation)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			found := false
+			for index := range installation.Resources {
+				process := installation.Resources[index].ManagedProcess
+				if installation.Resources[index].ID != intent.SafetyBinding.ResourceID || process == nil {
+					continue
+				}
+				process.LastOperation = domain.OperationProcessStart
+				if intent.Operation == ProcessStop {
+					process.LastOperation = domain.OperationProcessStop
+				}
+				process.LastJobID = intent.JobID
+				process.LastOperationResult = domain.OperationResult(branch.Result)
+				found = true
+			}
+			if !found {
+				return fmt.Errorf("process resource disappeared before terminal commit")
+			}
+			rawInstallation, encodeErr := persist.EncodeEntry(installation)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if err := transaction.Replace("installations/current", rawInstallation); err != nil {
+				return err
+			}
+		}
 		if intent.ContractionDigest != "" {
 			rawInstallation, _ := transaction.Get("installations/current")
 			installation, decodeErr := domain.DecodeInstallation(rawInstallation)
@@ -1645,6 +2068,29 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	if operation == CloseAll {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone || binding.GlobalGeneration != state.GlobalClose.Generation || binding.ProposedGeneration != state.GlobalClose.Generation+1 {
 			return fmt.Errorf("close-all global generation binding is stale or active")
+		}
+	}
+	if operation == ResourceCreate {
+		if binding.ResourceID == "" {
+			return fmt.Errorf("resource creation requires a generated stable identity")
+		}
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil || state.StopFence != nil {
+			return fmt.Errorf("independent safety authority blocks resource creation")
+		}
+	}
+	if operation == ResourceUpdate || operation == ProcessStart || operation == ProcessStop {
+		if state.GlobalClose.Phase != safety.GlobalCloseNone && operation != ProcessStop {
+			return fmt.Errorf("global close blocks non-contraction resource operation")
+		}
+		var resource *safety.ResourceSafety
+		for index := range state.Resources {
+			if state.Resources[index].ResourceID == binding.ResourceID {
+				resource = &state.Resources[index]
+				break
+			}
+		}
+		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil || resource.ChallengePending != nil || resource.Reactivating != nil {
+			return fmt.Errorf("resource lifecycle or expansion authority blocks process operation")
 		}
 	}
 	if operation == Publish {
@@ -2327,7 +2773,13 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	}
 	for _, resource := range newInstallation.Resources {
 		oldResource, existed := oldResources[resource.ID]
-		if !existed || protectedResourceStateEqual(oldResource, resource) {
+		if !existed {
+			if err := validateNewResourceAuthority(after, resource); err != nil {
+				return err
+			}
+			continue
+		}
+		if protectedResourceStateEqual(oldResource, resource) {
 			delete(oldResources, resource.ID)
 			continue
 		}
@@ -2338,6 +2790,9 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
 		}
 		jobID := resource.PublicationRecord.LastJobID
+		if resource.ManagedProcess != nil && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || resource.PublicationRecord == oldResource.PublicationRecord) {
+			jobID = resource.ManagedProcess.LastJobID
+		}
 		if resource.PublicationRecord.ContractionIntent != nil {
 			jobID = resource.PublicationRecord.ContractionIntent.JobID
 		} else if oldResource.PublicationRecord.ContractionIntent != nil {
@@ -2354,7 +2809,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if err != nil {
 			return fmt.Errorf("resource %q state intent: %w", resource.ID, err)
 		}
-		targetMatches := intent.Target == "resource/"+resource.ID || (intent.Operation == CloseAll || intent.Operation == StartupContraction) && intent.Target == string(plans.TargetInstallation)
+		targetMatches := intent.Target == "resource/"+resource.ID || (intent.Operation == CloseAll || intent.Operation == StartupContraction || intent.Operation == ResourceCreate) && intent.Target == string(plans.TargetInstallation)
 		if intent.Operation == AutomaticReconciliation && strings.HasPrefix(intent.Target, "journal/") {
 			journal, err := loadJournalEntries(after.Entries, strings.TrimPrefix(intent.Target, "journal/"))
 			if err == nil {
@@ -2374,6 +2829,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		}
 		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
 		ordinaryTerminal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		switch {
 		case beginningContraction:
@@ -2388,8 +2844,16 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			if oldResource.PublicationRecord.ContractionIntent.JobID != intent.JobID || oldResource.PublicationRecord.ContractionIntent.ClosureAuthorityDigest != intent.ContractionDigest || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != oldResource.PublicationRecord.UnpublishedGeneration || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) || !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) {
 				return fmt.Errorf("resource %q contraction result does not match its running authority", resource.ID)
 			}
+		case ordinaryLocal:
+			if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
+				return fmt.Errorf("resource %q: %w", resource.ID, err)
+			}
 		case ordinaryTerminal:
-			if !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
+			if intent.Operation == ProcessStart || intent.Operation == ProcessStop {
+				if resource.ManagedProcess == nil || !operationCodeMatchesIntent(resource.ManagedProcess.LastOperation, intent.Operation) || string(resource.ManagedProcess.LastOperationResult) != string(record.Result) {
+					return fmt.Errorf("resource %q process state does not match atomic terminal job result", resource.ID)
+				}
+			} else if !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
 				return fmt.Errorf("resource %q state does not match an atomic terminal job result", resource.ID)
 			}
 			if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
@@ -2402,6 +2866,31 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	}
 	if len(oldResources) != 0 {
 		return fmt.Errorf("resource state cannot disappear outside its typed deletion operation")
+	}
+	return nil
+}
+
+func validateNewResourceAuthority(document persist.Document, resource domain.AppResource) error {
+	var match *Reservation
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return err
+		}
+		if intent.Operation == ResourceCreate && intent.SafetyBinding.ResourceID == resource.ID && intent.Phase == PhaseLocalIntent {
+			if match != nil {
+				return fmt.Errorf("new resource has multiple creation authorities")
+			}
+			copy := intent
+			match = &copy
+		}
+	}
+	if match == nil || match.Target != string(plans.TargetInstallation) || match.AdmissionSource != AdmissionUI || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != 1 || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.Applied != nil {
+		return fmt.Errorf("new resource lacks exact authenticated durable creation authority")
+	}
+	record, err := jobs.LoadEntries(document.Entries, match.JobID)
+	if err != nil || record.Status != jobs.StatusRunning {
+		return fmt.Errorf("new resource creation job is not running")
 	}
 	return nil
 }
@@ -2450,10 +2939,25 @@ func loadInstallationEntries(entries map[string]json.RawMessage) (domain.Install
 }
 
 func validateOperationResourceDelta(before, after domain.AppResource, operation Type) error {
-	if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.ManagedProcess, after.ManagedProcess) {
-		return fmt.Errorf("operation %q does not own lifecycle or managed-process state", operation)
+	if before.Lifecycle != after.Lifecycle {
+		return fmt.Errorf("operation %q does not own lifecycle state", operation)
+	}
+	if operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && !reflect.DeepEqual(before.ManagedProcess, after.ManagedProcess) {
+		return fmt.Errorf("operation %q does not own managed-process state", operation)
 	}
 	switch operation {
+	case ResourceCreate:
+		beforeRecord, afterRecord := before.PublicationRecord, after.PublicationRecord
+		beforeRecord.LastOperation = ""
+		beforeRecord.LastOperationResult = ""
+		beforeRecord.LastJobID = ""
+		afterRecord.LastOperation = ""
+		afterRecord.LastOperationResult = ""
+		afterRecord.LastJobID = ""
+		if !reflect.DeepEqual(beforeRecord, afterRecord) || after.PublicationRecord.LastOperation != domain.OperationResourceCreate || after.PublicationRecord.LastOperationResult != domain.OperationSucceeded || after.PublicationRecord.LastJobID == "" || before.ID != after.ID || before.Name != after.Name || before.CurrentConfigDigest != after.CurrentConfigDigest || !reflect.DeepEqual(before.Target, after.Target) || !reflect.DeepEqual(before.Publication, after.Publication) || !reflect.DeepEqual(before.CredentialIDs, after.CredentialIDs) || !reflect.DeepEqual(before.ManagedPaths, after.ManagedPaths) {
+			return fmt.Errorf("resource create terminalization changed initial resource authority")
+		}
+		return nil
 	case Publish:
 		return nil
 	case StartupContraction:
@@ -2466,9 +2970,49 @@ func validateOperationResourceDelta(before, after domain.AppResource, operation 
 			return fmt.Errorf("contraction operation did not commit unpublished state with a fresh generation")
 		}
 		return nil
+	case ResourceUpdate:
+		beforePublication, afterPublication := before.PublicationRecord, after.PublicationRecord
+		beforePublication.LastOperation = ""
+		beforePublication.LastOperationResult = ""
+		beforePublication.LastJobID = ""
+		afterPublication.LastOperation = ""
+		afterPublication.LastOperationResult = ""
+		afterPublication.LastJobID = ""
+		if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(beforePublication, afterPublication) || before.ManagedProcess == nil || after.ManagedProcess == nil || before.ManagedProcess.Requested != after.ManagedProcess.Requested || !reflect.DeepEqual(before.ManagedProcess.Applied, after.ManagedProcess.Applied) || !reflect.DeepEqual(before.ManagedProcess.RuntimeObservation, after.ManagedProcess.RuntimeObservation) {
+			return fmt.Errorf("resource update changed applied lifecycle or process state")
+		}
+		return nil
+	case ProcessStart:
+		if exactProcessNoEffect(before, after) {
+			return nil
+		}
+		interruptedClosed := after.ManagedProcess != nil && after.ManagedProcess.Requested == domain.ProcessRequestedStopped && after.ManagedProcess.LastOperationResult == domain.OperationInterrupted
+		if after.ManagedProcess == nil || !interruptedClosed && (after.ManagedProcess.Requested != domain.ProcessRequestedRunning || after.ManagedProcess.Applied == nil) || before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.PublicationRecord, after.PublicationRecord) {
+			return fmt.Errorf("process start did not commit exact running bundle")
+		}
+		return nil
+	case ProcessStop:
+		if exactProcessNoEffect(before, after) {
+			return nil
+		}
+		if after.ManagedProcess == nil || after.ManagedProcess.Requested != domain.ProcessRequestedStopped || before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.PublicationRecord, after.PublicationRecord) {
+			return fmt.Errorf("process stop did not commit stopped authority")
+		}
+		return nil
 	default:
 		return fmt.Errorf("operation %q has no resource-state delta authority", operation)
 	}
+}
+
+func exactProcessNoEffect(before, after domain.AppResource) bool {
+	if before.ManagedProcess == nil || after.ManagedProcess == nil || after.ManagedProcess.LastOperationResult != domain.OperationFailed || before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(before.PublicationRecord, after.PublicationRecord) {
+		return false
+	}
+	prior, current := *before.ManagedProcess, *after.ManagedProcess
+	current.LastOperation = prior.LastOperation
+	current.LastOperationResult = prior.LastOperationResult
+	current.LastJobID = prior.LastJobID
+	return reflect.DeepEqual(prior, current)
 }
 
 func validateOperationRetentionTransition(before, after persist.Document) error {
@@ -2568,6 +3112,14 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 	switch operation {
 	case Publish:
 		return code == domain.OperationPublish
+	case ResourceCreate:
+		return code == domain.OperationResourceCreate
+	case ResourceUpdate:
+		return code == domain.OperationResourceUpdate
+	case ProcessStart:
+		return code == domain.OperationProcessStart
+	case ProcessStop:
+		return code == domain.OperationProcessStop
 	case Unpublish, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
 		return code == domain.OperationUnpublish
 	case CloseAll:
@@ -2601,12 +3153,15 @@ func validateReservation(value Reservation) error {
 	} else if value.Consumption == nil || value.Consumption.Source != value.AdmissionSource || !digest(value.Consumption.ConfirmationDigest) || !digest(value.Consumption.SafetyDigest) || value.Consumption.ConfirmedAt.IsZero() {
 		return fmt.Errorf("operation consumption snapshot is incomplete")
 	}
+	if value.AdmissionSource == AdmissionUI && value.Consumption != nil && (value.Consumption.Config.Applicable || value.Consumption.Applied.Applicable || len(value.Consumption.Evidence) != 0) {
+		return fmt.Errorf("authenticated UI consumption snapshot is invalid")
+	}
 	return nil
 }
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -2624,7 +3179,8 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 			return fmt.Errorf("Headscale target does not match safety authority")
 		}
 	case string(plans.TargetInstallation):
-		if identity != "" || request.SafetyBinding.ResourceID != "" {
+		resourceCreate := request.Operation == ResourceCreate && identity == "" && request.SafetyBinding.ResourceID != ""
+		if !resourceCreate && (identity != "" || request.SafetyBinding.ResourceID != "") {
 			return fmt.Errorf("installation target has unrelated resource safety authority")
 		}
 	default:
@@ -2633,6 +3189,12 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 	}
 	binding := request.SafetyBinding
+	if request.Operation == ResourceUpdate && request.Source == AdmissionUI {
+		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
+			return fmt.Errorf("authenticated resource update requires exact prior and candidate digests")
+		}
+		return nil
+	}
 	activationBound := binding.PlanID != "" || binding.IntentGeneration != 0 || binding.CandidateDigest != "" || binding.CandidateBundle != ""
 	if activationBound {
 		planBound := request.Source == AdmissionPlan && binding.PlanID == request.PlanID && exactDigest(binding.CandidateBundle)
@@ -2663,6 +3225,10 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 	case AdmissionStartup:
 		if planID != "" || operation != AutomaticReconciliation && operation != StartupContraction {
 			return fmt.Errorf("startup admission is not authorized for operation")
+		}
+	case AdmissionUI:
+		if planID != "" || operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop {
+			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:
 		return fmt.Errorf("operation admission source is unsupported")

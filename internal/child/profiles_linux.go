@@ -38,6 +38,11 @@ const (
 	ProfileLego                  ProfileID = "lego"
 	ProfileHTPasswd              ProfileID = "htpasswd"
 	ProfileTailscaleAdmin        ProfileID = "tailscale_admin"
+	ProfileResourceAccounts      ProfileID = "resource_accounts"
+	ProfileResourceDaemonReload  ProfileID = "resource_daemon_reload"
+	ProfileResourceStart         ProfileID = "resource_start"
+	ProfileResourceStop          ProfileID = "resource_stop"
+	ProfileResourceShow          ProfileID = "resource_show"
 )
 
 type IdentityKind string
@@ -90,7 +95,13 @@ type PackageArgument struct {
 }
 
 type Invocation struct {
-	Package *PackageInvocation `json:"package,omitempty"`
+	Package  *PackageInvocation  `json:"package,omitempty"`
+	Resource *ResourceInvocation `json:"resource,omitempty"`
+}
+
+type ResourceInvocation struct {
+	ResourceID string `json:"resource_id"`
+	Relay      bool   `json:"relay,omitempty"`
 }
 
 type PackageInvocation struct {
@@ -146,6 +157,11 @@ var catalog = map[ProfileID]Profile{
 	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},
 	ProfileHTPasswd:              {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNone},
 	ProfileTailscaleAdmin:        {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
+	ProfileResourceAccounts:      {ID: ProfileResourceAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceDaemonReload:  {ID: ProfileResourceDaemonReload, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceStart:         {ID: ProfileResourceStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceStop:          {ID: ProfileResourceStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceShow:          {ID: ProfileResourceShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 }
 
 func FixedProfileIDs() []ProfileID {
@@ -209,11 +225,48 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
-		if invocation.Package != nil {
-			return Profile{}, fmt.Errorf("external child profile rejects package invocation")
+	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow
+	if resourceProfile {
+		if invocation.Package != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
+			return Profile{}, fmt.Errorf("resource child invocation authority is invalid")
+		}
+		short := strings.TrimPrefix(invocation.Resource.ResourceID, "res_")[:20]
+		switch id {
+		case ProfileResourceAccounts:
+			profile.Arguments = []string{"/etc/lanpanel/sysusers/" + invocation.Resource.ResourceID + ".conf"}
+		case ProfileResourceDaemonReload:
+			profile.Arguments = []string{"daemon-reload"}
+		case ProfileResourceStart:
+			profile.Arguments = []string{"enable", "--now", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service"}
+			if invocation.Resource.Relay {
+				profile.Arguments = []string{"enable", "--now", "lanpanel-app-" + short + ".service", "lanpanel-app-" + short + ".socket", "lanpanel-relay-" + short + ".service"}
+			}
+		case ProfileResourceStop:
+			profile.Arguments = []string{"disable", "--now", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service"}
+			if invocation.Resource.Relay {
+				profile.Arguments = []string{"disable", "--now", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service", "lanpanel-relay-" + short + ".service"}
+			}
+		case ProfileResourceShow:
+			unit := "lanpanel-app-" + short + ".service"
+			if invocation.Resource.Relay {
+				unit = "lanpanel-relay-" + short + ".service"
+			}
+			profile.Arguments = []string{"show", "--property=ActiveState,SubState,MainPID,ControlGroup,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,SocketBindDeny,SocketBindAllow,IPAddressDeny,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,PrivateTmp,PrivateDevices,LockPersonality,RestrictRealtime,RestrictAddressFamilies,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,InaccessiblePaths,UMask", unit}
+		}
+		profile.Complete = true
+		if err := validateProfile(profile); err != nil {
+			return Profile{}, err
 		}
 		return profile, nil
+	}
+	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
+		if invocation.Package != nil || invocation.Resource != nil {
+			return Profile{}, fmt.Errorf("external child profile rejects typed invocation")
+		}
+		return profile, nil
+	}
+	if invocation.Resource != nil {
+		return Profile{}, fmt.Errorf("package child rejects resource invocation")
 	}
 	if invocation.Package == nil || !packageTransactionPattern.MatchString(invocation.Package.TransactionID) || invocation.Package.LockWaitSeconds == 0 || invocation.Package.LockWaitSeconds > 300 || len(invocation.Package.Packages) == 0 || len(invocation.Package.Packages) > 256 || (id == ProfileAPTDownload || id == ProfileAPTTransaction) && invocation.Package.Staged || id == ProfileAPTOfflineTransaction && !invocation.Package.Staged {
 		return Profile{}, fmt.Errorf("package child invocation authority is invalid")
@@ -265,6 +318,18 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		return Profile{}, err
 	}
 	return profile, nil
+}
+
+func validResourceIdentity(value string) bool {
+	if len(value) != 36 || !strings.HasPrefix(value, "res_") {
+		return false
+	}
+	for _, character := range value[4:] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func packageCapabilities() []int {

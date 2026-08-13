@@ -18,6 +18,22 @@ import (
 	"time"
 )
 
+func TestBPFGuardDirectoryRequiresExactBPFFSMount(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root runtime-guard test")
+	}
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), " /sys/fs/bpf ") {
+		t.Skip("test runner has no bpffs")
+	}
+	if err := ensureBPFGuardDirectory(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFixedBootstrapPreflightRequirementsAreCanonical(t *testing.T) {
 	paths := FixedPaths()
 	managed := FixedManagedPathRequirements(paths)
@@ -197,10 +213,10 @@ func TestTokenDeliveryMarksAttemptBeforeOutputAndNeverRedirectsSecret(t *testing
 }
 
 func testJournal(root string) Journal {
-	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: strings.Repeat("1", 64)}
+	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: strings.Repeat("1", 64), ManagedConfinement: release.ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: strings.Repeat("8", 64)}}
 	profileDigest, _ := release.ProfileDigest(profile)
 	paths := testPaths(root)
-	request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + profileDigest, LiveQualified: true}}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: "127.41.42.43", Port: 52345, Purpose: "management"}}, Disks: []preflight.DiskRequirement{{Path: root, MinimumAvailableBytes: 1}}, LastTrustedWall: time.Unix(1700000000, 0).UTC()}
+	request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: profile.ManagedConfinement.SchemaVersion, KernelRelease: profile.ManagedConfinement.KernelRelease, CgroupMode: profile.ManagedConfinement.CgroupMode, BindListenPolicy: profile.ManagedConfinement.BindListenPolicy, ConnectPolicy: profile.ManagedConfinement.ConnectPolicy, FilesystemPolicy: profile.ManagedConfinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), profile.ManagedConfinement.ProtectedDestinations...), QualificationDigest: "sha256:" + profile.ManagedConfinement.QualificationDigest}, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + profileDigest, LiveQualified: true}}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: "127.41.42.43", Port: 52345, Purpose: "management"}}, Disks: []preflight.DiskRequirement{{Path: root, MinimumAvailableBytes: 1}}, LastTrustedWall: time.Unix(1700000000, 0).UTC()}
 	requestDigest, _ := preflight.ExpansionRequestDigest(request)
 	accounts, _ := identity.InstallationAccounts("ins_00000000000000000000000000000001")
 	return Journal{SchemaVersion: JournalSchemaVersion, AttemptID: "bst_" + strings.Repeat("a", 64), InstallationID: "ins_00000000000000000000000000000001", GenerationID: "gen_00000000000000000000000000000001", SafetyGeneration: 1, Phase: PhasePrepared, Sequence: 1, Release: release.InstallIdentity{Kind: release.EnvelopeFinal, ReleaseTag: "v1.0.0", EnvelopeDigest: strings.Repeat("2", 64), ManifestDigest: strings.Repeat("3", 64), Binary: release.AssetIdentity{Path: "lanpanel", Digest: strings.Repeat("4", 64), Bytes: 1}, SourceTreeDigest: strings.Repeat("5", 64), Profile: profile, ProfileDigest: profileDigest, CapabilityDigest: strings.Repeat("6", 64), CandidateDigest: strings.Repeat("7", 64), HostFingerprint: "host-one", Operation: "bootstrap_install", AuthorityCreatedAt: time.Unix(1700000000, 0).UTC()}, Authority: identity.ManagementAuthority{Address: "127.41.42.43", Port: 52345}, PreflightRequest: request, PreflightDigest: requestDigest, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": strings.Repeat("4", 64)}, PlannedPaths: canonicalPaths([]string{paths.Journal, paths.CommitPath, paths.PersistentRoot})}

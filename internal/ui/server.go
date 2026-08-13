@@ -86,7 +86,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	securityHeaders(writer)
-	actionQuery := request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, "/api/actions/unpublish") && request.URL.Query().Has("resource_id") && len(request.URL.Query()) == 1
+	actionQuery := request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, "/api/actions/") && request.URL.Query().Has("resource_id") && len(request.URL.Query()) == 1
 	if request.Host != s.config.Authority || request.URL.RawQuery != "" && !actionQuery || request.URL.RawPath != "" {
 		reject(writer, http.StatusMisdirectedRequest)
 		return
@@ -306,7 +306,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
-	if operation == domain.OperationUnpublish {
+	if operation == domain.OperationUnpublish || operation == domain.OperationResourceUpdate || operation == domain.OperationProcessStart || operation == domain.OperationProcessStop {
 		resourceID, ok := firstExact(request.URL.Query()["resource_id"])
 		if !ok {
 			reject(writer, http.StatusBadRequest)
@@ -314,7 +314,9 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		target = domain.OperationTarget{Kind: domain.OperationTargetResource, ID: resourceID}
 	}
-	if operation != domain.OperationAdminTokenRotate && operation != domain.OperationCloseAll && operation != domain.OperationUnpublish || s.config.Actions == nil {
+	resourceOperation := operation == domain.OperationResourceCreate || operation == domain.OperationResourceUpdate
+	processOperation := operation == domain.OperationProcessStart || operation == domain.OperationProcessStop
+	if operation != domain.OperationAdminTokenRotate && operation != domain.OperationCloseAll && operation != domain.OperationUnpublish && !resourceOperation && !processOperation || s.config.Actions == nil {
 		reject(writer, http.StatusNotFound)
 		return
 	}
@@ -325,10 +327,43 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
+	if planRoute && (resourceOperation || processOperation) {
+		reject(writer, http.StatusNotFound)
+		return
+	}
 	if planRoute {
 		result, invokeErr := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: domain.OperationPlan, Target: target, Payload: application.PlanPayload{Operation: operation, Target: target}})
 		if invokeErr != nil {
 			reject(writer, http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(result.Payload)
+		return
+	}
+	if resourceOperation || processOperation {
+		request.Body = http.MaxBytesReader(writer, request.Body, 16<<10)
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		defer clear(data)
+		var payload any = application.ProcessMutationPayload{}
+		if resourceOperation {
+			if len(data) == 0 || !json.Valid(data) {
+				reject(writer, http.StatusBadRequest)
+				return
+			}
+			body := append(json.RawMessage(nil), data...)
+			payload = application.ResourceMutationPayload{Resource: body}
+		} else if len(strings.TrimSpace(string(data))) != 0 {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
+		if err != nil {
+			reject(writer, http.StatusServiceUnavailable)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")

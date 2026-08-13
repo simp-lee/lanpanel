@@ -539,10 +539,11 @@ func validGAInstallation() Installation {
 			Lifecycle:           LifecycleActive,
 			CurrentConfigDigest: testDigest,
 			Target: AppTarget{
-				Kind:          AppTargetLocalHTTP,
-				ReadinessPath: "/ready",
-				WebSocket:     WebSocketReadiness{Enabled: false},
-				LocalHTTP:     &LocalHTTPTarget{EndpointKind: LocalEndpointUnixSocketActivation},
+				Kind:                AppTargetLocalHTTP,
+				ReadinessPath:       "/ready",
+				AllowedHTTPStatuses: []uint16{200, 204},
+				WebSocket:           WebSocketReadiness{Enabled: false},
+				LocalHTTP:           &LocalHTTPTarget{EndpointKind: LocalEndpointUnixSocketActivation},
 			},
 			Publication: AppPublication{
 				Kind: PublicationDomainHTTPS,
@@ -559,6 +560,7 @@ func validGAInstallation() Installation {
 			ManagedProcess: &ManagedProcess{
 				ID:        "proc_00000000000000000000000000000001",
 				Requested: ProcessRequestedStopped,
+				Service:   ManagedService{Executable: "/usr/local/bin/example-app", WorkingDirectory: "/srv/example-app", WritePaths: []string{"/var/lib/example-app"}},
 			},
 			CredentialIDs: []string{"cred_00000000000000000000000000000001"},
 			ManagedPaths:  []string{"/var/lib/lanpanel/resources/example"},

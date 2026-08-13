@@ -204,11 +204,12 @@ type AppResource struct {
 }
 
 type AppTarget struct {
-	Kind          AppTargetKind      `json:"kind"`
-	ReadinessPath string             `json:"readiness_path"`
-	WebSocket     WebSocketReadiness `json:"websocket"`
-	LocalHTTP     *LocalHTTPTarget   `json:"local_http,omitempty"`
-	TailnetHTTP   *TailnetHTTPTarget `json:"tailnet_http,omitempty"`
+	Kind                AppTargetKind      `json:"kind"`
+	ReadinessPath       string             `json:"readiness_path"`
+	AllowedHTTPStatuses []uint16           `json:"allowed_http_statuses"`
+	WebSocket           WebSocketReadiness `json:"websocket"`
+	LocalHTTP           *LocalHTTPTarget   `json:"local_http,omitempty"`
+	TailnetHTTP         *TailnetHTTPTarget `json:"tailnet_http,omitempty"`
 }
 
 type WebSocketReadiness struct {
@@ -246,9 +247,55 @@ type TemporaryIPPublication struct {
 }
 
 type ManagedProcess struct {
-	ID                 string                `json:"id"`
-	Requested          ProcessRequestedState `json:"requested"`
-	RuntimeObservation *RuntimeObservation   `json:"runtime_observation,omitempty"`
+	ID                  string                   `json:"id"`
+	Requested           ProcessRequestedState    `json:"requested"`
+	Service             ManagedService           `json:"service"`
+	ReferenceBinding    *ProcessReferenceBinding `json:"reference_binding,omitempty"`
+	Applied             *ProcessBundle           `json:"applied,omitempty"`
+	RuntimeObservation  *RuntimeObservation      `json:"runtime_observation,omitempty"`
+	LastOperation       OperationCode            `json:"last_operation,omitempty"`
+	LastOperationResult OperationResult          `json:"last_operation_result,omitempty"`
+	LastJobID           string                   `json:"last_job_id,omitempty"`
+}
+
+type ProcessReferenceBinding struct {
+	ExecutableDigest         string   `json:"executable_digest"`
+	WorkingDirectoryIdentity string   `json:"working_directory_identity"`
+	EnvironmentFingerprint   string   `json:"environment_fingerprint,omitempty"`
+	WritePathIdentities      []string `json:"write_path_identities"`
+}
+
+type ManagedService struct {
+	Executable       string   `json:"executable"`
+	Arguments        []string `json:"arguments"`
+	WorkingDirectory string   `json:"working_directory"`
+	EnvironmentFile  string   `json:"environment_file,omitempty"`
+	WritePaths       []string `json:"write_paths"`
+}
+
+type ProcessBundle struct {
+	Generation               uint64   `json:"generation"`
+	ConfigDigest             string   `json:"config_digest"`
+	UnitDigest               string   `json:"unit_digest"`
+	SocketUnitDigest         string   `json:"socket_unit_digest"`
+	PolicyDigest             string   `json:"policy_digest"`
+	AccountDigest            string   `json:"account_digest"`
+	ExecutableDigest         string   `json:"executable_digest"`
+	WorkingDirectoryIdentity string   `json:"working_directory_identity"`
+	WritePathIdentities      []string `json:"write_path_identities"`
+	EnvironmentFingerprint   string   `json:"environment_fingerprint,omitempty"`
+	Cgroup                   string   `json:"cgroup"`
+	FrontendEndpoint         string   `json:"frontend_endpoint"`
+	BackendEndpoint          string   `json:"backend_endpoint,omitempty"`
+	EndpointSocketUnits      []string `json:"endpoint_socket_units"`
+	RelayRequired            bool     `json:"relay_required"`
+	ApplicationUID           uint32   `json:"application_uid"`
+	ApplicationGID           uint32   `json:"application_gid"`
+	RelayUID                 uint32   `json:"relay_uid,omitempty"`
+	RelayGID                 uint32   `json:"relay_gid,omitempty"`
+	TCPAddress               string   `json:"tcp_address,omitempty"`
+	TCPPort                  uint16   `json:"tcp_port,omitempty"`
+	ManagedPaths             []string `json:"managed_paths"`
 }
 
 type PublicationRecord struct {
@@ -628,6 +675,14 @@ func validateTarget(target AppTarget) error {
 	if err := validateReadinessPath(target.ReadinessPath); err != nil {
 		return fmt.Errorf("target.readiness_path: %w", err)
 	}
+	if len(target.AllowedHTTPStatuses) == 0 || len(target.AllowedHTTPStatuses) > 32 {
+		return fmt.Errorf("target.allowed_http_statuses must be a bounded nonempty set")
+	}
+	for index, status := range target.AllowedHTTPStatuses {
+		if status < 200 || status > 399 || index > 0 && target.AllowedHTTPStatuses[index-1] >= status {
+			return fmt.Errorf("target.allowed_http_statuses must contain sorted unique 2xx/3xx values")
+		}
+	}
 	if target.WebSocket.Enabled {
 		if err := validateReadinessPath(target.WebSocket.Path); err != nil {
 			return fmt.Errorf("target.websocket.path: %w", err)
@@ -642,7 +697,12 @@ func validateTarget(target AppTarget) error {
 		}
 		local := target.LocalHTTP
 		switch local.EndpointKind {
-		case LocalEndpointUnixSocketActivation, LocalEndpointRelayUnix:
+		case LocalEndpointUnixSocketActivation:
+			if local.TCPAddress != "" || local.TCPPort != 0 {
+				return fmt.Errorf("local_http %s must not include TCP authority", local.EndpointKind)
+			}
+			return nil
+		case LocalEndpointRelayUnix:
 			if local.TCPAddress != "" || local.TCPPort != 0 {
 				return fmt.Errorf("local_http %s must not include TCP authority", local.EndpointKind)
 			}
@@ -734,12 +794,130 @@ func validateManagedProcess(process ManagedProcess) error {
 	default:
 		return fmt.Errorf("managed_process.requested %q is not supported", process.Requested)
 	}
+	if err := validateManagedService(process.Service); err != nil {
+		return fmt.Errorf("managed_process.service: %w", err)
+	}
+	if process.ReferenceBinding != nil {
+		binding := process.ReferenceBinding
+		if !validSHA256Digest(binding.ExecutableDigest) || !validSHA256Digest(binding.WorkingDirectoryIdentity) || binding.EnvironmentFingerprint != "" && !validSHA256Digest(binding.EnvironmentFingerprint) {
+			return fmt.Errorf("managed_process.reference_binding is invalid")
+		}
+		for index, value := range binding.WritePathIdentities {
+			if !validSHA256Digest(value) || index > 0 && binding.WritePathIdentities[index-1] >= value {
+				return fmt.Errorf("managed_process.reference_binding write paths are invalid")
+			}
+		}
+	}
+	if process.Applied != nil {
+		if err := validateProcessBundle(*process.Applied); err != nil {
+			return fmt.Errorf("managed_process.applied: %w", err)
+		}
+	}
 	if process.RuntimeObservation != nil {
 		if err := validateRuntimeObservation(*process.RuntimeObservation); err != nil {
 			return fmt.Errorf("managed_process.runtime_observation: %w", err)
 		}
 	}
+	if (process.LastOperation == "") != (process.LastJobID == "") || process.LastOperation == "" && process.LastOperationResult != "" {
+		return fmt.Errorf("managed_process operation identity is one-sided")
+	}
+	if process.LastOperation != "" {
+		if process.LastOperation != OperationProcessStart && process.LastOperation != OperationProcessStop && process.LastOperation != OperationUnpublishAndStop {
+			return fmt.Errorf("managed_process last_operation is unsupported")
+		}
+		if process.LastOperationResult != "" {
+			if _, err := ParseOperationResult(string(process.LastOperationResult)); err != nil {
+				return fmt.Errorf("managed_process terminal result is invalid")
+			}
+		}
+		if !validOpaqueTargetID(process.LastJobID) {
+			return fmt.Errorf("managed_process operation job identity is invalid")
+		}
+	}
 	return nil
+}
+
+func validateManagedService(service ManagedService) error {
+	if err := validateExternalAbsolute(service.Executable, "executable"); err != nil {
+		return err
+	}
+	if err := validateExternalAbsolute(service.WorkingDirectory, "working_directory"); err != nil {
+		return err
+	}
+	if service.EnvironmentFile != "" {
+		if err := validateExternalAbsolute(service.EnvironmentFile, "environment_file"); err != nil {
+			return err
+		}
+	}
+	if len(service.Arguments) > 64 {
+		return fmt.Errorf("arguments exceed fixed count")
+	}
+	bytes := 0
+	for _, argument := range service.Arguments {
+		bytes += len(argument)
+		if argument == "" || len(argument) > 1024 || containsControl(argument) || strings.Contains(argument, "${") || strings.Contains(argument, "$(") || strings.Contains(argument, "`") || strings.Contains(argument, "%") {
+			return fmt.Errorf("arguments contain empty, expansion, systemd specifier, control, or unbounded value")
+		}
+	}
+	if bytes > 4096 {
+		return fmt.Errorf("arguments exceed fixed byte bound")
+	}
+	return validatePaths("managed_process.service.write_paths", service.WritePaths)
+}
+
+func containsControl(value string) bool {
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+func validateExternalAbsolute(value, label string) error {
+	if value == "" || value != strings.TrimSpace(value) || !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
+		return fmt.Errorf("%s must be a clean absolute non-root path", label)
+	}
+	return nil
+}
+
+func validateProcessBundle(bundle ProcessBundle) error {
+	if bundle.Generation == 0 || !validSHA256Digest(bundle.ConfigDigest) || !validSHA256Digest(bundle.UnitDigest) || !validSHA256Digest(bundle.SocketUnitDigest) || !validSHA256Digest(bundle.PolicyDigest) || !validSHA256Digest(bundle.AccountDigest) || !validSHA256Digest(bundle.ExecutableDigest) || !validSHA256Digest(bundle.WorkingDirectoryIdentity) || bundle.EnvironmentFingerprint != "" && !validSHA256Digest(bundle.EnvironmentFingerprint) || bundle.Cgroup == "" || bundle.FrontendEndpoint == "" || len(bundle.EndpointSocketUnits) > 2 || bundle.ApplicationUID == 0 || bundle.ApplicationGID == 0 || bundle.RelayRequired && (bundle.RelayUID == 0 || bundle.RelayGID == 0) || !bundle.RelayRequired && (bundle.RelayUID != 0 || bundle.RelayGID != 0) {
+		return fmt.Errorf("process bundle identity is incomplete")
+	}
+	if err := validateExternalAbsolute(bundle.Cgroup, "cgroup"); err != nil {
+		return err
+	}
+	if err := validateExternalAbsolute(bundle.FrontendEndpoint, "frontend_endpoint"); err != nil {
+		return err
+	}
+	if (bundle.TCPAddress == "") != (bundle.TCPPort == 0) {
+		return fmt.Errorf("TCP endpoint authority one-sided")
+	}
+	if bundle.TCPAddress != "" {
+		address, err := netip.ParseAddr(bundle.TCPAddress)
+		if err != nil || !address.IsLoopback() {
+			return fmt.Errorf("TCP endpoint authority invalid")
+		}
+	}
+	for index, value := range bundle.WritePathIdentities {
+		if !validSHA256Digest(value) || index > 0 && bundle.WritePathIdentities[index-1] >= value {
+			return fmt.Errorf("write path identity inventory invalid")
+		}
+	}
+	if len(bundle.EndpointSocketUnits) == 0 && !bundle.RelayRequired {
+		return fmt.Errorf("endpoint socket unit inventory missing")
+	}
+	for index, unit := range bundle.EndpointSocketUnits {
+		if unit == "" || strings.ContainsAny(unit, "/\x00\r\n") || !strings.HasSuffix(unit, ".socket") || index > 0 && bundle.EndpointSocketUnits[index-1] >= unit {
+			return fmt.Errorf("endpoint socket unit inventory is invalid")
+		}
+	}
+	if bundle.BackendEndpoint != "" {
+		if err := validateExternalAbsolute(bundle.BackendEndpoint, "backend_endpoint"); err != nil {
+			return err
+		}
+	}
+	return validatePaths("managed_process.applied.managed_paths", bundle.ManagedPaths)
 }
 
 func validatePublicationRecord(record PublicationRecord, publication AppPublication, currentConfigDigest string) error {

@@ -578,8 +578,8 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 	for id, after := range afterResources {
 		before, present := beforeResources[id]
 		if !present {
-			if role != RoleContraction || !hasBaseMarker(&after) || after.ChallengePending != nil || after.Reactivating != nil {
-				return fmt.Errorf("new resource safety identity must start contracted")
+			if role != RoleResourceCreate || after.State != ResourceActive || after.Ownership != OwnershipOwned || after.GenerationSequence != 1 || after.StickyUnpublished == nil || after.StickyUnpublished.Generation != 1 || after.StickyUnpublished.Kind != MarkerStickyUnpublished || after.Closing != nil || after.Contraction != nil || after.CertificateExpiry != nil || after.EdgeOne.RefreshJournal != "" || !after.EdgeOne.Deadline.IsZero() || after.EdgeOne.Expiry != nil || after.ChallengePending != nil || after.Reactivating != nil || after.DeletionTombstone != "" {
+				return fmt.Errorf("new resource safety identity must start as exact owned sticky-unpublished generation 1")
 			}
 			continue
 		}
@@ -989,7 +989,7 @@ func backupTransitionGeneration(marker *BackupTransition) uint64 {
 
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh, RoleResourceCreate:
 		return true
 	default:
 		return false

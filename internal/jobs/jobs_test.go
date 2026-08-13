@@ -74,6 +74,25 @@ func TestDurableJobResultContract(t *testing.T) {
 		}
 	})
 
+	t.Run("interrupted_lifecycle_contraction_is_terminal", func(t *testing.T) {
+		now := time.Unix(1700000000, 0).UTC()
+		record, err := NewReserved(Spec{Operation: "process_start", Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "ui/session/generation/1"}, now, bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err = Start(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err = Finish(record, Completion{Result: ResultInterrupted, Postconditions: []Postcondition{{Kind: "interrupted_lifecycle_contracted", Status: PostconditionKnown, Identity: record.ID}}, ErrorCode: "interrupted_lifecycle_contracted"}, now.Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.Status != StatusTerminal || record.Result != ResultInterrupted {
+			t.Fatalf("record=%#v", record)
+		}
+	})
+
 	t.Run("entropy_failure_prevents_job_creation", func(t *testing.T) {
 		if _, err := NewReserved(Spec{Operation: "publish", Target: "resource/app", ActorIdentity: "session"}, time.Now(), errorReader{}); err == nil {
 			t.Fatal("job ID entropy failure was ignored")

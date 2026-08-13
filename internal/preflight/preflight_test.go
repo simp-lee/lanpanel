@@ -272,9 +272,13 @@ func TestPreflightAuthorityRejectsStaleWrongScopeOrTarget(t *testing.T) {
 func expansionRequest(scope ExpansionScope) ExpansionRequest {
 	return ExpansionRequest{
 		Scope: scope, Target: "resource/res_00000000000000000000000000000001", Generation: 7,
-		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64), Authority: ProfileAuthority{Kind: FinalSupportedProfile, Digest: "sha256:" + strings.Repeat("a", 64), LiveQualified: true}},
+		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64), ManagedConfinement: testConfinement(), Authority: ProfileAuthority{Kind: FinalSupportedProfile, Digest: "sha256:" + strings.Repeat("a", 64), LiveQualified: true}},
 		Domains: []string{"app.example.test"}, ManagedPaths: []ManagedPathRequirement{{Path: "/var/lib/lanpanel/apps/app-one", Kind: ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}}, Disks: []DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1024}}, LastTrustedWall: time.Unix(1_699_999_000, 0).UTC(),
 	}
+}
+
+func testConfinement() ManagedConfinementProfile {
+	return ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: "sha256:" + strings.Repeat("8", 64)}
 }
 
 func passingExpansionObservations(request ExpansionRequest, now time.Time) ExpansionObservations {

@@ -400,7 +400,7 @@ func checksumsFor(t *testing.T, assets map[string][]byte) []byte {
 }
 
 func testProfile() OSProfile {
-	return OSProfile{ID: "debian-12-amd64", Family: "debian", Release: "12.10", Architecture: "amd64", SystemdVersion: "252.38", NginxVersion: "1.22.1-9", PackageSnapshotDigest: digest("packages")}
+	return OSProfile{ID: "debian-12-amd64", Family: "debian", Release: "12.10", Architecture: "amd64", SystemdVersion: "252.38", NginxVersion: "1.22.1-9", PackageSnapshotDigest: digest("packages"), ManagedConfinement: testConfinementProfile()}
 }
 
 func testSecurityReport(candidateDigest string, resolution FindingResolution) SecurityReport {
@@ -446,6 +446,10 @@ func validDependencyBaseline() []byte {
 
 func identity(path string, data []byte) AssetIdentity {
 	return AssetIdentity{Path: path, Digest: DigestBytes(data), Bytes: uint64(len(data))}
+}
+
+func testConfinementProfile() ConfinementProfile {
+	return ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest("confinement")}
 }
 
 func digest(seed string) string { return DigestBytes([]byte(seed)) }

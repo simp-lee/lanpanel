@@ -17,17 +17,19 @@ const (
 	StartupGuard       Name = "startup-guard"
 	ReloadGuard        Name = "reload-guard"
 	RuntimeGuard       Name = "runtime-guard"
+	ProcessGuard       Name = "process-guard"
 	Installer          Name = "installer"
 	Upgrade            Name = "upgrade"
 	FencedRecovery     Name = "fenced-recovery"
 	Timer              Name = "timer"
 	Relay              Name = "relay"
 	PackageNoAutostart Name = "package-no-autostart"
+	ManagedExecutor    Name = "managed-executor"
 )
 
 var fixed = map[Name]struct{}{
 	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
-	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, PackageNoAutostart: {},
+	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {},
 }
 
 type Handler func(args []string, stdout, stderr io.Writer) error

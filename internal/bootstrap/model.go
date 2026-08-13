@@ -115,7 +115,7 @@ type Commit struct {
 func FixedManagedPathRequirements(paths Paths) []preflight.ManagedPathRequirement {
 	values := []preflight.ManagedPathRequirement{
 		{Path: filepath.Dir(paths.BinaryPath), Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o755, MaximumMode: 0o755, AllowAbsent: true},
-		{Path: paths.PersistentRoot, Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true},
+		{Path: paths.PersistentRoot, Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o711, MaximumMode: 0o711, AllowAbsent: true},
 		{Path: paths.RuntimeRoot, Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o710, MaximumMode: 0o710, AllowAbsent: true},
 		{Path: filepath.Dir(paths.StartupAuthority), Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o710, MaximumMode: 0o710, AllowAbsent: true},
 		{Path: paths.SystemdRoot, Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o755, MaximumMode: 0o755, AllowAbsent: false},

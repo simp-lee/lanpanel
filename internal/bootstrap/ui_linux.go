@@ -56,7 +56,7 @@ func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	actions, err := application.HelperService(ui.HelperApplicationRequest)
+	actions, err := application.HelperServiceWithResources(ui.HelperApplicationRequest, ui.HelperResourceRequest)
 	if err != nil {
 		return err
 	}

@@ -53,6 +53,8 @@ const (
 	OperationManagedBasicGenerate Operation = "managed_basic_generate"
 	OperationContractionClose     Operation = "contraction_close"
 	OperationStartupContraction   Operation = "startup_contraction"
+	OperationResourceMutation     Operation = "resource_mutation"
+	OperationProcessLifecycle     Operation = "process_lifecycle"
 )
 
 type Policy struct {
@@ -89,6 +91,8 @@ var policies = map[Operation]Policy{
 	OperationManagedBasicGenerate: {Callers: []Caller{CallerUI}, SecretOutput: true},
 	OperationContractionClose:     {Callers: []Caller{CallerUI}},
 	OperationStartupContraction:   {Callers: []Caller{CallerRecovery}},
+	OperationResourceMutation:     {Callers: []Caller{CallerUI}},
+	OperationProcessLifecycle:     {Callers: []Caller{CallerUI}},
 }
 
 var refPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
@@ -103,6 +107,13 @@ type ActionPayload struct {
 	PlanID          string `json:"plan_id,omitempty"`
 	Confirmation    string `json:"confirmation,omitempty"`
 }
+type ResourcePayload struct {
+	Operation       string          `json:"operation"`
+	ActorIdentity   string          `json:"actor_identity"`
+	ActorGeneration uint64          `json:"actor_generation"`
+	Resource        json.RawMessage `json:"resource,omitempty"`
+}
+
 type ActionResult struct {
 	PlanID             string    `json:"plan_id,omitempty"`
 	Confirmation       string    `json:"confirmation,omitempty"`
@@ -119,14 +130,15 @@ type ActionResult struct {
 	AccessMayRemain    bool      `json:"access_may_remain,omitempty"`
 }
 type Request struct {
-	SchemaVersion    string         `json:"schema_version"`
-	RequestID        string         `json:"request_id"`
-	Operation        Operation      `json:"operation"`
-	Target           string         `json:"target"`
-	IntentGeneration uint64         `json:"intent_generation"`
-	Deadline         time.Time      `json:"deadline"`
-	InputDigest      string         `json:"input_digest"`
-	Action           *ActionPayload `json:"action,omitempty"`
+	SchemaVersion    string           `json:"schema_version"`
+	RequestID        string           `json:"request_id"`
+	Operation        Operation        `json:"operation"`
+	Target           string           `json:"target"`
+	IntentGeneration uint64           `json:"intent_generation"`
+	Deadline         time.Time        `json:"deadline"`
+	InputDigest      string           `json:"input_digest"`
+	Action           *ActionPayload   `json:"action,omitempty"`
+	Resource         *ResourcePayload `json:"resource,omitempty"`
 }
 
 type ResponseCode string
@@ -137,13 +149,17 @@ const (
 	ResponseFailed    ResponseCode = "failed"
 )
 
+type ResourceResult struct {
+	ResourceID string `json:"resource_id"`
+}
 type Response struct {
-	SchemaVersion string        `json:"schema_version"`
-	RequestID     string        `json:"request_id"`
-	Code          ResponseCode  `json:"code"`
-	ResultDigest  string        `json:"result_digest,omitempty"`
-	ErrorCode     string        `json:"error_code,omitempty"`
-	Action        *ActionResult `json:"action,omitempty"`
+	SchemaVersion string          `json:"schema_version"`
+	RequestID     string          `json:"request_id"`
+	Code          ResponseCode    `json:"code"`
+	ResultDigest  string          `json:"result_digest,omitempty"`
+	ErrorCode     string          `json:"error_code,omitempty"`
+	Action        *ActionResult   `json:"action,omitempty"`
+	Resource      *ResourceResult `json:"resource,omitempty"`
 }
 
 func PolicyFor(operation Operation) (Policy, bool) {
@@ -175,8 +191,10 @@ func ValidateRequest(request Request, now time.Time) error {
 	if request.SchemaVersion != SchemaVersion || !known || !refPattern.MatchString(request.RequestID) || !validOperationTarget(request.Operation, request.Target) || request.IntentGeneration == 0 || request.Deadline.IsZero() || !request.Deadline.After(now) || request.Deadline.Sub(now) > maximum || !digestPattern.MatchString(request.InputDigest) {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
-	if (request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose) != (request.Action != nil) {
-		return fmt.Errorf("helper action payload shape is invalid")
+	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose
+	resourceOperation := request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle
+	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
+		return fmt.Errorf("helper typed payload shape is invalid")
 	}
 	planAction := request.Operation == OperationApplicationPlan && ((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "" || request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "") && request.Action.PlanID == "" && request.Action.Confirmation == ""
 	rotationAction := request.Operation == OperationAdminTokenRotate && request.Action.Operation == "admin_token_rotate" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.PlanID != "" && request.Action.Confirmation == "rotate"
@@ -184,10 +202,15 @@ func ValidateRequest(request Request, now time.Time) error {
 	if request.Action != nil && (!validAction(*request.Action) || !planAction && !rotationAction && !contractionAction) {
 		return fmt.Errorf("helper action payload is invalid")
 	}
-	if request.Action != nil {
+	if request.Action != nil || request.Resource != nil {
 		digest, err := ApplicationInputDigest(request)
 		if err != nil || request.InputDigest != digest {
-			return fmt.Errorf("helper action payload digest is invalid")
+			return fmt.Errorf("helper typed payload digest is invalid")
+		}
+	}
+	if request.Resource != nil {
+		if !validResourcePayload(request.Operation, *request.Resource) {
+			return fmt.Errorf("helper resource payload is invalid")
 		}
 	}
 	return nil
@@ -196,7 +219,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose {
+	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -247,6 +270,24 @@ func validOperationTarget(operation Operation, target string) bool {
 		return exactID && kind == "credential"
 	case OperationStartupContraction:
 		return target == "installation" || target == "headscale" || exactID && kind == "resource"
+	case OperationResourceMutation:
+		return target == "installation" || exactID && kind == "resource"
+	case OperationProcessLifecycle:
+		return exactID && kind == "resource"
+	default:
+		return false
+	}
+}
+
+func validResourcePayload(operation Operation, value ResourcePayload) bool {
+	if !refPattern.MatchString(value.Operation) || !refPattern.MatchString(value.ActorIdentity) || value.ActorGeneration == 0 || len(value.Resource) > 12<<10 || len(value.Resource) != 0 && !json.Valid(value.Resource) {
+		return false
+	}
+	switch operation {
+	case OperationResourceMutation:
+		return (value.Operation == "resource_create" || value.Operation == "resource_update") && len(value.Resource) != 0
+	case OperationProcessLifecycle:
+		return (value.Operation == "process_start" || value.Operation == "process_stop") && len(value.Resource) == 0
 	default:
 		return false
 	}
@@ -291,13 +332,21 @@ func ValidateResponse(operation Operation, response Response) error {
 			if response.Action == nil || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.JobID != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || !validContractionOutcome(response.Action.ContractionOutcome, response.Action.AccessClosed, response.Action.SharedIngressDown, response.Action.AccessMayRemain) {
 				return fmt.Errorf("contraction response shape is invalid")
 			}
+		case OperationResourceMutation:
+			if response.Action != nil || response.Resource == nil || !strings.HasPrefix(response.Resource.ResourceID, "res_") || !refPattern.MatchString(response.Resource.ResourceID) {
+				return fmt.Errorf("resource helper response shape invalid")
+			}
+		case OperationProcessLifecycle:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Resource != nil {
+				return fmt.Errorf("process helper response shape invalid")
+			}
 		default:
 			if response.Action != nil {
 				return fmt.Errorf("unrelated helper response carried an action result")
 			}
 		}
 	case ResponseRejected, ResponseFailed:
-		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil {
+		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil {
 			return fmt.Errorf("failed helper response is not redacted")
 		}
 	default:

@@ -284,6 +284,20 @@ func RequireNoAdminTokenCandidate() error {
 	}
 	return fmt.Errorf("orphan admin token recovery candidate exists")
 }
+func KnownHostSecretDigests() (map[string]struct{}, error) {
+	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(parentFD)
+	defer unix.Close(oldFD)
+	data, err := readFD(oldFD)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(data)
+	return map[string]struct{}{digest(data): {}}, nil
+}
 func CurrentAdminTokenFingerprint() (string, error) {
 	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
 	if err != nil {

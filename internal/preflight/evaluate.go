@@ -34,7 +34,7 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID && validProfileAuthority(request.Profile)
+	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID && validProfileAuthority(request.Profile) && validManagedConfinement(request.Profile.ManagedConfinement)
 	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
 	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source+"/"+observed.Clock.Now.UTC().Format(time.RFC3339Nano))
@@ -158,6 +158,18 @@ func validateContractionRequest(request ContractionRequest) error {
 		return fmt.Errorf("contraction preflight authority is invalid")
 	}
 	return nil
+}
+
+func validManagedConfinement(profile ManagedConfinementProfile) bool {
+	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
+		return false
+	}
+	for index, destination := range profile.ProtectedDestinations {
+		if _, err := netip.ParsePrefix(destination); err != nil || index > 0 && profile.ProtectedDestinations[index-1] >= destination {
+			return false
+		}
+	}
+	return true
 }
 
 func validProfileAuthority(profile ExpectedProfile) bool {

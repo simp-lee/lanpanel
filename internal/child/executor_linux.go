@@ -42,6 +42,7 @@ type Launcher struct {
 type Result struct {
 	ExitCode       int
 	StdoutDigest   string
+	Stdout         []byte
 	StderrDigest   string
 	OutputCutOff   bool
 	PackageChanges []PackageChange
@@ -113,7 +114,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	command.Env = []string{}
 	command.ExtraFiles = []*os.File{instructionRead, inputRead}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate)
+	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
 	if err := ctx.Err(); err != nil {
@@ -167,7 +168,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if command.ProcessState != nil {
 		exitCode = command.ProcessState.ExitCode()
 	}
-	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
+	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), Stdout: stdout.Bytes(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
 	if profileID == ProfileAPTSimulate && exitCode == 0 && !result.OutputCutOff {
 		changes, parseErr := parseAPTSimulation(stdout.Bytes())
 		if parseErr != nil {

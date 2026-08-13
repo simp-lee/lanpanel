@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth
+.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/closure ./internal/contraction ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/ui
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/closure ./internal/confinement ./internal/contraction ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/process ./internal/relay ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/target ./internal/ui
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
@@ -62,7 +62,7 @@ ga-helper-boundary-audit:
 	@grep -Fq 'runtime.LockOSThread' internal/child/executor_linux.go
 	@grep -Fq 'setExactCapabilities' internal/child/executor_linux.go
 	@grep -Fq 'validOperationTarget' internal/helperproto/types.go
-	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = 'internal/child/executor_linux.go' || { printf 'external process call escaped child boundary:\n%s\n' "$$found" >&2; exit 1; }
+	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); expected=$$(printf '%s\n' internal/child/executor_linux.go internal/process/managed_exec_linux.go); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = "$$expected" || { printf 'external process call escaped fixed executor boundary:\n%s\n' "$$found" >&2; exit 1; }
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"([^" ]*/)?(sh|bash|dash)"|"([^" ]*/)?(sudo|doas|pkexec|su)"' internal cmd; then echo 'shell or sudo-like executable remains in production' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -n -E 'Command|Arguments|Argv|Unit|Path' internal/helperproto/types.go; then echo 'generic command, unit, argv, or path entered helper request schema' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
@@ -87,7 +87,7 @@ ga-nginx-contraction-integration:
 ga-playwright-action-boundary:
 	$(GO) test -count=1 ./internal/application ./internal/secrets ./internal/ui
 	@grep -Fq 'action_unavailable' internal/application/catalog.go
-	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'Shell|Terminal|FileBrowser|Generic(Unit|Path|Package)' internal/application internal/ui; then echo 'generic action escaped typed boundary' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
+	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' '((Operation|Action|Handler|Route)(Shell|Terminal|FileBrowser|Generic(Unit|Path|Package))|"(shell|terminal|file_browser|generic_(unit|path|package))")' internal/application internal/ui; then echo 'generic action escaped typed boundary' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
 ga-playwright-auth:
 	$(GO) test -count=1 ./internal/ui ./internal/session ./internal/bootstrap
@@ -111,4 +111,15 @@ ga-forbidden-utility-audit:
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command(Context)?\([^\n]*(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)' internal cmd; then echo 'forbidden download, archive, hash, TLS, or file utility remains' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' '"/[^"[:space:]]*/(curl|wget|sha256sum|tar|unzip|openssl|install|cp|mv|rm|ln|chmod|chown)"' internal cmd; then echo 'forbidden fixed child utility entered production profile' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit
+ga-target-readiness-integration:
+	$(GO) test -count=1 ./internal/target ./internal/resource
+	@grep -Fq 'CheckRedirect' internal/target/readiness.go
+	@grep -Fq 'Sec-WebSocket-Accept' internal/target/readiness.go
+
+ga-managed-process-integration:
+	$(GO) test -count=1 ./internal/process ./internal/relay ./internal/confinement ./internal/identity ./internal/application ./internal/helper
+	@grep -Fq 'KillMode=control-group' internal/process/units_linux.go
+	@grep -Fq 'SocketBindDeny=any' internal/confinement/policy_linux.go
+	@grep -Fq 'PR_SET_NO_NEW_PRIVS' internal/process/managed_exec_linux.go
+
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-managed-process-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit

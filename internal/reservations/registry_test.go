@@ -75,6 +75,7 @@ func TestConflictRegistry(t *testing.T) {
 		second.ManagedProcess = &domain.ManagedProcess{
 			ID:        "proc_00000000000000000000000000000002",
 			Requested: domain.ProcessRequestedStopped,
+			Service:   domain.ManagedService{Executable: "/usr/local/bin/second-app", WorkingDirectory: "/srv/second-app", WritePaths: []string{"/var/lib/second-app"}},
 		}
 		second.ManagedPaths = []string{"/var/lib/lanpanel/resources/second"}
 		installation.Resources = append(installation.Resources, second)
@@ -260,10 +261,11 @@ func validInstallation() domain.Installation {
 			Lifecycle:           domain.LifecycleActive,
 			CurrentConfigDigest: digest,
 			Target: domain.AppTarget{
-				Kind:          domain.AppTargetLocalHTTP,
-				ReadinessPath: "/ready",
-				WebSocket:     domain.WebSocketReadiness{Enabled: false},
-				LocalHTTP:     &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation},
+				Kind:                domain.AppTargetLocalHTTP,
+				ReadinessPath:       "/ready",
+				AllowedHTTPStatuses: []uint16{200},
+				WebSocket:           domain.WebSocketReadiness{Enabled: false},
+				LocalHTTP:           &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation},
 			},
 			Publication: domain.AppPublication{
 				Kind: domain.PublicationDomainHTTPS,
@@ -277,6 +279,7 @@ func validInstallation() domain.Installation {
 			ManagedProcess: &domain.ManagedProcess{
 				ID:        "proc_00000000000000000000000000000001",
 				Requested: domain.ProcessRequestedStopped,
+				Service:   domain.ManagedService{Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/var/lib/app"}},
 			},
 			CredentialIDs: []string{"cred_00000000000000000000000000000001"},
 			ManagedPaths:  []string{"/var/lib/lanpanel/resources/application"},

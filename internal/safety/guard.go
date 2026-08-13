@@ -315,6 +315,7 @@ const (
 	RoleCertificateActivation   ClearRole = "certificate_activation"
 	RoleEdgeOneRefresh          ClearRole = "edgeone_refresh"
 	RoleBootstrap               ClearRole = "bootstrap"
+	RoleResourceCreate          ClearRole = "resource_create"
 )
 
 type ClearTarget string

@@ -134,6 +134,26 @@ func TestSecretFingerprintBindingIsDurableAndImmutable(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedResourceUpdateBindsPriorAndCandidateDigests(t *testing.T) {
+	request := AdmitRequest{Operation: ResourceUpdate, Target: "resource/res_00000000000000000000000000000001", Source: AdmissionUI, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("prior")}}
+	if err := validateSafetyTargetBinding(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Operation = ProcessStart
+	if err := validateSafetyTargetBinding(request); err == nil {
+		t.Fatal("process start accepted resource-update digest authority")
+	}
+	request.Operation = ResourceUpdate
+	request.SafetyBinding.CandidateBundle = ""
+	if err := validateSafetyTargetBinding(request); err == nil {
+		t.Fatal("resource update accepted one-sided digest authority")
+	}
+	request.SafetyBinding.CandidateDigest = ""
+	if err := validateSafetyTargetBinding(request); err == nil {
+		t.Fatal("resource update accepted absent digest authority")
+	}
+}
+
 func TestOperationAdmissionContract(t *testing.T) {
 	t.Run("reservation_consumption_and_remote_wait_release_locks", func(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()
@@ -679,6 +699,51 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	}
 }
 
+func TestResourceCreateTerminalizesOnlyInitialAuthority(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	created := operationStateInstallation().Resources[0]
+	created.PublicationRecord = domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}
+	created.ManagedProcess.Requested = domain.ProcessRequestedStopped
+	beforeInstallation := operationStateInstallation()
+	beforeInstallation.Resources = []domain.AppResource{created}
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(ResourceCreate), Target: "installation", ActorIdentity: "ui/session/generation/1"}, now, bytes.NewReader(bytes.Repeat([]byte{7}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	afterRecord, err := jobs.Finish(running, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: created.CurrentConfigDigest}}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInstallation := beforeInstallation
+	afterInstallation.Resources = append([]domain.AppResource(nil), beforeInstallation.Resources...)
+	afterInstallation.Resources[0].PublicationRecord.LastOperation = domain.OperationResourceCreate
+	afterInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	afterInstallation.Resources[0].PublicationRecord.LastJobID = record.ID
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionUI, Operation: ResourceCreate, Target: "installation", Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: created.ID}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionUI, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	terminal := intent
+	terminal.Phase = PhaseTerminal
+	encode := func(value any) json.RawMessage {
+		raw, err := persist.EncodeEntry(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(beforeInstallation), reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(afterInstallation), reservationKey(record.ID): encode(terminal), "jobs/" + record.ID: encode(afterRecord)}}
+	if err := validateOperationStateTransitions(before, after); err != nil {
+		t.Fatal(err)
+	}
+	tampered := afterInstallation
+	tampered.Resources = append([]domain.AppResource(nil), afterInstallation.Resources...)
+	tampered.Resources[0].Name = "changed"
+	after.Entries["installations/current"] = encode(tampered)
+	if err := validateOperationStateTransitions(before, after); err == nil {
+		t.Fatal("resource create terminalization changed configuration")
+	}
+}
+
 func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
@@ -832,10 +897,10 @@ func operationStateInstallation() domain.Installation {
 		Resources: []domain.AppResource{{
 			ID: "res_00000000000000000000000000000001", Name: "App", Lifecycle: domain.LifecycleActive,
 			CurrentConfigDigest: testDigest("config"),
-			Target:              domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation}},
+			Target:              domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation}},
 			Publication:         domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.com", AccessMode: domain.AppAccessPublic}},
 			PublicationRecord:   domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 2},
-			ManagedProcess:      &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedStopped},
+			ManagedProcess:      &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedStopped, Service: domain.ManagedService{Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/var/lib/app"}}},
 		}},
 	}
 }

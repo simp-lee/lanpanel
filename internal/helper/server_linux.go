@@ -37,6 +37,7 @@ type ExecutionResult struct {
 	ResultDigest string
 	Secret       *helperproto.Secret
 	Action       *helperproto.ActionResult
+	Resource     *helperproto.ResourceResult
 }
 
 type Executor func(context.Context, helperproto.Caller, helperproto.Request, *helperproto.Secret) (ExecutionResult, error)
@@ -132,6 +133,12 @@ func ContractionCloseHandler(r Revalidator, e Executor) Registration {
 }
 func StartupContractionHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationStartupContraction, r, e)
+}
+func ResourceMutationHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationResourceMutation, r, e)
+}
+func ProcessLifecycleHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationProcessLifecycle, r, e)
 }
 
 type Server struct {
@@ -283,7 +290,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			}
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
-		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action}
+		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource}
 		if err := helperproto.WriteResponse(connection, request.Operation, response, result.Secret); err != nil {
 			return err
 		}

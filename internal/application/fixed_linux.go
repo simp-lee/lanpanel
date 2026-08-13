@@ -128,8 +128,26 @@ func (s *FixedService) Admitter(plan plans.Plan) (*operations.Admitter, error) {
 	binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 	return operations.NewAdmitter(s.normal, s.safety, operations.Options{Bindings: planBinding{binding}, Confirmation: confirmation{}, Registry: registry})
 }
-func (s *FixedService) Manager() *locks.Manager                { return s.manager }
-func (s *FixedService) Normal() *persist.Store                 { return s.normal }
+func (s *FixedService) Manager() *locks.Manager { return s.manager }
+func (s *FixedService) Normal() *persist.Store  { return s.normal }
+func (s *FixedService) NormalInstallationID() string {
+	if s == nil || s.normal == nil {
+		return ""
+	}
+	document, err := s.normal.Read()
+	if err != nil {
+		return ""
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return ""
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return ""
+	}
+	return installation.InstallationID
+}
 func (s *FixedService) SafetyState() (safety.State, error)     { return s.safety.Read() }
 func (s *FixedService) SafetyStore() *safety.Store             { return s.safety }
 func (s *FixedService) EmergencyStore() *safety.EmergencyStore { return s.emergency }
