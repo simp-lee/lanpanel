@@ -34,6 +34,34 @@ type ExecAuthority struct {
 	Evidence      resource.ReferenceEvidence `json:"evidence"`
 }
 
+func LoadExecAuthority(resourceID string) (ExecAuthority, error) {
+	path := AuthorityPath(resourceID)
+	file, err := os.Open(path)
+	if err != nil {
+		return ExecAuthority{}, err
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumManagedExecBytes {
+		return ExecAuthority{}, fmt.Errorf("managed execution authority file unsafe")
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maximumManagedExecBytes+1))
+	if err != nil || int64(len(payload)) != stat.Size {
+		return ExecAuthority{}, fmt.Errorf("managed execution authority changed")
+	}
+	var authority ExecAuthority
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&authority); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return ExecAuthority{}, fmt.Errorf("managed execution authority malformed")
+	}
+	canonical, _ := json.Marshal(authority)
+	if !bytes.Equal(canonical, payload) || authority.SchemaVersion != managedExecSchema || authority.ResourceID != resourceID {
+		return ExecAuthority{}, fmt.Errorf("managed execution authority noncanonical")
+	}
+	return authority, nil
+}
+
 func Execute(args []string) error {
 	runtime.LockOSThread()
 	if len(args) != 0 || os.Geteuid() != 0 {

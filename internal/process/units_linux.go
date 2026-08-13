@@ -36,7 +36,7 @@ type UnitSet struct {
 
 func (units UnitSet) BundlePolicy() confinement.UnitPolicy { return units.Confinement }
 
-func Render(installationID string, app domain.AppResource, accounts identity.ResourceAccountSet, policyProfile confinement.Profile, evidence resource.ReferenceEvidence) (UnitSet, error) {
+func Render(installationID string, app domain.AppResource, accounts identity.ResourceAccountSet, policyProfile confinement.Profile, evidence resource.ReferenceEvidence, frontendGID uint32) (UnitSet, error) {
 	if installationID == "" || accounts.InstallationID != installationID || app.Target.Kind != domain.AppTargetLocalHTTP || app.Target.LocalHTTP == nil || app.ManagedProcess == nil || app.ManagedProcess.Requested != domain.ProcessRequestedStopped && app.ManagedProcess.Requested != domain.ProcessRequestedRunning {
 		return UnitSet{}, fmt.Errorf("managed-process unit authority is invalid")
 	}
@@ -74,7 +74,7 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 	for _, directive := range policy.Directives {
 		service.WriteString(directive + "\n")
 	}
-	socket, err := renderSocket(app, paths, applicationIdentity)
+	socket, err := renderSocket(app, paths, applicationIdentity, frontendGID)
 	if err != nil {
 		return UnitSet{}, err
 	}
@@ -102,23 +102,27 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 		return UnitSet{}, err
 	}
 	endpointUnits := []string{paths.SocketUnit}
-	bundle := domain.ProcessBundle{Generation: max(uint64(1), appliedGeneration(app.ManagedProcess)), ConfigDigest: app.CurrentConfigDigest, UnitDigest: digest([]byte(service.String())), SocketUnitDigest: digest(append(append([]byte(nil), socket...), backendSocket...)), PolicyDigest: policy.Digest, AccountDigest: digest(sysusers), ExecutableDigest: evidence.ExecutableDigest, WorkingDirectoryIdentity: evidence.WorkingDirectoryIdentity, WritePathIdentities: append([]string(nil), evidence.WritePathIdentities...), EnvironmentFingerprint: evidence.EnvironmentFingerprint, Cgroup: policy.Cgroup, FrontendEndpoint: paths.FrontendSocket, EndpointSocketUnits: endpointUnits, RelayRequired: relay, ApplicationUID: applicationIdentity.UID, ApplicationGID: applicationIdentity.GID, RelayUID: relayUID, RelayGID: relayGID, ManagedPaths: paths.ManagedPaths()}
+	bundle := domain.ProcessBundle{Generation: max(uint64(1), appliedGeneration(app.ManagedProcess)), ConfigDigest: app.CurrentConfigDigest, UnitDigest: digest([]byte(service.String())), SocketUnitDigest: digest(append(append([]byte(nil), socket...), backendSocket...)), PolicyDigest: policy.Digest, AccountDigest: digest(sysusers), ExecutableDigest: evidence.ExecutableDigest, WorkingDirectoryIdentity: evidence.WorkingDirectoryIdentity, WritePathIdentities: append([]string(nil), evidence.WritePathIdentities...), EnvironmentFingerprint: evidence.EnvironmentFingerprint, Cgroup: policy.Cgroup, FrontendEndpoint: paths.FrontendSocket, EndpointSocketUnits: endpointUnits, RelayRequired: relay, ApplicationUID: applicationIdentity.UID, ApplicationGID: applicationIdentity.GID, FrontendGID: frontendGID, FrontendMode: 0o660, RelayUID: relayUID, RelayGID: relayGID, ManagedPaths: paths.ManagedPaths()}
 	if relay {
 		bundle.BackendEndpoint = paths.BackendSocket
 	}
 	if app.Target.LocalHTTP.EndpointKind == domain.LocalEndpointTCPSocketActivation {
+		bundle.FrontendGID, bundle.FrontendMode = 0, 0
 		bundle.TCPAddress = app.Target.LocalHTTP.TCPAddress
 		bundle.TCPPort = app.Target.LocalHTTP.TCPPort
 	}
 	return UnitSet{Paths: paths, Application: []byte(service.String()), Socket: socket, BackendSocket: backendSocket, Relay: relayBytes, Policy: policyBytes, Sysusers: sysusers, ExecAuthority: execAuthority, Bundle: bundle, Confinement: policy, ApplicationUID: applicationIdentity.UID, ApplicationGID: applicationIdentity.GID, RelayUID: relayUID, RelayGID: relayGID}, nil
 }
 
-func renderSocket(app domain.AppResource, paths resource.Paths, account identity.AccountIdentity) ([]byte, error) {
+func renderSocket(app domain.AppResource, paths resource.Paths, account identity.AccountIdentity, frontendGID uint32) ([]byte, error) {
 	local := app.Target.LocalHTTP
 	var listen, mode string
 	switch local.EndpointKind {
 	case domain.LocalEndpointUnixSocketActivation, domain.LocalEndpointRelayUnix:
-		listen, mode = "ListenStream="+paths.FrontendSocket, "SocketMode=0660\nSocketUser=root\nSocketGroup=www-data"
+		if frontendGID == 0 {
+			return nil, fmt.Errorf("Nginx frontend group identity is missing")
+		}
+		listen, mode = "ListenStream="+paths.FrontendSocket, "SocketMode=0660\nSocketUser=root\nSocketGroup="+fmt.Sprint(frontendGID)
 	case domain.LocalEndpointTCPSocketActivation:
 		listen, mode = "ListenStream="+local.TCPAddress+":"+fmt.Sprint(local.TCPPort), "BindIPv6Only=both\nFreeBind=no"
 	default:

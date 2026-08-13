@@ -11,6 +11,17 @@ import (
 
 const testDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestTemporaryPublicationRejectsReservedIPv4(t *testing.T) {
+	for _, address := range []string{"0.0.0.1", "192.88.99.1", "192.0.2.1", "240.0.0.1"} {
+		if err := ValidateTemporaryPublicIPv4(address); err == nil {
+			t.Fatalf("reserved address %s accepted", address)
+		}
+	}
+	if err := ValidateTemporaryPublicIPv4("8.8.8.8"); err != nil {
+		t.Fatalf("public address rejected: %v", err)
+	}
+}
+
 func TestInstallationSchema(t *testing.T) {
 	t.Run("optional_headscale_allows_local_app", func(t *testing.T) {
 		installation := validGAInstallation()
@@ -199,7 +210,7 @@ func TestInstallationSchema(t *testing.T) {
 	t.Run("publication_union_is_closed", func(t *testing.T) {
 		installation := validGAInstallation()
 		resource := &installation.Resources[0]
-		resource.Publication.TemporaryHTTP = &TemporaryIPPublication{PublicIPv4: "198.51.100.5", Port: 8080}
+		resource.Publication.TemporaryHTTP = &TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 8080}
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must contain only domain_https") {
 			t.Fatalf("ValidateInstallation(mixed publication) error = %v", err)
 		}
@@ -231,7 +242,7 @@ func TestInstallationSchema(t *testing.T) {
 		resource := &installation.Resources[0]
 		resource.Publication = AppPublication{
 			Kind:          PublicationTemporaryHTTP,
-			TemporaryHTTP: &TemporaryIPPublication{PublicIPv4: "198.51.100.5", Port: 8080},
+			TemporaryHTTP: &TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 8080},
 		}
 		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
 		resource.PublicationRecord.LastAppliedBundle = pointerBundle(domainBundle("old-domain", testDigest))
@@ -240,7 +251,7 @@ func TestInstallationSchema(t *testing.T) {
 		}
 
 		resource.PublicationRecord.State = PublicationPublished
-		resource.PublicationRecord.LastAppliedBundle = pointerBundle(temporaryBundle("temporary", testDigest, "198.51.100.5", 8080))
+		resource.PublicationRecord.LastAppliedBundle = pointerBundle(temporaryBundle("temporary", testDigest, "8.8.8.8", 8080))
 		resource.Publication.TemporaryHTTP.Port = 8081
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "cannot change before unpublish") {
 			t.Fatalf("ValidateInstallation(published temporary edit) error = %v", err)
@@ -266,17 +277,18 @@ func TestInstallationSchema(t *testing.T) {
 		resource := &installation.Resources[0]
 		resource.Publication = AppPublication{
 			Kind:          PublicationTemporaryHTTP,
-			TemporaryHTTP: &TemporaryIPPublication{PublicIPv4: "198.51.100.5", Port: 8080},
+			TemporaryHTTP: &TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 8080},
 		}
 		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
 		resource.PublicationRecord.LastAppliedBundle = &PublicationBundle{
+			Generation:       1,
 			ID:               "temporary-bundle",
 			ConfigDigest:     testDigest,
 			Kind:             PublicationTemporaryHTTP,
 			EndpointIdentity: "temporary-endpoint",
 			SiteIdentity:     "temporary-site",
 			TemporaryHTTP: &TemporaryHTTPBundleIdentity{
-				PublicIPv4:       "198.51.100.5",
+				PublicIPv4:       "8.8.8.8",
 				Port:             8080,
 				HostAuthority:    "wrong.example:8080",
 				ListenerIdentity: "listener-8080",
@@ -312,7 +324,7 @@ func TestInstallationSchema(t *testing.T) {
 		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
 		resource.PublicationRecord.LastAppliedBundle = pointerBundle(applied)
 		resource.PublicationRecord.ActivationIntent = &ActivationIntent{
-			ID:         "activation-one",
+			ID: "activation-one", JobID: "job-one", PlanID: "plan-one", Generation: 1,
 			Candidate:  domainBundle("bundle-candidate", testDigest),
 			PriorState: PublicationPublished,
 			Prior:      pointerBundle(domainBundle("bundle-other", testDigest)),
@@ -394,7 +406,7 @@ func TestInstallationSchema(t *testing.T) {
 		resource := &installation.Resources[0]
 		resource.PublicationRecord.State = PublicationActivating
 		resource.PublicationRecord.ActivationIntent = &ActivationIntent{
-			ID:         "activation-first",
+			ID: "activation-first", JobID: "job-one", PlanID: "plan-one", Generation: 1,
 			Candidate:  domainBundle("bundle-candidate", testDigest),
 			PriorState: PublicationUnpublished,
 		}
@@ -582,6 +594,7 @@ func publishedResource(health RuntimeHealth) AppResource {
 func temporaryBundle(id, configDigest, publicIPv4 string, port uint16) PublicationBundle {
 	return PublicationBundle{
 		ID:               id,
+		Generation:       1,
 		ConfigDigest:     configDigest,
 		Kind:             PublicationTemporaryHTTP,
 		EndpointIdentity: "endpoint-" + id,
@@ -596,6 +609,7 @@ func temporaryBundle(id, configDigest, publicIPv4 string, port uint16) Publicati
 func domainBundle(id, configDigest string) PublicationBundle {
 	return PublicationBundle{
 		ID:               id,
+		Generation:       1,
 		ConfigDigest:     configDigest,
 		Kind:             PublicationDomainHTTPS,
 		EndpointIdentity: "endpoint-" + id,

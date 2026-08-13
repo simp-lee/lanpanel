@@ -294,7 +294,7 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 		if err != nil {
 			return false, err
 		}
-		if (intent.Operation == Unpublish || intent.Operation == CloseAll) && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+		if (intent.Operation == Unpublish || intent.Operation == CloseAll || intent.Operation == Publish) && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
 			pending[intent.JobID] = intent
 		}
 	}
@@ -336,6 +336,16 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 			}
 			for index := range installation.Resources {
 				resource := &installation.Resources[index]
+				if intent.Operation == Publish && resource.ID == intent.SafetyBinding.ResourceID {
+					if resource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.ActivationIntent.JobID == jobID {
+						resource.PublicationRecord.ActivationIntent = nil
+					}
+					resource.PublicationRecord.State = domain.PublicationUnpublished
+					resource.PublicationRecord.LastOperation = domain.OperationPublish
+					resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+					resource.PublicationRecord.LastJobID = jobID
+					continue
+				}
 				contraction := resource.PublicationRecord.ContractionIntent
 				if contraction == nil || contraction.JobID != jobID {
 					continue
@@ -344,6 +354,23 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 				resource.PublicationRecord.LastOperation = contractionOperationCode(intent.Operation)
 				resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
 				resource.PublicationRecord.LastJobID = jobID
+			}
+			for _, key := range transaction.Keys("journals") {
+				rawJournal, _ := transaction.Get(key)
+				var journal JournalRecord
+				if err := decodeStrict(rawJournal, &journal); err != nil {
+					return err
+				}
+				if journal.JobID == jobID && journal.Kind == JournalAppActivation {
+					journal.Phase = JournalTerminal
+					rawJournal, err = persist.EncodeEntry(journal)
+					if err != nil {
+						return err
+					}
+					if err := transaction.Replace(key, rawJournal); err != nil {
+						return err
+					}
+				}
 			}
 			intent.Phase = PhaseTerminal
 			raw, err := persist.EncodeEntry(intent)

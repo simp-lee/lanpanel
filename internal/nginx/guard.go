@@ -68,10 +68,24 @@ func Guard(input GuardInput) GuardDecision {
 		switch entry.Kind {
 		case EntryChallenge:
 			return GuardDecision{Reason: "challenge ingress renderer is unavailable"}
-		case EntryApp, EntryTemporary:
-			// S11 owns the closed graph; S13 installs the typed canonical App
-			// renderer and activation authority. Until then App entries stay closed.
-			return GuardDecision{Reason: "App ingress renderer is unavailable"}
+		case EntryApp:
+			return GuardDecision{Reason: "domain App ingress prerequisite is unavailable"}
+		case EntryTemporary:
+			if input.Installation == nil {
+				return GuardDecision{Reason: "normal publication authority is unavailable"}
+			}
+			var app *domain.AppResource
+			for index := range input.Installation.Resources {
+				if input.Installation.Resources[index].ID == entry.ResourceID {
+					app = &input.Installation.Resources[index]
+					break
+				}
+			}
+			published := app != nil && app.PublicationRecord.State == domain.PublicationPublished && app.PublicationRecord.LastAppliedBundle != nil && app.PublicationRecord.LastAppliedBundle.Generation == entry.Generation && app.PublicationRecord.LastAppliedBundle.SiteIdentity == entry.Digest && resource.StickyUnpublished == nil && resource.Contraction == nil && resource.CertificateExpiry == nil && resource.EdgeOne.Expiry == nil && resource.Reactivating == nil
+			activating := app != nil && app.PublicationRecord.State == domain.PublicationActivating && app.PublicationRecord.ActivationIntent != nil && app.PublicationRecord.ActivationIntent.Candidate.Generation == entry.Generation && app.PublicationRecord.ActivationIntent.Candidate.SiteIdentity == entry.Digest && resource.Reactivating != nil && resource.Reactivating.Generation == entry.Generation && resource.Reactivating.CandidateBundle != ""
+			if !published && !activating {
+				return GuardDecision{Reason: "temporary App graph lacks exact published or activating authority"}
+			}
 		default:
 			return GuardDecision{Reason: "disk graph kind is unsupported"}
 		}

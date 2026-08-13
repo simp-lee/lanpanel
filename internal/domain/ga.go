@@ -291,6 +291,9 @@ type ProcessBundle struct {
 	RelayRequired            bool     `json:"relay_required"`
 	ApplicationUID           uint32   `json:"application_uid"`
 	ApplicationGID           uint32   `json:"application_gid"`
+	FrontendUID              uint32   `json:"frontend_uid,omitempty"`
+	FrontendGID              uint32   `json:"frontend_gid,omitempty"`
+	FrontendMode             uint32   `json:"frontend_mode,omitempty"`
 	RelayUID                 uint32   `json:"relay_uid,omitempty"`
 	RelayGID                 uint32   `json:"relay_gid,omitempty"`
 	TCPAddress               string   `json:"tcp_address,omitempty"`
@@ -323,6 +326,7 @@ type ContractionIntent struct {
 
 type PublicationBundle struct {
 	ID               string                       `json:"id"`
+	Generation       uint64                       `json:"generation"`
 	ConfigDigest     string                       `json:"config_digest"`
 	Kind             PublicationKind              `json:"kind"`
 	EndpointIdentity string                       `json:"endpoint_identity"`
@@ -390,6 +394,9 @@ type TemporaryHTTPBundleIdentity struct {
 
 type ActivationIntent struct {
 	ID         string             `json:"id"`
+	JobID      string             `json:"job_id"`
+	PlanID     string             `json:"plan_id"`
+	Generation uint64             `json:"generation"`
 	Candidate  PublicationBundle  `json:"candidate"`
 	PriorState PublicationState   `json:"prior_state"`
 	Prior      *PublicationBundle `json:"prior,omitempty"`
@@ -636,6 +643,9 @@ func validateResource(resource AppResource, credentialIDs map[string]struct{}) e
 	if err := validatePublication(resource.Publication); err != nil {
 		return err
 	}
+	if resource.Publication.Kind == PublicationTemporaryHTTP && resource.Target.WebSocket.Enabled {
+		return fmt.Errorf("temporary_ip_http does not support WebSocket")
+	}
 	if resource.Target.Kind == AppTargetLocalHTTP {
 		if resource.ManagedProcess == nil {
 			return fmt.Errorf("local_http requires managed_process")
@@ -772,9 +782,8 @@ func validatePublication(publication AppPublication) error {
 		if publication.TemporaryHTTP == nil || publication.DomainHTTPS != nil {
 			return fmt.Errorf("publication temporary_ip_http must contain only temporary_ip_http")
 		}
-		address, err := netip.ParseAddr(publication.TemporaryHTTP.PublicIPv4)
-		if err != nil || !address.Is4() || address.IsUnspecified() {
-			return fmt.Errorf("temporary_ip_http.public_ipv4 must be an IPv4 literal")
+		if err := ValidateTemporaryPublicIPv4(publication.TemporaryHTTP.PublicIPv4); err != nil {
+			return err
 		}
 		if publication.TemporaryHTTP.Port < 1024 || publication.TemporaryHTTP.Port == 80 || publication.TemporaryHTTP.Port == 443 {
 			return fmt.Errorf("temporary_ip_http.port must be in 1024..65535 and not 80 or 443")
@@ -889,6 +898,13 @@ func validateProcessBundle(bundle ProcessBundle) error {
 	}
 	if err := validateExternalAbsolute(bundle.FrontendEndpoint, "frontend_endpoint"); err != nil {
 		return err
+	}
+	if bundle.TCPAddress == "" {
+		if bundle.FrontendUID != 0 || bundle.FrontendGID == 0 || bundle.FrontendMode != 0o660 {
+			return fmt.Errorf("Unix frontend ownership authority is incomplete")
+		}
+	} else if bundle.FrontendUID != 0 || bundle.FrontendGID != 0 || bundle.FrontendMode != 0 {
+		return fmt.Errorf("TCP frontend must not carry Unix ownership authority")
 	}
 	if (bundle.TCPAddress == "") != (bundle.TCPPort == 0) {
 		return fmt.Errorf("TCP endpoint authority one-sided")
@@ -1011,8 +1027,8 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 			return fmt.Errorf("activating state requires activation_intent")
 		}
 		intent := record.ActivationIntent
-		if strings.TrimSpace(intent.ID) == "" {
-			return fmt.Errorf("activation_intent.id is required")
+		if strings.TrimSpace(intent.ID) == "" || intent.JobID == "" || intent.PlanID == "" || intent.Generation == 0 || intent.Candidate.Generation != intent.Generation {
+			return fmt.Errorf("activation_intent identity, job, Plan, and generation are required")
 		}
 		if err := validateBundle(intent.Candidate, kind); err != nil {
 			return fmt.Errorf("activation_intent.candidate: %w", err)
@@ -1092,7 +1108,7 @@ func validateRuntimeObservation(observation RuntimeObservation) error {
 }
 
 func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
-	if strings.TrimSpace(bundle.ID) == "" || strings.TrimSpace(bundle.EndpointIdentity) == "" || strings.TrimSpace(bundle.SiteIdentity) == "" {
+	if strings.TrimSpace(bundle.ID) == "" || bundle.Generation == 0 || strings.TrimSpace(bundle.EndpointIdentity) == "" || strings.TrimSpace(bundle.SiteIdentity) == "" {
 		return fmt.Errorf("id, endpoint_identity, and site_identity are required")
 	}
 	if !validSHA256Digest(bundle.ConfigDigest) {
@@ -1193,9 +1209,8 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			return fmt.Errorf("temporary_ip_http bundle must contain only temporary_ip_http identity")
 		}
 		identity := bundle.TemporaryHTTP
-		address, err := netip.ParseAddr(identity.PublicIPv4)
-		if err != nil || !address.Is4() || address.IsUnspecified() {
-			return fmt.Errorf("temporary_ip_http.public_ipv4 must be an IPv4 literal")
+		if err := ValidateTemporaryPublicIPv4(identity.PublicIPv4); err != nil {
+			return err
 		}
 		if identity.Port < 1024 || identity.Port == 80 || identity.Port == 443 {
 			return fmt.Errorf("temporary_ip_http.port must be in 1024..65535 and not 80 or 443")
@@ -1238,6 +1253,19 @@ func validateCandidateMatchesPublication(candidate PublicationBundle, publicatio
 		}
 	default:
 		return fmt.Errorf("publication kind %q is not supported", publication.Kind)
+	}
+	return nil
+}
+
+func ValidateTemporaryPublicIPv4(value string) error {
+	address, err := netip.ParseAddr(value)
+	if err != nil || !address.Is4() || address.String() != value || !address.IsGlobalUnicast() {
+		return fmt.Errorf("temporary_ip_http.public_ipv4 must be a canonical publicly routable IPv4 literal")
+	}
+	for _, prefix := range []netip.Prefix{netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("240.0.0.0/4")} {
+		if prefix.Contains(address) {
+			return fmt.Errorf("temporary_ip_http.public_ipv4 must be a canonical publicly routable IPv4 literal")
+		}
 	}
 	return nil
 }

@@ -140,6 +140,9 @@ func ResourceMutationHandler(r Revalidator, e Executor) Registration {
 func ProcessLifecycleHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationProcessLifecycle, r, e)
 }
+func PublicationActivateHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationPublicationActivate, r, e)
+}
 
 type Server struct {
 	identities IdentitySet

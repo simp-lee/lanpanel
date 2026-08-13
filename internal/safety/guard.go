@@ -110,7 +110,7 @@ func Check(input GuardInput) Decision {
 		if resource.Reactivating == nil || resource.ChallengePending != nil || resource.Reactivating.PlanID != input.PlanID || resource.Reactivating.Generation != input.Generation || resource.Reactivating.CandidateDigest != input.CandidateDigest || resource.Reactivating.CandidateBundle != input.CandidateBundle || !snapshotMatches(resource.Reactivating.BaseMarkers, resource) {
 			return Decision{Priority: priority, Reason: "matching reactivation identity is missing or stale"}
 		}
-		if !future(resource.Reactivating.CertificateUntil, input.Now) || !future(resource.Reactivating.ACLUntil, input.Now) {
+		if !resource.Reactivating.TemporaryHTTP && (!future(resource.Reactivating.CertificateUntil, input.Now) || !future(resource.Reactivating.ACLUntil, input.Now)) {
 			return Decision{Priority: PriorityBaseContraction, Reason: "reactivation safety deadline is not future"}
 		}
 		return Decision{Allowed: true, Priority: PriorityReactivating, Reason: "exact complete reactivation candidate is allowed"}
@@ -175,7 +175,7 @@ func effectivePriority(state State, resourceID string, now time.Time) EffectiveP
 	if resource.ChallengePending != nil && snapshotMatches(resource.ChallengePending.BaseMarkers, resource) && resource.EdgeOne.Expiry == nil && !edgeDeadlineExpired(resource, now) {
 		return PriorityChallenge
 	}
-	if resource.Reactivating != nil && snapshotMatches(resource.Reactivating.BaseMarkers, resource) && future(resource.Reactivating.CertificateUntil, now) && future(resource.Reactivating.ACLUntil, now) {
+	if resource.Reactivating != nil && snapshotMatches(resource.Reactivating.BaseMarkers, resource) && (resource.Reactivating.TemporaryHTTP || future(resource.Reactivating.CertificateUntil, now) && future(resource.Reactivating.ACLUntil, now)) {
 		return PriorityReactivating
 	}
 	if hasBaseMarker(resource) || edgeDeadlineExpired(resource, now) || resource.ChallengePending != nil || resource.Reactivating != nil {

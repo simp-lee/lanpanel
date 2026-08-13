@@ -116,10 +116,13 @@ ga-target-readiness-integration:
 	@grep -Fq 'CheckRedirect' internal/target/readiness.go
 	@grep -Fq 'Sec-WebSocket-Accept' internal/target/readiness.go
 
+ga-temporary-publication-integration:
+	$(GO) test -count=1 ./internal/publication ./internal/activation ./internal/preflight ./internal/target ./internal/nginx ./internal/application
+
 ga-managed-process-integration:
 	$(GO) test -count=1 ./internal/process ./internal/relay ./internal/confinement ./internal/identity ./internal/application ./internal/helper
 	@grep -Fq 'KillMode=control-group' internal/process/units_linux.go
 	@grep -Fq 'SocketBindDeny=any' internal/confinement/policy_linux.go
 	@grep -Fq 'PR_SET_NO_NEW_PRIVS' internal/process/managed_exec_linux.go
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-managed-process-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-temporary-publication-integration ga-managed-process-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit

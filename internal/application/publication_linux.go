@@ -1,0 +1,430 @@
+//go:build linux
+
+package application
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"lanpanel/internal/activation"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/filetxn"
+	"lanpanel/internal/jobs"
+	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
+	"lanpanel/internal/operations"
+	"lanpanel/internal/ownership"
+	"lanpanel/internal/plans"
+	"lanpanel/internal/preflight"
+	"lanpanel/internal/publication"
+	"lanpanel/internal/reservations"
+	"lanpanel/internal/safety"
+	"lanpanel/internal/target"
+	"slices"
+	"time"
+)
+
+type PublicationExecution struct {
+	Service     *FixedService
+	Admitter    *operations.Admitter
+	MutationSet *operations.MutationSet
+	Mutation    *operations.MutationLease
+	Exposure    *locks.Lease
+	JobID       string
+	Revision    uint64
+	Resource    domain.AppResource
+	Candidate   publication.Candidate
+	SafetyState safety.State
+	Ownership   ownership.Record
+}
+
+func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, payload ConfirmationPayload) (*PublicationExecution, error) {
+	service, err := OpenFixed()
+	if err != nil {
+		return nil, err
+	}
+	fail := func(cause error) (*PublicationExecution, error) { service.Close(); return nil, cause }
+	authority, err := actorAuthority(actor)
+	if err != nil {
+		return fail(err)
+	}
+	plan, err := service.ReadPlan(payload.PlanID)
+	if err != nil || plan.Operation != string(domain.OperationPublish) || plan.ActorIdentity != authority || plan.Target.Kind != plans.TargetResource || envelopeTarget != "resource/"+plan.Target.ID || payload.Confirmation != "publish" || time.Now().UTC().Before(plan.CreatedAt) || !time.Now().UTC().Before(plan.ExpiresAt) || plan.ReservedAt != nil || plan.ConsumedAt != nil || plan.RejectedAt != nil {
+		return fail(fmt.Errorf("publication confirmation invalid"))
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return fail(err)
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return fail(fmt.Errorf("installation authority missing"))
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return fail(err)
+	}
+	var resource *domain.AppResource
+	for index := range installation.Resources {
+		if installation.Resources[index].ID == plan.Target.ID {
+			copy := installation.Resources[index]
+			resource = &copy
+			break
+		}
+	}
+	if resource == nil {
+		return fail(fmt.Errorf("publication resource missing"))
+	}
+	if _, err := reservations.BuildClaims(installation); err != nil {
+		return fail(err)
+	}
+	state, err := service.safety.Read()
+	if err != nil {
+		return fail(err)
+	}
+	safetyResource := findSafetyResource(state, resource.ID)
+	if safetyResource == nil {
+		return fail(fmt.Errorf("publication safety resource missing"))
+	}
+	generation := safetyResource.GenerationSequence + 1
+	candidate, err := publication.PrepareTemporary(*resource, generation)
+	if err != nil {
+		return fail(err)
+	}
+	admitter, err := service.Admitter(plan)
+	if err != nil {
+		return fail(err)
+	}
+	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		return fail(err)
+	}
+	binding := operations.SafetyBinding{ResourceID: resource.ID, PlanID: plan.ID, IntentGeneration: generation, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, Deadline: plan.ExpiresAt}
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.Publish, Target: "resource/" + resource.ID, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	releaseErr := admission.Release()
+	if err != nil || releaseErr != nil {
+		return fail(errors.Join(err, releaseErr))
+	}
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return fail(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+	if err != nil {
+		mutationSet.Close()
+		return fail(err)
+	}
+	cleanup := func(cause error) (*PublicationExecution, error) {
+		releaseErr := operations.ReleaseExposure(mutation, exposure)
+		closeErr := mutationSet.Close()
+		admission, reacquireErr := service.manager.Acquire(context.WithoutCancel(ctx), locks.MutationAdmission)
+		if reacquireErr == nil {
+			document, readErr := service.normal.Read()
+			if readErr == nil {
+				reacquireErr = admitter.RejectReservation(context.WithoutCancel(ctx), admission, document.Revision, job.ID, "publication_revalidation_failed")
+			}
+			reacquireErr = errors.Join(reacquireErr, admission.Release())
+		}
+		return fail(errors.Join(cause, releaseErr, closeErr, reacquireErr))
+	}
+	fresh, err := service.normal.Read()
+	if err != nil || fresh.Revision != document.Revision+1 {
+		return cleanup(fmt.Errorf("publication normal authority changed"))
+	}
+	freshState, err := service.safety.Read()
+	if err != nil {
+		return cleanup(err)
+	}
+	freshRaw := fresh.Entries["installations/current"]
+	freshInstallation, err := domain.DecodeInstallation(freshRaw)
+	if err != nil {
+		return cleanup(err)
+	}
+	if _, err := reservations.BuildClaims(freshInstallation); err != nil {
+		return cleanup(err)
+	}
+	var freshResource *domain.AppResource
+	for index := range freshInstallation.Resources {
+		if freshInstallation.Resources[index].ID == resource.ID {
+			freshResource = &freshInstallation.Resources[index]
+		}
+	}
+	if freshResource == nil || freshResource.CurrentConfigDigest != resource.CurrentConfigDigest {
+		return cleanup(fmt.Errorf("publication config changed"))
+	}
+	var preflightOwned *ownership.Record
+	if freshResource.PublicationRecord.State == domain.PublicationPublished {
+		record, readErr := service.ownership.Read(resource.ID)
+		if readErr != nil {
+			return cleanup(readErr)
+		}
+		preflightOwned = &record
+	}
+	request, result, err := evaluateTemporaryPreflight(ctx, freshInstallation, *freshResource, freshState, preflightOwned)
+	if err != nil {
+		return cleanup(err)
+	}
+	ready, err := probeResourceTarget(ctx, *freshResource)
+	if err != nil {
+		return cleanup(err)
+	}
+	if !publicationPlanBindingMatches(plan, *freshResource, result, ready) {
+		return cleanup(fmt.Errorf("publication Plan binding changed"))
+	}
+	if request.Generation != freshResource.PublicationRecord.UnpublishedGeneration {
+		return cleanup(fmt.Errorf("publication preflight generation changed"))
+	}
+	next := freshState
+	next.Revision++
+	next.Resources = append([]safety.ResourceSafety(nil), freshState.Resources...)
+	var nextResource *safety.ResourceSafety
+	for index := range next.Resources {
+		if next.Resources[index].ResourceID == resource.ID {
+			nextResource = &next.Resources[index]
+		}
+	}
+	if nextResource == nil || nextResource.GenerationSequence+1 != generation {
+		return cleanup(fmt.Errorf("publication safety generation changed"))
+	}
+	snapshots := baseSnapshot(*nextResource)
+	nextResource.GenerationSequence = generation
+	nextResource.Reactivating = &safety.Reactivating{Generation: generation, PriorGeneration: generation - 1, PlanID: plan.ID, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, BaseMarkers: snapshots, TemporaryHTTP: true}
+	if _, err := service.safety.Commit(ctx, exposure, safety.RolePublish, freshState.Revision, next, safety.TransitionProof{}); err != nil {
+		return cleanup(err)
+	}
+	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: plan.NonceDigest})
+	if err != nil {
+		return cleanup(err)
+	}
+	activationIntent := domain.ActivationIntent{ID: "activation-" + job.ID, JobID: job.ID, PlanID: plan.ID, Generation: generation, Candidate: candidate.Bundle, PriorState: freshResource.PublicationRecord.State}
+	if freshResource.PublicationRecord.State == domain.PublicationPublished {
+		activationIntent.Prior = freshResource.PublicationRecord.LastAppliedBundle
+	}
+	if err := admitter.CommitPublicationBegin(ctx, mutation, exposure, intent.IntentGeneration, job.ID, operations.PublicationBeginCommit{ResourceID: resource.ID, Intent: activationIntent}); err != nil {
+		return cleanup(err)
+	}
+	revision := intent.IntentGeneration + 1
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "activation-" + job.ID, JobID: job.ID, Kind: operations.JournalAppActivation, Operation: operations.Publish, InstallationID: freshInstallation.InstallationID, Target: "resource/" + resource.ID, Generation: intent.IntentGeneration, Deadline: plan.ExpiresAt, ArtifactDigest: candidate.BundleDigest, ResourceIDs: []string{resource.ID}, ChildIDs: []string{}, Phase: operations.JournalPrepared}
+	if err := admitter.PutJournal(ctx, mutation, exposure, revision, journal, true); err != nil {
+		return cleanup(err)
+	}
+	revision++
+	owned, err := service.ownership.Read(resource.ID)
+	if err != nil {
+		return cleanup(err)
+	}
+	owned.Revision++
+	owned.Paths = upsertOwnedPath(owned.Paths, candidate.OwnershipPath)
+	owned.Listeners = upsertOwnedListener(owned.Listeners, candidate.OwnershipListener)
+	slices.SortFunc(owned.Paths, func(a, b ownership.OwnedPath) int { return compare(a.Path, b.Path) })
+	slices.SortFunc(owned.Listeners, func(a, b ownership.OwnedListener) int {
+		return compare(fmt.Sprintf("%s:%s:%d", a.Protocol, a.Address, a.Port), fmt.Sprintf("%s:%s:%d", b.Protocol, b.Address, b.Port))
+	})
+	persisted, err := service.OwnershipWrite(ctx, exposure, owned.Revision-1, owned)
+	if err != nil {
+		return cleanup(err)
+	}
+	safetyAfterOwnership, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return cleanup(err)
+	}
+	ownershipNext := safetyAfterOwnership
+	ownershipNext.Revision++
+	ownershipNext.Resources = append([]safety.ResourceSafety(nil), safetyAfterOwnership.Resources...)
+	for index := range ownershipNext.Resources {
+		if ownershipNext.Resources[index].ResourceID == resource.ID {
+			before := ownershipNext.Resources[index].OwnershipDigest
+			ownershipNext.Resources[index].OwnershipDigest = persisted.Checksum
+			proof := &safety.OwnershipConvergenceProof{ResourceID: resource.ID, IntentRef: plan.ID, Generation: generation, BeforeDigest: before, AfterDigest: persisted.Checksum}
+			if _, err := service.safety.Commit(ctx, exposure, safety.RoleOwnershipActivation, safetyAfterOwnership.Revision, ownershipNext, safety.TransitionProof{Ownership: proof}); err != nil {
+				return cleanup(err)
+			}
+		}
+	}
+	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted}, nil
+}
+
+func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, error) {
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return jobs.Record{}, execution.failClosed(ctx, err)
+	}
+	result, err := host.Activate(ctx, execution.Candidate, execution.Resource.Target)
+	if err != nil {
+		var failure *activation.Failure
+		if !errors.As(err, &failure) || !failure.PriorRestored {
+			return jobs.Record{}, execution.failClosed(ctx, err)
+		}
+		if restoreErr := execution.Service.RestorePublicationSafety(context.WithoutCancel(ctx), execution.Exposure, execution.Resource.ID); restoreErr == nil {
+			if rejectErr := execution.Admitter.RejectPublication(context.WithoutCancel(ctx), execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); rejectErr == nil {
+				return jobs.Record{}, err
+			} else {
+				err = errors.Join(err, rejectErr)
+			}
+		} else {
+			err = errors.Join(err, restoreErr)
+		}
+		return jobs.Record{}, execution.failClosed(ctx, err)
+	}
+	observation := domain.RuntimeObservation{Status: domain.RuntimeHealthy, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: "published"}
+	safetyCommit := func() error {
+		state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+		if err != nil {
+			return err
+		}
+		next := state
+		next.Revision++
+		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+		proof := &safety.ReactivationConvergenceProof{ResourceID: execution.Resource.ID, Generation: execution.Candidate.Generation, CandidateDigest: execution.Candidate.Bundle.ConfigDigest, CandidateBundle: execution.Candidate.BundleDigest, RuntimeClosureDigest: result.RuntimeDigest}
+		found := false
+		for index := range next.Resources {
+			resource := &next.Resources[index]
+			if resource.ResourceID == execution.Resource.ID {
+				if resource.Reactivating == nil {
+					return fmt.Errorf("publication reactivation authority disappeared")
+				}
+				proof.PlanID = resource.Reactivating.PlanID
+				resource.StickyUnpublished = nil
+				resource.Contraction = nil
+				resource.CertificateExpiry = nil
+				resource.EdgeOne.Expiry = nil
+				resource.Reactivating = nil
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("publication safety resource disappeared")
+		}
+		_, err = execution.Service.safety.Commit(ctx, execution.Exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Reactivation: proof})
+		return err
+	}
+	job, err := execution.Admitter.CommitPublicationPublished(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.PublicationTerminalCommit{ResourceID: execution.Resource.ID, Bundle: execution.Candidate.Bundle, Runtime: observation}, "activation-"+execution.JobID, result.RuntimeDigest, result.ModifiedPaths, safetyCommit)
+	if err != nil {
+		return jobs.Record{}, execution.failClosed(ctx, err)
+	}
+	execution.Revision++
+	return job, nil
+}
+
+func (execution *PublicationExecution) failClosed(_ context.Context, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	paths := nginx.FixedPaths()
+	_, auditErr := nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
+	if auditErr == nil {
+		_, _, auditErr = nginx.Contract(ctx, paths, filetxn.Owner{UID: 0, GID: 0}, []string{execution.Resource.ID})
+	}
+	host, hostErr := activation.NewFixedHost()
+	if hostErr == nil && auditErr == nil {
+		hostErr = host.Reload(ctx)
+	}
+	snapshot, stopErr := host.StopAndVerify(ctx)
+	observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
+	planID := ""
+	if resource := findSafetyResource(execution.SafetyState, execution.Resource.ID); resource != nil && resource.Reactivating != nil {
+		planID = resource.Reactivating.PlanID
+	}
+	fenceErr := execution.Service.WriteIngressActivationFence(ctx, execution.Exposure, execution.Resource.ID, planID, execution.Candidate.Generation, execution.Candidate.Generation-1, observed, stopErr != nil)
+	return errors.Join(cause, auditErr, hostErr, stopErr, fenceErr)
+}
+
+func (execution *PublicationExecution) Close() error {
+	if execution == nil {
+		return nil
+	}
+	err := operations.ReleaseExposure(execution.Mutation, execution.Exposure)
+	if execution.MutationSet != nil {
+		err = errors.Join(err, execution.MutationSet.Close())
+	}
+	if execution.Service != nil {
+		err = errors.Join(err, execution.Service.Close())
+	}
+	execution.Mutation = nil
+	execution.Exposure = nil
+	return err
+}
+func publicationPlanBindingMatches(plan plans.Plan, resource domain.AppResource, result preflight.Result, ready target.Evidence) bool {
+	if err := preflight.ValidateFreshResult(result, time.Now().UTC()); err != nil {
+		return false
+	}
+	preflightEvidence, err := result.PlanEvidence()
+	if err != nil {
+		return false
+	}
+	matchedPreflight, matchedReadiness := false, false
+	for index := range plan.Evidence {
+		if plan.Evidence[index].Kind == preflightEvidence.Kind && plan.Evidence[index].Identity == preflightEvidence.Identity && plan.Evidence[index].Generation == preflightEvidence.Generation {
+			preflightEvidence.Digest = plan.Evidence[index].Digest
+			matchedPreflight = true
+		}
+		if plan.Evidence[index].Kind == "target_readiness" && plan.Evidence[index].Identity == "resource/"+resource.ID && plan.Evidence[index].Generation == resource.ManagedProcess.Applied.Generation {
+			ready.Digest = plan.Evidence[index].Digest
+			matchedReadiness = true
+		}
+	}
+	if !matchedPreflight || !matchedReadiness {
+		return false
+	}
+	binding := plans.Binding{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: plan.ActorIdentity, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: ready.Digest, ObservedAt: ready.ObservedAt}}}
+	if resource.PublicationRecord.LastAppliedDigest != nil {
+		binding.Applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
+	}
+	expected := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+	return plans.SameBindingIdentity(expected, binding)
+}
+func baseSnapshot(resource safety.ResourceSafety) []safety.MarkerSnapshot {
+	values := []struct {
+		kind       safety.MarkerKind
+		generation uint64
+	}{{safety.MarkerStickyUnpublished, generation(resource.StickyUnpublished)}, {safety.MarkerContraction, generation(resource.Contraction)}, {safety.MarkerCertificateExpiry, deadlineGeneration(resource.CertificateExpiry)}, {safety.MarkerEdgeOneExpiry, deadlineGeneration(resource.EdgeOne.Expiry)}}
+	result := make([]safety.MarkerSnapshot, len(values))
+	for i, value := range values {
+		result[i] = safety.MarkerSnapshot{Kind: value.kind, State: safety.SnapshotAbsent}
+		if value.generation != 0 {
+			result[i].State = safety.SnapshotPresent
+			result[i].Generation = value.generation
+		}
+	}
+	return result
+}
+func generation(marker *safety.GenerationMarker) uint64 {
+	if marker == nil {
+		return 0
+	}
+	return marker.Generation
+}
+func deadlineGeneration(marker *safety.DeadlineMarker) uint64 {
+	if marker == nil {
+		return 0
+	}
+	return marker.Generation
+}
+func upsertOwnedPath(values []ownership.OwnedPath, candidate ownership.OwnedPath) []ownership.OwnedPath {
+	result := make([]ownership.OwnedPath, 0, len(values)+1)
+	for _, value := range values {
+		if value.Kind == candidate.Kind && value.Path == candidate.Path {
+			continue
+		}
+		result = append(result, value)
+	}
+	return append(result, candidate)
+}
+func upsertOwnedListener(values []ownership.OwnedListener, candidate ownership.OwnedListener) []ownership.OwnedListener {
+	result := make([]ownership.OwnedListener, 0, len(values)+1)
+	for _, value := range values {
+		if value.Protocol == candidate.Protocol && value.Address == candidate.Address && value.Port == candidate.Port {
+			continue
+		}
+		result = append(result, value)
+	}
+	return append(result, candidate)
+}
+func compare(a, b string) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}

@@ -17,12 +17,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"math/big"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -82,13 +85,23 @@ const (
 )
 
 type Entry struct {
-	Kind       EntryKind `json:"kind"`
-	ResourceID string    `json:"resource_id,omitempty"`
-	Relative   string    `json:"relative"`
-	Digest     string    `json:"digest"`
-	Domains    []string  `json:"domains,omitempty"`
-	Listeners  []string  `json:"listeners,omitempty"`
-	Generation uint64    `json:"generation"`
+	Kind       EntryKind      `json:"kind"`
+	ResourceID string         `json:"resource_id,omitempty"`
+	Relative   string         `json:"relative"`
+	Digest     string         `json:"digest"`
+	Domains    []string       `json:"domains,omitempty"`
+	Listeners  []string       `json:"listeners,omitempty"`
+	Generation uint64         `json:"generation"`
+	Temporary  *TemporarySite `json:"temporary,omitempty"`
+}
+
+type TemporarySite struct {
+	PublicIPv4      string `json:"public_ipv4"`
+	Port            uint16 `json:"port"`
+	HostAuthority   string `json:"host_authority"`
+	UpstreamNetwork string `json:"upstream_network"`
+	UpstreamAddress string `json:"upstream_address"`
+	ReadinessPath   string `json:"readiness_path"`
 }
 
 type Manifest struct {
@@ -353,6 +366,58 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 
 // Contract removes only manifest-bound App/challenge/temporary entries. It
 // never restores an enable after the caller has persisted contraction authority.
+func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry Entry) (Manifest, []string, error) {
+	manifest, err := Audit(paths, owner)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	replaceIndex := -1
+	for index, current := range manifest.Entries {
+		if current.Relative == entry.Relative || current.ResourceID == entry.ResourceID {
+			if current.Relative != entry.Relative || current.ResourceID != entry.ResourceID {
+				return Manifest{}, nil, fmt.Errorf("Nginx active entry identity conflicts")
+			}
+			replaceIndex = index
+		}
+	}
+	if replaceIndex >= 0 {
+		manifest.Entries = append(manifest.Entries[:replaceIndex], manifest.Entries[replaceIndex+1:]...)
+	}
+	data, err := RenderEntry(entry)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	entry.Digest = digest(data)
+	manifest.Entries = canonicalEntries(append(manifest.Entries, entry))
+	txn, err := filetxn.Open(filetxn.Config{RootPath: paths.ConfigRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingPath: paths.StagingPath(), Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}}, filetxn.Options{})
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	defer txn.Close()
+	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
+	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative))
+	var existing *filetxn.Metadata
+	mode := filetxn.CreateOnly
+	if replaceIndex >= 0 {
+		existing = &metadata
+		mode = filetxn.ReplaceOnly
+	}
+	result, err := txn.Put(ctx, filetxn.Request{Path: entryPath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: existing, New: metadata, MaxBytes: MaximumGraphFileSize}, data, mode)
+	if err != nil || result.State != filetxn.StateDurable {
+		return Manifest{}, nil, fmt.Errorf("install active Nginx entry: %w", err)
+	}
+	manifestData, err := EncodeManifest(manifest)
+	if err != nil {
+		return Manifest{}, []string{entryPath}, err
+	}
+	result, err = txn.Put(ctx, filetxn.Request{Path: paths.ManifestPath(), Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize}, manifestData, filetxn.ReplaceOnly)
+	if err != nil || result.State != filetxn.StateDurable {
+		return Manifest{}, []string{entryPath}, fmt.Errorf("commit active Nginx manifest: %w", err)
+	}
+	audited, err := Audit(paths, owner)
+	return audited, []string{entryPath, paths.ManifestPath()}, err
+}
+
 func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs []string) (Manifest, []string, error) {
 	manifest, err := Audit(paths, owner)
 	if err != nil {
@@ -493,7 +558,7 @@ func validEntry(entry Entry) bool {
 			return false
 		}
 	case EntryTemporary:
-		if prefix != TemporaryDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) != 0 || len(entry.Listeners) != 1 {
+		if prefix != TemporaryDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) != 0 || len(entry.Listeners) != 1 || entry.Temporary == nil || !validTemporarySite(*entry.Temporary, entry.Listeners[0]) {
 			return false
 		}
 	default:
@@ -517,7 +582,7 @@ func entriesEqual(left, right []Entry) bool {
 		return false
 	}
 	for index := range left {
-		if left[index].Kind != right[index].Kind || left[index].ResourceID != right[index].ResourceID || left[index].Relative != right[index].Relative || left[index].Digest != right[index].Digest || left[index].Generation != right[index].Generation || !slices.Equal(left[index].Domains, right[index].Domains) || !slices.Equal(left[index].Listeners, right[index].Listeners) {
+		if !reflect.DeepEqual(left[index], right[index]) {
 			return false
 		}
 	}
@@ -566,6 +631,38 @@ func validateParentChain(path string) error {
 // inert include while binding every declared identity. Later typed publication
 // and control renderers replace this closed representation; Audit never accepts
 // free-form Nginx directives as an entry implementation.
+func validTemporarySite(site TemporarySite, listener string) bool {
+	if domain.ValidateTemporaryPublicIPv4(site.PublicIPv4) != nil || site.Port < 1024 || site.Port == 80 || site.Port == 443 || site.HostAuthority != fmt.Sprintf("%s:%d", site.PublicIPv4, site.Port) || listener != fmt.Sprintf("tcp:0.0.0.0:%d", site.Port) || site.ReadinessPath == "" || !strings.HasPrefix(site.ReadinessPath, "/") {
+		return false
+	}
+	switch site.UpstreamNetwork {
+	case "unix":
+		return filepath.IsAbs(site.UpstreamAddress) && filepath.Clean(site.UpstreamAddress) == site.UpstreamAddress
+	case "tcp":
+		host, port, err := net.SplitHostPort(site.UpstreamAddress)
+		parsed, parseErr := netip.ParseAddr(host)
+		return err == nil && parseErr == nil && parsed.IsLoopback() && port != ""
+	default:
+		return false
+	}
+}
+
+func RenderEntry(entry Entry) ([]byte, error) {
+	if !validEntry(entry) {
+		return nil, fmt.Errorf("Nginx graph entry authority is invalid")
+	}
+	if entry.Kind != EntryTemporary {
+		return RenderClosedEntry(entry)
+	}
+	site := entry.Temporary
+	upstream := "http://" + site.UpstreamAddress
+	if site.UpstreamNetwork == "unix" {
+		upstream = "http://unix:" + site.UpstreamAddress + ":"
+	}
+	text := fmt.Sprintf("server {\n  listen 0.0.0.0:%d default_server;\n  server_name _;\n  add_header X-LanPanel-Rejection temporary_default always;\n  return 421;\n}\nserver {\n  listen 0.0.0.0:%d;\n  server_name %s;\n  if ($http_host != %s) { return 421; }\n  if ($server_protocol != HTTP/1.1) { return 505; }\n  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization \"\";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Cookie \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto http;\n    proxy_set_header Upgrade \"\";\n    proxy_set_header Connection \"\";\n    add_header Warning '299 lanpanel \"Public plaintext HTTP; never transmit credentials or sensitive data\"' always;\n    add_header X-LanPanel-Plaintext-Warning public_http_anyone_no_credentials always;\n    proxy_pass %s;\n  }\n}\n", site.Port, site.Port, site.PublicIPv4, site.HostAuthority, upstream)
+	return []byte(text), nil
+}
+
 func RenderClosedEntry(entry Entry) ([]byte, error) {
 	if !validEntry(entry) {
 		return nil, fmt.Errorf("Nginx graph entry authority is invalid")
@@ -578,6 +675,9 @@ func RenderClosedEntry(entry Entry) ([]byte, error) {
 		Listeners  []string  `json:"listeners,omitempty"`
 		Generation uint64    `json:"generation"`
 	}{entry.Kind, entry.ResourceID, entry.Relative, entry.Domains, entry.Listeners, entry.Generation}
+	if entry.Temporary != nil {
+		return nil, fmt.Errorf("active entry cannot use closed renderer")
+	}
 	data, err := json.Marshal(binding)
 	if err != nil {
 		return nil, err
@@ -586,7 +686,7 @@ func RenderClosedEntry(entry Entry) ([]byte, error) {
 }
 
 func validateEntryConfig(entry Entry, data []byte) error {
-	expected, err := RenderClosedEntry(entry)
+	expected, err := RenderEntry(entry)
 	if err != nil || !bytes.Equal(data, expected) {
 		return fmt.Errorf("Nginx graph entry is not its exact closed rendering")
 	}

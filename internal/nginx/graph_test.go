@@ -42,6 +42,25 @@ func TestClosedGraphRejectsForeignFilesAndContractsWithoutRestore(t *testing.T) 
 	}
 }
 
+func TestTemporaryEntryClearsCredentialsAndRequiresExactAuthority(t *testing.T) {
+	entry := Entry{Kind: EntryTemporary, ResourceID: "res_00000000000000000000000000000001", Relative: "temporary-enabled/res_00000000000000000000000000000001.conf", Digest: "sha256:" + strings.Repeat("a", 64), Listeners: []string{"tcp:0.0.0.0:18080"}, Generation: 2, Temporary: &TemporarySite{PublicIPv4: "8.8.8.8", Port: 18080, HostAuthority: "8.8.8.8:18080", UpstreamNetwork: "unix", UpstreamAddress: "/var/lib/lanpanel/resources/res_00000000000000000000000000000001/frontend/http.sock", ReadinessPath: "/ready"}}
+	data, err := RenderEntry(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, header := range []string{"Authorization", "Proxy-Authorization", "Cookie", "Forwarded", "X-Forwarded-Port", "X-Client-IP", "CF-Connecting-IP", "EO-Connecting-IP"} {
+		if !strings.Contains(text, "proxy_set_header "+header+" \"\";") {
+			t.Fatalf("temporary sanitizer omits %s", header)
+		}
+	}
+	for _, expected := range []string{"server_name 8.8.8.8;", "if ($http_host != 8.8.8.8:18080)", "if ($server_protocol != HTTP/1.1)", "proxy_set_header X-Real-IP $remote_addr;", "proxy_set_header X-Forwarded-Proto http;"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("temporary route omits %q", expected)
+		}
+	}
+}
+
 func TestAuditRejectsManifestBoundEntryWithHiddenDirective(t *testing.T) {
 	paths, manifest := installTestGraph(t)
 	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}

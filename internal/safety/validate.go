@@ -231,7 +231,7 @@ func validateChallenge(challenge ChallengePending) error {
 }
 
 func validateReactivating(reactivating Reactivating) error {
-	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() || reactivating.ACLUntil.IsZero() {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || (!reactivating.TemporaryHTTP && (reactivating.CertificateUntil.IsZero() || reactivating.ACLUntil.IsZero())) || (reactivating.TemporaryHTTP && (!reactivating.CertificateUntil.IsZero() || !reactivating.ACLUntil.IsZero())) {
 		return fmt.Errorf("reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {

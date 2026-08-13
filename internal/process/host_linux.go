@@ -216,6 +216,19 @@ func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) er
 	}
 	return nil
 }
+func (host Host) VerifyApplied(ctx context.Context, resourceID string, bundle domain.ProcessBundle, policy confinement.UnitPolicy) error {
+	if err := host.verifyEffectiveUnit(ctx, resourceID, false, policy); err != nil {
+		return err
+	}
+	units := UnitSet{Bundle: bundle, Confinement: policy, ApplicationUID: bundle.ApplicationUID, ApplicationGID: bundle.ApplicationGID, RelayUID: bundle.RelayUID, RelayGID: bundle.RelayGID}
+	if err := host.waitApplicationIdentity(ctx, resourceID, units); err != nil {
+		return err
+	}
+	if bundle.RelayRequired {
+		return host.verifyEffectiveRelay(ctx, resourceID, units)
+	}
+	return nil
+}
 func (host Host) VerifyCommittedJournal(ctx context.Context, journal Journal, running bool) error {
 	if journal.Applied == nil {
 		if running {

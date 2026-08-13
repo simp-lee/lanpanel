@@ -660,7 +660,7 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
 	beforeInstallation.Resources[0].PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Unpublish), Target: "resource/" + beforeInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
@@ -748,7 +748,7 @@ func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
 	afterInstallation := operationStateInstallation()
-	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + afterInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{9}, 32)))
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(ResourceUpdate), Target: "resource/" + afterInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{9}, 32)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,8 +761,7 @@ func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	afterInstallation.Resources[0].PublicationRecord.UnpublishedGeneration++
-	afterInstallation.Resources[0].PublicationRecord.LastOperation = domain.OperationPublish
+	afterInstallation.Resources[0].PublicationRecord.LastOperation = domain.OperationResourceUpdate
 	afterInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationSucceeded
 	afterInstallation.Resources[0].PublicationRecord.LastJobID = record.ID
 	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{}}
@@ -779,7 +778,7 @@ func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	if err := validateOperationStateTransitions(before, after); err == nil {
 		t.Fatal("resource operation state changed without job and intent")
 	}
-	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: "plan-one", AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + afterInstallation.Resources[0].ID, Phase: PhaseTerminal, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionUI, Operation: ResourceUpdate, Target: "resource/" + afterInstallation.Resources[0].ID, Phase: PhaseTerminal, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionUI, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
 	activeIntent := intent
 	activeIntent.Phase = PhaseLocalIntent
 	before.Entries[reservationKey(record.ID)] = encode(activeIntent)

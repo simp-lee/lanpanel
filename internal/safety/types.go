@@ -72,8 +72,9 @@ type Reactivating struct {
 	BaseMarkers      []MarkerSnapshot `json:"base_markers"`
 	ProbePending     bool             `json:"probe_pending"`
 	ProbeCorrelation string           `json:"probe_correlation,omitempty"`
-	CertificateUntil time.Time        `json:"certificate_until"`
-	ACLUntil         time.Time        `json:"acl_until"`
+	CertificateUntil time.Time        `json:"certificate_until,omitzero"`
+	ACLUntil         time.Time        `json:"acl_until,omitzero"`
+	TemporaryHTTP    bool             `json:"temporary_http,omitempty"`
 }
 
 type HeadscaleReactivating struct {

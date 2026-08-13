@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/reservations"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -103,7 +104,11 @@ func ValidateCreate(current domain.Installation, candidate domain.AppResource) e
 	}
 	next := current
 	next.Resources = append(append([]domain.AppResource(nil), current.Resources...), candidate)
-	return domain.ValidateInstallation(next)
+	if err := domain.ValidateInstallation(next); err != nil {
+		return err
+	}
+	_, err = reservations.BuildClaims(next)
+	return err
 }
 
 func PrepareUpdate(current domain.Installation, candidate domain.AppResource) (domain.AppResource, error) {
@@ -151,6 +156,9 @@ func PrepareUpdate(current domain.Installation, candidate domain.AppResource) (d
 		}
 	}
 	if err := domain.ValidateInstallation(next); err != nil {
+		return domain.AppResource{}, err
+	}
+	if _, err := reservations.BuildClaims(next); err != nil {
 		return domain.AppResource{}, err
 	}
 	return candidate, nil

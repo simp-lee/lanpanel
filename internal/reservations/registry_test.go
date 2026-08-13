@@ -92,11 +92,12 @@ func TestConflictRegistry(t *testing.T) {
 		resource := &installation.Resources[0]
 		resource.Publication = domain.AppPublication{
 			Kind:          domain.PublicationTemporaryHTTP,
-			TemporaryHTTP: &domain.TemporaryIPPublication{PublicIPv4: "198.51.100.5", Port: 18080},
+			TemporaryHTTP: &domain.TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 18080},
 		}
 		resource.PublicationRecord.LastAppliedDigest = stringPointer(digest)
 		resource.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{
-			ID: "old-bundle", ConfigDigest: digest, Kind: domain.PublicationDomainHTTPS,
+			Generation: 1,
+			ID:         "old-bundle", ConfigDigest: digest, Kind: domain.PublicationDomainHTTPS,
 			EndpointIdentity: "old-endpoint", SiteIdentity: "old-site",
 			ManagedPaths:  []string{"/var/lib/lanpanel/resources/old-runtime"},
 			CredentialIDs: []string{"cred_00000000000000000000000000000002"},

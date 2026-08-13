@@ -20,6 +20,10 @@ type HelperClient func(context.Context, helperproto.Operation, helperproto.Actio
 type ResourceHelperClient func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error)
 type ResourceMutationPayload struct{ Resource any }
 type ProcessMutationPayload struct{}
+type PublicationResult struct {
+	JobID     string
+	PublicURL string
+}
 type RotationResult struct {
 	Fingerprint string
 	JobID       string
@@ -97,7 +101,15 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 		}
 		start, _ := RegisterAction(domain.OperationProcessStart, ProcessMutationPayload{}, true, false, processAction)
 		stop, _ := RegisterAction(domain.OperationProcessStop, ProcessMutationPayload{}, true, false, processAction)
-		registrations = append(registrations, create, update, start, stop)
+		publish, _ := RegisterAction(domain.OperationPublish, ConfirmationPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+			payload := call.Payload.(ConfirmationPayload)
+			reply, err := resourceClient(ctx, helperproto.OperationPublicationActivate, helperproto.ResourcePayload{Operation: string(domain.OperationPublish), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation}, "resource/"+call.Target.ID)
+			if err != nil || reply.Action == nil || reply.Action.JobID == "" {
+				return Result{}, fmt.Errorf("publication activation failed")
+			}
+			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: PublicationResult{JobID: reply.Action.JobID, PublicURL: reply.Action.PublicURL}}, nil
+		})
+		registrations = append(registrations, create, update, start, stop, publish)
 	}
 	return New(registrations)
 }

@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
+	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
 	"reflect"
 	"slices"
@@ -131,6 +132,15 @@ type ProcessStateCommit struct {
 	Applied     *domain.ProcessBundle
 	Observation domain.RuntimeObservation
 }
+type PublicationBeginCommit struct {
+	ResourceID string
+	Intent     domain.ActivationIntent
+}
+type PublicationTerminalCommit struct {
+	ResourceID string
+	Bundle     domain.PublicationBundle
+	Runtime    domain.RuntimeObservation
+}
 type ChildState string
 
 type ChildOutcome string
@@ -171,6 +181,7 @@ const (
 	JournalNonIngressLocalCommit JournalKind = "non_ingress_local_commit"
 	JournalPackageTransaction    JournalKind = "package_transaction"
 	JournalAppContraction        JournalKind = "app_contraction"
+	JournalAppActivation         JournalKind = "app_activation"
 
 	JournalPrepared JournalPhase = "prepared"
 	JournalActive   JournalPhase = "active"
@@ -1375,6 +1386,228 @@ func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, e
 // while leaving the job running. Runtime closure happens only after this
 // durable boundary, so restart/reconciliation cannot infer or reopen prior
 // ingress from normal state.
+func (admitter *Admitter) CommitPublicationBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit PublicationBeginCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.ResourceID == "" {
+		return fmt.Errorf("publication begin requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != commit.ResourceID || mutation.Target() != intent.Target || commit.Intent.JobID != jobID || commit.Intent.PlanID != intent.PlanID || commit.Intent.Generation != intent.SafetyBinding.IntentGeneration || commit.Intent.Candidate.Generation != commit.Intent.Generation || commit.Intent.Candidate.ConfigDigest != intent.SafetyBinding.CandidateDigest || publication.RequireBundleDigest(commit.Intent.Candidate, intent.SafetyBinding.CandidateBundle) != nil {
+			return fmt.Errorf("publication begin intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != commit.ResourceID {
+				continue
+			}
+			if resource.PublicationRecord.State != commit.Intent.PriorState || resource.PublicationRecord.ActivationIntent != nil || commit.Intent.Candidate.ConfigDigest != resource.CurrentConfigDigest {
+				return fmt.Errorf("publication prior or candidate changed")
+			}
+			resource.PublicationRecord.State = domain.PublicationActivating
+			resource.PublicationRecord.ActivationIntent = &commit.Intent
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: intent.Consumption.ConfirmedAt.UTC().Format(time.RFC3339), Reason: "activating_may_be_live"}
+			resource.PublicationRecord.LastJobID = jobID
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("publication resource disappeared")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit PublicationTerminalCommit, journalID, runtimeDigest string, paths []string, safetyCommit func() error) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(runtimeDigest) {
+		return jobs.Record{}, fmt.Errorf("publication terminal commit requires exact authority")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	if safetyCommit == nil {
+		return jobs.Record{}, fmt.Errorf("publication terminal safety convergence missing")
+	}
+	if err := safetyCommit(); err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != commit.ResourceID || commit.Bundle.ConfigDigest != intent.SafetyBinding.CandidateDigest || publication.RequireBundleDigest(commit.Bundle, intent.SafetyBinding.CandidateBundle) != nil {
+			return fmt.Errorf("publication terminal intent mismatched")
+		}
+		journalRaw, present := transaction.Get("journals/" + journalID)
+		if !present {
+			return fmt.Errorf("publication journal missing")
+		}
+		var journal JournalRecord
+		if err := decodeStrict(journalRaw, &journal); err != nil {
+			return err
+		}
+		if journal.JobID != jobID || journal.Kind != JournalAppActivation || journal.ArtifactDigest != intent.SafetyBinding.CandidateBundle || journal.Phase != JournalPrepared {
+			return fmt.Errorf("publication journal authority changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != commit.ResourceID {
+				continue
+			}
+			active := resource.PublicationRecord.ActivationIntent
+			if resource.PublicationRecord.State != domain.PublicationActivating || active == nil || active.JobID != jobID || !reflect.DeepEqual(active.Candidate, commit.Bundle) {
+				return fmt.Errorf("publication candidate authority changed")
+			}
+			digest := commit.Bundle.ConfigDigest
+			resource.PublicationRecord.State = domain.PublicationPublished
+			resource.PublicationRecord.LastAppliedDigest = &digest
+			bundle := commit.Bundle
+			resource.PublicationRecord.LastAppliedBundle = &bundle
+			resource.PublicationRecord.ActivationIntent = nil
+			resource.PublicationRecord.RuntimeObservation = &commit.Runtime
+			resource.PublicationRecord.LastOperation = domain.OperationPublish
+			resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+			resource.PublicationRecord.LastJobID = jobID
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("publication resource disappeared")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		journal.Phase = JournalTerminal
+		journalRaw, err = persist.EncodeEntry(journal)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("journals/"+journal.ID, journalRaw); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: paths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: runtimeDigest}}}, observedNow)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err = persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+func (admitter *Admitter) RejectPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, code string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("publication rejection requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent {
+			return fmt.Errorf("publication intent is not rejectable")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == intent.SafetyBinding.ResourceID && resource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.ActivationIntent.JobID == jobID {
+				active := resource.PublicationRecord.ActivationIntent
+				resource.PublicationRecord.State = active.PriorState
+				resource.PublicationRecord.ActivationIntent = nil
+				resource.PublicationRecord.LastOperation = domain.OperationPublish
+				resource.PublicationRecord.LastOperationResult = domain.OperationFailed
+				resource.PublicationRecord.LastJobID = jobID
+				resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: observed.Format(time.RFC3339), Reason: "activation_restored_prior"}
+			}
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		for _, key := range transaction.Keys("journals") {
+			journalRaw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if err := decodeStrict(journalRaw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID == jobID && journal.Kind == JournalAppActivation {
+				journal.Phase = JournalTerminal
+				journalRaw, err = persist.EncodeEntry(journal)
+				if err != nil {
+					return err
+				}
+				if err := transaction.Replace(key, journalRaw); err != nil {
+					return err
+				}
+			}
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultFailed, Postconditions: []jobs.Postcondition{{Kind: "prior_publication_restored", Status: jobs.PostconditionVerified, Identity: intent.SafetyBinding.CandidateBundle}}, ErrorCode: code}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err = persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(jobID), raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitContractionState(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ContractionCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(commit.ClosureAuthorityDigest) || len(commit.UnpublishedGenerations) > maximumJournalResources {
 		return fmt.Errorf("contraction state commit requires exact bounded authority")
@@ -2113,7 +2346,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if !resource.EdgeOne.Deadline.IsZero() && resource.EdgeOne.Deadline.Sub(now) < 5*time.Minute {
 			return fmt.Errorf("EdgeOne safety deadline is too near for ordinary activation")
 		}
-		if resource.Reactivating != nil && (resource.Reactivating.CertificateUntil.Sub(now) < 5*time.Minute || resource.Reactivating.ACLUntil.Sub(now) < 5*time.Minute) {
+		if resource.Reactivating != nil && !resource.Reactivating.TemporaryHTTP && (resource.Reactivating.CertificateUntil.Sub(now) < 5*time.Minute || resource.Reactivating.ACLUntil.Sub(now) < 5*time.Minute) {
 			return fmt.Errorf("reactivation safety deadline is too near")
 		}
 		if !consuming {
@@ -2526,6 +2759,10 @@ func validateJournalRecord(value JournalRecord) error {
 		if value.Operation != PackageTransaction || value.Target != string(plans.TargetInstallation) || len(value.ResourceIDs) != 0 {
 			return fmt.Errorf("package journal operation or target is invalid")
 		}
+	} else if value.Kind == JournalAppActivation {
+		if value.Operation != Publish || len(value.ResourceIDs) != 1 || value.Target != "resource/"+value.ResourceIDs[0] {
+			return fmt.Errorf("App activation journal identity is invalid")
+		}
 	} else if value.Kind == JournalAppContraction {
 		switch value.Operation {
 		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
@@ -2549,10 +2786,10 @@ func validateJournalRecord(value JournalRecord) error {
 		if !exactApp && !exactCloseAll {
 			return fmt.Errorf("App contraction journal does not exactly identify its affected resources")
 		}
-	} else if len(value.ResourceIDs) != 0 {
+	} else if value.Kind != JournalAppActivation && len(value.ResourceIDs) != 0 {
 		return fmt.Errorf("non-ingress journal unexpectedly identifies App resources")
 	}
-	if len(value.ChildIDs) == 0 || len(value.ChildIDs) > maximumChildrenPerJob {
+	if value.Kind != JournalAppActivation && len(value.ChildIDs) == 0 || len(value.ChildIDs) > maximumChildrenPerJob {
 		return fmt.Errorf("journal child inventory is empty or unbounded")
 	}
 	for index, childID := range value.ChildIDs {
@@ -2827,11 +3064,29 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if err != nil {
 			return err
 		}
+		beginningActivation := oldResource.PublicationRecord.State != domain.PublicationActivating && resource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.ActivationIntent != nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && intent.Operation == Publish && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
+		terminalActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		failedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == oldResource.PublicationRecord.ActivationIntent.PriorState && resource.PublicationRecord.ActivationIntent == nil && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultFailed
 		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
-		ordinaryTerminal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		ordinaryTerminal := intent.Operation != Publish && oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		switch {
+		case beginningActivation:
+			activation := resource.PublicationRecord.ActivationIntent
+			if activation.JobID != intent.JobID || activation.PlanID != intent.PlanID || activation.Generation != intent.SafetyBinding.IntentGeneration || resource.PublicationRecord.LastJobID != intent.JobID {
+				return fmt.Errorf("resource %q activation identity does not match durable intent", resource.ID)
+			}
+		case terminalActivation:
+			activation := oldResource.PublicationRecord.ActivationIntent
+			if activation.JobID != intent.JobID || resource.PublicationRecord.LastAppliedBundle == nil || !reflect.DeepEqual(*resource.PublicationRecord.LastAppliedBundle, activation.Candidate) || resource.PublicationRecord.LastOperation != domain.OperationPublish || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
+				return fmt.Errorf("resource %q publication result does not match durable activation", resource.ID)
+			}
+		case failedActivation:
+			activation := oldResource.PublicationRecord.ActivationIntent
+			if activation.JobID != intent.JobID || resource.PublicationRecord.LastAppliedDigest != oldResource.PublicationRecord.LastAppliedDigest || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationFailed {
+				return fmt.Errorf("resource %q failed publication did not preserve exact prior", resource.ID)
+			}
 		case beginningContraction:
 			contraction := resource.PublicationRecord.ContractionIntent
 			if contraction.JobID != intent.JobID || contraction.Operation != string(intent.Operation) || contraction.Generation != resource.PublicationRecord.UnpublishedGeneration || contraction.ClosureAuthorityDigest != intent.ContractionDigest || resource.PublicationRecord.LastOperation != oldResource.PublicationRecord.LastOperation || resource.PublicationRecord.LastOperationResult != oldResource.PublicationRecord.LastOperationResult {
@@ -2959,6 +3214,9 @@ func validateOperationResourceDelta(before, after domain.AppResource, operation 
 		}
 		return nil
 	case Publish:
+		if after.PublicationRecord.State != domain.PublicationActivating && after.PublicationRecord.State != domain.PublicationPublished {
+			return fmt.Errorf("publish did not preserve activating or commit published state")
+		}
 		return nil
 	case StartupContraction:
 		if after.PublicationRecord.State != domain.PublicationUnpublished || after.PublicationRecord.UnpublishedGeneration < before.PublicationRecord.UnpublishedGeneration || after.PublicationRecord.UnpublishedGeneration == before.PublicationRecord.UnpublishedGeneration && before.PublicationRecord.State != domain.PublicationUnpublished {

@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -359,8 +360,9 @@ func RunRole(args []string) error {
 		}
 		if normal, normalErr := application.OpenFixed(); normalErr == nil {
 			allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+			recoveryErr := normal.PendingPublicationRecovery()
 			_ = normal.Close()
-			if guardErr == nil && allowed {
+			if guardErr == nil && recoveryErr == nil && allowed {
 				return ExecutionResult{ResultDigest: request.InputDigest}, nil
 			}
 		}
@@ -576,7 +578,11 @@ func RunRole(args []string) error {
 			startProcess := *startResource.ManagedProcess
 			startProcess.Requested = domain.ProcessRequestedRunning
 			startResource.ManagedProcess = &startProcess
-			units, err := managedprocess.Render(installationID, startResource, accounts, profile, evidence)
+			nginxGID, groupErr := lookupGroupGID("www-data")
+			if groupErr != nil {
+				return ExecutionResult{}, groupErr
+			}
+			units, err := managedprocess.Render(installationID, startResource, accounts, profile, evidence, nginxGID)
 			if err != nil {
 				return ExecutionResult{}, err
 			}
@@ -669,6 +675,31 @@ func RunRole(args []string) error {
 		journalActive = false
 		return ExecutionResult{ResultDigest: observation.Digest, Action: &helperproto.ActionResult{JobID: job.ID}}, nil
 	})
+	publicationHandler := PublicationActivateHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Resource.Operation != "publish" || !strings.HasPrefix(request.Target, "resource/") {
+			return fmt.Errorf("publication caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (output ExecutionResult, resultErr error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("publication carried secret")
+		}
+		execution, err := application.BeginPublication(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer func() {
+			closeErr := execution.Close()
+			if resultErr != nil && closeErr != nil {
+				resultErr = errors.Join(resultErr, closeErr)
+			}
+		}()
+		job, err := execution.Run(ctx)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: execution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: execution.Candidate.PublicURL}}, nil
+	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("Management profile request carried secret")
@@ -678,7 +709,7 @@ func RunRole(args []string) error {
 		tokenMu.Unlock()
 		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}
@@ -698,8 +729,9 @@ func RunRole(args []string) error {
 func reconcileStartupContraction(ctx context.Context) error {
 	if normal, err := application.OpenFixed(); err == nil {
 		allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+		publicationErr := normal.PendingPublicationRecovery()
 		_ = normal.Close()
-		if guardErr == nil && allowed {
+		if guardErr == nil && publicationErr == nil && allowed {
 			return nil
 		}
 	}
@@ -720,6 +752,24 @@ func reconcileStartupContraction(ctx context.Context) error {
 		return nil
 	}
 	return runErr
+}
+
+func lookupGroupGID(name string) (uint32, error) {
+	data, err := os.ReadFile("/etc/group")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) == 4 && fields[0] == name {
+			value, err := strconv.ParseUint(fields[2], 10, 32)
+			if err != nil || value == 0 {
+				return 0, fmt.Errorf("fixed group identity is invalid")
+			}
+			return uint32(value), nil
+		}
+	}
+	return 0, fmt.Errorf("fixed group identity is missing")
 }
 
 func ReadIdentityConfig() (IdentityConfig, error) {
