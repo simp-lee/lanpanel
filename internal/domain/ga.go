@@ -235,10 +235,21 @@ type AppPublication struct {
 }
 
 type DomainHTTPSPublication struct {
-	CanonicalDomain string        `json:"canonical_domain"`
-	Aliases         []string      `json:"aliases,omitempty"`
-	AccessMode      AppAccessMode `json:"access_mode"`
-	CredentialID    string        `json:"credential_id,omitempty"`
+	CanonicalDomain string              `json:"canonical_domain"`
+	Aliases         []string            `json:"aliases,omitempty"`
+	AccessMode      AppAccessMode       `json:"access_mode"`
+	CredentialID    string              `json:"credential_id,omitempty"`
+	Certificate     *CertificateRequest `json:"certificate,omitempty"`
+}
+type CertificateRequest struct {
+	ChallengeMethod     string `json:"challenge_method"`
+	DirectoryURL        string `json:"directory_url"`
+	AccountKeyPath      string `json:"account_key_path"`
+	AccountEmail        string `json:"account_email"`
+	TermsAccepted       bool   `json:"terms_accepted"`
+	DNSProvider         string `json:"dns_provider,omitempty"`
+	ProviderProfilePath string `json:"provider_profile_path,omitempty"`
+	AuthoritativeZone   string `json:"authoritative_zone,omitempty"`
 }
 
 type TemporaryIPPublication struct {
@@ -353,8 +364,36 @@ type DomainHTTPSBundleIdentity struct {
 }
 
 type CertificateBundleIdentity struct {
-	PointerIdentity string `json:"pointer_identity"`
-	BindingIdentity string `json:"binding_identity"`
+	PointerIdentity string                        `json:"pointer_identity"`
+	BindingIdentity string                        `json:"binding_identity"`
+	Generation      uint64                        `json:"generation,omitempty"`
+	Fingerprint     string                        `json:"fingerprint,omitempty"`
+	SANIdentity     string                        `json:"san_identity,omitempty"`
+	NotAfter        string                        `json:"not_after,omitempty"`
+	LastTrustedWall string                        `json:"last_trusted_wall,omitempty"`
+	ChainIdentity   string                        `json:"chain_identity,omitempty"`
+	IssuerIdentity  string                        `json:"issuer_identity,omitempty"`
+	Authority       *CertificateAuthorityIdentity `json:"authority,omitempty"`
+}
+type CertificateAuthorityIdentity struct {
+	CertificateID         string                          `json:"certificate_id"`
+	DirectoryURL          string                          `json:"directory_url"`
+	AccountKeyPath        string                          `json:"account_key_path"`
+	AccountKeyFingerprint string                          `json:"account_key_fingerprint"`
+	AccountEmail          string                          `json:"account_email"`
+	TermsAccepted         bool                            `json:"terms_accepted"`
+	Method                string                          `json:"method"`
+	Provider              string                          `json:"provider,omitempty"`
+	ProfilePath           string                          `json:"profile_path,omitempty"`
+	ProfileFingerprint    string                          `json:"profile_fingerprint,omitempty"`
+	CredentialFiles       []CertificateCredentialIdentity `json:"credential_files"`
+	Zone                  string                          `json:"zone,omitempty"`
+	Principal             string                          `json:"principal,omitempty"`
+}
+type CertificateCredentialIdentity struct {
+	Key         string `json:"key"`
+	Path        string `json:"path"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 type AuthBundleIdentity struct {
@@ -777,6 +816,18 @@ func validatePublication(publication AppPublication) error {
 		default:
 			return fmt.Errorf("access mode %q is not supported", publication.DomainHTTPS.AccessMode)
 		}
+		certificate := publication.DomainHTTPS.Certificate
+		if certificate != nil {
+			if certificate.ChallengeMethod != "http-01" && certificate.ChallengeMethod != "dns-01" || !canonicalHTTPSURL(certificate.DirectoryURL) || !cleanAbsolutePath(certificate.AccountKeyPath) || !validACMEEmail(certificate.AccountEmail) || !certificate.TermsAccepted {
+				return fmt.Errorf("domain_https certificate authority is invalid")
+			}
+			if certificate.ChallengeMethod == "http-01" && (certificate.DNSProvider != "" || certificate.ProviderProfilePath != "" || certificate.AuthoritativeZone != "") {
+				return fmt.Errorf("http-01 must not contain DNS provider authority")
+			}
+			if certificate.ChallengeMethod == "dns-01" && (!validDNSProvider(certificate.DNSProvider) || !cleanAbsolutePath(certificate.ProviderProfilePath) || certificate.AuthoritativeZone == "") {
+				return fmt.Errorf("dns-01 provider authority is incomplete")
+			}
+		}
 		return nil
 	case PublicationTemporaryHTTP:
 		if publication.TemporaryHTTP == nil || publication.DomainHTTPS != nil {
@@ -794,6 +845,9 @@ func validatePublication(publication AppPublication) error {
 	}
 }
 
+func validACMEEmail(value string) bool {
+	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
+}
 func validateManagedProcess(process ManagedProcess) error {
 	if !strings.HasPrefix(process.ID, "proc_") || !idPattern.MatchString(process.ID) {
 		return fmt.Errorf("managed_process.id is invalid")
@@ -1160,10 +1214,17 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			}
 			seen[exactDomain] = struct{}{}
 		}
-		if identity.Certificate.PointerIdentity == "" || identity.Certificate.BindingIdentity == "" ||
-			identity.Certificate.PointerIdentity != strings.TrimSpace(identity.Certificate.PointerIdentity) ||
-			identity.Certificate.BindingIdentity != strings.TrimSpace(identity.Certificate.BindingIdentity) {
+		certificate := identity.Certificate
+		if certificate.PointerIdentity == "" || certificate.BindingIdentity == "" || certificate.PointerIdentity != strings.TrimSpace(certificate.PointerIdentity) || certificate.BindingIdentity != strings.TrimSpace(certificate.BindingIdentity) {
 			return fmt.Errorf("domain_https certificate pointer and binding identities are required")
+		}
+		if certificate.Generation == 0 || !validSHA256Digest(certificate.Fingerprint) || !validSHA256Digest(certificate.SANIdentity) || !validSHA256Digest(certificate.ChainIdentity) || !validSHA256Digest(certificate.IssuerIdentity) {
+			return fmt.Errorf("domain_https certificate complete identity is invalid")
+		}
+		deadline, err := time.Parse(time.RFC3339, certificate.NotAfter)
+		wall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
+		if err != nil || wallErr != nil || deadline.IsZero() || wall.IsZero() || deadline.Before(wall) {
+			return fmt.Errorf("domain_https certificate deadline evidence invalid")
 		}
 		switch identity.Auth.Mode {
 		case AppAccessPublic, AppAccessApplicationManaged:
@@ -1300,6 +1361,22 @@ func validateHTTPSURL(value string) error {
 		return fmt.Errorf("must be a hierarchical HTTPS URL without userinfo, query, or fragment")
 	}
 	return nil
+}
+
+func canonicalHTTPSURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
+}
+func cleanAbsolutePath(value string) bool {
+	return filepath.IsAbs(value) && filepath.Clean(value) == value && value != "/" && !strings.ContainsAny(value, "\x00\r\n")
+}
+func validDNSProvider(value string) bool {
+	switch value {
+	case "cloudflare", "route53", "digitalocean", "gcloud", "tencentcloud":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateReadinessPath(value string) error {

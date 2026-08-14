@@ -54,13 +54,23 @@ type MarkerSnapshot struct {
 }
 
 type ChallengePending struct {
-	Generation        uint64           `json:"generation"`
-	PlanID            string           `json:"plan_id"`
-	Host              string           `json:"host"`
-	TokenPath         string           `json:"token_path"`
-	Webroot           string           `json:"webroot"`
-	BootstrapIdentity string           `json:"bootstrap_identity"`
-	BaseMarkers       []MarkerSnapshot `json:"base_markers"`
+	Generation          uint64           `json:"generation"`
+	PlanID              string           `json:"plan_id"`
+	Method              string           `json:"method,omitempty"`
+	ConfigDigest        string           `json:"config_digest,omitempty"`
+	SANIdentity         string           `json:"san_identity,omitempty"`
+	ACMEBinding         string           `json:"acme_binding,omitempty"`
+	CertificateIdentity string           `json:"certificate_identity,omitempty"`
+	OwnerLock           string           `json:"owner_lock,omitempty"`
+	Provider            string           `json:"provider,omitempty"`
+	Zone                string           `json:"zone,omitempty"`
+	Owners              []string         `json:"owners,omitempty"`
+	Host                string           `json:"host"`
+	Hosts               []string         `json:"hosts,omitempty"`
+	TokenPath           string           `json:"token_path"`
+	Webroot             string           `json:"webroot"`
+	BootstrapIdentity   string           `json:"bootstrap_identity"`
+	BaseMarkers         []MarkerSnapshot `json:"base_markers"`
 }
 
 type Reactivating struct {
@@ -111,20 +121,28 @@ const (
 	OwnershipOrphan OwnershipState = "ownership_orphan"
 )
 
+type ActiveCertificateAuthority struct {
+	Generation      uint64    `json:"generation"`
+	Fingerprint     string    `json:"fingerprint"`
+	Binding         string    `json:"binding"`
+	NotAfter        time.Time `json:"not_after"`
+	LastTrustedWall time.Time `json:"last_trusted_wall"`
+}
 type ResourceSafety struct {
-	ResourceID         string            `json:"resource_id"`
-	GenerationSequence uint64            `json:"generation_sequence"`
-	State              ResourceState     `json:"state"`
-	Ownership          OwnershipState    `json:"ownership"`
-	OwnershipDigest    string            `json:"ownership_digest"`
-	StickyUnpublished  *GenerationMarker `json:"sticky_unpublished,omitempty"`
-	Closing            *GenerationMarker `json:"closing,omitempty"`
-	Contraction        *GenerationMarker `json:"contraction,omitempty"`
-	CertificateExpiry  *DeadlineMarker   `json:"certificate_expiry,omitempty"`
-	EdgeOne            EdgeOneSafety     `json:"edgeone"`
-	ChallengePending   *ChallengePending `json:"challenge_pending,omitempty"`
-	Reactivating       *Reactivating     `json:"reactivating,omitempty"`
-	DeletionTombstone  string            `json:"deletion_tombstone,omitempty"`
+	ResourceID         string                      `json:"resource_id"`
+	GenerationSequence uint64                      `json:"generation_sequence"`
+	State              ResourceState               `json:"state"`
+	Ownership          OwnershipState              `json:"ownership"`
+	OwnershipDigest    string                      `json:"ownership_digest"`
+	StickyUnpublished  *GenerationMarker           `json:"sticky_unpublished,omitempty"`
+	Closing            *GenerationMarker           `json:"closing,omitempty"`
+	Contraction        *GenerationMarker           `json:"contraction,omitempty"`
+	ActiveCertificate  *ActiveCertificateAuthority `json:"active_certificate,omitempty"`
+	CertificateExpiry  *DeadlineMarker             `json:"certificate_expiry,omitempty"`
+	EdgeOne            EdgeOneSafety               `json:"edgeone"`
+	ChallengePending   *ChallengePending           `json:"challenge_pending,omitempty"`
+	Reactivating       *Reactivating               `json:"reactivating,omitempty"`
+	DeletionTombstone  string                      `json:"deletion_tombstone,omitempty"`
 }
 
 type HeadscaleSafety struct {

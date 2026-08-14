@@ -616,18 +616,18 @@ func domainBundle(id, configDigest string) PublicationBundle {
 		SiteIdentity:     "site-" + id,
 		DomainHTTPS: &DomainHTTPSBundleIdentity{
 			ExactDomains: []string{"app.example.com", "alias.example.com"},
-			Certificate: CertificateBundleIdentity{
-				PointerIdentity: "certificate-pointer",
-				BindingIdentity: "certificate-binding",
-			},
-			Auth:     AuthBundleIdentity{Mode: AppAccessPublic},
-			Static:   StaticBundleIdentity{RouteIdentities: []string{}},
-			GoAccess: GoAccessBundleIdentity{Enabled: false},
-			EdgeOne:  EdgeOneBundleIdentity{Enabled: false},
+			Certificate:  completeCertificate("certificate-pointer", "certificate-binding"),
+			Auth:         AuthBundleIdentity{Mode: AppAccessPublic},
+			Static:       StaticBundleIdentity{RouteIdentities: []string{}},
+			GoAccess:     GoAccessBundleIdentity{Enabled: false},
+			EdgeOne:      EdgeOneBundleIdentity{Enabled: false},
 		},
 	}
 }
 
+func completeCertificate(pointer, binding string) CertificateBundleIdentity {
+	return CertificateBundleIdentity{PointerIdentity: pointer, BindingIdentity: binding, Generation: 1, Fingerprint: testDigest, SANIdentity: testDigest, ChainIdentity: testDigest, IssuerIdentity: testDigest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}
+}
 func pointer(value string) *string { return &value }
 
 func pointerBundle(value PublicationBundle) *PublicationBundle { return &value }

@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -728,6 +729,17 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 }
 
 func validateResourceTransition(role ClearRole, before, after ResourceSafety, proof TransitionProof) error {
+	if role == RoleCertificateHandoff {
+		pending, active := before.ChallengePending, after.Reactivating
+		if pending == nil || before.Reactivating != nil || after.ChallengePending != nil || active == nil || active.PlanID != pending.PlanID || active.Generation != pending.Generation || active.PriorGeneration+1 != pending.Generation || active.CandidateDigest != pending.ConfigDigest || !reflect.DeepEqual(active.BaseMarkers, pending.BaseMarkers) || !isDigest(active.CandidateBundle) {
+			return fmt.Errorf("certificate handoff does not exactly replace challenge authority")
+		}
+		before.ChallengePending = nil
+		after.Reactivating = nil
+		if !reflect.DeepEqual(before, after) {
+			return fmt.Errorf("certificate handoff changed unrelated safety authority")
+		}
+	}
 	beforeGenerations := resourceGenerations(before)
 	if before.Closing != nil && after.Closing == nil && after.StickyUnpublished != nil && after.StickyUnpublished.Generation == before.Closing.Generation {
 		delete(beforeGenerations, "closing")
@@ -767,7 +779,24 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if err := markerTransition(role, before.Contraction, after.Contraction, RoleContraction, ClearBaseContraction); err != nil {
 		return err
 	}
-	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleContraction, ClearBaseContraction); err != nil {
+	if !reflect.DeepEqual(before.ActiveCertificate, after.ActiveCertificate) {
+		observation := false
+		if role == RoleCertificateObservation && before.ActiveCertificate != nil && after.ActiveCertificate != nil {
+			prior, next := *before.ActiveCertificate, *after.ActiveCertificate
+			priorWall, nextWall := prior.LastTrustedWall, next.LastTrustedWall
+			prior.LastTrustedWall = time.Time{}
+			next.LastTrustedWall = time.Time{}
+			observation = reflect.DeepEqual(prior, next) && !nextWall.Before(priorWall) && next.NotAfter.After(nextWall)
+		}
+		allowed := role == RolePublish || role == RoleCertificateActivation || role == RoleDelete || observation
+		if !allowed {
+			return fmt.Errorf("wrong active certificate authority writer")
+		}
+		if !observation && after.ActiveCertificate != nil && before.ActiveCertificate != nil && after.ActiveCertificate.Generation <= before.ActiveCertificate.Generation {
+			return fmt.Errorf("active certificate generation did not advance")
+		}
+	}
+	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleCertificateActivation, ClearBaseContraction); err != nil {
 		return err
 	}
 	if err := deadlineTransition(role, before.EdgeOne.Expiry, after.EdgeOne.Expiry, RoleContraction, ClearBaseContraction); err != nil {
@@ -865,7 +894,7 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 	if reflect.DeepEqual(before, after) {
 		return nil
 	}
-	if role == RoleContraction && before != nil && after == nil {
+	if (role == RoleContraction || role == RoleCertificateHandoff) && before != nil && after == nil {
 		return nil
 	}
 	if role != RoleChallenge {
@@ -883,8 +912,11 @@ func reactivationTransition(role ClearRole, priorGeneration uint64, before, afte
 	if role == RoleContraction && before != nil && after == nil {
 		return nil
 	}
-	if role != RolePublish {
+	if role != RolePublish && role != RoleCertificateHandoff {
 		return fmt.Errorf("wrong reactivation writer")
+	}
+	if role == RoleCertificateHandoff {
+		return nil
 	}
 	if after != nil && (after.PriorGeneration != priorGeneration || after.Generation != priorGeneration+1) {
 		return fmt.Errorf("reactivation does not bind the exact prior generation")
@@ -989,7 +1021,7 @@ func backupTransitionGeneration(marker *BackupTransition) uint64 {
 
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleEdgeOneRefresh, RoleResourceCreate:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleCertificateHandoff, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleCertificateObservation, RoleEdgeOneRefresh, RoleResourceCreate:
 		return true
 	default:
 		return false

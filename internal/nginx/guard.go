@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/safety"
+	"slices"
 	"time"
 )
 
@@ -67,7 +68,10 @@ func Guard(input GuardInput) GuardDecision {
 		}
 		switch entry.Kind {
 		case EntryChallenge:
-			return GuardDecision{Reason: "challenge ingress renderer is unavailable"}
+			pending := resource.ChallengePending
+			if pending == nil || pending.Method != "http-01" || pending.Generation != entry.Generation || pending.Webroot != entry.Challenge.Webroot || pending.TokenPath != "/.well-known/acme-challenge" || pending.BootstrapIdentity == "" || !slices.Equal(pending.Hosts, entry.Domains) || !challengeSnapshotMatches(pending.BaseMarkers, *resource) || resource.EdgeOne.Expiry != nil {
+				return GuardDecision{Reason: "challenge graph lacks exact durable HTTP-01 authority"}
+			}
 		case EntryApp:
 			return GuardDecision{Reason: "domain App ingress prerequisite is unavailable"}
 		case EntryTemporary:
@@ -93,6 +97,44 @@ func Guard(input GuardInput) GuardDecision {
 	return GuardDecision{Allowed: true, Reason: "exact durable safety and disk graph match"}
 }
 
+func certificateCurrent(resource *domain.AppResource, now time.Time) bool {
+	if resource == nil || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
+		return false
+	}
+	certificate := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate
+	deadline, deadlineErr := time.Parse(time.RFC3339, certificate.NotAfter)
+	wall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
+	return deadlineErr == nil && wallErr == nil && !now.Before(wall) && deadline.After(now)
+}
+func challengeSnapshotMatches(snapshot []safety.MarkerSnapshot, resource safety.ResourceSafety) bool {
+	current := map[safety.MarkerKind]uint64{}
+	if resource.StickyUnpublished != nil {
+		current[safety.MarkerStickyUnpublished] = resource.StickyUnpublished.Generation
+	}
+	if resource.Contraction != nil {
+		current[safety.MarkerContraction] = resource.Contraction.Generation
+	}
+	if resource.CertificateExpiry != nil {
+		current[safety.MarkerCertificateExpiry] = resource.CertificateExpiry.Generation
+	}
+	if resource.EdgeOne.Expiry != nil {
+		current[safety.MarkerEdgeOneExpiry] = resource.EdgeOne.Expiry.Generation
+	}
+	if len(snapshot) != 4 {
+		return false
+	}
+	for _, marker := range snapshot {
+		generation, present := current[marker.Kind]
+		if marker.State == safety.SnapshotPresent {
+			if !present || generation != marker.Generation {
+				return false
+			}
+		} else if marker.State != safety.SnapshotAbsent || present {
+			return false
+		}
+	}
+	return true
+}
 func hasAppEntries(manifest Manifest) bool {
 	for _, entry := range manifest.Entries {
 		if entry.Kind != EntryControl {

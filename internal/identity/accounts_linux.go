@@ -26,13 +26,12 @@ const (
 type AccountRole string
 
 const (
-	RoleUI               AccountRole = "ui"
-	RoleTimer            AccountRole = "timer"
-	RoleRecovery         AccountRole = "recovery"
-	RoleHeadscale        AccountRole = "headscale"
-	RoleCertificateStage AccountRole = "certificate_stage"
-	RoleHTPasswd         AccountRole = "htpasswd"
-	RoleTailscale        AccountRole = "tailscale"
+	RoleUI        AccountRole = "ui"
+	RoleTimer     AccountRole = "timer"
+	RoleRecovery  AccountRole = "recovery"
+	RoleHeadscale AccountRole = "headscale"
+	RoleHTPasswd  AccountRole = "htpasswd"
+	RoleTailscale AccountRole = "tailscale"
 )
 
 type AccountSpec struct {
@@ -68,7 +67,7 @@ func InstallationAccounts(installationID string) (AccountSet, error) {
 	roles := []struct {
 		role   AccountRole
 		suffix string
-	}{{RoleUI, "ui"}, {RoleTimer, "timer"}, {RoleRecovery, "recovery"}, {RoleHeadscale, "headscale"}, {RoleCertificateStage, "cert"}, {RoleHTPasswd, "htp"}, {RoleTailscale, "tailscale"}}
+	}{{RoleUI, "ui"}, {RoleTimer, "timer"}, {RoleRecovery, "recovery"}, {RoleHeadscale, "headscale"}, {RoleHTPasswd, "htp"}, {RoleTailscale, "tailscale"}}
 	set := AccountSet{HelperClientGroup: clientGroup, Specs: make([]AccountSpec, 0, len(roles))}
 	for _, value := range roles {
 		name := prefix + "-" + value.suffix
@@ -334,7 +333,7 @@ func readAccountFile(path string) ([]byte, error) {
 }
 
 func validateAccountSet(set AccountSet, requireIdentities bool) error {
-	if set.HelperClientGroup == "" || len(set.HelperClientGroup) > 31 || len(set.Specs) != 7 || requireIdentities && len(set.Identities) != len(set.Specs) {
+	if set.HelperClientGroup == "" || len(set.HelperClientGroup) > 31 || len(set.Specs) != 6 || requireIdentities && len(set.Identities) != len(set.Specs) {
 		return fmt.Errorf("installation account set is incomplete")
 	}
 	seenRole, seenName := map[AccountRole]bool{}, map[string]bool{}

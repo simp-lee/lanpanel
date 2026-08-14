@@ -93,6 +93,12 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if err := verifyRootExecutable(profile.Executable); err != nil {
 		return Result{}, fmt.Errorf("external child executable: %w", err)
 	}
+	if profile.ExecutableDigest != "" {
+		digest, err := executableDigest(profile.Executable)
+		if err != nil || digest != profile.ExecutableDigest {
+			return Result{}, fmt.Errorf("external child executable digest mismatched")
+		}
+	}
 	instruction := bootstrapInstruction{SchemaVersion: bootstrapSchema, ProfileID: profileID, Identities: launcher.identities, Invocation: invocation, HasInput: len(input) != 0}
 	instructionBytes, err := json.Marshal(instruction)
 	if err != nil || len(instructionBytes) > maximumBootstrapBytes {
@@ -122,6 +128,18 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	}
 	if err := command.Start(); err != nil {
 		return Result{}, err
+	}
+	var legoGroup *invocationCgroup
+	if profileID == ProfileLego {
+		if invocation.Lego == nil {
+			return Result{}, fmt.Errorf("lego cgroup invocation missing")
+		}
+		legoGroup, err = createInvocationCgroup(invocation.Lego.CertificateID, command.Process.Pid)
+		if err != nil {
+			terminateErr := terminateProcessGroupBeforeReap(command.Process.Pid)
+			waitErr := command.Wait()
+			return Result{}, errors.Join(err, terminateErr, waitErr)
+		}
 	}
 	_ = instructionRead.Close()
 	_ = inputRead.Close()
@@ -156,6 +174,10 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	// Keep the leader unreaped while terminating and checking its process group.
 	// This prevents its numeric PID/PGID from being reused for an unrelated host
 	// process before the final group signal.
+	cgroupErr := legoGroup.KillAndRemove()
+	if cgroupErr != nil {
+		cgroupErr = &CgroupClosureError{Cause: cgroupErr}
+	}
 	groupErr := terminateProcessGroupBeforeReap(command.Process.Pid)
 	waitErr := command.Wait()
 	var writeErr error
@@ -177,8 +199,8 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 			result.PackageChanges = changes
 		}
 	}
-	if terminalErr != nil || waitErr != nil || writeErr != nil || groupErr != nil {
-		return result, errors.Join(terminalErr, waitErr, writeErr, groupErr, fmt.Errorf("external child failed with redacted exit status %d", result.ExitCode))
+	if terminalErr != nil || waitErr != nil || writeErr != nil || groupErr != nil || cgroupErr != nil {
+		return result, errors.Join(terminalErr, waitErr, writeErr, groupErr, cgroupErr, fmt.Errorf("external child failed with redacted exit status %d", result.ExitCode))
 	}
 	return result, nil
 }
@@ -241,11 +263,58 @@ func ExecuteBootstrap(args []string) error {
 	if err := applyProfile(profile, instruction.HasInput); err != nil {
 		return err
 	}
+	if instruction.ProfileID == ProfileLego {
+		environment, err := decodeEnvironmentFrame(os.Stdin, 64<<10)
+		if err != nil {
+			return err
+		}
+		if instruction.Invocation.Lego == nil || !slices.Equal(environment, instruction.Invocation.Lego.Environment) {
+			return fmt.Errorf("child environment differs from typed invocation")
+		}
+		profile.Environment = environment
+	}
 	argv := append([]string{profile.Executable}, profile.Arguments...)
 	return unix.Exec(profile.Executable, argv, profile.Environment)
 }
 
+func mountLegoInputs(profile Profile) error {
+	certificateID := filepath.Base(profile.Chroot)
+	if profile.Chroot != "/var/lib/lanpanel/certificates/chroot/"+certificateID {
+		return fmt.Errorf("ACME chroot identity invalid")
+	}
+	readonly := []string{"/usr/lib/lanpanel/dependencies/lego", "/etc/ssl/certs/ca-certificates.crt", "/etc/resolv.conf", "/etc/hosts"}
+	for _, source := range readonly {
+		target := filepath.Join(profile.Chroot, strings.TrimPrefix(source, "/"))
+		if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind ACME child input: %w", err)
+		}
+		if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
+			return fmt.Errorf("protect ACME child input: %w", err)
+		}
+	}
+	webroot := "/var/lib/lanpanel/certificates/webroot/" + certificateID
+	target := filepath.Join(profile.Chroot, strings.TrimPrefix(webroot, "/"))
+	if err := unix.Mount(webroot, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind ACME child webroot: %w", err)
+	}
+	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+		return fmt.Errorf("protect ACME child webroot: %w", err)
+	}
+	return nil
+}
+
 func applyProfile(profile Profile, hasInput bool) error {
+	if profile.ID == ProfileLego {
+		if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+			return fmt.Errorf("create ACME mount namespace: %w", err)
+		}
+		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+			return fmt.Errorf("make ACME mounts private: %w", err)
+		}
+		if err := mountLegoInputs(profile); err != nil {
+			return err
+		}
+	}
 	originalNetwork := ""
 	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets {
 		var err error
@@ -264,7 +333,7 @@ func applyProfile(profile Profile, hasInput bool) error {
 	if profile.Network != NetworkNone && profile.Network != NetworkNoSockets && profile.Network != NetworkUnixOnly && profile.Network != NetworkHostQualified && profile.Network != NetworkProviderOnly && profile.Network != NetworkLocalAPIOnly {
 		return fmt.Errorf("child network profile is unsupported")
 	}
-	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets || profile.Network == NetworkUnixOnly {
+	if profile.Network == NetworkNone || profile.Network == NetworkNoSockets || profile.Network == NetworkUnixOnly || len(profile.AllowedAddressFamilies) > 0 {
 		if err := installAddressFamilyFilter(profile.AllowedAddressFamilies); err != nil {
 			return err
 		}
@@ -330,7 +399,11 @@ func applyProfile(profile Profile, hasInput bool) error {
 			return fmt.Errorf("set child resource limit: %w", err)
 		}
 	}
-	unix.Umask(0o077)
+	mask := profile.Umask
+	if mask == 0 {
+		mask = 0o077
+	}
+	unix.Umask(int(mask))
 	if hasInput {
 		if err := unix.Dup2(4, 0); err != nil {
 			return fmt.Errorf("install child stdin: %w", err)
@@ -361,17 +434,17 @@ func addressFamilyFilter(allowed []int) ([]unix.SockFilter, error) {
 			{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)},
 		}, nil
 	}
-	if len(allowed) != 1 || allowed[0] != unix.AF_UNIX {
-		return nil, fmt.Errorf("no-network child address-family policy is invalid")
+	unixOnly := slices.Equal(allowed, []int{unix.AF_UNIX})
+	internetOnly := slices.Equal(allowed, []int{unix.AF_INET, unix.AF_INET6})
+	if !unixOnly && !internetOnly {
+		return nil, fmt.Errorf("child address-family policy is invalid")
 	}
-	return []unix.SockFilter{
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_SOCKET), Jt: 0, Jf: 3},
-		{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16},
-		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.AF_UNIX), Jt: 1, Jf: 0},
-		{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EAFNOSUPPORT)},
-		{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)},
-	}, nil
+	filter := []unix.SockFilter{{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}, {Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_SOCKET), Jf: uint8(len(allowed) + 2)}, {Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 16}}
+	for index, family := range allowed {
+		filter = append(filter, unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(family), Jt: uint8(len(allowed) - index)})
+	}
+	filter = append(filter, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EAFNOSUPPORT)}, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)})
+	return filter, nil
 }
 
 func installAddressFamilyFilter(allowed []int) error {
@@ -387,6 +460,32 @@ func installAddressFamilyFilter(allowed []int) error {
 		return fmt.Errorf("install no-network child address-family filter: %w", err)
 	}
 	return nil
+}
+
+func decodeEnvironmentFrame(reader io.Reader, maximum int) ([]string, error) {
+	payload, err := io.ReadAll(io.LimitReader(reader, int64(maximum+1)))
+	if err != nil || len(payload) > maximum {
+		return nil, fmt.Errorf("child environment frame invalid")
+	}
+	parts := bytes.Split(payload, []byte{0})
+	if len(parts) < 4 || string(parts[0]) != "lanpanel.acme.environment.v1" || len(parts[len(parts)-1]) != 0 {
+		return nil, fmt.Errorf("child environment frame invalid")
+	}
+	result := make([]string, len(parts)-2)
+	seen := map[string]bool{}
+	for index, raw := range parts[1 : len(parts)-1] {
+		value := string(raw)
+		key, _, found := strings.Cut(value, "=")
+		if !found || key == "" || seen[key] || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("child environment frame invalid")
+		}
+		seen[key] = true
+		result[index] = value
+	}
+	if result[0] != "LANG=C" || result[1] != "LC_ALL=C" {
+		return nil, fmt.Errorf("child environment locale invalid")
+	}
+	return result, nil
 }
 
 func writePipeFull(file *os.File, value []byte) error {
@@ -551,6 +650,18 @@ func assertAppliedIdentity(profile Profile) error {
 	return nil
 }
 
+func executableDigest(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
 func verifyRootExecutable(path string) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("executable path is not absolute and clean")

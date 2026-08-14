@@ -35,6 +35,7 @@ const (
 	CloseAll                Type = "close_all"
 	EmergencyCloseAll       Type = "emergency_close_all"
 	CertificateExpiry       Type = "certificate_expiry"
+	CertificateRenew        Type = "certificate_renew"
 	EdgeOneExpiry           Type = "edgeone_expiry"
 	Maintenance             Type = "maintenance"
 	PackageTransaction      Type = "package_transaction"
@@ -79,6 +80,8 @@ type SafetyBinding struct {
 	IntentGeneration     uint64    `json:"intent_generation,omitempty"`
 	CandidateDigest      string    `json:"candidate_digest,omitempty"`
 	CandidateBundle      string    `json:"candidate_bundle,omitempty"`
+	ChallengeMethod      string    `json:"challenge_method,omitempty"`
+	CertificateIdentity  string    `json:"certificate_identity,omitempty"`
 }
 type AdmissionSource string
 
@@ -98,23 +101,34 @@ type ConsumptionSnapshot struct {
 	ConfirmedAt        time.Time           `json:"confirmed_at"`
 	SafetyDigest       string              `json:"safety_digest"`
 }
+type CertificatePublicationHandoff struct {
+	PlanID                string `json:"plan_id"`
+	Generation            uint64 `json:"generation"`
+	SANIdentity           string `json:"san_identity"`
+	ACMEBinding           string `json:"acme_binding"`
+	CertificateID         string `json:"certificate_id"`
+	Fingerprint           string `json:"fingerprint"`
+	ChallengeSafetyDigest string `json:"challenge_safety_digest"`
+}
 type Reservation struct {
-	SchemaVersion       string               `json:"schema_version"`
-	JobID               string               `json:"job_id"`
-	PlanID              string               `json:"plan_id,omitempty"`
-	AdmissionSource     AdmissionSource      `json:"admission_source"`
-	Operation           Type                 `json:"operation"`
-	Target              string               `json:"target"`
-	Phase               Phase                `json:"phase"`
-	SafetyDigest        string               `json:"safety_digest"`
-	JournalSafetyDigest string               `json:"journal_safety_digest,omitempty"`
-	ContractionDigest   string               `json:"contraction_digest,omitempty"`
-	SecretFingerprint   string               `json:"secret_fingerprint,omitempty"`
-	SecretCommitted     bool                 `json:"secret_committed,omitempty"`
-	SafetyBinding       SafetyBinding        `json:"safety_binding"`
-	CreatedAt           time.Time            `json:"created_at"`
-	IntentGeneration    uint64               `json:"intent_generation,omitempty"`
-	Consumption         *ConsumptionSnapshot `json:"consumption,omitempty"`
+	SchemaVersion       string                         `json:"schema_version"`
+	JobID               string                         `json:"job_id"`
+	PlanID              string                         `json:"plan_id,omitempty"`
+	OperationBinding    string                         `json:"operation_binding,omitempty"`
+	CertificateHandoff  *CertificatePublicationHandoff `json:"certificate_handoff,omitempty"`
+	AdmissionSource     AdmissionSource                `json:"admission_source"`
+	Operation           Type                           `json:"operation"`
+	Target              string                         `json:"target"`
+	Phase               Phase                          `json:"phase"`
+	SafetyDigest        string                         `json:"safety_digest"`
+	JournalSafetyDigest string                         `json:"journal_safety_digest,omitempty"`
+	ContractionDigest   string                         `json:"contraction_digest,omitempty"`
+	SecretFingerprint   string                         `json:"secret_fingerprint,omitempty"`
+	SecretCommitted     bool                           `json:"secret_committed,omitempty"`
+	SafetyBinding       SafetyBinding                  `json:"safety_binding"`
+	CreatedAt           time.Time                      `json:"created_at"`
+	IntentGeneration    uint64                         `json:"intent_generation,omitempty"`
+	Consumption         *ConsumptionSnapshot           `json:"consumption,omitempty"`
 }
 
 type ContractionCommit struct {
@@ -182,27 +196,40 @@ const (
 	JournalPackageTransaction    JournalKind = "package_transaction"
 	JournalAppContraction        JournalKind = "app_contraction"
 	JournalAppActivation         JournalKind = "app_activation"
+	JournalCertificateActivation JournalKind = "certificate_activation"
 
 	JournalPrepared JournalPhase = "prepared"
 	JournalActive   JournalPhase = "active"
 	JournalTerminal JournalPhase = "terminal"
 )
 
+type CertificateJournalIdentity struct {
+	CertificateID        string `json:"certificate_id"`
+	PriorGeneration      uint64 `json:"prior_generation,omitempty"`
+	CandidateGeneration  uint64 `json:"candidate_generation"`
+	PriorPointer         string `json:"prior_pointer,omitempty"`
+	CandidatePointer     string `json:"candidate_pointer"`
+	PriorFingerprint     string `json:"prior_fingerprint,omitempty"`
+	CandidateFingerprint string `json:"candidate_fingerprint,omitempty"`
+	StageUID             uint32 `json:"stage_uid,omitempty"`
+	StageGID             uint32 `json:"stage_gid,omitempty"`
+}
 type JournalRecord struct {
-	SchemaVersion      string       `json:"schema_version"`
-	ID                 string       `json:"id"`
-	JobID              string       `json:"job_id"`
-	Kind               JournalKind  `json:"kind"`
-	Operation          Type         `json:"operation"`
-	InstallationID     string       `json:"installation_id"`
-	Target             string       `json:"target"`
-	Generation         uint64       `json:"generation"`
-	Deadline           time.Time    `json:"deadline"`
-	ArtifactDigest     string       `json:"artifact_digest"`
-	SafetyMarkerDigest string       `json:"safety_marker_digest"`
-	ResourceIDs        []string     `json:"resource_ids,omitempty"`
-	ChildIDs           []string     `json:"child_ids"`
-	Phase              JournalPhase `json:"phase"`
+	SchemaVersion      string                      `json:"schema_version"`
+	ID                 string                      `json:"id"`
+	JobID              string                      `json:"job_id"`
+	Kind               JournalKind                 `json:"kind"`
+	Operation          Type                        `json:"operation"`
+	InstallationID     string                      `json:"installation_id"`
+	Target             string                      `json:"target"`
+	Generation         uint64                      `json:"generation"`
+	Deadline           time.Time                   `json:"deadline"`
+	ArtifactDigest     string                      `json:"artifact_digest"`
+	SafetyMarkerDigest string                      `json:"safety_marker_digest"`
+	ResourceIDs        []string                    `json:"resource_ids,omitempty"`
+	ChildIDs           []string                    `json:"child_ids"`
+	Phase              JournalPhase                `json:"phase"`
+	Certificate        *CertificateJournalIdentity `json:"certificate,omitempty"`
 }
 
 type AdmitRequest struct {
@@ -648,7 +675,7 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 		if request.IntentGeneration != request.ExpectedRevision+1 {
 			return fmt.Errorf("phase intent generation must equal the fresh normal-state revision")
 		}
-		if string(reservation.Operation) != binding.Operation || reservation.Target != planTarget(binding.Target) {
+		if !planOperationMatches(reservation.Operation, binding.Operation) || reservation.Target != planTarget(binding.Target) {
 			return fmt.Errorf("Plan does not match the reserved operation target")
 		}
 		if _, err := plans.Consume(transaction, reservation.PlanID, reservation.JobID, binding, observedNow); err != nil {
@@ -861,8 +888,8 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 		if err != nil {
 			return err
 		}
-		if reservation.Phase != PhaseLocalIntent || reservation.AdmissionSource != AdmissionPlan {
-			return fmt.Errorf("remote wait requires a Plan-bound local phase intent")
+		if reservation.Phase != PhaseLocalIntent || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew)) {
+			return fmt.Errorf("remote wait requires Plan issuance or timer renewal authority")
 		}
 		reservation.Phase = PhaseRemoteWait
 		raw, err := persist.EncodeEntry(reservation)
@@ -922,25 +949,29 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 	if err != nil {
 		return fail(err)
 	}
-	if intent.Consumption == nil || currentDigest != intent.Consumption.SafetyDigest {
+	if intent.Consumption == nil || currentDigest != intent.Consumption.SafetyDigest && !exactCertificateChallenge(state, intent.SafetyBinding) && !exactCertificatePublicationAuthority(state, intent) {
 		return fail(fmt.Errorf("contraction or safety transition preempted remote operation"))
 	}
-	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil {
+	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil && !exactCertificatePublicationAuthority(state, intent) {
 		return fail(err)
 	}
-	binding, err := admitter.bindings.CurrentBinding(intent.Operation, intent.Target, observedNow)
-	if err != nil {
-		return fail(err)
-	}
-	if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
-		return fail(err)
-	}
-	if planTarget(binding.Target) != intent.Target || binding.ActorIdentity != record.ActorIdentity {
-		return fail(fmt.Errorf("operation target or actor binding changed during remote wait"))
-	}
-	snapshot := plans.Binding{Operation: string(intent.Operation), Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
-	if !plans.SameBindingIdentity(binding, snapshot) {
-		return fail(fmt.Errorf("Plan-derived binding changed during remote wait"))
+	if intent.AdmissionSource == AdmissionPlan {
+		binding, err := admitter.bindings.CurrentBinding(intent.Operation, intent.Target, observedNow)
+		if err != nil {
+			return fail(err)
+		}
+		if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
+			return fail(err)
+		}
+		if planTarget(binding.Target) != intent.Target || binding.ActorIdentity != record.ActorIdentity {
+			return fail(fmt.Errorf("operation target or actor binding changed during remote wait"))
+		}
+		snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
+		if !plans.SameBindingIdentity(binding, snapshot) {
+			return fail(fmt.Errorf("Plan-derived binding changed during remote wait"))
+		}
+	} else if intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew {
+		return fail(fmt.Errorf("remote wait admission source invalid"))
 	}
 	var result Reservation
 	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
@@ -1019,6 +1050,28 @@ func (admitter *Admitter) ReserveChild(ctx context.Context, admission *locks.Lea
 	})
 	return err
 }
+func (admitter *Admitter) BindOperationIdentity(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, binding string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(binding) {
+		return fmt.Errorf("operation identity binding requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseLocalIntent || intent.OperationBinding != "" {
+			return fmt.Errorf("operation identity already bound or wrong phase")
+		}
+		intent.OperationBinding = binding
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(jobID), raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) BindSecretFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, fingerprint string) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(fingerprint) {
 		return fmt.Errorf("secret fingerprint binding requires exact authority")
@@ -1101,6 +1154,250 @@ func FindPendingSecretIntent(document persist.Document, operation Type, target s
 		found = true
 	}
 	return result, found, nil
+}
+
+func certificateDeadlineAfter(candidate, prior string) bool {
+	candidateTime, candidateErr := time.Parse(time.RFC3339, candidate)
+	priorTime, priorErr := time.Parse(time.RFC3339, prior)
+	return candidateErr == nil && priorErr == nil && candidateTime.After(priorTime)
+}
+func (admitter *Admitter) CommitCertificateRenewal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, prior, candidate domain.CertificateBundleIdentity) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("certificate renewal commit requires operation locks")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != CertificateRenew || intent.Target != "resource/"+resourceID || intent.Phase != PhaseReentered {
+			return fmt.Errorf("certificate renewal intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != resourceID {
+				continue
+			}
+			if resource.PublicationRecord.State != domain.PublicationPublished || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate, prior) {
+				return fmt.Errorf("applied certificate changed before renewal commit")
+			}
+			if candidate.Generation != prior.Generation+1 || candidate.BindingIdentity != prior.BindingIdentity || candidate.SANIdentity != prior.SANIdentity || candidate.Authority == nil || prior.Authority == nil || !reflect.DeepEqual(candidate.Authority, prior.Authority) || !certificateDeadlineAfter(candidate.NotAfter, prior.NotAfter) {
+				return fmt.Errorf("renewed certificate identity invalid")
+			}
+			resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate = candidate
+			resource.PublicationRecord.LastJobID = jobID
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeHealthy, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: "certificate_renewed_and_served"}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("certificate renewal resource missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+func (admitter *Admitter) TerminalizeJournalLessCertificate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, closureIdentity string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(closureIdentity) {
+		return jobs.Record{}, fmt.Errorf("journal-less certificate recovery requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if (intent.Operation != Publish && intent.Operation != CertificateRenew) || intent.Phase != PhaseLocalIntent || intent.JournalSafetyDigest != "" || intent.SafetyBinding.CertificateIdentity == "" || intent.SafetyBinding.ChallengeMethod == "" {
+			return fmt.Errorf("journal-less certificate intent mismatched")
+		}
+		for _, key := range transaction.Keys("journals") {
+			raw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if err := decodeStrict(raw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID == jobID {
+				return fmt.Errorf("journal-less certificate unexpectedly has journal")
+			}
+		}
+		for _, key := range transaction.Keys("children") {
+			raw, _ := transaction.Get(key)
+			var child ChildRecord
+			if err := decodeStrict(raw, &child); err != nil {
+				return err
+			}
+			if child.JobID == jobID {
+				return fmt.Errorf("journal-less certificate unexpectedly has child")
+			}
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("journal-less certificate job mismatched")
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "certificate_child_never_started", Status: jobs.PostconditionKnown, Identity: closureIdentity}}, ErrorCode: "certificate_executor_interrupted"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
+func (admitter *Admitter) TerminalizeContractedCertificate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, pending safety.ChallengePending, closureIdentity string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(closureIdentity) {
+		return jobs.Record{}, fmt.Errorf("certificate reconciliation requires exact closure authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		identityMatches := (intent.Operation == Publish || intent.Operation == CertificateRenew) && intent.Target == "resource/"+intent.SafetyBinding.ResourceID && intent.SafetyBinding.PlanID == pending.PlanID && intent.SafetyBinding.IntentGeneration == pending.Generation && intent.SafetyBinding.CandidateDigest == pending.SANIdentity && intent.SafetyBinding.CandidateBundle == pending.ACMEBinding
+		if !identityMatches {
+			return fmt.Errorf("certificate reconciliation intent mismatched")
+		}
+		if intent.Phase == PhaseTerminal {
+			record, err := jobs.Load(transaction, jobID)
+			if err != nil || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultInterrupted {
+				return fmt.Errorf("certificate reconciliation terminal result mismatched")
+			}
+			for _, key := range transaction.Keys("journals") {
+				raw, _ := transaction.Get(key)
+				var journal JournalRecord
+				if decodeStrict(raw, &journal) != nil {
+					return fmt.Errorf("certificate reconciliation journal invalid")
+				}
+				if journal.JobID == jobID && (journal.Kind != JournalCertificateActivation || journal.Phase != JournalTerminal) {
+					return fmt.Errorf("certificate reconciliation terminal journal mismatched")
+				}
+			}
+			for _, key := range transaction.Keys("children") {
+				raw, _ := transaction.Get(key)
+				var child ChildRecord
+				if decodeStrict(raw, &child) != nil {
+					return fmt.Errorf("certificate reconciliation child invalid")
+				}
+				if child.JobID == jobID && child.State != ChildTerminal {
+					return fmt.Errorf("certificate reconciliation child nonterminal")
+				}
+			}
+			completed = record
+			return nil
+		}
+		if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered {
+			return fmt.Errorf("certificate reconciliation phase mismatched")
+		}
+		for _, key := range transaction.Keys("children") {
+			raw, _ := transaction.Get(key)
+			var child ChildRecord
+			if err := decodeStrict(raw, &child); err != nil {
+				return err
+			}
+			if child.JobID != jobID || child.State == ChildTerminal {
+				continue
+			}
+			child.State = ChildTerminal
+			child.Outcome = ChildUnknown
+			child.TerminalAt = &observed
+			child.ResultDigest = closureIdentity
+			encoded, err := persist.EncodeEntry(child)
+			if err != nil {
+				return err
+			}
+			if err := transaction.Replace(key, encoded); err != nil {
+				return err
+			}
+		}
+		journalFound := false
+		for _, key := range transaction.Keys("journals") {
+			raw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if err := decodeStrict(raw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID != jobID {
+				continue
+			}
+			if journal.Kind != JournalCertificateActivation {
+				return fmt.Errorf("certificate reconciliation journal kind mismatched")
+			}
+			if journal.Phase != JournalTerminal {
+				journal.Phase = JournalTerminal
+				encoded, encodeErr := persist.EncodeEntry(journal)
+				if encodeErr != nil {
+					return encodeErr
+				}
+				if err := transaction.Replace(key, encoded); err != nil {
+					return err
+				}
+			}
+			journalFound = true
+		}
+		if !journalFound {
+			return fmt.Errorf("certificate reconciliation journal missing")
+		}
+		intent.Phase = PhaseTerminal
+		encodedIntent, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), encodedIntent); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "certificate_provider_result", Status: jobs.PostconditionUnobserved, Identity: closureIdentity}}, ErrorCode: "certificate_executor_interrupted"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+func (admitter *Admitter) OperationIntent(jobID string) (Reservation, error) {
+	if admitter == nil {
+		return Reservation{}, fmt.Errorf("operation admitter missing")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil {
+		return Reservation{}, err
+	}
+	return loadReservationEntries(document.Entries, jobID)
 }
 
 func (admitter *Admitter) TransitionChild(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, child ChildRecord) error {
@@ -1386,6 +1683,113 @@ func linkedWorkTerminal(transaction *persist.Transaction, jobID string) (bool, e
 // while leaving the job running. Runtime closure happens only after this
 // durable boundary, so restart/reconciliation cannot infer or reopen prior
 // ingress from normal state.
+func (admitter *Admitter) CommitCertificatePublicationBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit PublicationBeginCommit, journal JournalRecord) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.ResourceID == "" {
+		return fmt.Errorf("certificate publication handoff requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseReentered || intent.CertificateHandoff != nil || intent.OperationBinding == "" || intent.SafetyBinding.ResourceID != commit.ResourceID || mutation.Target() != intent.Target || commit.Intent.JobID != jobID || commit.Intent.PlanID != intent.PlanID || commit.Intent.Generation != intent.SafetyBinding.IntentGeneration || commit.Intent.Candidate.Generation != commit.Intent.Generation || commit.Intent.Candidate.ConfigDigest != intent.Consumption.Config.Digest {
+			return fmt.Errorf("certificate publication handoff intent mismatched")
+		}
+		bundle := commit.Intent.Candidate
+		if bundle.DomainHTTPS == nil || bundle.DomainHTTPS.Certificate.Authority == nil || bundle.DomainHTTPS.Certificate.Authority.CertificateID == "" || bundle.DomainHTTPS.Certificate.BindingIdentity != intent.SafetyBinding.CandidateBundle || bundle.DomainHTTPS.Certificate.SANIdentity != intent.SafetyBinding.CandidateDigest {
+			return fmt.Errorf("certificate publication candidate mismatched challenge")
+		}
+		bundleDigest, err := publication.BundleDigest(bundle)
+		if err != nil {
+			return err
+		}
+		if journal.ID != "activation-"+jobID || journal.JobID != jobID || journal.Kind != JournalAppActivation || journal.Operation != Publish || journal.InstallationID == "" || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.ArtifactDigest != bundleDigest || journal.SafetyMarkerDigest != "" || len(journal.ResourceIDs) != 1 || journal.ResourceIDs[0] != commit.ResourceID || len(journal.ChildIDs) != 0 || journal.Phase != JournalPrepared {
+			return fmt.Errorf("certificate publication journal invalid")
+		}
+		certificateKey := ""
+		var certificateJournal JournalRecord
+		for _, key := range transaction.Keys("journals") {
+			raw, _ := transaction.Get(key)
+			var current JournalRecord
+			if err := decodeStrict(raw, &current); err != nil {
+				return err
+			}
+			if current.JobID == jobID && current.Kind == JournalCertificateActivation {
+				if certificateKey != "" {
+					return fmt.Errorf("certificate publication has multiple certificate journals")
+				}
+				certificateKey = key
+				certificateJournal = current
+			}
+		}
+		certificate := certificateJournal.Certificate
+		if certificateKey == "" || certificateJournal.Phase != JournalActive || certificate == nil || certificate.CertificateID != bundle.DomainHTTPS.Certificate.Authority.CertificateID || certificate.CandidateFingerprint != bundle.DomainHTTPS.Certificate.Fingerprint {
+			return fmt.Errorf("certificate publication staged identity missing")
+		}
+		original := intent.SafetyBinding
+		intent.CertificateHandoff = &CertificatePublicationHandoff{PlanID: original.PlanID, Generation: original.IntentGeneration, SANIdentity: original.CandidateDigest, ACMEBinding: original.CandidateBundle, CertificateID: certificate.CertificateID, Fingerprint: certificate.CandidateFingerprint, ChallengeSafetyDigest: intent.JournalSafetyDigest}
+		intent.SafetyBinding.CandidateDigest = bundle.ConfigDigest
+		intent.SafetyBinding.CandidateBundle = bundleDigest
+		nextSafetyDigest, err := safetyBindingDigest(intent.SafetyBinding)
+		if err != nil {
+			return err
+		}
+		intent.JournalSafetyDigest = nextSafetyDigest
+		journal.SafetyMarkerDigest = nextSafetyDigest
+		intent.Phase = PhaseLocalIntent
+		encodedIntent, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), encodedIntent); err != nil {
+			return err
+		}
+		certificateJournal.Phase = JournalTerminal
+		encodedCertificate, err := persist.EncodeEntry(certificateJournal)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(certificateKey, encodedCertificate); err != nil {
+			return err
+		}
+		encodedJournal, err := persist.EncodeEntry(journal)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Create("journals/"+journal.ID, encodedJournal); err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != commit.ResourceID {
+				continue
+			}
+			if resource.PublicationRecord.State != commit.Intent.PriorState || resource.PublicationRecord.ActivationIntent != nil || bundle.ConfigDigest != resource.CurrentConfigDigest {
+				return fmt.Errorf("certificate publication prior or candidate changed")
+			}
+			resource.PublicationRecord.State = domain.PublicationActivating
+			resource.PublicationRecord.ActivationIntent = &commit.Intent
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: intent.Consumption.ConfirmedAt.UTC().Format(time.RFC3339), Reason: "activating_may_be_live"}
+			resource.PublicationRecord.LastJobID = jobID
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("certificate publication resource disappeared")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitPublicationBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit PublicationBeginCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.ResourceID == "" {
 		return fmt.Errorf("publication begin requires exact authority")
@@ -2017,7 +2421,7 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 		if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
 			return jobs.Record{}, err
 		}
-		snapshot := plans.Binding{Operation: string(intentView.Operation), Target: binding.Target, ActorIdentity: recordView.ActorIdentity, Config: intentView.Consumption.Config, Applied: intentView.Consumption.Applied, Evidence: intentView.Consumption.Evidence}
+		snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: recordView.ActorIdentity, Config: intentView.Consumption.Config, Applied: intentView.Consumption.Applied, Evidence: intentView.Consumption.Evidence}
 		if planTarget(binding.Target) != intentView.Target || !plans.SameBindingIdentity(binding, snapshot) {
 			return jobs.Record{}, fmt.Errorf("Plan-derived binding changed before terminal commit")
 		}
@@ -2234,6 +2638,36 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 	return completed, err
 }
 
+func exactCertificatePublicationAuthority(state safety.State, intent Reservation) bool {
+	handoff := intent.CertificateHandoff
+	if handoff == nil || state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported || state.GlobalClose.Phase != safety.GlobalCloseNone {
+		return false
+	}
+	for _, resource := range state.Resources {
+		if resource.ResourceID != intent.SafetyBinding.ResourceID {
+			continue
+		}
+		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan {
+			return false
+		}
+		if pending := resource.ChallengePending; pending != nil && pending.PlanID == handoff.PlanID && pending.Generation == handoff.Generation && pending.SANIdentity == handoff.SANIdentity && pending.ACMEBinding == handoff.ACMEBinding && pending.CertificateIdentity == handoff.CertificateID {
+			return true
+		}
+		if active := resource.Reactivating; active != nil && active.PlanID == handoff.PlanID && active.Generation == handoff.Generation && active.CandidateDigest == intent.SafetyBinding.CandidateDigest && active.CandidateBundle == intent.SafetyBinding.CandidateBundle {
+			return true
+		}
+	}
+	return false
+}
+func exactCertificateChallenge(state safety.State, binding SafetyBinding) bool {
+	for _, resource := range state.Resources {
+		pending := resource.ChallengePending
+		if resource.ResourceID == binding.ResourceID && pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle {
+			return true
+		}
+	}
+	return false
+}
 func (admitter *Admitter) validateFreshAuthority(document persist.Document, intent Reservation) error {
 	if intent.Consumption == nil {
 		return fmt.Errorf("operation has no consumed immutable authority")
@@ -2251,9 +2685,13 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 		return err
 	}
 	if !isContraction(intent.Operation) && currentDigest != intent.Consumption.SafetyDigest {
-		return fmt.Errorf("contraction or safety transition preempted operation authority")
+		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew) && exactCertificateChallenge(state, intent.SafetyBinding)
+		certificateHandoff := intent.Operation == Publish && exactCertificatePublicationAuthority(state, intent)
+		if !ownedChallenge && !certificateHandoff {
+			return fmt.Errorf("contraction or safety transition preempted operation authority")
+		}
 	}
-	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil {
+	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil && !exactCertificatePublicationAuthority(state, intent) {
 		return err
 	}
 	if intent.AdmissionSource != AdmissionPlan {
@@ -2270,7 +2708,7 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 	if err := plans.ValidateBindingFreshness(binding, observedNow); err != nil {
 		return err
 	}
-	snapshot := plans.Binding{Operation: string(intent.Operation), Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
+	snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
 	if planTarget(binding.Target) != intent.Target || !plans.SameBindingIdentity(binding, snapshot) {
 		return fmt.Errorf("Plan-derived binding changed after intent commit")
 	}
@@ -2283,7 +2721,8 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	contraction := isContraction(operation)
 	if operation == CertificateExpiry || operation == EdgeOneExpiry {
-		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
+		valid := validExpiryBinding(operation, state, binding) || !consuming && validExpiryProposal(operation, state, binding, now)
+		if !valid || binding.Deadline.IsZero() || binding.Deadline.After(now) {
 			return fmt.Errorf("expiry contraction authority binding is stale, absent, or not due")
 		}
 	}
@@ -2326,6 +2765,20 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 			return fmt.Errorf("resource lifecycle or expansion authority blocks process operation")
 		}
 	}
+	if operation == CertificateRenew {
+		var resource *safety.ResourceSafety
+		for index := range state.Resources {
+			if state.Resources[index].ResourceID == binding.ResourceID {
+				resource = &state.Resources[index]
+			}
+		}
+		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil {
+			return fmt.Errorf("certificate safety resource unavailable")
+		}
+		if operation == CertificateRenew && (state.GlobalClose.Phase != safety.GlobalCloseNone || resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.EdgeOne.Expiry != nil || resource.ChallengePending != nil || resource.Reactivating != nil) {
+			return fmt.Errorf("certificate renewal blocked by safety marker")
+		}
+	}
 	if operation == Publish {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone {
 			return fmt.Errorf("global close blocks expansion admission")
@@ -2340,7 +2793,9 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if resource == nil {
 			return fmt.Errorf("publish safety resource binding is missing")
 		}
-		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan || resource.ChallengePending != nil {
+		ownedChallenge := exactCertificateChallenge(state, binding)
+		challengeStart := consuming && binding.CertificateIdentity != "" && (binding.ChallengeMethod == "http-01" || binding.ChallengeMethod == "dns-01")
+		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan || resource.ChallengePending != nil && !ownedChallenge || ownedChallenge && resource.ChallengePending.Method == "http-01" && resource.EdgeOne.Expiry != nil || challengeStart && binding.ChallengeMethod == "http-01" && resource.EdgeOne.Expiry != nil {
 			return fmt.Errorf("resource lifecycle or challenge authority blocks publish")
 		}
 		if !resource.EdgeOne.Deadline.IsZero() && resource.EdgeOne.Deadline.Sub(now) < 5*time.Minute {
@@ -2349,7 +2804,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if resource.Reactivating != nil && !resource.Reactivating.TemporaryHTTP && (resource.Reactivating.CertificateUntil.Sub(now) < 5*time.Minute || resource.Reactivating.ACLUntil.Sub(now) < 5*time.Minute) {
 			return fmt.Errorf("reactivation safety deadline is too near")
 		}
-		if !consuming {
+		if !consuming || ownedChallenge || challengeStart {
 			return nil
 		}
 		action := safety.ActionPublish
@@ -2394,6 +2849,7 @@ func contractionGeneration(reservation Reservation) uint64 {
 	return reservation.SafetyBinding.IntentGeneration
 }
 
+func planOperationMatches(operation Type, binding string) bool { return binding == string(operation) }
 func requirePreflightEvidence(operation Type, target string, evidence []plans.Evidence, now time.Time) error {
 	switch operation {
 	case Publish:
@@ -2454,13 +2910,39 @@ func validStartupBinding(state safety.State, binding SafetyBinding) bool {
 	return false
 }
 
+func validExpiryProposal(operation Type, state safety.State, binding SafetyBinding, now time.Time) bool {
+	for _, resource := range state.Resources {
+		if resource.ResourceID != binding.ResourceID {
+			continue
+		}
+		expectedKind := "certificate_expiry"
+		if operation == EdgeOneExpiry {
+			expectedKind = "edgeone_expiry"
+		}
+		if binding.ExpiryKind != expectedKind || binding.ExpiryGeneration != resource.GenerationSequence+1 {
+			return false
+		}
+		if operation == CertificateExpiry {
+			if resource.CertificateExpiry != nil || resource.ActiveCertificate == nil || binding.CandidateBundle != resource.ActiveCertificate.Binding {
+				return false
+			}
+			deadline := resource.ActiveCertificate.NotAfter
+			if now.Before(resource.ActiveCertificate.LastTrustedWall) {
+				deadline = now
+			}
+			return binding.Deadline.Equal(deadline)
+		}
+		return resource.EdgeOne.Expiry == nil
+	}
+	return false
+}
 func validExpiryBinding(operation Type, state safety.State, binding SafetyBinding) bool {
 	for _, resource := range state.Resources {
 		if resource.ResourceID != binding.ResourceID {
 			continue
 		}
 		if operation == CertificateExpiry && binding.ExpiryKind == "certificate_expiry" && resource.CertificateExpiry != nil {
-			return resource.CertificateExpiry.Generation == binding.ExpiryGeneration && resource.CertificateExpiry.Deadline.Equal(binding.Deadline)
+			return resource.CertificateExpiry.Generation == binding.ExpiryGeneration && resource.CertificateExpiry.Deadline.Equal(binding.Deadline) && resource.CertificateExpiry.Binding == binding.CandidateBundle
 		}
 		if operation == EdgeOneExpiry && binding.ExpiryKind == "edgeone_expiry" && resource.EdgeOne.Expiry != nil {
 			return resource.EdgeOne.Expiry.Generation == binding.ExpiryGeneration && resource.EdgeOne.Expiry.Deadline.Equal(binding.Deadline)
@@ -2578,6 +3060,26 @@ func validateIntentEntry(key string, raw json.RawMessage) error {
 	}
 	return nil
 }
+func validCertificateHandoffTransition(oldValue, newValue Reservation) bool {
+	handoff := newValue.CertificateHandoff
+	if oldValue.Operation != Publish || oldValue.Phase != PhaseReentered || newValue.Phase != PhaseLocalIntent || oldValue.CertificateHandoff != nil || handoff == nil || handoff.PlanID != oldValue.SafetyBinding.PlanID || handoff.Generation != oldValue.SafetyBinding.IntentGeneration || handoff.SANIdentity != oldValue.SafetyBinding.CandidateDigest || handoff.ACMEBinding != oldValue.SafetyBinding.CandidateBundle || handoff.ACMEBinding != oldValue.OperationBinding || handoff.ChallengeSafetyDigest != oldValue.JournalSafetyDigest || !exactDigest(handoff.ChallengeSafetyDigest) || !exactDigest(handoff.SANIdentity) || !exactDigest(handoff.ACMEBinding) || !validIdentityRef(handoff.CertificateID) || !exactDigest(handoff.Fingerprint) || !exactDigest(newValue.SafetyBinding.CandidateDigest) || !exactDigest(newValue.SafetyBinding.CandidateBundle) {
+		return false
+	}
+	candidateDigest, candidateBundle := newValue.SafetyBinding.CandidateDigest, newValue.SafetyBinding.CandidateBundle
+	expectedSafetyDigest, err := safetyBindingDigest(newValue.SafetyBinding)
+	if err != nil || newValue.JournalSafetyDigest != expectedSafetyDigest {
+		return false
+	}
+	newValue.Phase = oldValue.Phase
+	newValue.CertificateHandoff = nil
+	newValue.SafetyBinding.CandidateDigest = oldValue.SafetyBinding.CandidateDigest
+	newValue.SafetyBinding.CandidateBundle = oldValue.SafetyBinding.CandidateBundle
+	newValue.JournalSafetyDigest = oldValue.JournalSafetyDigest
+	if candidateDigest == oldValue.SafetyBinding.CandidateDigest || candidateBundle == oldValue.SafetyBinding.CandidateBundle {
+		return false
+	}
+	return reflect.DeepEqual(oldValue, newValue)
+}
 func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		value, err := decodeReservation(after)
@@ -2603,6 +3105,9 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	if validCertificateHandoffTransition(oldValue, newValue) {
+		return nil
+	}
 	oldPhase, newPhase := oldValue.Phase, newValue.Phase
 	oldValue.Phase = ""
 	newValue.Phase = ""
@@ -2612,6 +3117,7 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	oldContractionDigest, newContractionDigest := oldValue.ContractionDigest, newValue.ContractionDigest
 	oldSecretFingerprint, newSecretFingerprint := oldValue.SecretFingerprint, newValue.SecretFingerprint
 	oldSecretCommitted, newSecretCommitted := oldValue.SecretCommitted, newValue.SecretCommitted
+	oldOperationBinding, newOperationBinding := oldValue.OperationBinding, newValue.OperationBinding
 	oldValue.IntentGeneration = 0
 	newValue.IntentGeneration = 0
 	oldValue.Consumption = nil
@@ -2624,14 +3130,17 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	newValue.SecretFingerprint = ""
 	oldValue.SecretCommitted = false
 	newValue.SecretCommitted = false
+	oldValue.OperationBinding = ""
+	newValue.OperationBinding = ""
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("immutable operation intent binding was rewritten")
 	}
-	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != "" && oldContractionDigest == newContractionDigest && oldSecretFingerprint == newSecretFingerprint
-	contractionBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldContractionDigest == "" && exactDigest(newContractionDigest) && oldJournalSafety == newJournalSafety && oldSecretFingerprint == newSecretFingerprint
-	secretBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == "" && exactDigest(newSecretFingerprint) && !oldSecretCommitted && !newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest
-	secretCommitOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == newSecretFingerprint && exactDigest(newSecretFingerprint) && !oldSecretCommitted && newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest
-	valid := journalBindingOnly || contractionBindingOnly || secretBindingOnly || secretCommitOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
+	journalBindingOnly := oldPhase == newPhase && oldJournalSafety == "" && newJournalSafety != "" && oldContractionDigest == newContractionDigest && oldSecretFingerprint == newSecretFingerprint && oldOperationBinding == newOperationBinding
+	contractionBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldContractionDigest == "" && exactDigest(newContractionDigest) && oldJournalSafety == newJournalSafety && oldSecretFingerprint == newSecretFingerprint && oldOperationBinding == newOperationBinding
+	secretBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == "" && exactDigest(newSecretFingerprint) && !oldSecretCommitted && !newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest && oldOperationBinding == newOperationBinding
+	secretCommitOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldSecretFingerprint == newSecretFingerprint && exactDigest(newSecretFingerprint) && !oldSecretCommitted && newSecretCommitted && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest && oldOperationBinding == newOperationBinding
+	operationBindingOnly := oldPhase == PhaseLocalIntent && newPhase == oldPhase && oldOperationBinding == "" && exactDigest(newOperationBinding) && oldJournalSafety == newJournalSafety && oldContractionDigest == newContractionDigest && oldSecretFingerprint == newSecretFingerprint
+	valid := journalBindingOnly || contractionBindingOnly || secretBindingOnly || secretCommitOnly || operationBindingOnly || oldPhase == PhaseReserved && (newPhase == PhaseLocalIntent || newPhase == PhaseRejected) || oldPhase == PhaseLocalIntent && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal) || oldPhase == PhaseRemoteWait && (newPhase == PhaseReentered || newPhase == PhaseTerminal) || oldPhase == PhaseReentered && (newPhase == PhaseRemoteWait || newPhase == PhaseTerminal)
 	if !valid {
 		return fmt.Errorf("operation intent phase transition is invalid")
 	}
@@ -2747,6 +3256,33 @@ func validateJournalEntry(key string, raw json.RawMessage) error {
 	return validateJournalRecord(value)
 }
 
+func validateCertificateJournalIdentity(value JournalRecord) error {
+	identity := value.Certificate
+	if identity == nil || !validIdentityRef(identity.CertificateID) || identity.CandidateGeneration == 0 || identity.StageUID == 0 || identity.StageGID == 0 {
+		return fmt.Errorf("certificate journal pointer identity missing")
+	}
+	candidate := fmt.Sprintf("/var/lib/lanpanel/certificates/bundles/%s-%020d", identity.CertificateID, identity.CandidateGeneration)
+	if identity.CandidatePointer != candidate {
+		return fmt.Errorf("certificate journal candidate pointer invalid")
+	}
+	if identity.PriorGeneration == 0 {
+		if identity.PriorPointer != "" || identity.PriorFingerprint != "" {
+			return fmt.Errorf("certificate journal unexpected prior identity")
+		}
+	} else {
+		prior := fmt.Sprintf("/var/lib/lanpanel/certificates/bundles/%s-%020d", identity.CertificateID, identity.PriorGeneration)
+		if identity.PriorPointer != prior || !exactDigest(identity.PriorFingerprint) || identity.CandidateGeneration != identity.PriorGeneration+1 {
+			return fmt.Errorf("certificate journal prior identity invalid")
+		}
+	}
+	if identity.CandidateFingerprint != "" && !exactDigest(identity.CandidateFingerprint) {
+		return fmt.Errorf("certificate journal candidate fingerprint invalid")
+	}
+	if value.Phase == JournalActive && identity.CandidateFingerprint == "" {
+		return fmt.Errorf("active certificate journal lacks candidate fingerprint")
+	}
+	return nil
+}
 func validateJournalRecord(value JournalRecord) error {
 	if value.SchemaVersion != "lanpanel.journal.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.InstallationID) || !validIdentityRef(value.Target) || value.Generation == 0 || value.Deadline.IsZero() || !exactDigest(value.ArtifactDigest) || !exactDigest(value.SafetyMarkerDigest) || (value.Phase != JournalPrepared && value.Phase != JournalActive && value.Phase != JournalTerminal) {
 		return fmt.Errorf("operation journal identity is invalid")
@@ -2758,6 +3294,15 @@ func validateJournalRecord(value JournalRecord) error {
 	} else if value.Kind == JournalPackageTransaction {
 		if value.Operation != PackageTransaction || value.Target != string(plans.TargetInstallation) || len(value.ResourceIDs) != 0 {
 			return fmt.Errorf("package journal operation or target is invalid")
+		}
+	} else if value.Kind == JournalCertificateActivation {
+		if err := validateCertificateJournalIdentity(value); err != nil {
+			return err
+		}
+		exactResource := len(value.ResourceIDs) == 1 && value.Target == "resource/"+value.ResourceIDs[0]
+		exactHeadscale := len(value.ResourceIDs) == 0 && value.Target == "headscale"
+		if value.Operation != Publish && value.Operation != CertificateRenew || !exactResource && !exactHeadscale {
+			return fmt.Errorf("certificate activation journal identity is invalid")
 		}
 	} else if value.Kind == JournalAppActivation {
 		if value.Operation != Publish || len(value.ResourceIDs) != 1 || value.Target != "resource/"+value.ResourceIDs[0] {
@@ -2771,6 +3316,9 @@ func validateJournalRecord(value JournalRecord) error {
 		}
 	} else {
 		return fmt.Errorf("operation journal kind is not allowed")
+	}
+	if value.Kind != JournalCertificateActivation && value.Certificate != nil {
+		return fmt.Errorf("non-certificate journal carried certificate identity")
 	}
 	if len(value.ResourceIDs) > maximumJournalResources || !sort.StringsAreSorted(value.ResourceIDs) {
 		return fmt.Errorf("journal affected-resource inventory is unbounded or noncanonical")
@@ -2786,7 +3334,7 @@ func validateJournalRecord(value JournalRecord) error {
 		if !exactApp && !exactCloseAll {
 			return fmt.Errorf("App contraction journal does not exactly identify its affected resources")
 		}
-	} else if value.Kind != JournalAppActivation && len(value.ResourceIDs) != 0 {
+	} else if value.Kind != JournalAppActivation && value.Kind != JournalCertificateActivation && len(value.ResourceIDs) != 0 {
 		return fmt.Errorf("non-ingress journal unexpectedly identifies App resources")
 	}
 	if value.Kind != JournalAppActivation && len(value.ChildIDs) == 0 || len(value.ChildIDs) > maximumChildrenPerJob {
@@ -2824,10 +3372,33 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 		return err
 	}
 	oldPhase, newPhase := oldValue.Phase, newValue.Phase
+	oldCandidateFingerprint, newCandidateFingerprint := "", ""
+	var oldUID, oldGID, newUID, newGID uint32
+	if oldValue.Certificate != nil {
+		oldCandidateFingerprint = oldValue.Certificate.CandidateFingerprint
+		oldUID = oldValue.Certificate.StageUID
+		oldGID = oldValue.Certificate.StageGID
+		oldValue.Certificate.CandidateFingerprint = ""
+		oldValue.Certificate.StageUID = 0
+		oldValue.Certificate.StageGID = 0
+	}
+	if newValue.Certificate != nil {
+		newCandidateFingerprint = newValue.Certificate.CandidateFingerprint
+		newUID = newValue.Certificate.StageUID
+		newGID = newValue.Certificate.StageGID
+		newValue.Certificate.CandidateFingerprint = ""
+		newValue.Certificate.StageUID = 0
+		newValue.Certificate.StageGID = 0
+	}
 	oldValue.Phase = ""
 	newValue.Phase = ""
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("journal identity was rewritten")
+	}
+	filledCandidate := oldCandidateFingerprint == "" && exactDigest(newCandidateFingerprint) && oldUID == newUID && oldGID == newGID && oldUID != 0 && oldPhase == JournalPrepared && newPhase == JournalActive
+	sameCandidate := oldCandidateFingerprint == newCandidateFingerprint && oldUID == newUID && oldGID == newGID
+	if !filledCandidate && !sameCandidate {
+		return fmt.Errorf("journal candidate fingerprint was rewritten")
 	}
 	if oldPhase == JournalTerminal || oldPhase == JournalPrepared && newPhase != JournalActive && newPhase != JournalTerminal || oldPhase == JournalActive && newPhase != JournalTerminal {
 		return fmt.Errorf("journal transition is invalid")
@@ -2937,7 +3508,10 @@ func validateLinks(document persist.Document) error {
 	for jobID := range childrenByJob {
 		sort.Strings(childrenByJob[jobID])
 	}
-	journalByJob := map[string]string{}
+	journalByJob := map[string]bool{}
+	journalsByJob := map[string][]JournalRecord{}
+	certificateUID := map[uint32]string{}
+	certificateGID := map[uint32]string{}
 	for _, key := range journalKeys {
 		var journal JournalRecord
 		if err := decodeStrict(document.Entries[key], &journal); err != nil {
@@ -2946,19 +3520,42 @@ func validateLinks(document persist.Document) error {
 		if err := validateJournalRecord(journal); err != nil {
 			return err
 		}
+		if certificate := journal.Certificate; certificate != nil {
+			if prior := certificateUID[certificate.StageUID]; prior != "" && prior != certificate.CertificateID {
+				return fmt.Errorf("certificate journal stage UID collision")
+			}
+			if prior := certificateGID[certificate.StageGID]; prior != "" && prior != certificate.CertificateID {
+				return fmt.Errorf("certificate journal stage GID collision")
+			}
+			certificateUID[certificate.StageUID] = certificate.CertificateID
+			certificateGID[certificate.StageGID] = certificate.CertificateID
+		}
 		intent, ok := intents[journal.JobID]
 		if !ok {
 			return fmt.Errorf("journal has no matching operation intent")
 		}
-		if _, duplicate := journalByJob[journal.JobID]; duplicate {
-			return fmt.Errorf("operation intent has more than one journal authority")
+		priorJournals := journalsByJob[journal.JobID]
+		if len(priorJournals) > 0 {
+			prior := priorJournals[0]
+			validPair := len(priorJournals) == 1 && intent.CertificateHandoff != nil && ((prior.Kind == JournalAppActivation && (prior.Phase == JournalPrepared || prior.Phase == JournalTerminal) && journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal) || (journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalTerminal) && prior.Kind == JournalCertificateActivation && prior.Phase == JournalTerminal))
+			if !validPair {
+				return fmt.Errorf("operation intent has incompatible journal authorities")
+			}
 		}
-		journalByJob[journal.JobID] = journal.ID
-		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.SafetyMarkerDigest != intent.JournalSafetyDigest || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) {
+		journalsByJob[journal.JobID] = append(priorJournals, journal)
+		journalByJob[journal.JobID] = true
+		pendingCertificateReservation := journal.Kind == JournalCertificateActivation && journal.Phase == JournalPrepared && len(childrenByJob[journal.JobID]) < len(journal.ChildIDs) && slices.Equal(childrenByJob[journal.JobID], journal.ChildIDs[:len(childrenByJob[journal.JobID])])
+		terminalNeverSubmitted := journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal && intent.Phase == PhaseTerminal && len(childrenByJob[journal.JobID]) < len(journal.ChildIDs) && slices.Equal(childrenByJob[journal.JobID], journal.ChildIDs[:len(childrenByJob[journal.JobID])])
+		handoffAppJournal := intent.CertificateHandoff != nil && journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalTerminal) && len(journal.ChildIDs) == 0
+		handoffCertificateJournal := intent.CertificateHandoff != nil && journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal && journal.SafetyMarkerDigest == intent.CertificateHandoff.ChallengeSafetyDigest
+		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.SafetyMarkerDigest != intent.JournalSafetyDigest && !handoffCertificateJournal || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) && !pendingCertificateReservation && !terminalNeverSubmitted && !handoffAppJournal {
 			return fmt.Errorf("journal installation, operation, target, generation, or child inventory does not match its authorities")
 		}
 		for _, childID := range journal.ChildIDs {
-			child := children[childID]
+			child, present := children[childID]
+			if !present && (pendingCertificateReservation || terminalNeverSubmitted) {
+				continue
+			}
 			if child.ArtifactDigest != journal.ArtifactDigest || !child.Deadline.Equal(journal.Deadline) {
 				return fmt.Errorf("journal artifact or deadline does not match exact child %q", childID)
 			}
@@ -2968,7 +3565,7 @@ func validateLinks(document persist.Document) error {
 		}
 	}
 	for jobID, intent := range intents {
-		if intent.JournalSafetyDigest != "" && journalByJob[jobID] == "" {
+		if intent.JournalSafetyDigest != "" && !journalByJob[jobID] {
 			return fmt.Errorf("operation intent binds missing journal authority")
 		}
 	}
@@ -3064,13 +3661,13 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		if err != nil {
 			return err
 		}
-		beginningActivation := oldResource.PublicationRecord.State != domain.PublicationActivating && resource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.ActivationIntent != nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && intent.Operation == Publish && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
+		beginningActivation := oldResource.PublicationRecord.State != domain.PublicationActivating && resource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.ActivationIntent != nil && ((beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent) || (beforeIntent.Phase == PhaseReentered && intent.Phase == PhaseLocalIntent && intent.CertificateHandoff != nil)) && intent.Operation == Publish && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		failedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == oldResource.PublicationRecord.ActivationIntent.PriorState && resource.PublicationRecord.ActivationIntent == nil && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultFailed
 		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
-		ordinaryTerminal := intent.Operation != Publish && oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		ordinaryTerminal := intent.Operation != Publish && oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered || beforeIntent.Phase == PhaseRemoteWait && intent.Operation == CertificateRenew) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		switch {
 		case beginningActivation:
 			activation := resource.PublicationRecord.ActivationIntent
@@ -3392,8 +3989,16 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 }
 
 func validateReservation(value Reservation) error {
-	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
+	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
+		return fmt.Errorf("operation certificate challenge binding invalid")
+	}
+	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || value.OperationBinding != "" && !exactDigest(value.OperationBinding) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
 		return fmt.Errorf("operation reservation is invalid")
+	}
+	if handoff := value.CertificateHandoff; handoff != nil {
+		if value.Operation != Publish || (value.Phase != PhaseLocalIntent && value.Phase != PhaseTerminal) || handoff.PlanID != value.PlanID || handoff.Generation != value.SafetyBinding.IntentGeneration || handoff.ACMEBinding != value.OperationBinding || !exactDigest(handoff.SANIdentity) || !exactDigest(handoff.ACMEBinding) || !validIdentityRef(handoff.CertificateID) || !exactDigest(handoff.Fingerprint) || !exactDigest(handoff.ChallengeSafetyDigest) {
+			return fmt.Errorf("certificate publication handoff invalid")
+		}
 	}
 	if value.Phase != PhaseReserved && value.Phase != PhaseLocalIntent && value.Phase != PhaseRemoteWait && value.Phase != PhaseRejected && value.Phase != PhaseReentered && value.Phase != PhaseTerminal {
 		return fmt.Errorf("operation phase is invalid")
@@ -3419,7 +4024,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -3477,7 +4082,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}
 	case AdmissionTimer:
-		if planID != "" || operation != CertificateExpiry && operation != EdgeOneExpiry && operation != AutomaticReconciliation {
+		if planID != "" || operation != CertificateExpiry && operation != CertificateRenew && operation != EdgeOneExpiry && operation != AutomaticReconciliation {
 			return fmt.Errorf("timer admission is not authorized for operation")
 		}
 	case AdmissionStartup:
@@ -3493,6 +4098,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 	}
 	return nil
 }
+func SafetyBindingDigest(binding SafetyBinding) (string, error) { return safetyBindingDigest(binding) }
 func safetyBindingDigest(binding SafetyBinding) (string, error) {
 	data, err := json.Marshal(binding)
 	if err != nil {

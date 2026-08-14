@@ -93,7 +93,7 @@ func TestMalformedOwnershipOrMissingGraphForcesFallbackInventory(t *testing.T) {
 
 func bundle(id, domainName string) domain.PublicationBundle {
 	digest := digestTest(id)
-	return domain.PublicationBundle{Generation: 1, ID: id, ConfigDigest: digest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint-" + id, SiteIdentity: "site-" + id, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{domainName}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
+	return domain.PublicationBundle{Generation: 1, ID: id, ConfigDigest: digest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint-" + id, SiteIdentity: "site-" + id, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{domainName}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: digestTest("fingerprint"), SANIdentity: digestTest("san"), ChainIdentity: digestTest("chain"), IssuerIdentity: digestTest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
 }
 func digestTest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)

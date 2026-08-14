@@ -136,6 +136,7 @@ type Request struct {
 	ReleaseAuthority *release.InstallAuthority
 	Preflight        PreflightEvaluator
 	SourceBinaryPath string
+	LegoBytes        []byte
 	Random           io.Reader
 	Now              func() time.Time
 	Paths            Paths

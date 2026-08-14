@@ -66,6 +66,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err := verifySourceBinary(request.SourceBinaryPath, releaseBinary{Digest: releaseIdentity.Binary.Digest, Bytes: releaseIdentity.Binary.Bytes}); err != nil {
 		return err
 	}
+	if len(request.LegoBytes) == 0 || uint64(len(request.LegoBytes)) != releaseIdentity.Lego.Bytes || digestBytes(request.LegoBytes) != releaseIdentity.Lego.Digest {
+		return fmt.Errorf("selected lego bytes differ from release authority")
+	}
 	if request.Preflight == nil {
 		return fmt.Errorf("installer bootstrap preflight evaluator is missing")
 	}
@@ -313,6 +316,10 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 	}
 	if journal.Phase == PhaseStoresInitialized {
+		if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/lego", request.LegoBytes, 0o755); err != nil {
+			return err
+		}
+		journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/lego"] = journal.Release.Lego.Digest
 		if err := installNginxBaseline(ctx, &journal); err != nil {
 			return err
 		}
@@ -431,6 +438,23 @@ func createBootstrapDirectories(journal Journal) error {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
 			return err
 		}
+	}
+	certificateRoot := filepath.Join(journal.Paths.PersistentRoot, "certificates")
+	if _, err := ensureDirectory(certificateRoot, owner, 0o711); err != nil {
+		return err
+	}
+	for _, path := range []string{filepath.Join(certificateRoot, "chroot"), filepath.Join(certificateRoot, "webroot")} {
+		if _, err := ensureDirectory(path, owner, 0o711); err != nil {
+			return err
+		}
+	}
+	for _, path := range []string{filepath.Join(certificateRoot, "staging"), filepath.Join(certificateRoot, "active"), filepath.Join(certificateRoot, "bootstrap"), filepath.Join(certificateRoot, "bundles")} {
+		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
+			return err
+		}
+	}
+	if _, err := ensureDirectory("/usr/lib/lanpanel/dependencies", owner, 0o755); err != nil {
+		return err
 	}
 	if _, err := ensureDirectory(filepath.Dir(journal.Paths.BinaryPath), owner, 0o755); err != nil {
 		return err

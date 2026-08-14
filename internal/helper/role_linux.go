@@ -5,17 +5,23 @@ package helper
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/application"
+	"lanpanel/internal/certificates"
+	"lanpanel/internal/child"
 	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/packages"
 	managedprocess "lanpanel/internal/process"
+	"lanpanel/internal/renewal"
 	"lanpanel/internal/resource"
 	"lanpanel/internal/secrets"
 	"os"
@@ -56,6 +62,25 @@ func RunRole(args []string) error {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
 	rotationRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
+	childClosure, err := child.ObserveExclusiveCurrentCgroup()
+	if err != nil {
+		return err
+	}
+	if err := application.ReconcileCertificateChallenges(context.Background(), childClosure); err != nil {
+		return err
+	}
+	if err := application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure); err != nil {
+		return err
+	}
+	if err := application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure); err != nil {
+		return err
+	}
+	if err := application.ReconcileCompletedCertificateRenewals(context.Background()); err != nil {
+		return err
+	}
+	if err := application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()); err != nil {
+		return err
+	}
 	if err := application.ReconcileResourceCreates(context.Background()); err != nil {
 		return err
 	}
@@ -700,6 +725,14 @@ func RunRole(args []string) error {
 		}
 		return ExecutionResult{ResultDigest: execution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: execution.Candidate.PublicURL}}, nil
 	})
+	renewalHandler := CertificateRenewHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerTimer || request.Target != "installation" {
+			return fmt.Errorf("certificate renewal requires timer installation tick")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, _ helperproto.Request, _ *helperproto.Secret) (ExecutionResult, error) {
+		return executeCertificateTimer(ctx)
+	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("Management profile request carried secret")
@@ -709,7 +742,7 @@ func RunRole(args []string) error {
 		tokenMu.Unlock()
 		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, renewalHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}
@@ -772,6 +805,120 @@ func lookupGroupGID(name string) (uint32, error) {
 	return 0, fmt.Errorf("fixed group identity is missing")
 }
 
+func digestString(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
+	now := time.Now().UTC()
+	independent := func(cause error) (ExecutionResult, error) {
+		return ExecutionResult{}, errors.Join(cause, application.ContractIndependentCertificateExpiries(context.WithoutCancel(ctx), now))
+	}
+	service, err := application.OpenFixed()
+	if err != nil {
+		return independent(err)
+	}
+	if err := service.ObserveCertificateTrustedWall(ctx, now); err != nil {
+		service.Close()
+		return independent(err)
+	}
+	state, err := service.SafetyState()
+	if err != nil {
+		service.Close()
+		return independent(err)
+	}
+	document, err := service.Normal().Read()
+	if err != nil {
+		service.Close()
+		return independent(err)
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		service.Close()
+		return independent(fmt.Errorf("installation authority missing"))
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		service.Close()
+		return independent(err)
+	}
+	decisions := map[string]renewal.Decision{}
+	for _, resource := range installation.Resources {
+		for _, safetyResource := range state.Resources {
+			if safetyResource.ResourceID == resource.ID && safetyResource.CertificateExpiry != nil {
+				decisions[resource.ID] = renewal.DecisionContract
+			}
+		}
+		if decisions[resource.ID] == renewal.DecisionContract {
+			continue
+		}
+		decision, decisionErr := renewal.Evaluate(renewal.Input{Now: now, RenewBefore: 30 * 24 * time.Hour, Publication: resource.PublicationRecord, Safety: state, ResourceID: resource.ID})
+		if decisionErr != nil {
+			service.Close()
+			return independent(decisionErr)
+		}
+		if decision != renewal.DecisionIdle {
+			decisions[resource.ID] = decision
+		}
+	}
+	if err := service.Close(); err != nil {
+		return independent(err)
+	}
+	summary := strings.Builder{}
+	for _, resource := range installation.Resources {
+		if decisions[resource.ID] != renewal.DecisionContract {
+			continue
+		}
+		if err := application.ContractExpiredCertificate(ctx, resource.ID, now); err != nil {
+			return independent(err)
+		}
+		fmt.Fprintf(&summary, "%s:contracted;", resource.ID)
+	}
+	for _, resource := range installation.Resources {
+		if decisions[resource.ID] != renewal.DecisionRenew {
+			continue
+		}
+		fingerprint, err := executeCertificateRenewal(ctx, resource.ID)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		fmt.Fprintf(&summary, "%s:renewed:%s;", resource.ID, fingerprint)
+		break
+	}
+	return ExecutionResult{ResultDigest: digestString(summary.String())}, nil
+}
+
+func executeCertificateRenewal(ctx context.Context, resourceID string) (string, error) {
+	execution, err := application.BeginCertificateRenew(ctx, resourceID)
+	if err != nil {
+		return "", err
+	}
+	defer execution.Close()
+	abort := func(cause error) error { return execution.Abort(context.WithoutCancel(ctx), cause) }
+	stageIdentity := child.Identity{UID: execution.StageUID, GID: execution.StageGID, Chroot: "/var/lib/lanpanel/certificates/chroot/" + execution.Challenge.Safety.CertificateIdentity}
+	if err := execution.ActivateChallenge(ctx); err != nil {
+		return "", abort(err)
+	}
+	result, runErr := execution.RunRemote(ctx, stageIdentity.UID, stageIdentity.GID)
+	if err := execution.TerminalizeChild(ctx, result, runErr); err != nil {
+		return "", abort(err)
+	}
+	if runErr != nil {
+		return "", abort(runErr)
+	}
+	material, err := execution.LoadIssued(time.Now().UTC())
+	if err != nil {
+		return "", abort(err)
+	}
+	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: stageIdentity.UID, GID: stageIdentity.GID}, time.Now().UTC())
+	if err != nil {
+		return "", abort(err)
+	}
+	if _, err := execution.CompleteRenewal(ctx, bundle); err != nil {
+		return "", abort(err)
+	}
+	return bundle.Fingerprint, nil
+}
 func ReadIdentityConfig() (IdentityConfig, error) {
 	parent := filepath.Dir(FixedIdentityConfigPath)
 	if err := validateRootParentChain(parent, 0, 0o711); err != nil {

@@ -7,6 +7,7 @@ package child
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -97,6 +98,22 @@ type PackageArgument struct {
 type Invocation struct {
 	Package  *PackageInvocation  `json:"package,omitempty"`
 	Resource *ResourceInvocation `json:"resource,omitempty"`
+	Lego     *LegoInvocation     `json:"lego,omitempty"`
+}
+type LegoInvocation struct {
+	CertificateID    string   `json:"certificate_id"`
+	DirectoryURL     string   `json:"directory_url"`
+	AccountEmail     string   `json:"account_email"`
+	Method           string   `json:"method"`
+	Provider         string   `json:"provider,omitempty"`
+	Domains          []string `json:"domains"`
+	Webroot          string   `json:"webroot,omitempty"`
+	DataPath         string   `json:"data_path"`
+	UID              uint32   `json:"uid"`
+	GID              uint32   `json:"gid"`
+	Chroot           string   `json:"chroot"`
+	ExecutableDigest string   `json:"executable_digest"`
+	Environment      []string `json:"environment"`
 }
 
 type ResourceInvocation struct {
@@ -120,6 +137,8 @@ type Profile struct {
 	UID                    uint32
 	GID                    uint32
 	Chroot                 string
+	ExecutableDigest       string
+	Umask                  uint32
 	Network                NetworkPolicy
 	AllowedAddressFamilies []int
 	AllowedCapabilities    []int
@@ -154,7 +173,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
-	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/local/lib/lanpanel/bin/lego", IdentityKind: IdentityCertificateStage, Network: NetworkProviderOnly},
+	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/lib/lanpanel/dependencies/lego", IdentityKind: IdentityCertificateStage, Network: NetworkHostQualified, AllowedAddressFamilies: []int{2, 10}, Timeout: 10 * time.Minute, MaximumInputBytes: 32 << 10, MaximumOutputBytes: 64 << 10, MaximumFileBytes: 16 << 20, Umask: 0o022, Complete: true},
 	ProfileHTPasswd:              {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNone},
 	ProfileTailscaleAdmin:        {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
 	ProfileResourceAccounts:      {ID: ProfileResourceAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -227,7 +246,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	}
 	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow
 	if resourceProfile {
-		if invocation.Package != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
+		if invocation.Package != nil || invocation.Lego != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
 			return Profile{}, fmt.Errorf("resource child invocation authority is invalid")
 		}
 		short := strings.TrimPrefix(invocation.Resource.ResourceID, "res_")[:20]
@@ -259,8 +278,11 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		}
 		return profile, nil
 	}
+	if id == ProfileLego {
+		return resolveLegoInvocation(profile, invocation)
+	}
 	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
-		if invocation.Package != nil || invocation.Resource != nil {
+		if invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil {
 			return Profile{}, fmt.Errorf("external child profile rejects typed invocation")
 		}
 		return profile, nil
@@ -320,6 +342,103 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	return profile, nil
 }
 
+func resolveLegoInvocation(profile Profile, invocation Invocation) (Profile, error) {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Lego == nil {
+		return Profile{}, fmt.Errorf("lego child invocation authority invalid")
+	}
+	value := invocation.Lego
+	if !regexp.MustCompile(`^cert_[0-9a-f]{32}$`).MatchString(value.CertificateID) || value.Method != "http-01" && value.Method != "dns-01" || len(value.Domains) == 0 || len(value.Domains) > 32 || !strings.HasPrefix(value.DirectoryURL, "https://") || value.DataPath != "/work" || !validACMEEmail(value.AccountEmail) || value.UID == 0 || value.GID == 0 || value.Chroot != "/var/lib/lanpanel/certificates/chroot/"+value.CertificateID || !packageDigestPattern.MatchString(value.ExecutableDigest) {
+		return Profile{}, fmt.Errorf("lego invocation identity invalid")
+	}
+	if err := validateLegoEnvironment(value.Provider, value.Method, value.Environment); err != nil {
+		return Profile{}, err
+	}
+	arguments := []string{"--server", value.DirectoryURL, "--email", value.AccountEmail, "--path", value.DataPath, "--accept-tos", "--pem"}
+	if value.Method == "http-01" {
+		if value.Webroot != "/var/lib/lanpanel/certificates/webroot/"+value.CertificateID || value.Provider != "" {
+			return Profile{}, fmt.Errorf("lego HTTP-01 authority invalid")
+		}
+		arguments = append(arguments, "--http", "--http.webroot", value.Webroot)
+	} else {
+		matched, err := regexp.MatchString(`^(cloudflare|route53|digitalocean|gcloud|tencentcloud)$`, value.Provider)
+		if err != nil || !matched || value.Webroot != "" {
+			return Profile{}, fmt.Errorf("lego DNS-01 authority invalid")
+		}
+		arguments = append(arguments, "--dns", value.Provider)
+	}
+	previous := ""
+	for _, domain := range value.Domains {
+		if domain == "" || strings.ToLower(domain) != domain || strings.ContainsAny(domain, "\x00\r\n /") || previous != "" && previous >= domain {
+			return Profile{}, fmt.Errorf("lego domain authority invalid")
+		}
+		arguments = append(arguments, "--domains", domain)
+		previous = domain
+	}
+	arguments = append(arguments, "run", "--no-bundle")
+	profile.Arguments = arguments
+	profile.Environment = []string{"LANG=C", "LC_ALL=C"}
+	profile.UID = value.UID
+	profile.GID = value.GID
+	profile.Chroot = value.Chroot
+	profile.ExecutableDigest = value.ExecutableDigest
+	profile.Complete = true
+	if err := validateProfile(profile); err != nil {
+		return Profile{}, err
+	}
+	return profile, nil
+}
+
+func validateLegoEnvironment(provider, method string, environment []string) error {
+	if len(environment) < 2 || environment[0] != "LANG=C" || environment[1] != "LC_ALL=C" {
+		return fmt.Errorf("lego environment identity invalid")
+	}
+	allowed := map[string]bool{}
+	required := map[string]bool{}
+	if method == "http-01" {
+		if len(environment) != 2 {
+			return fmt.Errorf("lego HTTP environment invalid")
+		}
+		return nil
+	}
+	schemas := map[string]struct{ required, optional []string }{"cloudflare": {[]string{"CF_DNS_API_TOKEN_FILE"}, nil}, "route53": {[]string{"AWS_SHARED_CREDENTIALS_FILE", "AWS_REGION", "AWS_HOSTED_ZONE_ID", "AWS_PROFILE", "AWS_EC2_METADATA_DISABLED"}, nil}, "digitalocean": {[]string{"DO_AUTH_TOKEN_FILE"}, nil}, "gcloud": {[]string{"GCE_SERVICE_ACCOUNT_FILE", "GCE_PROJECT"}, nil}, "tencentcloud": {[]string{"TENCENTCLOUD_SECRET_ID_FILE", "TENCENTCLOUD_SECRET_KEY_FILE"}, []string{"TENCENTCLOUD_SESSION_TOKEN_FILE", "TENCENTCLOUD_REGION"}}}
+	schema, ok := schemas[provider]
+	if !ok {
+		return fmt.Errorf("lego provider environment invalid")
+	}
+	for _, key := range schema.required {
+		allowed[key] = true
+		required[key] = true
+	}
+	for _, key := range schema.optional {
+		allowed[key] = true
+	}
+	previous := ""
+	for _, entry := range environment[2:] {
+		key, value, found := strings.Cut(entry, "=")
+		if !found || !allowed[key] || previous != "" && previous >= key || value == "" || strings.ContainsAny(value, "\x00\r\n") {
+			return fmt.Errorf("lego environment closure invalid")
+		}
+		if key == "AWS_EC2_METADATA_DISABLED" && value != "true" {
+			return fmt.Errorf("lego metadata fallback is not disabled")
+		}
+		if strings.HasSuffix(key, "_FILE") {
+			if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+				return fmt.Errorf("lego credential path invalid")
+			}
+		} else if strings.ContainsAny(value, " =") {
+			return fmt.Errorf("lego non-secret environment invalid")
+		}
+		delete(required, key)
+		previous = key
+	}
+	if len(required) != 0 {
+		return fmt.Errorf("lego environment incomplete")
+	}
+	return nil
+}
+func validACMEEmail(value string) bool {
+	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
+}
 func validResourceIdentity(value string) bool {
 	if len(value) != 36 || !strings.HasPrefix(value, "res_") {
 		return false
@@ -337,7 +456,7 @@ func packageCapabilities() []int {
 }
 
 func validateProfile(profile Profile) error {
-	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 || profile.MaximumFileBytes > 4<<30 || profile.PersistentDaemon && (profile.ID != ProfileNginxStart || !profile.RootTCB || profile.Timeout != 0 || profile.MaximumFileBytes != 0) {
+	if profile.ID == "" || profile.Executable == "" || !strings.HasPrefix(profile.Executable, "/") || profile.Timeout < 0 || profile.Timeout > 30*time.Minute || profile.MaximumInputBytes < 0 || profile.MaximumInputBytes > 64<<10 || profile.MaximumOutputBytes < 0 || profile.MaximumOutputBytes > 1<<20 || profile.MaximumFileBytes > 4<<30 || profile.Umask > 0o077 || profile.PersistentDaemon && (profile.ID != ProfileNginxStart || !profile.RootTCB || profile.Timeout != 0 || profile.MaximumFileBytes != 0) {
 		return fmt.Errorf("external child profile shape is invalid")
 	}
 	for _, argument := range profile.Arguments {

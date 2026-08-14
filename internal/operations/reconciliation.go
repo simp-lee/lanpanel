@@ -379,7 +379,7 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 	if journal.InstallationID != installation.InstallationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration {
 		return ExactReconciliationDecision{}, fmt.Errorf("exact reconciliation journal does not match installation or intent authority")
 	}
-	if journal.Kind == JournalAppContraction || journal.Kind == JournalAppActivation {
+	if journal.Kind == JournalAppContraction || journal.Kind == JournalAppActivation || journal.Kind == JournalCertificateActivation {
 		installed := make([]string, 0, len(installation.Resources))
 		for _, resource := range installation.Resources {
 			installed = append(installed, resource.ID)
@@ -411,7 +411,8 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 		}
 		children[child.ID] = child
 	}
-	if len(children) != len(journal.ChildIDs) {
+	handoffApp := intent.CertificateHandoff != nil && journal.Kind == JournalAppActivation && len(journal.ChildIDs) == 0
+	if len(children) != len(journal.ChildIDs) && !handoffApp {
 		return ExactReconciliationDecision{}, fmt.Errorf("exact reconciliation child inventory does not match journal")
 	}
 	allSucceeded := true
@@ -440,7 +441,7 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 		}
 		decision.Action = ReconcileFinalizeNonIngressCommit
 		return decision, nil
-	case JournalAppContraction, JournalAppActivation:
+	case JournalAppContraction, JournalAppActivation, JournalCertificateActivation:
 		decision.Action = ReconcileContractApp
 		return decision, nil
 	default:

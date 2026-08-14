@@ -263,8 +263,10 @@ func validOperationTarget(operation Operation, target string) bool {
 		return target == "installation" || exactID && kind == "resource"
 	case OperationCredentialImport, OperationCredentialAdopt:
 		return exactID && kind == "credential"
-	case OperationCertificateIssue, OperationCertificateRenew:
+	case OperationCertificateIssue:
 		return target == "headscale" || exactID && kind == "resource"
+	case OperationCertificateRenew:
+		return target == "installation" || target == "headscale" || exactID && kind == "resource"
 	case OperationEdgeOneRefresh, OperationGoAccessProbe:
 		return exactID && kind == "resource"
 	case OperationHeadscaleAdmin, OperationPreauthKeyCreate:

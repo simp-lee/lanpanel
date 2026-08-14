@@ -171,9 +171,18 @@ func validateResource(resource ResourceSafety) error {
 	if resource.Contraction != nil && resource.Contraction.Kind != MarkerContraction {
 		return fmt.Errorf("contraction marker kind mismatch")
 	}
+	if resource.ActiveCertificate != nil {
+		active := resource.ActiveCertificate
+		if active.Generation == 0 || !isDigest(active.Fingerprint) || !validRef(active.Binding) || active.NotAfter.IsZero() || active.LastTrustedWall.IsZero() || !active.NotAfter.After(active.LastTrustedWall) {
+			return fmt.Errorf("active certificate authority invalid")
+		}
+	}
 	if resource.CertificateExpiry != nil {
 		if err := validateDeadlineMarker(*resource.CertificateExpiry); err != nil {
 			return fmt.Errorf("certificate expiry: %w", err)
+		}
+		if resource.ActiveCertificate == nil || resource.CertificateExpiry.Binding != resource.ActiveCertificate.Binding {
+			return fmt.Errorf("certificate expiry lacks matching active authority")
 		}
 	}
 	if resource.EdgeOne.Expiry != nil {
@@ -221,8 +230,33 @@ func validateDeadlineMarker(marker DeadlineMarker) error {
 }
 
 func validateChallenge(challenge ChallengePending) error {
-	if challenge.Generation == 0 || !validRef(challenge.PlanID) || !validHost(challenge.Host) || !cleanAbsolute(challenge.TokenPath) || !cleanAbsolute(challenge.Webroot) || !isDigest(challenge.BootstrapIdentity) {
-		return fmt.Errorf("challenge identity is incomplete")
+	if challenge.Generation == 0 || !validRef(challenge.PlanID) || !validHost(challenge.Host) || len(challenge.Hosts) == 0 || !isDigest(challenge.ConfigDigest) || !isDigest(challenge.SANIdentity) || !isDigest(challenge.ACMEBinding) || !validRef(challenge.CertificateIdentity) || !isDigest(challenge.BootstrapIdentity) {
+		return fmt.Errorf("challenge complete ACME identity is incomplete")
+	}
+	for index, host := range challenge.Hosts {
+		if !validHost(host) || index > 0 && challenge.Hosts[index-1] >= host {
+			return fmt.Errorf("challenge Host inventory invalid")
+		}
+	}
+	switch challenge.Method {
+	case "http-01":
+		if challenge.OwnerLock != "" || challenge.Provider != "" || challenge.Zone != "" || len(challenge.Owners) != 0 || challenge.TokenPath != "/.well-known/acme-challenge" || !strings.HasPrefix(challenge.Webroot, "/var/lib/lanpanel/certificates/webroot/") {
+			return fmt.Errorf("HTTP-01 route authority invalid")
+		}
+	case "dns-01":
+		if !isDigest(challenge.OwnerLock) || (challenge.Provider != "cloudflare" && challenge.Provider != "route53" && challenge.Provider != "digitalocean" && challenge.Provider != "gcloud" && challenge.Provider != "tencentcloud") || !validHost(challenge.Zone) || len(challenge.Owners) != len(challenge.Hosts) || challenge.TokenPath != "/dns-01" || challenge.Webroot != "/var/lib/lanpanel/certificates/dns-only" {
+			return fmt.Errorf("DNS-01 owner authority invalid")
+		}
+		for index, owner := range challenge.Owners {
+			if owner != "_acme-challenge."+challenge.Hosts[index] || (owner != challenge.Zone && !strings.HasSuffix(owner, "."+challenge.Zone)) {
+				return fmt.Errorf("DNS-01 owner inventory invalid")
+			}
+		}
+	default:
+		return fmt.Errorf("challenge method invalid")
+	}
+	if !strings.HasPrefix(challenge.TokenPath, "/") || filepath.Clean(challenge.TokenPath) != challenge.TokenPath || !cleanAbsolute(challenge.Webroot) {
+		return fmt.Errorf("challenge path authority invalid")
 	}
 	if err := validateBaseSnapshot(challenge.BaseMarkers); err != nil {
 		return err

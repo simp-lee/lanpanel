@@ -2,7 +2,9 @@ package release
 
 import (
 	"fmt"
+	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/dependencies"
+	"lanpanel/internal/filetxn"
 	"reflect"
 	"regexp"
 	"slices"
@@ -357,6 +359,37 @@ func verifyEnvelopeAssets(envelope Envelope, checksumBytes []byte, assets map[st
 	if err != nil || dependencies.ValidateForOSProfile(baseline, profileDigest, profile.NginxVersion) != nil {
 		return fmt.Errorf("dependency baseline does not bind the exact release OS profile")
 	}
+	var selected *dependencies.Selection
+	for index := range baseline.Selections {
+		if baseline.Selections[index].Component == "lego" {
+			selected = &baseline.Selections[index]
+		}
+	}
+	var legoArchive, lego *AssetIdentity
+	for index := range envelope.AdditionalAssets {
+		asset := &envelope.AdditionalAssets[index]
+		if asset.Path == "lego.tar.gz" {
+			legoArchive = asset
+		} else if asset.Path == "lego" {
+			lego = asset
+		}
+	}
+	expectedLegoArtifact := fmt.Sprintf("https://github.com/go-acme/lego/releases/download/v4.25.2/lego_v4.25.2_linux_%s.tar.gz", profile.Architecture)
+	if selected == nil || legoArchive == nil || lego == nil || selected.SourceKind != dependencies.SourceCanonicalArtifact || selected.SelectedVersion != "4.25.2" || selected.LatestStableVersion != "4.25.2" || selected.OperatingSystem != "linux" || selected.Architecture != profile.Architecture || selected.ArtifactIdentity != expectedLegoArtifact || selected.ArtifactDigest != legoArchive.Digest {
+		return fmt.Errorf("lego archive does not match canonical v4.25.2 dependency authority")
+	}
+	archiveBytes, archivePresent := assets[legoArchive.Path]
+	executableBytes, executablePresent := assets[lego.Path]
+	if !archivePresent || !executablePresent {
+		return fmt.Errorf("lego archive or executable bytes missing")
+	}
+	extracted, err := managedarchive.Extract(archiveBytes, managedarchive.Spec{Format: managedarchive.TarGzip, MaximumArchiveBytes: 256 << 20, MaximumExtractedBytes: 258 << 20, MaximumMembers: 3, Members: []managedarchive.Member{{Path: "CHANGELOG.md", MaximumBytes: 1 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/share/doc/lanpanel/lego/CHANGELOG.md", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644}}, {Path: "LICENSE", MaximumBytes: 1 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/share/doc/lanpanel/lego/LICENSE", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644}}, {Path: "lego", MaximumBytes: 256 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/lib/lanpanel/dependencies/lego", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o755}}}})
+	if err != nil {
+		return fmt.Errorf("extract lego executable: %w", err)
+	}
+	if !executablePresent || DigestBytes(extracted["lego"]) != lego.Digest || !slices.Equal(extracted["lego"], executableBytes) {
+		return fmt.Errorf("lego executable is not the exact archive member")
+	}
 	return nil
 }
 
@@ -374,7 +407,7 @@ func VerifyFinalFromCandidate(final, candidate *VerifiedEnvelope) error {
 	if final == nil || candidate == nil || final.value.Kind != EnvelopeFinal || candidate.value.Kind != EnvelopeQualificationCandidate {
 		return fmt.Errorf("candidate/final envelope kinds are invalid")
 	}
-	if final.value.QualificationCandidateOID != candidate.digest || final.value.ReleaseTag != candidate.value.ReleaseTag || final.value.Binary != candidate.value.Binary || final.value.SourceArchive != candidate.value.SourceArchive || final.value.SourceTreeDigest != candidate.value.SourceTreeDigest || final.value.DependencyBaseline != candidate.value.DependencyBaseline || final.value.SBOM != candidate.value.SBOM || final.value.License != candidate.value.License || final.value.Notice != candidate.value.Notice {
+	if final.value.QualificationCandidateOID != candidate.digest || final.value.ReleaseTag != candidate.value.ReleaseTag || final.value.Binary != candidate.value.Binary || final.value.SourceArchive != candidate.value.SourceArchive || final.value.SourceTreeDigest != candidate.value.SourceTreeDigest || final.value.DependencyBaseline != candidate.value.DependencyBaseline || final.value.SBOM != candidate.value.SBOM || final.value.License != candidate.value.License || final.value.Notice != candidate.value.Notice || !reflect.DeepEqual(final.value.AdditionalAssets, candidate.value.AdditionalAssets) {
 		return fmt.Errorf("final envelope does not wrap unchanged candidate source, binary, and baseline")
 	}
 	if len(final.value.SupportedProfiles) != 1 || candidate.value.QualificationTarget == nil || !reflect.DeepEqual(final.value.SupportedProfiles[0].Profile, *candidate.value.QualificationTarget) {

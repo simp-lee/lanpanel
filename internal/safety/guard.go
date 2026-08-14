@@ -96,7 +96,7 @@ func Check(input GuardInput) Decision {
 	}
 	switch input.Action {
 	case ActionAppChallenge:
-		if resource.ChallengePending == nil || resource.ChallengePending.PlanID != input.PlanID || resource.ChallengePending.Generation != input.Generation || resource.ChallengePending.BootstrapIdentity != input.CandidateDigest {
+		if resource.ChallengePending == nil || resource.ChallengePending.Method != "http-01" || resource.ChallengePending.PlanID != input.PlanID || resource.ChallengePending.Generation != input.Generation || resource.ChallengePending.BootstrapIdentity != input.CandidateDigest {
 			return Decision{Priority: priority, Reason: "matching challenge identity is missing"}
 		}
 		if resource.EdgeOne.Expiry != nil || edgeDeadlineExpired(resource, input.Now) {
@@ -129,7 +129,7 @@ func Check(input GuardInput) Decision {
 
 func checkHeadscaleChallenge(input GuardInput) Decision {
 	challenge := input.State.Headscale.ChallengePending
-	if challenge == nil || challenge.PlanID != input.PlanID || challenge.Generation != input.Generation || challenge.BootstrapIdentity != input.CandidateDigest {
+	if challenge == nil || challenge.Method != "http-01" || challenge.PlanID != input.PlanID || challenge.Generation != input.Generation || challenge.BootstrapIdentity != input.CandidateDigest {
 		return Decision{Priority: PriorityBaseContraction, Reason: "matching Headscale challenge identity is missing"}
 	}
 	if !headscaleSnapshotMatches(challenge.BaseMarkers, input.State.Headscale) {
@@ -310,9 +310,11 @@ const (
 	RolePublish                 ClearRole = "publish"
 	RoleDelete                  ClearRole = "delete"
 	RoleChallenge               ClearRole = "challenge"
+	RoleCertificateHandoff      ClearRole = "certificate_handoff"
 	RoleContraction             ClearRole = "contraction"
 	RoleIngressActivation       ClearRole = "ingress_activation"
 	RoleCertificateActivation   ClearRole = "certificate_activation"
+	RoleCertificateObservation  ClearRole = "certificate_observation"
 	RoleEdgeOneRefresh          ClearRole = "edgeone_refresh"
 	RoleBootstrap               ClearRole = "bootstrap"
 	RoleResourceCreate          ClearRole = "resource_create"

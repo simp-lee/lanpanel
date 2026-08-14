@@ -104,7 +104,7 @@ func TestConflictRegistry(t *testing.T) {
 			Listeners:     []domain.BundleListenerIdentity{{Network: "tcp", Port: 19002}},
 			DomainHTTPS: &domain.DomainHTTPSBundleIdentity{
 				ExactDomains: []string{"old.example.com"},
-				Certificate:  domain.CertificateBundleIdentity{PointerIdentity: "old-pointer", BindingIdentity: "old-certificate"},
+				Certificate:  domain.CertificateBundleIdentity{PointerIdentity: "old-pointer", BindingIdentity: "old-certificate", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"},
 				Auth:         domain.AuthBundleIdentity{Mode: domain.AppAccessPublic},
 				Static:       domain.StaticBundleIdentity{RouteIdentities: []string{}},
 				GoAccess:     domain.GoAccessBundleIdentity{Enabled: false},

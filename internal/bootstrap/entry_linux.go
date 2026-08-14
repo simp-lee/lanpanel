@@ -133,7 +133,11 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 		result, err := preflight.EvaluateExpansion(request, observed)
 		return request, result, err
 	}
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Preflight: preflightEvaluator, SourceBinaryPath: input.SourceBinaryPath, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	legoBytes, present := input.Assets[identityValue.Lego.Path]
+	if !present {
+		return fmt.Errorf("selected lego asset missing")
+	}
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Preflight: preflightEvaluator, SourceBinaryPath: input.SourceBinaryPath, LegoBytes: legoBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 
 type ControllingTTY struct{}

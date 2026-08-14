@@ -1,7 +1,9 @@
 package release
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"lanpanel/internal/dependencies"
 	"strings"
 	"testing"
@@ -111,6 +113,22 @@ func TestVerifiedReleaseViewsCannotMutateInternalAuthority(t *testing.T) {
 	freshFinal := final.Envelope()
 	if freshFinal.SupportedProfiles[0].Profile.NginxVersion != testProfile().NginxVersion || freshFinal.Network.ExternalPurposes[0] == "tampered" {
 		t.Fatal("final accessor exposed mutable verified authority")
+	}
+}
+
+func TestReleaseRejectsLegoAssetOutsideDependencyBaseline(t *testing.T) {
+	envelope, assets, checksums := candidateMaterial(t)
+	for index := range envelope.AdditionalAssets {
+		if envelope.AdditionalAssets[index].Path == "lego" {
+			assets["lego"] = []byte("other")
+			envelope.AdditionalAssets[index] = identity("lego", assets["lego"])
+		}
+	}
+	checksums = checksumsFor(t, assets)
+	envelope.Checksums = identity("checksums.txt", checksums)
+	raw, _ := MarshalCanonical(envelope)
+	if _, err := VerifyCandidateRelease(DigestBytes(raw), raw, checksums, assets); err == nil {
+		t.Fatal("lego asset outside baseline accepted")
 	}
 }
 
@@ -370,6 +388,8 @@ func baseAssets() map[string][]byte {
 		"NOTICE":                   []byte("notice"),
 		"dependency-baseline.json": validDependencyBaseline(),
 		"lanpanel-linux-amd64":     []byte("binary"),
+		"lego":                     []byte("artifact-lego"),
+		"lego.tar.gz":              legoArchive(),
 		"lanpanel-v1.0.0.tar.gz":   []byte("source"),
 		"lanpanel.spdx.json":       []byte("sbom"),
 		"stable-checklist.json":    []byte("checklist"),
@@ -377,6 +397,7 @@ func baseAssets() map[string][]byte {
 }
 
 func setCoreAssets(envelope *Envelope, assets map[string][]byte) {
+	envelope.AdditionalAssets = []AssetIdentity{identity("lego", assets["lego"]), identity("lego.tar.gz", assets["lego.tar.gz"])}
 	envelope.Binary = identity("lanpanel-linux-amd64", assets["lanpanel-linux-amd64"])
 	envelope.SourceArchive = identity("lanpanel-v1.0.0.tar.gz", assets["lanpanel-v1.0.0.tar.gz"])
 	envelope.License = identity("LICENSE", assets["LICENSE"])
@@ -421,6 +442,9 @@ func validDependencyBaseline() []byte {
 	profileDigest, _ := ProfileDigest(testProfile())
 	selection := func(component string, kind dependencies.SourceKind, version, artifact string) dependencies.Selection {
 		value := dependencies.Selection{Component: component, SourceKind: kind, SelectedVersion: version, LatestStableVersion: version, LatestStablePublishedAt: published, MetadataSource: "https://metadata.example.test/releases", MetadataSnapshotDigest: digest("metadata-" + component), ArtifactIdentity: artifact, ArtifactDigest: digest("artifact-" + component)}
+		if component == "lego" {
+			value.ArtifactDigest = DigestBytes(legoArchive())
+		}
 		if kind == dependencies.SourceDistroRepository {
 			value.OSProfileDigest = profileDigest
 		} else {
@@ -433,7 +457,7 @@ func validDependencyBaseline() []byte {
 		selection("apache2-utils", dependencies.SourceDistroRepository, "2.4.62-1", "apache2-utils=2.4.62-1@debian/bookworm-security"),
 		selection("goaccess", dependencies.SourceDistroRepository, "1.7-1", "goaccess=1.7-1@debian/bookworm"),
 		selection("headscale", dependencies.SourceCanonicalArtifact, "0.25.1", "https://downloads.example.test/headscale-0.25.1"),
-		selection("lego", dependencies.SourceCanonicalArtifact, "4.25.2", "https://downloads.example.test/lego-4.25.2"),
+		selection("lego", dependencies.SourceCanonicalArtifact, "4.25.2", "https://github.com/go-acme/lego/releases/download/v4.25.2/lego_v4.25.2_linux_amd64.tar.gz"),
 		selection("nginx", dependencies.SourceDistroRepository, "1.22.1-9", "nginx=1.22.1-9@debian/bookworm-security"),
 		selection("tailscale-client", dependencies.SourceCanonicalArtifact, "1.82.0", "https://downloads.example.test/tailscale-1.82.0"),
 	}}
@@ -444,6 +468,23 @@ func validDependencyBaseline() []byte {
 	return data
 }
 
+func legoArchive() []byte {
+	var output bytes.Buffer
+	compressed := gzip.NewWriter(&output)
+	compressed.Header.ModTime = time.Unix(0, 0).UTC()
+	archive := tar.NewWriter(compressed)
+	for _, member := range []struct {
+		name string
+		mode int64
+		data []byte
+	}{{"CHANGELOG.md", 0o644, []byte("changelog")}, {"LICENSE", 0o644, []byte("license")}, {"lego", 0o755, []byte("artifact-lego")}} {
+		_ = archive.WriteHeader(&tar.Header{Name: member.name, Mode: member.mode, Size: int64(len(member.data)), ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR})
+		_, _ = archive.Write(member.data)
+	}
+	_ = archive.Close()
+	_ = compressed.Close()
+	return output.Bytes()
+}
 func identity(path string, data []byte) AssetIdentity {
 	return AssetIdentity{Path: path, Digest: DigestBytes(data), Bytes: uint64(len(data))}
 }

@@ -34,7 +34,7 @@ func TestSafetySchemaContract(t *testing.T) {
 				case StopFenceCertificateActivation:
 					fence.Scope = FenceScope{Kind: "app", ResourceID: "app-one"}
 					fence.SafetyGenerations = append(fence.SafetyGenerations, MarkerGeneration{Kind: "certificate_expiry", Generation: 1})
-					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), CertificateExpiry: &DeadlineMarker{Generation: 1, Deadline: time.Unix(200, 0).UTC(), Binding: "certificate"}}}
+					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), ActiveCertificate: &ActiveCertificateAuthority{Generation: 1, Fingerprint: digest("certificate"), Binding: "certificate", LastTrustedWall: time.Unix(100, 0).UTC(), NotAfter: time.Unix(200, 0).UTC()}, CertificateExpiry: &DeadlineMarker{Generation: 1, Deadline: time.Unix(200, 0).UTC(), Binding: "certificate"}}}
 				case StopFenceEdgeOneRefresh:
 					fence.Scope = FenceScope{Kind: "app", ResourceID: "app-one"}
 					state.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), EdgeOne: EdgeOneSafety{RefreshJournal: "journal", Deadline: time.Unix(200, 0).UTC()}}}
@@ -360,6 +360,45 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 	})
 }
 
+func TestCertificateTrustedWallObservationOnlyAdvances(t *testing.T) {
+	current := stateWithResource()
+	current.Resources[0].ChallengePending = nil
+	current.Resources[0].ActiveCertificate = &ActiveCertificateAuthority{Generation: 1, Fingerprint: digest("cert"), Binding: "binding", LastTrustedWall: time.Unix(100, 0).UTC(), NotAfter: time.Unix(300, 0).UTC()}
+	next := current
+	next.Revision++
+	next.Resources = append([]ResourceSafety(nil), current.Resources...)
+	active := *current.Resources[0].ActiveCertificate
+	active.LastTrustedWall = time.Unix(200, 0).UTC()
+	next.Resources[0].ActiveCertificate = &active
+	if err := validateTransition(RoleCertificateObservation, current, next, TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	active.LastTrustedWall = time.Unix(50, 0).UTC()
+	next.Resources[0].ActiveCertificate = &active
+	if err := validateTransition(RoleCertificateObservation, current, next, TransitionProof{}); err == nil {
+		t.Fatal("trusted wall regression accepted")
+	}
+}
+func TestCertificateHandoffAtomicallyReplacesChallengeWithSameGeneration(t *testing.T) {
+	current := stateWithResource()
+	next := current
+	next.Revision++
+	next.Resources = append([]ResourceSafety(nil), current.Resources...)
+	pending := next.Resources[0].ChallengePending
+	next.Resources[0].ChallengePending = nil
+	next.Resources[0].Reactivating = &Reactivating{Generation: pending.Generation, PriorGeneration: pending.Generation - 1, PlanID: pending.PlanID, CandidateDigest: pending.ConfigDigest, CandidateBundle: digest("bundle"), BaseMarkers: append([]MarkerSnapshot(nil), pending.BaseMarkers...)}
+	if err := validateTransition(RoleCertificateHandoff, current, next, TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	changed := next
+	changed.Resources = append([]ResourceSafety(nil), next.Resources...)
+	active := *changed.Resources[0].Reactivating
+	active.CandidateDigest = digest("other")
+	changed.Resources[0].Reactivating = &active
+	if err := validateTransition(RoleCertificateHandoff, current, changed, TransitionProof{}); err == nil {
+		t.Fatal("mismatched certificate handoff accepted")
+	}
+}
 func TestSafetyPriorityAndGuardContract(t *testing.T) {
 	t.Run("pairwise_priority_is_fail_closed", func(t *testing.T) {
 		base := stateWithResource()
@@ -859,7 +898,7 @@ func validAppReactivating(sticky *GenerationMarker) *Reactivating {
 
 func stateWithResource() State {
 	snapshots := []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotPresent, Generation: 1}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}
-	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Host: "app.example.com", TokenPath: "/var/lib/lanpanel/token", Webroot: "/var/lib/lanpanel/webroot", BootstrapIdentity: digest("bootstrap"), BaseMarkers: append([]MarkerSnapshot(nil), snapshots...)}}}}
+	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Method: "http-01", ConfigDigest: digest("config"), SANIdentity: digest("san"), ACMEBinding: digest("acme"), CertificateIdentity: "cert-one", Host: "app.example.com", Hosts: []string{"app.example.com"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert-one", BootstrapIdentity: digest("bootstrap"), BaseMarkers: append([]MarkerSnapshot(nil), snapshots...)}}}}
 }
 
 func validTransition(generation uint64) *TransitionMarker {

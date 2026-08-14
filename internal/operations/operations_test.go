@@ -471,8 +471,8 @@ func TestOperationAdmissionContract(t *testing.T) {
 		state = safety.EmptyState()
 		state.DependencyTransitionPending = &safety.TransitionMarker{Generation: 3}
 		deadline := time.Now().UTC().Add(-time.Minute)
-		state.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 4, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), CertificateExpiry: &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}}}
-		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, false, time.Now()); err != nil {
+		state.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 4, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: testDigest("certificate"), Binding: "certificate", LastTrustedWall: deadline.Add(-time.Hour), NotAfter: deadline}, CertificateExpiry: &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}}}
+		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, false, time.Now()); err != nil {
 			t.Fatalf("deadline contraction exception rejected: %v", err)
 		}
 		futureDeadline := time.Now().UTC().Add(time.Hour)
@@ -502,12 +502,12 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		independentSafety.state = state
 		expiryRequest, expiryPreflight := contractionPreflight(preflight.ContractionExpiry, "resource/res_00000000000000000000000000000001", 4, time.Now().UTC())
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, expiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		wrongGeneration := expiryPreflight
 		wrongGeneration.Generation++
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, wrongGeneration, fresh(), exposure, func(bool) error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, wrongGeneration, fresh(), exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("state-independent contraction accepted mismatched safety generation")
 		}
 		emergency := safety.EmptyState()
@@ -541,7 +541,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		_, otherProof, _ := unavailableProof(t)
 		independentSafety.state = state
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline}, expiryRequest, expiryPreflight, otherProof, exposure, func(bool) error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, otherProof, exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("unavailability proof from another store was accepted")
 		}
 	})
@@ -660,7 +660,7 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
 	beforeInstallation.Resources[0].PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Unpublish), Target: "resource/" + beforeInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
@@ -699,6 +699,85 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	}
 }
 
+func TestPlanBoundCertificateChallengeStartsAcrossMatchingBaseMarker(t *testing.T) {
+	state := safety.State{GlobalClose: safety.GlobalClose{Phase: safety.GlobalCloseNone}, Resources: []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", State: safety.ResourceActive, Ownership: safety.OwnershipOwned, StickyUnpublished: &safety.GenerationMarker{Generation: 3}}}}
+	binding := SafetyBinding{ResourceID: state.Resources[0].ResourceID, PlanID: "plan_0000000000000000000000000000000", IntentGeneration: 4, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), ChallengeMethod: "http-01", CertificateIdentity: "cert_00000000000000000000000000000000", Deadline: time.Now().UTC().Add(time.Hour)}
+	if err := authorize(Publish, state, binding, true, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	ordinary := binding
+	ordinary.ChallengeMethod = ""
+	ordinary.CertificateIdentity = ""
+	if err := authorize(Publish, state, ordinary, true, time.Now().UTC()); err == nil {
+		t.Fatal("ordinary publish crossed sticky marker")
+	}
+	state.Resources[0].EdgeOne.Expiry = &safety.DeadlineMarker{Generation: 5, Deadline: time.Now().UTC(), Binding: "edge"}
+	if err := authorize(Publish, state, binding, true, time.Now().UTC()); err == nil {
+		t.Fatal("HTTP challenge crossed EdgeOne expiry")
+	}
+}
+func TestCertificatePublicationHandoffTransitionIsExact(t *testing.T) {
+	old := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: "job_00000000000000000000000000000000", PlanID: "plan_0000000000000000000000000000000", OperationBinding: testDigest("acme"), JournalSafetyDigest: testDigest("challenge-safety"), AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/res_00000000000000000000000000000001", Phase: PhaseReentered, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan_0000000000000000000000000000000", IntentGeneration: 2, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), Deadline: time.Now().UTC().Add(time.Hour)}, CreatedAt: time.Now().UTC(), IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: time.Now().UTC(), SafetyDigest: testDigest("safety")}}
+	next := old
+	next.Phase = PhaseLocalIntent
+	next.SafetyBinding.CandidateDigest = testDigest("config")
+	next.SafetyBinding.CandidateBundle = testDigest("bundle")
+	next.CertificateHandoff = &CertificatePublicationHandoff{PlanID: old.PlanID, Generation: 2, SANIdentity: testDigest("san"), ACMEBinding: testDigest("acme"), CertificateID: "cert_00000000000000000000000000000000", Fingerprint: testDigest("fingerprint"), ChallengeSafetyDigest: old.JournalSafetyDigest}
+	next.JournalSafetyDigest, _ = safetyBindingDigest(next.SafetyBinding)
+	encode := func(value Reservation) json.RawMessage {
+		raw, err := persist.EncodeEntry(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if err := validateIntentTransition("", encode(old), encode(next)); err != nil {
+		t.Fatal(err)
+	}
+	changed := next
+	changed.Target = "resource/res_00000000000000000000000000000002"
+	if err := validateIntentTransition("", encode(old), encode(changed)); err == nil {
+		t.Fatal("rewritten certificate handoff accepted")
+	}
+}
+func TestInterruptedCertificateRemoteWaitTerminalizesOnlyAfterContraction(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	installation := operationStateInstallation()
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(CertificateRenew), Target: "resource/" + installation.Resources[0].ID, ActorIdentity: "timer/certificate-renewal"}, now, bytes.NewReader(bytes.Repeat([]byte{8}, 64)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	terminal, err := jobs.Finish(running, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "certificate_provider_result", Status: jobs.PostconditionUnobserved, Identity: testDigest("closed")}}, ErrorCode: "certificate_executor_interrupted"}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionTimer, Operation: CertificateRenew, Target: "resource/" + installation.Resources[0].ID, Phase: PhaseRemoteWait, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: installation.Resources[0].ID, PlanID: "cert_00000000000000000000000000000000", IntentGeneration: 2, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("binding"), Deadline: now.Add(time.Hour)}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionTimer, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	terminalIntent := intent
+	terminalIntent.Phase = PhaseTerminal
+	child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "lego-" + record.ID, JobID: record.ID, InstallationID: installation.InstallationID, Operation: CertificateRenew, Target: intent.Target, IntentGeneration: 2, Profile: "lego", InputDigest: testDigest("binding"), ArtifactDigest: testDigest("binding"), Deadline: intent.SafetyBinding.Deadline, State: ChildSubmitted, SubmittedAt: now}
+	terminalChild := child
+	terminalChild.State = ChildTerminal
+	terminalChild.Outcome = ChildUnknown
+	terminalChild.TerminalAt = pointerTime(now.Add(time.Second))
+	terminalChild.ResultDigest = testDigest("closed")
+	journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + record.ID, JobID: record.ID, Kind: JournalCertificateActivation, Operation: CertificateRenew, InstallationID: installation.InstallationID, Target: intent.Target, Generation: 2, Deadline: intent.SafetyBinding.Deadline, ArtifactDigest: testDigest("binding"), SafetyMarkerDigest: testDigest("marker"), ResourceIDs: []string{installation.Resources[0].ID}, ChildIDs: []string{child.ID}, Phase: JournalPrepared, Certificate: &CertificateJournalIdentity{CertificateID: "cert_00000000000000000000000000000000", PriorGeneration: 1, CandidateGeneration: 2, PriorPointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000001", CandidatePointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000002", PriorFingerprint: testDigest("prior"), StageUID: 1200, StageGID: 1200}}
+	terminalJournal := journal
+	terminalJournal.Phase = JournalTerminal
+	encode := func(value any) json.RawMessage {
+		raw, err := persist.EncodeEntry(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(installation), "jobs/" + record.ID: encode(running), reservationKey(record.ID): encode(intent), "children/" + child.ID: encode(child), "journals/" + journal.ID: encode(journal)}}
+	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(installation), "jobs/" + record.ID: encode(terminal), reservationKey(record.ID): encode(terminalIntent), "children/" + child.ID: encode(terminalChild), "journals/" + journal.ID: encode(terminalJournal)}}
+	if err := validateOperationStateTransitions(before, after); err != nil {
+		t.Fatal(err)
+	}
+}
+func pointerTime(value time.Time) *time.Time { return &value }
 func TestResourceCreateTerminalizesOnlyInitialAuthority(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	created := operationStateInstallation().Resources[0]

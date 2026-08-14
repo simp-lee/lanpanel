@@ -74,7 +74,6 @@ func (authority *NormalAuthority) PersistClosing(ctx context.Context, inventory 
 		}
 		resource.GenerationSequence = generation
 		resource.Closing = &safety.GenerationMarker{Kind: safety.MarkerClosing, Generation: generation, Reason: "contraction"}
-		resource.ChallengePending = nil
 		resource.Reactivating = nil
 		delete(remaining, resource.ResourceID)
 	}

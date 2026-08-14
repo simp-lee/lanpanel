@@ -59,7 +59,7 @@ func operationRegistry() (*operations.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}})
+	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}})
 }
 
 type FixedService struct {
@@ -133,6 +133,13 @@ func (s *FixedService) Admitter(plan plans.Plan) (*operations.Admitter, error) {
 	}
 	binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 	return operations.NewAdmitter(s.normal, s.safety, operations.Options{Bindings: planBinding{binding}, Confirmation: confirmation{}, Registry: registry})
+}
+func (s *FixedService) TimerAdmitter() (*operations.Admitter, error) {
+	registry, err := operationRegistry()
+	if err != nil {
+		return nil, err
+	}
+	return operations.NewAdmitter(s.normal, s.safety, operations.Options{Bindings: planBinding{}, Confirmation: confirmation{}, Registry: registry})
 }
 func (s *FixedService) Manager() *locks.Manager { return s.manager }
 func (s *FixedService) Normal() *persist.Store  { return s.normal }
@@ -209,6 +216,126 @@ func (s *FixedService) WriteIngressActivationFence(ctx context.Context, lease *l
 	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+func activeCertificateAuthority(certificate domain.CertificateBundleIdentity) (*safety.ActiveCertificateAuthority, error) {
+	notAfter, deadlineErr := time.Parse(time.RFC3339, certificate.NotAfter)
+	lastWall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
+	if deadlineErr != nil || wallErr != nil || certificate.Generation == 0 || certificate.Fingerprint == "" || certificate.BindingIdentity == "" {
+		return nil, fmt.Errorf("active certificate deadline identity invalid")
+	}
+	return &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, NotAfter: notAfter, LastTrustedWall: lastWall}, nil
+}
+func (s *FixedService) CommitRenewedCertificateAuthority(ctx context.Context, lease *locks.Lease, resourceID string, certificate domain.CertificateBundleIdentity) error {
+	authority, err := activeCertificateAuthority(certificate)
+	if err != nil {
+		return err
+	}
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	found := false
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	for index := range next.Resources {
+		resource := &next.Resources[index]
+		if resource.ResourceID == resourceID {
+			if resource.ActiveCertificate == nil || authority.Generation != resource.ActiveCertificate.Generation+1 || authority.Binding != resource.ActiveCertificate.Binding {
+				return fmt.Errorf("renewed certificate safety authority mismatched")
+			}
+			resource.ActiveCertificate = authority
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("renewed certificate safety resource missing")
+	}
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+func (s *FixedService) MarkCertificateActivationUncertain(ctx context.Context, lease *locks.Lease, resourceID, binding string, now time.Time) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	found := false
+	for index := range next.Resources {
+		resource := &next.Resources[index]
+		if resource.ResourceID == resourceID {
+			resource.GenerationSequence++
+			resource.CertificateExpiry = &safety.DeadlineMarker{Generation: resource.GenerationSequence, Deadline: now.UTC(), Binding: binding}
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("certificate uncertainty resource missing")
+	}
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+func (s *FixedService) WriteCertificateActivationFence(ctx context.Context, lease *locks.Lease, resourceID, journalRef, priorPointer, candidatePointer string, observed safety.StopObservation, accessMayRemain bool) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil {
+		return err
+	}
+	var resource *safety.ResourceSafety
+	for index := range state.Resources {
+		if state.Resources[index].ResourceID == resourceID {
+			resource = &state.Resources[index]
+		}
+	}
+	if resource == nil || resource.CertificateExpiry == nil {
+		return fmt.Errorf("certificate fence requires expiry authority")
+	}
+	inventory, err := s.ownership.Inventory()
+	if err != nil {
+		return err
+	}
+	checksums := map[string]string{}
+	for _, record := range inventory.Records {
+		checksums[record.ResourceID] = record.Checksum
+	}
+	graph, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if err != nil {
+		return err
+	}
+	data, err := nginx.EncodeManifest(graph)
+	if err != nil {
+		return err
+	}
+	fence := &safety.StopFence{Kind: safety.StopFenceCertificateActivation, OriginOperation: "certificate_activation", Scope: safety.FenceScope{Kind: "app", ResourceID: resourceID}, FenceGeneration: state.StopFenceSequence + 1, CreatedAt: time.Now().UTC(), SafetyGenerations: applicablePublicationMarkers(state, resourceID), OwnedGraphDigest: shaDigest(data), InventoryDigest: safety.OwnershipInventoryDigest(checksums), Observation: observed, AccessMayRemain: accessMayRemain, CertificateActivation: &safety.CertificateActivationFence{JournalRef: journalRef, ResourceGeneration: resource.GenerationSequence, PriorPointer: priorPointer, CandidatePointer: candidatePointer, ExpiryGeneration: resource.CertificateExpiry.Generation}}
+	authority, err := safety.ReserveEmergencyStopFenceGeneration(lease, s.emergency, safety.RoleCertificateActivation, safety.StopFenceCertificateActivation, safety.StopFenceDigest(*fence), state.StopFenceSequence)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = authority.Sequence
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.StopFence = fence
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+func (s *FixedService) UpdateCertificateActivationFence(ctx context.Context, lease *locks.Lease, observation safety.StopObservation, accessMayRemain bool) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil {
+		return err
+	}
+	if state.StopFence == nil || state.StopFence.Kind != safety.StopFenceCertificateActivation {
+		return fmt.Errorf("certificate activation stop fence missing")
+	}
+	next := state
+	next.Revision++
+	copy := *state.StopFence
+	copy.Observation = observation
+	copy.AccessMayRemain = accessMayRemain
+	next.StopFence = &copy
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
 func applicablePublicationMarkers(state safety.State, resourceID string) []safety.MarkerGeneration {
 	result := []safety.MarkerGeneration{}
 	if state.GlobalClose.Phase != safety.GlobalCloseNone {
@@ -261,6 +388,37 @@ func shaDigest(data []byte) string {
 }
 func (s *FixedService) OwnershipInventory() (ownership.Inventory, error) {
 	return s.ownership.Inventory()
+}
+func (s *FixedService) PendingCertificateRecovery() error {
+	document, err := s.normal.Read()
+	if err != nil {
+		return err
+	}
+	certificateJobs := map[string]bool{}
+	for key, raw := range document.Entries {
+		if !strings.HasPrefix(key, "journals/") {
+			continue
+		}
+		var journal operations.JournalRecord
+		if json.Unmarshal(raw, &journal) == nil && journal.Kind == operations.JournalCertificateActivation && journal.Phase != operations.JournalTerminal {
+			certificateJobs[journal.JobID] = true
+		}
+	}
+	ids := []string{}
+	for key, raw := range document.Entries {
+		if !strings.HasPrefix(key, "intents/") {
+			continue
+		}
+		var intent operations.Reservation
+		if json.Unmarshal(raw, &intent) == nil && certificateJobs[intent.JobID] && intent.Phase != operations.PhaseTerminal && intent.Phase != operations.PhaseRejected {
+			ids = append(ids, intent.JobID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	sort.Strings(ids)
+	return fmt.Errorf("interrupted certificate operation requires contraction: %s", strings.Join(ids, ","))
 }
 func (s *FixedService) PendingPublicationRecovery() error {
 	document, err := s.normal.Read()
@@ -319,6 +477,9 @@ func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 		return false, err
 	}
 	if err := s.PendingPublicationRecovery(); err != nil {
+		return false, err
+	}
+	if err := s.PendingCertificateRecovery(); err != nil {
 		return false, err
 	}
 	raw, present := document.Entries["installations/current"]

@@ -24,6 +24,7 @@ type InstallAuthority struct {
 	caseID                string
 	operation             string
 	authorityCreatedAt    time.Time
+	lego                  AssetIdentity
 }
 
 type InstallIdentity struct {
@@ -42,6 +43,7 @@ type InstallIdentity struct {
 	CaseID                string        `json:"case_id,omitempty"`
 	Operation             string        `json:"operation"`
 	AuthorityCreatedAt    time.Time     `json:"authority_created_at"`
+	Lego                  AssetIdentity `json:"lego"`
 }
 
 func (authority *InstallAuthority) Identity() InstallIdentity {
@@ -54,7 +56,7 @@ func (authority *InstallAuthority) Identity() InstallIdentity {
 		Profile: authority.profile, ProfileDigest: authority.profileDigest, CapabilityDigest: authority.capabilityDigest,
 		CandidateDigest: authority.candidateDigest, QualificationManifest: authority.qualificationManifest,
 		HostFingerprint: authority.hostFingerprint, CaseID: authority.caseID, Operation: authority.operation,
-		AuthorityCreatedAt: authority.authorityCreatedAt,
+		AuthorityCreatedAt: authority.authorityCreatedAt, Lego: authority.lego,
 	}
 }
 
@@ -70,7 +72,7 @@ func RehydrateInstallAuthority(value InstallIdentity) (*InstallAuthority, error)
 		profile: value.Profile, profileDigest: value.ProfileDigest, capabilityDigest: value.CapabilityDigest,
 		candidateDigest: value.CandidateDigest, qualificationManifest: value.QualificationManifest,
 		hostFingerprint: value.HostFingerprint, caseID: value.CaseID, operation: value.Operation,
-		authorityCreatedAt: value.AuthorityCreatedAt,
+		authorityCreatedAt: value.AuthorityCreatedAt, lego: value.Lego,
 	}, nil
 }
 
@@ -103,7 +105,7 @@ func VerifyCandidateInstallAuthority(expectedEnvelopeDigest, expectedQualificati
 		binary: value.Binary, sourceTreeDigest: value.SourceTreeDigest, profile: profile, profileDigest: profileDigest,
 		capabilityDigest: DigestBytes(capabilityBytes), candidateDigest: candidate.envelope.digest,
 		qualificationManifest: manifest.digest, hostFingerprint: observed.HostFingerprint,
-		caseID: observed.CaseID, operation: observed.Operation, authorityCreatedAt: manifest.value.CreatedAt,
+		caseID: observed.CaseID, operation: observed.Operation, authorityCreatedAt: manifest.value.CreatedAt, lego: findAdditionalAsset(value, "lego"),
 	}, nil
 }
 
@@ -133,11 +135,23 @@ func VerifyFinalInstallAuthority(expectedManifestDigest, expectedEnvelopeDigest 
 		manifestDigest: final.manifest.digest, binary: value.Binary, sourceTreeDigest: value.SourceTreeDigest,
 		profile: profile, profileDigest: profileDigest, capabilityDigest: DigestBytes(capabilityBytes),
 		candidateDigest: value.QualificationCandidateOID, hostFingerprint: observed.HostFingerprint,
-		operation: "bootstrap_install", authorityCreatedAt: final.security.ScannedAt,
+		operation: "bootstrap_install", authorityCreatedAt: final.security.ScannedAt, lego: findAdditionalAsset(value, "lego"),
 	}, nil
 }
 
+func findAdditionalAsset(value Envelope, path string) AssetIdentity {
+	for _, asset := range value.AdditionalAssets {
+		if asset.Path == path {
+			return asset
+		}
+	}
+	return AssetIdentity{}
+}
+
 func ValidateInstallIdentity(value InstallIdentity) error {
+	if validateAsset(value.Lego) != nil || value.Lego.Path != "lego" {
+		return fmt.Errorf("installation lego identity is invalid")
+	}
 	if value.Kind != EnvelopeQualificationCandidate && value.Kind != EnvelopeFinal || !releaseTagPattern.MatchString(value.ReleaseTag) || !ValidDigest(value.EnvelopeDigest) || value.Kind == EnvelopeFinal && !ValidDigest(value.ManifestDigest) || value.Kind == EnvelopeQualificationCandidate && value.ManifestDigest != "" || validateAsset(value.Binary) != nil || !ValidDigest(value.SourceTreeDigest) || validateOSProfile(value.Profile) != nil || !ValidDigest(value.ProfileDigest) || !ValidDigest(value.CapabilityDigest) || !ValidDigest(value.CandidateDigest) || !refPattern.MatchString(value.HostFingerprint) || value.Operation != "bootstrap_install" || !sameUTCSecond(value.AuthorityCreatedAt) {
 		return fmt.Errorf("installation release identity is invalid")
 	}
