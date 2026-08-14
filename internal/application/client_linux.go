@@ -20,6 +20,22 @@ type HelperClient func(context.Context, helperproto.Operation, helperproto.Actio
 type ResourceHelperClient func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error)
 type ResourceMutationPayload struct{ Resource any }
 type ProcessMutationPayload struct{}
+type ManagedBasicPayload struct {
+	Username     string `json:"username,omitempty"`
+	PlanID       string `json:"plan_id,omitempty"`
+	Confirmation string `json:"confirmation"`
+}
+type DomainStatusPayload struct{}
+type StaticRootPayload struct {
+	Path         string `json:"path"`
+	Confirmation string `json:"confirmation"`
+}
+type ManagedBasicActionResult struct {
+	CredentialID string `json:"credential_id"`
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	JobID        string `json:"job_id"`
+	Password     []byte `json:"password,omitempty"`
+}
 type PublicationResult struct {
 	JobID     string
 	PublicURL string
@@ -61,6 +77,50 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: RotationResult{reply.Digest, reply.Action.JobID, reply.Secret}}, nil
 	})
+	managedBasicAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		payload := call.Payload.(ManagedBasicPayload)
+		helperOperation := helperproto.OperationManagedBasicGenerate
+		if call.Operation == domain.OperationManagedBasicDelete {
+			helperOperation = helperproto.OperationManagedBasicDelete
+		}
+		reply, err := client(ctx, helperOperation, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation, Username: payload.Username})
+		if err != nil || reply.Action == nil || reply.Action.JobID == "" {
+			clear(reply.Secret)
+			return Result{}, fmt.Errorf("managed Basic action failed")
+		}
+		if call.Operation != domain.OperationManagedBasicDelete && len(reply.Secret) == 0 {
+			return Result{}, fmt.Errorf("managed Basic secret missing")
+		}
+		result := ManagedBasicActionResult{CredentialID: reply.Action.TargetID, Fingerprint: reply.Digest, JobID: reply.Action.JobID, Password: reply.Secret}
+		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: result}, nil
+	}
+	staticRootAction, _ := RegisterAction(domain.OperationStaticRootRegister, StaticRootPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		payload := call.Payload.(StaticRootPayload)
+		reply, err := client(ctx, helperproto.OperationStaticRootRegister, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: payload.Confirmation, StaticRoot: payload.Path})
+		if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+			return Result{}, fmt.Errorf("static root registration failed")
+		}
+		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
+	})
+	externalHTPasswdAction, _ := RegisterAction(domain.OperationExternalHTPasswdRegister, StaticRootPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		payload := call.Payload.(StaticRootPayload)
+		reply, err := client(ctx, helperproto.OperationExternalHTPasswdRegister, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: payload.Confirmation, ExternalHTPasswdFile: payload.Path})
+		if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+			return Result{}, fmt.Errorf("external htpasswd registration failed")
+		}
+		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
+	})
+	domainStatusAction, _ := RegisterAction(domain.OperationStatus, DomainStatusPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		reply, err := client(ctx, helperproto.OperationDomainStatus, helperproto.ActionPayload{Operation: "status", TargetKind: "resource", TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation})
+		if err != nil || reply.Resource == nil || reply.Resource.ResourceID != call.Target.ID || len(reply.Secret) != 0 {
+			return Result{}, fmt.Errorf("domain status failed")
+		}
+		status := DomainSourceStatus{ResourceID: reply.Resource.ResourceID, Status: reply.Resource.Status, AccessMayRemain: reply.Resource.AccessMayRemain, CredentialFingerprint: reply.Resource.CredentialFingerprint, CredentialChanged: reply.Resource.CredentialChanged, StaticFingerprint: reply.Resource.StaticFingerprint, StaticChanged: reply.Resource.StaticChanged, ObservedAt: reply.Resource.ObservedAt, Reason: reply.Resource.Reason, AllowedActions: append([]string(nil), reply.Resource.AllowedActions...), CredentialIDs: append([]string(nil), reply.Resource.CredentialIDs...)}
+		return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
+	})
+	basicCreate, _ := RegisterAction(domain.OperationManagedBasicCreate, ManagedBasicPayload{}, true, false, managedBasicAction)
+	basicRotate, _ := RegisterAction(domain.OperationManagedBasicRotate, ManagedBasicPayload{}, true, false, managedBasicAction)
+	basicDelete, _ := RegisterAction(domain.OperationManagedBasicDelete, ManagedBasicPayload{}, true, false, managedBasicAction)
 	contractionAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(ConfirmationPayload)
 		reply, err := client(ctx, helperproto.OperationContractionClose, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation})
@@ -72,7 +132,7 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 	}
 	closeAll, _ := RegisterAction("close_all", ConfirmationPayload{}, true, false, contractionAction)
 	unpublish, _ := RegisterAction("unpublish", ConfirmationPayload{}, true, false, contractionAction)
-	registrations := []Registration{plan, rotate, closeAll, unpublish}
+	registrations := []Registration{plan, rotate, basicCreate, basicRotate, basicDelete, staticRootAction, externalHTPasswdAction, domainStatusAction, closeAll, unpublish}
 	if resourceClient != nil {
 		resourceAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ResourceMutationPayload)

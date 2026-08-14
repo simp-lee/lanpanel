@@ -699,6 +699,46 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	}
 }
 
+func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	installation := operationStateInstallation()
+	resource := &installation.Resources[0]
+	resource.PublicationRecord.State = domain.PublicationPublished
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
+	resource.PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
+	resource.PublicationRecord.LastAppliedBundle = &bundle
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	terminal, err := jobs.Finish(running, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: testDigest("runtime")}}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource.PublicationRecord.LastOperation = domain.OperationPublish
+	resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	resource.PublicationRecord.LastJobID = terminal.ID
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: terminal.ID, PlanID: "plan-one", AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + resource.ID, Phase: PhaseTerminal, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: resource.ID}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	encode := func(value any) json.RawMessage {
+		raw, err := persist.EncodeEntry(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(installation), reservationKey(terminal.ID): encode(intent), "jobs/" + terminal.ID: encode(terminal)}}
+	afterInstallation := installation
+	afterInstallation.Resources = append([]domain.AppResource(nil), installation.Resources...)
+	afterInstallation.Resources[0].PublicationRecord.State = domain.PublicationUnpublished
+	afterInstallation.Resources[0].PublicationRecord.UnpublishedGeneration = 3
+	afterInstallation.Resources[0].PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: now.Add(2 * time.Second).Format(time.RFC3339), Reason: "committed_activation_recovery_contracted"}
+	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(afterInstallation), reservationKey(terminal.ID): encode(intent), "jobs/" + terminal.ID: encode(terminal)}}
+	if err := validateOperationStateTransitions(before, after); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPlanBoundCertificateChallengeStartsAcrossMatchingBaseMarker(t *testing.T) {
 	state := safety.State{GlobalClose: safety.GlobalClose{Phase: safety.GlobalCloseNone}, Resources: []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", State: safety.ResourceActive, Ownership: safety.OwnershipOwned, StickyUnpublished: &safety.GenerationMarker{Generation: 3}}}}
 	binding := SafetyBinding{ResourceID: state.Resources[0].ResourceID, PlanID: "plan_0000000000000000000000000000000", IntentGeneration: 4, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), ChallengeMethod: "http-01", CertificateIdentity: "cert_00000000000000000000000000000000", Deadline: time.Now().UTC().Add(time.Hour)}

@@ -128,6 +128,18 @@ func GoAccessProbeHandler(r Revalidator, e Executor) Registration {
 func ManagedBasicGenerateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagedBasicGenerate, r, e)
 }
+func ManagedBasicDeleteHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationManagedBasicDelete, r, e)
+}
+func StaticRootRegisterHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationStaticRootRegister, r, e)
+}
+func ExternalHTPasswdRegisterHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationExternalHTPasswdRegister, r, e)
+}
+func DomainStatusHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationDomainStatus, r, e)
+}
 func ContractionCloseHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationContractionClose, r, e)
 }
@@ -263,6 +275,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			return err
 		}
 		requestContext, cancel := context.WithTimeout(ctx, remaining)
+		go func() { buffer := make([]byte, 1); _, _ = connection.Read(buffer); cancel() }()
 		handler, available := server.handlers[request.Operation]
 		if !available {
 			cancel()
@@ -294,9 +307,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
 		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource}
-		if err := helperproto.WriteResponse(connection, request.Operation, response, result.Secret); err != nil {
-			return err
-		}
+		return helperproto.WriteResponse(connection, request.Operation, response, result.Secret)
 	}
 }
 

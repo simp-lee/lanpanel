@@ -25,6 +25,7 @@ import (
 	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -59,7 +60,7 @@ func operationRegistry() (*operations.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}})
+	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}})
 }
 
 type FixedService struct {
@@ -504,7 +505,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	if err := domain.ValidateOperationTarget(payload.Operation, payload.Target); err != nil {
 		return plans.Plan{}, err
 	}
-	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish {
+	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish && payload.Operation != domain.OperationManagedBasicDelete {
 		return plans.Plan{}, ErrUnavailable
 	}
 	document, err := s.normal.Read()
@@ -517,6 +518,36 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	}
 	if payload.Operation == domain.OperationPublish {
 		return s.createPublishPlan(ctx, authority, document, payload.Target)
+	}
+	if payload.Operation == domain.OperationManagedBasicDelete {
+		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
+		if err != nil {
+			return plans.Plan{}, err
+		}
+		var credential *domain.Credential
+		for index := range installation.Credentials {
+			if installation.Credentials[index].ID == payload.Target.ID {
+				credential = &installation.Credentials[index]
+			}
+		}
+		if credential == nil || credential.Kind != "managed_basic" {
+			return plans.Plan{}, fmt.Errorf("managed Basic credential missing")
+		}
+		if err := requireNoDegradedAppliedSource(credential.OwnerResourceID); err != nil {
+			return plans.Plan{}, err
+		}
+		for _, resource := range installation.Resources {
+			if applicationCredentialReferenced(resource, credential.ID) {
+				return plans.Plan{}, fmt.Errorf("active resource reference blocks credential delete")
+			}
+		}
+		admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
+		if err != nil {
+			return plans.Plan{}, err
+		}
+		defer admission.Release()
+		spec := plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetCredential, ID: credential.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: credential.Fingerprint}, ExposureSummary: "deletes_managed_basic_credential_" + credential.ID, Prerequisites: "credential_has_no_current_applied_or_activating_reference", Lifetime: 10 * time.Minute}
+		return s.plans.Create(ctx, admission, document.Revision, spec)
 	}
 	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {
@@ -545,6 +576,19 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	return s.plans.Create(ctx, admission, document.Revision, spec)
 }
 
+func applicationCredentialReferenced(resource domain.AppResource, id string) bool {
+	if slices.Contains(resource.CredentialIDs, id) || resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID == id {
+		return true
+	}
+	if bundle := resource.PublicationRecord.LastAppliedBundle; bundle != nil && slices.Contains(bundle.CredentialIDs, id) {
+		return true
+	}
+	if intent := resource.PublicationRecord.ActivationIntent; intent != nil && (slices.Contains(intent.Candidate.CredentialIDs, id) || intent.Prior != nil && slices.Contains(intent.Prior.CredentialIDs, id)) {
+		return true
+	}
+	return false
+}
+
 func (s *FixedService) createPublishPlan(ctx context.Context, authority string, document persist.Document, target domain.OperationTarget) (plans.Plan, error) {
 	if target.Kind != domain.OperationTargetResource {
 		return plans.Plan{}, fmt.Errorf("publish target must be a resource")
@@ -567,8 +611,11 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	if resource == nil {
 		return plans.Plan{}, fmt.Errorf("publish resource missing")
 	}
+	if resource.Publication.Kind == domain.PublicationDomainHTTPS {
+		return s.createDomainPublishPlan(ctx, authority, document, installation, *resource)
+	}
 	if resource.Publication.Kind != domain.PublicationTemporaryHTTP {
-		return plans.Plan{}, fmt.Errorf("publication prerequisite unavailable until typed domain activation")
+		return plans.Plan{}, fmt.Errorf("publication type unsupported")
 	}
 	if resource.Target.Kind != domain.AppTargetLocalHTTP || resource.Target.WebSocket.Enabled || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest {
 		return plans.Plan{}, fmt.Errorf("temporary publication requires exact running local target without WebSocket")
@@ -611,6 +658,70 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	}
 	temporary := resource.Publication.TemporaryHTTP
 	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence}, ExposureSummary: fmt.Sprintf("url=http://%s:%d/ listener=0.0.0.0:%d target=resource/%s", temporary.PublicIPv4, temporary.Port, temporary.Port, resource.ID), Prerequisites: publication.PlaintextWarning, Lifetime: 10 * time.Minute}
+	_ = request
+	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	defer admission.Release()
+	return s.plans.Create(ctx, admission, document.Revision, spec)
+}
+
+func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority string, document persist.Document, installation domain.Installation, resource domain.AppResource) (plans.Plan, error) {
+	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
+		return plans.Plan{}, err
+	}
+	if resource.Target.Kind != domain.AppTargetLocalHTTP || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest {
+		return plans.Plan{}, fmt.Errorf("domain publication requires exact running target")
+	}
+	if _, err := reservations.BuildClaims(installation); err != nil {
+		return plans.Plan{}, err
+	}
+	state, err := s.safety.Read()
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	safetyResource := findSafetyResource(state, resource.ID)
+	if safetyResource == nil || safetyResource.StickyUnpublished == nil && resource.PublicationRecord.State != domain.PublicationPublished {
+		return plans.Plan{}, fmt.Errorf("domain publish authority unavailable")
+	}
+	request, preflightResult, err := evaluateDomainPreflight(ctx, installation, resource, state)
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	preflightEvidence, err := preflightResult.PlanEvidence()
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	readiness, err := probeResourceTarget(ctx, resource)
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	_, bindingDigest, err := candidateACMEBinding(resource)
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	sourceEvidence, err := observeDomainSources(s, resource)
+	if err != nil {
+		return plans.Plan{}, err
+	}
+	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: readiness.Digest, ObservedAt: readiness.ObservedAt}
+	acmeEvidence := plans.Evidence{Kind: "acme_binding", Identity: "resource/" + resource.ID, Generation: safetyResource.GenerationSequence + 1, Digest: bindingDigest, ObservedAt: time.Now().UTC()}
+	applied := plans.DigestBinding{}
+	if resource.PublicationRecord.LastAppliedDigest != nil {
+		applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
+	}
+	publication := resource.Publication.DomainHTTPS
+	domains := append([]string{publication.CanonicalDomain}, publication.Aliases...)
+	sort.Strings(domains)
+	anonymousStatic := publication.AccessMode == domain.AppAccessApplicationManaged && len(publication.StaticMappings) > 0
+	staticValues := make([]string, len(publication.StaticMappings))
+	for index, mapping := range publication.StaticMappings {
+		staticValues[index] = mapping.URLPath + ":" + mapping.RelativePath
+	}
+	certificate := publication.Certificate
+	summary := fmt.Sprintf("url=https://%s/ listeners=80,443 domains=%s auth=%s credential=%s cidrs=%s static_root=%s static=%s static_anonymous_confirmed=%t certificate=%s:%s:%s target=resource/%s", publication.CanonicalDomain, strings.Join(domains, ","), publication.AccessMode, publication.CredentialID, strings.Join(publication.CIDRs, ","), publication.StaticRootID, strings.Join(staticValues, ","), anonymousStatic, certificate.ChallengeMethod, certificate.DNSProvider, certificate.DirectoryURL, resource.ID)
+	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence, acmeEvidence, sourceEvidence}, ExposureSummary: summary, Prerequisites: "Exact certificate, auth, CIDR, static, target, and Host/SNI validation required before activation.", Lifetime: 10 * time.Minute}
 	_ = request
 	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {

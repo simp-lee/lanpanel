@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -104,55 +105,57 @@ type OperationTarget struct {
 }
 
 const (
-	OperationInstanceConfigCreate    OperationCode = "instance_config_create"
-	OperationInstanceConfigUpdate    OperationCode = "instance_config_update"
-	OperationValidate                OperationCode = "validate"
-	OperationPlan                    OperationCode = "plan"
-	OperationDeploy                  OperationCode = "deploy"
-	OperationStatus                  OperationCode = "status"
-	OperationDiagnostics             OperationCode = "diagnostics"
-	OperationConfigurationExport     OperationCode = "configuration_export"
-	OperationAdminTokenRotate        OperationCode = "admin_token_rotate"
-	OperationHeadscaleReissue        OperationCode = "headscale_certificate_reissue"
-	OperationDependencyUpload        OperationCode = "dependency_upload"
-	OperationDependencyImport        OperationCode = "dependency_import"
-	OperationMaintenance             OperationCode = "maintenance"
-	OperationBackupEnter             OperationCode = "backup_enter"
-	OperationBackupPreparingAbort    OperationCode = "backup_preparing_abort"
-	OperationBackupExit              OperationCode = "backup_exit"
-	OperationRestoreEvidenceImport   OperationCode = "restore_evidence_import"
-	OperationRestoreCutover          OperationCode = "restore_cutover"
-	OperationConnectorVerify         OperationCode = "connector_verify"
-	OperationConnectorAuthKeyImport  OperationCode = "connector_auth_key_import"
-	OperationConnectorAuthKeyAdopt   OperationCode = "connector_auth_key_adopt"
-	OperationConnectorAuthKeyDiscard OperationCode = "connector_auth_key_discard"
-	OperationConnectorLogin          OperationCode = "connector_login"
-	OperationConnectorDisconnect     OperationCode = "connector_disconnect"
-	OperationConnectorRebind         OperationCode = "connector_rebind"
-	OperationResourceCreate          OperationCode = "resource_create"
-	OperationResourceUpdate          OperationCode = "resource_update"
-	OperationResourceDelete          OperationCode = "resource_delete"
-	OperationPublish                 OperationCode = "publish"
-	OperationUnpublish               OperationCode = "unpublish"
-	OperationCloseAll                OperationCode = "close_all"
-	OperationProcessStart            OperationCode = "process_start"
-	OperationProcessStop             OperationCode = "process_stop"
-	OperationUnpublishAndStop        OperationCode = "unpublish_and_stop"
-	OperationHeadscaleUserCreate     OperationCode = "headscale_user_create"
-	OperationHeadscaleUserList       OperationCode = "headscale_user_list"
-	OperationPreauthKeyCreate        OperationCode = "preauth_key_create"
-	OperationPreauthKeyList          OperationCode = "preauth_key_list"
-	OperationPreauthKeyRevoke        OperationCode = "preauth_key_revoke"
-	OperationDeviceList              OperationCode = "device_list"
-	OperationDeviceExpire            OperationCode = "device_expire"
-	OperationManagedBasicCreate      OperationCode = "managed_basic_create"
-	OperationManagedBasicRotate      OperationCode = "managed_basic_rotate"
-	OperationManagedBasicDelete      OperationCode = "managed_basic_delete"
-	OperationEdgeOneDiagnostics      OperationCode = "edgeone_diagnostics"
-	OperationEdgeOneRefresh          OperationCode = "edgeone_refresh"
-	OperationJobList                 OperationCode = "job_list"
-	OperationJobDetail               OperationCode = "job_detail"
-	OperationSessionLogout           OperationCode = "session_logout"
+	OperationInstanceConfigCreate     OperationCode = "instance_config_create"
+	OperationInstanceConfigUpdate     OperationCode = "instance_config_update"
+	OperationValidate                 OperationCode = "validate"
+	OperationPlan                     OperationCode = "plan"
+	OperationDeploy                   OperationCode = "deploy"
+	OperationStatus                   OperationCode = "status"
+	OperationDiagnostics              OperationCode = "diagnostics"
+	OperationConfigurationExport      OperationCode = "configuration_export"
+	OperationAdminTokenRotate         OperationCode = "admin_token_rotate"
+	OperationHeadscaleReissue         OperationCode = "headscale_certificate_reissue"
+	OperationDependencyUpload         OperationCode = "dependency_upload"
+	OperationDependencyImport         OperationCode = "dependency_import"
+	OperationMaintenance              OperationCode = "maintenance"
+	OperationBackupEnter              OperationCode = "backup_enter"
+	OperationBackupPreparingAbort     OperationCode = "backup_preparing_abort"
+	OperationBackupExit               OperationCode = "backup_exit"
+	OperationRestoreEvidenceImport    OperationCode = "restore_evidence_import"
+	OperationRestoreCutover           OperationCode = "restore_cutover"
+	OperationConnectorVerify          OperationCode = "connector_verify"
+	OperationConnectorAuthKeyImport   OperationCode = "connector_auth_key_import"
+	OperationConnectorAuthKeyAdopt    OperationCode = "connector_auth_key_adopt"
+	OperationConnectorAuthKeyDiscard  OperationCode = "connector_auth_key_discard"
+	OperationConnectorLogin           OperationCode = "connector_login"
+	OperationConnectorDisconnect      OperationCode = "connector_disconnect"
+	OperationConnectorRebind          OperationCode = "connector_rebind"
+	OperationResourceCreate           OperationCode = "resource_create"
+	OperationResourceUpdate           OperationCode = "resource_update"
+	OperationResourceDelete           OperationCode = "resource_delete"
+	OperationPublish                  OperationCode = "publish"
+	OperationUnpublish                OperationCode = "unpublish"
+	OperationCloseAll                 OperationCode = "close_all"
+	OperationProcessStart             OperationCode = "process_start"
+	OperationProcessStop              OperationCode = "process_stop"
+	OperationUnpublishAndStop         OperationCode = "unpublish_and_stop"
+	OperationHeadscaleUserCreate      OperationCode = "headscale_user_create"
+	OperationHeadscaleUserList        OperationCode = "headscale_user_list"
+	OperationPreauthKeyCreate         OperationCode = "preauth_key_create"
+	OperationPreauthKeyList           OperationCode = "preauth_key_list"
+	OperationPreauthKeyRevoke         OperationCode = "preauth_key_revoke"
+	OperationDeviceList               OperationCode = "device_list"
+	OperationDeviceExpire             OperationCode = "device_expire"
+	OperationManagedBasicCreate       OperationCode = "managed_basic_create"
+	OperationManagedBasicRotate       OperationCode = "managed_basic_rotate"
+	OperationManagedBasicDelete       OperationCode = "managed_basic_delete"
+	OperationStaticRootRegister       OperationCode = "static_root_register"
+	OperationExternalHTPasswdRegister OperationCode = "external_htpasswd_register"
+	OperationEdgeOneDiagnostics       OperationCode = "edgeone_diagnostics"
+	OperationEdgeOneRefresh           OperationCode = "edgeone_refresh"
+	OperationJobList                  OperationCode = "job_list"
+	OperationJobDetail                OperationCode = "job_detail"
+	OperationSessionLogout            OperationCode = "session_logout"
 )
 
 type Installation struct {
@@ -162,6 +165,7 @@ type Installation struct {
 	Headscale      *HeadscaleDomain    `json:"headscale,omitempty"`
 	Connector      *TailnetConnector   `json:"connector,omitempty"`
 	Credentials    []Credential        `json:"credentials,omitempty"`
+	StaticRoots    []StaticContentRoot `json:"static_roots,omitempty"`
 	ManagedPaths   []string            `json:"managed_paths,omitempty"`
 	Resources      []AppResource       `json:"resources,omitempty"`
 }
@@ -186,8 +190,25 @@ type TailnetConnector struct {
 }
 
 type Credential struct {
+	ID              string `json:"id"`
+	Kind            string `json:"kind,omitempty"`
+	OwnerResourceID string `json:"owner_resource_id,omitempty"`
+	Username        string `json:"username,omitempty"`
+	ManagedPath     string `json:"managed_path,omitempty"`
+	ExternalPath    string `json:"external_path,omitempty"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+}
+type StaticContentRoot struct {
 	ID          string `json:"id"`
-	ManagedPath string `json:"managed_path"`
+	Path        string `json:"path"`
+	Fingerprint string `json:"fingerprint"`
+	Device      uint64 `json:"device"`
+}
+type StaticMapping struct {
+	URLPath      string `json:"url_path"`
+	RelativePath string `json:"relative_path"`
+	Directory    bool   `json:"directory"`
+	Anonymous    bool   `json:"anonymous,omitempty"`
 }
 
 type AppResource struct {
@@ -239,6 +260,9 @@ type DomainHTTPSPublication struct {
 	Aliases         []string            `json:"aliases,omitempty"`
 	AccessMode      AppAccessMode       `json:"access_mode"`
 	CredentialID    string              `json:"credential_id,omitempty"`
+	CIDRs           []string            `json:"cidrs,omitempty"`
+	StaticRootID    string              `json:"static_root_id,omitempty"`
+	StaticMappings  []StaticMapping     `json:"static_mappings,omitempty"`
 	Certificate     *CertificateRequest `json:"certificate,omitempty"`
 }
 type CertificateRequest struct {
@@ -399,10 +423,21 @@ type CertificateCredentialIdentity struct {
 type AuthBundleIdentity struct {
 	Mode               AppAccessMode `json:"mode"`
 	CredentialIdentity string        `json:"credential_identity,omitempty"`
+	ReferenceIdentity  string        `json:"reference_identity,omitempty"`
 }
 
 type StaticBundleIdentity struct {
-	RouteIdentities []string `json:"route_identities"`
+	RootID          string                      `json:"root_id,omitempty"`
+	Routes          []StaticRouteBundleIdentity `json:"routes"`
+	RouteIdentities []string                    `json:"route_identities"`
+}
+type StaticRouteBundleIdentity struct {
+	URLPath      string `json:"url_path"`
+	RelativePath string `json:"relative_path"`
+	SourcePath   string `json:"source_path"`
+	Directory    bool   `json:"directory"`
+	Anonymous    bool   `json:"anonymous,omitempty"`
+	Fingerprint  string `json:"fingerprint"`
 }
 
 type GoAccessBundleIdentity struct {
@@ -478,7 +513,7 @@ func ParseOperationCode(value string) (OperationCode, error) {
 		OperationHeadscaleUserList, OperationPreauthKeyCreate, OperationPreauthKeyList,
 		OperationPreauthKeyRevoke, OperationDeviceList, OperationDeviceExpire,
 		OperationManagedBasicCreate, OperationManagedBasicRotate,
-		OperationManagedBasicDelete, OperationEdgeOneDiagnostics,
+		OperationManagedBasicDelete, OperationStaticRootRegister, OperationExternalHTPasswdRegister, OperationEdgeOneDiagnostics,
 		OperationEdgeOneRefresh, OperationJobList, OperationJobDetail,
 		OperationSessionLogout:
 		return OperationCode(value), nil
@@ -497,7 +532,7 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 		allowed = target.Kind == OperationTargetInstallation || target.Kind == OperationTargetResource
 	case OperationResourceUpdate, OperationResourceDelete, OperationPublish, OperationUnpublish,
 		OperationProcessStart, OperationProcessStop, OperationUnpublishAndStop,
-		OperationManagedBasicCreate, OperationEdgeOneDiagnostics, OperationEdgeOneRefresh:
+		OperationManagedBasicCreate, OperationStaticRootRegister, OperationExternalHTPasswdRegister, OperationEdgeOneDiagnostics, OperationEdgeOneRefresh:
 		allowed = target.Kind == OperationTargetResource
 	case OperationManagedBasicRotate, OperationManagedBasicDelete:
 		allowed = target.Kind == OperationTargetCredential
@@ -624,6 +659,7 @@ func ValidateInstallation(installation Installation) error {
 		}
 	}
 	credentialIDs := make(map[string]struct{}, len(installation.Credentials))
+	credentialOwners := make(map[string]string, len(installation.Credentials))
 	for index, credential := range installation.Credentials {
 		if !strings.HasPrefix(credential.ID, "cred_") || !idPattern.MatchString(credential.ID) {
 			return fmt.Errorf("credentials[%d].id is invalid", index)
@@ -632,9 +668,29 @@ func ValidateInstallation(installation Installation) error {
 			return fmt.Errorf("credential id %q is duplicated", credential.ID)
 		}
 		credentialIDs[credential.ID] = struct{}{}
-		if err := validateManagedPath(credential.ManagedPath); err != nil {
-			return fmt.Errorf("credentials[%d].managed_path: %w", index, err)
+		credentialOwners[credential.ID] = credential.OwnerResourceID
+		switch credential.Kind {
+		case "managed_basic":
+			if !validBasicUsername(credential.Username) || !idPattern.MatchString(credential.OwnerResourceID) || credential.ManagedPath != "/etc/lanpanel-public/basic/"+credential.ID+".htpasswd" || credential.ExternalPath != "" || !validSHA256Digest(credential.Fingerprint) {
+				return fmt.Errorf("credentials[%d] managed Basic identity invalid", index)
+			}
+		case "external_htpasswd":
+			if !idPattern.MatchString(credential.OwnerResourceID) || credential.Username != "" || credential.ManagedPath != "" || !cleanAbsolutePath(credential.ExternalPath) || !validSHA256Digest(credential.Fingerprint) {
+				return fmt.Errorf("credentials[%d] external htpasswd identity invalid", index)
+			}
+		default:
+			return fmt.Errorf("credentials[%d] kind invalid", index)
 		}
+	}
+	staticRootIDs := map[string]struct{}{}
+	for index, root := range installation.StaticRoots {
+		if !strings.HasPrefix(root.ID, "static_") || len(root.ID) != 39 || !cleanAbsolutePath(root.Path) || !validSHA256Digest(root.Fingerprint) || root.Device == 0 {
+			return fmt.Errorf("static_roots[%d] identity invalid", index)
+		}
+		if _, duplicate := staticRootIDs[root.ID]; duplicate {
+			return fmt.Errorf("static root duplicated")
+		}
+		staticRootIDs[root.ID] = struct{}{}
 	}
 	resourceIDs := make(map[string]struct{}, len(installation.Resources))
 	for index := range installation.Resources {
@@ -643,8 +699,13 @@ func ValidateInstallation(installation Installation) error {
 			return fmt.Errorf("resource id %q is duplicated", resource.ID)
 		}
 		resourceIDs[resource.ID] = struct{}{}
-		if err := validateResource(*resource, credentialIDs); err != nil {
+		if err := validateResource(*resource, credentialIDs, credentialOwners, staticRootIDs); err != nil {
 			return fmt.Errorf("resources[%d]: %w", index, err)
+		}
+	}
+	for id, owner := range credentialOwners {
+		if _, present := resourceIDs[owner]; !present {
+			return fmt.Errorf("credential %q owner resource is missing", id)
 		}
 	}
 	return nil
@@ -661,7 +722,7 @@ func validateManagement(authority ManagementAuthority) error {
 	return validatePaths("management.managed_paths", authority.ManagedPaths)
 }
 
-func validateResource(resource AppResource, credentialIDs map[string]struct{}) error {
+func validateResource(resource AppResource, credentialIDs map[string]struct{}, credentialOwners map[string]string, staticRootIDs map[string]struct{}) error {
 	if !strings.HasPrefix(resource.ID, "res_") || !idPattern.MatchString(resource.ID) {
 		return fmt.Errorf("id is invalid")
 	}
@@ -707,11 +768,22 @@ func validateResource(resource AppResource, credentialIDs map[string]struct{}) e
 		if _, exists := credentialIDs[credentialID]; !exists {
 			return fmt.Errorf("credential_id %q does not exist", credentialID)
 		}
+		if owner := credentialOwners[credentialID]; owner != "" && owner != resource.ID {
+			return fmt.Errorf("credential_id %q belongs to another resource", credentialID)
+		}
+	}
+	if publication := resource.Publication.DomainHTTPS; publication != nil && publication.StaticRootID != "" {
+		if _, present := staticRootIDs[publication.StaticRootID]; !present {
+			return fmt.Errorf("publication static_root_id does not exist")
+		}
 	}
 	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID != "" {
 		credentialID := resource.Publication.DomainHTTPS.CredentialID
 		if _, exists := credentialIDs[credentialID]; !exists {
 			return fmt.Errorf("publication credential_id %q does not exist", credentialID)
+		}
+		if owner := credentialOwners[credentialID]; owner != "" && owner != resource.ID {
+			return fmt.Errorf("publication credential belongs to another resource")
 		}
 		if _, referenced := seenCredentials[credentialID]; !referenced {
 			return fmt.Errorf("publication credential_id %q must be declared in resource credential_ids", credentialID)
@@ -813,8 +885,17 @@ func validatePublication(publication AppPublication) error {
 			if publication.DomainHTTPS.CredentialID == "" {
 				return fmt.Errorf("basic access requires credential_id")
 			}
+			if err := validatePublicationCIDRs(publication.DomainHTTPS.CIDRs); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("access mode %q is not supported", publication.DomainHTTPS.AccessMode)
+		}
+		if publication.DomainHTTPS.AccessMode != AppAccessBasic && len(publication.DomainHTTPS.CIDRs) != 0 {
+			return fmt.Errorf("CIDR allowlist requires basic access")
+		}
+		if err := validateStaticMappings(*publication.DomainHTTPS); err != nil {
+			return err
 		}
 		certificate := publication.DomainHTTPS.Certificate
 		if certificate != nil {
@@ -845,6 +926,60 @@ func validatePublication(publication AppPublication) error {
 	}
 }
 
+func validatePublicationCIDRs(values []string) error {
+	if len(values) > 128 {
+		return fmt.Errorf("CIDR allowlist oversized")
+	}
+	prior := ""
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || prefix.String() != value || prefix.Bits() == 0 || !prefix.Addr().IsGlobalUnicast() || prefix.Addr().IsPrivate() || prior != "" && prior >= value {
+			return fmt.Errorf("CIDR allowlist noncanonical")
+		}
+		prior = value
+	}
+	return nil
+}
+func validateStaticMappings(publication DomainHTTPSPublication) error {
+	if len(publication.StaticMappings) > 128 {
+		return fmt.Errorf("static mapping inventory oversized")
+	}
+	if (publication.StaticRootID == "") != (len(publication.StaticMappings) == 0) {
+		return fmt.Errorf("static root and mapping inventory must be paired")
+	}
+	prior := ""
+	for _, mapping := range publication.StaticMappings {
+		if !validStaticURL(mapping.URLPath, mapping.Directory) || mapping.RelativePath == "" || filepath.IsAbs(mapping.RelativePath) || filepath.Clean(mapping.RelativePath) != mapping.RelativePath || strings.HasPrefix(mapping.RelativePath, "..") || prior != "" && prior >= mapping.URLPath {
+			return fmt.Errorf("static mapping invalid")
+		}
+		if publication.AccessMode == AppAccessApplicationManaged && !mapping.Anonymous {
+			return fmt.Errorf("application-managed static requires anonymous confirmation")
+		}
+		prior = mapping.URLPath
+	}
+	return nil
+}
+func validStaticURL(value string, directory bool) bool {
+	if value == "" || !strings.HasPrefix(value, "/") || strings.ContainsAny(value, "?#\\%\x00\r\n \t;{}$\"'") || filepath.Clean(value) != strings.TrimSuffix(value, "/") {
+		return false
+	}
+	return directory == (value != "/" && strings.HasSuffix(value, "/"))
+}
+func validBasicUsername(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for index, character := range value {
+		if index == 0 && ((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')) {
+			continue
+		}
+		if index > 0 && ((character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || strings.ContainsRune("._@-", character)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
 func validACMEEmail(value string) bool {
 	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
 }
@@ -1228,15 +1363,23 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 		}
 		switch identity.Auth.Mode {
 		case AppAccessPublic, AppAccessApplicationManaged:
-			if identity.Auth.CredentialIdentity != "" {
+			if identity.Auth.CredentialIdentity != "" || identity.Auth.ReferenceIdentity != "" {
 				return fmt.Errorf("domain_https %s auth must not include credential identity", identity.Auth.Mode)
 			}
 		case AppAccessBasic:
-			if identity.Auth.CredentialIdentity == "" || identity.Auth.CredentialIdentity != strings.TrimSpace(identity.Auth.CredentialIdentity) {
-				return fmt.Errorf("domain_https basic auth requires credential identity")
+			if !strings.HasPrefix(identity.Auth.CredentialIdentity, "cred_") || !validSHA256Digest(identity.Auth.ReferenceIdentity) {
+				return fmt.Errorf("domain_https basic auth requires complete credential identity")
 			}
 		default:
 			return fmt.Errorf("domain_https auth mode %q is not supported", identity.Auth.Mode)
+		}
+		if (identity.Static.RootID == "") != (len(identity.Static.Routes) == 0) || len(identity.Static.Routes) != len(identity.Static.RouteIdentities) {
+			return fmt.Errorf("domain_https static bundle inventory incomplete")
+		}
+		for index, route := range identity.Static.Routes {
+			if !strings.HasPrefix(identity.Static.RootID, "static_") || !validStaticURL(route.URLPath, route.Directory) || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || !cleanAbsolutePath(route.SourcePath) || !validSHA256Digest(route.Fingerprint) || index > 0 && identity.Static.Routes[index-1].URLPath >= route.URLPath {
+				return fmt.Errorf("domain_https static route bundle invalid")
+			}
 		}
 		seenRoutes := map[string]struct{}{}
 		for _, routeIdentity := range identity.Static.RouteIdentities {
@@ -1297,7 +1440,13 @@ func validateCandidateMatchesPublication(candidate PublicationBundle, publicatio
 	switch publication.Kind {
 	case PublicationDomainHTTPS:
 		expectedDomains := append([]string{publication.DomainHTTPS.CanonicalDomain}, publication.DomainHTTPS.Aliases...)
-		if candidate.DomainHTTPS == nil || !reflect.DeepEqual(candidate.DomainHTTPS.ExactDomains, expectedDomains) {
+		slices.Sort(expectedDomains)
+		candidateDomains := []string(nil)
+		if candidate.DomainHTTPS != nil {
+			candidateDomains = append(candidateDomains, candidate.DomainHTTPS.ExactDomains...)
+			slices.Sort(candidateDomains)
+		}
+		if candidate.DomainHTTPS == nil || !reflect.DeepEqual(candidateDomains, expectedDomains) {
 			return fmt.Errorf("domain identity must match current publication exact domains")
 		}
 		if candidate.DomainHTTPS.Auth.Mode != publication.DomainHTTPS.AccessMode {
@@ -1368,7 +1517,15 @@ func canonicalHTTPSURL(value string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
 }
 func cleanAbsolutePath(value string) bool {
-	return filepath.IsAbs(value) && filepath.Clean(value) == value && value != "/" && !strings.ContainsAny(value, "\x00\r\n")
+	if !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 func validDNSProvider(value string) bool {
 	switch value {

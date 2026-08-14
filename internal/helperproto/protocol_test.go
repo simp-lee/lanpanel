@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -52,12 +53,73 @@ func TestTypedProtocolRejectsQueueingAndGenericSecrets(t *testing.T) {
 	}
 }
 
+func TestManagedBasicAndStaticRequestsAreClosed(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []Request{{SchemaVersion: SchemaVersion, RequestID: "basic-create", Operation: OperationManagedBasicGenerate, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "managed_basic_create", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "generate", Username: "admin.user"}}, {SchemaVersion: SchemaVersion, RequestID: "static-register", Operation: OperationStaticRootRegister, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "static_root_register", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "register", StaticRoot: "/srv/application/static"}}}
+	for index := range cases {
+		digestValue, err := ApplicationInputDigest(cases[index])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases[index].InputDigest = digestValue
+		if err := ValidateRequest(cases[index], now); err != nil {
+			t.Fatalf("valid request rejected: %v", err)
+		}
+	}
+	unsafe := cases[1]
+	unsafe.Action.StaticRoot = "/srv/static\ninclude"
+	unsafe.InputDigest, _ = ApplicationInputDigest(unsafe)
+	if ValidateRequest(unsafe, now) == nil {
+		t.Fatal("unsafe static path accepted")
+	}
+}
+
+func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
+	now := time.Now().UTC()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "domain-status", Operation: OperationDomainStatus, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "status", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1}}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatal(err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("status"), Resource: &ResourceResult{ResourceID: request.Action.TargetID, Status: "degraded", AccessMayRemain: true, ObservedAt: now, Reason: "external htpasswd changed", AllowedActions: []string{"unpublish", "close_all"}}}
+	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Resource.Status = "healthy"
+	response.Resource.AllowedActions = nil
+	response.Resource.AccessMayRemain = false
+	response.Resource.CredentialChanged = true
+	response.Resource.CredentialFingerprint = digest("changed")
+	response.Resource.Reason = "external htpasswd fingerprint changed but remains valid"
+	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
+		t.Fatalf("valid changed external status rejected: %v", err)
+	}
+	response.Resource.Reason = ""
+	if ValidateResponse(OperationDomainStatus, response) == nil {
+		t.Fatal("status without remediation reason accepted")
+	}
+}
+
+func TestPublicationRequestAllowsBoundedIssuanceDeadline(t *testing.T) {
+	now := time.Now().UTC()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "publish", Operation: OperationPublicationActivate, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(10 * time.Minute), Resource: &ResourcePayload{Operation: "publish", ActorIdentity: "session-one", ActorGeneration: 1, PlanID: "plan-one", Confirmation: "publish"}}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatal(err)
+	}
+	request.Deadline = now.Add(12 * time.Minute)
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if ValidateRequest(request, now) == nil {
+		t.Fatal("unbounded publication deadline accepted")
+	}
+}
+
 func TestOneTimeOutputSecretIsOutsideGenericResponse(t *testing.T) {
 	secret, err := NewOutputSecret([]byte("generated-password"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := Response{SchemaVersion: SchemaVersion, RequestID: "request-one", Code: ResponseSucceeded, ResultDigest: digest("result")}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "request-one", Code: ResponseSucceeded, ResultDigest: digest("result"), Action: &ActionResult{JobID: "job_00000000000000000000000000000001", Operation: "managed_basic_rotate", TargetKind: "credential", TargetID: "cred_00000000000000000000000000000001"}}
 	var wire bytes.Buffer
 	if err := WriteResponse(&wire, OperationManagedBasicGenerate, response, secret); err != nil {
 		t.Fatal(err)
@@ -68,7 +130,7 @@ func TestOneTimeOutputSecretIsOutsideGenericResponse(t *testing.T) {
 		t.Fatal("output secret entered generic response JSON")
 	}
 	got, output, err := ReadResponse(bytes.NewReader(encoded), OperationManagedBasicGenerate)
-	if err != nil || got != response || output == nil {
+	if err != nil || !reflect.DeepEqual(got, response) || output == nil {
 		t.Fatalf("ReadResponse()=%#v,%#v,%v", got, output, err)
 	}
 	seen := ""

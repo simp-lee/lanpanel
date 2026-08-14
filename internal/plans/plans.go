@@ -38,6 +38,7 @@ const (
 	TargetInstallation TargetKind = "installation"
 	TargetResource     TargetKind = "resource"
 	TargetHeadscale    TargetKind = "headscale"
+	TargetCredential   TargetKind = "credential"
 )
 
 type Target struct {
@@ -539,7 +540,7 @@ func planTarget(target Target) string {
 }
 func key(id string) string { return "plans/" + id }
 func validTarget(target Target) bool {
-	return target.Kind == TargetInstallation && target.ID == "" || (target.Kind == TargetResource || target.Kind == TargetHeadscale) && validRef(target.ID)
+	return target.Kind == TargetInstallation && target.ID == "" || (target.Kind == TargetResource || target.Kind == TargetHeadscale || target.Kind == TargetCredential) && validRef(target.ID)
 }
 func digestBindingValid(value DigestBinding) bool {
 	return value.Applicable && digest(value.Digest) || !value.Applicable && value.Digest == ""

@@ -43,7 +43,19 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		return application.HelperReply{}, err
 	}
 	defer connection.Close()
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = connection.SetDeadline(time.Now())
+		case <-finished:
+		}
+	}()
 	deadline := time.Now().Add(75 * time.Second)
+	if operation == helperproto.OperationPublicationActivate {
+		deadline = time.Now().Add(11 * time.Minute)
+	}
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
 		deadline = value
 	}
@@ -70,12 +82,15 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	defer clear(random)
 	nonce := hex.EncodeToString(random)
 	requestDeadline := time.Now().UTC().Add(time.Minute)
+	if operation == helperproto.OperationPublicationActivate {
+		requestDeadline = time.Now().UTC().Add(11 * time.Minute)
+	}
 	if operation == helperproto.OperationAdminTokenReconcile {
 		requestDeadline = time.Now().UTC().Add(30 * time.Second)
 	}
 	target := "installation"
-	if action != nil && action.TargetKind == "resource" && action.TargetID != "" {
-		target = "resource/" + action.TargetID
+	if action != nil && action.TargetID != "" && (action.TargetKind == "resource" || action.TargetKind == "credential") {
+		target = action.TargetKind + "/" + action.TargetID
 	}
 	if len(explicitTarget) == 1 {
 		target = explicitTarget[0]
@@ -99,6 +114,7 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	}
 	var output []byte
 	if responseSecret != nil {
+		defer responseSecret.Destroy()
 		output, err = responseSecret.OutputCopy()
 		if err != nil {
 			return application.HelperReply{}, err

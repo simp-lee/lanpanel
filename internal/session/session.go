@@ -119,6 +119,12 @@ func (m *Manager) AuthenticateSocket(selector, proof, origin, fingerprint string
 	}
 	return Principal{selector, m.generation}, nil
 }
+func (m *Manager) Valid(principal Principal) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	value, ok := m.entries[principal.Selector]
+	return ok && !expired(value, m.now().UTC()) && principal.Generation == m.generation && value.generation == m.generation && value.fingerprint == m.fingerprint
+}
 func (m *Manager) Attach(principal Principal, socket Socket) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

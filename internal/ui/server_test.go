@@ -37,6 +37,38 @@ func testServer(t *testing.T) *Server {
 	}
 	return server
 }
+func TestActionLeaseCancelsOnSessionInvalidation(t *testing.T) {
+	server := testServer(t)
+	principal := session.Principal{Selector: "selector", Generation: 1}
+	lease := server.beginAction(context.Background(), principal, false)
+	defer server.endAction(lease)
+	server.cancelActions(&principal, nil)
+	select {
+	case <-lease.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("action lease was not canceled")
+	}
+}
+
+func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *testing.T) {
+	server := testServer(t)
+	request := httptest.NewRequest(http.MethodGet, "http://127.1.2.3:52345/", nil)
+	request.Host = "127.1.2.3:52345"
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatal(response.Code)
+	}
+	for _, id := range []string{"domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
+		if !strings.Contains(response.Body.String(), `id="`+id+`"`) {
+			t.Fatalf("management control %s missing", id)
+		}
+	}
+	if !strings.Contains(response.Body.String(), "Static mappings (one URL|relative") {
+		t.Fatal("repeatable static mapping editor missing")
+	}
+}
+
 func TestLoginRequiresExactHostOriginAndBoundedBody(t *testing.T) {
 	server := testServer(t)
 	request := httptest.NewRequest(http.MethodPost, "http://127.1.2.3:52345/login", strings.NewReader("token=secret"))

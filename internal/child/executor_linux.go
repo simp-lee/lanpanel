@@ -120,7 +120,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	command.Env = []string{}
 	command.ExtraFiles = []*os.File{instructionRead, inputRead}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow)
+	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileHTPasswd)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
 	if err := ctx.Err(); err != nil {
@@ -191,8 +191,10 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 		exitCode = command.ProcessState.ExitCode()
 	}
 	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), Stdout: stdout.Bytes(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
+	stdout.Destroy()
+	stderr.Destroy()
 	if profileID == ProfileAPTSimulate && exitCode == 0 && !result.OutputCutOff {
-		changes, parseErr := parseAPTSimulation(stdout.Bytes())
+		changes, parseErr := parseAPTSimulation(result.Stdout)
 		if parseErr != nil {
 			terminalErr = errors.Join(terminalErr, parseErr)
 		} else {
@@ -338,6 +340,11 @@ func applyProfile(profile Profile, hasInput bool) error {
 			return err
 		}
 	}
+	if profile.ID == ProfileHTPasswd {
+		if err := installReadOnlyFilesystemFilter(); err != nil {
+			return err
+		}
+	}
 	if profile.Chroot != "" {
 		if err := unix.Chroot(profile.Chroot); err != nil {
 			return fmt.Errorf("enter child filesystem root: %w", err)
@@ -445,6 +452,25 @@ func addressFamilyFilter(allowed []int) ([]unix.SockFilter, error) {
 	}
 	filter = append(filter, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EAFNOSUPPORT)}, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: uint32(unix.SECCOMP_RET_ALLOW)})
 	return filter, nil
+}
+
+func installReadOnlyFilesystemFilter() error {
+	deny := uint32(unix.SECCOMP_RET_ERRNO) | uint32(unix.EROFS)
+	allow := uint32(unix.SECCOMP_RET_ALLOW)
+	writeFlags := uint32(unix.O_WRONLY | unix.O_RDWR | unix.O_CREAT | unix.O_TRUNC | unix.O_APPEND | unix.O_TMPFILE)
+	filter := []unix.SockFilter{{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}, {Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_OPEN), Jf: 4}, {Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 24}, {Code: unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K, K: writeFlags, Jf: 1}, {Code: unix.BPF_RET | unix.BPF_K, K: deny}, {Code: unix.BPF_RET | unix.BPF_K, K: allow}, {Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 0}, {Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(unix.SYS_OPENAT), Jf: 4}, {Code: unix.BPF_LD | unix.BPF_W | unix.BPF_ABS, K: 32}, {Code: unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K, K: writeFlags, Jf: 1}, {Code: unix.BPF_RET | unix.BPF_K, K: deny}, {Code: unix.BPF_RET | unix.BPF_K, K: allow}}
+	for _, call := range []uint32{uint32(unix.SYS_CREAT), uint32(unix.SYS_OPENAT2), uint32(unix.SYS_TRUNCATE), uint32(unix.SYS_FTRUNCATE), uint32(unix.SYS_UNLINK), uint32(unix.SYS_UNLINKAT), uint32(unix.SYS_RMDIR), uint32(unix.SYS_RENAME), uint32(unix.SYS_RENAMEAT), uint32(unix.SYS_RENAMEAT2), uint32(unix.SYS_MKDIR), uint32(unix.SYS_MKDIRAT), uint32(unix.SYS_LINK), uint32(unix.SYS_LINKAT), uint32(unix.SYS_SYMLINK), uint32(unix.SYS_SYMLINKAT), uint32(unix.SYS_MKNOD), uint32(unix.SYS_MKNODAT), uint32(unix.SYS_CHMOD), uint32(unix.SYS_FCHMOD), uint32(unix.SYS_FCHMODAT), uint32(unix.SYS_CHOWN), uint32(unix.SYS_FCHOWN), uint32(unix.SYS_FCHOWNAT), uint32(unix.SYS_LCHOWN), uint32(unix.SYS_UTIME), uint32(unix.SYS_UTIMES), uint32(unix.SYS_FUTIMESAT), uint32(unix.SYS_UTIMENSAT), uint32(unix.SYS_SETXATTR), uint32(unix.SYS_LSETXATTR), uint32(unix.SYS_FSETXATTR), uint32(unix.SYS_REMOVEXATTR), uint32(unix.SYS_LREMOVEXATTR), uint32(unix.SYS_FREMOVEXATTR), uint32(unix.SYS_FALLOCATE), uint32(unix.SYS_IO_URING_SETUP), uint32(unix.SYS_MOUNT)} {
+		filter = append(filter, unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: call, Jf: 1}, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: deny})
+	}
+	filter = append(filter, unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: allow})
+	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return fmt.Errorf("set no-new-privileges before read-only filter: %w", err)
+	}
+	if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, uintptr(unsafe.Pointer(&program)), 0, 0); err != nil {
+		return fmt.Errorf("install read-only child filesystem filter: %w", err)
+	}
+	return nil
 }
 
 func installAddressFamilyFilter(allowed []int) error {
@@ -731,6 +757,12 @@ func (writer *digestWriter) Digest() string {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return "sha256:" + hex.EncodeToString(writer.hash.Sum(nil))
+}
+func (writer *digestWriter) Destroy() {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	clear(writer.bytes)
+	writer.bytes = nil
 }
 func (writer *digestWriter) Bytes() []byte {
 	writer.mu.Lock()

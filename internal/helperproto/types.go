@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -27,35 +28,39 @@ const (
 type Operation string
 
 const (
-	OperationApplicationPlan      Operation = "application_plan"
-	OperationManagedFileCommit    Operation = "managed_file_commit"
-	OperationAccountCreate        Operation = "account_create"
-	OperationAdminTokenVerify     Operation = "admin_token_verify"
-	OperationAdminTokenSource     Operation = "admin_token_source_status"
-	OperationManagementProfile    Operation = "management_profile_status"
-	OperationAdminTokenRotate     Operation = "admin_token_rotate"
-	OperationAdminTokenReconcile  Operation = "admin_token_rotate_reconcile"
-	OperationPackageTransaction   Operation = "package_transaction"
-	OperationSystemdTransition    Operation = "systemd_transition"
-	OperationNginxTest            Operation = "nginx_test"
-	OperationNginxReload          Operation = "nginx_reload"
-	OperationCredentialImport     Operation = "credential_import"
-	OperationCredentialAdopt      Operation = "credential_adopt"
-	OperationCertificateIssue     Operation = "certificate_issue"
-	OperationCertificateRenew     Operation = "certificate_renew"
-	OperationEdgeOneRefresh       Operation = "edgeone_refresh"
-	OperationHeadscaleAdmin       Operation = "headscale_admin"
-	OperationPreauthKeyCreate     Operation = "preauth_key_create"
-	OperationTailscaleAuthImport  Operation = "tailscale_auth_import"
-	OperationTailscaleAuthAdopt   Operation = "tailscale_auth_adopt"
-	OperationTailscaleAdmin       Operation = "tailscale_admin"
-	OperationGoAccessProbe        Operation = "goaccess_probe"
-	OperationManagedBasicGenerate Operation = "managed_basic_generate"
-	OperationContractionClose     Operation = "contraction_close"
-	OperationStartupContraction   Operation = "startup_contraction"
-	OperationResourceMutation     Operation = "resource_mutation"
-	OperationProcessLifecycle     Operation = "process_lifecycle"
-	OperationPublicationActivate  Operation = "publication_activate"
+	OperationApplicationPlan          Operation = "application_plan"
+	OperationManagedFileCommit        Operation = "managed_file_commit"
+	OperationAccountCreate            Operation = "account_create"
+	OperationAdminTokenVerify         Operation = "admin_token_verify"
+	OperationAdminTokenSource         Operation = "admin_token_source_status"
+	OperationManagementProfile        Operation = "management_profile_status"
+	OperationAdminTokenRotate         Operation = "admin_token_rotate"
+	OperationAdminTokenReconcile      Operation = "admin_token_rotate_reconcile"
+	OperationPackageTransaction       Operation = "package_transaction"
+	OperationSystemdTransition        Operation = "systemd_transition"
+	OperationNginxTest                Operation = "nginx_test"
+	OperationNginxReload              Operation = "nginx_reload"
+	OperationCredentialImport         Operation = "credential_import"
+	OperationCredentialAdopt          Operation = "credential_adopt"
+	OperationCertificateIssue         Operation = "certificate_issue"
+	OperationCertificateRenew         Operation = "certificate_renew"
+	OperationEdgeOneRefresh           Operation = "edgeone_refresh"
+	OperationHeadscaleAdmin           Operation = "headscale_admin"
+	OperationPreauthKeyCreate         Operation = "preauth_key_create"
+	OperationTailscaleAuthImport      Operation = "tailscale_auth_import"
+	OperationTailscaleAuthAdopt       Operation = "tailscale_auth_adopt"
+	OperationTailscaleAdmin           Operation = "tailscale_admin"
+	OperationGoAccessProbe            Operation = "goaccess_probe"
+	OperationManagedBasicGenerate     Operation = "managed_basic_generate"
+	OperationManagedBasicDelete       Operation = "managed_basic_delete"
+	OperationStaticRootRegister       Operation = "static_root_register"
+	OperationExternalHTPasswdRegister Operation = "external_htpasswd_register"
+	OperationDomainStatus             Operation = "domain_status"
+	OperationContractionClose         Operation = "contraction_close"
+	OperationStartupContraction       Operation = "startup_contraction"
+	OperationResourceMutation         Operation = "resource_mutation"
+	OperationProcessLifecycle         Operation = "process_lifecycle"
+	OperationPublicationActivate      Operation = "publication_activate"
 )
 
 type Policy struct {
@@ -66,48 +71,55 @@ type Policy struct {
 }
 
 var policies = map[Operation]Policy{
-	OperationApplicationPlan:      {Callers: []Caller{CallerUI}},
-	OperationManagedFileCommit:    {Callers: []Caller{CallerUI}},
-	OperationAccountCreate:        {Callers: []Caller{CallerUI}},
-	OperationAdminTokenVerify:     {Callers: []Caller{CallerUI}, SecretInput: true},
-	OperationAdminTokenSource:     {Callers: []Caller{CallerUI}},
-	OperationManagementProfile:    {Callers: []Caller{CallerUI}},
-	OperationAdminTokenRotate:     {Callers: []Caller{CallerUI}, SecretOutput: true},
-	OperationAdminTokenReconcile:  {Callers: []Caller{CallerUI}},
-	OperationPackageTransaction:   {Callers: []Caller{CallerUI}},
-	OperationSystemdTransition:    {Callers: []Caller{CallerUI}},
-	OperationNginxTest:            {Callers: []Caller{CallerUI, CallerRecovery}},
-	OperationNginxReload:          {Callers: []Caller{CallerUI}},
-	OperationCredentialImport:     {Callers: []Caller{CallerUI}, SecretInput: true},
-	OperationCredentialAdopt:      {Callers: []Caller{CallerUI}},
-	OperationCertificateIssue:     {Callers: []Caller{CallerUI}},
-	OperationCertificateRenew:     {Callers: []Caller{CallerUI, CallerTimer}},
-	OperationEdgeOneRefresh:       {Callers: []Caller{CallerUI, CallerTimer}},
-	OperationHeadscaleAdmin:       {Callers: []Caller{CallerUI}},
-	OperationPreauthKeyCreate:     {Callers: []Caller{CallerUI}, SecretOutput: true},
-	OperationTailscaleAuthImport:  {Callers: []Caller{CallerUI}, SecretInput: true},
-	OperationTailscaleAuthAdopt:   {Callers: []Caller{CallerUI}},
-	OperationTailscaleAdmin:       {Callers: []Caller{CallerUI}},
-	OperationGoAccessProbe:        {Callers: []Caller{CallerUI}},
-	OperationManagedBasicGenerate: {Callers: []Caller{CallerUI}, SecretOutput: true},
-	OperationContractionClose:     {Callers: []Caller{CallerUI}},
-	OperationStartupContraction:   {Callers: []Caller{CallerRecovery}},
-	OperationResourceMutation:     {Callers: []Caller{CallerUI}},
-	OperationProcessLifecycle:     {Callers: []Caller{CallerUI}},
-	OperationPublicationActivate:  {Callers: []Caller{CallerUI}, MaximumDuration: time.Minute},
+	OperationApplicationPlan:          {Callers: []Caller{CallerUI}},
+	OperationManagedFileCommit:        {Callers: []Caller{CallerUI}},
+	OperationAccountCreate:            {Callers: []Caller{CallerUI}},
+	OperationAdminTokenVerify:         {Callers: []Caller{CallerUI}, SecretInput: true},
+	OperationAdminTokenSource:         {Callers: []Caller{CallerUI}},
+	OperationManagementProfile:        {Callers: []Caller{CallerUI}},
+	OperationAdminTokenRotate:         {Callers: []Caller{CallerUI}, SecretOutput: true},
+	OperationAdminTokenReconcile:      {Callers: []Caller{CallerUI}},
+	OperationPackageTransaction:       {Callers: []Caller{CallerUI}},
+	OperationSystemdTransition:        {Callers: []Caller{CallerUI}},
+	OperationNginxTest:                {Callers: []Caller{CallerUI, CallerRecovery}},
+	OperationNginxReload:              {Callers: []Caller{CallerUI}},
+	OperationCredentialImport:         {Callers: []Caller{CallerUI}, SecretInput: true},
+	OperationCredentialAdopt:          {Callers: []Caller{CallerUI}},
+	OperationCertificateIssue:         {Callers: []Caller{CallerUI}},
+	OperationCertificateRenew:         {Callers: []Caller{CallerUI, CallerTimer}},
+	OperationEdgeOneRefresh:           {Callers: []Caller{CallerUI, CallerTimer}},
+	OperationHeadscaleAdmin:           {Callers: []Caller{CallerUI}},
+	OperationPreauthKeyCreate:         {Callers: []Caller{CallerUI}, SecretOutput: true},
+	OperationTailscaleAuthImport:      {Callers: []Caller{CallerUI}, SecretInput: true},
+	OperationTailscaleAuthAdopt:       {Callers: []Caller{CallerUI}},
+	OperationTailscaleAdmin:           {Callers: []Caller{CallerUI}},
+	OperationGoAccessProbe:            {Callers: []Caller{CallerUI}},
+	OperationManagedBasicGenerate:     {Callers: []Caller{CallerUI}, SecretOutput: true},
+	OperationManagedBasicDelete:       {Callers: []Caller{CallerUI}},
+	OperationStaticRootRegister:       {Callers: []Caller{CallerUI}},
+	OperationExternalHTPasswdRegister: {Callers: []Caller{CallerUI}},
+	OperationDomainStatus:             {Callers: []Caller{CallerUI}},
+	OperationContractionClose:         {Callers: []Caller{CallerUI}},
+	OperationStartupContraction:       {Callers: []Caller{CallerRecovery}},
+	OperationResourceMutation:         {Callers: []Caller{CallerUI}},
+	OperationProcessLifecycle:         {Callers: []Caller{CallerUI}},
+	OperationPublicationActivate:      {Callers: []Caller{CallerUI}, MaximumDuration: 11 * time.Minute},
 }
 
 var refPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type ActionPayload struct {
-	Operation       string `json:"operation"`
-	TargetKind      string `json:"target_kind"`
-	TargetID        string `json:"target_id,omitempty"`
-	ActorIdentity   string `json:"actor_identity"`
-	ActorGeneration uint64 `json:"actor_generation"`
-	PlanID          string `json:"plan_id,omitempty"`
-	Confirmation    string `json:"confirmation,omitempty"`
+	Operation            string `json:"operation"`
+	TargetKind           string `json:"target_kind"`
+	TargetID             string `json:"target_id,omitempty"`
+	ActorIdentity        string `json:"actor_identity"`
+	ActorGeneration      uint64 `json:"actor_generation"`
+	PlanID               string `json:"plan_id,omitempty"`
+	Confirmation         string `json:"confirmation,omitempty"`
+	Username             string `json:"username,omitempty"`
+	StaticRoot           string `json:"static_root_path,omitempty"`
+	ExternalHTPasswdFile string `json:"external_htpasswd_path,omitempty"`
 }
 type ResourcePayload struct {
 	Operation       string          `json:"operation"`
@@ -155,7 +167,17 @@ const (
 )
 
 type ResourceResult struct {
-	ResourceID string `json:"resource_id"`
+	ResourceID            string    `json:"resource_id"`
+	Status                string    `json:"status,omitempty"`
+	AccessMayRemain       bool      `json:"access_may_remain,omitempty"`
+	CredentialFingerprint string    `json:"credential_fingerprint,omitempty"`
+	CredentialChanged     bool      `json:"credential_changed,omitempty"`
+	StaticFingerprint     string    `json:"static_fingerprint,omitempty"`
+	StaticChanged         bool      `json:"static_changed,omitempty"`
+	ObservedAt            time.Time `json:"observed_at,omitempty"`
+	Reason                string    `json:"reason,omitempty"`
+	AllowedActions        []string  `json:"allowed_actions,omitempty"`
+	CredentialIDs         []string  `json:"credential_ids,omitempty"`
 }
 type Response struct {
 	SchemaVersion string          `json:"schema_version"`
@@ -196,15 +218,20 @@ func ValidateRequest(request Request, now time.Time) error {
 	if request.SchemaVersion != SchemaVersion || !known || !refPattern.MatchString(request.RequestID) || !validOperationTarget(request.Operation, request.Target) || request.IntentGeneration == 0 || request.Deadline.IsZero() || !request.Deadline.After(now) || request.Deadline.Sub(now) > maximum || !digestPattern.MatchString(request.InputDigest) {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
-	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose
+	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose || request.Operation == OperationManagedBasicGenerate || request.Operation == OperationManagedBasicDelete || request.Operation == OperationStaticRootRegister || request.Operation == OperationExternalHTPasswdRegister || request.Operation == OperationDomainStatus
 	resourceOperation := request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
 	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
 		return fmt.Errorf("helper typed payload shape is invalid")
 	}
-	planAction := request.Operation == OperationApplicationPlan && ((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "" || request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "") && request.Action.PlanID == "" && request.Action.Confirmation == ""
+	planAction := request.Operation == OperationApplicationPlan && (((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "") || (request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "") || (request.Action.Operation == "managed_basic_delete" && request.Action.TargetKind == "credential" && request.Action.TargetID != "")) && request.Action.PlanID == "" && request.Action.Confirmation == ""
 	rotationAction := request.Operation == OperationAdminTokenRotate && request.Action.Operation == "admin_token_rotate" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.PlanID != "" && request.Action.Confirmation == "rotate"
 	contractionAction := request.Operation == OperationContractionClose && ((request.Action.Operation == "close_all" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.Confirmation == "close") || (request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Action.Confirmation == "unpublish")) && request.Action.PlanID != ""
-	if request.Action != nil && (!validAction(*request.Action) || !planAction && !rotationAction && !contractionAction) {
+	managedGenerate := request.Operation == OperationManagedBasicGenerate && ((request.Action.Operation == "managed_basic_create" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && basicUsernamePattern.MatchString(request.Action.Username)) || (request.Action.Operation == "managed_basic_rotate" && request.Action.TargetKind == "credential" && request.Action.TargetID != "" && request.Target == "credential/"+request.Action.TargetID && request.Action.Username == "")) && request.Action.PlanID == "" && request.Action.Confirmation == "generate"
+	staticRegister := request.Operation == OperationStaticRootRegister && request.Action.Operation == "static_root_register" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID == "" && request.Action.Confirmation == "register" && filepath.IsAbs(request.Action.StaticRoot) && filepath.Clean(request.Action.StaticRoot) == request.Action.StaticRoot && request.Action.ExternalHTPasswdFile == ""
+	externalRegister := request.Operation == OperationExternalHTPasswdRegister && request.Action.Operation == "external_htpasswd_register" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID == "" && request.Action.Confirmation == "register" && filepath.IsAbs(request.Action.ExternalHTPasswdFile) && filepath.Clean(request.Action.ExternalHTPasswdFile) == request.Action.ExternalHTPasswdFile && request.Action.StaticRoot == ""
+	statusAction := request.Operation == OperationDomainStatus && request.Action.Operation == "status" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID == "" && request.Action.Confirmation == "" && request.Action.StaticRoot == "" && request.Action.ExternalHTPasswdFile == ""
+	managedDelete := request.Operation == OperationManagedBasicDelete && request.Action.Operation == "managed_basic_delete" && request.Action.TargetKind == "credential" && request.Action.TargetID != "" && request.Target == "credential/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID != "" && request.Action.Confirmation == "delete"
+	if request.Action != nil && (!validAction(*request.Action) || !planAction && !rotationAction && !contractionAction && !managedGenerate && !managedDelete && !staticRegister && !externalRegister && !statusAction || (request.Operation != OperationManagedBasicGenerate && request.Action.Username != "") || (request.Operation != OperationStaticRootRegister && request.Action.StaticRoot != "") || (request.Operation != OperationExternalHTPasswdRegister && request.Action.ExternalHTPasswdFile != "")) {
 		return fmt.Errorf("helper action payload is invalid")
 	}
 	if request.Action != nil || request.Resource != nil {
@@ -224,7 +251,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
+	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -242,6 +269,8 @@ func maximumDuration(operation Operation) time.Duration {
 		return 30 * time.Minute
 	case OperationCertificateIssue, OperationCertificateRenew, OperationEdgeOneRefresh:
 		return 10 * time.Minute
+	case OperationPublicationActivate:
+		return 11 * time.Minute
 	default:
 		return time.Minute
 	}
@@ -256,7 +285,7 @@ func validOperationTarget(operation Operation, target string) bool {
 	case OperationAccountCreate:
 		return target == "installation" || exactID && (kind == "resource" || kind == "service")
 	case OperationApplicationPlan:
-		return target == "installation" || exactID && kind == "resource"
+		return target == "installation" || exactID && (kind == "resource" || kind == "credential")
 	case OperationPackageTransaction, OperationSystemdTransition, OperationNginxTest, OperationNginxReload, OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationAdminTokenRotate, OperationAdminTokenReconcile:
 		return target == "installation"
 	case OperationContractionClose:
@@ -274,7 +303,11 @@ func validOperationTarget(operation Operation, target string) bool {
 	case OperationTailscaleAuthImport, OperationTailscaleAuthAdopt, OperationTailscaleAdmin:
 		return target == "connector"
 	case OperationManagedBasicGenerate:
+		return exactID && (kind == "credential" || kind == "resource")
+	case OperationManagedBasicDelete:
 		return exactID && kind == "credential"
+	case OperationStaticRootRegister, OperationExternalHTPasswdRegister, OperationDomainStatus:
+		return exactID && kind == "resource"
 	case OperationStartupContraction:
 		return target == "installation" || target == "headscale" || exactID && kind == "resource"
 	case OperationResourceMutation:
@@ -302,6 +335,29 @@ func validResourcePayload(operation Operation, value ResourcePayload) bool {
 	}
 }
 
+func validCredentialStatusIDs(values []string) bool {
+	if len(values) > 128 {
+		return false
+	}
+	prior := ""
+	for _, value := range values {
+		if !strings.HasPrefix(value, "cred_") || !refPattern.MatchString(value) || prior != "" && prior >= value {
+			return false
+		}
+		prior = value
+	}
+	return true
+}
+func validDomainStatus(value ResourceResult) bool {
+	if value.Status != "healthy" && value.Status != "degraded" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || (value.CredentialFingerprint != "" && !digestPattern.MatchString(value.CredentialFingerprint)) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.CredentialChanged && value.CredentialFingerprint == "" || value.StaticChanged && value.StaticFingerprint == "" {
+		return false
+	}
+	degradedActions := len(value.AllowedActions) == 2 && value.AllowedActions[0] == "unpublish" && value.AllowedActions[1] == "close_all"
+	return value.Status == "degraded" && value.AccessMayRemain && degradedActions || value.Status == "healthy" && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0
+}
+func validDisplay(value string) bool {
+	return len(value) > 0 && len(value) <= 4096 && !strings.ContainsAny(value, "\x00\r\n")
+}
 func validContractionOutcome(outcome string, accessClosed, sharedDown, mayRemain bool) bool {
 	switch outcome {
 	case "succeeded":
@@ -315,8 +371,10 @@ func validContractionOutcome(outcome string, accessClosed, sharedDown, mayRemain
 	}
 }
 
+var basicUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$`)
+
 func validAction(value ActionPayload) bool {
-	return refPattern.MatchString(value.Operation) && refPattern.MatchString(value.TargetKind) && (value.TargetID == "" || refPattern.MatchString(value.TargetID)) && refPattern.MatchString(value.ActorIdentity) && value.ActorGeneration != 0 && (value.PlanID == "" || refPattern.MatchString(value.PlanID)) && (value.Confirmation == "" || refPattern.MatchString(value.Confirmation))
+	return refPattern.MatchString(value.Operation) && refPattern.MatchString(value.TargetKind) && (value.TargetID == "" || refPattern.MatchString(value.TargetID)) && refPattern.MatchString(value.ActorIdentity) && value.ActorGeneration != 0 && (value.PlanID == "" || refPattern.MatchString(value.PlanID)) && (value.Confirmation == "" || refPattern.MatchString(value.Confirmation)) && (value.Username == "" || basicUsernamePattern.MatchString(value.Username)) && len(value.StaticRoot) <= 4096 && !strings.ContainsAny(value.StaticRoot, "\x00\r\n") && len(value.ExternalHTPasswdFile) <= 4096 && !strings.ContainsAny(value.ExternalHTPasswdFile, "\x00\r\n")
 }
 
 func ValidateResponse(operation Operation, response Response) error {
@@ -330,12 +388,34 @@ func ValidateResponse(operation Operation, response Response) error {
 		}
 		switch operation {
 		case OperationApplicationPlan:
-			if response.Action == nil || !refPattern.MatchString(response.Action.PlanID) || !digestPattern.MatchString(response.Action.Confirmation) || response.Action.JobID != "" || response.Action.Operation != "admin_token_rotate" && response.Action.Operation != "close_all" && response.Action.Operation != "unpublish" || (response.Action.Operation == "unpublish") != (response.Action.TargetKind == "resource" && response.Action.TargetID != "") || response.Action.Operation != "unpublish" && (response.Action.TargetKind != "installation" || response.Action.TargetID != "") || !refPattern.MatchString(response.Action.ExposureSummary) || !refPattern.MatchString(response.Action.Prerequisites) || response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain {
+			action := response.Action
+			validTarget := action != nil && ((action.Operation == "admin_token_rotate" || action.Operation == "close_all") && action.TargetKind == "installation" && action.TargetID == "" || action.Operation == "unpublish" && action.TargetKind == "resource" && action.TargetID != "" || action.Operation == "managed_basic_delete" && action.TargetKind == "credential" && action.TargetID != "")
+			if !validTarget || !refPattern.MatchString(action.PlanID) || !digestPattern.MatchString(action.Confirmation) || action.JobID != "" || !validDisplay(action.ExposureSummary) || !validDisplay(action.Prerequisites) || action.ExpiresAt.IsZero() || action.ContractionOutcome != "" || action.AccessClosed || action.SharedIngressDown || action.AccessMayRemain {
 				return fmt.Errorf("application Plan response shape is invalid")
 			}
 		case OperationAdminTokenRotate:
 			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain {
 				return fmt.Errorf("admin token response shape is invalid")
+			}
+		case OperationManagedBasicGenerate:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || (response.Action.Operation != "managed_basic_create" && response.Action.Operation != "managed_basic_rotate") || response.Action.TargetKind != "credential" || !refPattern.MatchString(response.Action.TargetID) || response.Resource != nil {
+				return fmt.Errorf("managed Basic response shape invalid")
+			}
+		case OperationManagedBasicDelete:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.Operation != "managed_basic_delete" || response.Action.TargetKind != "credential" || !refPattern.MatchString(response.Action.TargetID) || response.Resource != nil {
+				return fmt.Errorf("managed Basic delete response shape invalid")
+			}
+		case OperationStaticRootRegister:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.Operation != "static_root_register" || response.Action.TargetKind != "static" || !refPattern.MatchString(response.Action.TargetID) || response.Resource != nil {
+				return fmt.Errorf("static root response shape invalid")
+			}
+		case OperationExternalHTPasswdRegister:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.Operation != "external_htpasswd_register" || response.Action.TargetKind != "credential" || !refPattern.MatchString(response.Action.TargetID) || response.Resource != nil {
+				return fmt.Errorf("external htpasswd response shape invalid")
+			}
+		case OperationDomainStatus:
+			if response.Resource == nil || !refPattern.MatchString(response.Resource.ResourceID) || !validDomainStatus(*response.Resource) || response.Action != nil {
+				return fmt.Errorf("domain status response shape invalid")
 			}
 		case OperationContractionClose:
 			if response.Action == nil || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.JobID != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || !validContractionOutcome(response.Action.ContractionOutcome, response.Action.AccessClosed, response.Action.SharedIngressDown, response.Action.AccessMayRemain) {

@@ -79,15 +79,15 @@ func TestConflictRegistry(t *testing.T) {
 		}
 		second.ManagedPaths = []string{"/var/lib/lanpanel/resources/second"}
 		installation.Resources = append(installation.Resources, second)
-		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
-			t.Fatalf("BuildClaims(shared resource credential) error = %v", err)
+		if _, err := BuildClaims(installation); err == nil {
+			t.Fatal("shared managed Basic credential accepted")
 		}
 	})
 
 	t.Run("pending_applied_identity_remains_reserved", func(t *testing.T) {
 		installation := validInstallation()
 		installation.Credentials = append(installation.Credentials, domain.Credential{
-			ID: "cred_00000000000000000000000000000002", ManagedPath: "/var/lib/lanpanel/credentials/old",
+			ID: "cred_00000000000000000000000000000002", Kind: "external_htpasswd", OwnerResourceID: "res_00000000000000000000000000000001", ExternalPath: "/srv/external/old.htpasswd", Fingerprint: digest,
 		})
 		resource := &installation.Resources[0]
 		resource.Publication = domain.AppPublication{
@@ -125,6 +125,14 @@ func TestConflictRegistry(t *testing.T) {
 			if !hasClaim(claims, expected.Kind, expected.Value) {
 				t.Fatalf("BuildClaims() omitted still-applied claim %#v from %#v", expected, claims)
 			}
+		}
+	})
+
+	t.Run("domain_bundle_uses_only_shared_ingress_claim", func(t *testing.T) {
+		bundle := domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}, {Network: "tcp", Port: 19002}}}
+		claims := bundleClaims("resource:one", bundle)
+		if hasClaim(claims, KindListener, "tcp:80") || hasClaim(claims, KindListener, "tcp:443") || !hasClaim(claims, KindListener, "tcp:19002") {
+			t.Fatalf("domain listener claims=%#v", claims)
 		}
 	})
 
@@ -251,10 +259,7 @@ func validInstallation() domain.Installation {
 			LoginServer:  "https://control.example.com",
 			ManagedPaths: []string{"/var/lib/lanpanel/connector"},
 		},
-		Credentials: []domain.Credential{{
-			ID:          "cred_00000000000000000000000000000001",
-			ManagedPath: "/var/lib/lanpanel/credentials/app-basic",
-		}},
+		Credentials:  []domain.Credential{{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: "res_00000000000000000000000000000001", Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: "sha256:" + strings.Repeat("e", 64)}},
 		ManagedPaths: []string{"/var/lib/lanpanel/state"},
 		Resources: []domain.AppResource{{
 			ID:                  "res_00000000000000000000000000000001",

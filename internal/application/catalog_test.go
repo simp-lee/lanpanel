@@ -56,7 +56,7 @@ func TestCoreActionVocabularyIsClosed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(seen) != 49 {
+	if len(seen) != 51 {
 		t.Fatalf("core actions=%d", len(seen))
 	}
 }

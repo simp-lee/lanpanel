@@ -249,6 +249,20 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 	})
 }
 
+func TestInterruptedDomainReactivationCanContractToFreshClosing(t *testing.T) {
+	now := time.Now().UTC()
+	current := EmptyState()
+	current.Resources = []ResourceSafety{{ResourceID: "app-a", GenerationSequence: 4, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), Reactivating: &Reactivating{Generation: 4, PriorGeneration: 3, PlanID: "plan", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: now.Add(time.Hour), ACLUntil: now.Add(time.Hour)}}}
+	next := current
+	next.Resources = append([]ResourceSafety(nil), current.Resources...)
+	next.Resources[0].GenerationSequence = 5
+	next.Resources[0].Closing = &GenerationMarker{Kind: MarkerClosing, Generation: 5, Reason: "interrupted_domain_activation"}
+	next.Resources[0].Reactivating = nil
+	if err := validateTransition(RoleContraction, current, next, TransitionProof{}); err != nil {
+		t.Fatalf("interrupted reactivation contraction: %v", err)
+	}
+}
+
 func TestSafetyGenerationHighWaterPreventsMarkerReuse(t *testing.T) {
 	now := time.Now().UTC()
 	current := EmptyState()

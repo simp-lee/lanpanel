@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -881,7 +882,21 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate}, nil
 }
 
+func publicationOnlyResourceUpdate(prior, candidate domain.AppResource) bool {
+	return prior.ID == candidate.ID && prior.Name == candidate.Name && prior.Lifecycle == candidate.Lifecycle && reflect.DeepEqual(prior.Target, candidate.Target) && reflect.DeepEqual(prior.ManagedPaths, candidate.ManagedPaths) && reflect.DeepEqual(nonPublicationCredentials(prior), nonPublicationCredentials(candidate)) && prior.ManagedProcess != nil && candidate.ManagedProcess != nil && reflect.DeepEqual(prior.ManagedProcess, candidate.ManagedProcess)
+}
+func nonPublicationCredentials(resource domain.AppResource) []string {
+	values := append([]string(nil), resource.CredentialIDs...)
+	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID != "" {
+		values = slices.DeleteFunc(values, func(value string) bool { return value == resource.Publication.DomainHTTPS.CredentialID })
+	}
+	return values
+}
+
 func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppResource, knownSecretDigests map[string]struct{}) (*ResourceExecution, error) {
+	if err := requireNoDegradedAppliedSource(candidate.ID); err != nil {
+		return nil, err
+	}
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err
@@ -910,8 +925,12 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 			break
 		}
 	}
-	if prior != nil && prior.ManagedProcess != nil && prior.ManagedProcess.Requested == domain.ProcessRequestedRunning {
-		return fail(fmt.Errorf("stop managed process before resource update"))
+	if prior != nil && prior.PublicationRecord.State == domain.PublicationPublished && (prior.Publication.Kind == domain.PublicationTemporaryHTTP || candidate.Publication.Kind == domain.PublicationTemporaryHTTP) && !reflect.DeepEqual(prior.Publication, candidate.Publication) {
+		return fail(fmt.Errorf("published temporary publication cannot be edited"))
+	}
+	runningPublicationOnly := prior != nil && publicationOnlyResourceUpdate(*prior, candidate)
+	if prior != nil && prior.ManagedProcess != nil && prior.ManagedProcess.Requested == domain.ProcessRequestedRunning && !runningPublicationOnly {
+		return fail(fmt.Errorf("stop managed process before process or target update"))
 	}
 	candidate, err = resource.PrepareUpdate(installation, candidate)
 	if err != nil {

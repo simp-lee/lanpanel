@@ -111,6 +111,9 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	if err != nil {
 		return fail(err)
 	}
+	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
+		return fail(err)
+	}
 	publication := resource.Publication.DomainHTTPS
 	if publication == nil || publication.Certificate == nil {
 		return fail(fmt.Errorf("domain certificate request missing"))
@@ -151,8 +154,23 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 			safetyResource = &state.Resources[index]
 		}
 	}
-	if safetyResource == nil {
-		return fail(fmt.Errorf("certificate safety resource missing"))
+	if safetyResource == nil || executionGeneration(plan) != safetyResource.GenerationSequence+1 {
+		return fail(fmt.Errorf("certificate safety generation changed"))
+	}
+	_, preflightResult, err := evaluateDomainPreflight(ctx, installation, resource, state)
+	if err != nil {
+		return fail(err)
+	}
+	readiness, err := probeResourceTarget(ctx, resource)
+	if err != nil {
+		return fail(err)
+	}
+	sourceEvidence, err := observeDomainSources(service, resource)
+	if err != nil {
+		return fail(err)
+	}
+	if !domainPublicationPlanMatches(plan, resource, preflightResult, readiness, bindingDigest, sourceEvidence) {
+		return fail(fmt.Errorf("certificate Plan evidence changed before remote work"))
 	}
 	generation := safetyResource.GenerationSequence + 1
 	idBytes := make([]byte, 16)
@@ -1181,6 +1199,61 @@ func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Conte
 		return domain.ActivationIntent{}, err
 	}
 	return intent, nil
+}
+
+func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Context, candidate publication.Candidate, aclUntil time.Time) (*PublicationExecution, error) {
+	if candidate.ResourceID != execution.Resource.ID || candidate.Generation != execution.Challenge.Safety.Generation {
+		return nil, fmt.Errorf("domain publication candidate identity changed")
+	}
+	if _, err := execution.BeginPublicationHandoff(ctx, candidate.Bundle, aclUntil); err != nil {
+		return nil, err
+	}
+	owned, err := execution.Service.ownership.Read(execution.Resource.ID)
+	if err != nil {
+		return nil, err
+	}
+	owned.Revision++
+	owned.Paths = upsertOwnedPath(owned.Paths, candidate.OwnershipPath)
+	for _, listener := range candidate.OwnershipListeners {
+		owned.Listeners = upsertOwnedListener(owned.Listeners, listener)
+	}
+	slices.SortFunc(owned.Paths, func(a, b ownership.OwnedPath) int { return compare(a.Path, b.Path) })
+	slices.SortFunc(owned.Listeners, func(a, b ownership.OwnedListener) int {
+		return compare(fmt.Sprintf("%s:%s:%d", a.Protocol, a.Address, a.Port), fmt.Sprintf("%s:%s:%d", b.Protocol, b.Address, b.Port))
+	})
+	persisted, err := execution.Service.OwnershipWrite(ctx, execution.Exposure, owned.Revision-1, owned)
+	if err != nil {
+		return nil, err
+	}
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil {
+		return nil, err
+	}
+	next := state
+	next.Revision++
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	found := false
+	for index := range next.Resources {
+		if next.Resources[index].ResourceID == execution.Resource.ID {
+			before := next.Resources[index].OwnershipDigest
+			next.Resources[index].OwnershipDigest = persisted.Checksum
+			proof := &safety.OwnershipConvergenceProof{ResourceID: execution.Resource.ID, IntentRef: execution.Plan.ID, Generation: candidate.Generation, BeforeDigest: before, AfterDigest: persisted.Checksum}
+			if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleOwnershipActivation, state.Revision, next, safety.TransitionProof{Ownership: proof}); err != nil {
+				return nil, err
+			}
+			found = true
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("domain publication ownership safety missing")
+	}
+	result := &PublicationExecution{Service: execution.Service, Admitter: execution.Admitter, MutationSet: execution.MutationSet, Mutation: execution.Mutation, Exposure: execution.Exposure, JobID: execution.JobID, Revision: execution.Revision, Resource: execution.Resource, Candidate: candidate, SafetyState: next, Ownership: persisted, PlanID: execution.Plan.ID}
+	execution.Service = nil
+	execution.Admitter = nil
+	execution.MutationSet = nil
+	execution.Mutation = nil
+	execution.Exposure = nil
+	return result, nil
 }
 
 func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, identity certificates.Identity) (jobs.Record, error) {

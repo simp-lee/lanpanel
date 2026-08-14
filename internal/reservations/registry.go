@@ -168,10 +168,13 @@ func BuildClaims(installation domain.Installation) ([]Claim, error) {
 	}
 	for _, credential := range installation.Credentials {
 		owner := installationOwner + ":credential:" + credential.ID
-		claims = append(claims,
-			Claim{Kind: KindCredential, Value: credential.ID, Owner: owner},
-			Claim{Kind: KindManagedPath, Value: credential.ManagedPath, Owner: owner},
-		)
+		claims = append(claims, Claim{Kind: KindCredential, Value: credential.ID, Owner: owner})
+		if credential.ManagedPath != "" {
+			claims = append(claims, Claim{Kind: KindManagedPath, Value: credential.ManagedPath, Owner: owner})
+		}
+	}
+	for _, root := range installation.StaticRoots {
+		claims = append(claims, Claim{Kind: KindManagedPath, Value: root.Path, Owner: installationOwner + ":static:" + root.ID})
 	}
 	for _, resource := range installation.Resources {
 		owner := installationOwner + ":resource:" + resource.ID
@@ -231,6 +234,9 @@ func bundleClaims(owner string, bundle domain.PublicationBundle) []Claim {
 		claims = append(claims, Claim{Kind: KindCredentialUse, Value: credentialID, Owner: owner})
 	}
 	for _, listener := range bundle.Listeners {
+		if bundle.DomainHTTPS != nil && (listener.Port == 80 || listener.Port == 443) {
+			continue
+		}
 		claims = append(claims, Claim{Kind: KindListener, Value: listenerValue(listener.Network, listener.Port), Owner: owner})
 	}
 	if bundle.DomainHTTPS != nil {

@@ -95,7 +95,7 @@ func Probe(ctx context.Context, request ProbeRequest, transport Transport) (Evid
 		return Evidence{}, fmt.Errorf("target readiness observation time is invalid")
 	}
 	evidence := Evidence{ResourceID: request.ResourceID, ConfigDigest: request.ConfigDigest, EndpointIdentity: request.EndpointIdentity, TransportIdentity: transport.Identity(), HTTPStatus: httpStatus, WebSocketStatus: websocketStatus, ObservedAt: now}
-	identity := strings.Join([]string{evidence.ResourceID, evidence.ConfigDigest, evidence.EndpointIdentity, evidence.TransportIdentity, fmt.Sprint(evidence.HTTPStatus), fmt.Sprint(evidence.WebSocketStatus), evidence.ObservedAt.Format(time.RFC3339Nano)}, "\x00")
+	identity := strings.Join([]string{evidence.ResourceID, evidence.ConfigDigest, evidence.EndpointIdentity, evidence.TransportIdentity, fmt.Sprint(evidence.HTTPStatus), fmt.Sprint(evidence.WebSocketStatus)}, "\x00")
 	sum := sha256.Sum256([]byte(identity))
 	evidence.Digest = "sha256:" + hex.EncodeToString(sum[:])
 	return evidence, nil
@@ -156,7 +156,10 @@ func probeWebSocket(ctx context.Context, request ProbeRequest, transport Transpo
 		}
 		return response.StatusCode, nil
 	}
-	if request.AccessMode == domain.AppAccessApplicationManaged && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) && request.ApplicationManagedWebSocketProof.valid(request) {
+	if request.AccessMode == domain.AppAccessApplicationManaged && (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) {
+		if request.ApplicationManagedWebSocketProof != nil && !request.ApplicationManagedWebSocketProof.valid(request) {
+			return response.StatusCode, fmt.Errorf("application-managed WebSocket proof changed")
+		}
 		return response.StatusCode, nil
 	}
 	return response.StatusCode, fmt.Errorf("target WebSocket readiness returned disallowed status %d", response.StatusCode)

@@ -30,24 +30,29 @@ import (
 type Type string
 
 const (
-	Publish                 Type = "publish"
-	Unpublish               Type = "unpublish"
-	CloseAll                Type = "close_all"
-	EmergencyCloseAll       Type = "emergency_close_all"
-	CertificateExpiry       Type = "certificate_expiry"
-	CertificateRenew        Type = "certificate_renew"
-	EdgeOneExpiry           Type = "edgeone_expiry"
-	Maintenance             Type = "maintenance"
-	PackageTransaction      Type = "package_transaction"
-	AdminTokenRotate        Type = "admin_token_rotate"
-	Upgrade                 Type = "upgrade"
-	BackupEnter             Type = "backup_enter"
-	AutomaticReconciliation Type = "automatic_exact_journal_reconciliation"
-	StartupContraction      Type = "startup_activation_contraction"
-	ResourceCreate          Type = "resource_create"
-	ResourceUpdate          Type = "resource_update"
-	ProcessStart            Type = "process_start"
-	ProcessStop             Type = "process_stop"
+	Publish                  Type = "publish"
+	Unpublish                Type = "unpublish"
+	CloseAll                 Type = "close_all"
+	EmergencyCloseAll        Type = "emergency_close_all"
+	CertificateExpiry        Type = "certificate_expiry"
+	CertificateRenew         Type = "certificate_renew"
+	ManagedBasicCreate       Type = "managed_basic_create"
+	ManagedBasicRotate       Type = "managed_basic_rotate"
+	ManagedBasicDelete       Type = "managed_basic_delete"
+	StaticRootRegister       Type = "static_root_register"
+	ExternalHTPasswdRegister Type = "external_htpasswd_register"
+	EdgeOneExpiry            Type = "edgeone_expiry"
+	Maintenance              Type = "maintenance"
+	PackageTransaction       Type = "package_transaction"
+	AdminTokenRotate         Type = "admin_token_rotate"
+	Upgrade                  Type = "upgrade"
+	BackupEnter              Type = "backup_enter"
+	AutomaticReconciliation  Type = "automatic_exact_journal_reconciliation"
+	StartupContraction       Type = "startup_activation_contraction"
+	ResourceCreate           Type = "resource_create"
+	ResourceUpdate           Type = "resource_update"
+	ProcessStart             Type = "process_start"
+	ProcessStop              Type = "process_stop"
 )
 
 const (
@@ -486,7 +491,7 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 				if err != nil {
 					return err
 				}
-				if existing.Target == request.Target && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+				if (existing.Target == request.Target || existing.SafetyBinding.ResourceID != "" && existing.SafetyBinding.ResourceID == request.SafetyBinding.ResourceID) && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
 					return fmt.Errorf("target already has a nonterminal expansion authority")
 				}
 			}
@@ -1161,6 +1166,319 @@ func certificateDeadlineAfter(candidate, prior string) bool {
 	priorTime, priorErr := time.Parse(time.RFC3339, prior)
 	return candidateErr == nil && priorErr == nil && candidateTime.After(priorTime)
 }
+func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, credential domain.Credential) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || credential.Kind != "managed_basic" || !exactDigest(credential.Fingerprint) {
+		return fmt.Errorf("managed Basic create requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ManagedBasicCreate || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+credential.OwnerResourceID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != credential.OwnerResourceID {
+			return fmt.Errorf("managed Basic create intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		for _, current := range installation.Credentials {
+			if current.ID == credential.ID {
+				return fmt.Errorf("managed Basic credential ID collision")
+			}
+		}
+		found := false
+		for _, resource := range installation.Resources {
+			if resource.ID == credential.OwnerResourceID {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("managed Basic owner resource missing")
+		}
+		installation.Credentials = append(installation.Credentials, credential)
+		slices.SortFunc(installation.Credentials, func(a, b domain.Credential) int { return strings.Compare(a.ID, b.ID) })
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, credentialID, username, path, fingerprint string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(fingerprint) {
+		return fmt.Errorf("managed Basic commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ManagedBasicRotate || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+credentialID || mutation.Target() != intent.Target {
+			return fmt.Errorf("managed Basic intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Credentials {
+			credential := &installation.Credentials[index]
+			if credential.ID != credentialID {
+				continue
+			}
+			if credential.Kind != "managed_basic" || credential.Username != username || credential.ManagedPath != path {
+				return fmt.Errorf("managed Basic credential identity changed")
+			}
+			credential.Fingerprint = fingerprint
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("managed Basic credential missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, credentialID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("managed Basic delete requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ManagedBasicDelete || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+credentialID || mutation.Target() != intent.Target {
+			return fmt.Errorf("managed Basic delete intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		for _, resource := range installation.Resources {
+			if credentialReferenced(resource, credentialID) {
+				return fmt.Errorf("active resource reference blocks credential delete")
+			}
+		}
+		kept := installation.Credentials[:0]
+		found := false
+		for _, credential := range installation.Credentials {
+			if credential.ID == credentialID {
+				if credential.Kind != "managed_basic" {
+					return fmt.Errorf("credential is not managed Basic")
+				}
+				found = true
+				continue
+			}
+			kept = append(kept, credential)
+		}
+		if !found {
+			return fmt.Errorf("managed Basic credential missing")
+		}
+		installation.Credentials = kept
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func operationNonPublicationCredentials(resource domain.AppResource) []string {
+	values := append([]string(nil), resource.CredentialIDs...)
+	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID != "" {
+		values = slices.DeleteFunc(values, func(value string) bool { return value == resource.Publication.DomainHTTPS.CredentialID })
+	}
+	return values
+}
+func credentialReferenced(resource domain.AppResource, credentialID string) bool {
+	if slices.Contains(resource.CredentialIDs, credentialID) || resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID == credentialID {
+		return true
+	}
+	bundles := []*domain.PublicationBundle{resource.PublicationRecord.LastAppliedBundle}
+	if intent := resource.PublicationRecord.ActivationIntent; intent != nil {
+		bundles = append(bundles, &intent.Candidate, intent.Prior)
+	}
+	for _, bundle := range bundles {
+		if bundle != nil && slices.Contains(bundle.CredentialIDs, credentialID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (admitter *Admitter) CommitExternalHTPasswd(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, revision uint64, jobID, resourceID string, credential domain.Credential) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || credential.Kind != "external_htpasswd" || credential.OwnerResourceID != resourceID || !exactDigest(credential.Fingerprint) {
+		return fmt.Errorf("external htpasswd commit authority invalid")
+	}
+	encoded, _ := json.Marshal(credential)
+	sum := sha256.Sum256(encoded)
+	binding := "sha256:" + hex.EncodeToString(sum[:])
+	_, _, err := admitter.normal.Update(ctx, exposure, revision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != ExternalHTPasswdRegister || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != resourceID || intent.SafetyBinding.CandidateDigest != credential.Fingerprint || intent.SafetyBinding.CandidateBundle != binding {
+			return fmt.Errorf("external htpasswd intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		ownerFound := false
+		for _, resource := range installation.Resources {
+			ownerFound = ownerFound || resource.ID == resourceID
+		}
+		if !ownerFound {
+			return fmt.Errorf("external htpasswd owner resource missing")
+		}
+		for _, current := range installation.Credentials {
+			if current.ID == credential.ID || current.ExternalPath == credential.ExternalPath {
+				return fmt.Errorf("external htpasswd identity conflicts")
+			}
+		}
+		installation.Credentials = append(installation.Credentials, credential)
+		slices.SortFunc(installation.Credentials, func(a, b domain.Credential) int { return strings.Compare(a.ID, b.ID) })
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitStaticRoot(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, root domain.StaticContentRoot) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(root.Fingerprint) {
+		return fmt.Errorf("static root commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		rootRaw, _ := json.Marshal(root)
+		rootSum := sha256.Sum256(rootRaw)
+		rootDigest := "sha256:" + hex.EncodeToString(rootSum[:])
+		if intent.Operation != StaticRootRegister || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != resourceID || intent.SafetyBinding.CandidateDigest != root.Fingerprint || intent.SafetyBinding.CandidateBundle != rootDigest {
+			return fmt.Errorf("static root intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		ownerFound := false
+		for _, resource := range installation.Resources {
+			ownerFound = ownerFound || resource.ID == resourceID
+		}
+		if !ownerFound {
+			return fmt.Errorf("static root owner resource missing")
+		}
+		for _, current := range installation.StaticRoots {
+			if current.ID == root.ID || current.Path == root.Path {
+				return fmt.Errorf("static root identity conflicts")
+			}
+		}
+		installation.StaticRoots = append(installation.StaticRoots, root)
+		slices.SortFunc(installation.StaticRoots, func(a, b domain.StaticContentRoot) int { return strings.Compare(a.ID, b.ID) })
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) TerminalizeManagedBasicChildClosure(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, childID, closureDigest string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(closureDigest) {
+		return fmt.Errorf("managed Basic child closure authority invalid")
+	}
+	terminal, err := admitter.trustedNow()
+	if err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseLocalIntent || (intent.Operation != ManagedBasicCreate && intent.Operation != ManagedBasicRotate) || mutation.Target() != intent.Target {
+			return fmt.Errorf("managed Basic child intent changed")
+		}
+		raw, present := transaction.Get("children/" + childID)
+		if !present {
+			return fmt.Errorf("managed Basic child missing")
+		}
+		var child ChildRecord
+		if decodeStrict(raw, &child) != nil || child.JobID != jobID || child.Profile != "htpasswd" || child.State == ChildTerminal {
+			return fmt.Errorf("managed Basic child closure identity changed")
+		}
+		child.State = ChildTerminal
+		child.TerminalAt = &terminal
+		child.Outcome = ChildUnknown
+		child.ResultDigest = closureDigest
+		raw, err = persist.EncodeEntry(child)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("children/"+childID, raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) TerminalizeManagedBasicInterrupted(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, paths []string, condition jobs.Postcondition) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || condition.Status != jobs.PostconditionKnown {
+		return jobs.Record{}, fmt.Errorf("managed Basic recovery terminal authority invalid")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != PhaseLocalIntent || (intent.Operation != ManagedBasicCreate && intent.Operation != ManagedBasicRotate && intent.Operation != ManagedBasicDelete) || mutation.Target() != intent.Target {
+			return fmt.Errorf("managed Basic recovery intent changed")
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, ModifiedPaths: paths, Postconditions: []jobs.Postcondition{condition}, ErrorCode: "managed_basic_interrupted"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
 func (admitter *Admitter) CommitCertificateRenewal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, prior, candidate domain.CertificateBundleIdentity) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return fmt.Errorf("certificate renewal commit requires operation locks")
@@ -1844,9 +2162,6 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 	if safetyCommit == nil {
 		return jobs.Record{}, fmt.Errorf("publication terminal safety convergence missing")
 	}
-	if err := safetyCommit(); err != nil {
-		return jobs.Record{}, err
-	}
 	var completed jobs.Record
 	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
@@ -1933,7 +2248,10 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 		completed = record
 		return nil
 	})
-	return completed, err
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	return completed, safetyCommit()
 }
 func (admitter *Admitter) RejectPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, code string) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
@@ -2010,6 +2328,152 @@ func (admitter *Admitter) RejectPublication(ctx context.Context, mutation *Mutat
 		return transaction.Replace(reservationKey(jobID), raw)
 	})
 	return err
+}
+
+func (admitter *Admitter) ConvergeCommittedPublicationContraction(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, resourceID string, generation uint64, runtimeDigest string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || generation == 0 || !exactDigest(runtimeDigest) {
+		return fmt.Errorf("committed publication contraction authority invalid")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != resourceID {
+				continue
+			}
+			if resource.PublicationRecord.State != domain.PublicationPublished || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.LastAppliedBundle == nil {
+				return fmt.Errorf("committed publication recovery state changed")
+			}
+			intent, err := loadReservation(transaction, resource.PublicationRecord.LastJobID)
+			if err != nil || intent.Operation != Publish || intent.Phase != PhaseTerminal {
+				return fmt.Errorf("committed publication recovery intent changed")
+			}
+			record, err := jobs.Load(transaction, resource.PublicationRecord.LastJobID)
+			if err != nil || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultSucceeded {
+				return fmt.Errorf("committed publication recovery job changed")
+			}
+			resource.PublicationRecord.State = domain.PublicationUnpublished
+			resource.PublicationRecord.UnpublishedGeneration = generation
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: observed.Format(time.RFC3339), Reason: "committed_activation_recovery_contracted"}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("committed publication recovery resource missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) TerminalizeInterruptedPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, generation uint64, paths []string, runtimeDigest string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || generation == 0 || !exactDigest(runtimeDigest) {
+		return jobs.Record{}, fmt.Errorf("publication recovery terminal authority invalid")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID || mutation.Target() != intent.Target {
+			return fmt.Errorf("publication recovery intent changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != resourceID {
+				continue
+			}
+			if resource.PublicationRecord.ActivationIntent == nil || resource.PublicationRecord.ActivationIntent.JobID != jobID {
+				return fmt.Errorf("publication activation identity missing")
+			}
+			resource.PublicationRecord.State = domain.PublicationUnpublished
+			resource.PublicationRecord.UnpublishedGeneration = generation
+			resource.PublicationRecord.ActivationIntent = nil
+			resource.PublicationRecord.LastOperation = domain.OperationPublish
+			resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+			resource.PublicationRecord.LastJobID = jobID
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: observed.Format(time.RFC3339), Reason: "interrupted_activation_contracted"}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("publication recovery resource missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		journalFound := false
+		for _, key := range transaction.Keys("journals") {
+			journalRaw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if decodeStrict(journalRaw, &journal) != nil {
+				return fmt.Errorf("publication recovery journal malformed")
+			}
+			if journal.JobID == jobID && journal.Kind == JournalAppActivation {
+				if journalFound || journal.ArtifactDigest != intent.SafetyBinding.CandidateBundle || journal.Phase == JournalTerminal {
+					return fmt.Errorf("publication recovery journal identity changed")
+				}
+				journalFound = true
+				journal.Phase = JournalTerminal
+				journalRaw, err = persist.EncodeEntry(journal)
+				if err != nil {
+					return err
+				}
+				if err := transaction.Replace(key, journalRaw); err != nil {
+					return err
+				}
+			}
+		}
+		if !journalFound {
+			return fmt.Errorf("publication recovery journal missing")
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, ModifiedPaths: paths, Postconditions: []jobs.Postcondition{{Kind: "interrupted_activation_contracted", Status: jobs.PostconditionKnown, Identity: runtimeDigest}}, ErrorCode: "activation_contracted"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err = persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
 }
 
 func (admitter *Admitter) CommitContractionState(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ContractionCommit) error {
@@ -2164,6 +2628,9 @@ func (admitter *Admitter) CommitResourceUpdate(ctx context.Context, mutation *Mu
 				}
 				candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
 				candidate.ManagedProcess.Applied = cloneProcessBundle(prior.ManagedProcess.Applied)
+				if prior.Name == candidate.Name && prior.Lifecycle == candidate.Lifecycle && reflect.DeepEqual(prior.Target, candidate.Target) && reflect.DeepEqual(prior.ManagedPaths, candidate.ManagedPaths) && reflect.DeepEqual(operationNonPublicationCredentials(prior), operationNonPublicationCredentials(candidate)) && reflect.DeepEqual(prior.ManagedProcess, candidate.ManagedProcess) && candidate.ManagedProcess.Applied != nil {
+					candidate.ManagedProcess.Applied.ConfigDigest = candidate.CurrentConfigDigest
+				}
 				candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
 				candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
 				candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
@@ -2748,6 +3215,17 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		}
 		if state.GlobalClose.Phase != safety.GlobalCloseNone || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil || state.StopFence != nil {
 			return fmt.Errorf("independent safety authority blocks resource creation")
+		}
+	}
+	if operation == ManagedBasicCreate || operation == ManagedBasicRotate || operation == ManagedBasicDelete || operation == StaticRootRegister || operation == ExternalHTPasswdRegister {
+		var resource *safety.ResourceSafety
+		for index := range state.Resources {
+			if state.Resources[index].ResourceID == binding.ResourceID {
+				resource = &state.Resources[index]
+			}
+		}
+		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil || resource.ChallengePending != nil || resource.Reactivating != nil {
+			return fmt.Errorf("resource safety blocks credential or static operation")
 		}
 	}
 	if operation == ResourceUpdate || operation == ProcessStart || operation == ProcessStop {
@@ -3663,6 +4141,8 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		}
 		beginningActivation := oldResource.PublicationRecord.State != domain.PublicationActivating && resource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.ActivationIntent != nil && ((beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent) || (beforeIntent.Phase == PhaseReentered && intent.Phase == PhaseLocalIntent && intent.CertificateHandoff != nil)) && intent.Operation == Publish && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		committedRecoveryContraction := oldResource.PublicationRecord.State == domain.PublicationPublished && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseTerminal && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusTerminal && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
+		interruptedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultInterrupted
 		failedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == oldResource.PublicationRecord.ActivationIntent.PriorState && resource.PublicationRecord.ActivationIntent == nil && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultFailed
 		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
@@ -3678,6 +4158,14 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			activation := oldResource.PublicationRecord.ActivationIntent
 			if activation.JobID != intent.JobID || resource.PublicationRecord.LastAppliedBundle == nil || !reflect.DeepEqual(*resource.PublicationRecord.LastAppliedBundle, activation.Candidate) || resource.PublicationRecord.LastOperation != domain.OperationPublish || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
 				return fmt.Errorf("resource %q publication result does not match durable activation", resource.ID)
+			}
+		case committedRecoveryContraction:
+			if resource.PublicationRecord.LastAppliedDigest == nil || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedDigest, oldResource.PublicationRecord.LastAppliedDigest) || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != oldResource.PublicationRecord.LastOperation || resource.PublicationRecord.LastOperationResult != oldResource.PublicationRecord.LastOperationResult || resource.PublicationRecord.LastJobID != oldResource.PublicationRecord.LastJobID {
+				return fmt.Errorf("resource %q committed publication recovery identity changed", resource.ID)
+			}
+		case interruptedActivation:
+			if resource.PublicationRecord.LastAppliedDigest != oldResource.PublicationRecord.LastAppliedDigest || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationInterrupted {
+				return fmt.Errorf("resource %q interrupted publication contraction identity changed", resource.ID)
 			}
 		case failedActivation:
 			activation := oldResource.PublicationRecord.ActivationIntent
@@ -4024,7 +4512,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -4045,6 +4533,10 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		resourceCreate := request.Operation == ResourceCreate && identity == "" && request.SafetyBinding.ResourceID != ""
 		if !resourceCreate && (identity != "" || request.SafetyBinding.ResourceID != "") {
 			return fmt.Errorf("installation target has unrelated resource safety authority")
+		}
+	case "credential":
+		if (request.Operation != ManagedBasicRotate && request.Operation != ManagedBasicDelete) || identity == "" || !validIdentityRef(request.SafetyBinding.ResourceID) {
+			return fmt.Errorf("credential target authority invalid")
 		}
 	default:
 		if request.Operation != AutomaticReconciliation || kind != "journal" || identity == "" {
@@ -4077,7 +4569,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("Plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, BackupEnter:
+		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, ManagedBasicDelete, BackupEnter:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}
@@ -4090,7 +4582,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("startup admission is not authorized for operation")
 		}
 	case AdmissionUI:
-		if planID != "" || operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop {
+		if planID != "" || operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
 			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:

@@ -33,9 +33,12 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	if err != nil || !stop.Complete || !reflect.DeepEqual(stop.Arguments, []string{"stop", "lanpanel-nginx.service"}) || !reflect.DeepEqual(stop.AllowedAddressFamilies, []int{1}) {
 		t.Fatalf("Nginx stop profile=%#v error=%v", stop, err)
 	}
-	htpasswd, err := ResolveProfile(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 1200, GID: 1200}})
-	if err != nil || htpasswd.Complete {
-		t.Fatalf("incomplete htpasswd profile=%#v error=%v", htpasswd, err)
+	htpasswd, err := ResolveInvocation(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 30000001, GID: 30000001}}, Invocation{HTPasswd: &HTPasswdInvocation{Username: "admin", Cost: 12}})
+	if err != nil || !htpasswd.Complete || !reflect.DeepEqual(htpasswd.Arguments, []string{"-n", "-i", "-B", "-C", "12", "admin"}) || htpasswd.MaximumInputBytes != 72 || htpasswd.RootTCB || htpasswd.UID != 30000001 || htpasswd.GID != 30000001 || len(htpasswd.AllowedCapabilities) != 0 {
+		t.Fatalf("typed htpasswd profile=%#v error=%v", htpasswd, err)
+	}
+	if _, err := ResolveInvocation(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 30000001, GID: 30000001}}, Invocation{HTPasswd: &HTPasswdInvocation{Username: "admin", Cost: 10}}); err == nil {
+		t.Fatal("mutable htpasswd cost accepted")
 	}
 	if _, err := ResolveProfile(ProfileID("shell"), Identities{}); err == nil {
 		t.Fatal("unknown arbitrary executable profile was accepted")

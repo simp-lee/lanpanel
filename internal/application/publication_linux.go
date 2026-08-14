@@ -36,6 +36,7 @@ type PublicationExecution struct {
 	Candidate   publication.Candidate
 	SafetyState safety.State
 	Ownership   ownership.Record
+	PlanID      string
 }
 
 func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, payload ConfirmationPayload) (*PublicationExecution, error) {
@@ -215,7 +216,13 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	}
 	owned.Revision++
 	owned.Paths = upsertOwnedPath(owned.Paths, candidate.OwnershipPath)
-	owned.Listeners = upsertOwnedListener(owned.Listeners, candidate.OwnershipListener)
+	listeners := candidate.OwnershipListeners
+	if len(listeners) == 0 {
+		listeners = []ownership.OwnedListener{candidate.OwnershipListener}
+	}
+	for _, listener := range listeners {
+		owned.Listeners = upsertOwnedListener(owned.Listeners, listener)
+	}
 	slices.SortFunc(owned.Paths, func(a, b ownership.OwnedPath) int { return compare(a.Path, b.Path) })
 	slices.SortFunc(owned.Listeners, func(a, b ownership.OwnedListener) int {
 		return compare(fmt.Sprintf("%s:%s:%d", a.Protocol, a.Address, a.Port), fmt.Sprintf("%s:%s:%d", b.Protocol, b.Address, b.Port))
@@ -241,7 +248,7 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 			}
 		}
 	}
-	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted}, nil
+	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted, PlanID: plan.ID}, nil
 }
 
 func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, error) {
@@ -288,6 +295,13 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 				resource.Contraction = nil
 				resource.CertificateExpiry = nil
 				resource.EdgeOne.Expiry = nil
+				if execution.Candidate.Bundle.DomainHTTPS != nil {
+					authority, authorityErr := activeCertificateAuthority(execution.Candidate.Bundle.DomainHTTPS.Certificate)
+					if authorityErr != nil {
+						return authorityErr
+					}
+					resource.ActiveCertificate = authority
+				}
 				resource.Reactivating = nil
 				found = true
 			}
@@ -300,6 +314,9 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 	}
 	job, err := execution.Admitter.CommitPublicationPublished(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.PublicationTerminalCommit{ResourceID: execution.Resource.ID, Bundle: execution.Candidate.Bundle, Runtime: observation}, "activation-"+execution.JobID, result.RuntimeDigest, result.ModifiedPaths, safetyCommit)
 	if err != nil {
+		if job.ID != "" {
+			return job, err
+		}
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}
 	execution.Revision++
@@ -320,9 +337,11 @@ func (execution *PublicationExecution) failClosed(_ context.Context, cause error
 	}
 	snapshot, stopErr := host.StopAndVerify(ctx)
 	observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
-	planID := ""
-	if resource := findSafetyResource(execution.SafetyState, execution.Resource.ID); resource != nil && resource.Reactivating != nil {
-		planID = resource.Reactivating.PlanID
+	planID := execution.PlanID
+	if planID == "" {
+		if resource := findSafetyResource(execution.SafetyState, execution.Resource.ID); resource != nil && resource.Reactivating != nil {
+			planID = resource.Reactivating.PlanID
+		}
 	}
 	fenceErr := execution.Service.WriteIngressActivationFence(ctx, execution.Exposure, execution.Resource.ID, planID, execution.Candidate.Generation, execution.Candidate.Generation-1, observed, stopErr != nil)
 	return errors.Join(cause, auditErr, hostErr, stopErr, fenceErr)

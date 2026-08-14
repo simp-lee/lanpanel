@@ -62,11 +62,20 @@ func RunRole(args []string) error {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
 	rotationRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
+	if err := application.ReconcileStaticRootRegistrations(context.Background()); err != nil {
+		return err
+	}
 	childClosure, err := child.ObserveExclusiveCurrentCgroup()
 	if err != nil {
 		return err
 	}
+	if err := application.ReconcileManagedBasic(context.Background(), childClosure); err != nil {
+		return err
+	}
 	if err := application.ReconcileCertificateChallenges(context.Background(), childClosure); err != nil {
+		return err
+	}
+	if err := application.ReconcileInterruptedDomainPublications(context.Background()); err != nil {
 		return err
 	}
 	if err := application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure); err != nil {
@@ -447,10 +456,27 @@ func RunRole(args []string) error {
 				execution, err = application.BeginResourceCreate(ctx, actor, candidate)
 			}
 		case "resource_update":
-			decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&candidate); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-				return ExecutionResult{}, fmt.Errorf("resource update payload is invalid")
+			var marker struct {
+				SchemaVersion string `json:"schema_version"`
+			}
+			_ = json.Unmarshal(request.Resource.Resource, &marker)
+			if marker.SchemaVersion == application.DomainPublicationUpdateSchema {
+				var update application.DomainPublicationUpdate
+				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&update); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+					return ExecutionResult{}, fmt.Errorf("domain publication update payload invalid")
+				}
+				candidate, err = application.DomainPublicationCandidate(update)
+			} else {
+				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&candidate); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+					return ExecutionResult{}, fmt.Errorf("resource update payload is invalid")
+				}
+			}
+			if err != nil {
+				return ExecutionResult{}, err
 			}
 			if candidate.ManagedProcess == nil {
 				return ExecutionResult{}, fmt.Errorf("resource update managed process is absent")
@@ -709,6 +735,16 @@ func RunRole(args []string) error {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("publication carried secret")
 		}
+		kind, err := application.CurrentPublicationKind(request.Target)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		if kind == domain.PublicationDomainHTTPS {
+			return executeDomainPublication(ctx, request)
+		}
+		if kind != domain.PublicationTemporaryHTTP {
+			return ExecutionResult{}, fmt.Errorf("publication type unsupported")
+		}
 		execution, err := application.BeginPublication(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 		if err != nil {
 			return ExecutionResult{}, err
@@ -724,6 +760,97 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		return ExecutionResult{ResultDigest: execution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: execution.Candidate.PublicURL}}, nil
+	})
+	managedBasicHandler := ManagedBasicGenerateHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("managed Basic caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("managed Basic request carried secret")
+		}
+		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
+		var result application.ManagedBasicResult
+		var err error
+		if request.Action.Operation == "managed_basic_create" {
+			result, err = application.CreateManagedBasic(ctx, request.Action.TargetID, request.Action.Username, actor)
+		} else {
+			result, err = application.RotateManagedBasic(ctx, request.Action.TargetID, actor)
+		}
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer clear(result.Password)
+		output, err := helperproto.NewOutputSecret(result.Password)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: result.Fingerprint, Secret: output, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: request.Action.Operation, TargetKind: "credential", TargetID: result.CredentialID}}, nil
+	})
+	staticRootHandler := StaticRootRegisterHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("static root caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("static root carried secret")
+		}
+		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
+		result, err := application.RegisterStaticRoot(ctx, request.Action.TargetID, request.Action.StaticRoot, actor)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: result.Root.Fingerprint, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: "static_root_register", TargetKind: "static", TargetID: result.Root.ID}}, nil
+	})
+	externalHTPasswdHandler := ExternalHTPasswdRegisterHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("external htpasswd caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("external htpasswd carried secret")
+		}
+		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
+		result, err := application.RegisterExternalHTPasswd(ctx, request.Action.TargetID, request.Action.ExternalHTPasswdFile, actor)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: result.Fingerprint, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: "external_htpasswd_register", TargetKind: "credential", TargetID: result.CredentialID}}, nil
+	})
+	domainStatusHandler := DomainStatusHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("domain status caller unauthorized")
+		}
+		return nil
+	}, func(_ context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("domain status carried secret")
+		}
+		status, err := application.ObserveDomainLiveSources(request.Action.TargetID)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		raw, _ := json.Marshal(status)
+		return ExecutionResult{ResultDigest: digestString(string(raw)), Resource: &helperproto.ResourceResult{ResourceID: status.ResourceID, Status: status.Status, AccessMayRemain: status.AccessMayRemain, CredentialFingerprint: status.CredentialFingerprint, CredentialChanged: status.CredentialChanged, StaticFingerprint: status.StaticFingerprint, StaticChanged: status.StaticChanged, ObservedAt: status.ObservedAt, Reason: status.Reason, AllowedActions: append([]string(nil), status.AllowedActions...), CredentialIDs: append([]string(nil), status.CredentialIDs...)}}, nil
+	})
+	managedBasicDeleteHandler := ManagedBasicDeleteHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Action == nil {
+			return fmt.Errorf("managed Basic delete caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("managed Basic delete carried secret")
+		}
+		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
+		record, err := application.DeleteManagedBasic(ctx, request.Action.TargetID, actor, request.Action.PlanID)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(request.Action.TargetID), Action: &helperproto.ActionResult{JobID: record.ID, Operation: "managed_basic_delete", TargetKind: "credential", TargetID: request.Action.TargetID}}, nil
 	})
 	renewalHandler := CertificateRenewHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerTimer || request.Target != "installation" {
@@ -742,7 +869,7 @@ func RunRole(args []string) error {
 		tokenMu.Unlock()
 		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, renewalHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, renewalHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}
@@ -809,6 +936,57 @@ func digestString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+func executeDomainPublication(ctx context.Context, request helperproto.Request) (output ExecutionResult, resultErr error) {
+	execution, err := application.BeginCertificateIssue(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	defer func() {
+		if closeErr := execution.Close(); resultErr != nil && closeErr != nil {
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	abort := func(cause error) (ExecutionResult, error) {
+		return ExecutionResult{}, execution.Abort(context.WithoutCancel(ctx), cause)
+	}
+	if err := execution.ActivateChallenge(ctx); err != nil {
+		return abort(err)
+	}
+	result, runErr := execution.RunRemote(ctx, execution.StageUID, execution.StageGID)
+	if err := execution.TerminalizeChild(ctx, result, runErr); err != nil {
+		return abort(err)
+	}
+	if runErr != nil {
+		return abort(runErr)
+	}
+	material, err := execution.LoadIssued(time.Now().UTC())
+	if err != nil {
+		return abort(err)
+	}
+	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC())
+	if err != nil {
+		return abort(err)
+	}
+	certificate, err := execution.PreparePublicationCertificate(ctx, identity)
+	if err != nil {
+		return abort(err)
+	}
+	publicationExecution, err := execution.PrepareDomainPublication(ctx, certificate)
+	if err != nil {
+		return abort(err)
+	}
+	defer func() {
+		if closeErr := publicationExecution.Close(); resultErr != nil && closeErr != nil {
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	job, err := publicationExecution.Run(ctx)
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	return ExecutionResult{ResultDigest: publicationExecution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: publicationExecution.Candidate.PublicURL}}, nil
+}
+
 func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 	now := time.Now().UTC()
 	independent := func(cause error) (ExecutionResult, error) {

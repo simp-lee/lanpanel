@@ -46,6 +46,25 @@ func TestSharedReadinessSkipsDisabledWebSocketAndRejectsRedirect(t *testing.T) {
 	}
 }
 
+func TestReadinessIdentityIsStableAcrossFreshObservationTimes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) }))
+	defer server.Close()
+	address := strings.TrimPrefix(server.URL, "http://")
+	request := validProbeRequest(address)
+	first, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tcp/" + address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Now = func() time.Time { return time.Unix(1700000060, 0).UTC() }
+	second, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tcp/" + address})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Digest != second.Digest || first.ObservedAt == second.ObservedAt {
+		t.Fatalf("readiness identity changed across observation times: %#v %#v", first, second)
+	}
+}
+
 func TestSharedReadinessValidatesWebSocketAndApplicationBoundary(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -83,10 +102,14 @@ func TestSharedReadinessValidatesWebSocketAndApplicationBoundary(t *testing.T) {
 	request = validProbeRequest(strings.TrimPrefix(boundary.URL, "http://"))
 	request.AccessMode = domain.AppAccessApplicationManaged
 	request.Target.WebSocket = domain.WebSocketReadiness{Enabled: true, Path: "/ws"}
-	request.ApplicationManagedWebSocketProof = &ControlledWebSocketProof{ResourceID: request.ResourceID, ConfigDigest: request.ConfigDigest, EndpointIdentity: request.EndpointIdentity, AuthenticatedStatus: 101, Digest: digest("qualified-authenticated-101")}
 	request.Target.AllowedHTTPStatuses = []uint16{200}
-	if _, err := Probe(context.Background(), request, dialTransport{strings.TrimPrefix(boundary.URL, "http://"), request.EndpointIdentity + "/tcp/" + strings.TrimPrefix(boundary.URL, "http://")}); err != nil {
+	transport := dialTransport{strings.TrimPrefix(boundary.URL, "http://"), request.EndpointIdentity + "/tcp/" + strings.TrimPrefix(boundary.URL, "http://")}
+	if _, err := Probe(context.Background(), request, transport); err != nil {
 		t.Fatalf("application-managed 401 boundary rejected: %v", err)
+	}
+	request.ApplicationManagedWebSocketProof = &ControlledWebSocketProof{ResourceID: request.ResourceID, ConfigDigest: request.ConfigDigest, EndpointIdentity: request.EndpointIdentity, AuthenticatedStatus: 200, Digest: digest("invalid")}
+	if _, err := Probe(context.Background(), request, transport); err == nil {
+		t.Fatal("mismatched optional WebSocket proof accepted")
 	}
 }
 

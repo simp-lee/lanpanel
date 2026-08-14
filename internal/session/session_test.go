@@ -59,7 +59,13 @@ func TestStalePrincipalCannotSurviveTokenRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !manager.Valid(principal) {
+		t.Fatal("fresh principal invalid")
+	}
 	manager.CommitTokenRotation("fp2")
+	if manager.Valid(principal) {
+		t.Fatal("rotated principal remained valid")
+	}
 	if err := manager.Attach(principal, &socket{}); err == nil {
 		t.Fatal("stale generation attached after rotation")
 	}

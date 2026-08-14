@@ -29,6 +29,9 @@ type ProcessExecution struct {
 }
 
 func BeginProcess(ctx context.Context, actor Actor, resourceID string, start bool) (*ProcessExecution, error) {
+	if err := requireNoDegradedAppliedSource(resourceID); err != nil {
+		return nil, err
+	}
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err

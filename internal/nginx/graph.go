@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,6 +96,27 @@ type Entry struct {
 	Generation uint64         `json:"generation"`
 	Temporary  *TemporarySite `json:"temporary,omitempty"`
 	Challenge  *ChallengeSite `json:"challenge,omitempty"`
+	Domain     *DomainSite    `json:"domain,omitempty"`
+}
+type DomainSite struct {
+	Hosts              []string      `json:"hosts"`
+	CertificatePointer string        `json:"certificate_pointer"`
+	RejectionAuditPath string        `json:"rejection_audit_path"`
+	AuthMode           string        `json:"auth_mode"`
+	HTPasswdPath       string        `json:"htpasswd_path,omitempty"`
+	CIDRs              []string      `json:"cidrs,omitempty"`
+	UpstreamNetwork    string        `json:"upstream_network"`
+	UpstreamAddress    string        `json:"upstream_address"`
+	WebSocket          bool          `json:"websocket"`
+	Static             []StaticRoute `json:"static,omitempty"`
+}
+type StaticRoute struct {
+	URLPath      string `json:"url_path"`
+	RelativePath string `json:"relative_path"`
+	SourcePath   string `json:"source_path"`
+	Directory    bool   `json:"directory"`
+	Anonymous    bool   `json:"anonymous,omitempty"`
+	Identity     string `json:"identity"`
 }
 type ChallengeSite struct {
 	Hosts   []string `json:"hosts"`
@@ -276,6 +298,9 @@ func ValidateManifest(manifest Manifest) error {
 			seenDomain[domain] = entry.ResourceID
 		}
 		for _, listener := range entry.Listeners {
+			if sharedHTTPSListener(listener) {
+				continue
+			}
 			if owner := seenListener[listener]; owner != "" && owner != entry.ResourceID {
 				return fmt.Errorf("Nginx listener %q belongs to multiple resources", listener)
 			}
@@ -523,7 +548,7 @@ func renderMain(paths Paths) string {
 		"  server_tokens off;\n" +
 		"  access_log off;\n" +
 		"  include " + paths.SanitizerPath() + ";\n" +
-		"  log_format lanpanel_rejection '$msec $remote_addr $server_port $ssl_server_name $host $status $http_x_lanpanel_closure_id';\n" +
+		"  log_format lanpanel_rejection '$msec $remote_addr $server_port $ssl_server_name $host $status $http_x_lanpanel_closure_id';\n  map $status $lanpanel_rejection_loggable { default 0; 421 1; }\n" +
 		"  server {\n" +
 		"    listen 80 default_server;\n" +
 		"    listen [::]:80 default_server;\n" +
@@ -592,7 +617,7 @@ func validEntry(entry Entry) bool {
 	prefix := strings.Split(entry.Relative, string(filepath.Separator))[0]
 	switch entry.Kind {
 	case EntryApp:
-		if prefix != AppsDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) == 0 {
+		if prefix != AppsDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) == 0 || (entry.Domain != nil && !validDomainSite(*entry.Domain, entry.Domains)) {
 			return false
 		}
 	case EntryChallenge:
@@ -623,6 +648,9 @@ func validEntry(entry Entry) bool {
 	return true
 }
 
+func sharedHTTPSListener(value string) bool {
+	return value == "tcp:0.0.0.0:80" || value == "tcp:[::]:80" || value == "tcp:0.0.0.0:443" || value == "tcp:[::]:443"
+}
 func entriesEqual(left, right []Entry) bool {
 	if len(left) != len(right) {
 		return false
@@ -709,6 +737,92 @@ func validTemporarySite(site TemporarySite, listener string) bool {
 	}
 }
 
+func validDomainSite(site DomainSite, domains []string) bool {
+	if !slices.Equal(site.Hosts, domains) || !strings.HasPrefix(site.CertificatePointer, "/var/lib/lanpanel/certificates/active/") || filepath.Clean(site.CertificatePointer) != site.CertificatePointer || strings.ContainsAny(site.CertificatePointer, "\x00\r\n") || (site.AuthMode != "public" && site.AuthMode != "application_managed" && site.AuthMode != "basic") || (site.AuthMode == "basic") != (site.HTPasswdPath != "") || (site.HTPasswdPath != "" && (!filepath.IsAbs(site.HTPasswdPath) || filepath.Clean(site.HTPasswdPath) != site.HTPasswdPath || strings.ContainsAny(site.HTPasswdPath, "\x00\r\n"))) || (site.RejectionAuditPath != "/var/log/lanpanel/nginx-rejections.log") || (site.AuthMode != "basic" && len(site.CIDRs) != 0) || (site.UpstreamNetwork != "unix" && site.UpstreamNetwork != "tcp") || site.UpstreamAddress == "" {
+		return false
+	}
+	if strings.ContainsAny(site.UpstreamAddress, " \t\r\n;{}#$\\\"") {
+		return false
+	}
+	if site.UpstreamNetwork == "unix" && (!filepath.IsAbs(site.UpstreamAddress) || filepath.Clean(site.UpstreamAddress) != site.UpstreamAddress) {
+		return false
+	}
+	if site.UpstreamNetwork == "tcp" {
+		host, port, err := net.SplitHostPort(site.UpstreamAddress)
+		address, addressErr := netip.ParseAddr(host)
+		value, valueErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || addressErr != nil || valueErr != nil || value == 0 || !address.IsLoopback() {
+			return false
+		}
+	}
+	priorCIDR := ""
+	for _, value := range site.CIDRs {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil || prefix.String() != value || priorCIDR != "" && priorCIDR >= value {
+			return false
+		}
+		priorCIDR = value
+	}
+	prior := ""
+	for _, route := range site.Static {
+		if route.URLPath == "" || !strings.HasPrefix(route.URLPath, "/") || strings.ContainsAny(route.URLPath, " \t\r\n;{}#$\\\"'") || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || strings.HasPrefix(route.RelativePath, "..") || route.SourcePath == "" || !filepath.IsAbs(route.SourcePath) || filepath.Clean(route.SourcePath) != route.SourcePath || strings.ContainsAny(route.SourcePath, "\x00\r\n") || route.Directory != (route.URLPath != "/" && strings.HasSuffix(route.URLPath, "/")) || !validDigest(route.Identity) || prior != "" && prior >= route.URLPath {
+			return false
+		}
+		prior = route.URLPath
+	}
+	return true
+}
+func quoteNginxArgument(value string) string {
+	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "$", "\\$")
+	return "\"" + replacer.Replace(value) + "\""
+}
+func renderDomain(entry Entry) ([]byte, error) {
+	site := entry.Domain
+	hosts := strings.Join(site.Hosts, " ")
+	hostPattern := make([]string, len(site.Hosts))
+	for index, host := range site.Hosts {
+		hostPattern[index] = regexp.QuoteMeta(host)
+	}
+	certificate := quoteNginxArgument(site.CertificatePointer + "/certificate.pem")
+	key := quoteNginxArgument(site.CertificatePointer + "/private-key.pem")
+	var output strings.Builder
+	fmt.Fprintf(&output, "server {\n  listen 80;\n  listen [::]:80;\n  server_name %s;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  return 308 https://$http_host$request_uri;\n}\n", hosts, quoteNginxArgument(site.RejectionAuditPath), strings.Join(hostPattern, "|"))
+	fmt.Fprintf(&output, "server {\n  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n  server_name %s;\n  ssl_certificate %s;\n  ssl_certificate_key %s;\n  ssl_protocols TLSv1.2 TLSv1.3;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  if ($ssl_server_name !~* ^(?:%s)$) { return 421; }\n", hosts, certificate, key, quoteNginxArgument(site.RejectionAuditPath), strings.Join(hostPattern, "|"), strings.Join(hostPattern, "|"))
+	if site.AuthMode == "basic" {
+		output.WriteString("  auth_basic \"Restricted\";\n  auth_basic_user_file " + quoteNginxArgument(site.HTPasswdPath) + ";\n")
+		for _, cidr := range site.CIDRs {
+			output.WriteString("  allow " + cidr + ";\n")
+		}
+		if len(site.CIDRs) > 0 {
+			output.WriteString("  deny all;\n")
+		}
+	}
+	for _, route := range site.Static {
+		modifier := " ="
+		source := route.SourcePath
+		if route.Directory {
+			modifier = " ^~"
+			source += "/"
+		}
+		fmt.Fprintf(&output, "  location%s %s {\n    disable_symlinks on;\n    alias %s;\n    try_files $request_filename =404;\n    limit_except GET HEAD { deny all; }\n  }\n", modifier, route.URLPath, quoteNginxArgument(source))
+	}
+	authorization := "\"\""
+	if site.AuthMode == "application_managed" {
+		authorization = "$http_authorization"
+	}
+	upstream := "http://unix:" + site.UpstreamAddress + ":"
+	if site.UpstreamNetwork == "tcp" {
+		upstream = "http://" + site.UpstreamAddress
+	}
+	output.WriteString("  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization " + authorization + ";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-LanPanel-Closure-ID \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Real-IP $remote_addr;\n")
+	if site.WebSocket {
+		output.WriteString("    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n")
+	} else {
+		output.WriteString("    proxy_set_header Upgrade \"\";\n    proxy_set_header Connection \"\";\n")
+	}
+	output.WriteString("    proxy_pass " + upstream + ";\n  }\n}\n")
+	return []byte(output.String()), nil
+}
 func DigestEntry(entry Entry) (string, error) {
 	copy := entry
 	copy.Digest = "sha256:" + strings.Repeat("0", 64)
@@ -724,6 +838,9 @@ func RenderEntry(entry Entry) ([]byte, error) {
 	}
 	if entry.Kind == EntryChallenge {
 		return renderChallenge(entry)
+	}
+	if entry.Kind == EntryApp && entry.Domain != nil {
+		return renderDomain(entry)
 	}
 	if entry.Kind != EntryTemporary {
 		return RenderClosedEntry(entry)
@@ -749,7 +866,7 @@ func RenderClosedEntry(entry Entry) ([]byte, error) {
 		Listeners  []string  `json:"listeners,omitempty"`
 		Generation uint64    `json:"generation"`
 	}{entry.Kind, entry.ResourceID, entry.Relative, entry.Domains, entry.Listeners, entry.Generation}
-	if entry.Temporary != nil || entry.Challenge != nil {
+	if entry.Temporary != nil || entry.Challenge != nil || entry.Domain != nil {
 		return nil, fmt.Errorf("active entry cannot use closed renderer")
 	}
 	data, err := json.Marshal(binding)

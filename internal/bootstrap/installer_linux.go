@@ -16,10 +16,12 @@ import (
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -450,6 +452,24 @@ func createBootstrapDirectories(journal Journal) error {
 	}
 	for _, path := range []string{filepath.Join(certificateRoot, "staging"), filepath.Join(certificateRoot, "active"), filepath.Join(certificateRoot, "bootstrap"), filepath.Join(certificateRoot, "bundles")} {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
+			return err
+		}
+	}
+	if journal.Paths == FixedPaths() {
+		group, err := user.LookupGroup("www-data")
+		if err != nil {
+			return err
+		}
+		gid, err := strconv.ParseUint(group.Gid, 10, 32)
+		if err != nil || gid == 0 {
+			return fmt.Errorf("Nginx group identity invalid")
+		}
+		for _, path := range []string{"/etc/lanpanel-public", "/etc/lanpanel-public/basic"} {
+			if _, err := ensureDirectory(path, filetxn.Owner{UID: 0, GID: uint32(gid)}, 0o750); err != nil {
+				return err
+			}
+		}
+		if _, err := ensureDirectory("/etc/lanpanel-public/basic/.txn", owner, 0o700); err != nil {
 			return err
 		}
 	}

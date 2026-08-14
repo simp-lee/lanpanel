@@ -540,10 +540,7 @@ func validGAInstallation() Installation {
 			LoginServer:  "https://control.example.com",
 			ManagedPaths: []string{"/var/lib/lanpanel/connector"},
 		},
-		Credentials: []Credential{{
-			ID:          "cred_00000000000000000000000000000001",
-			ManagedPath: "/var/lib/lanpanel/credentials/app-basic",
-		}},
+		Credentials:  []Credential{{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: "res_00000000000000000000000000000001", Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: testDigest}},
 		ManagedPaths: []string{"/var/lib/lanpanel/state"},
 		Resources: []AppResource{{
 			ID:                  "res_00000000000000000000000000000001",
