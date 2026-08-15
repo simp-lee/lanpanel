@@ -756,7 +756,8 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if before.Ownership != after.Ownership || before.OwnershipDigest != after.OwnershipDigest {
 		orphanContraction := role == RoleOwnershipContraction && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOrphan && before.OwnershipDigest == after.OwnershipDigest
 		activationRebind := role == RoleOwnershipActivation && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipConvergenceProof(before, after, proof.Ownership)
-		if !orphanContraction && !activationRebind {
+		retirementRebind := role == RoleOwnershipRetirement && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipRetirementProof(before, after, proof.Ownership)
+		if !orphanContraction && !activationRebind && !retirementRebind {
 			return fmt.Errorf("ownership authority transition lacks exact contraction or activation proof")
 		}
 	}
@@ -928,6 +929,10 @@ func baseMarkersRemoved(before, after ResourceSafety) bool {
 	return before.StickyUnpublished != nil && after.StickyUnpublished == nil || before.Contraction != nil && after.Contraction == nil || before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.EdgeOne.Expiry != nil && after.EdgeOne.Expiry == nil
 }
 
+func validOwnershipRetirementProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {
+	return proof != nil && proof.ResourceID == before.ResourceID && validRef(proof.IntentRef) && proof.Generation != 0 && proof.BeforeDigest == before.OwnershipDigest && proof.AfterDigest == after.OwnershipDigest && isDigest(proof.BeforeDigest) && isDigest(proof.AfterDigest)
+}
+
 func validOwnershipConvergenceProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {
 	return proof != nil && after.Reactivating != nil && proof.ResourceID == before.ResourceID && proof.IntentRef == after.Reactivating.PlanID && proof.Generation == after.Reactivating.Generation && proof.BeforeDigest == before.OwnershipDigest && proof.AfterDigest == after.OwnershipDigest && isDigest(proof.BeforeDigest) && isDigest(proof.AfterDigest)
 }
@@ -1021,7 +1026,7 @@ func backupTransitionGeneration(marker *BackupTransition) uint64 {
 
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleCertificateHandoff, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleCertificateObservation, RoleEdgeOneRefresh, RoleResourceCreate:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleOwnershipRetirement, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleCertificateHandoff, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleCertificateObservation, RoleEdgeOneRefresh, RoleResourceCreate:
 		return true
 	default:
 		return false

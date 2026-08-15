@@ -300,7 +300,8 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 		result, err := handler.execute(requestContext, caller, request, secret)
 		cancel()
 		destroySecret()
-		if err != nil {
+		terminalPartial := request.Operation == helperproto.OperationPublicationActivate && result.Secret == nil && result.Action != nil && result.Action.JobResult == "partial" && result.Action.JobID != "" && result.Action.PublicURL != "" && result.ResultDigest != ""
+		if err != nil && !terminalPartial {
 			if result.Secret != nil {
 				result.Secret.Destroy()
 			}

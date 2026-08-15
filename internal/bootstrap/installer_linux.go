@@ -436,10 +436,17 @@ func createBootstrapDirectories(journal Journal) error {
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)
 	}
-	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot, filepath.Dir(nginxPaths.AuditPath)} {
+	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot} {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
 			return err
 		}
+	}
+	auditMode := uint32(0o700)
+	if journal.Paths == FixedPaths() {
+		auditMode = 0o711
+	}
+	if _, err := ensureDirectory(filepath.Dir(nginxPaths.AuditPath), owner, auditMode); err != nil {
+		return err
 	}
 	certificateRoot := filepath.Join(journal.Paths.PersistentRoot, "certificates")
 	if _, err := ensureDirectory(certificateRoot, owner, 0o711); err != nil {
@@ -456,6 +463,9 @@ func createBootstrapDirectories(journal Journal) error {
 		}
 	}
 	if journal.Paths == FixedPaths() {
+		if _, err := ensureDirectory("/var/log/lanpanel/goaccess", owner, 0o711); err != nil {
+			return err
+		}
 		group, err := user.LookupGroup("www-data")
 		if err != nil {
 			return err
@@ -463,6 +473,9 @@ func createBootstrapDirectories(journal Journal) error {
 		gid, err := strconv.ParseUint(group.Gid, 10, 32)
 		if err != nil || gid == 0 {
 			return fmt.Errorf("Nginx group identity invalid")
+		}
+		if _, err := ensureDirectory("/run/lanpanel-goaccess", filetxn.Owner{UID: 0, GID: uint32(gid)}, 0o750); err != nil {
+			return err
 		}
 		for _, path := range []string{"/etc/lanpanel-public", "/etc/lanpanel-public/basic"} {
 			if _, err := ensureDirectory(path, filetxn.Owner{UID: 0, GID: uint32(gid)}, 0o750); err != nil {

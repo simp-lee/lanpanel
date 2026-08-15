@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/closure"
 	"lanpanel/internal/domain"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
+	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
 	"reflect"
 	"time"
@@ -179,13 +182,19 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			return err
 		}
 		result, contractErr := host.ContractResource(ctx, resource.ID)
+		if contractErr == nil {
+			contractErr = stopRecoveredGoAccessBounded(service, exposure, resource)
+		}
 		if contractErr != nil {
-			snapshot, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			snapshot, stopErr := stopRecoveredNginxBounded(host)
+			goaccessErr := stopRecoveredGoAccessBounded(service, exposure, resource)
 			observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
-			fenceErr := service.WriteIngressActivationFence(context.WithoutCancel(ctx), exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil)
+			fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
+			fenceErr := service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
+			cancelFence()
 			operations.ReleaseExposure(mutation, exposure)
 			mutationSet.Close()
-			return errors.Join(contractErr, stopErr, fenceErr)
+			return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)
 		}
 		pointerErr := restoreInterruptedDomainPointer(ctx, *activationIntent)
 		freshDocument, err := service.normal.Read()
@@ -205,8 +214,345 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := reconcileRetiredGoAccess(ctx, service); err != nil {
+		return err
+	}
+	return reconcilePendingContractionGoAccess(ctx, service)
+}
+func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedService) error {
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	host, err := goaccessruntime.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	for _, resource := range installation.Resources {
+		retirements := append([]domain.GoAccessRetirementIdentity(nil), resource.PublicationRecord.PendingGoAccessRetirements...)
+		if len(retirements) == 0 {
+			continue
+		}
+		authorityDigest, digestErr := operations.GoAccessRetirementInventoryDigest(retirements)
+		if digestErr != nil {
+			return digestErr
+		}
+		if resource.PublicationRecord.GoAccessRetirementAuthorityDigest != authorityDigest || resource.PublicationRecord.GoAccessRetirementSourceJournalID != "" {
+			return fmt.Errorf("pending GoAccess contraction source changed")
+		}
+		sourceJobID := resource.PublicationRecord.GoAccessRetirementSourceJobID
+		expectedBinding, bindingErr := operations.GoAccessRetirementBinding(installation.InstallationID, resource.ID, "contraction", sourceJobID, "", authorityDigest, retirements)
+		if bindingErr != nil {
+			return bindingErr
+		}
+		oldRecord, loadErr := jobs.LoadEntries(document.Entries, sourceJobID)
+		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || oldRecord.Result != jobs.ResultPartial || oldRecord.ErrorCode != "goaccess_stop_failed" {
+			return fmt.Errorf("pending GoAccess contraction job authority changed")
+		}
+		retirementIntent, runningRetirement, resume, authorityErr := operations.FindRunningGoAccessRetirement(document, "resource/"+resource.ID)
+		if authorityErr != nil {
+			return authorityErr
+		}
+		if resume && !reflect.DeepEqual(retirementIntent.SafetyBinding, expectedBinding) {
+			return fmt.Errorf("pending GoAccess contraction immutable authority changed")
+		}
+		jobID := runningRetirement.ID
+		needsBegin := resume && runningRetirement.Status == jobs.StatusReserved
+		if !resume {
+			admission, acquireErr := service.manager.Acquire(ctx, locks.MutationAdmission)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			fresh, readErr := service.normal.Read()
+			if readErr == nil {
+				job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.GoAccessRetirement, Target: "resource/" + resource.ID, ActorIdentity: "startup-recovery", Source: operations.AdmissionStartup, SafetyBinding: expectedBinding, ExpectedRevision: fresh.Revision})
+				readErr = admitErr
+				jobID = job.ID
+				needsBegin = admitErr == nil
+			}
+			releaseErr := admission.Release()
+			if err := errors.Join(readErr, releaseErr); err != nil {
+				return err
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				return err
+			}
+		}
+		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+		if err != nil {
+			return err
+		}
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), time.Minute)
+		mutation, exposure, err := mutationSet.AcquireExposure(cleanupCtx, "resource/"+resource.ID, service.manager)
+		if err != nil {
+			cancelCleanup()
+			mutationSet.Close()
+			return err
+		}
+		if needsBegin {
+			_, err = admitter.BeginPlanless(cleanupCtx, mutation, exposure, operations.ConsumeRequest{JobID: jobID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
+			if err == nil {
+				document, err = service.normal.Read()
+			}
+		}
+		if err == nil {
+			freshInstallation, decodeErr := installationFromDocument(document)
+			err = decodeErr
+			if decodeErr == nil {
+				err = fmt.Errorf("pending GoAccess contraction authority changed")
+				for _, candidate := range freshInstallation.Resources {
+					if candidate.ID == resource.ID && reflect.DeepEqual(candidate.PublicationRecord.PendingGoAccessRetirements, retirements) {
+						err = nil
+						break
+					}
+				}
+			}
+		}
+		if err == nil {
+			err = operations.ValidateGoAccessRetirementAuthority(document, expectedBinding)
+		}
+		if err == nil {
+			for _, item := range retirements {
+				stopErr := host.Retire(cleanupCtx, resource.ID, item.Generation, item.ServiceIdentity, item.UnitIdentities)
+				if stopErr == nil && item.RemoveState {
+					stopErr = host.RemoveGenerationState(cleanupCtx, resource.ID, item.StateGeneration)
+				}
+				if stopErr == nil && item.RemoveShared {
+					stopErr = host.CleanupUncommittedShared(cleanupCtx, installation.InstallationID, resource.ID)
+				}
+				if stopErr != nil {
+					err = errors.Join(err, stopErr)
+				}
+			}
+		}
+		if err == nil {
+			for _, item := range retirements {
+				if pruneErr := pruneRetiredGoAccessOwnership(cleanupCtx, service, exposure, resource.ID, sourceJobID, item.Generation, item.StateGeneration, item.RemoveState, item.RemoveShared); pruneErr != nil {
+					err = errors.Join(err, pruneErr)
+				}
+			}
+		}
+		if err == nil {
+			_, err = admitter.CompleteGoAccessContractionReconciliation(cleanupCtx, mutation, exposure, document.Revision, jobID, resource.ID, retirements)
+		}
+		cancelCleanup()
+		releaseErr := operations.ReleaseExposure(mutation, exposure)
+		closeErr := mutationSet.Close()
+		if err := errors.Join(err, releaseErr, closeErr); err != nil {
+			return err
+		}
+		document, err = service.normal.Read()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+func reconcileRetiredGoAccess(ctx context.Context, service *FixedService) error {
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	host, err := goaccessruntime.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	for _, resource := range installation.Resources {
+		if resource.PublicationRecord.State != domain.PublicationPublished {
+			continue
+		}
+		bundle := resource.PublicationRecord.LastAppliedBundle
+		if bundle == nil || bundle.DomainHTTPS == nil || bundle.DomainHTTPS.GoAccess.RetiredGeneration == 0 {
+			continue
+		}
+		goaccess := bundle.DomainHTTPS.GoAccess
+		retirements := append([]domain.GoAccessRetirementIdentity(nil), resource.PublicationRecord.PendingGoAccessRetirements...)
+		if len(retirements) == 0 {
+			removeRetiredState := goaccess.RemovesRetiredState()
+			complete, completeErr := host.RetirementComplete(ctx, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, removeRetiredState)
+			if completeErr != nil {
+				return completeErr
+			}
+			if !complete {
+				return fmt.Errorf("completed GoAccess retirement authority invalid")
+			}
+			if ownershipErr := requireRetiredGoAccessOwnershipComplete(service, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, removeRetiredState); ownershipErr != nil {
+				return ownershipErr
+			}
+			continue
+		}
+		if len(retirements) != 1 || !reflect.DeepEqual(retirements[0], domain.GoAccessRetirementIdentity{Generation: goaccess.RetiredGeneration, StateGeneration: goaccess.RetiredStateGeneration, ServiceIdentity: goaccess.RetiredServiceIdentity, RemoveState: goaccess.RemovesRetiredState(), UnitIdentities: goaccess.RetiredUnitIdentities}) {
+			return fmt.Errorf("pending GoAccess publication retirement changed")
+		}
+		retirementDigest, digestErr := operations.GoAccessRetirementInventoryDigest(retirements)
+		if digestErr != nil {
+			return digestErr
+		}
+		if resource.PublicationRecord.GoAccessRetirementAuthorityDigest != retirementDigest {
+			return fmt.Errorf("pending GoAccess publication digest changed")
+		}
+		sourceJobID, sourceJournalID := resource.PublicationRecord.GoAccessRetirementSourceJobID, resource.PublicationRecord.GoAccessRetirementSourceJournalID
+		expectedBinding, bindingErr := operations.GoAccessRetirementBinding(installation.InstallationID, resource.ID, "publication", sourceJobID, sourceJournalID, retirementDigest, retirements)
+		if bindingErr != nil {
+			return bindingErr
+		}
+		record, recordErr := jobs.LoadEntries(document.Entries, sourceJobID)
+		if recordErr != nil {
+			return recordErr
+		}
+		if record.Status == jobs.StatusRunning {
+			mutationSet, openErr := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+			if openErr != nil {
+				return openErr
+			}
+			mutation, exposure, acquireErr := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+			if acquireErr != nil {
+				mutationSet.Close()
+				return acquireErr
+			}
+			interruptCtx, cancelInterrupt := context.WithTimeout(context.Background(), 15*time.Second)
+			record, recordErr = admitter.InterruptPublicationGoAccessRetirement(interruptCtx, mutation, exposure, document.Revision, record.ID, resource.ID)
+			cancelInterrupt()
+			releaseErr := operations.ReleaseExposure(mutation, exposure)
+			closeErr := mutationSet.Close()
+			if err := errors.Join(recordErr, releaseErr, closeErr); err != nil {
+				return err
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				return err
+			}
+		}
+		complete, completeErr := host.RetirementComplete(ctx, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, goaccess.RemovesRetiredState())
+		if completeErr != nil {
+			return completeErr
+		}
+		if record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded {
+			if !complete {
+				return fmt.Errorf("succeeded publication retains incomplete GoAccess retirement")
+			}
+			continue
+		}
+		reconciliation := record.Status == jobs.StatusTerminal && ((record.Result == jobs.ResultPartial && record.ErrorCode == "goaccess_stop_failed") || (record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery"))
+		if record.Status != jobs.StatusRunning && !reconciliation {
+			return fmt.Errorf("GoAccess retirement durable job authority changed")
+		}
+		jobID := sourceJobID
+		retirementIntent, runningRetirement, resumeReconciliation, authorityErr := operations.FindRunningGoAccessRetirement(document, "resource/"+resource.ID)
+		if authorityErr != nil {
+			return authorityErr
+		}
+		if resumeReconciliation && !reflect.DeepEqual(retirementIntent.SafetyBinding, expectedBinding) {
+			return fmt.Errorf("pending GoAccess publication immutable authority changed")
+		}
+		needsBegin := resumeReconciliation && runningRetirement.Status == jobs.StatusReserved
+		if resumeReconciliation {
+			reconciliation = true
+			jobID = runningRetirement.ID
+		}
+		if reconciliation && !resumeReconciliation {
+			admission, admissionErr := service.manager.Acquire(ctx, locks.MutationAdmission)
+			if admissionErr != nil {
+				return admissionErr
+			}
+			fresh, readErr := service.normal.Read()
+			if readErr == nil {
+				newJob, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.GoAccessRetirement, Target: "resource/" + resource.ID, ActorIdentity: "startup-recovery", Source: operations.AdmissionStartup, SafetyBinding: expectedBinding, ExpectedRevision: fresh.Revision})
+				readErr = admitErr
+				if admitErr == nil {
+					jobID = newJob.ID
+					needsBegin = true
+				}
+			}
+			releaseErr := admission.Release()
+			if err := errors.Join(readErr, releaseErr); err != nil {
+				return err
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				return err
+			}
+		}
+		mutationSet, openErr := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+		if openErr != nil {
+			return openErr
+		}
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), time.Minute)
+		mutation, exposure, acquireErr := mutationSet.AcquireExposure(cleanupCtx, "resource/"+resource.ID, service.manager)
+		if acquireErr != nil {
+			cancelCleanup()
+			mutationSet.Close()
+			return acquireErr
+		}
+		if reconciliation && needsBegin {
+			_, beginErr := admitter.BeginPlanless(cleanupCtx, mutation, exposure, operations.ConsumeRequest{JobID: jobID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
+			if beginErr != nil {
+				cancelCleanup()
+				operations.ReleaseExposure(mutation, exposure)
+				mutationSet.Close()
+				return beginErr
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				cancelCleanup()
+				operations.ReleaseExposure(mutation, exposure)
+				mutationSet.Close()
+				return err
+			}
+		}
+		freshDocument, freshErr := service.normal.Read()
+		if freshErr == nil && reconciliation {
+			freshErr = operations.ValidateGoAccessRetirementAuthority(freshDocument, expectedBinding)
+		}
+		if freshErr == nil && !complete {
+			freshErr = host.Retire(cleanupCtx, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredServiceIdentity, goaccess.RetiredUnitIdentities)
+		}
+		removeRetiredState := goaccess.RemovesRetiredState()
+		if freshErr == nil && !complete && removeRetiredState {
+			freshErr = host.RemoveGenerationState(cleanupCtx, resource.ID, goaccess.RetiredStateGeneration)
+		}
+		if freshErr == nil {
+			freshErr = pruneRetiredGoAccessOwnership(cleanupCtx, service, exposure, resource.ID, sourceJobID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, removeRetiredState, false)
+		}
+		if freshErr == nil {
+			if reconciliation {
+				_, freshErr = admitter.CompleteGoAccessRetirementReconciliation(cleanupCtx, mutation, exposure, freshDocument.Revision, jobID, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredServiceIdentity)
+			} else {
+				_, freshErr = admitter.CompletePublicationGoAccessRetirement(cleanupCtx, mutation, exposure, freshDocument.Revision, jobID, resource.ID)
+			}
+		}
+		cancelCleanup()
+		releaseErr := operations.ReleaseExposure(mutation, exposure)
+		closeErr := mutationSet.Close()
+		if err := errors.Join(freshErr, releaseErr, closeErr); err != nil {
+			return err
+		}
+		document, err = service.normal.Read()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func interruptDomainSafety(item safety.ResourceSafety, intent domain.ActivationIntent) (safety.ResourceSafety, uint64, bool, error) {
 	if item.Reactivating != nil {
 		if item.Reactivating.PlanID != intent.PlanID || item.Reactivating.Generation != intent.Generation {
@@ -222,6 +568,99 @@ func interruptDomainSafety(item safety.ResourceSafety, intent domain.ActivationI
 		return item, item.Closing.Generation, false, nil
 	}
 	return item, 0, false, fmt.Errorf("reactivating publication safety missing")
+}
+
+func stopRecoveredNginxBounded(host activation.Host) (closure.RuntimeSnapshot, error) {
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return host.StopAndVerify(stopCtx)
+}
+
+func stopRecoveredGoAccessBounded(service *FixedService, exposure *locks.Lease, resource domain.AppResource) error {
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return stopRecoveredGoAccess(stopCtx, service, exposure, resource)
+}
+
+func stopRecoveredGoAccess(ctx context.Context, service *FixedService, exposure *locks.Lease, resource domain.AppResource) error {
+	type generationAction struct {
+		identity        string
+		unitIdentities  []string
+		stateGeneration uint64
+		removeState     bool
+		removeShared    bool
+		candidate       bool
+	}
+	document, documentErr := service.normal.Read()
+	if documentErr != nil {
+		return documentErr
+	}
+	installation, installationErr := installationFromDocument(document)
+	if installationErr != nil {
+		return installationErr
+	}
+	priorShared := goAccessSharedRetained(resource)
+	generations := map[uint64]generationAction{}
+	add := func(bundle *domain.PublicationBundle, candidate bool) {
+		if bundle == nil || bundle.DomainHTTPS == nil {
+			return
+		}
+		goaccess := bundle.DomainHTTPS.GoAccess
+		if goaccess.Enabled {
+			action := generationAction{}
+			if candidate {
+				action = generationAction{identity: goaccess.ServiceIdentity, unitIdentities: append([]string(nil), goaccess.UnitIdentities...), stateGeneration: goaccess.StateGeneration, removeState: goaccess.StateGeneration == goaccess.Generation, removeShared: !priorShared, candidate: true}
+			}
+			generations[goaccess.Generation] = action
+		}
+		if goaccess.RetiredGeneration != 0 {
+			generations[goaccess.RetiredGeneration] = generationAction{identity: goaccess.RetiredServiceIdentity, unitIdentities: append([]string(nil), goaccess.RetiredUnitIdentities...), stateGeneration: goaccess.RetiredStateGeneration}
+		}
+	}
+	add(resource.PublicationRecord.LastAppliedBundle, false)
+	if intent := resource.PublicationRecord.ActivationIntent; intent != nil {
+		add(&intent.Candidate, true)
+		add(intent.Prior, false)
+	}
+	if len(generations) == 0 {
+		return nil
+	}
+	host, err := goaccessruntime.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	for generation, action := range generations {
+		if action.identity == "" {
+			err = errors.Join(err, host.Stop(ctx, resource.ID, generation))
+		} else {
+			currentErr := error(nil)
+			if action.candidate {
+				gid, gidErr := nginxGroupGID()
+				candidate, renderErr := goaccessruntime.Render(installation.InstallationID, resource, gid, generation)
+				currentErr = errors.Join(gidErr, renderErr)
+				if currentErr == nil {
+					currentErr = host.CleanupCandidate(ctx, candidate)
+				}
+			} else {
+				currentErr = host.Retire(ctx, resource.ID, generation, action.identity, action.unitIdentities)
+				if currentErr == nil && action.removeState {
+					currentErr = host.RemoveGenerationState(ctx, resource.ID, action.stateGeneration)
+				}
+				if currentErr == nil && action.removeShared {
+					currentErr = host.CleanupUncommittedShared(ctx, installation.InstallationID, resource.ID)
+				}
+			}
+			if currentErr == nil {
+				sourceJobID := resource.PublicationRecord.LastJobID
+				if intent := resource.PublicationRecord.ActivationIntent; intent != nil {
+					sourceJobID = intent.JobID
+				}
+				currentErr = pruneRetiredGoAccessOwnership(ctx, service, exposure, resource.ID, sourceJobID, generation, action.stateGeneration, action.removeState, action.removeShared)
+			}
+			err = errors.Join(err, currentErr)
+		}
+	}
+	return err
 }
 
 func convergeInterruptedDomainClosing(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID string, generation uint64, runtimeDigest, reason string) error {
@@ -257,12 +696,64 @@ func convergeCommittedDomainPublication(ctx context.Context, service *FixedServi
 	if applied == nil || applied.DomainHTTPS == nil || marker.Generation != applied.Generation {
 		return contractCommittedDomainPublication(ctx, service, resource, marker)
 	}
+	if applied.DomainHTTPS.GoAccess.RetiredGeneration != 0 {
+		document, readErr := service.normal.Read()
+		if readErr != nil {
+			return readErr
+		}
+		record, loadErr := jobs.LoadEntries(document.Entries, resource.PublicationRecord.LastJobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status == jobs.StatusRunning {
+			admitter, admitErr := service.TimerAdmitter()
+			if admitErr != nil {
+				return admitErr
+			}
+			mutationSet, openErr := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+			if openErr != nil {
+				return openErr
+			}
+			mutation, exposure, acquireErr := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+			if acquireErr != nil {
+				mutationSet.Close()
+				return acquireErr
+			}
+			interruptCtx, cancelInterrupt := context.WithTimeout(context.Background(), 15*time.Second)
+			_, interruptErr := admitter.InterruptPublicationGoAccessRetirement(interruptCtx, mutation, exposure, document.Revision, record.ID, resource.ID)
+			cancelInterrupt()
+			releaseErr := operations.ReleaseExposure(mutation, exposure)
+			closeErr := mutationSet.Close()
+			if err := errors.Join(interruptErr, releaseErr, closeErr); err != nil {
+				return err
+			}
+		}
+	}
 	candidate, err := prepareDomainCandidate(service, resource, marker.Generation, applied.DomainHTTPS.Certificate)
+	if err == nil && candidate.Bundle.DomainHTTPS != nil {
+		candidate.Bundle.DomainHTTPS.GoAccess = applied.DomainHTTPS.GoAccess
+		candidate.BundleDigest, err = publication.BundleDigest(candidate.Bundle)
+	}
 	if err != nil {
 		return contractCommittedDomainPublication(ctx, service, resource, marker)
 	}
 	if !reflect.DeepEqual(candidate.Bundle, *applied) {
 		return contractCommittedDomainPublication(ctx, service, resource, marker)
+	}
+	if applied.DomainHTTPS.GoAccess.Enabled {
+		gid, gidErr := nginxGroupGID()
+		recoveryDocument, documentErr := service.normal.Read()
+		recoveryInstallation, installationErr := installationFromDocument(recoveryDocument)
+		runtimeCandidate, renderErr := goaccessruntime.Render(recoveryInstallation.InstallationID, resource, gid, applied.DomainHTTPS.GoAccess.Generation)
+		verifyErr := errors.Join(gidErr, documentErr, installationErr, renderErr)
+		goaccessHost, hostErr := goaccessruntime.NewFixedHost()
+		verifyErr = errors.Join(verifyErr, hostErr)
+		if verifyErr == nil {
+			verifyErr = goaccessHost.Verify(ctx, runtimeCandidate)
+		}
+		if verifyErr != nil {
+			return contractCommittedDomainPublication(ctx, service, resource, marker)
+		}
 	}
 	host, err := activation.NewFixedHost()
 	if err != nil {
@@ -277,7 +768,9 @@ func convergeCommittedDomainPublication(ctx context.Context, service *FixedServi
 		return err
 	}
 	record, err := jobs.LoadEntries(document.Entries, resource.PublicationRecord.LastJobID)
-	if err != nil || record.Result != jobs.ResultSucceeded || len(record.Postconditions) != 1 || record.Postconditions[0].Kind != "published" || record.Postconditions[0].Identity != runtimeDigest {
+	validSucceeded := err == nil && record.Result == jobs.ResultSucceeded && len(record.Postconditions) == 1 && record.Postconditions[0].Kind == "published" && record.Postconditions[0].Identity == runtimeDigest
+	validInterrupted := err == nil && record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery" && len(record.Postconditions) == 2 && record.Postconditions[0].Kind == "published_committed" && record.Postconditions[0].Identity == applied.SiteIdentity
+	if !validSucceeded && !validInterrupted {
 		return contractCommittedDomainPublication(ctx, service, resource, marker)
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
@@ -367,11 +860,17 @@ func contractCommittedDomainPublication(ctx context.Context, service *FixedServi
 		return err
 	}
 	result, contractErr := host.ContractResource(ctx, resource.ID)
+	if contractErr == nil {
+		contractErr = stopRecoveredGoAccessBounded(service, exposure, resource)
+	}
 	if contractErr != nil {
-		snapshot, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+		snapshot, stopErr := stopRecoveredNginxBounded(host)
+		goaccessErr := stopRecoveredGoAccessBounded(service, exposure, resource)
 		observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
-		fenceErr := service.WriteIngressActivationFence(context.WithoutCancel(ctx), exposure, resource.ID, marker.PlanID, generation, generation-1, observed, stopErr != nil)
-		return errors.Join(contractErr, stopErr, fenceErr)
+		fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
+		fenceErr := service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, marker.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
+		cancelFence()
+		return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)
 	}
 	document, err := service.normal.Read()
 	if err != nil {
@@ -414,8 +913,12 @@ func resumeCommittedDomainContraction(ctx context.Context, service *FixedService
 		return err
 	}
 	result, contractErr := host.ContractResource(ctx, resource.ID)
+	if contractErr == nil {
+		contractErr = stopRecoveredGoAccessBounded(service, exposure, resource)
+	}
 	if contractErr != nil {
-		snapshot, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+		snapshot, stopErr := stopRecoveredNginxBounded(host)
+		goaccessErr := stopRecoveredGoAccessBounded(service, exposure, resource)
 		observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
 		planID := ""
 		if admitter, openErr := service.TimerAdmitter(); openErr == nil {
@@ -423,8 +926,10 @@ func resumeCommittedDomainContraction(ctx context.Context, service *FixedService
 				planID = intent.PlanID
 			}
 		}
-		fenceErr := service.WriteIngressActivationFence(context.WithoutCancel(ctx), exposure, resource.ID, planID, closing.Generation, closing.Generation-1, observed, stopErr != nil)
-		return errors.Join(contractErr, stopErr, fenceErr)
+		fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
+		fenceErr := service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, planID, closing.Generation, closing.Generation-1, observed, stopErr != nil || goaccessErr != nil)
+		cancelFence()
+		return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)
 	}
 	if resource.PublicationRecord.State == domain.PublicationPublished {
 		document, err := service.normal.Read()

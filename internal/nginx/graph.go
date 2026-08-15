@@ -109,6 +109,18 @@ type DomainSite struct {
 	UpstreamAddress    string        `json:"upstream_address"`
 	WebSocket          bool          `json:"websocket"`
 	Static             []StaticRoute `json:"static,omitempty"`
+	GoAccess           *GoAccessSite `json:"goaccess,omitempty"`
+}
+type GoAccessSite struct {
+	CanonicalHost  string   `json:"canonical_host"`
+	CredentialPath string   `json:"credential_path"`
+	CIDRs          []string `json:"cidrs,omitempty"`
+	DashboardPath  string   `json:"dashboard_path"`
+	WebSocketPath  string   `json:"websocket_path"`
+	Endpoint       string   `json:"endpoint"`
+	ReportPath     string   `json:"report_path"`
+	AccessLog      string   `json:"access_log"`
+	Identity       string   `json:"identity"`
 }
 type StaticRoute struct {
 	URLPath      string `json:"url_path"`
@@ -763,14 +775,43 @@ func validDomainSite(site DomainSite, domains []string) bool {
 		}
 		priorCIDR = value
 	}
+	if site.GoAccess != nil && (!validGoAccessSite(*site.GoAccess) || !slices.Contains(site.Hosts, site.GoAccess.CanonicalHost)) {
+		return false
+	}
 	prior := ""
 	for _, route := range site.Static {
 		if route.URLPath == "" || !strings.HasPrefix(route.URLPath, "/") || strings.ContainsAny(route.URLPath, " \t\r\n;{}#$\\\"'") || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || strings.HasPrefix(route.RelativePath, "..") || route.SourcePath == "" || !filepath.IsAbs(route.SourcePath) || filepath.Clean(route.SourcePath) != route.SourcePath || strings.ContainsAny(route.SourcePath, "\x00\r\n") || route.Directory != (route.URLPath != "/" && strings.HasSuffix(route.URLPath, "/")) || !validDigest(route.Identity) || prior != "" && prior >= route.URLPath {
 			return false
 		}
+		if goaccess := site.GoAccess; goaccess != nil && (strings.HasPrefix(route.URLPath, goaccess.DashboardPath) || strings.HasPrefix(goaccess.DashboardPath, route.URLPath) || route.URLPath == goaccess.WebSocketPath || route.Directory && strings.HasPrefix(goaccess.WebSocketPath, route.URLPath)) {
+			return false
+		}
 		prior = route.URLPath
 	}
 	return true
+}
+func validGoAccessSite(value GoAccessSite) bool {
+	if strings.ContainsAny(value.CredentialPath+value.Endpoint+value.ReportPath+value.AccessLog, "\x00\r\n") || !filepath.IsAbs(value.CredentialPath) || filepath.Clean(value.CredentialPath) != value.CredentialPath || !validDomain(value.CanonicalHost) || !strings.HasPrefix(value.Endpoint, "/run/lanpanel-goaccess/") || filepath.Clean(value.Endpoint) != value.Endpoint || !strings.HasPrefix(value.ReportPath, "/var/lib/lanpanel/goaccess/") || filepath.Clean(value.ReportPath) != value.ReportPath || !strings.HasPrefix(value.AccessLog, "/var/log/lanpanel/goaccess/") || filepath.Clean(value.AccessLog) != value.AccessLog || !strings.HasPrefix(value.DashboardPath, "/") || !strings.HasSuffix(value.DashboardPath, "/") || filepath.Clean(value.DashboardPath) != strings.TrimSuffix(value.DashboardPath, "/") || !strings.HasPrefix(value.WebSocketPath, "/") || strings.HasSuffix(value.WebSocketPath, "/") || filepath.Clean(value.WebSocketPath) != value.WebSocketPath || strings.HasPrefix(value.WebSocketPath, value.DashboardPath) || !validDigest(value.Identity) {
+		return false
+	}
+	prior := ""
+	for _, cidr := range value.CIDRs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil || prefix.String() != cidr || prefix.Bits() == 0 || !prefix.Addr().IsGlobalUnicast() || prefix.Addr().IsPrivate() || prior != "" && prior >= cidr {
+			return false
+		}
+		prior = cidr
+	}
+	return true
+}
+func renderLocationAccess(output *strings.Builder, path string, cidrs []string) {
+	output.WriteString("    auth_basic \"Restricted\";\n    auth_basic_user_file " + quoteNginxArgument(path) + ";\n")
+	for _, cidr := range cidrs {
+		output.WriteString("    allow " + cidr + ";\n")
+	}
+	if len(cidrs) > 0 {
+		output.WriteString("    deny all;\n")
+	}
 }
 func quoteNginxArgument(value string) string {
 	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "$", "\\$")
@@ -788,14 +829,14 @@ func renderDomain(entry Entry) ([]byte, error) {
 	var output strings.Builder
 	fmt.Fprintf(&output, "server {\n  listen 80;\n  listen [::]:80;\n  server_name %s;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  return 308 https://$http_host$request_uri;\n}\n", hosts, quoteNginxArgument(site.RejectionAuditPath), strings.Join(hostPattern, "|"))
 	fmt.Fprintf(&output, "server {\n  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n  server_name %s;\n  ssl_certificate %s;\n  ssl_certificate_key %s;\n  ssl_protocols TLSv1.2 TLSv1.3;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  if ($ssl_server_name !~* ^(?:%s)$) { return 421; }\n", hosts, certificate, key, quoteNginxArgument(site.RejectionAuditPath), strings.Join(hostPattern, "|"), strings.Join(hostPattern, "|"))
-	if site.AuthMode == "basic" {
-		output.WriteString("  auth_basic \"Restricted\";\n  auth_basic_user_file " + quoteNginxArgument(site.HTPasswdPath) + ";\n")
-		for _, cidr := range site.CIDRs {
-			output.WriteString("  allow " + cidr + ";\n")
-		}
-		if len(site.CIDRs) > 0 {
-			output.WriteString("  deny all;\n")
-		}
+	if value := site.GoAccess; value != nil {
+		output.WriteString("  access_log " + quoteNginxArgument(value.AccessLog) + " combined;\n")
+		output.WriteString("  location = " + value.WebSocketPath + " {\n")
+		renderLocationAccess(&output, value.CredentialPath, value.CIDRs)
+		output.WriteString("    proxy_http_version 1.1;\n    proxy_pass_request_headers off;\n    proxy_set_header Host $http_host;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n    proxy_set_header Sec-WebSocket-Key $http_sec_websocket_key;\n    proxy_set_header Sec-WebSocket-Version $http_sec_websocket_version;\n    proxy_set_header Authorization \"\";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Cookie \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-LanPanel-Closure-ID \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_pass http://unix:" + value.Endpoint + ":;\n  }\n")
+		output.WriteString("  location = " + value.DashboardPath + " {\n    if ($host != " + quoteNginxArgument(value.CanonicalHost) + ") { return 308 https://" + value.CanonicalHost + "$request_uri; }\n")
+		renderLocationAccess(&output, value.CredentialPath, value.CIDRs)
+		output.WriteString("    default_type text/html;\n    disable_symlinks on;\n    alias " + quoteNginxArgument(value.ReportPath) + ";\n    limit_except GET HEAD { deny all; }\n  }\n  location ^~ " + value.DashboardPath + " { return 404; }\n")
 	}
 	for _, route := range site.Static {
 		modifier := " ="
@@ -804,7 +845,11 @@ func renderDomain(entry Entry) ([]byte, error) {
 			modifier = " ^~"
 			source += "/"
 		}
-		fmt.Fprintf(&output, "  location%s %s {\n    disable_symlinks on;\n    alias %s;\n    try_files $request_filename =404;\n    limit_except GET HEAD { deny all; }\n  }\n", modifier, route.URLPath, quoteNginxArgument(source))
+		fmt.Fprintf(&output, "  location%s %s {\n", modifier, route.URLPath)
+		if site.AuthMode == "basic" {
+			renderLocationAccess(&output, site.HTPasswdPath, site.CIDRs)
+		}
+		fmt.Fprintf(&output, "    disable_symlinks on;\n    alias %s;\n    try_files $request_filename =404;\n    limit_except GET HEAD { deny all; }\n  }\n", quoteNginxArgument(source))
 	}
 	authorization := "\"\""
 	if site.AuthMode == "application_managed" {
@@ -814,7 +859,11 @@ func renderDomain(entry Entry) ([]byte, error) {
 	if site.UpstreamNetwork == "tcp" {
 		upstream = "http://" + site.UpstreamAddress
 	}
-	output.WriteString("  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization " + authorization + ";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-LanPanel-Closure-ID \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Real-IP $remote_addr;\n")
+	output.WriteString("  location / {\n")
+	if site.AuthMode == "basic" {
+		renderLocationAccess(&output, site.HTPasswdPath, site.CIDRs)
+	}
+	output.WriteString("    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization " + authorization + ";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-LanPanel-Closure-ID \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Real-IP $remote_addr;\n")
 	if site.WebSocket {
 		output.WriteString("    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n")
 	} else {

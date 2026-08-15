@@ -887,8 +887,10 @@ func publicationOnlyResourceUpdate(prior, candidate domain.AppResource) bool {
 }
 func nonPublicationCredentials(resource domain.AppResource) []string {
 	values := append([]string(nil), resource.CredentialIDs...)
-	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID != "" {
-		values = slices.DeleteFunc(values, func(value string) bool { return value == resource.Publication.DomainHTTPS.CredentialID })
+	if publication := resource.Publication.DomainHTTPS; publication != nil {
+		values = slices.DeleteFunc(values, func(value string) bool {
+			return value == publication.CredentialID || value == publication.GoAccess.CredentialID
+		})
 	}
 	return values
 }
@@ -924,6 +926,9 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 			prior = &installation.Resources[index]
 			break
 		}
+	}
+	if prior != nil && len(prior.PublicationRecord.PendingGoAccessRetirements) > 0 {
+		return fail(fmt.Errorf("pending GoAccess retirement blocks resource update"))
 	}
 	if prior != nil && prior.PublicationRecord.State == domain.PublicationPublished && (prior.Publication.Kind == domain.PublicationTemporaryHTTP || candidate.Publication.Kind == domain.PublicationTemporaryHTTP) && !reflect.DeepEqual(prior.Publication, candidate.Publication) {
 		return fail(fmt.Errorf("published temporary publication cannot be edited"))

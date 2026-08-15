@@ -15,6 +15,7 @@ import (
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -660,7 +661,7 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
 	beforeInstallation.Resources[0].PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 1, RetiredStateGeneration: 1, RetiredServiceIdentity: testDigest("retired-service"), RetiredUnitIdentities: operationUnitIdentities("retired")}}}
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Unpublish), Target: "resource/" + beforeInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
@@ -682,7 +683,7 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	afterInstallation.Resources[0].PublicationRecord.State = domain.PublicationUnpublished
 	afterInstallation.Resources[0].PublicationRecord.UnpublishedGeneration = 3
 	afterInstallation.Resources[0].PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: now.Format(time.RFC3339), Reason: "closing_may_be_live"}
-	afterInstallation.Resources[0].PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: record.ID, Operation: string(Unpublish), Generation: 3, ClosureAuthorityDigest: testDigest("closure"), Prior: &bundle}
+	afterInstallation.Resources[0].PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: record.ID, Operation: string(Unpublish), Generation: 3, ClosureAuthorityDigest: testDigest("closure"), Prior: &bundle, GoAccessRetirements: []domain.GoAccessRetirementIdentity{{Generation: 1, StateGeneration: 1, ServiceIdentity: testDigest("retired-service"), UnitIdentities: operationUnitIdentities("retired")}}}
 	afterIntent := intent
 	afterIntent.ContractionDigest = testDigest("closure")
 	after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(afterInstallation), reservationKey(record.ID): encode(afterIntent), "jobs/" + record.ID: encode(running)}}
@@ -697,6 +698,252 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	if err := validateOperationStateTransitions(after, unsafeDocument); err == nil {
 		t.Fatal("running contraction lost authority before terminal runtime evidence")
 	}
+	terminal, finishErr := jobs.Finish(running, jobs.Completion{Result: jobs.ResultPartial, Postconditions: []jobs.Postcondition{{Kind: "goaccess_retirement_pending", Status: jobs.PostconditionKnown, Identity: testDigest("closure")}}, ErrorCode: "goaccess_stop_failed"}, now.Add(time.Second))
+	if finishErr != nil {
+		t.Fatal(finishErr)
+	}
+	terminalIntent := afterIntent
+	terminalIntent.Phase = PhaseTerminal
+	terminalInstallation := afterInstallation
+	terminalInstallation.Resources = append([]domain.AppResource(nil), afterInstallation.Resources...)
+	terminalResource := &terminalInstallation.Resources[0]
+	terminalResource.PublicationRecord.ContractionIntent = nil
+	terminalResource.PublicationRecord.PendingGoAccessRetirements = []domain.GoAccessRetirementIdentity{{Generation: 1, StateGeneration: 1, ServiceIdentity: testDigest("retired-service"), UnitIdentities: operationUnitIdentities("retired")}}
+	terminalResource.PublicationRecord.GoAccessRetirementSourceJobID = record.ID
+	terminalResource.PublicationRecord.GoAccessRetirementAuthorityDigest = testDigest("retirement-authority")
+	terminalResource.PublicationRecord.LastOperation = domain.OperationUnpublish
+	terminalResource.PublicationRecord.LastOperationResult = domain.OperationPartial
+	terminalResource.PublicationRecord.LastJobID = record.ID
+	terminalDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{"installations/current": encode(terminalInstallation), reservationKey(record.ID): encode(terminalIntent), "jobs/" + record.ID: encode(terminal)}}
+	if err := validateOperationStateTransitions(after, terminalDocument); err != nil {
+		t.Fatalf("partial contraction retirement transition rejected: %v", err)
+	}
+}
+
+func TestGoAccessRetirementModifiedPathsCoverExactCleanup(t *testing.T) {
+	retirement := domain.GoAccessRetirementIdentity{Generation: 2, StateGeneration: 1, ServiceIdentity: testDigest("service"), RemoveState: true, RemoveShared: true, UnitIdentities: operationUnitIdentities("service")}
+	paths, err := GoAccessRetirementModifiedPaths("res_00000000000000000000000000000001", retirement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"/etc/systemd/system/lanpanel-goaccess-res_00000000000000000000000000000001-2.service", "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-res_00000000000000000000000000000001-2.service", "/run/lanpanel-goaccess/res_00000000000000000000000000000001-2.sock", "/var/lib/lanpanel/goaccess/res_00000000000000000000000000000001/generations/1", "/var/log/lanpanel/goaccess/res_00000000000000000000000000000001", "/etc/sysusers.d/lanpanel-goaccess-res_00000000000000000000000000000001.conf", "/etc/passwd"} {
+		if !slices.Contains(paths, required) {
+			t.Fatalf("retirement modified paths omit %q: %v", required, paths)
+		}
+	}
+	if !slices.IsSorted(paths) {
+		t.Fatalf("retirement modified paths are not sorted: %v", paths)
+	}
+}
+
+func TestContractionTransfersPendingGoAccessRetirementAuthority(t *testing.T) {
+	pending := domain.GoAccessRetirementIdentity{Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("service"), RemoveState: true, UnitIdentities: operationUnitIdentities("service")}
+	record := domain.PublicationRecord{PendingGoAccessRetirements: []domain.GoAccessRetirementIdentity{pending}, GoAccessRetirementSourceJobID: "job-source", GoAccessRetirementSourceJournalID: "journal-source", GoAccessRetirementAuthorityDigest: testDigest("authority")}
+	retirements, err := transferPendingGoAccessRetirements(&record, []domain.GoAccessRetirementIdentity{{Generation: 2, StateGeneration: 2, ServiceIdentity: pending.ServiceIdentity, UnitIdentities: append([]string(nil), pending.UnitIdentities...)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retirements) != 1 || !retirements[0].RemoveState || len(record.PendingGoAccessRetirements) != 0 || record.GoAccessRetirementSourceJobID != "" || record.GoAccessRetirementSourceJournalID != "" || record.GoAccessRetirementAuthorityDigest != "" {
+		t.Fatalf("pending retirement transfer=%#v record=%#v", retirements, record)
+	}
+}
+
+func TestContractionRetainsCommittedGoAccessState(t *testing.T) {
+	prior := domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{Enabled: true, Generation: 1, StateGeneration: 1, ServiceIdentity: testDigest("prior"), UnitIdentities: operationUnitIdentities("prior")}}}
+	candidate := domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{Enabled: true, Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("candidate"), UnitIdentities: operationUnitIdentities("candidate"), RetiredGeneration: 1, RetiredStateGeneration: 1, RetiredServiceIdentity: testDigest("prior"), RetiredUnitIdentities: operationUnitIdentities("prior")}}}
+	retirements, err := goAccessRetirements(&prior, &candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retirements) != 2 || retirements[0].Generation != 1 || retirements[0].RemoveState || retirements[0].RemoveShared || !retirements[1].RemoveState {
+		t.Fatalf("retirements=%#v", retirements)
+	}
+	first, err := goAccessRetirements(nil, &domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{Enabled: true, Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("candidate")}}})
+	if err != nil || len(first) != 1 || !first[0].RemoveShared {
+		t.Fatalf("first candidate retirements=%#v %v", first, err)
+	}
+}
+
+func TestRunningGoAccessRetirementAuthorityIsResumable(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(GoAccessRetirement), Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "startup-recovery"}, now, bytes.NewReader(bytes.Repeat([]byte{6}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	retirements := []domain.GoAccessRetirementIdentity{{Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("service"), UnitIdentities: operationUnitIdentities("service")}}
+	authorityDigest, digestErr := GoAccessRetirementInventoryDigest(retirements)
+	if digestErr != nil {
+		t.Fatal(digestErr)
+	}
+	binding, bindingErr := GoAccessRetirementBinding("ins_00000000000000000000000000000001", "res_00000000000000000000000000000001", "contraction", "job-source", "", authorityDigest, retirements)
+	if bindingErr != nil {
+		t.Fatal(bindingErr)
+	}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionStartup, Operation: GoAccessRetirement, Target: record.Target, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: binding, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionStartup, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	raw, err := persist.EncodeEntry(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobRaw, err := persist.EncodeEntry(running)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{reservationKey(record.ID): raw, "jobs/" + record.ID: jobRaw}}
+	observed, observedJob, present, err := FindRunningGoAccessRetirement(document, record.Target)
+	if err != nil || !present || observed.JobID != record.ID || observedJob.ID != record.ID || observedJob.Status != jobs.StatusRunning {
+		t.Fatalf("resumable retirement=%v %#v %#v %v", present, observed, observedJob, err)
+	}
+	reservedIntent := intent
+	reservedIntent.Phase = PhaseReserved
+	reservedIntent.IntentGeneration = 0
+	reservedIntent.Consumption = nil
+	reservedIntentRaw, encodeErr := persist.EncodeEntry(reservedIntent)
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	reservedJobRaw, encodeErr := persist.EncodeEntry(record)
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	reservedDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{reservationKey(record.ID): reservedIntentRaw, "jobs/" + record.ID: reservedJobRaw}}
+	observed, observedJob, present, err = FindRunningGoAccessRetirement(reservedDocument, record.Target)
+	if err != nil || !present || observed.Phase != PhaseReserved || observedJob.Status != jobs.StatusReserved {
+		t.Fatalf("reserved retirement recovery=%v %#v %#v %v", present, observed, observedJob, err)
+	}
+}
+
+func TestPublicationRetirementAuthoritySurvivesCertificateJobMutation(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	installation := operationStateInstallation()
+	resource := &installation.Resources[0]
+	bundle := domainBundleForRetirement(resource.CurrentConfigDigest)
+	retirements := []domain.GoAccessRetirementIdentity{{Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("service"), UnitIdentities: operationUnitIdentities("service")}}
+	authorityDigest, err := GoAccessRetirementInventoryDigest(retirements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{10}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(source)
+	source, err = jobs.Finish(running, jobs.Completion{Result: jobs.ResultPartial, Postconditions: []jobs.Postcondition{{Kind: "goaccess_prior_retirement", Status: jobs.PostconditionKnown, Identity: "2:" + testDigest("service")}}, ErrorCode: "goaccess_stop_failed"}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewal, err := jobs.NewReserved(jobs.Spec{Operation: string(CertificateRenew), Target: "resource/" + resource.ID, ActorIdentity: "timer"}, now, bytes.NewReader(bytes.Repeat([]byte{11}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle.DomainHTTPS.Certificate.Generation++
+	bundle.DomainHTTPS.Certificate.Fingerprint = testDigest("renewed-cert")
+	resource.PublicationRecord = domain.PublicationRecord{State: domain.PublicationPublished, UnpublishedGeneration: 2, LastAppliedDigest: &bundle.ConfigDigest, LastAppliedBundle: &bundle, LastOperation: domain.OperationPublish, LastOperationResult: domain.OperationPartial, LastJobID: renewal.ID, PendingGoAccessRetirements: retirements, GoAccessRetirementSourceJobID: source.ID, GoAccessRetirementSourceJournalID: "activation-" + source.ID, GoAccessRetirementAuthorityDigest: authorityDigest}
+	binding, err := GoAccessRetirementBinding(installation.InstallationID, resource.ID, "publication", source.ID, "activation-"+source.ID, authorityDigest, retirements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encode := func(value any) json.RawMessage {
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	journal := JournalRecord{SchemaVersion: "lanpanel.operation.journal.v1", ID: "activation-" + source.ID, JobID: source.ID, Phase: JournalTerminal}
+	document := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{"installations/current": encode(installation), "jobs/" + source.ID: encode(source), "journals/" + journal.ID: encode(journal)}}
+	if err := ValidateGoAccessRetirementAuthority(document, binding); err != nil {
+		t.Fatalf("dedicated retirement authority was invalidated by renewal metadata: %v", err)
+	}
+}
+
+func TestGoAccessRetirementKeepsPublishJobRunningUntilFinalCommit(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	installation := operationStateInstallation()
+	resource := &installation.Resources[0]
+	bundle := domainBundleForRetirement(resource.CurrentConfigDigest)
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{8}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: "plan-one", AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + resource.ID, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: resource.ID}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	resource.PublicationRecord.State = domain.PublicationActivating
+	resource.PublicationRecord.ActivationIntent = &domain.ActivationIntent{ID: "activation-test", JobID: record.ID, PlanID: "plan-one", Generation: 2, PriorState: domain.PublicationUnpublished, Candidate: bundle}
+	resource.PublicationRecord.LastJobID = record.ID
+	encode := func(value any) json.RawMessage {
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(installation), reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+	pendingInstallation := installation
+	pendingInstallation.Resources = append([]domain.AppResource(nil), installation.Resources...)
+	pending := &pendingInstallation.Resources[0]
+	pending.PublicationRecord.State = domain.PublicationPublished
+	pending.PublicationRecord.ActivationIntent = nil
+	pending.PublicationRecord.LastAppliedBundle = &bundle
+	pending.PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
+	pending.PublicationRecord.LastOperation = domain.OperationPublish
+	pending.PublicationRecord.LastOperationResult = domain.OperationPartial
+	pending.PublicationRecord.PendingGoAccessRetirements = []domain.GoAccessRetirementIdentity{{Generation: 2, StateGeneration: 2, ServiceIdentity: testDigest("service"), UnitIdentities: operationUnitIdentities("service")}}
+	pending.PublicationRecord.GoAccessRetirementSourceJobID = record.ID
+	pending.PublicationRecord.GoAccessRetirementSourceJournalID = "activation-" + record.ID
+	pending.PublicationRecord.GoAccessRetirementAuthorityDigest = testDigest("bundle-authority")
+	pendingDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(pendingInstallation), reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+	if err := validateOperationStateTransitions(before, pendingDocument); err != nil {
+		t.Fatalf("pending retirement transition rejected: %v", err)
+	}
+	partial, partialErr := jobs.Finish(running, jobs.Completion{Result: jobs.ResultPartial, Postconditions: []jobs.Postcondition{{Kind: "goaccess_prior_retirement", Status: jobs.PostconditionKnown, Identity: "2:" + testDigest("service")}}, ErrorCode: "goaccess_stop_failed"}, now.Add(time.Second))
+	if partialErr != nil {
+		t.Fatal(partialErr)
+	}
+	partialIntent := intent
+	partialIntent.Phase = PhaseTerminal
+	partialInstallation := pendingInstallation
+	partialInstallation.Resources = append([]domain.AppResource(nil), pendingInstallation.Resources...)
+	partialInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationPartial
+	partialDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{"installations/current": encode(partialInstallation), reservationKey(record.ID): encode(partialIntent), "jobs/" + record.ID: encode(partial)}}
+	if err := validateOperationStateTransitions(pendingDocument, partialDocument); err != nil {
+		t.Fatalf("partial retirement transition rejected: %v", err)
+	}
+	interrupted, interruptedErr := jobs.Finish(running, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "published_committed", Status: jobs.PostconditionKnown, Identity: "site"}, {Kind: "goaccess_prior_retirement", Status: jobs.PostconditionKnown, Identity: "2:" + testDigest("service")}}, ErrorCode: "goaccess_retirement_recovery"}, now.Add(time.Second))
+	if interruptedErr != nil {
+		t.Fatal(interruptedErr)
+	}
+	interruptedIntent := intent
+	interruptedIntent.Phase = PhaseTerminal
+	interruptedInstallation := pendingInstallation
+	interruptedInstallation.Resources = append([]domain.AppResource(nil), pendingInstallation.Resources...)
+	interruptedInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationInterrupted
+	interruptedDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{"installations/current": encode(interruptedInstallation), reservationKey(record.ID): encode(interruptedIntent), "jobs/" + record.ID: encode(interrupted)}}
+	if err := validateOperationStateTransitions(pendingDocument, interruptedDocument); err != nil {
+		t.Fatalf("interrupted retirement transition rejected: %v", err)
+	}
+	terminal, err := jobs.Finish(running, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "goaccess_prior_retirement", Status: jobs.PostconditionVerified, Identity: "2:" + testDigest("service")}}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalIntent := intent
+	terminalIntent.Phase = PhaseTerminal
+	terminalInstallation := pendingInstallation
+	terminalInstallation.Resources = append([]domain.AppResource(nil), pendingInstallation.Resources...)
+	terminalInstallation.Resources[0].PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	clearGoAccessRetirementAuthority(&terminalInstallation.Resources[0].PublicationRecord)
+	terminalDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 3, Entries: map[string]json.RawMessage{"installations/current": encode(terminalInstallation), reservationKey(record.ID): encode(terminalIntent), "jobs/" + record.ID: encode(terminal)}}
+	if err := validateOperationStateTransitions(pendingDocument, terminalDocument); err != nil {
+		t.Fatalf("terminal retirement transition rejected: %v", err)
+	}
+}
+
+func operationUnitIdentities(label string) []string {
+	return []string{testDigest(label + "-1"), testDigest(label + "-2"), testDigest(label + "-3"), testDigest(label + "-4"), testDigest(label + "-5")}
+}
+
+func domainBundleForRetirement(configDigest string) domain.PublicationBundle {
+	return domain.PublicationBundle{ID: "pub_2_00000000000000000000000000000001", Generation: 2, ConfigDigest: configDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest("service"), RetiredUnitIdentities: operationUnitIdentities("service")}, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
 }
 
 func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T) {

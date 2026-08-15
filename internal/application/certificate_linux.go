@@ -357,6 +357,9 @@ func BeginCertificateRenew(ctx context.Context, resourceID string) (*Certificate
 	if err != nil {
 		return fail(err)
 	}
+	if len(resource.PublicationRecord.PendingGoAccessRetirements) != 0 {
+		return fail(fmt.Errorf("certificate renewal is blocked by pending GoAccess retirement"))
+	}
 	state, err := service.safety.Read()
 	if err != nil {
 		return fail(err)
@@ -680,6 +683,21 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 		}
 	}
 	contractionResult, runErr := (contraction.Engine{Authority: authority, Runtime: runtime}).Run(ctx, inventory)
+	goaccessGenerations := goAccessContractionInventory(installation, []string{resourceID})
+	contractionResult, runErr, cleanupComplete := stopGoAccessAfterClosure(ctx, goaccessGenerations, contractionResult, runErr)
+	if cleanupComplete {
+		if pruneErr := pruneGoAccessContractionOwnership(ctx, service, exposure, job.ID, goaccessGenerations); pruneErr != nil {
+			cleanupComplete = false
+			if contractionResult.AccessClosed {
+				contractionResult.Outcome = contraction.OutcomePartial
+				contractionResult.ErrorCode = "goaccess_stop_failed"
+			}
+			runErr = errors.Join(runErr, pruneErr)
+		}
+	}
+	if !cleanupComplete && !contractionResult.AccessClosed {
+		return runErr
+	}
 	_, completeErr := contraction.CompleteNormal(ctx, authority, contractionResult)
 	if completeErr != nil {
 		return errors.Join(runErr, completeErr)
@@ -1202,6 +1220,7 @@ func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Conte
 }
 
 func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Context, candidate publication.Candidate, aclUntil time.Time) (*PublicationExecution, error) {
+	activationDeadline := time.Now().UTC().Add(time.Minute)
 	if candidate.ResourceID != execution.Resource.ID || candidate.Generation != execution.Challenge.Safety.Generation {
 		return nil, fmt.Errorf("domain publication candidate identity changed")
 	}
@@ -1213,7 +1232,13 @@ func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Con
 		return nil, err
 	}
 	owned.Revision++
-	owned.Paths = upsertOwnedPath(owned.Paths, candidate.OwnershipPath)
+	paths := candidate.OwnershipPaths
+	if len(paths) == 0 {
+		paths = []ownership.OwnedPath{candidate.OwnershipPath}
+	}
+	for _, path := range paths {
+		owned.Paths = upsertOwnedPath(owned.Paths, path)
+	}
 	for _, listener := range candidate.OwnershipListeners {
 		owned.Listeners = upsertOwnedListener(owned.Listeners, listener)
 	}
@@ -1247,13 +1272,17 @@ func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Con
 	if !found {
 		return nil, fmt.Errorf("domain publication ownership safety missing")
 	}
-	result := &PublicationExecution{Service: execution.Service, Admitter: execution.Admitter, MutationSet: execution.MutationSet, Mutation: execution.Mutation, Exposure: execution.Exposure, JobID: execution.JobID, Revision: execution.Revision, Resource: execution.Resource, Candidate: candidate, SafetyState: next, Ownership: persisted, PlanID: execution.Plan.ID}
+	result := publicationExecutionFromCertificate(execution, candidate, next, persisted, activationDeadline)
 	execution.Service = nil
 	execution.Admitter = nil
 	execution.MutationSet = nil
 	execution.Mutation = nil
 	execution.Exposure = nil
 	return result, nil
+}
+
+func publicationExecutionFromCertificate(execution *CertificateExecution, candidate publication.Candidate, state safety.State, owned ownership.Record, deadline time.Time) *PublicationExecution {
+	return &PublicationExecution{Service: execution.Service, Admitter: execution.Admitter, MutationSet: execution.MutationSet, Mutation: execution.Mutation, Exposure: execution.Exposure, JobID: execution.JobID, Revision: execution.Revision, Resource: execution.Resource, Candidate: candidate, SafetyState: state, Ownership: owned, PlanID: execution.Plan.ID, InstallationID: execution.InstallationID, ActivationDeadline: deadline}
 }
 
 func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, identity certificates.Identity) (jobs.Record, error) {
@@ -1437,7 +1466,7 @@ func openCertificateSafetyOnly() (*certificateSafetyOnly, error) {
 		return nil, err
 	}
 	fail := func(err error) (*certificateSafetyOnly, error) { manager.Close(); return nil, err }
-	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.Policy{ManagedRoots: []string{"/etc/lanpanel", fixedRoot}}, LockAuthority: manager.Authority()})
+	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
 		return fail(err)
 	}

@@ -262,6 +262,10 @@ func CompleteNormal(ctx context.Context, authority *NormalAuthority, result Resu
 	case OutcomeSucceeded:
 	case OutcomePartial:
 		branch, status, kind, code = "known_residual", jobs.PostconditionKnown, "shared_ingress_down", "activation_contracted"
+		if result.ErrorCode == "goaccess_stop_failed" {
+			code = result.ErrorCode
+			kind = "goaccess_retirement_pending"
+		}
 	case OutcomeInterrupted:
 		branch, status, kind, code = "executor_died", jobs.PostconditionKnown, "contraction_interrupted", "activation_contracted"
 	case OutcomeUnknown:

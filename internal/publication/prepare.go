@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/domain"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/ownership"
 	"net"
@@ -27,6 +28,7 @@ type Candidate struct {
 	Entry                    nginx.Entry
 	EntryBytes               []byte
 	OwnershipPath            ownership.OwnedPath
+	OwnershipPaths           []ownership.OwnedPath
 	OwnershipListener        ownership.OwnedListener
 	OwnershipListeners       []ownership.OwnedListener
 	PublicURL                string
@@ -37,6 +39,9 @@ type Candidate struct {
 }
 
 func PrepareTemporary(resource domain.AppResource, generation uint64) (Candidate, error) {
+	if prior := resource.PublicationRecord.LastAppliedBundle; prior != nil && prior.DomainHTTPS != nil && (prior.DomainHTTPS.GoAccess.Enabled || prior.DomainHTTPS.GoAccess.RetiredGeneration != 0) {
+		return Candidate{}, fmt.Errorf("temporary publication cannot discard retained GoAccess authority")
+	}
 	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationTemporaryHTTP || resource.Publication.TemporaryHTTP == nil || resource.Target.Kind != domain.AppTargetLocalHTTP || resource.Target.LocalHTTP == nil || resource.Target.WebSocket.Enabled || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || generation == 0 {
 		return Candidate{}, fmt.Errorf("temporary publication prerequisite is incomplete")
 	}
@@ -77,7 +82,7 @@ func PrepareTemporary(resource domain.AppResource, generation uint64) (Candidate
 	return Candidate{ResourceID: resource.ID, Generation: generation, Bundle: bundle, BundleDigest: bundleDigest, Entry: entry, EntryBytes: data, OwnershipPath: ownership.OwnedPath{Kind: ownership.PathSite, Path: entryPath, IdentityDigest: ownership.PathIdentity(resource.ID, ownership.PathSite, entryPath)}, OwnershipListener: listenerOwnership, OwnershipListeners: []ownership.OwnedListener{listenerOwnership}, PublicURL: "http://" + site.HostAuthority + "/", PriorBundle: prior, PriorBundleDigest: priorDigest}, nil
 }
 
-func PrepareDomain(resource domain.AppResource, generation uint64, certificate domain.CertificateBundleIdentity, credentialPath, credentialFingerprint string, staticRoutes []nginx.StaticRoute) (Candidate, error) {
+func PrepareDomain(resource domain.AppResource, generation uint64, certificate domain.CertificateBundleIdentity, credentialPath, credentialFingerprint, goaccessCredentialPath, goaccessCredentialFingerprint string, staticRoutes []nginx.StaticRoute, goaccessCandidate *goaccessruntime.Candidate) (Candidate, error) {
 	publication := resource.Publication.DomainHTTPS
 	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationDomainHTTPS || publication == nil || certificate.Authority == nil || certificate.Authority.CertificateID == "" || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest || generation == 0 {
 		return Candidate{}, fmt.Errorf("domain publication prerequisite incomplete")
@@ -101,6 +106,36 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 	}
 	relative := filepath.ToSlash(filepath.Join(nginx.AppsDirectory, resource.ID+".conf"))
 	site := nginx.DomainSite{Hosts: hosts, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: nginx.FixedPaths().AuditPath, AuthMode: string(publication.AccessMode), HTPasswdPath: credentialPath, CIDRs: append([]string(nil), publication.CIDRs...), UpstreamNetwork: upstreamNetwork, UpstreamAddress: upstreamAddress, WebSocket: resource.Target.WebSocket.Enabled, Static: append([]nginx.StaticRoute(nil), staticRoutes...)}
+	retiredGoAccessGeneration := uint64(0)
+	retiredGoAccessStateGeneration := uint64(0)
+	retiredGoAccessIdentity := ""
+	retiredGoAccessUnits := []string{}
+	if prior := resource.PublicationRecord.LastAppliedBundle; prior != nil && prior.DomainHTTPS != nil && (goaccessCandidate == nil || !goaccessCandidate.ReuseApplied) {
+		goaccess := prior.DomainHTTPS.GoAccess
+		if goaccess.Enabled {
+			retiredGoAccessGeneration = goaccess.Generation
+			retiredGoAccessStateGeneration = goaccess.StateGeneration
+			retiredGoAccessIdentity = goaccess.ServiceIdentity
+			retiredGoAccessUnits = append([]string(nil), goaccess.UnitIdentities...)
+		} else {
+			retiredGoAccessGeneration = goaccess.RetiredGeneration
+			retiredGoAccessStateGeneration = goaccess.RetiredStateGeneration
+			retiredGoAccessIdentity = goaccess.RetiredServiceIdentity
+			retiredGoAccessUnits = append([]string(nil), goaccess.RetiredUnitIdentities...)
+		}
+	}
+	goaccessIdentity := domain.GoAccessBundleIdentity{RetiredGeneration: retiredGoAccessGeneration, RetiredStateGeneration: retiredGoAccessStateGeneration, RetiredServiceIdentity: retiredGoAccessIdentity, RetiredUnitIdentities: retiredGoAccessUnits}
+	if publication.GoAccess.Enabled {
+		if goaccessCandidate == nil || goaccessCredentialPath == "" || goaccessCredentialFingerprint == "" {
+			return Candidate{}, fmt.Errorf("GoAccess candidate authority missing")
+		}
+		reference := digest([]byte(publication.GoAccess.CredentialID + "\x00" + goaccessCredentialPath))
+		route := digest([]byte(publication.GoAccess.DashboardPath + "\x00" + publication.GoAccess.WebSocketPath + "\x00" + goaccessCandidate.Paths.Endpoint + "\x00" + reference))
+		site.GoAccess = &nginx.GoAccessSite{CanonicalHost: publication.CanonicalDomain, CredentialPath: goaccessCredentialPath, CIDRs: append([]string(nil), publication.GoAccess.CIDRs...), DashboardPath: publication.GoAccess.DashboardPath, WebSocketPath: publication.GoAccess.WebSocketPath, Endpoint: goaccessCandidate.Paths.Endpoint, ReportPath: goaccessCandidate.Paths.Report, AccessLog: goaccessCandidate.Paths.AccessLog, Identity: route}
+		goaccessIdentity = domain.GoAccessBundleIdentity{Enabled: true, Generation: goaccessCandidate.Generation, StateGeneration: goaccessCandidate.StateGeneration, CanonicalHost: publication.CanonicalDomain, RetiredGeneration: retiredGoAccessGeneration, RetiredStateGeneration: retiredGoAccessStateGeneration, RetiredServiceIdentity: retiredGoAccessIdentity, RouteIdentity: route, ServiceIdentity: goaccessCandidate.ServiceIdentity, UnitIdentities: append([]string(nil), goaccessCandidate.UnitIdentities...), RetiredUnitIdentities: retiredGoAccessUnits, CredentialIdentity: publication.GoAccess.CredentialID, ReferenceIdentity: reference, CIDRs: append([]string(nil), publication.GoAccess.CIDRs...), DashboardPath: publication.GoAccess.DashboardPath, WebSocketPath: publication.GoAccess.WebSocketPath, Endpoint: goaccessCandidate.Paths.Endpoint, AccessLog: goaccessCandidate.Paths.AccessLog, DatabasePath: goaccessCandidate.Paths.Database, ReportPath: goaccessCandidate.Paths.Report}
+	} else if goaccessCandidate != nil || goaccessCredentialPath != "" || goaccessCredentialFingerprint != "" {
+		return Candidate{}, fmt.Errorf("disabled GoAccess carried authority")
+	}
 	entry := nginx.Entry{Kind: nginx.EntryApp, ResourceID: resource.ID, Relative: relative, Digest: "sha256:" + strings.Repeat("0", 64), Domains: hosts, Listeners: []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp:[::]:80", "tcp:[::]:443"}, Generation: generation, Domain: &site}
 	slices.Sort(entry.Listeners)
 	data, err := nginx.RenderEntry(entry)
@@ -112,15 +147,26 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 	routeIdentities := make([]string, len(staticRoutes))
 	routeBundles := make([]domain.StaticRouteBundleIdentity, len(staticRoutes))
 	managedPaths := []string{entryPath, certificate.PointerIdentity}
+	ownershipPaths := []ownership.OwnedPath{{Kind: ownership.PathSite, Path: entryPath, IdentityDigest: ownership.PathIdentity(resource.ID, ownership.PathSite, entryPath)}}
 	for index, route := range staticRoutes {
 		routeIdentities[index] = digest([]byte(route.URLPath + "\x00" + route.SourcePath + "\x00" + fmt.Sprint(route.Directory) + "\x00" + route.Identity))
 		routeBundles[index] = domain.StaticRouteBundleIdentity{URLPath: route.URLPath, RelativePath: route.RelativePath, SourcePath: route.SourcePath, Directory: route.Directory, Anonymous: route.Anonymous, Fingerprint: route.Identity}
 	}
 	credentialIDs := []string{}
 	if publication.CredentialID != "" {
-		credentialIDs = []string{publication.CredentialID}
+		credentialIDs = append(credentialIDs, publication.CredentialID)
 	}
-	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: applied.PolicyDigest, SiteIdentity: entry.Digest, ManagedPaths: managedPaths, CredentialIDs: credentialIDs, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: hosts, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: publication.AccessMode, CredentialIdentity: publication.CredentialID, ReferenceIdentity: authIdentity}, Static: domain.StaticBundleIdentity{RootID: publication.StaticRootID, Routes: routeBundles, RouteIdentities: routeIdentities}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
+	if publication.GoAccess.Enabled {
+		credentialIDs = append(credentialIDs, publication.GoAccess.CredentialID)
+		goaccessManagedPaths := []string{goaccessCandidate.Paths.ServiceUnit, goaccessCandidate.Paths.ServiceEnablement, goaccessCandidate.Paths.RelayUnit, goaccessCandidate.Paths.RelayEnablement, goaccessCandidate.Paths.SocketUnit, goaccessCandidate.Paths.SocketEnablement, goaccessCandidate.Paths.Sysusers, goaccessCandidate.Paths.RetentionUnit, goaccessCandidate.Paths.RetentionTimer, goaccessCandidate.Paths.RetentionEnablement, goaccessCandidate.Paths.RetentionLock, goaccessCandidate.Paths.StateRoot, filepath.Dir(goaccessCandidate.Paths.AccessLog), goaccessCandidate.Paths.Endpoint}
+		managedPaths = append(managedPaths, goaccessManagedPaths...)
+		for _, path := range goaccessManagedPaths {
+			ownershipPaths = append(ownershipPaths, ownership.OwnedPath{Kind: ownership.PathService, Path: path, IdentityDigest: ownership.PathIdentity(resource.ID, ownership.PathService, path)})
+		}
+		slices.Sort(managedPaths)
+	}
+	slices.Sort(credentialIDs)
+	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: applied.PolicyDigest, SiteIdentity: entry.Digest, ManagedPaths: managedPaths, CredentialIDs: credentialIDs, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: hosts, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: publication.AccessMode, CredentialIdentity: publication.CredentialID, ReferenceIdentity: authIdentity}, Static: domain.StaticBundleIdentity{RootID: publication.StaticRootID, Routes: routeBundles, RouteIdentities: routeIdentities}, GoAccess: goaccessIdentity, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
 	bundleDigest, err := BundleDigest(bundle)
 	if err != nil {
 		return Candidate{}, err
@@ -138,7 +184,7 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 	if err != nil {
 		return Candidate{}, err
 	}
-	return Candidate{ResourceID: resource.ID, Generation: generation, Bundle: bundle, BundleDigest: bundleDigest, Entry: entry, EntryBytes: data, OwnershipPath: ownership.OwnedPath{Kind: ownership.PathSite, Path: entryPath, IdentityDigest: ownership.PathIdentity(resource.ID, ownership.PathSite, entryPath)}, OwnershipListeners: []ownership.OwnedListener{}, PublicURL: "https://" + publication.CanonicalDomain + "/", CertificatePointer: pointer, CertificateCandidatePath: candidatePath, PriorBundle: prior, PriorBundleDigest: priorDigest}, nil
+	return Candidate{ResourceID: resource.ID, Generation: generation, Bundle: bundle, BundleDigest: bundleDigest, Entry: entry, EntryBytes: data, OwnershipPath: ownershipPaths[0], OwnershipPaths: ownershipPaths, OwnershipListeners: []ownership.OwnedListener{}, PublicURL: "https://" + publication.CanonicalDomain + "/", CertificatePointer: pointer, CertificateCandidatePath: candidatePath, PriorBundle: prior, PriorBundleDigest: priorDigest}, nil
 }
 func priorPublication(resource domain.AppResource) (*domain.PublicationBundle, string, error) {
 	if resource.PublicationRecord.LastAppliedBundle == nil {

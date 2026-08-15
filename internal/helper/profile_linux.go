@@ -47,7 +47,7 @@ func managementProfileWithRecovery(recoveryErr error) string {
 }
 func validateIndependentAuthority(manager *locks.Manager) error {
 	owner := filetxn.Owner{UID: 0, GID: 0}
-	ownershipStore, err := ownership.Open(ownership.Config{RootPath: "/var/lib/lanpanel/ownership", StagingPath: "/var/lib/lanpanel/ownership/.filetxn", RecordsPath: "/var/lib/lanpanel/ownership/records", Owner: owner, Policy: ownership.Policy{ManagedRoots: []string{"/etc/lanpanel", "/var/lib/lanpanel"}}, LockAuthority: manager.Authority()})
+	ownershipStore, err := ownership.Open(ownership.Config{RootPath: "/var/lib/lanpanel/ownership", StagingPath: "/var/lib/lanpanel/ownership/.filetxn", RecordsPath: "/var/lib/lanpanel/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
 		return err
 	}

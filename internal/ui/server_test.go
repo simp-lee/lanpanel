@@ -67,6 +67,16 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if !strings.Contains(response.Body.String(), "Static mappings (one URL|relative") {
 		t.Fatal("repeatable static mapping editor missing")
 	}
+	for _, field := range []string{"goaccess_enabled", "goaccess_credential_id", "goaccess_cidrs", "goaccess_dashboard_path", "goaccess_websocket_path"} {
+		if !strings.Contains(response.Body.String(), `name="`+field+`"`) {
+			t.Fatalf("GoAccess UI field %s missing", field)
+		}
+	}
+	for _, required := range []string{"GoAccess retirement pending; job", "goaccess_retirement_job_id", "goaccess_retirement_generations", "App credential ", "GoAccess credential ", "goaccess_credential_fingerprint", "goaccess_credential_changed"} {
+		if !strings.Contains(appJS, required) {
+			t.Fatalf("GoAccess retirement UI evidence missing %q", required)
+		}
+	}
 }
 
 func TestLoginRequiresExactHostOriginAndBoundedBody(t *testing.T) {

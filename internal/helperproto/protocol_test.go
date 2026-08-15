@@ -88,15 +88,27 @@ func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	response.Resource.Status = "healthy"
 	response.Resource.AllowedActions = nil
 	response.Resource.AccessMayRemain = false
+	response.Resource.CredentialID = "cred_00000000000000000000000000000001"
 	response.Resource.CredentialChanged = true
 	response.Resource.CredentialFingerprint = digest("changed")
-	response.Resource.Reason = "external htpasswd fingerprint changed but remains valid"
+	response.Resource.GoAccessCredentialID = "cred_00000000000000000000000000000002"
+	response.Resource.GoAccessCredentialChanged = true
+	response.Resource.GoAccessCredentialFingerprint = digest("goaccess-changed")
+	response.Resource.Reason = "App and GoAccess external htpasswd fingerprints changed but remain valid"
 	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
 		t.Fatalf("valid changed external status rejected: %v", err)
 	}
 	response.Resource.Reason = ""
 	if ValidateResponse(OperationDomainStatus, response) == nil {
 		t.Fatal("status without remediation reason accepted")
+	}
+	response.Resource = &ResourceResult{ResourceID: request.Action.TargetID, Status: "degraded", AccessMayRemain: true, ObservedAt: now, Reason: "GoAccess retirement pending", AllowedActions: []string{"unpublish", "close_all"}, GoAccessRetirementJobID: "job-retirement", GoAccessRetirementGenerations: []uint64{2, 4}}
+	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
+		t.Fatalf("pending GoAccess retirement status rejected: %v", err)
+	}
+	response.Resource.GoAccessRetirementGenerations = []uint64{4, 2}
+	if ValidateResponse(OperationDomainStatus, response) == nil {
+		t.Fatal("unsorted GoAccess retirement generations accepted")
 	}
 }
 
@@ -106,6 +118,14 @@ func TestPublicationRequestAllowsBoundedIssuanceDeadline(t *testing.T) {
 	request.InputDigest, _ = ApplicationInputDigest(request)
 	if err := ValidateRequest(request, now); err != nil {
 		t.Fatal(err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("publication"), Action: &ActionResult{JobID: "job-publication", JobResult: "partial", PublicURL: "https://app.example.test/"}}
+	if err := ValidateResponse(OperationPublicationActivate, response); err != nil {
+		t.Fatalf("partial publication result rejected: %v", err)
+	}
+	response.Action.JobResult = "unknown"
+	if ValidateResponse(OperationPublicationActivate, response) == nil {
+		t.Fatal("unknown publication job result accepted")
 	}
 	request.Deadline = now.Add(12 * time.Minute)
 	request.InputDigest, _ = ApplicationInputDigest(request)

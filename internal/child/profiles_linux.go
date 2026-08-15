@@ -36,6 +36,11 @@ const (
 	ProfileNginxQuitSignal       ProfileID = "nginx_quit_signal"
 	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
 	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
+	ProfileGoAccessAccounts      ProfileID = "goaccess_accounts"
+	ProfileGoAccessStart         ProfileID = "goaccess_start"
+	ProfileGoAccessRetain        ProfileID = "goaccess_retain"
+	ProfileGoAccessStop          ProfileID = "goaccess_stop"
+	ProfileGoAccessShow          ProfileID = "goaccess_show"
 	ProfileLego                  ProfileID = "lego"
 	ProfileHTPasswd              ProfileID = "htpasswd"
 	ProfileTailscaleAdmin        ProfileID = "tailscale_admin"
@@ -124,6 +129,8 @@ type LegoInvocation struct {
 type ResourceInvocation struct {
 	ResourceID string `json:"resource_id"`
 	Relay      bool   `json:"relay,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+	UnitMask   uint8  `json:"unit_mask,omitempty"`
 }
 
 type PackageInvocation struct {
@@ -178,6 +185,11 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
+	ProfileGoAccessAccounts:      {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessStart:         {ID: ProfileGoAccessStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessRetain:        {ID: ProfileGoAccessRetain, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessStop:          {ID: ProfileGoAccessStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessShow:          {ID: ProfileGoAccessShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/lib/lanpanel/dependencies/lego", IdentityKind: IdentityCertificateStage, Network: NetworkHostQualified, AllowedAddressFamilies: []int{2, 10}, Timeout: 10 * time.Minute, MaximumInputBytes: 32 << 10, MaximumOutputBytes: 64 << 10, MaximumFileBytes: 16 << 20, Umask: 0o022, Complete: true},
 	ProfileHTPasswd:              {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNoSockets, Timeout: 5 * time.Second, MaximumInputBytes: 72, MaximumOutputBytes: 4 << 10, Complete: true},
 	ProfileTailscaleAdmin:        {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
@@ -249,15 +261,45 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow
+	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow || id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
 	if resourceProfile {
 		if invocation.Package != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
 			return Profile{}, fmt.Errorf("resource child invocation authority is invalid")
 		}
 		short := strings.TrimPrefix(invocation.Resource.ResourceID, "res_")[:20]
+		goaccessUnit := invocation.Resource.ResourceID + "-" + strconv.FormatUint(invocation.Resource.Generation, 10)
+		goaccessProfile := id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
+		if goaccessProfile != (invocation.Resource.Generation > 0) {
+			return Profile{}, fmt.Errorf("resource child generation authority invalid")
+		}
 		switch id {
 		case ProfileResourceAccounts:
 			profile.Arguments = []string{"/etc/lanpanel/sysusers/" + invocation.Resource.ResourceID + ".conf"}
+		case ProfileGoAccessAccounts:
+			profile.Arguments = []string{"/etc/sysusers.d/lanpanel-goaccess-" + invocation.Resource.ResourceID + ".conf"}
+		case ProfileGoAccessStart:
+			profile.Arguments = []string{"enable", "--now", "lanpanel-goaccess-" + goaccessUnit + ".service", "lanpanel-goaccess-" + goaccessUnit + ".socket", "lanpanel-goaccess-relay-" + goaccessUnit + ".service", "lanpanel-goaccess-retention-" + goaccessUnit + ".timer"}
+		case ProfileGoAccessRetain:
+			profile.Arguments = []string{"start", "lanpanel-goaccess-retention-" + goaccessUnit + ".service"}
+		case ProfileGoAccessStop:
+			mask := invocation.Resource.UnitMask
+			if mask == 0 {
+				mask = 31
+			}
+			if mask&^uint8(31) != 0 {
+				return Profile{}, fmt.Errorf("GoAccess stop unit mask invalid")
+			}
+			profile.Arguments = []string{"disable", "--now"}
+			for _, item := range []struct {
+				bit  uint8
+				name string
+			}{{4, "lanpanel-goaccess-" + goaccessUnit + ".socket"}, {2, "lanpanel-goaccess-relay-" + goaccessUnit + ".service"}, {1, "lanpanel-goaccess-" + goaccessUnit + ".service"}, {16, "lanpanel-goaccess-retention-" + goaccessUnit + ".timer"}, {8, "lanpanel-goaccess-retention-" + goaccessUnit + ".service"}} {
+				if mask&item.bit != 0 {
+					profile.Arguments = append(profile.Arguments, item.name)
+				}
+			}
+		case ProfileGoAccessShow:
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,JoinsNamespaceOf,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,Environment,Sockets,Service,Unit,FragmentPath,DropInPaths,Listen,SocketMode,SocketUser,SocketGroup,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,TimeoutStartUSec", "lanpanel-goaccess-" + goaccessUnit + ".service", "lanpanel-goaccess-relay-" + goaccessUnit + ".service", "lanpanel-goaccess-" + goaccessUnit + ".socket", "lanpanel-goaccess-retention-" + goaccessUnit + ".timer", "lanpanel-goaccess-retention-" + goaccessUnit + ".service"}
 		case ProfileResourceDaemonReload:
 			profile.Arguments = []string{"daemon-reload"}
 		case ProfileResourceStart:

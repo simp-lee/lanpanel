@@ -17,7 +17,7 @@ import (
 )
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessProbe, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -238,6 +238,37 @@ func TestAPTSimulationReturnsOnlyCanonicalExactChanges(t *testing.T) {
 	}
 	if _, err := parseAPTSimulation([]byte("Remv nginx [1.22.1]\n")); err == nil {
 		t.Fatal("APT simulation removal was accepted")
+	}
+}
+
+func TestGoAccessProfilesDeriveOnlyFixedPerResourceUnits(t *testing.T) {
+	inv := Invocation{Resource: &ResourceInvocation{ResourceID: "res_00000000000000000000000000000001", Generation: 2}}
+	start, err := ResolveInvocation(ProfileGoAccessStart, Identities{}, inv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(start.Arguments, " ")
+	for _, required := range []string{"lanpanel-goaccess-res_00000000000000000000000000000001-2.service", "lanpanel-goaccess-res_00000000000000000000000000000001-2.socket", "lanpanel-goaccess-relay-res_00000000000000000000000000000001-2.service", "lanpanel-goaccess-retention-res_00000000000000000000000000000001-2.timer"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("start profile missing %q", required)
+		}
+	}
+	retain, err := ResolveInvocation(ProfileGoAccessRetain, Identities{}, inv)
+	if err != nil || !reflect.DeepEqual(retain.Arguments, []string{"start", "lanpanel-goaccess-retention-res_00000000000000000000000000000001-2.service"}) {
+		t.Fatalf("retention profile=%v error=%v", retain.Arguments, err)
+	}
+	if _, err = ResolveInvocation(ProfileGoAccessStart, Identities{}, Invocation{}); err == nil {
+		t.Fatal("untyped GoAccess invocation accepted")
+	}
+	subset := inv
+	subset.Resource = &ResourceInvocation{ResourceID: inv.Resource.ResourceID, Generation: 2, UnitMask: 5}
+	stop, err := ResolveInvocation(ProfileGoAccessStop, Identities{}, subset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined = strings.Join(stop.Arguments, " ")
+	if !strings.Contains(joined, ".socket") || !strings.Contains(joined, ".service") || strings.Contains(joined, "relay") {
+		t.Fatalf("subset stop args=%v", stop.Arguments)
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
 	"os"
+	"os/user"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -29,6 +31,17 @@ func RunRuntimeGuard(args []string) error {
 		return fmt.Errorf("runtime socket group is missing")
 	}
 	if _, err = ensureDirectory(FixedPaths().RuntimeRoot, filetxn.Owner{UID: 0, GID: config.SocketGroup}, 0o710); err != nil {
+		return err
+	}
+	nginxGroup, lookupErr := user.LookupGroup("www-data")
+	if lookupErr != nil {
+		return lookupErr
+	}
+	nginxGID, parseErr := strconv.ParseUint(nginxGroup.Gid, 10, 32)
+	if parseErr != nil || nginxGID == 0 {
+		return fmt.Errorf("Nginx runtime group invalid")
+	}
+	if _, err = ensureDirectory("/run/lanpanel-goaccess", filetxn.Owner{UID: 0, GID: uint32(nginxGID)}, 0o750); err != nil {
 		return err
 	}
 	return ensureBPFGuardDirectory()

@@ -19,7 +19,7 @@ import (
 
 const (
 	SchemaVersion         = "lanpanel.job.v1"
-	MaximumModifiedPaths  = 64
+	MaximumModifiedPaths  = 8192
 	MaximumPostconditions = 32
 )
 
@@ -47,6 +47,8 @@ var (
 		"managed_basic_hash_failed":                  {},
 		"static_root_registration_interrupted":       {},
 		"external_htpasswd_registration_interrupted": {},
+		"goaccess_retirement_recovery":               {},
+		"goaccess_stop_failed":                       {},
 		"normal_revision_changed":                    {},
 		"plan_consumption_rejected":                  {},
 		"planless_start_rejected":                    {},

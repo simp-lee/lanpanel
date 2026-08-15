@@ -3,6 +3,7 @@
 package operations
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
@@ -22,6 +24,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +52,7 @@ const (
 	BackupEnter              Type = "backup_enter"
 	AutomaticReconciliation  Type = "automatic_exact_journal_reconciliation"
 	StartupContraction       Type = "startup_activation_contraction"
+	GoAccessRetirement       Type = "goaccess_retirement_reconciliation"
 	ResourceCreate           Type = "resource_create"
 	ResourceUpdate           Type = "resource_update"
 	ProcessStart             Type = "process_start"
@@ -56,7 +60,7 @@ const (
 )
 
 const (
-	maximumTerminalOperationGraphs = 256
+	maximumTerminalOperationGraphs = 512
 	maximumActiveOperationGraphs   = 64
 	maximumChildrenPerJob          = 32
 	maximumJournalResources        = 256
@@ -74,19 +78,25 @@ const (
 )
 
 type SafetyBinding struct {
-	GlobalGeneration     uint64    `json:"global_generation,omitempty"`
-	DependencyGeneration uint64    `json:"dependency_generation,omitempty"`
-	ExpiryKind           string    `json:"expiry_kind,omitempty"`
-	ExpiryGeneration     uint64    `json:"expiry_generation,omitempty"`
-	ResourceID           string    `json:"resource_id,omitempty"`
-	Deadline             time.Time `json:"deadline"`
-	ProposedGeneration   uint64    `json:"proposed_generation,omitempty"`
-	PlanID               string    `json:"plan_id,omitempty"`
-	IntentGeneration     uint64    `json:"intent_generation,omitempty"`
-	CandidateDigest      string    `json:"candidate_digest,omitempty"`
-	CandidateBundle      string    `json:"candidate_bundle,omitempty"`
-	ChallengeMethod      string    `json:"challenge_method,omitempty"`
-	CertificateIdentity  string    `json:"certificate_identity,omitempty"`
+	GlobalGeneration        uint64                              `json:"global_generation,omitempty"`
+	DependencyGeneration    uint64                              `json:"dependency_generation,omitempty"`
+	ExpiryKind              string                              `json:"expiry_kind,omitempty"`
+	ExpiryGeneration        uint64                              `json:"expiry_generation,omitempty"`
+	ResourceID              string                              `json:"resource_id,omitempty"`
+	Deadline                time.Time                           `json:"deadline"`
+	ProposedGeneration      uint64                              `json:"proposed_generation,omitempty"`
+	PlanID                  string                              `json:"plan_id,omitempty"`
+	IntentGeneration        uint64                              `json:"intent_generation,omitempty"`
+	CandidateDigest         string                              `json:"candidate_digest,omitempty"`
+	CandidateBundle         string                              `json:"candidate_bundle,omitempty"`
+	ChallengeMethod         string                              `json:"challenge_method,omitempty"`
+	CertificateIdentity     string                              `json:"certificate_identity,omitempty"`
+	InstallationID          string                              `json:"installation_id,omitempty"`
+	GoAccessSource          string                              `json:"goaccess_source,omitempty"`
+	GoAccessSourceJobID     string                              `json:"goaccess_source_job_id,omitempty"`
+	GoAccessSourceJournalID string                              `json:"goaccess_source_journal_id,omitempty"`
+	GoAccessAuthorityDigest string                              `json:"goaccess_authority_digest,omitempty"`
+	GoAccessRetirements     []domain.GoAccessRetirementIdentity `json:"goaccess_retirements,omitempty"`
 }
 type AdmissionSource string
 
@@ -156,9 +166,10 @@ type PublicationBeginCommit struct {
 	Intent     domain.ActivationIntent
 }
 type PublicationTerminalCommit struct {
-	ResourceID string
-	Bundle     domain.PublicationBundle
-	Runtime    domain.RuntimeObservation
+	ResourceID                string
+	Bundle                    domain.PublicationBundle
+	Runtime                   domain.RuntimeObservation
+	GoAccessRetirementPending bool
 }
 type ChildState string
 
@@ -1295,8 +1306,10 @@ func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation
 
 func operationNonPublicationCredentials(resource domain.AppResource) []string {
 	values := append([]string(nil), resource.CredentialIDs...)
-	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID != "" {
-		values = slices.DeleteFunc(values, func(value string) bool { return value == resource.Publication.DomainHTTPS.CredentialID })
+	if publication := resource.Publication.DomainHTTPS; publication != nil {
+		values = slices.DeleteFunc(values, func(value string) bool {
+			return value == publication.CredentialID || value == publication.GoAccess.CredentialID
+		})
 	}
 	return values
 }
@@ -1503,6 +1516,9 @@ func (admitter *Admitter) CommitCertificateRenewal(ctx context.Context, mutation
 			}
 			if resource.PublicationRecord.State != domain.PublicationPublished || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate, prior) {
 				return fmt.Errorf("applied certificate changed before renewal commit")
+			}
+			if len(resource.PublicationRecord.PendingGoAccessRetirements) != 0 {
+				return fmt.Errorf("certificate renewal commit found pending GoAccess retirement")
 			}
 			if candidate.Generation != prior.Generation+1 || candidate.BindingIdentity != prior.BindingIdentity || candidate.SANIdentity != prior.SANIdentity || candidate.Authority == nil || prior.Authority == nil || !reflect.DeepEqual(candidate.Authority, prior.Authority) || !certificateDeadlineAfter(candidate.NotAfter, prior.NotAfter) {
 				return fmt.Errorf("renewed certificate identity invalid")
@@ -1899,12 +1915,37 @@ func activeGraphCount(transaction *persist.Transaction) (int, error) {
 }
 
 func pruneTerminalGraphs(transaction *persist.Transaction, keep int) error {
+	return pruneTerminalGraphsExcept(transaction, keep, "")
+}
+
+func pruneTerminalGraphsExcept(transaction *persist.Transaction, keep int, exemptPin string) error {
 	if keep < 0 {
 		return fmt.Errorf("terminal graph retention bound is invalid")
 	}
 	type terminalGraph struct {
 		intent Reservation
 		ended  time.Time
+	}
+	pinned := map[string]bool{}
+	pinReferences := map[string]int{}
+	if raw, present := transaction.Get("installations/current"); present {
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return err
+		}
+		for _, resource := range installation.Resources {
+			if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
+				if resource.PublicationRecord.GoAccessRetirementSourceJobID == "" {
+					return fmt.Errorf("pending GoAccess retirement source missing")
+				}
+				pinReferences[resource.PublicationRecord.GoAccessRetirementSourceJobID]++
+			}
+		}
+		for source, references := range pinReferences {
+			if source != exemptPin || references > 1 {
+				pinned[source] = true
+			}
+		}
 	}
 	graphs := []terminalGraph{}
 	for _, key := range transaction.Keys("intents") {
@@ -1932,8 +1973,20 @@ func pruneTerminalGraphs(transaction *persist.Transaction, keep int) error {
 		return graphs[i].ended.Before(graphs[j].ended)
 	})
 	remove := len(graphs) - keep
+	if remove <= 0 {
+		return nil
+	}
+	removable := make([]terminalGraph, 0, remove)
+	for _, graph := range graphs {
+		if !pinned[graph.intent.JobID] {
+			removable = append(removable, graph)
+		}
+	}
+	if len(removable) < remove {
+		return fmt.Errorf("terminal graph retention is pinned by pending GoAccess retirement")
+	}
 	for index := 0; index < remove; index++ {
-		intent := graphs[index].intent
+		intent := removable[index].intent
 		for _, namespace := range []string{"children", "journals"} {
 			for _, key := range transaction.Keys(namespace) {
 				raw, _ := transaction.Get(key)
@@ -2168,6 +2221,10 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 		if err != nil {
 			return err
 		}
+		expectedRetirement := commit.Bundle.DomainHTTPS != nil && commit.Bundle.DomainHTTPS.GoAccess.RetiredGeneration != 0
+		if commit.GoAccessRetirementPending != expectedRetirement {
+			return fmt.Errorf("publication retirement authority mismatched")
+		}
 		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != commit.ResourceID || commit.Bundle.ConfigDigest != intent.SafetyBinding.CandidateDigest || publication.RequireBundleDigest(commit.Bundle, intent.SafetyBinding.CandidateBundle) != nil {
 			return fmt.Errorf("publication terminal intent mismatched")
 		}
@@ -2204,7 +2261,24 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 			resource.PublicationRecord.ActivationIntent = nil
 			resource.PublicationRecord.RuntimeObservation = &commit.Runtime
 			resource.PublicationRecord.LastOperation = domain.OperationPublish
-			resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+			if commit.GoAccessRetirementPending {
+				identity := commit.Bundle.DomainHTTPS.GoAccess
+				resource.PublicationRecord.LastOperationResult = domain.OperationPartial
+				resource.PublicationRecord.PendingGoAccessRetirements = []domain.GoAccessRetirementIdentity{{Generation: identity.RetiredGeneration, StateGeneration: identity.RetiredStateGeneration, ServiceIdentity: identity.RetiredServiceIdentity, RemoveState: identity.RemovesRetiredState(), UnitIdentities: append([]string(nil), identity.RetiredUnitIdentities...)}}
+				retirementDigest, digestErr := GoAccessRetirementInventoryDigest(resource.PublicationRecord.PendingGoAccessRetirements)
+				if digestErr != nil {
+					return digestErr
+				}
+				resource.PublicationRecord.GoAccessRetirementSourceJobID = jobID
+				resource.PublicationRecord.GoAccessRetirementSourceJournalID = journalID
+				resource.PublicationRecord.GoAccessRetirementAuthorityDigest = retirementDigest
+			} else {
+				resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+				resource.PublicationRecord.PendingGoAccessRetirements = nil
+				resource.PublicationRecord.GoAccessRetirementSourceJobID = ""
+				resource.PublicationRecord.GoAccessRetirementSourceJournalID = ""
+				resource.PublicationRecord.GoAccessRetirementAuthorityDigest = ""
+			}
 			resource.PublicationRecord.LastJobID = jobID
 			found = true
 		}
@@ -2218,34 +2292,44 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 		if err := transaction.Replace("installations/current", raw); err != nil {
 			return err
 		}
-		journal.Phase = JournalTerminal
+		if commit.GoAccessRetirementPending {
+			journal.Phase = JournalActive
+		} else {
+			journal.Phase = JournalTerminal
+		}
 		journalRaw, err = persist.EncodeEntry(journal)
 		if err != nil {
 			return err
 		}
-		if err := transaction.Replace("journals/"+journal.ID, journalRaw); err != nil {
+		if err = transaction.Replace("journals/"+journal.ID, journalRaw); err != nil {
 			return err
 		}
 		record, err := jobs.Load(transaction, jobID)
 		if err != nil {
 			return err
 		}
-		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: paths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: runtimeDigest}}}, observedNow)
-		if err != nil {
-			return err
+		if commit.GoAccessRetirementPending {
+			completed = record
+		} else {
+			publicationPaths := append(append([]string(nil), paths...), commit.Bundle.ManagedPaths...)
+			completion := jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: publicationPaths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: runtimeDigest}}}
+			record, err = jobs.Finish(record, completion, observedNow)
+			if err != nil {
+				return err
+			}
+			if err = jobs.Replace(transaction, record); err != nil {
+				return err
+			}
+			intent.Phase = PhaseTerminal
+			raw, err = persist.EncodeEntry(intent)
+			if err != nil {
+				return err
+			}
+			if err = transaction.Replace(reservationKey(jobID), raw); err != nil {
+				return err
+			}
+			completed = record
 		}
-		if err := jobs.Replace(transaction, record); err != nil {
-			return err
-		}
-		intent.Phase = PhaseTerminal
-		raw, err = persist.EncodeEntry(intent)
-		if err != nil {
-			return err
-		}
-		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
-			return err
-		}
-		completed = record
 		return nil
 	})
 	if err != nil {
@@ -2253,6 +2337,480 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 	}
 	return completed, safetyCommit()
 }
+func (admitter *Admitter) InterruptPublicationGoAccessRetirement(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("GoAccess retirement interruption requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var interrupted jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if pruneErr := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); pruneErr != nil {
+			return pruneErr
+		}
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status != jobs.StatusRunning || record.Operation != string(Publish) {
+			return fmt.Errorf("GoAccess retirement running job changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		retirementIdentity, siteIdentity := "", ""
+		modifiedPaths := []string{}
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == resourceID && resource.PublicationRecord.LastJobID == jobID && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil {
+				goaccess := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.GoAccess
+				if goaccess.RetiredGeneration != 0 {
+					paths, pathErr := publicationGoAccessModifiedPaths(resourceID, resource.PublicationRecord.LastAppliedBundle)
+					if pathErr != nil {
+						return pathErr
+					}
+					retirementIdentity = fmt.Sprintf("%d:%s", goaccess.RetiredGeneration, goaccess.RetiredServiceIdentity)
+					siteIdentity = resource.PublicationRecord.LastAppliedBundle.SiteIdentity
+					modifiedPaths = paths
+					resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+				}
+			}
+		}
+		if retirementIdentity == "" {
+			return fmt.Errorf("GoAccess retirement interruption authority missing")
+		}
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, ModifiedPaths: modifiedPaths, Postconditions: []jobs.Postcondition{{Kind: "published_committed", Status: jobs.PostconditionKnown, Identity: siteIdentity}, {Kind: "goaccess_prior_retirement", Status: jobs.PostconditionKnown, Identity: retirementIdentity}}, ErrorCode: "goaccess_retirement_recovery"}, observed)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		journalRaw, present := transaction.Get("journals/activation-" + jobID)
+		if !present {
+			return fmt.Errorf("GoAccess retirement journal missing")
+		}
+		var journal JournalRecord
+		if loadErr = decodeStrict(journalRaw, &journal); loadErr != nil {
+			return loadErr
+		}
+		if journal.JobID != jobID || journal.Phase != JournalActive {
+			return fmt.Errorf("GoAccess retirement journal changed")
+		}
+		journal.Phase = JournalTerminal
+		journalRaw, loadErr = persist.EncodeEntry(journal)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("journals/"+journal.ID, journalRaw); loadErr != nil {
+			return loadErr
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, loadErr := persist.EncodeEntry(intent)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace(reservationKey(jobID), raw); loadErr != nil {
+			return loadErr
+		}
+		raw, loadErr = persist.EncodeEntry(installation)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("installations/current", raw); loadErr != nil {
+			return loadErr
+		}
+		interrupted = record
+		return nil
+	})
+	return interrupted, err
+}
+
+func (admitter *Admitter) FailPublicationGoAccessRetirement(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("GoAccess retirement failure requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var failed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if pruneErr := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); pruneErr != nil {
+			return pruneErr
+		}
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status != jobs.StatusRunning || record.Operation != string(Publish) {
+			return fmt.Errorf("GoAccess retirement running job changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		retirementIdentity := ""
+		siteIdentity := ""
+		modifiedPaths := []string{}
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == resourceID && resource.PublicationRecord.LastJobID == jobID && resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil {
+				goaccess := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.GoAccess
+				if goaccess.RetiredGeneration != 0 {
+					paths, pathErr := publicationGoAccessModifiedPaths(resourceID, resource.PublicationRecord.LastAppliedBundle)
+					if pathErr != nil {
+						return pathErr
+					}
+					retirementIdentity = fmt.Sprintf("%d:%s", goaccess.RetiredGeneration, goaccess.RetiredServiceIdentity)
+					siteIdentity = resource.PublicationRecord.LastAppliedBundle.SiteIdentity
+					modifiedPaths = paths
+					resource.PublicationRecord.LastOperationResult = domain.OperationPartial
+				}
+			}
+		}
+		if retirementIdentity == "" {
+			return fmt.Errorf("GoAccess retirement failure authority missing")
+		}
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: jobs.ResultPartial, ModifiedPaths: modifiedPaths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: siteIdentity}, {Kind: "goaccess_prior_retirement", Status: jobs.PostconditionKnown, Identity: retirementIdentity}}, ErrorCode: "goaccess_stop_failed"}, observed)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		journalRaw, present := transaction.Get("journals/activation-" + jobID)
+		if !present {
+			return fmt.Errorf("GoAccess retirement journal missing")
+		}
+		var journal JournalRecord
+		if loadErr = decodeStrict(journalRaw, &journal); loadErr != nil {
+			return loadErr
+		}
+		if journal.JobID != jobID || journal.Phase != JournalActive {
+			return fmt.Errorf("GoAccess retirement journal changed")
+		}
+		journal.Phase = JournalTerminal
+		journalRaw, loadErr = persist.EncodeEntry(journal)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("journals/"+journal.ID, journalRaw); loadErr != nil {
+			return loadErr
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, loadErr := persist.EncodeEntry(intent)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace(reservationKey(jobID), raw); loadErr != nil {
+			return loadErr
+		}
+		raw, loadErr = persist.EncodeEntry(installation)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("installations/current", raw); loadErr != nil {
+			return loadErr
+		}
+		failed = record
+		return nil
+	})
+	return failed, err
+}
+
+func (admitter *Admitter) CompletePublicationGoAccessRetirement(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("GoAccess retirement completion requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if pruneErr := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); pruneErr != nil {
+			return pruneErr
+		}
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status != jobs.StatusRunning || record.Operation != string(Publish) {
+			return fmt.Errorf("GoAccess retirement job authority changed")
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil || intent.Operation != Publish || intent.Phase != PhaseLocalIntent {
+			return fmt.Errorf("GoAccess retirement reservation authority changed")
+		}
+		journalRaw, present := transaction.Get("journals/activation-" + jobID)
+		if !present {
+			return fmt.Errorf("GoAccess retirement journal missing")
+		}
+		var journal JournalRecord
+		if loadErr = decodeStrict(journalRaw, &journal); loadErr != nil {
+			return loadErr
+		}
+		if journal.JobID != jobID || journal.Kind != JournalAppActivation || journal.Phase != JournalActive {
+			return fmt.Errorf("GoAccess retirement journal authority changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		var bundle *domain.PublicationBundle
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == resourceID && resource.PublicationRecord.LastJobID == jobID && resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.GoAccess.RetiredGeneration != 0 {
+				resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+				clearGoAccessRetirementAuthority(&resource.PublicationRecord)
+				bundle = resource.PublicationRecord.LastAppliedBundle
+			}
+		}
+		if bundle == nil {
+			return fmt.Errorf("GoAccess retirement resource authority changed")
+		}
+		if journal.ArtifactDigest == "" || publication.RequireBundleDigest(*bundle, journal.ArtifactDigest) != nil {
+			return fmt.Errorf("GoAccess retirement bundle authority changed")
+		}
+		goaccess := bundle.DomainHTTPS.GoAccess
+		modifiedPaths, pathErr := publicationGoAccessModifiedPaths(resourceID, bundle)
+		if pathErr != nil {
+			return pathErr
+		}
+		retirementIdentity := fmt.Sprintf("%d:%s", goaccess.RetiredGeneration, goaccess.RetiredServiceIdentity)
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: modifiedPaths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: bundle.SiteIdentity}, {Kind: "goaccess_prior_retirement", Status: jobs.PostconditionVerified, Identity: retirementIdentity}}}, observed)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		journal.Phase = JournalTerminal
+		journalRaw, loadErr = persist.EncodeEntry(journal)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("journals/"+journal.ID, journalRaw); loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, loadErr := persist.EncodeEntry(intent)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace(reservationKey(jobID), raw); loadErr != nil {
+			return loadErr
+		}
+		raw, loadErr = persist.EncodeEntry(installation)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("installations/current", raw); loadErr != nil {
+			return loadErr
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
+func (admitter *Admitter) CompleteGoAccessRetirementReconciliation(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, generation uint64, serviceIdentity string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("GoAccess reconciliation completion requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status != jobs.StatusRunning || record.Operation != string(GoAccessRetirement) || intent.Operation != GoAccessRetirement || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID {
+			return fmt.Errorf("GoAccess reconciliation job authority changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		oldJobID := ""
+		sourceJournalID := ""
+		siteIdentity := ""
+		modifiedPaths := []string{}
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == resourceID && resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil {
+				goaccess := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.GoAccess
+				if goaccess.RetiredGeneration == generation && goaccess.RetiredServiceIdentity == serviceIdentity {
+					retirement := domain.GoAccessRetirementIdentity{Generation: goaccess.RetiredGeneration, StateGeneration: goaccess.RetiredStateGeneration, ServiceIdentity: goaccess.RetiredServiceIdentity, RemoveState: goaccess.RemovesRetiredState(), UnitIdentities: append([]string(nil), goaccess.RetiredUnitIdentities...)}
+					retirementPaths, pathErr := GoAccessRetirementModifiedPaths(resourceID, retirement)
+					if pathErr != nil {
+						return pathErr
+					}
+					oldJobID = resource.PublicationRecord.GoAccessRetirementSourceJobID
+					sourceJournalID = resource.PublicationRecord.GoAccessRetirementSourceJournalID
+					siteIdentity = resource.PublicationRecord.LastAppliedBundle.SiteIdentity
+					modifiedPaths = append(modifiedPaths, retirementPaths...)
+					resource.PublicationRecord.LastJobID = jobID
+					resource.PublicationRecord.LastOperation = domain.OperationPublish
+					resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+					clearGoAccessRetirementAuthority(&resource.PublicationRecord)
+				}
+			}
+		}
+		if oldJobID == "" {
+			return fmt.Errorf("GoAccess reconciliation resource authority changed")
+		}
+		oldRecord, loadErr := jobs.Load(transaction, oldJobID)
+		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || !((oldRecord.Result == jobs.ResultPartial && oldRecord.ErrorCode == "goaccess_stop_failed") || (oldRecord.Result == jobs.ResultInterrupted && oldRecord.ErrorCode == "goaccess_retirement_recovery")) {
+			return fmt.Errorf("GoAccess prior retirement result changed")
+		}
+		journalRaw, present := transaction.Get("journals/" + sourceJournalID)
+		if !present {
+			return fmt.Errorf("GoAccess retirement journal missing")
+		}
+		var journal JournalRecord
+		if loadErr = decodeStrict(journalRaw, &journal); loadErr != nil {
+			return loadErr
+		}
+		if journal.Phase != JournalTerminal || journal.JobID != oldJobID {
+			return fmt.Errorf("GoAccess retirement journal changed")
+		}
+		if pruneErr := pruneTerminalGraphsExcept(transaction, maximumTerminalOperationGraphs-1, oldJobID); pruneErr != nil {
+			return pruneErr
+		}
+		retirementIdentity := fmt.Sprintf("%d:%s", generation, serviceIdentity)
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: modifiedPaths, Postconditions: []jobs.Postcondition{{Kind: "published", Status: jobs.PostconditionVerified, Identity: siteIdentity}, {Kind: "goaccess_prior_retirement", Status: jobs.PostconditionVerified, Identity: retirementIdentity}}}, observed)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, loadErr := persist.EncodeEntry(intent)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace(reservationKey(jobID), raw); loadErr != nil {
+			return loadErr
+		}
+		raw, loadErr = persist.EncodeEntry(installation)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("installations/current", raw); loadErr != nil {
+			return loadErr
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
+func (admitter *Admitter) CompleteGoAccessContractionReconciliation(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, retirements []domain.GoAccessRetirementIdentity) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("GoAccess contraction reconciliation requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		if record.Status != jobs.StatusRunning || record.Operation != string(GoAccessRetirement) || intent.Operation != GoAccessRetirement || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID {
+			return fmt.Errorf("GoAccess contraction reconciliation job changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		oldJobID := ""
+		operation := domain.OperationCode("")
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID == resourceID && reflect.DeepEqual(resource.PublicationRecord.PendingGoAccessRetirements, retirements) {
+				oldJobID = resource.PublicationRecord.GoAccessRetirementSourceJobID
+				operation = resource.PublicationRecord.LastOperation
+				clearGoAccessRetirementAuthority(&resource.PublicationRecord)
+				resource.PublicationRecord.LastJobID = jobID
+				resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+			}
+		}
+		if oldJobID == "" || (operation != domain.OperationUnpublish && operation != domain.OperationCloseAll) {
+			return fmt.Errorf("GoAccess contraction reconciliation authority changed")
+		}
+		oldRecord, loadErr := jobs.Load(transaction, oldJobID)
+		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || oldRecord.Result != jobs.ResultPartial || oldRecord.ErrorCode != "goaccess_stop_failed" {
+			return fmt.Errorf("GoAccess contraction partial result changed")
+		}
+		if pruneErr := pruneTerminalGraphsExcept(transaction, maximumTerminalOperationGraphs-1, oldJobID); pruneErr != nil {
+			return pruneErr
+		}
+		identities := make([]string, 0, len(retirements))
+		modifiedPaths := []string{}
+		for _, item := range retirements {
+			identities = append(identities, fmt.Sprintf("%d:%s", item.Generation, item.ServiceIdentity))
+			paths, pathErr := GoAccessRetirementModifiedPaths(resourceID, item)
+			if pathErr != nil {
+				return pathErr
+			}
+			modifiedPaths = append(modifiedPaths, paths...)
+		}
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: modifiedPaths, Postconditions: []jobs.Postcondition{{Kind: "goaccess_contraction_retirement", Status: jobs.PostconditionVerified, Identity: strings.Join(identities, ",")}}}, observed)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, loadErr := persist.EncodeEntry(intent)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace(reservationKey(jobID), raw); loadErr != nil {
+			return loadErr
+		}
+		raw, loadErr = persist.EncodeEntry(installation)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = transaction.Replace("installations/current", raw); loadErr != nil {
+			return loadErr
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
 func (admitter *Admitter) RejectPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, code string) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return fmt.Errorf("publication rejection requires exact authority")
@@ -2357,8 +2915,14 @@ func (admitter *Admitter) ConvergeCommittedPublicationContraction(ctx context.Co
 				return fmt.Errorf("committed publication recovery intent changed")
 			}
 			record, err := jobs.Load(transaction, resource.PublicationRecord.LastJobID)
-			if err != nil || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultSucceeded {
+			if err != nil || record.Status != jobs.StatusTerminal || !(record.Result == jobs.ResultSucceeded || record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery") {
 				return fmt.Errorf("committed publication recovery job changed")
+			}
+			if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
+				if resource.PublicationRecord.GoAccessRetirementSourceJournalID == "" {
+					return fmt.Errorf("committed publication contraction found nonpublication retirement source")
+				}
+				clearGoAccessRetirementAuthority(&resource.PublicationRecord)
 			}
 			resource.PublicationRecord.State = domain.PublicationUnpublished
 			resource.PublicationRecord.UnpublishedGeneration = generation
@@ -2535,7 +3099,15 @@ func (admitter *Admitter) CommitContractionState(ctx context.Context, mutation *
 			resource.PublicationRecord.UnpublishedGeneration = generation
 			resource.PublicationRecord.ActivationIntent = nil
 			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeUnknown, ObservedAt: intent.Consumption.ConfirmedAt.UTC().Format(time.RFC3339), Reason: "closing_may_be_live"}
-			resource.PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: intent.JobID, Operation: string(intent.Operation), Generation: generation, ClosureAuthorityDigest: commit.ClosureAuthorityDigest, Prior: cloneBundle(prior), Candidate: cloneBundle(candidate)}
+			retirements, retirementErr := goAccessRetirements(prior, candidate)
+			if retirementErr != nil {
+				return retirementErr
+			}
+			retirements, retirementErr = transferPendingGoAccessRetirements(&resource.PublicationRecord, retirements)
+			if retirementErr != nil {
+				return retirementErr
+			}
+			resource.PublicationRecord.ContractionIntent = &domain.ContractionIntent{JobID: intent.JobID, Operation: string(intent.Operation), Generation: generation, ClosureAuthorityDigest: commit.ClosureAuthorityDigest, Prior: cloneBundle(prior), Candidate: cloneBundle(candidate), GoAccessRetirements: retirements}
 			delete(remaining, resource.ID)
 		}
 		if len(remaining) != 0 {
@@ -2790,6 +3362,200 @@ func PendingResourceCreates(document persist.Document) ([]Reservation, error) {
 	return result, nil
 }
 
+func clearGoAccessRetirementAuthority(record *domain.PublicationRecord) {
+	record.PendingGoAccessRetirements = nil
+	record.GoAccessRetirementSourceJobID = ""
+	record.GoAccessRetirementSourceJournalID = ""
+	record.GoAccessRetirementAuthorityDigest = ""
+}
+
+func publicationGoAccessModifiedPaths(resourceID string, bundle *domain.PublicationBundle) ([]string, error) {
+	if bundle == nil || bundle.DomainHTTPS == nil || bundle.DomainHTTPS.GoAccess.RetiredGeneration == 0 {
+		return nil, fmt.Errorf("publication GoAccess modified-path authority invalid")
+	}
+	goaccess := bundle.DomainHTTPS.GoAccess
+	retirement := domain.GoAccessRetirementIdentity{Generation: goaccess.RetiredGeneration, StateGeneration: goaccess.RetiredStateGeneration, ServiceIdentity: goaccess.RetiredServiceIdentity, RemoveState: goaccess.RemovesRetiredState(), UnitIdentities: append([]string(nil), goaccess.RetiredUnitIdentities...)}
+	retirementPaths, err := GoAccessRetirementModifiedPaths(resourceID, retirement)
+	if err != nil {
+		return nil, err
+	}
+	paths := append(append([]string(nil), bundle.ManagedPaths...), nginx.FixedPaths().ManifestPath())
+	paths = append(paths, retirementPaths...)
+	return paths, nil
+}
+
+func GoAccessStopModifiedPaths(resourceID string, generation uint64) ([]string, error) {
+	if !validIdentityRef(resourceID) || !strings.HasPrefix(resourceID, "res_") || generation == 0 {
+		return nil, fmt.Errorf("GoAccess stop modified-path authority invalid")
+	}
+	unitID := resourceID + "-" + strconv.FormatUint(generation, 10)
+	paths := []string{
+		"/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service",
+		"/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service",
+		"/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket",
+		"/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer",
+		"/run/lanpanel-goaccess/" + unitID + ".sock",
+		"/var/log/lanpanel/goaccess/" + resourceID,
+	}
+	slices.Sort(paths)
+	return paths, nil
+}
+
+func GoAccessRetirementModifiedPaths(resourceID string, retirement domain.GoAccessRetirementIdentity) ([]string, error) {
+	if !validIdentityRef(resourceID) || !strings.HasPrefix(resourceID, "res_") || retirement.Generation == 0 || retirement.StateGeneration == 0 || retirement.StateGeneration > retirement.Generation || len(retirement.UnitIdentities) != 5 {
+		return nil, fmt.Errorf("GoAccess retirement modified-path authority invalid")
+	}
+	unitID := resourceID + "-" + strconv.FormatUint(retirement.Generation, 10)
+	paths := []string{
+		"/etc/systemd/system/lanpanel-goaccess-" + unitID + ".service",
+		"/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service",
+		"/etc/systemd/system/lanpanel-goaccess-relay-" + unitID + ".service",
+		"/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service",
+		"/etc/systemd/system/lanpanel-goaccess-" + unitID + ".socket",
+		"/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket",
+		"/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".service",
+		"/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".timer",
+		"/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer",
+		"/run/lanpanel-goaccess/" + unitID + ".sock",
+		"/var/log/lanpanel/goaccess/" + resourceID,
+	}
+	if retirement.RemoveState {
+		paths = append(paths, "/var/lib/lanpanel/goaccess/"+resourceID+"/generations/"+strconv.FormatUint(retirement.StateGeneration, 10))
+	}
+	if retirement.RemoveShared {
+		paths = append(paths, "/var/lib/lanpanel/goaccess/"+resourceID, "/etc/sysusers.d/lanpanel-goaccess-"+resourceID+".conf", "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow")
+	}
+	slices.Sort(paths)
+	return paths, nil
+}
+
+func GoAccessRetirementInventoryDigest(retirements []domain.GoAccessRetirementIdentity) (string, error) {
+	data, err := json.Marshal(retirements)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+func GoAccessRetirementBinding(installationID, resourceID, source, sourceJobID, sourceJournalID, authorityDigest string, retirements []domain.GoAccessRetirementIdentity) (SafetyBinding, error) {
+	binding := SafetyBinding{ResourceID: resourceID, InstallationID: installationID, GoAccessSource: source, GoAccessSourceJobID: sourceJobID, GoAccessSourceJournalID: sourceJournalID, GoAccessAuthorityDigest: authorityDigest, GoAccessRetirements: append([]domain.GoAccessRetirementIdentity(nil), retirements...)}
+	if err := validateGoAccessRetirementBinding(binding); err != nil {
+		return SafetyBinding{}, err
+	}
+	return binding, nil
+}
+func validateGoAccessRetirementBinding(binding SafetyBinding) error {
+	if !validIdentityRef(binding.InstallationID) || !strings.HasPrefix(binding.InstallationID, "ins_") || !validIdentityRef(binding.ResourceID) || !validIdentityRef(binding.GoAccessSourceJobID) || !exactDigest(binding.GoAccessAuthorityDigest) || len(binding.GoAccessRetirements) == 0 {
+		return fmt.Errorf("GoAccess retirement binding incomplete")
+	}
+	prior := uint64(0)
+	for _, item := range binding.GoAccessRetirements {
+		if item.Generation <= prior || item.StateGeneration == 0 || item.StateGeneration > item.Generation || !exactDigest(item.ServiceIdentity) {
+			return fmt.Errorf("GoAccess retirement binding inventory invalid")
+		}
+		prior = item.Generation
+	}
+	switch binding.GoAccessSource {
+	case "publication":
+		if binding.GoAccessSourceJournalID != "activation-"+binding.GoAccessSourceJobID || len(binding.GoAccessRetirements) != 1 {
+			return fmt.Errorf("GoAccess publication retirement binding invalid")
+		}
+	case "contraction":
+		if binding.GoAccessSourceJournalID != "" {
+			return fmt.Errorf("GoAccess contraction retirement binding invalid")
+		}
+	default:
+		return fmt.Errorf("GoAccess retirement binding source invalid")
+	}
+	return nil
+}
+
+func ValidateGoAccessRetirementAuthority(document persist.Document, binding SafetyBinding) error {
+	if err := validateGoAccessRetirementBinding(binding); err != nil {
+		return err
+	}
+	rawInstallation, present := document.Entries["installations/current"]
+	if !present {
+		return fmt.Errorf("GoAccess retirement installation missing")
+	}
+	installation, err := domain.DecodeInstallation(rawInstallation)
+	if err != nil {
+		return err
+	}
+	if installation.InstallationID != binding.InstallationID {
+		return fmt.Errorf("GoAccess retirement installation changed")
+	}
+	sourceRecord, err := jobs.LoadEntries(document.Entries, binding.GoAccessSourceJobID)
+	if err != nil {
+		return err
+	}
+	for _, resource := range installation.Resources {
+		if resource.ID != binding.ResourceID {
+			continue
+		}
+		pendingDigest, digestErr := GoAccessRetirementInventoryDigest(resource.PublicationRecord.PendingGoAccessRetirements)
+		if digestErr != nil {
+			return digestErr
+		}
+		if resource.PublicationRecord.GoAccessRetirementSourceJobID != binding.GoAccessSourceJobID || resource.PublicationRecord.GoAccessRetirementSourceJournalID != binding.GoAccessSourceJournalID || resource.PublicationRecord.GoAccessRetirementAuthorityDigest != binding.GoAccessAuthorityDigest || pendingDigest != binding.GoAccessAuthorityDigest || !reflect.DeepEqual(resource.PublicationRecord.PendingGoAccessRetirements, binding.GoAccessRetirements) {
+			return fmt.Errorf("GoAccess retirement source authority changed")
+		}
+		switch binding.GoAccessSource {
+		case "publication":
+			journalRaw, present := document.Entries["journals/"+binding.GoAccessSourceJournalID]
+			if !present {
+				return fmt.Errorf("GoAccess retirement journal missing")
+			}
+			var journal JournalRecord
+			if err := decodeStrict(journalRaw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID != binding.GoAccessSourceJobID || journal.Phase != JournalTerminal || sourceRecord.Status != jobs.StatusTerminal || !((sourceRecord.Result == jobs.ResultPartial && sourceRecord.ErrorCode == "goaccess_stop_failed") || (sourceRecord.Result == jobs.ResultInterrupted && sourceRecord.ErrorCode == "goaccess_retirement_recovery")) {
+				return fmt.Errorf("GoAccess publication retirement source changed")
+			}
+		case "contraction":
+			if sourceRecord.Status != jobs.StatusTerminal || sourceRecord.Result != jobs.ResultPartial || sourceRecord.ErrorCode != "goaccess_stop_failed" {
+				return fmt.Errorf("GoAccess contraction retirement source changed")
+			}
+		default:
+			return fmt.Errorf("GoAccess retirement source invalid")
+		}
+		return nil
+	}
+	return fmt.Errorf("GoAccess retirement resource missing")
+}
+
+func FindRunningGoAccessRetirement(document persist.Document, target string) (Reservation, jobs.Record, bool, error) {
+	var found Reservation
+	var record jobs.Record
+	present := false
+	for key, raw := range document.Entries {
+		if !strings.HasPrefix(key, "intents/") {
+			continue
+		}
+		intent, err := decodeReservation(raw)
+		if err != nil {
+			return Reservation{}, jobs.Record{}, false, err
+		}
+		if intent.Operation != GoAccessRetirement || intent.Target != target || intent.Phase != PhaseReserved && intent.Phase != PhaseLocalIntent {
+			continue
+		}
+		if err := validateGoAccessRetirementBinding(intent.SafetyBinding); err != nil {
+			return Reservation{}, jobs.Record{}, false, err
+		}
+		if present {
+			return Reservation{}, jobs.Record{}, false, fmt.Errorf("multiple GoAccess retirement authorities")
+		}
+		record, err = jobs.LoadEntries(document.Entries, intent.JobID)
+		if err != nil || intent.Phase == PhaseReserved && record.Status != jobs.StatusReserved || intent.Phase == PhaseLocalIntent && record.Status != jobs.StatusRunning {
+			return Reservation{}, jobs.Record{}, false, fmt.Errorf("GoAccess retirement authority phase changed")
+		}
+		found = intent
+		present = true
+	}
+	return found, record, present, nil
+}
+
 func FindResourceCreateAuthority(document persist.Document, jobID, resourceID string) (Reservation, error) {
 	intent, err := loadReservationEntries(document.Entries, jobID)
 	if err != nil {
@@ -2810,6 +3576,73 @@ func cloneProcessBundle(value *domain.ProcessBundle) *domain.ProcessBundle {
 	copy.EndpointSocketUnits = append([]string(nil), value.EndpointSocketUnits...)
 	copy.ManagedPaths = append([]string(nil), value.ManagedPaths...)
 	return &copy
+}
+
+func transferPendingGoAccessRetirements(record *domain.PublicationRecord, retirements []domain.GoAccessRetirementIdentity) ([]domain.GoAccessRetirementIdentity, error) {
+	for _, pending := range record.PendingGoAccessRetirements {
+		matched := false
+		for index := range retirements {
+			if retirements[index].Generation == pending.Generation {
+				if retirements[index].ServiceIdentity != pending.ServiceIdentity || !slices.Equal(retirements[index].UnitIdentities, pending.UnitIdentities) {
+					return nil, fmt.Errorf("pending GoAccess retirement identity conflicts")
+				}
+				retirements[index].RemoveState = retirements[index].RemoveState || pending.RemoveState
+				retirements[index].RemoveShared = retirements[index].RemoveShared || pending.RemoveShared
+				matched = true
+			}
+		}
+		if !matched {
+			retirements = append(retirements, pending)
+		}
+	}
+	slices.SortFunc(retirements, func(a, b domain.GoAccessRetirementIdentity) int { return cmp.Compare(a.Generation, b.Generation) })
+	record.PendingGoAccessRetirements = nil
+	record.GoAccessRetirementSourceJobID = ""
+	record.GoAccessRetirementSourceJournalID = ""
+	record.GoAccessRetirementAuthorityDigest = ""
+	return retirements, nil
+}
+
+func goAccessRetirements(bundles ...*domain.PublicationBundle) ([]domain.GoAccessRetirementIdentity, error) {
+	byGeneration := map[uint64]domain.GoAccessRetirementIdentity{}
+	priorShared := false
+	if len(bundles) > 0 && bundles[0] != nil && bundles[0].DomainHTTPS != nil {
+		identity := bundles[0].DomainHTTPS.GoAccess
+		priorShared = identity.Enabled || identity.RetiredGeneration != 0
+	}
+	for bundleIndex, bundle := range bundles {
+		if bundle == nil || bundle.DomainHTTPS == nil {
+			continue
+		}
+		identity := bundle.DomainHTTPS.GoAccess
+		values := []domain.GoAccessRetirementIdentity{}
+		if identity.Enabled {
+			values = append(values, domain.GoAccessRetirementIdentity{Generation: identity.Generation, StateGeneration: identity.StateGeneration, ServiceIdentity: identity.ServiceIdentity, RemoveState: bundleIndex > 0 && identity.StateGeneration == identity.Generation, RemoveShared: bundleIndex > 0 && !priorShared, UnitIdentities: append([]string(nil), identity.UnitIdentities...)})
+		}
+		if identity.RetiredGeneration != 0 {
+			values = append(values, domain.GoAccessRetirementIdentity{Generation: identity.RetiredGeneration, StateGeneration: identity.RetiredStateGeneration, ServiceIdentity: identity.RetiredServiceIdentity, RemoveState: bundleIndex > 0 && identity.RemovesRetiredState(), UnitIdentities: append([]string(nil), identity.RetiredUnitIdentities...)})
+		}
+		for _, value := range values {
+			if prior, present := byGeneration[value.Generation]; present {
+				if prior.StateGeneration != value.StateGeneration || prior.ServiceIdentity != value.ServiceIdentity || !slices.Equal(prior.UnitIdentities, value.UnitIdentities) {
+					return nil, fmt.Errorf("GoAccess contraction generation identity conflicts")
+				}
+				value.RemoveState = value.RemoveState && prior.RemoveState
+				value.RemoveShared = value.RemoveShared && prior.RemoveShared
+			}
+			byGeneration[value.Generation] = value
+		}
+	}
+	generations := make([]uint64, 0, len(byGeneration))
+	for generation := range byGeneration {
+		generations = append(generations, generation)
+	}
+	slices.Sort(generations)
+	result := make([]domain.GoAccessRetirementIdentity, 0, len(generations))
+	for _, generation := range generations {
+		result = append(result, byGeneration[generation])
+	}
+	return result, nil
 }
 
 func cloneBundle(value *domain.PublicationBundle) *domain.PublicationBundle {
@@ -2930,6 +3763,24 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 				}
 				if contraction.ClosureAuthorityDigest != intent.ContractionDigest || contraction.Generation != resource.PublicationRecord.UnpublishedGeneration || contraction.Operation != string(intent.Operation) {
 					return fmt.Errorf("contraction terminalization identity changed")
+				}
+				if errorCode == "goaccess_stop_failed" && len(contraction.GoAccessRetirements) > 0 {
+					retirementDigest, digestErr := GoAccessRetirementInventoryDigest(contraction.GoAccessRetirements)
+					if digestErr != nil {
+						return digestErr
+					}
+					resource.PublicationRecord.PendingGoAccessRetirements = append([]domain.GoAccessRetirementIdentity(nil), contraction.GoAccessRetirements...)
+					resource.PublicationRecord.GoAccessRetirementSourceJobID = intent.JobID
+					resource.PublicationRecord.GoAccessRetirementSourceJournalID = ""
+					resource.PublicationRecord.GoAccessRetirementAuthorityDigest = retirementDigest
+					resource.PublicationRecord.LastOperationResult = domain.OperationPartial
+				} else {
+					clearGoAccessRetirementAuthority(&resource.PublicationRecord)
+					if errorCode == "" {
+						resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+					} else {
+						resource.PublicationRecord.LastOperationResult = domain.OperationPartial
+					}
 				}
 				resource.PublicationRecord.ContractionIntent = nil
 				resource.PublicationRecord.LastOperation = contractionOperationCode(intent.Operation)
@@ -3354,7 +4205,7 @@ func requiresContractionPreflight(operation Type) bool {
 
 func isContraction(operation Type) bool {
 	switch operation {
-	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
+	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction, GoAccessRetirement:
 		return true
 	default:
 		return false
@@ -4015,7 +4866,7 @@ func validateLinks(document persist.Document) error {
 		priorJournals := journalsByJob[journal.JobID]
 		if len(priorJournals) > 0 {
 			prior := priorJournals[0]
-			validPair := len(priorJournals) == 1 && intent.CertificateHandoff != nil && ((prior.Kind == JournalAppActivation && (prior.Phase == JournalPrepared || prior.Phase == JournalTerminal) && journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal) || (journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalTerminal) && prior.Kind == JournalCertificateActivation && prior.Phase == JournalTerminal))
+			validPair := len(priorJournals) == 1 && intent.CertificateHandoff != nil && ((prior.Kind == JournalAppActivation && (prior.Phase == JournalPrepared || prior.Phase == JournalActive || prior.Phase == JournalTerminal) && journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal) || (journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalActive || journal.Phase == JournalTerminal) && prior.Kind == JournalCertificateActivation && prior.Phase == JournalTerminal))
 			if !validPair {
 				return fmt.Errorf("operation intent has incompatible journal authorities")
 			}
@@ -4024,7 +4875,7 @@ func validateLinks(document persist.Document) error {
 		journalByJob[journal.JobID] = true
 		pendingCertificateReservation := journal.Kind == JournalCertificateActivation && journal.Phase == JournalPrepared && len(childrenByJob[journal.JobID]) < len(journal.ChildIDs) && slices.Equal(childrenByJob[journal.JobID], journal.ChildIDs[:len(childrenByJob[journal.JobID])])
 		terminalNeverSubmitted := journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal && intent.Phase == PhaseTerminal && len(childrenByJob[journal.JobID]) < len(journal.ChildIDs) && slices.Equal(childrenByJob[journal.JobID], journal.ChildIDs[:len(childrenByJob[journal.JobID])])
-		handoffAppJournal := intent.CertificateHandoff != nil && journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalTerminal) && len(journal.ChildIDs) == 0
+		handoffAppJournal := intent.CertificateHandoff != nil && journal.Kind == JournalAppActivation && (journal.Phase == JournalPrepared || journal.Phase == JournalActive || journal.Phase == JournalTerminal) && len(journal.ChildIDs) == 0
 		handoffCertificateJournal := intent.CertificateHandoff != nil && journal.Kind == JournalCertificateActivation && journal.Phase == JournalTerminal && journal.SafetyMarkerDigest == intent.CertificateHandoff.ChallengeSafetyDigest
 		if journal.InstallationID != installationID || journal.Operation != intent.Operation || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.SafetyMarkerDigest != intent.JournalSafetyDigest && !handoffCertificateJournal || !reflect.DeepEqual(journal.ChildIDs, childrenByJob[journal.JobID]) && !pendingCertificateReservation && !terminalNeverSubmitted && !handoffAppJournal {
 			return fmt.Errorf("journal installation, operation, target, generation, or child inventory does not match its authorities")
@@ -4102,7 +4953,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
 		}
 		jobID := resource.PublicationRecord.LastJobID
-		if resource.ManagedProcess != nil && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || resource.PublicationRecord == oldResource.PublicationRecord) {
+		if resource.ManagedProcess != nil && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || reflect.DeepEqual(resource.PublicationRecord, oldResource.PublicationRecord)) {
 			jobID = resource.ManagedProcess.LastJobID
 		}
 		if resource.PublicationRecord.ContractionIntent != nil {
@@ -4140,12 +4991,19 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return err
 		}
 		beginningActivation := oldResource.PublicationRecord.State != domain.PublicationActivating && resource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.ActivationIntent != nil && ((beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent) || (beforeIntent.Phase == PhaseReentered && intent.Phase == PhaseLocalIntent && intent.CertificateHandoff != nil)) && intent.Operation == Publish && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
+		pendingRetirementActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.GoAccess.RetiredGeneration != 0
+		retirementTerminalBase := oldResource.PublicationRecord.State == domain.PublicationPublished && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && intent.Operation == Publish
+		terminalRetirement := retirementTerminalBase && record.Result == jobs.ResultSucceeded
+		failedRetirement := retirementTerminalBase && record.Result == jobs.ResultPartial
+		interruptedRetirement := retirementTerminalBase && record.Result == jobs.ResultInterrupted
 		terminalActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.ActivationIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
-		committedRecoveryContraction := oldResource.PublicationRecord.State == domain.PublicationPublished && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseTerminal && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusTerminal && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
-		interruptedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultInterrupted
+		committedRecoveryContraction := oldResource.PublicationRecord.State == domain.PublicationPublished && oldResource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseTerminal && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusTerminal && record.Status == jobs.StatusTerminal && (record.Result == jobs.ResultSucceeded || record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery")
+		interruptedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.ActivationIntent == nil && resource.PublicationRecord.UnpublishedGeneration > oldResource.PublicationRecord.UnpublishedGeneration && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && (record.Result == jobs.ResultInterrupted || record.Result == jobs.ResultPartial && record.ErrorCode == "goaccess_stop_failed")
 		failedActivation := oldResource.PublicationRecord.State == domain.PublicationActivating && oldResource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.State == oldResource.PublicationRecord.ActivationIntent.PriorState && resource.PublicationRecord.ActivationIntent == nil && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultFailed
 		beginningContraction := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent != nil && beforeIntent.Phase == intent.Phase && (intent.Phase == PhaseLocalIntent || intent.Phase == PhaseReentered) && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
+		terminalGoAccessContractionReconciliation := oldResource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.State == domain.PublicationUnpublished && len(oldResource.PublicationRecord.PendingGoAccessRetirements) > 0 && len(resource.PublicationRecord.PendingGoAccessRetirements) == 0 && intent.Operation == GoAccessRetirement && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
+		terminalGoAccessReconciliation := oldResource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.State == domain.PublicationPublished && reflect.DeepEqual(oldResource.PublicationRecord.LastAppliedBundle, resource.PublicationRecord.LastAppliedBundle) && intent.Operation == GoAccessRetirement && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
 		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
 		ordinaryTerminal := intent.Operation != Publish && oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered || beforeIntent.Phase == PhaseRemoteWait && intent.Operation == CertificateRenew) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		switch {
@@ -4153,6 +5011,23 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			activation := resource.PublicationRecord.ActivationIntent
 			if activation.JobID != intent.JobID || activation.PlanID != intent.PlanID || activation.Generation != intent.SafetyBinding.IntentGeneration || resource.PublicationRecord.LastJobID != intent.JobID {
 				return fmt.Errorf("resource %q activation identity does not match durable intent", resource.ID)
+			}
+		case pendingRetirementActivation:
+			activation := oldResource.PublicationRecord.ActivationIntent
+			if activation.JobID != intent.JobID || resource.PublicationRecord.LastAppliedBundle == nil || !reflect.DeepEqual(*resource.PublicationRecord.LastAppliedBundle, activation.Candidate) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationPartial {
+				return fmt.Errorf("resource %q pending GoAccess retirement authority changed", resource.ID)
+			}
+		case terminalRetirement:
+			if !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationSucceeded {
+				return fmt.Errorf("resource %q GoAccess retirement terminal result changed", resource.ID)
+			}
+		case failedRetirement:
+			if !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationPartial || record.ErrorCode != "goaccess_stop_failed" {
+				return fmt.Errorf("resource %q GoAccess retirement partial result changed", resource.ID)
+			}
+		case interruptedRetirement:
+			if !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationInterrupted || record.ErrorCode != "goaccess_retirement_recovery" {
+				return fmt.Errorf("resource %q GoAccess retirement interruption changed", resource.ID)
 			}
 		case terminalActivation:
 			activation := oldResource.PublicationRecord.ActivationIntent
@@ -4164,7 +5039,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 				return fmt.Errorf("resource %q committed publication recovery identity changed", resource.ID)
 			}
 		case interruptedActivation:
-			if resource.PublicationRecord.LastAppliedDigest != oldResource.PublicationRecord.LastAppliedDigest || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationInterrupted {
+			if resource.PublicationRecord.LastAppliedDigest != oldResource.PublicationRecord.LastAppliedDigest || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
 				return fmt.Errorf("resource %q interrupted publication contraction identity changed", resource.ID)
 			}
 		case failedActivation:
@@ -4183,6 +5058,14 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		case terminalContraction:
 			if oldResource.PublicationRecord.ContractionIntent.JobID != intent.JobID || oldResource.PublicationRecord.ContractionIntent.ClosureAuthorityDigest != intent.ContractionDigest || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != oldResource.PublicationRecord.UnpublishedGeneration || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) || !operationCodeMatchesIntent(resource.PublicationRecord.LastOperation, intent.Operation) {
 				return fmt.Errorf("resource %q contraction result does not match its running authority", resource.ID)
+			}
+		case terminalGoAccessContractionReconciliation:
+			if resource.PublicationRecord.LastJobID != intent.JobID || resource.PublicationRecord.LastOperation != oldResource.PublicationRecord.LastOperation || resource.PublicationRecord.LastOperationResult != domain.OperationSucceeded {
+				return fmt.Errorf("resource %q GoAccess contraction reconciliation changed", resource.ID)
+			}
+		case terminalGoAccessReconciliation:
+			if resource.PublicationRecord.LastJobID != intent.JobID || resource.PublicationRecord.LastOperation != domain.OperationPublish || resource.PublicationRecord.LastOperationResult != domain.OperationSucceeded {
+				return fmt.Errorf("resource %q GoAccess reconciliation result changed", resource.ID)
 			}
 		case ordinaryLocal:
 			if err := validateOperationResourceDelta(oldResource, resource, intent.Operation); err != nil {
@@ -4387,6 +5270,18 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 		jobID   string
 		endedAt time.Time
 	}
+	pinned := map[string]bool{}
+	if raw, present := before.Entries["installations/current"]; present {
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return err
+		}
+		for _, resource := range installation.Resources {
+			if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
+				pinned[resource.PublicationRecord.GoAccessRetirementSourceJobID] = true
+			}
+		}
+	}
 	terminalBefore := []graph{}
 	deleted := map[string]bool{}
 	becomingTerminal := 0
@@ -4423,6 +5318,11 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 	if required < 0 {
 		required = 0
 	}
+	for jobID := range deleted {
+		if pinned[jobID] {
+			return fmt.Errorf("terminal graph retention deleted pending GoAccess source")
+		}
+	}
 	if len(deleted) != required {
 		return fmt.Errorf("terminal graph retention deleted %d graphs; exact oldest overflow is %d", len(deleted), required)
 	}
@@ -4432,9 +5332,18 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 		}
 		return terminalBefore[left].endedAt.Before(terminalBefore[right].endedAt)
 	})
+	removable := make([]graph, 0, len(terminalBefore))
+	for _, graph := range terminalBefore {
+		if !pinned[graph.jobID] {
+			removable = append(removable, graph)
+		}
+	}
+	if len(removable) < required {
+		return fmt.Errorf("terminal graph retention lacks unpinned capacity")
+	}
 	for index := 0; index < required; index++ {
-		if !deleted[terminalBefore[index].jobID] {
-			return fmt.Errorf("terminal graph retention did not delete the oldest graph")
+		if !deleted[removable[index].jobID] {
+			return fmt.Errorf("terminal graph retention did not delete the oldest unpinned graph")
 		}
 	}
 	return nil
@@ -4512,7 +5421,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -4544,6 +5453,12 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 	}
 	binding := request.SafetyBinding
+	if request.Operation == GoAccessRetirement {
+		if request.Source != AdmissionStartup {
+			return fmt.Errorf("GoAccess retirement must be startup-bound")
+		}
+		return validateGoAccessRetirementBinding(binding)
+	}
 	if request.Operation == ResourceUpdate && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
 			return fmt.Errorf("authenticated resource update requires exact prior and candidate digests")
@@ -4578,7 +5493,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("timer admission is not authorized for operation")
 		}
 	case AdmissionStartup:
-		if planID != "" || operation != AutomaticReconciliation && operation != StartupContraction {
+		if planID != "" || operation != AutomaticReconciliation && operation != StartupContraction && operation != GoAccessRetirement {
 			return fmt.Errorf("startup admission is not authorized for operation")
 		}
 	case AdmissionUI:

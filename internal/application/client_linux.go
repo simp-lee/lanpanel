@@ -37,8 +37,9 @@ type ManagedBasicActionResult struct {
 	Password     []byte `json:"password,omitempty"`
 }
 type PublicationResult struct {
-	JobID     string
-	PublicURL string
+	JobID     string `json:"job_id"`
+	JobResult string `json:"job_result"`
+	PublicURL string `json:"public_url"`
 }
 type RotationResult struct {
 	Fingerprint string
@@ -115,7 +116,7 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 		if err != nil || reply.Resource == nil || reply.Resource.ResourceID != call.Target.ID || len(reply.Secret) != 0 {
 			return Result{}, fmt.Errorf("domain status failed")
 		}
-		status := DomainSourceStatus{ResourceID: reply.Resource.ResourceID, Status: reply.Resource.Status, AccessMayRemain: reply.Resource.AccessMayRemain, CredentialFingerprint: reply.Resource.CredentialFingerprint, CredentialChanged: reply.Resource.CredentialChanged, StaticFingerprint: reply.Resource.StaticFingerprint, StaticChanged: reply.Resource.StaticChanged, ObservedAt: reply.Resource.ObservedAt, Reason: reply.Resource.Reason, AllowedActions: append([]string(nil), reply.Resource.AllowedActions...), CredentialIDs: append([]string(nil), reply.Resource.CredentialIDs...)}
+		status := DomainSourceStatus{ResourceID: reply.Resource.ResourceID, Status: reply.Resource.Status, AccessMayRemain: reply.Resource.AccessMayRemain, CredentialID: reply.Resource.CredentialID, CredentialFingerprint: reply.Resource.CredentialFingerprint, CredentialChanged: reply.Resource.CredentialChanged, GoAccessCredentialID: reply.Resource.GoAccessCredentialID, GoAccessCredentialFingerprint: reply.Resource.GoAccessCredentialFingerprint, GoAccessCredentialChanged: reply.Resource.GoAccessCredentialChanged, StaticFingerprint: reply.Resource.StaticFingerprint, StaticChanged: reply.Resource.StaticChanged, ObservedAt: reply.Resource.ObservedAt, Reason: reply.Resource.Reason, AllowedActions: append([]string(nil), reply.Resource.AllowedActions...), CredentialIDs: append([]string(nil), reply.Resource.CredentialIDs...), GoAccessRetirementJobID: reply.Resource.GoAccessRetirementJobID, GoAccessRetirementGenerations: append([]uint64(nil), reply.Resource.GoAccessRetirementGenerations...)}
 		return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
 	})
 	basicCreate, _ := RegisterAction(domain.OperationManagedBasicCreate, ManagedBasicPayload{}, true, false, managedBasicAction)
@@ -164,10 +165,10 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 		publish, _ := RegisterAction(domain.OperationPublish, ConfirmationPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ConfirmationPayload)
 			reply, err := resourceClient(ctx, helperproto.OperationPublicationActivate, helperproto.ResourcePayload{Operation: string(domain.OperationPublish), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation}, "resource/"+call.Target.ID)
-			if err != nil || reply.Action == nil || reply.Action.JobID == "" {
+			if err != nil || reply.Action == nil || reply.Action.JobID == "" || reply.Action.JobResult != "succeeded" && reply.Action.JobResult != "partial" {
 				return Result{}, fmt.Errorf("publication activation failed")
 			}
-			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: PublicationResult{JobID: reply.Action.JobID, PublicURL: reply.Action.PublicURL}}, nil
+			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: PublicationResult{JobID: reply.Action.JobID, JobResult: reply.Action.JobResult, PublicURL: reply.Action.PublicURL}}, nil
 		})
 		registrations = append(registrations, create, update, start, stop, publish)
 	}

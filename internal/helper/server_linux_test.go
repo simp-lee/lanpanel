@@ -80,6 +80,54 @@ func TestServerAuthenticatesPeerAndRevalidatesEveryRequest(t *testing.T) {
 	}
 }
 
+func TestServerReturnsDurablePartialPublicationDespiteExecutorCleanupError(t *testing.T) {
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	if uid == 0 || gid == 0 {
+		t.Skip("test requires a dedicated non-root peer")
+	}
+	now := time.Now().UTC()
+	identities := IdentitySet{UI: PeerIdentity{UID: uid, GID: gid}, Timer: PeerIdentity{UID: uid + 1, GID: gid}, Recovery: PeerIdentity{UID: uid + 2, GID: gid}}
+	server, err := NewServer(identities, []Registration{PublicationActivateHandler(
+		func(context.Context, helperproto.Caller, helperproto.Request) error { return nil },
+		func(context.Context, helperproto.Caller, helperproto.Request, *helperproto.Secret) (ExecutionResult, error) {
+			return ExecutionResult{ResultDigest: digest("publication"), Action: &helperproto.ActionResult{JobID: "job-partial", JobResult: "partial", PublicURL: "https://app.example.test/"}}, errors.New("post-commit lease release failed")
+		},
+	)}, Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "helper.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.serveUnix(ctx, listener, false) }()
+	client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-partial", Operation: helperproto.OperationPublicationActivate, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 2, Deadline: now.Add(time.Minute), Resource: &helperproto.ResourcePayload{Operation: "publish", ActorIdentity: "session-one", ActorGeneration: 1, PlanID: "plan-one", Confirmation: "publish"}}
+	request.InputDigest, err = helperproto.ApplicationInputDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = helperproto.WriteRequest(client, request, nil); err != nil {
+		t.Fatal(err)
+	}
+	response, secret, err := helperproto.ReadResponse(client, request.Operation)
+	if err != nil || secret != nil || response.Code != helperproto.ResponseSucceeded || response.Action == nil || response.Action.JobResult != "partial" {
+		t.Fatalf("partial publication response=%#v secret=%v err=%v", response, secret, err)
+	}
+	_ = client.Close()
+	cancel()
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerRejectsUnauthorizedLocalPeerAndIncompleteHandlers(t *testing.T) {
 	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
 	if uid == 0 || gid == 0 {

@@ -589,6 +589,15 @@ func TestSafetyOwnershipAuthorityIsExactAndFailClosed(t *testing.T) {
 	if err := validateTransition(RoleOwnershipActivation, before, after, TransitionProof{}); err == nil {
 		t.Fatal("ownership digest changed without exact activation proof")
 	}
+	retirementBefore := EmptyState()
+	retirementBefore.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 3, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("expanded-owner")}}
+	retirementAfter := retirementBefore
+	retirementAfter.Resources = append([]ResourceSafety(nil), retirementBefore.Resources...)
+	retirementAfter.Resources[0].OwnershipDigest = digest("retired-owner")
+	retirementProof := &OwnershipConvergenceProof{ResourceID: "app-one", IntentRef: "job-retirement", Generation: 2, BeforeDigest: digest("expanded-owner"), AfterDigest: digest("retired-owner")}
+	if err := validateTransition(RoleOwnershipRetirement, retirementBefore, retirementAfter, TransitionProof{Ownership: retirementProof}); err != nil {
+		t.Fatalf("retirement ownership rebind rejected: %v", err)
+	}
 }
 
 func TestSafetyStoreRequiresLockGenerationAndUniqueClearer(t *testing.T) {

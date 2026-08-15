@@ -134,6 +134,7 @@ type ActionResult struct {
 	PlanID             string    `json:"plan_id,omitempty"`
 	Confirmation       string    `json:"confirmation,omitempty"`
 	JobID              string    `json:"job_id,omitempty"`
+	JobResult          string    `json:"job_result,omitempty"`
 	Operation          string    `json:"operation,omitempty"`
 	TargetKind         string    `json:"target_kind,omitempty"`
 	TargetID           string    `json:"target_id,omitempty"`
@@ -167,17 +168,23 @@ const (
 )
 
 type ResourceResult struct {
-	ResourceID            string    `json:"resource_id"`
-	Status                string    `json:"status,omitempty"`
-	AccessMayRemain       bool      `json:"access_may_remain,omitempty"`
-	CredentialFingerprint string    `json:"credential_fingerprint,omitempty"`
-	CredentialChanged     bool      `json:"credential_changed,omitempty"`
-	StaticFingerprint     string    `json:"static_fingerprint,omitempty"`
-	StaticChanged         bool      `json:"static_changed,omitempty"`
-	ObservedAt            time.Time `json:"observed_at,omitempty"`
-	Reason                string    `json:"reason,omitempty"`
-	AllowedActions        []string  `json:"allowed_actions,omitempty"`
-	CredentialIDs         []string  `json:"credential_ids,omitempty"`
+	ResourceID                    string    `json:"resource_id"`
+	Status                        string    `json:"status,omitempty"`
+	AccessMayRemain               bool      `json:"access_may_remain,omitempty"`
+	CredentialID                  string    `json:"credential_id,omitempty"`
+	CredentialFingerprint         string    `json:"credential_fingerprint,omitempty"`
+	CredentialChanged             bool      `json:"credential_changed,omitempty"`
+	GoAccessCredentialID          string    `json:"goaccess_credential_id,omitempty"`
+	GoAccessCredentialFingerprint string    `json:"goaccess_credential_fingerprint,omitempty"`
+	GoAccessCredentialChanged     bool      `json:"goaccess_credential_changed,omitempty"`
+	StaticFingerprint             string    `json:"static_fingerprint,omitempty"`
+	StaticChanged                 bool      `json:"static_changed,omitempty"`
+	ObservedAt                    time.Time `json:"observed_at,omitempty"`
+	Reason                        string    `json:"reason,omitempty"`
+	AllowedActions                []string  `json:"allowed_actions,omitempty"`
+	CredentialIDs                 []string  `json:"credential_ids,omitempty"`
+	GoAccessRetirementJobID       string    `json:"goaccess_retirement_job_id,omitempty"`
+	GoAccessRetirementGenerations []uint64  `json:"goaccess_retirement_generations,omitempty"`
 }
 type Response struct {
 	SchemaVersion string          `json:"schema_version"`
@@ -348,12 +355,31 @@ func validCredentialStatusIDs(values []string) bool {
 	}
 	return true
 }
+func validStatusCredential(id, fingerprint string, changed bool) bool {
+	if id == "" || fingerprint == "" {
+		return id == "" && fingerprint == "" && !changed
+	}
+	return strings.HasPrefix(id, "cred_") && refPattern.MatchString(id) && digestPattern.MatchString(fingerprint)
+}
 func validDomainStatus(value ResourceResult) bool {
-	if value.Status != "healthy" && value.Status != "degraded" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || (value.CredentialFingerprint != "" && !digestPattern.MatchString(value.CredentialFingerprint)) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.CredentialChanged && value.CredentialFingerprint == "" || value.StaticChanged && value.StaticFingerprint == "" {
+	if value.Status != "healthy" && value.Status != "degraded" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || !validStatusCredential(value.CredentialID, value.CredentialFingerprint, value.CredentialChanged) || !validStatusCredential(value.GoAccessCredentialID, value.GoAccessCredentialFingerprint, value.GoAccessCredentialChanged) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.StaticChanged && value.StaticFingerprint == "" {
 		return false
 	}
+	retirement := value.GoAccessRetirementJobID != "" || len(value.GoAccessRetirementGenerations) != 0
+	if retirement {
+		if !refPattern.MatchString(value.GoAccessRetirementJobID) || value.Reason != "GoAccess retirement pending" || len(value.GoAccessRetirementGenerations) == 0 || len(value.GoAccessRetirementGenerations) > 128 {
+			return false
+		}
+		prior := uint64(0)
+		for _, generation := range value.GoAccessRetirementGenerations {
+			if generation <= prior {
+				return false
+			}
+			prior = generation
+		}
+	}
 	degradedActions := len(value.AllowedActions) == 2 && value.AllowedActions[0] == "unpublish" && value.AllowedActions[1] == "close_all"
-	return value.Status == "degraded" && value.AccessMayRemain && degradedActions || value.Status == "healthy" && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0
+	return value.Status == "degraded" && value.AccessMayRemain && degradedActions && (!retirement || value.Reason == "GoAccess retirement pending") || value.Status == "healthy" && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0 && !retirement
 }
 func validDisplay(value string) bool {
 	return len(value) > 0 && len(value) <= 4096 && !strings.ContainsAny(value, "\x00\r\n")
@@ -385,6 +411,12 @@ func ValidateResponse(operation Operation, response Response) error {
 	case ResponseSucceeded:
 		if !digestPattern.MatchString(response.ResultDigest) || response.ErrorCode != "" {
 			return fmt.Errorf("successful helper response is incomplete")
+		}
+		if operation != OperationPublicationActivate && response.Action != nil && response.Action.JobResult != "" {
+			return fmt.Errorf("unrelated helper response carried a job result")
+		}
+		if operation != OperationDomainStatus && response.Resource != nil && (response.Resource.GoAccessRetirementJobID != "" || len(response.Resource.GoAccessRetirementGenerations) != 0) {
+			return fmt.Errorf("unrelated helper response carried GoAccess retirement status")
 		}
 		switch operation {
 		case OperationApplicationPlan:
@@ -430,7 +462,7 @@ func ValidateResponse(operation Operation, response Response) error {
 				return fmt.Errorf("process helper response shape invalid")
 			}
 		case OperationPublicationActivate:
-			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PublicURL == "" || response.Resource != nil {
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PublicURL == "" || response.Action.JobResult != "succeeded" && response.Action.JobResult != "partial" || response.Resource != nil {
 				return fmt.Errorf("publication helper response shape invalid")
 			}
 		default:

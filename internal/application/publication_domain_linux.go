@@ -3,10 +3,12 @@
 package application
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/domain"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/htpasswdref"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/plans"
@@ -19,17 +21,23 @@ import (
 )
 
 type DomainSourceStatus struct {
-	ResourceID            string    `json:"resource_id"`
-	Status                string    `json:"status"`
-	AccessMayRemain       bool      `json:"access_may_remain"`
-	CredentialFingerprint string    `json:"credential_fingerprint,omitempty"`
-	CredentialChanged     bool      `json:"credential_changed,omitempty"`
-	StaticFingerprint     string    `json:"static_fingerprint,omitempty"`
-	StaticChanged         bool      `json:"static_changed,omitempty"`
-	ObservedAt            time.Time `json:"observed_at"`
-	Reason                string    `json:"reason"`
-	AllowedActions        []string  `json:"allowed_actions"`
-	CredentialIDs         []string  `json:"credential_ids,omitempty"`
+	ResourceID                    string    `json:"resource_id"`
+	Status                        string    `json:"status"`
+	AccessMayRemain               bool      `json:"access_may_remain"`
+	CredentialID                  string    `json:"credential_id,omitempty"`
+	CredentialFingerprint         string    `json:"credential_fingerprint,omitempty"`
+	CredentialChanged             bool      `json:"credential_changed,omitempty"`
+	GoAccessCredentialID          string    `json:"goaccess_credential_id,omitempty"`
+	GoAccessCredentialFingerprint string    `json:"goaccess_credential_fingerprint,omitempty"`
+	GoAccessCredentialChanged     bool      `json:"goaccess_credential_changed,omitempty"`
+	StaticFingerprint             string    `json:"static_fingerprint,omitempty"`
+	StaticChanged                 bool      `json:"static_changed,omitempty"`
+	ObservedAt                    time.Time `json:"observed_at"`
+	Reason                        string    `json:"reason"`
+	AllowedActions                []string  `json:"allowed_actions"`
+	CredentialIDs                 []string  `json:"credential_ids,omitempty"`
+	GoAccessRetirementJobID       string    `json:"goaccess_retirement_job_id,omitempty"`
+	GoAccessRetirementGenerations []uint64  `json:"goaccess_retirement_generations,omitempty"`
 }
 
 func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, resultErr error) {
@@ -53,6 +61,17 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 		}
 	}
 	slices.Sort(result.CredentialIDs)
+	if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
+		result.Status = "degraded"
+		result.AccessMayRemain = true
+		result.Reason = "GoAccess retirement pending"
+		result.AllowedActions = []string{"unpublish", "close_all"}
+		result.GoAccessRetirementJobID = resource.PublicationRecord.GoAccessRetirementSourceJobID
+		for _, item := range resource.PublicationRecord.PendingGoAccessRetirements {
+			result.GoAccessRetirementGenerations = append(result.GoAccessRetirementGenerations, item.Generation)
+		}
+		return result, nil
+	}
 	if resource.PublicationRecord.State != domain.PublicationPublished || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
 		result.Reason = "no applied domain publication"
 		return result, nil
@@ -84,6 +103,7 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 		if credential.Kind == "managed_basic" && observed.Mode != 0o640 {
 			return degradedDomainStatus(result, "managed Basic mode changed"), nil
 		}
+		result.CredentialID = credential.ID
 		result.CredentialFingerprint = observed.Fingerprint
 		result.CredentialChanged = observed.Fingerprint != credential.Fingerprint && credential.Kind == "external_htpasswd"
 		expectedReference := shaDigest([]byte(credential.ID + "\x00" + path))
@@ -94,6 +114,46 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 			return degradedDomainStatus(result, "managed Basic drift"), nil
 		}
 
+	}
+	if bundle.GoAccess.Enabled {
+		var credential *domain.Credential
+		for index := range installation.Credentials {
+			if installation.Credentials[index].ID == bundle.GoAccess.CredentialIdentity {
+				credential = &installation.Credentials[index]
+			}
+		}
+		if credential == nil || credential.Kind != "external_htpasswd" {
+			return degradedDomainStatus(result, "applied GoAccess credential missing"), nil
+		}
+		gid, groupErr := nginxGroupGID()
+		if groupErr != nil {
+			return result, groupErr
+		}
+		observed, observeErr := htpasswdref.Validate(credential.ExternalPath, gid)
+		if observeErr != nil {
+			return degradedDomainStatus(result, "applied GoAccess htpasswd unsafe"), nil
+		}
+		if shaDigest([]byte(credential.ID+"\x00"+credential.ExternalPath)) != bundle.GoAccess.ReferenceIdentity {
+			return degradedDomainStatus(result, "applied GoAccess credential reference changed"), nil
+		}
+		result.GoAccessCredentialID = credential.ID
+		result.GoAccessCredentialFingerprint = observed.Fingerprint
+		result.GoAccessCredentialChanged = observed.Fingerprint != credential.Fingerprint
+		runtimeHost, hostErr := goaccessruntime.NewFixedHost()
+		runtimeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if hostErr == nil {
+			hostErr = func() error {
+				candidate, candidateErr := goaccessruntime.ObserveCandidate(installation.InstallationID, resource.ID, gid, bundle.GoAccess)
+				if candidateErr != nil {
+					return candidateErr
+				}
+				return runtimeHost.Verify(runtimeCtx, candidate)
+			}()
+		}
+		cancel()
+		if hostErr != nil {
+			return degradedDomainStatus(result, "applied GoAccess service unavailable"), nil
+		}
 	}
 	if len(bundle.Static.Routes) > 0 {
 		var root *domain.StaticContentRoot
@@ -132,8 +192,12 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 		}
 	}
 	result.Reason = "source identities exact"
-	if result.CredentialChanged {
-		result.Reason = "external htpasswd fingerprint changed but remains valid"
+	if result.CredentialChanged && result.GoAccessCredentialChanged {
+		result.Reason = "App and GoAccess external htpasswd fingerprints changed but remain valid"
+	} else if result.CredentialChanged {
+		result.Reason = "App external htpasswd fingerprint changed but remains valid"
+	} else if result.GoAccessCredentialChanged {
+		result.Reason = "GoAccess external htpasswd fingerprint changed but remains valid"
 	}
 	return result, nil
 }
@@ -172,6 +236,43 @@ func degradedDomainStatus(value DomainSourceStatus, reason string) DomainSourceS
 	value.Reason = reason
 	value.AllowedActions = []string{"unpublish", "close_all"}
 	return value
+}
+
+func requireGoAccessServiceTransition(resource domain.AppResource) error {
+	configured := resource.Publication.DomainHTTPS
+	applied := resource.PublicationRecord.LastAppliedBundle
+	if configured == nil || !configured.GoAccess.Enabled || resource.PublicationRecord.State != domain.PublicationPublished || applied == nil || applied.DomainHTTPS == nil || !applied.DomainHTTPS.GoAccess.Enabled {
+		return nil
+	}
+	goaccess := applied.DomainHTTPS.GoAccess
+	if goaccess.CanonicalHost != configured.CanonicalDomain || goaccess.WebSocketPath != configured.GoAccess.WebSocketPath {
+		return fmt.Errorf("active GoAccess service identity change requires an explicit disable publication first")
+	}
+	return nil
+}
+
+func requireGoAccessRetirementComplete(ctx context.Context, service *FixedService, resource domain.AppResource) error {
+	if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
+		return fmt.Errorf("GoAccess retirement reconciliation pending")
+	}
+	bundle := resource.PublicationRecord.LastAppliedBundle
+	if bundle == nil || bundle.DomainHTTPS == nil || bundle.DomainHTTPS.GoAccess.RetiredGeneration == 0 {
+		return nil
+	}
+	goaccess := bundle.DomainHTTPS.GoAccess
+	host, err := goaccessruntime.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	removeState := goaccess.RemovesRetiredState()
+	complete, err := host.RetirementComplete(ctx, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, removeState)
+	if err != nil {
+		return err
+	}
+	if !complete {
+		return fmt.Errorf("GoAccess retirement is incomplete")
+	}
+	return requireRetiredGoAccessOwnershipComplete(service, resource.ID, goaccess.RetiredGeneration, goaccess.RetiredStateGeneration, removeState)
 }
 
 func observeDomainSources(service *FixedService, resource domain.AppResource) (plans.Evidence, error) {
@@ -215,6 +316,30 @@ func observeDomainSources(service *FixedService, resource domain.AppResource) (p
 		}
 		if len(identities) == 0 {
 			return plans.Evidence{}, fmt.Errorf("domain Basic credential missing")
+		}
+	}
+	if publication.GoAccess.Enabled {
+		gid, gidErr := nginxGroupGID()
+		if gidErr != nil {
+			return plans.Evidence{}, gidErr
+		}
+		found := false
+		for _, credential := range installation.Credentials {
+			if credential.ID != publication.GoAccess.CredentialID {
+				continue
+			}
+			if credential.Kind != "external_htpasswd" || credential.OwnerResourceID != resource.ID {
+				return plans.Evidence{}, fmt.Errorf("GoAccess credential authority changed")
+			}
+			observed, observeErr := htpasswdref.Validate(credential.ExternalPath, gid)
+			if observeErr != nil {
+				return plans.Evidence{}, observeErr
+			}
+			identities = append(identities, "goaccess", credential.ID, credential.ExternalPath, observed.Fingerprint)
+			found = true
+		}
+		if !found {
+			return plans.Evidence{}, fmt.Errorf("GoAccess external credential missing")
 		}
 	}
 	if publication.StaticRootID != "" {
@@ -325,6 +450,34 @@ func prepareDomainCandidate(service *FixedService, resource domain.AppResource, 
 		}
 		credentialFingerprint = observed.Fingerprint
 	}
+	goaccessPath, goaccessFingerprint := "", ""
+	var goaccessCandidate *goaccessruntime.Candidate
+	if publicationConfig.GoAccess.Enabled {
+		var credential *domain.Credential
+		for index := range installation.Credentials {
+			if installation.Credentials[index].ID == publicationConfig.GoAccess.CredentialID {
+				credential = &installation.Credentials[index]
+			}
+		}
+		if credential == nil || credential.Kind != "external_htpasswd" {
+			return publication.Candidate{}, fmt.Errorf("GoAccess external htpasswd missing")
+		}
+		gid, groupErr := nginxGroupGID()
+		if groupErr != nil {
+			return publication.Candidate{}, groupErr
+		}
+		observed, observeErr := htpasswdref.Validate(credential.ExternalPath, gid)
+		if observeErr != nil {
+			return publication.Candidate{}, observeErr
+		}
+		candidate, renderErr := goaccessruntime.Render(installation.InstallationID, resource, gid, generation)
+		if renderErr != nil {
+			return publication.Candidate{}, renderErr
+		}
+		goaccessPath = credential.ExternalPath
+		goaccessFingerprint = observed.Fingerprint
+		goaccessCandidate = &candidate
+	}
 	routes := []nginx.StaticRoute{}
 	if publicationConfig.StaticRootID != "" {
 		var root *domain.StaticContentRoot
@@ -364,7 +517,7 @@ func prepareDomainCandidate(service *FixedService, resource domain.AppResource, 
 			routes = append(routes, nginx.StaticRoute{URLPath: value.Mapping.URLPath, RelativePath: value.Mapping.RelativePath, SourcePath: value.SourcePath, Directory: value.Mapping.Directory, Anonymous: value.Mapping.Anonymous, Identity: value.Fingerprint})
 		}
 	}
-	return publication.PrepareDomain(resource, generation, certificate, credentialPath, credentialFingerprint, routes)
+	return publication.PrepareDomain(resource, generation, certificate, credentialPath, credentialFingerprint, goaccessPath, goaccessFingerprint, routes, goaccessCandidate)
 }
 func nginxGroupGID() (uint32, error) {
 	group, err := user.LookupGroup("www-data")
@@ -379,7 +532,7 @@ func nginxGroupGID() (uint32, error) {
 }
 func protectedStaticPaths(installation domain.Installation, excluded ...string) []string {
 	paths := append([]string(nil), installation.ManagedPaths...)
-	paths = append(paths, "/var/lib/lanpanel", "/run/lanpanel", "/etc/lanpanel", "/etc/lanpanel-public", "/usr/lib/lanpanel")
+	paths = append(paths, "/var/lib/lanpanel", "/var/log/lanpanel/goaccess", "/run/lanpanel", "/run/lanpanel-goaccess", "/etc/lanpanel", "/etc/lanpanel-public", "/etc/systemd/system", "/etc/sysusers.d", "/usr/lib/lanpanel")
 	for _, root := range installation.StaticRoots {
 		if len(excluded) == 0 || root.Path != excluded[0] {
 			paths = append(paths, root.Path)
@@ -395,6 +548,15 @@ func protectedStaticPaths(installation domain.Installation, excluded ...string) 
 	}
 	for _, resource := range installation.Resources {
 		paths = append(paths, resource.ManagedPaths...)
+		if bundle := resource.PublicationRecord.LastAppliedBundle; bundle != nil {
+			paths = append(paths, bundle.ManagedPaths...)
+		}
+		if intent := resource.PublicationRecord.ActivationIntent; intent != nil {
+			paths = append(paths, intent.Candidate.ManagedPaths...)
+			if intent.Prior != nil {
+				paths = append(paths, intent.Prior.ManagedPaths...)
+			}
+		}
 		if resource.ManagedProcess != nil {
 			paths = append(paths, resource.ManagedProcess.Service.Executable, resource.ManagedProcess.Service.EnvironmentFile)
 			paths = append(paths, resource.ManagedProcess.Service.WritePaths...)

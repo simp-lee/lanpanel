@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -71,9 +72,17 @@ type Policy struct {
 	ManagedRoots []string
 }
 
+func FixedPolicy() Policy {
+	return Policy{ManagedRoots: []string{"/etc/lanpanel", "/etc/lanpanel-public", "/var/lib/lanpanel", "/var/log/lanpanel", "/etc/systemd/system", "/etc/sysusers.d", "/run/lanpanel", "/run/lanpanel-goaccess"}}
+}
+
 type WriterRole string
 
-const ActivationWriter WriterRole = "activation_writer"
+const (
+	ActivationWriter                WriterRole = "activation_writer"
+	GoAccessRetirementWriter        WriterRole = "goaccess_retirement_writer"
+	GoAccessCandidateRollbackWriter WriterRole = "goaccess_candidate_rollback_writer"
+)
 
 type Config struct {
 	RootPath      string
@@ -132,7 +141,7 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 	if lease == nil || lease.Authority() != store.config.LockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("ownership write requires the shared exposure lock")
 	}
-	if role != ActivationWriter {
+	if role != ActivationWriter && role != GoAccessRetirementWriter && role != GoAccessCandidateRollbackWriter {
 		return filetxn.Result{}, fmt.Errorf("ownership writer role %q is not authorized", role)
 	}
 	if record.State != Owned {
@@ -168,8 +177,14 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 		if current.Revision != expectedRevision {
 			return filetxn.Result{}, fmt.Errorf("ownership revision changed: current=%d expected=%d", current.Revision, expectedRevision)
 		}
-		if !preservesInventory(current, record) {
+		if role == ActivationWriter && !preservesInventory(current, record) {
 			return filetxn.Result{}, fmt.Errorf("activation ownership update must preserve the complete prior inventory")
+		}
+		if role == GoAccessRetirementWriter && !exactGoAccessRetirement(current, record) {
+			return filetxn.Result{}, fmt.Errorf("GoAccess retirement ownership delta is not exact")
+		}
+		if role == GoAccessCandidateRollbackWriter && !exactGoAccessCandidateRollback(current, record) {
+			return filetxn.Result{}, fmt.Errorf("GoAccess candidate rollback ownership delta is not exact")
 		}
 		disposition = filetxn.ReplaceOnly
 	}
@@ -519,6 +534,105 @@ func preservesInventory(current, next Record) bool {
 		}
 	}
 	return true
+}
+
+func exactGoAccessRetirement(current, next Record) bool {
+	if current.ResourceID != next.ResourceID || current.State != next.State || len(current.Listeners) != len(next.Listeners) {
+		return false
+	}
+	currentPaths := map[string]OwnedPath{}
+	for _, path := range current.Paths {
+		currentPaths[string(path.Kind)+"\x00"+path.Path+"\x00"+path.IdentityDigest] = path
+	}
+	nextPaths := map[string]bool{}
+	for _, path := range next.Paths {
+		key := string(path.Kind) + "\x00" + path.Path + "\x00" + path.IdentityDigest
+		if _, present := currentPaths[key]; !present {
+			return false
+		}
+		nextPaths[key] = true
+	}
+	removed := map[string]bool{}
+	for key, path := range currentPaths {
+		if !nextPaths[key] {
+			removed[path.Path] = true
+		}
+	}
+	listenerKey := func(value OwnedListener) string {
+		return fmt.Sprintf("%s\x00%s\x00%d\x00%s", value.Protocol, value.Address, value.Port, value.IdentityDigest)
+	}
+	listeners := map[string]bool{}
+	for _, value := range current.Listeners {
+		listeners[listenerKey(value)] = true
+	}
+	for _, value := range next.Listeners {
+		if !listeners[listenerKey(value)] {
+			return false
+		}
+	}
+	endpointPrefix := "/run/lanpanel-goaccess/" + current.ResourceID + "-"
+	generation := uint64(0)
+	for path := range removed {
+		if strings.HasPrefix(path, endpointPrefix) && strings.HasSuffix(path, ".sock") {
+			value, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(path, endpointPrefix), ".sock"), 10, 64)
+			if err != nil || value == 0 || generation != 0 {
+				return false
+			}
+			generation = value
+		}
+	}
+	if generation == 0 {
+		return false
+	}
+	unitID := current.ResourceID + "-" + strconv.FormatUint(generation, 10)
+	expected := map[string]bool{"/etc/systemd/system/lanpanel-goaccess-" + unitID + ".service": true, "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service": true, "/etc/systemd/system/lanpanel-goaccess-relay-" + unitID + ".service": true, "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service": true, "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".socket": true, "/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket": true, "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".service": true, "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".timer": true, "/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer": true, "/run/lanpanel-goaccess/" + unitID + ".sock": true}
+	statePrefix := "/var/lib/lanpanel/goaccess/" + current.ResourceID + "/generations/"
+	stateRoot := ""
+	for path := range removed {
+		if !strings.HasPrefix(path, statePrefix) {
+			continue
+		}
+		stateGeneration, err := strconv.ParseUint(strings.TrimPrefix(path, statePrefix), 10, 64)
+		if err != nil || stateGeneration == 0 || stateGeneration > generation || stateRoot != "" {
+			return false
+		}
+		stateRoot = path
+	}
+	if stateRoot != "" {
+		expected[stateRoot] = true
+	}
+	if len(removed) != len(expected) {
+		return false
+	}
+	for path := range expected {
+		if !removed[path] {
+			return false
+		}
+	}
+	return true
+}
+
+func exactGoAccessCandidateRollback(current, next Record) bool {
+	shared := map[string]bool{"/etc/sysusers.d/lanpanel-goaccess-" + current.ResourceID + ".conf": true, "/var/log/lanpanel/goaccess/" + current.ResourceID: true, "/var/log/lanpanel/goaccess/" + current.ResourceID + "/.retention.lock": true}
+	middle := current
+	middle.Paths = make([]OwnedPath, 0, len(current.Paths))
+	seen := map[string]bool{}
+	for _, path := range current.Paths {
+		if shared[path.Path] {
+			seen[path.Path] = true
+			continue
+		}
+		middle.Paths = append(middle.Paths, path)
+	}
+	if len(seen) != len(shared) {
+		return false
+	}
+	for _, path := range next.Paths {
+		if shared[path.Path] {
+			return false
+		}
+	}
+	return exactGoAccessRetirement(middle, next)
 }
 
 func openRecordsDirectory(config Config) (int, unix.Stat_t, error) {

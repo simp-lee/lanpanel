@@ -6,6 +6,7 @@ import (
 	"lanpanel/internal/application"
 	"lanpanel/internal/bootstrap"
 	"lanpanel/internal/child"
+	"lanpanel/internal/goaccess"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/nginxguard"
 	"lanpanel/internal/packages"
@@ -62,7 +63,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return managedprocess.RunGuard(args, application.RunningProcessBundles)
 		}},
 		{Name: roles.ManagedExecutor, Handler: func(args []string, _, _ io.Writer) error { return managedprocess.Execute(args) }},
-		{Name: roles.Relay, Handler: func(args []string, _, _ io.Writer) error { return relay.Run(args) }},
+		{Name: roles.Relay, Handler: func(args []string, _, _ io.Writer) error { return relay.Run(args) }}, {Name: roles.GoAccessRelay, Handler: func(args []string, _, _ io.Writer) error { return goaccess.RunRelay(args) }}, {Name: roles.GoAccessRetention, Handler: func(args []string, _, _ io.Writer) error { return goaccess.RunRetention(args) }}, {Name: roles.GoAccessAccountGuard, Handler: func(args []string, _, _ io.Writer) error {
+			if err := bootstrap.RequireCommitted(bootstrap.FixedPaths()); err != nil {
+				return err
+			}
+			return goaccess.RunAccountGuard(args)
+		}},
 	})
 	if err != nil {
 		return err

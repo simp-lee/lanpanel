@@ -8,11 +8,15 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
-const InstallationSchemaVersion = "lanpanel.installation.ga.v1"
+const (
+	InstallationSchemaVersion = "lanpanel.installation.ga.v1"
+	MaximumResources          = 256
+)
 
 type LifecycleState string
 
@@ -264,6 +268,14 @@ type DomainHTTPSPublication struct {
 	StaticRootID    string              `json:"static_root_id,omitempty"`
 	StaticMappings  []StaticMapping     `json:"static_mappings,omitempty"`
 	Certificate     *CertificateRequest `json:"certificate,omitempty"`
+	GoAccess        GoAccessPublication `json:"goaccess"`
+}
+type GoAccessPublication struct {
+	Enabled       bool     `json:"enabled"`
+	CredentialID  string   `json:"credential_id,omitempty"`
+	CIDRs         []string `json:"cidrs,omitempty"`
+	DashboardPath string   `json:"dashboard_path,omitempty"`
+	WebSocketPath string   `json:"websocket_path,omitempty"`
 }
 type CertificateRequest struct {
 	ChallengeMethod     string `json:"challenge_method"`
@@ -337,26 +349,40 @@ type ProcessBundle struct {
 }
 
 type PublicationRecord struct {
-	State                 PublicationState           `json:"state"`
-	UnpublishedGeneration uint64                     `json:"unpublished_generation"`
-	LastAppliedDigest     *string                    `json:"last_applied_digest,omitempty"`
-	LastAppliedBundle     *PublicationBundle         `json:"last_applied_bundle,omitempty"`
-	EffectiveSecurity     *EffectiveSecurityIdentity `json:"effective_security,omitempty"`
-	ActivationIntent      *ActivationIntent          `json:"activation_intent,omitempty"`
-	ContractionIntent     *ContractionIntent         `json:"contraction_intent,omitempty"`
-	RuntimeObservation    *RuntimeObservation        `json:"runtime_observation,omitempty"`
-	LastOperation         OperationCode              `json:"last_operation,omitempty"`
-	LastOperationResult   OperationResult            `json:"last_operation_result,omitempty"`
-	LastJobID             string                     `json:"last_job_id,omitempty"`
+	State                             PublicationState             `json:"state"`
+	UnpublishedGeneration             uint64                       `json:"unpublished_generation"`
+	LastAppliedDigest                 *string                      `json:"last_applied_digest,omitempty"`
+	LastAppliedBundle                 *PublicationBundle           `json:"last_applied_bundle,omitempty"`
+	EffectiveSecurity                 *EffectiveSecurityIdentity   `json:"effective_security,omitempty"`
+	ActivationIntent                  *ActivationIntent            `json:"activation_intent,omitempty"`
+	ContractionIntent                 *ContractionIntent           `json:"contraction_intent,omitempty"`
+	RuntimeObservation                *RuntimeObservation          `json:"runtime_observation,omitempty"`
+	LastOperation                     OperationCode                `json:"last_operation,omitempty"`
+	LastOperationResult               OperationResult              `json:"last_operation_result,omitempty"`
+	LastJobID                         string                       `json:"last_job_id,omitempty"`
+	PendingGoAccessRetirements        []GoAccessRetirementIdentity `json:"pending_goaccess_retirements,omitempty"`
+	GoAccessRetirementSourceJobID     string                       `json:"goaccess_retirement_source_job_id,omitempty"`
+	GoAccessRetirementSourceJournalID string                       `json:"goaccess_retirement_source_journal_id,omitempty"`
+	GoAccessRetirementAuthorityDigest string                       `json:"goaccess_retirement_authority_digest,omitempty"`
 }
 
 type ContractionIntent struct {
-	JobID                  string             `json:"job_id"`
-	Operation              string             `json:"operation"`
-	Generation             uint64             `json:"generation"`
-	ClosureAuthorityDigest string             `json:"closure_authority_digest"`
-	Prior                  *PublicationBundle `json:"prior,omitempty"`
-	Candidate              *PublicationBundle `json:"candidate,omitempty"`
+	JobID                  string                       `json:"job_id"`
+	Operation              string                       `json:"operation"`
+	Generation             uint64                       `json:"generation"`
+	ClosureAuthorityDigest string                       `json:"closure_authority_digest"`
+	Prior                  *PublicationBundle           `json:"prior,omitempty"`
+	Candidate              *PublicationBundle           `json:"candidate,omitempty"`
+	GoAccessRetirements    []GoAccessRetirementIdentity `json:"goaccess_retirements,omitempty"`
+}
+
+type GoAccessRetirementIdentity struct {
+	Generation      uint64   `json:"generation"`
+	StateGeneration uint64   `json:"state_generation"`
+	ServiceIdentity string   `json:"service_identity"`
+	RemoveState     bool     `json:"remove_state,omitempty"`
+	RemoveShared    bool     `json:"remove_shared,omitempty"`
+	UnitIdentities  []string `json:"unit_identities"`
 }
 
 type PublicationBundle struct {
@@ -441,9 +467,30 @@ type StaticRouteBundleIdentity struct {
 }
 
 type GoAccessBundleIdentity struct {
-	Enabled         bool   `json:"enabled"`
-	RouteIdentity   string `json:"route_identity,omitempty"`
-	ServiceIdentity string `json:"service_identity,omitempty"`
+	Enabled                bool     `json:"enabled"`
+	Generation             uint64   `json:"generation,omitempty"`
+	StateGeneration        uint64   `json:"state_generation,omitempty"`
+	CanonicalHost          string   `json:"canonical_host,omitempty"`
+	RetiredGeneration      uint64   `json:"retired_generation,omitempty"`
+	RetiredStateGeneration uint64   `json:"retired_state_generation,omitempty"`
+	RetiredServiceIdentity string   `json:"retired_service_identity,omitempty"`
+	UnitIdentities         []string `json:"unit_identities,omitempty"`
+	RetiredUnitIdentities  []string `json:"retired_unit_identities,omitempty"`
+	RouteIdentity          string   `json:"route_identity,omitempty"`
+	ServiceIdentity        string   `json:"service_identity,omitempty"`
+	CredentialIdentity     string   `json:"credential_identity,omitempty"`
+	ReferenceIdentity      string   `json:"reference_identity,omitempty"`
+	CIDRs                  []string `json:"cidrs,omitempty"`
+	DashboardPath          string   `json:"dashboard_path,omitempty"`
+	WebSocketPath          string   `json:"websocket_path,omitempty"`
+	Endpoint               string   `json:"endpoint,omitempty"`
+	AccessLog              string   `json:"access_log,omitempty"`
+	DatabasePath           string   `json:"database_path,omitempty"`
+	ReportPath             string   `json:"report_path,omitempty"`
+}
+
+func (identity GoAccessBundleIdentity) RemovesRetiredState() bool {
+	return identity.RetiredGeneration != 0 && identity.Enabled && identity.StateGeneration != identity.RetiredStateGeneration
 }
 
 type EdgeOneBundleIdentity struct {
@@ -660,6 +707,7 @@ func ValidateInstallation(installation Installation) error {
 	}
 	credentialIDs := make(map[string]struct{}, len(installation.Credentials))
 	credentialOwners := make(map[string]string, len(installation.Credentials))
+	credentialsByID := make(map[string]Credential, len(installation.Credentials))
 	for index, credential := range installation.Credentials {
 		if !strings.HasPrefix(credential.ID, "cred_") || !idPattern.MatchString(credential.ID) {
 			return fmt.Errorf("credentials[%d].id is invalid", index)
@@ -669,6 +717,7 @@ func ValidateInstallation(installation Installation) error {
 		}
 		credentialIDs[credential.ID] = struct{}{}
 		credentialOwners[credential.ID] = credential.OwnerResourceID
+		credentialsByID[credential.ID] = credential
 		switch credential.Kind {
 		case "managed_basic":
 			if !validBasicUsername(credential.Username) || !idPattern.MatchString(credential.OwnerResourceID) || credential.ManagedPath != "/etc/lanpanel-public/basic/"+credential.ID+".htpasswd" || credential.ExternalPath != "" || !validSHA256Digest(credential.Fingerprint) {
@@ -692,6 +741,9 @@ func ValidateInstallation(installation Installation) error {
 		}
 		staticRootIDs[root.ID] = struct{}{}
 	}
+	if len(installation.Resources) > MaximumResources {
+		return fmt.Errorf("installation resource limit exceeds %d", MaximumResources)
+	}
 	resourceIDs := make(map[string]struct{}, len(installation.Resources))
 	for index := range installation.Resources {
 		resource := &installation.Resources[index]
@@ -701,6 +753,31 @@ func ValidateInstallation(installation Installation) error {
 		resourceIDs[resource.ID] = struct{}{}
 		if err := validateResource(*resource, credentialIDs, credentialOwners, staticRootIDs); err != nil {
 			return fmt.Errorf("resources[%d]: %w", index, err)
+		}
+		if publication := resource.Publication.DomainHTTPS; publication != nil && publication.GoAccess.Enabled {
+			credential, present := credentialsByID[publication.GoAccess.CredentialID]
+			if !present || credential.Kind != "external_htpasswd" || credential.OwnerResourceID != resource.ID {
+				return fmt.Errorf("resources[%d]: GoAccess requires its owned external htpasswd", index)
+			}
+			if publication.CredentialID != "" {
+				appCredential := credentialsByID[publication.CredentialID]
+				appPath := appCredential.ExternalPath
+				if appPath == "" {
+					appPath = appCredential.ManagedPath
+				}
+				if appPath != "" && appPath == credential.ExternalPath {
+					return fmt.Errorf("resources[%d]: GoAccess htpasswd must be independent", index)
+				}
+			}
+			declared := false
+			for _, id := range resource.CredentialIDs {
+				if id == credential.ID {
+					declared = true
+				}
+			}
+			if !declared {
+				return fmt.Errorf("resources[%d]: GoAccess credential must be declared", index)
+			}
 		}
 	}
 	for id, owner := range credentialOwners {
@@ -742,6 +819,18 @@ func validateResource(resource AppResource, credentialIDs map[string]struct{}, c
 	}
 	if err := validatePublication(resource.Publication); err != nil {
 		return err
+	}
+	if publication := resource.Publication.DomainHTTPS; publication != nil && publication.GoAccess.Enabled {
+		goaccess := publication.GoAccess
+		reserved := []string{resource.Target.ReadinessPath}
+		if resource.Target.WebSocket.Enabled {
+			reserved = append(reserved, resource.Target.WebSocket.Path)
+		}
+		for _, path := range reserved {
+			if goaccess.WebSocketPath == path || strings.TrimSuffix(goaccess.DashboardPath, "/") == path || strings.HasPrefix(path, goaccess.DashboardPath) {
+				return fmt.Errorf("GoAccess route overlaps target readiness")
+			}
+		}
 	}
 	if resource.Publication.Kind == PublicationTemporaryHTTP && resource.Target.WebSocket.Enabled {
 		return fmt.Errorf("temporary_ip_http does not support WebSocket")
@@ -897,6 +986,9 @@ func validatePublication(publication AppPublication) error {
 		if err := validateStaticMappings(*publication.DomainHTTPS); err != nil {
 			return err
 		}
+		if err := validateGoAccessPublication(*publication.DomainHTTPS); err != nil {
+			return err
+		}
 		certificate := publication.DomainHTTPS.Certificate
 		if certificate != nil {
 			if certificate.ChallengeMethod != "http-01" && certificate.ChallengeMethod != "dns-01" || !canonicalHTTPSURL(certificate.DirectoryURL) || !cleanAbsolutePath(certificate.AccountKeyPath) || !validACMEEmail(certificate.AccountEmail) || !certificate.TermsAccepted {
@@ -937,6 +1029,27 @@ func validatePublicationCIDRs(values []string) error {
 			return fmt.Errorf("CIDR allowlist noncanonical")
 		}
 		prior = value
+	}
+	return nil
+}
+func validateGoAccessPublication(publication DomainHTTPSPublication) error {
+	value := publication.GoAccess
+	if !value.Enabled {
+		if value.CredentialID != "" || len(value.CIDRs) != 0 || value.DashboardPath != "" || value.WebSocketPath != "" {
+			return fmt.Errorf("disabled GoAccess carries authority")
+		}
+		return nil
+	}
+	if value.CredentialID == "" || value.CredentialID == publication.CredentialID || !validStaticURL(value.DashboardPath, true) || !validStaticURL(value.WebSocketPath, false) || strings.HasPrefix(value.WebSocketPath, value.DashboardPath) {
+		return fmt.Errorf("enabled GoAccess authority invalid")
+	}
+	if err := validatePublicationCIDRs(value.CIDRs); err != nil {
+		return fmt.Errorf("GoAccess %w", err)
+	}
+	for _, mapping := range publication.StaticMappings {
+		if strings.HasPrefix(mapping.URLPath, value.DashboardPath) || strings.HasPrefix(value.DashboardPath, mapping.URLPath) || mapping.URLPath == value.WebSocketPath || mapping.Directory && strings.HasPrefix(value.WebSocketPath, mapping.URLPath) {
+			return fmt.Errorf("GoAccess route overlaps static mapping")
+		}
 	}
 	return nil
 }
@@ -1167,6 +1280,31 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 			return fmt.Errorf("effective_security.effective_deadline must be RFC3339: %w", err)
 		}
 	}
+	validateRetirements := func(values []GoAccessRetirementIdentity) error {
+		prior := uint64(0)
+		for _, value := range values {
+			if value.Generation <= prior || value.StateGeneration == 0 || value.StateGeneration > value.Generation || !validSHA256Digest(value.ServiceIdentity) || len(value.UnitIdentities) != 5 {
+				return fmt.Errorf("GoAccess retirement inventory must be sorted and exact")
+			}
+			for _, identity := range value.UnitIdentities {
+				if !validSHA256Digest(identity) {
+					return fmt.Errorf("GoAccess retirement unit identity invalid")
+				}
+			}
+			prior = value.Generation
+		}
+		return nil
+	}
+	if err := validateRetirements(record.PendingGoAccessRetirements); err != nil {
+		return err
+	}
+	pendingRetirement := len(record.PendingGoAccessRetirements) > 0
+	if pendingRetirement != (record.GoAccessRetirementSourceJobID != "" && validSHA256Digest(record.GoAccessRetirementAuthorityDigest)) || !pendingRetirement && (record.GoAccessRetirementSourceJournalID != "" || record.GoAccessRetirementAuthorityDigest != "") {
+		return fmt.Errorf("pending GoAccess retirement source authority invalid")
+	}
+	if pendingRetirement && (record.ContractionIntent != nil || (record.State != PublicationUnpublished && record.State != PublicationPublished)) {
+		return fmt.Errorf("pending GoAccess retirements require committed state")
+	}
 	if record.ContractionIntent != nil {
 		intent := record.ContractionIntent
 		if record.State != PublicationUnpublished || record.ActivationIntent != nil || intent.JobID == "" || intent.JobID != strings.TrimSpace(intent.JobID) || strings.ContainsAny(intent.JobID, "\r\n") || intent.Generation != record.UnpublishedGeneration || !validSHA256Digest(intent.ClosureAuthorityDigest) {
@@ -1176,6 +1314,9 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 		case "publish", "unpublish", "close_all", "certificate_expiry", "edgeone_expiry", "automatic_exact_journal_reconciliation", "startup_activation_contraction":
 		default:
 			return fmt.Errorf("contraction_intent operation %q is unsupported", intent.Operation)
+		}
+		if err := validateRetirements(intent.GoAccessRetirements); err != nil {
+			return fmt.Errorf("contraction_intent: %w", err)
 		}
 		for name, bundle := range map[string]*PublicationBundle{"prior": intent.Prior, "candidate": intent.Candidate} {
 			if bundle != nil {
@@ -1391,12 +1532,27 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			}
 			seenRoutes[routeIdentity] = struct{}{}
 		}
-		if identity.GoAccess.Enabled {
-			if identity.GoAccess.RouteIdentity == "" || identity.GoAccess.ServiceIdentity == "" {
-				return fmt.Errorf("enabled GoAccess requires route and service identities")
+		goaccess := identity.GoAccess
+		validUnits := func(values []string) bool {
+			if len(values) != 5 {
+				return false
 			}
-		} else if identity.GoAccess.RouteIdentity != "" || identity.GoAccess.ServiceIdentity != "" {
-			return fmt.Errorf("disabled GoAccess must not include route or service identity")
+			for _, value := range values {
+				if !validSHA256Digest(value) {
+					return false
+				}
+			}
+			return true
+		}
+		retiredUnitsValid := goaccess.RetiredGeneration == 0 && goaccess.RetiredStateGeneration == 0 && len(goaccess.RetiredUnitIdentities) == 0 || goaccess.RetiredGeneration != 0 && goaccess.RetiredStateGeneration != 0 && goaccess.RetiredStateGeneration <= goaccess.RetiredGeneration && validUnits(goaccess.RetiredUnitIdentities)
+		if goaccess.Enabled {
+			stateSegment := "/generations/" + strconv.FormatUint(goaccess.StateGeneration, 10) + "/"
+			unitSuffix := "-" + strconv.FormatUint(goaccess.Generation, 10) + ".sock"
+			if goaccess.Generation == 0 || goaccess.StateGeneration == 0 || goaccess.StateGeneration > goaccess.Generation || validateDomain(goaccess.CanonicalHost) != nil || !validUnits(goaccess.UnitIdentities) || !retiredUnitsValid || (goaccess.RetiredGeneration == 0) != (goaccess.RetiredServiceIdentity == "") || goaccess.RetiredGeneration >= goaccess.Generation && goaccess.RetiredGeneration != 0 || !validSHA256Digest(goaccess.RouteIdentity) || !validSHA256Digest(goaccess.ServiceIdentity) || !idPattern.MatchString(goaccess.CredentialIdentity) || !validSHA256Digest(goaccess.ReferenceIdentity) || validatePublicationCIDRs(goaccess.CIDRs) != nil || !validStaticURL(goaccess.DashboardPath, true) || !validStaticURL(goaccess.WebSocketPath, false) || !cleanAbsolutePath(goaccess.Endpoint) || !strings.HasPrefix(goaccess.Endpoint, "/run/lanpanel-goaccess/") || !strings.HasSuffix(goaccess.Endpoint, unitSuffix) || !cleanAbsolutePath(goaccess.AccessLog) || !strings.HasPrefix(goaccess.AccessLog, "/var/log/lanpanel/goaccess/") || !cleanAbsolutePath(goaccess.DatabasePath) || !strings.HasPrefix(goaccess.DatabasePath, "/var/lib/lanpanel/goaccess/") || !strings.HasSuffix(goaccess.DatabasePath, stateSegment+"database") || !cleanAbsolutePath(goaccess.ReportPath) || !strings.HasPrefix(goaccess.ReportPath, "/var/lib/lanpanel/goaccess/") || !strings.HasSuffix(goaccess.ReportPath, stateSegment+"report/index.html") {
+				return fmt.Errorf("enabled GoAccess identity invalid")
+			}
+		} else if len(goaccess.UnitIdentities) != 0 || !retiredUnitsValid || (goaccess.RetiredGeneration == 0) != (goaccess.RetiredServiceIdentity == "") || goaccess.RetiredServiceIdentity != "" && !validSHA256Digest(goaccess.RetiredServiceIdentity) || goaccess.Generation != 0 || goaccess.StateGeneration != 0 || goaccess.CanonicalHost != "" || goaccess.RouteIdentity != "" || goaccess.ServiceIdentity != "" || goaccess.CredentialIdentity != "" || goaccess.ReferenceIdentity != "" || len(goaccess.CIDRs) != 0 || goaccess.DashboardPath != "" || goaccess.WebSocketPath != "" || goaccess.Endpoint != "" || goaccess.AccessLog != "" || goaccess.DatabasePath != "" || goaccess.ReportPath != "" {
+			return fmt.Errorf("disabled GoAccess must not include authority")
 		}
 		if identity.EdgeOne.Enabled {
 			if identity.Auth.Mode != AppAccessPublic || identity.GoAccess.Enabled {
@@ -1454,6 +1610,11 @@ func validateCandidateMatchesPublication(candidate PublicationBundle, publicatio
 		}
 		if publication.DomainHTTPS.AccessMode == AppAccessBasic && candidate.DomainHTTPS.Auth.CredentialIdentity != publication.DomainHTTPS.CredentialID {
 			return fmt.Errorf("auth identity must match current publication credential")
+		}
+		configured := publication.DomainHTTPS.GoAccess
+		applied := candidate.DomainHTTPS.GoAccess
+		if configured.Enabled != applied.Enabled || configured.Enabled && (publication.DomainHTTPS.CanonicalDomain != applied.CanonicalHost || configured.CredentialID != applied.CredentialIdentity || !slices.Equal(configured.CIDRs, applied.CIDRs) || configured.DashboardPath != applied.DashboardPath || configured.WebSocketPath != applied.WebSocketPath) {
+			return fmt.Errorf("GoAccess identity must match current publication config")
 		}
 	case PublicationTemporaryHTTP:
 		if candidate.TemporaryHTTP == nil ||

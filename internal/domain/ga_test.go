@@ -520,6 +520,56 @@ func TestInstallationSchema(t *testing.T) {
 	})
 }
 
+func TestGoAccessRequiresIndependentOwnedExternalCredential(t *testing.T) {
+	installation := validGAInstallation()
+	resource := &installation.Resources[0]
+	resource.Publication.DomainHTTPS.GoAccess = GoAccessPublication{Enabled: true, CredentialID: "cred_00000000000000000000000000000001", DashboardPath: "/__lanpanel/goaccess/", WebSocketPath: "/__lanpanel/goaccess-ws"}
+	if ValidateInstallation(installation) == nil {
+		t.Fatal("Managed Basic accepted for GoAccess")
+	}
+	resource.Publication.DomainHTTPS.AccessMode = AppAccessBasic
+	resource.Publication.DomainHTTPS.CredentialID = installation.Credentials[0].ID
+	external := Credential{ID: "cred_00000000000000000000000000000002", Kind: "external_htpasswd", OwnerResourceID: resource.ID, ExternalPath: "/srv/goaccess.htpasswd", Fingerprint: testDigest}
+	installation.Credentials = append(installation.Credentials, external)
+	resource.CredentialIDs = append(resource.CredentialIDs, external.ID)
+	resource.Publication.DomainHTTPS.GoAccess.CredentialID = external.ID
+	installation.Credentials[len(installation.Credentials)-1].ExternalPath = installation.Credentials[0].ManagedPath
+	if ValidateInstallation(installation) == nil {
+		t.Fatal("Managed Basic effective path reused for GoAccess")
+	}
+	installation.Credentials[len(installation.Credentials)-1].ExternalPath = "/srv/goaccess.htpasswd"
+	if err := ValidateInstallation(installation); err != nil {
+		t.Fatal(err)
+	}
+	resource.Publication.DomainHTTPS.GoAccess.WebSocketPath = resource.Target.ReadinessPath
+	if ValidateInstallation(installation) == nil {
+		t.Fatal("GoAccess route overlapping target readiness accepted")
+	}
+	resource.Publication.DomainHTTPS.GoAccess.WebSocketPath = "/__lanpanel/goaccess-ws"
+	resource.Publication.DomainHTTPS.GoAccess.DashboardPath = "/reserved/"
+	resource.Target.ReadinessPath = "/reserved/live"
+	if ValidateInstallation(installation) == nil {
+		t.Fatal("GoAccess dashboard prefix shadowing target readiness accepted")
+	}
+}
+func TestInstallationRejectsResourcesBeyondRecoveryCapacity(t *testing.T) {
+	installation := validGAInstallation()
+	for len(installation.Resources) <= MaximumResources {
+		installation.Resources = append(installation.Resources, installation.Resources[0])
+	}
+	if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "resource limit") {
+		t.Fatalf("oversized resource inventory accepted: %v", err)
+	}
+}
+
+func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
+	installation := validGAInstallation()
+	installation.Resources[0].Publication.DomainHTTPS.GoAccess.DashboardPath = "/__lanpanel/goaccess/"
+	if ValidateInstallation(installation) == nil {
+		t.Fatal("disabled GoAccess authority accepted")
+	}
+}
+
 func validGAInstallation() Installation {
 	return Installation{
 		SchemaVersion:  InstallationSchemaVersion,
@@ -619,6 +669,18 @@ func domainBundle(id, configDigest string) PublicationBundle {
 			GoAccess:     GoAccessBundleIdentity{Enabled: false},
 			EdgeOne:      EdgeOneBundleIdentity{Enabled: false},
 		},
+	}
+}
+
+func TestDisabledGoAccessBundleRetainsExactRetirementAuthority(t *testing.T) {
+	bundle := domainBundle("pub_1_00000000000000000000000000000001", testDigest)
+	bundle.DomainHTTPS.GoAccess = GoAccessBundleIdentity{RetiredGeneration: 1, RetiredStateGeneration: 1, RetiredServiceIdentity: testDigest, RetiredUnitIdentities: []string{testDigest, testDigest, testDigest, testDigest, testDigest}}
+	if err := validateBundle(bundle, PublicationDomainHTTPS); err != nil {
+		t.Fatalf("retirement authority rejected: %v", err)
+	}
+	bundle.DomainHTTPS.GoAccess.RetiredServiceIdentity = ""
+	if err := validateBundle(bundle, PublicationDomainHTTPS); err == nil {
+		t.Fatal("generation-only retirement authority accepted")
 	}
 }
 

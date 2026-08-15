@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/activation"
+	"lanpanel/internal/closure"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
@@ -20,23 +22,27 @@ import (
 	"lanpanel/internal/reservations"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/target"
+	"path/filepath"
 	"slices"
 	"time"
 )
 
 type PublicationExecution struct {
-	Service     *FixedService
-	Admitter    *operations.Admitter
-	MutationSet *operations.MutationSet
-	Mutation    *operations.MutationLease
-	Exposure    *locks.Lease
-	JobID       string
-	Revision    uint64
-	Resource    domain.AppResource
-	Candidate   publication.Candidate
-	SafetyState safety.State
-	Ownership   ownership.Record
-	PlanID      string
+	Service            *FixedService
+	Admitter           *operations.Admitter
+	MutationSet        *operations.MutationSet
+	Mutation           *operations.MutationLease
+	Exposure           *locks.Lease
+	JobID              string
+	Revision           uint64
+	Resource           domain.AppResource
+	Candidate          publication.Candidate
+	SafetyState        safety.State
+	Ownership          ownership.Record
+	PlanID             string
+	InstallationID     string
+	ActivationDeadline time.Time
+	StagedGoAccess     *goaccessruntime.Candidate
 }
 
 func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, payload ConfirmationPayload) (*PublicationExecution, error) {
@@ -111,6 +117,7 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 		return fail(err)
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+	activationDeadline := time.Now().UTC().Add(time.Minute)
 	if err != nil {
 		mutationSet.Close()
 		return fail(err)
@@ -215,7 +222,13 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 		return cleanup(err)
 	}
 	owned.Revision++
-	owned.Paths = upsertOwnedPath(owned.Paths, candidate.OwnershipPath)
+	paths := candidate.OwnershipPaths
+	if len(paths) == 0 {
+		paths = []ownership.OwnedPath{candidate.OwnershipPath}
+	}
+	for _, path := range paths {
+		owned.Paths = upsertOwnedPath(owned.Paths, path)
+	}
 	listeners := candidate.OwnershipListeners
 	if len(listeners) == 0 {
 		listeners = []ownership.OwnedListener{candidate.OwnershipListener}
@@ -248,22 +261,80 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 			}
 		}
 	}
-	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted, PlanID: plan.ID}, nil
+	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted, PlanID: plan.ID, InstallationID: installation.InstallationID, ActivationDeadline: activationDeadline}, nil
+}
+
+func goAccessSharedRetained(resource domain.AppResource) bool {
+	if bundle := resource.PublicationRecord.LastAppliedBundle; bundle != nil && bundle.DomainHTTPS != nil {
+		return bundle.DomainHTTPS.GoAccess.Enabled || bundle.DomainHTTPS.GoAccess.RetiredGeneration != 0
+	}
+	return false
 }
 
 func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, error) {
+	activationCtx, cancelActivation := context.WithDeadline(ctx, execution.ActivationDeadline)
+	defer cancelActivation()
+	candidateGoAccess := execution.Candidate.Bundle.DomainHTTPS != nil && execution.Candidate.Bundle.DomainHTTPS.GoAccess.Enabled
+	var goaccessHost goaccessruntime.Host
+	var stagedGoAccess *goaccessruntime.Candidate
+	if candidateGoAccess {
+		gid, gidErr := nginxGroupGID()
+		if gidErr != nil {
+			pruneErr := execution.rollbackUnstagedGoAccessOwnership(activationCtx)
+			return jobs.Record{}, execution.failClosed(ctx, errors.Join(gidErr, pruneErr))
+		}
+		candidate, renderErr := goaccessruntime.Render(execution.InstallationID, execution.Resource, gid, execution.Candidate.Generation)
+		if renderErr != nil {
+			pruneErr := execution.rollbackUnstagedGoAccessOwnership(activationCtx)
+			return jobs.Record{}, execution.failClosed(ctx, errors.Join(renderErr, pruneErr))
+		}
+		if !candidate.ReuseApplied {
+			stagedGoAccess = &candidate
+			execution.StagedGoAccess = &candidate
+		}
+		goaccessHost, renderErr = goaccessruntime.NewFixedHost()
+		if renderErr == nil {
+			renderErr = goaccessHost.Stage(activationCtx, execution.Resource.ID, candidate)
+		}
+		if renderErr != nil {
+			if !candidate.ReuseApplied {
+				cleanupErr := goaccessHost.CleanupCandidate(activationCtx, candidate)
+				if cleanupErr != nil {
+					return jobs.Record{}, execution.failClosed(ctx, errors.Join(renderErr, cleanupErr))
+				}
+				if pruneErr := pruneRetiredGoAccessOwnership(activationCtx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, candidate.Generation, candidate.StateGeneration, !candidate.RetainState, !candidate.RetainShared); pruneErr != nil {
+					return jobs.Record{}, execution.failClosed(ctx, errors.Join(renderErr, pruneErr))
+				}
+			}
+			if activationCtx.Err() != nil {
+				return jobs.Record{}, execution.failClosed(ctx, errors.Join(renderErr, activationCtx.Err()))
+			}
+			return jobs.Record{}, execution.restorePriorAfterStaging(activationCtx, renderErr)
+		}
+	}
 	host, err := activation.NewFixedHost()
 	if err != nil {
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}
-	result, err := host.Activate(ctx, execution.Candidate, execution.Resource.Target)
+	result, err := host.Activate(activationCtx, execution.Candidate, execution.Resource.Target)
 	if err != nil {
+		if stagedGoAccess != nil {
+			if cleanupErr := goaccessHost.CleanupCandidate(activationCtx, *stagedGoAccess); cleanupErr != nil {
+				return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, cleanupErr))
+			}
+			if pruneErr := pruneRetiredGoAccessOwnership(activationCtx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, stagedGoAccess.Generation, stagedGoAccess.StateGeneration, !stagedGoAccess.RetainState, !stagedGoAccess.RetainShared); pruneErr != nil {
+				return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, pruneErr))
+			}
+		}
+		if activationCtx.Err() != nil {
+			return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, activationCtx.Err()))
+		}
 		var failure *activation.Failure
 		if !errors.As(err, &failure) || !failure.PriorRestored {
 			return jobs.Record{}, execution.failClosed(ctx, err)
 		}
-		if restoreErr := execution.Service.RestorePublicationSafety(context.WithoutCancel(ctx), execution.Exposure, execution.Resource.ID); restoreErr == nil {
-			if rejectErr := execution.Admitter.RejectPublication(context.WithoutCancel(ctx), execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); rejectErr == nil {
+		if restoreErr := execution.Service.RestorePublicationSafety(activationCtx, execution.Exposure, execution.Resource.ID); restoreErr == nil {
+			if rejectErr := execution.Admitter.RejectPublication(activationCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); rejectErr == nil {
 				return jobs.Record{}, err
 			} else {
 				err = errors.Join(err, rejectErr)
@@ -309,10 +380,14 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 		if !found {
 			return fmt.Errorf("publication safety resource disappeared")
 		}
-		_, err = execution.Service.safety.Commit(ctx, execution.Exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Reactivation: proof})
+		_, err = execution.Service.safety.Commit(activationCtx, execution.Exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Reactivation: proof})
 		return err
 	}
-	job, err := execution.Admitter.CommitPublicationPublished(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.PublicationTerminalCommit{ResourceID: execution.Resource.ID, Bundle: execution.Candidate.Bundle, Runtime: observation}, "activation-"+execution.JobID, result.RuntimeDigest, result.ModifiedPaths, safetyCommit)
+	if stagedGoAccess != nil && !stagedGoAccess.RetainShared {
+		result.ModifiedPaths = append(result.ModifiedPaths, "/etc/passwd", "/etc/group", "/etc/shadow", "/etc/gshadow")
+	}
+	retirementPending := execution.Candidate.Bundle.DomainHTTPS != nil && execution.Candidate.Bundle.DomainHTTPS.GoAccess.RetiredGeneration != 0
+	job, err := execution.Admitter.CommitPublicationPublished(activationCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.PublicationTerminalCommit{ResourceID: execution.Resource.ID, Bundle: execution.Candidate.Bundle, Runtime: observation, GoAccessRetirementPending: retirementPending}, "activation-"+execution.JobID, result.RuntimeDigest, result.ModifiedPaths, safetyCommit)
 	if err != nil {
 		if job.ID != "" {
 			return job, err
@@ -320,22 +395,199 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}
 	execution.Revision++
+	retirement := domain.GoAccessBundleIdentity{}
+	if execution.Candidate.Bundle.DomainHTTPS != nil {
+		retirement = execution.Candidate.Bundle.DomainHTTPS.GoAccess
+	}
+	if retirement.RetiredGeneration != 0 {
+		retirementCtx, cancelRetirement := context.WithDeadline(context.Background(), execution.ActivationDeadline)
+		goaccessHost, retireErr := goaccessruntime.NewFixedHost()
+		if retireErr == nil {
+			retireErr = goaccessHost.Retire(retirementCtx, execution.Resource.ID, retirement.RetiredGeneration, retirement.RetiredServiceIdentity, retirement.RetiredUnitIdentities)
+		}
+		removeRetiredState := retirement.RemovesRetiredState()
+		if retireErr == nil && removeRetiredState {
+			retireErr = goaccessHost.RemoveGenerationState(retirementCtx, execution.Resource.ID, retirement.RetiredStateGeneration)
+		}
+		if retireErr == nil {
+			retireErr = pruneRetiredGoAccessOwnership(retirementCtx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, retirement.RetiredGeneration, retirement.RetiredStateGeneration, removeRetiredState, false)
+		}
+		cancelRetirement()
+		terminalCtx, cancelTerminal := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelTerminal()
+		if retireErr != nil {
+			partial, recordErr := execution.Admitter.FailPublicationGoAccessRetirement(terminalCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID)
+			if recordErr == nil {
+				job = partial
+				execution.Revision++
+			}
+			return job, errors.Join(fmt.Errorf("GoAccess prior generation retirement failed: %w", retireErr), recordErr)
+		}
+		completed, completeErr := execution.Admitter.CompletePublicationGoAccessRetirement(terminalCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID)
+		if completeErr != nil {
+			return job, completeErr
+		}
+		job = completed
+		execution.Revision++
+	}
 	return job, nil
+}
+func requireRetiredGoAccessOwnershipComplete(service *FixedService, resourceID string, generation, stateGeneration uint64, removeState bool) error {
+	paths, err := goaccessruntime.DerivePaths(resourceID, generation)
+	if err != nil {
+		return err
+	}
+	forbidden := map[string]bool{paths.ServiceUnit: true, paths.ServiceEnablement: true, paths.RelayUnit: true, paths.RelayEnablement: true, paths.SocketUnit: true, paths.SocketEnablement: true, paths.RetentionUnit: true, paths.RetentionTimer: true, paths.RetentionEnablement: true, paths.Endpoint: true}
+	if removeState {
+		statePaths, stateErr := goaccessruntime.DerivePaths(resourceID, stateGeneration)
+		if stateErr != nil {
+			return stateErr
+		}
+		forbidden[statePaths.StateRoot] = true
+	}
+	record, err := service.ownership.Read(resourceID)
+	if err != nil {
+		return err
+	}
+	for _, path := range record.Paths {
+		if forbidden[path.Path] {
+			return fmt.Errorf("retired GoAccess ownership remains")
+		}
+	}
+	state, err := service.safety.Read()
+	if err != nil {
+		return err
+	}
+	for _, item := range state.Resources {
+		if item.ResourceID == resourceID {
+			if item.OwnershipDigest != record.Checksum {
+				return fmt.Errorf("retired GoAccess safety ownership differs")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("retired GoAccess safety resource missing")
+}
+
+func pruneRetiredGoAccessOwnership(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID, sourceJobID string, generation, stateGeneration uint64, removeState, removeShared bool) error {
+	paths, err := goaccessruntime.DerivePaths(resourceID, generation)
+	if err != nil {
+		return err
+	}
+	remove := map[string]bool{paths.ServiceUnit: true, paths.ServiceEnablement: true, paths.RelayUnit: true, paths.RelayEnablement: true, paths.SocketUnit: true, paths.SocketEnablement: true, paths.RetentionUnit: true, paths.RetentionTimer: true, paths.RetentionEnablement: true, paths.Endpoint: true}
+	if removeState {
+		statePaths, stateErr := goaccessruntime.DerivePaths(resourceID, stateGeneration)
+		if stateErr != nil {
+			return stateErr
+		}
+		remove[statePaths.StateRoot] = true
+	}
+	if removeShared {
+		remove[paths.Sysusers] = true
+		remove[filepath.Dir(paths.AccessLog)] = true
+		remove[paths.RetentionLock] = true
+	}
+	record, err := service.ownership.Read(resourceID)
+	if err != nil {
+		return err
+	}
+	kept := make([]ownership.OwnedPath, 0, len(record.Paths))
+	changed := false
+	for _, path := range record.Paths {
+		if remove[path.Path] {
+			changed = true
+			continue
+		}
+		kept = append(kept, path)
+	}
+	persisted := record
+	if changed {
+		record.Revision++
+		record.Paths = kept
+		persisted, err = service.OwnershipRetireGoAccess(ctx, exposure, record.Revision-1, record, removeShared)
+		if err != nil {
+			return err
+		}
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	found := false
+	var proof *safety.OwnershipConvergenceProof
+	for index := range next.Resources {
+		item := &next.Resources[index]
+		if item.ResourceID != resourceID {
+			continue
+		}
+		if item.OwnershipDigest == persisted.Checksum {
+			return nil
+		}
+		proof = &safety.OwnershipConvergenceProof{ResourceID: resourceID, IntentRef: sourceJobID, Generation: generation, BeforeDigest: item.OwnershipDigest, AfterDigest: persisted.Checksum}
+		item.OwnershipDigest = persisted.Checksum
+		found = true
+	}
+	if !found || proof == nil {
+		return fmt.Errorf("GoAccess ownership retirement safety resource missing")
+	}
+	_, err = service.safety.Commit(ctx, exposure, safety.RoleOwnershipRetirement, state.Revision, next, safety.TransitionProof{Ownership: proof})
+	return err
+}
+
+func (execution *PublicationExecution) rollbackUnstagedGoAccessOwnership(ctx context.Context) error {
+	goaccess := execution.Candidate.Bundle.DomainHTTPS.GoAccess
+	if goaccess.Generation != execution.Candidate.Generation {
+		return nil
+	}
+	return pruneRetiredGoAccessOwnership(ctx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, goaccess.Generation, goaccess.StateGeneration, goaccess.StateGeneration == goaccess.Generation, !goAccessSharedRetained(execution.Resource))
+}
+
+func (execution *PublicationExecution) restorePriorAfterStaging(ctx context.Context, cause error) error {
+	restoreErr := execution.Service.RestorePublicationSafety(ctx, execution.Exposure, execution.Resource.ID)
+	if restoreErr == nil {
+		restoreErr = execution.Admitter.RejectPublication(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "goaccess_staging_restored_prior")
+	}
+	if restoreErr == nil {
+		return cause
+	}
+	return execution.failClosed(ctx, errors.Join(cause, restoreErr))
+}
+
+type publicationFailureHost interface {
+	Reload(context.Context) error
+	StopAndVerify(context.Context) (closure.RuntimeSnapshot, error)
+}
+
+func shutdownFailedPublicationRuntime(host publicationFailureHost, contractionErr error, reloadTimeout, stopTimeout time.Duration) (closure.RuntimeSnapshot, error, error) {
+	reloadErr := error(nil)
+	if contractionErr == nil {
+		reloadCtx, cancelReload := context.WithTimeout(context.Background(), reloadTimeout)
+		reloadErr = host.Reload(reloadCtx)
+		cancelReload()
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), stopTimeout)
+	snapshot, stopErr := host.StopAndVerify(stopCtx)
+	cancelStop()
+	return snapshot, reloadErr, stopErr
 }
 
 func (execution *PublicationExecution) failClosed(_ context.Context, cause error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+	contractCtx, cancelContract := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelContract()
 	paths := nginx.FixedPaths()
 	_, auditErr := nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
 	if auditErr == nil {
-		_, _, auditErr = nginx.Contract(ctx, paths, filetxn.Owner{UID: 0, GID: 0}, []string{execution.Resource.ID})
+		_, _, auditErr = nginx.Contract(contractCtx, paths, filetxn.Owner{UID: 0, GID: 0}, []string{execution.Resource.ID})
 	}
 	host, hostErr := activation.NewFixedHost()
-	if hostErr == nil && auditErr == nil {
-		hostErr = host.Reload(ctx)
+	snapshot := closure.RuntimeSnapshot{}
+	reloadErr, stopErr := error(nil), hostErr
+	if hostErr == nil {
+		snapshot, reloadErr, stopErr = shutdownFailedPublicationRuntime(host, auditErr, 15*time.Second, time.Minute)
 	}
-	snapshot, stopErr := host.StopAndVerify(ctx)
 	observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
 	planID := execution.PlanID
 	if planID == "" {
@@ -343,8 +595,23 @@ func (execution *PublicationExecution) failClosed(_ context.Context, cause error
 			planID = resource.Reactivating.PlanID
 		}
 	}
-	fenceErr := execution.Service.WriteIngressActivationFence(ctx, execution.Exposure, execution.Resource.ID, planID, execution.Candidate.Generation, execution.Candidate.Generation-1, observed, stopErr != nil)
-	return errors.Join(cause, auditErr, hostErr, stopErr, fenceErr)
+	var cleanupErr error
+	if execution.StagedGoAccess != nil {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), time.Minute)
+		goaccessHost, newErr := goaccessruntime.NewFixedHost()
+		cleanupErr = newErr
+		if newErr == nil {
+			cleanupErr = goaccessHost.CleanupCandidate(cleanupCtx, *execution.StagedGoAccess)
+		}
+		if cleanupErr == nil {
+			cleanupErr = pruneRetiredGoAccessOwnership(cleanupCtx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, execution.StagedGoAccess.Generation, execution.StagedGoAccess.StateGeneration, !execution.StagedGoAccess.RetainState, !execution.StagedGoAccess.RetainShared)
+		}
+		cancelCleanup()
+	}
+	fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
+	fenceErr := execution.Service.WriteIngressActivationFence(fenceCtx, execution.Exposure, execution.Resource.ID, planID, execution.Candidate.Generation, execution.Candidate.Generation-1, observed, stopErr != nil || cleanupErr != nil)
+	cancelFence()
+	return errors.Join(cause, auditErr, hostErr, reloadErr, stopErr, cleanupErr, fenceErr)
 }
 
 func (execution *PublicationExecution) Close() error {

@@ -307,42 +307,64 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 			return err
 		}
 		for jobID, intent := range pending {
+			retirements := map[int][]domain.GoAccessRetirementIdentity{}
+			for index := range installation.Resources {
+				resource := &installation.Resources[index]
+				if contraction := resource.PublicationRecord.ContractionIntent; contraction != nil && contraction.JobID == jobID && len(contraction.GoAccessRetirements) != 0 {
+					retirements[index] = append([]domain.GoAccessRetirementIdentity(nil), contraction.GoAccessRetirements...)
+				}
+				if activation := resource.PublicationRecord.ActivationIntent; intent.Operation == Publish && activation != nil && activation.JobID == jobID {
+					values, retirementErr := goAccessRetirements(activation.Prior, &activation.Candidate)
+					if retirementErr != nil {
+						return retirementErr
+					}
+					if len(values) != 0 {
+						retirements[index] = values
+					}
+				}
+			}
+			result, errorCode, conditionKind := jobs.ResultInterrupted, "activation_contracted", "contraction_interrupted"
+			if len(retirements) != 0 {
+				result, errorCode, conditionKind = jobs.ResultPartial, "goaccess_stop_failed", "goaccess_retirement_pending"
+			}
 			record, err := jobs.Load(transaction, jobID)
 			if err != nil {
 				return err
 			}
-			if record.Status == jobs.StatusRunning {
-				record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "contraction_interrupted", Status: jobs.PostconditionKnown, Identity: closureDigest}}, ErrorCode: "activation_contracted"}, now)
-				if err != nil {
-					return err
-				}
-				if err := jobs.Replace(transaction, record); err != nil {
-					return err
-				}
-			} else if record.Status != jobs.StatusReserved {
-				return fmt.Errorf("interrupted contraction job state changed")
-			} else {
+			if record.Status == jobs.StatusReserved {
 				record, err = jobs.Start(record)
 				if err != nil {
 					return err
 				}
-				record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "contraction_interrupted", Status: jobs.PostconditionKnown, Identity: closureDigest}}, ErrorCode: "activation_contracted"}, now)
-				if err != nil {
-					return err
-				}
-				if err := jobs.Replace(transaction, record); err != nil {
-					return err
-				}
+			} else if record.Status != jobs.StatusRunning {
+				return fmt.Errorf("interrupted contraction job state changed")
+			}
+			record, err = jobs.Finish(record, jobs.Completion{Result: result, Postconditions: []jobs.Postcondition{{Kind: conditionKind, Status: jobs.PostconditionKnown, Identity: closureDigest}}, ErrorCode: errorCode}, now)
+			if err != nil {
+				return err
+			}
+			if err := jobs.Replace(transaction, record); err != nil {
+				return err
 			}
 			for index := range installation.Resources {
 				resource := &installation.Resources[index]
+				if values := retirements[index]; len(values) != 0 {
+					digest, digestErr := GoAccessRetirementInventoryDigest(values)
+					if digestErr != nil {
+						return digestErr
+					}
+					resource.PublicationRecord.PendingGoAccessRetirements = values
+					resource.PublicationRecord.GoAccessRetirementSourceJobID = jobID
+					resource.PublicationRecord.GoAccessRetirementSourceJournalID = ""
+					resource.PublicationRecord.GoAccessRetirementAuthorityDigest = digest
+				}
 				if intent.Operation == Publish && resource.ID == intent.SafetyBinding.ResourceID {
 					if resource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.ActivationIntent.JobID == jobID {
 						resource.PublicationRecord.ActivationIntent = nil
 					}
 					resource.PublicationRecord.State = domain.PublicationUnpublished
 					resource.PublicationRecord.LastOperation = domain.OperationPublish
-					resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+					resource.PublicationRecord.LastOperationResult = domain.OperationResult(result)
 					resource.PublicationRecord.LastJobID = jobID
 					continue
 				}
@@ -352,7 +374,7 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 				}
 				resource.PublicationRecord.ContractionIntent = nil
 				resource.PublicationRecord.LastOperation = contractionOperationCode(intent.Operation)
-				resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+				resource.PublicationRecord.LastOperationResult = domain.OperationResult(result)
 				resource.PublicationRecord.LastJobID = jobID
 			}
 			for _, key := range transaction.Keys("journals") {

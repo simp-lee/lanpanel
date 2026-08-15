@@ -9,6 +9,20 @@ import (
 	"testing"
 )
 
+func TestGoAccessAccountsBindInstallationAndResource(t *testing.T) {
+	first, err := GoAccessAccounts("ins_00000000000000000000000000000001", "res_00000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := GoAccessAccounts("ins_00000000000000000000000000000002", "res_00000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Application.User == second.Application.User || first.Relay == nil || first.Application.User == first.Relay.User || !strings.Contains(first.Application.Comment, first.InstallationID) {
+		t.Fatal("GoAccess account origin is not exact")
+	}
+}
+
 func TestInstallationAccountsAreCollisionSafeAndExact(t *testing.T) {
 	set, err := InstallationAccounts("ins_00000000000000000000000000000001")
 	if err != nil {

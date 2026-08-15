@@ -10,21 +10,34 @@ import (
 	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/safety"
+	"slices"
+	"time"
 )
 
+type goaccessGeneration struct {
+	generation      uint64
+	stateGeneration uint64
+	retiredIdentity string
+	removeState     bool
+	removeShared    bool
+	installationID  string
+	unitIdentities  []string
+}
 type CloseAllExecution struct {
-	Service     *FixedService
-	Admitter    *operations.Admitter
-	MutationSet *operations.MutationSet
-	Mutation    *operations.MutationLease
-	Exposure    *locks.Lease
-	Authority   *contraction.NormalAuthority
-	Inventory   closure.Inventory
+	Service             *FixedService
+	Admitter            *operations.Admitter
+	MutationSet         *operations.MutationSet
+	Mutation            *operations.MutationLease
+	Exposure            *locks.Lease
+	Authority           *contraction.NormalAuthority
+	Inventory           closure.Inventory
+	GoAccessGenerations map[string][]goaccessGeneration
 }
 
 func BeginCloseAll(ctx context.Context, actor Actor, payload ConfirmationPayload) (*CloseAllExecution, error) {
@@ -134,7 +147,8 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 		_ = mutationSet.Close()
 		return fail(err)
 	}
-	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
+	goaccessIDs := goAccessContractionInventory(freshInstallation, resourceIDs)
+	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, GoAccessGenerations: goaccessIDs, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
 }
 func contractionGenerations(installation domain.Installation, state safety.State, selectedIDs []string) (map[string]uint64, error) {
 	normal := make(map[string]uint64, len(installation.Resources))
@@ -182,6 +196,10 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 		}
 		execution.Inventory = uncertain
 		result, runErr := (contraction.Engine{Authority: execution.Authority, Runtime: fallback}).Run(ctx, uncertain)
+		result, runErr, cleanupComplete := execution.stopGoAccessAfterClosure(ctx, result, runErr)
+		if !cleanupComplete && !result.AccessClosed {
+			return result, errors.Join(runErr, execution.Close())
+		}
 		_, completeErr := contraction.CompleteNormal(ctx, execution.Authority, result)
 		closeErr := execution.Close()
 		if completeErr == nil && closeErr == nil && (result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown) {
@@ -190,6 +208,10 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 		return result, errors.Join(err, runErr, completeErr, closeErr)
 	}
 	result, runErr := (contraction.Engine{Authority: execution.Authority, Runtime: host}).Run(ctx, execution.Inventory)
+	result, runErr, cleanupComplete := execution.stopGoAccessAfterClosure(ctx, result, runErr)
+	if !cleanupComplete && !result.AccessClosed {
+		return result, errors.Join(runErr, execution.Close())
+	}
 	_, completeErr := contraction.CompleteNormal(ctx, execution.Authority, result)
 	closeErr := execution.Close()
 	if completeErr != nil || closeErr != nil {
@@ -199,6 +221,140 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 		return result, nil
 	}
 	return result, runErr
+}
+func goAccessContractionInventory(installation domain.Installation, resourceIDs []string) map[string][]goaccessGeneration {
+	result := map[string][]goaccessGeneration{}
+	selected := func(id string) bool {
+		if len(resourceIDs) == 0 {
+			return true
+		}
+		return slices.Contains(resourceIDs, id)
+	}
+	for _, resource := range installation.Resources {
+		if !selected(resource.ID) {
+			continue
+		}
+		add := func(identity domain.GoAccessBundleIdentity, candidate bool) {
+			values := []goaccessGeneration{}
+			if identity.Enabled {
+				value := goaccessGeneration{generation: identity.Generation, stateGeneration: identity.StateGeneration, installationID: installation.InstallationID, unitIdentities: append([]string(nil), identity.UnitIdentities...)}
+				if candidate {
+					value.retiredIdentity = identity.ServiceIdentity
+					value.removeState = identity.StateGeneration == identity.Generation
+					value.removeShared = !goAccessSharedRetained(resource)
+				}
+				values = append(values, value)
+			}
+			if identity.RetiredGeneration != 0 {
+				values = append(values, goaccessGeneration{generation: identity.RetiredGeneration, stateGeneration: identity.RetiredStateGeneration, retiredIdentity: identity.RetiredServiceIdentity, installationID: installation.InstallationID, unitIdentities: append([]string(nil), identity.RetiredUnitIdentities...)})
+			}
+			for _, value := range values {
+				duplicate := false
+				for _, prior := range result[resource.ID] {
+					if prior.generation == value.generation {
+						duplicate = true
+					}
+				}
+				if !duplicate {
+					result[resource.ID] = append(result[resource.ID], value)
+				}
+			}
+		}
+		if applied := resource.PublicationRecord.LastAppliedBundle; applied != nil && applied.DomainHTTPS != nil {
+			add(applied.DomainHTTPS.GoAccess, false)
+		}
+		if activation := resource.PublicationRecord.ActivationIntent; activation != nil && activation.Candidate.DomainHTTPS != nil {
+			add(activation.Candidate.DomainHTTPS.GoAccess, true)
+		}
+		for _, pending := range resource.PublicationRecord.PendingGoAccessRetirements {
+			matched := false
+			for index := range result[resource.ID] {
+				item := &result[resource.ID][index]
+				if item.generation == pending.Generation {
+					item.stateGeneration = pending.StateGeneration
+					item.retiredIdentity = pending.ServiceIdentity
+					item.unitIdentities = append([]string(nil), pending.UnitIdentities...)
+					item.removeState = item.removeState || pending.RemoveState
+					item.removeShared = item.removeShared || pending.RemoveShared
+					matched = true
+				}
+			}
+			if !matched {
+				result[resource.ID] = append(result[resource.ID], goaccessGeneration{generation: pending.Generation, stateGeneration: pending.StateGeneration, retiredIdentity: pending.ServiceIdentity, removeState: pending.RemoveState, removeShared: pending.RemoveShared, installationID: installation.InstallationID, unitIdentities: append([]string(nil), pending.UnitIdentities...)})
+			}
+		}
+	}
+	return result
+}
+func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goaccessGeneration, result contraction.Result, runErr error) (contraction.Result, error, bool) {
+	if len(generations) == 0 {
+		return result, runErr, true
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelStop()
+	host, stopErr := goaccessruntime.NewFixedHost()
+	if stopErr == nil {
+		for resourceID, items := range generations {
+			for _, generation := range items {
+				if generation.retiredIdentity == "" {
+					paths, pathErr := operations.GoAccessStopModifiedPaths(resourceID, generation.generation)
+					result.ModifiedPaths = append(result.ModifiedPaths, paths...)
+					stopErr = errors.Join(stopErr, pathErr, host.Stop(stopCtx, resourceID, generation.generation))
+				} else {
+					currentErr := host.Retire(stopCtx, resourceID, generation.generation, generation.retiredIdentity, generation.unitIdentities)
+					if currentErr == nil && generation.removeState {
+						currentErr = host.RemoveGenerationState(stopCtx, resourceID, generation.stateGeneration)
+					}
+					if currentErr == nil && generation.removeShared {
+						currentErr = host.CleanupUncommittedShared(stopCtx, generation.installationID, resourceID)
+					}
+					if currentErr == nil {
+						paths, pathErr := operations.GoAccessRetirementModifiedPaths(resourceID, domain.GoAccessRetirementIdentity{Generation: generation.generation, StateGeneration: generation.stateGeneration, ServiceIdentity: generation.retiredIdentity, RemoveState: generation.removeState, RemoveShared: generation.removeShared, UnitIdentities: append([]string(nil), generation.unitIdentities...)})
+						currentErr = pathErr
+						result.ModifiedPaths = append(result.ModifiedPaths, paths...)
+					}
+					stopErr = errors.Join(stopErr, currentErr)
+				}
+			}
+		}
+	}
+	complete := stopErr == nil
+	if stopErr != nil {
+		if result.AccessClosed {
+			result.Outcome = contraction.OutcomePartial
+			result.ErrorCode = "goaccess_stop_failed"
+		}
+		runErr = errors.Join(runErr, stopErr)
+	}
+	return result, runErr, complete
+}
+func pruneGoAccessContractionOwnership(_ context.Context, service *FixedService, exposure *locks.Lease, sourceJobID string, generations map[string][]goaccessGeneration) error {
+	pruneCtx, cancelPrune := context.WithTimeout(context.Background(), time.Minute)
+	defer cancelPrune()
+	var result error
+	for resourceID, items := range generations {
+		for _, item := range items {
+			if item.retiredIdentity != "" {
+				result = errors.Join(result, pruneRetiredGoAccessOwnership(pruneCtx, service, exposure, resourceID, sourceJobID, item.generation, item.stateGeneration, item.removeState, item.removeShared))
+			}
+		}
+	}
+	return result
+}
+func (execution *CloseAllExecution) stopGoAccessAfterClosure(ctx context.Context, result contraction.Result, runErr error) (contraction.Result, error, bool) {
+	var cleanupComplete bool
+	result, runErr, cleanupComplete = stopGoAccessAfterClosure(ctx, execution.GoAccessGenerations, result, runErr)
+	if cleanupComplete {
+		if pruneErr := pruneGoAccessContractionOwnership(ctx, execution.Service, execution.Exposure, execution.Authority.JobID, execution.GoAccessGenerations); pruneErr != nil {
+			cleanupComplete = false
+			if result.AccessClosed {
+				result.Outcome = contraction.OutcomePartial
+				result.ErrorCode = "goaccess_stop_failed"
+			}
+			runErr = errors.Join(runErr, pruneErr)
+		}
+	}
+	return result, runErr, cleanupComplete
 }
 func (execution *CloseAllExecution) Close() error {
 	if execution == nil {

@@ -60,7 +60,7 @@ func operationRegistry() (*operations.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}})
+	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}, {Operation: operations.GoAccessRetirement, Owner: "application.goaccess", Results: table}})
 }
 
 type FixedService struct {
@@ -89,7 +89,7 @@ func OpenFixed() (*FixedService, error) {
 		normal.Close()
 		return fail(err)
 	}
-	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.Policy{ManagedRoots: []string{"/etc/lanpanel", fixedRoot}}, LockAuthority: manager.Authority()})
+	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
 		normal.Close()
 		return fail(err)
@@ -464,6 +464,16 @@ func (s *FixedService) OwnershipWrite(ctx context.Context, lease *locks.Lease, e
 	}
 	return s.ownership.Read(record.ResourceID)
 }
+func (s *FixedService) OwnershipRetireGoAccess(ctx context.Context, lease *locks.Lease, expected uint64, record ownership.Record, removeShared bool) (ownership.Record, error) {
+	role := ownership.GoAccessRetirementWriter
+	if removeShared {
+		role = ownership.GoAccessCandidateRollbackWriter
+	}
+	if _, err := s.ownership.Write(ctx, lease, role, expected, record); err != nil {
+		return ownership.Record{}, err
+	}
+	return s.ownership.Read(record.ResourceID)
+}
 func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	state, err := s.safety.Read()
 	if err != nil {
@@ -668,6 +678,12 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 }
 
 func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority string, document persist.Document, installation domain.Installation, resource domain.AppResource) (plans.Plan, error) {
+	if err := requireGoAccessRetirementComplete(ctx, s, resource); err != nil {
+		return plans.Plan{}, err
+	}
+	if err := requireGoAccessServiceTransition(resource); err != nil {
+		return plans.Plan{}, err
+	}
 	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
 		return plans.Plan{}, err
 	}
@@ -720,8 +736,8 @@ func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority st
 		staticValues[index] = mapping.URLPath + ":" + mapping.RelativePath
 	}
 	certificate := publication.Certificate
-	summary := fmt.Sprintf("url=https://%s/ listeners=80,443 domains=%s auth=%s credential=%s cidrs=%s static_root=%s static=%s static_anonymous_confirmed=%t certificate=%s:%s:%s target=resource/%s", publication.CanonicalDomain, strings.Join(domains, ","), publication.AccessMode, publication.CredentialID, strings.Join(publication.CIDRs, ","), publication.StaticRootID, strings.Join(staticValues, ","), anonymousStatic, certificate.ChallengeMethod, certificate.DNSProvider, certificate.DirectoryURL, resource.ID)
-	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence, acmeEvidence, sourceEvidence}, ExposureSummary: summary, Prerequisites: "Exact certificate, auth, CIDR, static, target, and Host/SNI validation required before activation.", Lifetime: 10 * time.Minute}
+	summary := fmt.Sprintf("url=https://%s/ listeners=80,443 domains=%s auth=%s credential=%s cidrs=%s static_root=%s static=%s static_anonymous_confirmed=%t goaccess=%t goaccess_credential=%s goaccess_cidrs=%s goaccess_dashboard=%s goaccess_websocket=%s certificate=%s:%s:%s target=resource/%s", publication.CanonicalDomain, strings.Join(domains, ","), publication.AccessMode, publication.CredentialID, strings.Join(publication.CIDRs, ","), publication.StaticRootID, strings.Join(staticValues, ","), anonymousStatic, publication.GoAccess.Enabled, publication.GoAccess.CredentialID, strings.Join(publication.GoAccess.CIDRs, ","), publication.GoAccess.DashboardPath, publication.GoAccess.WebSocketPath, certificate.ChallengeMethod, certificate.DNSProvider, certificate.DirectoryURL, resource.ID)
+	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence, acmeEvidence, sourceEvidence}, ExposureSummary: summary, Prerequisites: "Exact certificate, auth, CIDR, static, isolated GoAccess staging, target, and Host/SNI validation required before activation.", Lifetime: 10 * time.Minute}
 	_ = request
 	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {

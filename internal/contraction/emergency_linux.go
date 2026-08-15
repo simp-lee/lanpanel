@@ -10,6 +10,7 @@ import (
 	"lanpanel/internal/closure"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
@@ -17,6 +18,7 @@ import (
 	"lanpanel/internal/persist"
 	"lanpanel/internal/safety"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,7 +62,7 @@ func OpenEmergency(ctx context.Context) (*EmergencyService, error) {
 	}
 	service := &EmergencyService{manager: manager, exposure: exposure, paths: nginx.FixedPaths()}
 	closeFail := func(err error) (*EmergencyService, error) { _ = service.Close(); return nil, err }
-	ownershipStore, err := ownership.Open(ownership.Config{RootPath: "/var/lib/lanpanel/ownership", StagingPath: "/var/lib/lanpanel/ownership/.filetxn", RecordsPath: "/var/lib/lanpanel/ownership/records", Owner: owner, Policy: ownership.Policy{ManagedRoots: []string{"/etc/lanpanel", "/var/lib/lanpanel"}}, LockAuthority: manager.Authority()})
+	ownershipStore, err := ownership.Open(ownership.Config{RootPath: "/var/lib/lanpanel/ownership", StagingPath: "/var/lib/lanpanel/ownership/.filetxn", RecordsPath: "/var/lib/lanpanel/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err == nil {
 		service.ownership = ownershipStore
 		service.inventory, err = ownershipStore.Inventory()
@@ -346,7 +348,51 @@ func (service *EmergencyService) PersistStopFence(_ context.Context, inventory c
 	next.StopFence = &fence
 	return service.emergency.Commit(service.exposure, safety.RoleContraction, current.Sequence, next)
 }
+func (service *EmergencyService) stopGoAccess(ctx context.Context, inventory closure.Inventory) error {
+	host, err := goaccessruntime.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, identity := range inventory.Identities {
+		if identity.Kind != closure.IdentityOwnershipPath {
+			continue
+		}
+		prefix := "service:/etc/systemd/system/lanpanel-goaccess-" + identity.ResourceID + "-"
+		if !strings.HasPrefix(identity.Value, prefix) || !strings.HasSuffix(identity.Value, ".service") {
+			continue
+		}
+		generationText := strings.TrimSuffix(strings.TrimPrefix(identity.Value, prefix), ".service")
+		generation, parseErr := strconv.ParseUint(generationText, 10, 64)
+		if parseErr != nil || generation == 0 {
+			return fmt.Errorf("emergency GoAccess generation identity invalid")
+		}
+		key := fmt.Sprintf("%s:%d", identity.ResourceID, generation)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if stopErr := host.EnsureStopped(ctx, identity.ResourceID, generation); stopErr != nil {
+			err = errors.Join(err, stopErr)
+		}
+	}
+	discovered, discoverErr := goaccessruntime.DiscoverServiceGenerations(ctx)
+	if discoverErr != nil {
+		return errors.Join(err, discoverErr)
+	}
+	for _, item := range discovered {
+		key := fmt.Sprintf("%s:%d", item.ResourceID, item.Generation)
+		if !seen[key] {
+			err = errors.Join(err, fmt.Errorf("unowned GoAccess service generation discovered: %s", key))
+		}
+	}
+	return err
+}
+
 func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory closure.Inventory, closureDigest string) error {
+	if err := service.stopGoAccess(ctx, inventory); err != nil {
+		return err
+	}
 	current, err := service.emergency.Authority()
 	if err != nil || current.GlobalClose.Phase == safety.GlobalCloseNone || current.StopFence != nil || service.normal == nil || service.safetyStore == nil || service.safetyState == nil || !inventory.Complete {
 		return nil

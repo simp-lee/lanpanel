@@ -10,6 +10,57 @@ import (
 	"testing"
 )
 
+func TestFixedPolicyIncludesCompleteGoAccessClosure(t *testing.T) {
+	policy := FixedPolicy()
+	for _, required := range []string{"/etc/systemd/system", "/etc/sysusers.d", "/var/log/lanpanel", "/run/lanpanel", "/run/lanpanel-goaccess"} {
+		found := false
+		for _, root := range policy.ManagedRoots {
+			if root == required {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("fixed ownership policy missing %s", required)
+		}
+	}
+	roots, err := validatePolicy(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateManagedPath("/run/lanpanel-goaccess/res_00000000000000000000000000000001-2.sock", roots); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoAccessRetirementWriterAcceptsOnlyExactGenerationClosure(t *testing.T) {
+	resourceID := "res_00000000000000000000000000000001"
+	generation := "2"
+	unitID := resourceID + "-" + generation
+	paths := []string{"/etc/systemd/system/lanpanel-goaccess-" + unitID + ".service", "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service", "/etc/systemd/system/lanpanel-goaccess-relay-" + unitID + ".service", "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service", "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".socket", "/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket", "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".service", "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".timer", "/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer", "/run/lanpanel-goaccess/" + unitID + ".sock", "/var/lib/lanpanel/goaccess/" + resourceID + "/generations/2"}
+	current := Record{ResourceID: resourceID, State: Owned, Paths: []OwnedPath{}}
+	for _, path := range paths {
+		current.Paths = append(current.Paths, OwnedPath{Kind: PathService, Path: path, IdentityDigest: PathIdentity(resourceID, PathService, path)})
+	}
+	next := current
+	next.Paths = []OwnedPath{}
+	if !exactGoAccessRetirement(current, next) {
+		t.Fatal("exact GoAccess retirement rejected")
+	}
+	unsafe := next
+	unsafe.Paths = append(unsafe.Paths, current.Paths[0])
+	if exactGoAccessRetirement(current, unsafe) {
+		t.Fatal("partial GoAccess retirement accepted")
+	}
+	shared := []string{"/etc/sysusers.d/lanpanel-goaccess-" + resourceID + ".conf", "/var/log/lanpanel/goaccess/" + resourceID, "/var/log/lanpanel/goaccess/" + resourceID + "/.retention.lock"}
+	rollbackCurrent := current
+	for _, path := range shared {
+		rollbackCurrent.Paths = append(rollbackCurrent.Paths, OwnedPath{Kind: PathService, Path: path, IdentityDigest: PathIdentity(resourceID, PathService, path)})
+	}
+	if !exactGoAccessCandidateRollback(rollbackCurrent, next) {
+		t.Fatal("exact first-candidate rollback rejected")
+	}
+}
+
 func TestOwnershipEvidenceContract(t *testing.T) {
 	t.Run("atomic_record_inventory_and_orphan_classification", func(t *testing.T) {
 		store, manager, lease, record := newTestStore(t)

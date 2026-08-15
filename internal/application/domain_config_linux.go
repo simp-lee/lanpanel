@@ -5,6 +5,7 @@ package application
 import (
 	"fmt"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/htpasswdref"
 	"slices"
 )
 
@@ -29,24 +30,51 @@ func DomainPublicationCandidate(update DomainPublicationUpdate) (domain.AppResou
 	if err != nil {
 		return domain.AppResource{}, err
 	}
-	_, resource, err := loadCertificateResource(document.Entries, update.ResourceID)
+	installation, resource, err := loadCertificateResource(document.Entries, update.ResourceID)
 	if err != nil {
 		return domain.AppResource{}, err
 	}
 	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
 		return domain.AppResource{}, err
 	}
-	priorCredential := ""
+	priorCredential, priorGoAccessCredential := "", ""
 	if resource.Publication.DomainHTTPS != nil {
 		priorCredential = resource.Publication.DomainHTTPS.CredentialID
+		priorGoAccessCredential = resource.Publication.DomainHTTPS.GoAccess.CredentialID
 	}
 	resource.Publication = domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &update.Publication}
-	if priorCredential != "" && priorCredential != update.Publication.CredentialID {
-		resource.CredentialIDs = slices.DeleteFunc(resource.CredentialIDs, func(value string) bool { return value == priorCredential })
+	for _, prior := range []string{priorCredential, priorGoAccessCredential} {
+		if prior != "" && prior != update.Publication.CredentialID && prior != update.Publication.GoAccess.CredentialID {
+			resource.CredentialIDs = slices.DeleteFunc(resource.CredentialIDs, func(value string) bool { return value == prior })
+		}
 	}
-	if update.Publication.CredentialID != "" && !slices.Contains(resource.CredentialIDs, update.Publication.CredentialID) {
-		resource.CredentialIDs = append(resource.CredentialIDs, update.Publication.CredentialID)
+	for _, candidate := range []string{update.Publication.CredentialID, update.Publication.GoAccess.CredentialID} {
+		if candidate != "" && !slices.Contains(resource.CredentialIDs, candidate) {
+			resource.CredentialIDs = append(resource.CredentialIDs, candidate)
+		}
 	}
 	slices.Sort(resource.CredentialIDs)
+	if update.Publication.GoAccess.Enabled {
+		gid, gidErr := nginxGroupGID()
+		if gidErr != nil {
+			return domain.AppResource{}, gidErr
+		}
+		found := false
+		for _, credential := range installation.Credentials {
+			if credential.ID != update.Publication.GoAccess.CredentialID {
+				continue
+			}
+			if credential.Kind != "external_htpasswd" || credential.OwnerResourceID != resource.ID || credential.ExternalPath == "" {
+				return domain.AppResource{}, fmt.Errorf("GoAccess candidate credential authority invalid")
+			}
+			if _, validateErr := htpasswdref.Validate(credential.ExternalPath, gid); validateErr != nil {
+				return domain.AppResource{}, validateErr
+			}
+			found = true
+		}
+		if !found {
+			return domain.AppResource{}, fmt.Errorf("GoAccess candidate credential missing")
+		}
+	}
 	return resource, nil
 }

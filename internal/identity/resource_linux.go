@@ -3,6 +3,8 @@
 package identity
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -13,6 +15,18 @@ type ResourceAccountSet struct {
 	Application    AccountSpec       `json:"application"`
 	Relay          *AccountSpec      `json:"relay,omitempty"`
 	Identities     []AccountIdentity `json:"identities,omitempty"`
+}
+
+func GoAccessAccounts(installationID, resourceID string) (ResourceAccountSet, error) {
+	if !ValidateInstallationID(installationID) || len(resourceID) != 36 || !strings.HasPrefix(resourceID, "res_") {
+		return ResourceAccountSet{}, fmt.Errorf("GoAccess account authority is invalid")
+	}
+	digest := sha256.Sum256([]byte(installationID + "\x00" + resourceID))
+	suffix := hex.EncodeToString(digest[:])[:20]
+	application := AccountSpec{Role: AccountRole("goaccess:" + resourceID), User: "lp-ga-" + suffix, Group: "lp-ga-" + suffix, Comment: "LanPanel " + installationID + " " + resourceID + " GoAccess", Home: LockedHome, Shell: NoLoginShell}
+	relay := AccountSpec{Role: AccountRole("goaccess-relay:" + resourceID), User: "lp-gar-" + suffix, Group: "lp-gar-" + suffix, Comment: "LanPanel " + installationID + " " + resourceID + " GoAccess relay", Home: LockedHome, Shell: NoLoginShell}
+	set := ResourceAccountSet{InstallationID: installationID, ResourceID: resourceID, Application: application, Relay: &relay}
+	return set, validateResourceAccountSet(set, false)
 }
 
 func ResourceAccounts(installationID, resourceID string, relay bool) (ResourceAccountSet, error) {
@@ -128,6 +142,86 @@ func inspectResourceAccountFiles(_ AccountSet, set ResourceAccountSet, passwdPat
 		return false, nil, fmt.Errorf("application and relay identities are not distinct")
 	}
 	return true, identities, nil
+}
+
+type AccountDeletionState struct {
+	Users  []bool
+	Groups []bool
+}
+
+func InspectResourceAccountDeletionFiles(set ResourceAccountSet, passwdPath, groupPath, shadowPath string) (AccountDeletionState, error) {
+	if err := validateResourceAccountSet(set, true); err != nil {
+		return AccountDeletionState{}, err
+	}
+	passwdBytes, err := readAccountFile(passwdPath)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	groupBytes, err := readAccountFile(groupPath)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	shadowBytes, err := readAccountFile(shadowPath)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	users, err := parsePasswd(passwdBytes)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	groups, err := parseGroups(groupBytes)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	shadow, err := parseShadow(shadowBytes)
+	if err != nil {
+		return AccountDeletionState{}, err
+	}
+	if set.Relay == nil {
+		return AccountDeletionState{}, fmt.Errorf("resource deletion relay identity missing")
+	}
+	specs := []AccountSpec{set.Application, *set.Relay}
+	expected := map[string]AccountIdentity{}
+	for _, value := range set.Identities {
+		expected[value.User] = value
+	}
+	state := AccountDeletionState{Users: make([]bool, len(specs)), Groups: make([]bool, len(specs))}
+	for index, spec := range specs {
+		want, ok := expected[spec.User]
+		if !ok {
+			return AccountDeletionState{}, fmt.Errorf("resource deletion numeric identity missing")
+		}
+		user, userOK := users[spec.User]
+		group, groupOK := groups[spec.Group]
+		password, shadowOK := shadow[spec.User]
+		if userOK && (!groupOK || user.uid != want.UID || user.gid != want.GID || group.gid != want.GID || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell) {
+			return AccountDeletionState{}, fmt.Errorf("resource deletion user identity differs")
+		}
+		if shadowOK && !lockedPassword(password) {
+			return AccountDeletionState{}, fmt.Errorf("resource deletion shadow identity differs")
+		}
+		if groupOK && (group.gid != want.GID || len(group.members) != 0) {
+			return AccountDeletionState{}, fmt.Errorf("resource deletion group identity differs")
+		}
+		state.Users[index] = userOK || shadowOK
+		state.Groups[index] = groupOK
+		for name, other := range users {
+			if name != spec.User && (other.uid == want.UID || other.gid == want.GID) {
+				return AccountDeletionState{}, fmt.Errorf("resource deletion user identity aliases %q", name)
+			}
+		}
+		for name, other := range groups {
+			if name != spec.Group && other.gid == want.GID {
+				return AccountDeletionState{}, fmt.Errorf("resource deletion group aliases %q", name)
+			}
+			for _, member := range other.members {
+				if member == spec.User {
+					return AccountDeletionState{}, fmt.Errorf("resource deletion account has supplementary group")
+				}
+			}
+		}
+	}
+	return state, nil
 }
 
 func validateResourceAccountSet(set ResourceAccountSet, requireIdentity bool) error {

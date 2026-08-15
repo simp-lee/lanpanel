@@ -19,6 +19,7 @@ import (
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/jobs"
 	"lanpanel/internal/packages"
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/renewal"
@@ -759,7 +760,7 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		return ExecutionResult{ResultDigest: execution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: execution.Candidate.PublicURL}}, nil
+		return ExecutionResult{ResultDigest: execution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, JobResult: string(job.Result), PublicURL: execution.Candidate.PublicURL}}, nil
 	})
 	managedBasicHandler := ManagedBasicGenerateHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Action == nil {
@@ -834,7 +835,7 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		raw, _ := json.Marshal(status)
-		return ExecutionResult{ResultDigest: digestString(string(raw)), Resource: &helperproto.ResourceResult{ResourceID: status.ResourceID, Status: status.Status, AccessMayRemain: status.AccessMayRemain, CredentialFingerprint: status.CredentialFingerprint, CredentialChanged: status.CredentialChanged, StaticFingerprint: status.StaticFingerprint, StaticChanged: status.StaticChanged, ObservedAt: status.ObservedAt, Reason: status.Reason, AllowedActions: append([]string(nil), status.AllowedActions...), CredentialIDs: append([]string(nil), status.CredentialIDs...)}}, nil
+		return ExecutionResult{ResultDigest: digestString(string(raw)), Resource: &helperproto.ResourceResult{ResourceID: status.ResourceID, Status: status.Status, AccessMayRemain: status.AccessMayRemain, CredentialID: status.CredentialID, CredentialFingerprint: status.CredentialFingerprint, CredentialChanged: status.CredentialChanged, GoAccessCredentialID: status.GoAccessCredentialID, GoAccessCredentialFingerprint: status.GoAccessCredentialFingerprint, GoAccessCredentialChanged: status.GoAccessCredentialChanged, StaticFingerprint: status.StaticFingerprint, StaticChanged: status.StaticChanged, ObservedAt: status.ObservedAt, Reason: status.Reason, AllowedActions: append([]string(nil), status.AllowedActions...), CredentialIDs: append([]string(nil), status.CredentialIDs...), GoAccessRetirementJobID: status.GoAccessRetirementJobID, GoAccessRetirementGenerations: append([]uint64(nil), status.GoAccessRetirementGenerations...)}}, nil
 	})
 	managedBasicDeleteHandler := ManagedBasicDeleteHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Action == nil {
@@ -942,7 +943,7 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 		return ExecutionResult{}, err
 	}
 	defer func() {
-		if closeErr := execution.Close(); resultErr != nil && closeErr != nil {
+		if closeErr := execution.Close(); closeErr != nil {
 			resultErr = errors.Join(resultErr, closeErr)
 		}
 	}()
@@ -976,15 +977,18 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 		return abort(err)
 	}
 	defer func() {
-		if closeErr := publicationExecution.Close(); resultErr != nil && closeErr != nil {
+		if closeErr := publicationExecution.Close(); closeErr != nil {
 			resultErr = errors.Join(resultErr, closeErr)
 		}
 	}()
 	job, err := publicationExecution.Run(ctx)
 	if err != nil {
-		return ExecutionResult{}, err
+		if job.ID == "" || job.Status != jobs.StatusTerminal || job.Result != jobs.ResultPartial {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: publicationExecution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, JobResult: string(job.Result), PublicURL: publicationExecution.Candidate.PublicURL}}, nil
 	}
-	return ExecutionResult{ResultDigest: publicationExecution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, PublicURL: publicationExecution.Candidate.PublicURL}}, nil
+	return ExecutionResult{ResultDigest: publicationExecution.Candidate.BundleDigest, Action: &helperproto.ActionResult{JobID: job.ID, JobResult: string(job.Result), PublicURL: publicationExecution.Candidate.PublicURL}}, nil
 }
 
 func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {

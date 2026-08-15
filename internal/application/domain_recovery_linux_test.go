@@ -4,9 +4,22 @@ package application
 
 import (
 	"lanpanel/internal/domain"
+	"lanpanel/internal/ownership"
+	"lanpanel/internal/plans"
+	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
 	"testing"
+	"time"
 )
+
+func TestCertificateHandoffCarriesInstallationAndActivationDeadline(t *testing.T) {
+	deadline := time.Now().UTC().Add(time.Minute)
+	source := &CertificateExecution{InstallationID: "ins_00000000000000000000000000000001", JobID: "job", Plan: plans.Plan{ID: "plan"}}
+	execution := publicationExecutionFromCertificate(source, publication.Candidate{}, safety.State{}, ownership.Record{}, deadline)
+	if execution.InstallationID != source.InstallationID || !execution.ActivationDeadline.Equal(deadline) || execution.JobID != "job" {
+		t.Fatalf("handoff lost runtime authority: %+v", execution)
+	}
+}
 
 func TestInterruptedDomainActivationContractionWinsWithFreshGeneration(t *testing.T) {
 	item := safety.ResourceSafety{ResourceID: "res_one", GenerationSequence: 7, Reactivating: &safety.Reactivating{PlanID: "plan_one", Generation: 7}}

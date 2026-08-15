@@ -301,6 +301,7 @@ const (
 	RoleJournalConvergence      ClearRole = "journal_convergence"
 	RoleOwnershipContraction    ClearRole = "ownership_contraction"
 	RoleOwnershipActivation     ClearRole = "ownership_activation"
+	RoleOwnershipRetirement     ClearRole = "ownership_retirement"
 	RoleUpgradeRecovery         ClearRole = "upgrade_recovery"
 	RoleMaintenance             ClearRole = "maintenance"
 	RoleMaintenanceBegin        ClearRole = "maintenance_begin"

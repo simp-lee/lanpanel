@@ -26,6 +26,14 @@ func TestPrepareTemporaryBindsExactPublicSurface(t *testing.T) {
 		t.Fatalf("candidate identity mismatch: %#v", candidate)
 	}
 }
+func TestPrepareTemporaryRejectsRetainedGoAccessAuthority(t *testing.T) {
+	resource := temporaryResource()
+	resource.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest, RetiredUnitIdentities: []string{testDigest, testDigest, testDigest, testDigest, testDigest}}}}
+	if _, err := PrepareTemporary(resource, 2); err == nil || !strings.Contains(err.Error(), "retained GoAccess authority") {
+		t.Fatalf("temporary publication discarded retained GoAccess: %v", err)
+	}
+}
+
 func TestPrepareTemporaryRejectsWebSocketAndNonpublicAddress(t *testing.T) {
 	resource := temporaryResource()
 	resource.Target.WebSocket = domain.WebSocketReadiness{Enabled: true, Path: "/ws"}
