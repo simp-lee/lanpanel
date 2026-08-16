@@ -275,7 +275,7 @@ func validateReactivating(reactivating Reactivating) error {
 }
 
 func validateHeadscaleReactivating(reactivating HeadscaleReactivating) error {
-	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CertificateFingerprint) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() {
 		return fmt.Errorf("Headscale reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {

@@ -587,6 +587,33 @@ func TestHeadscaleIdentityCannotBeRenamedAdoptedOrDisabled(t *testing.T) {
 	}
 }
 
+func TestHeadscaleDeployIntentIsExactAndNonApplied(t *testing.T) {
+	value := *testHeadscaleDomain()
+	value.DeployIntent = &HeadscaleDeployIntent{Generation: 1, PlanID: "plan_control", JobID: "job_control", Phase: HeadscaleDeployPrepared, PreflightDigest: testDigest, CertificateBinding: testDigest, Candidate: HeadscaleAppliedIdentity{Generation: 1, ConfigDigest: testDigest, ArtifactDigest: testDigest, ServiceIdentity: testDigest, ControlIdentity: testDigest, CertificateID: "cert_00000000000000000000000000000001"}}
+	value.LastOperation = OperationDeploy
+	value.LastJobID = "job_control"
+	if err := ValidateHeadscale(value); err != nil {
+		t.Fatal(err)
+	}
+	if value.Enabled || value.Applied != nil {
+		t.Fatal("prepared Headscale deploy became applied")
+	}
+	changed := value
+	intent := *changed.DeployIntent
+	intent.PlanID = ""
+	changed.DeployIntent = &intent
+	if err := ValidateHeadscale(changed); err == nil {
+		t.Fatal("Headscale deploy without Plan authority accepted")
+	}
+	changed = value
+	intent = *changed.DeployIntent
+	intent.Candidate.ControlIdentity = ""
+	changed.DeployIntent = &intent
+	if err := ValidateHeadscale(changed); err == nil {
+		t.Fatal("Headscale deploy with incomplete control identity accepted")
+	}
+}
+
 func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
 	installation := validGAInstallation()
 	installation.Resources[0].Publication.DomainHTTPS.GoAccess.DashboardPath = "/__lanpanel/goaccess/"
@@ -648,7 +675,7 @@ func validGAInstallation() Installation {
 }
 
 func testHeadscaleDomain() *HeadscaleDomain {
-	return &HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: HeadscaleArtifactIdentity{BaselineDigest: testDigest, Version: "0.25.1", ArchiveDigest: testDigest, ExecutableDigest: testDigest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest}, Database: HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", IdentityBundleDigest: testDigest, Generation: 1, Phase: HeadscaleIdentityCommitted}, DesiredDigest: testDigest, ManagedPaths: HeadscaleManagedPaths()}
+	return &HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: HeadscaleArtifactIdentity{BaselineDigest: testDigest, Version: "0.25.1", ArchiveDigest: testDigest, ExecutableDigest: testDigest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest}, Database: HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", IdentityBundleDigest: testDigest, Generation: 1, Phase: HeadscaleIdentityCommitted}, DesiredDigest: testDigest, ManagedPaths: HeadscaleManagedPaths()}
 }
 
 func publishedResource(health RuntimeHealth) AppResource {

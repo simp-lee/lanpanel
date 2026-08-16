@@ -136,7 +136,7 @@ func NewCandidate(request CandidateRequest) (domain.HeadscaleDomain, IdentitySna
 		return domain.HeadscaleDomain{}, IdentitySnapshot{}, nil, err
 	}
 	desiredDigest := digest(desiredBytes)
-	snapshot := IdentitySnapshot{SchemaVersion: IdentitySnapshotSchema, InstallationID: request.InstallationID, HeadscaleID: headscaleID, ControlDomain: request.ControlDomain, MagicDNSNamespace: request.MagicDNSNamespace, Policy: TrustedMeshPolicy, Artifact: artifact, DatabaseUUID: databaseUUID, SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", DatabaseGeneration: 1, DesiredConfigDigest: desiredDigest}
+	snapshot := IdentitySnapshot{SchemaVersion: IdentitySnapshotSchema, InstallationID: request.InstallationID, HeadscaleID: headscaleID, ControlDomain: request.ControlDomain, MagicDNSNamespace: request.MagicDNSNamespace, Policy: TrustedMeshPolicy, Artifact: artifact, DatabaseUUID: databaseUUID, SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", DatabaseGeneration: 1, DesiredConfigDigest: desiredDigest}
 	snapshotBytes, err := json.Marshal(snapshot)
 	if err != nil {
 		return domain.HeadscaleDomain{}, IdentitySnapshot{}, nil, err

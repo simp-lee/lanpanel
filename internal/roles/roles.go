@@ -11,28 +11,29 @@ import (
 type Name string
 
 const (
-	UI                   Name = "ui"
-	ChildExecutor        Name = "child-executor"
-	Helper               Name = "helper"
-	StartupGuard         Name = "startup-guard"
-	ReloadGuard          Name = "reload-guard"
-	RuntimeGuard         Name = "runtime-guard"
-	ProcessGuard         Name = "process-guard"
-	Installer            Name = "installer"
-	Upgrade              Name = "upgrade"
-	FencedRecovery       Name = "fenced-recovery"
-	Timer                Name = "timer"
-	Relay                Name = "relay"
-	GoAccessRelay        Name = "goaccess-relay"
-	GoAccessRetention    Name = "goaccess-retention"
-	GoAccessAccountGuard Name = "goaccess-account-guard"
-	PackageNoAutostart   Name = "package-no-autostart"
-	ManagedExecutor      Name = "managed-executor"
+	UI                    Name = "ui"
+	ChildExecutor         Name = "child-executor"
+	Helper                Name = "helper"
+	StartupGuard          Name = "startup-guard"
+	ReloadGuard           Name = "reload-guard"
+	RuntimeGuard          Name = "runtime-guard"
+	ProcessGuard          Name = "process-guard"
+	Installer             Name = "installer"
+	Upgrade               Name = "upgrade"
+	FencedRecovery        Name = "fenced-recovery"
+	Timer                 Name = "timer"
+	Relay                 Name = "relay"
+	GoAccessRelay         Name = "goaccess-relay"
+	GoAccessRetention     Name = "goaccess-retention"
+	GoAccessAccountGuard  Name = "goaccess-account-guard"
+	HeadscalePrivateProbe Name = "headscale-private-probe"
+	PackageNoAutostart    Name = "package-no-autostart"
+	ManagedExecutor       Name = "managed-executor"
 )
 
 var fixed = map[Name]struct{}{
 	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
-	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {},
+	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {},
 }
 
 type Handler func(args []string, stdout, stderr io.Writer) error

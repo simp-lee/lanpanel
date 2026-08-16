@@ -1250,6 +1250,19 @@ func testRegistry(t *testing.T) *Registry {
 	return registry
 }
 
+func TestExactHeadscaleCertificateChallengeAuthority(t *testing.T) {
+	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("candidate"), ACMEBinding: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
+	state := safety.EmptyState()
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, ConfigDigest: binding.CandidateDigest, ACMEBinding: binding.ACMEBinding, CertificateIdentity: binding.CertificateIdentity}
+	if !exactCertificateChallenge(state, binding) {
+		t.Fatal("exact Headscale challenge rejected")
+	}
+	state.Headscale.ChallengePending.CertificateIdentity = "cert_11111111111111111111111111111111"
+	if exactCertificateChallenge(state, binding) {
+		t.Fatal("mismatched Headscale challenge accepted")
+	}
+}
+
 func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	normal, manager, admission, mutationSet := newOperationStores(t)
@@ -1269,7 +1282,7 @@ func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	document, _ := normal.Read()
-	candidate := domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.test", MagicDNSNamespace: "mesh.example.test", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: testDigest("baseline"), Version: "0.25.1", ArchiveDigest: testDigest("archive"), ExecutableDigest: testDigest("executable"), ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest("contract")}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: testDigest("config"), ManagedPaths: domain.HeadscaleManagedPaths()}
+	candidate := domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.test", MagicDNSNamespace: "mesh.example.test", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: testDigest("baseline"), Version: "0.25.1", ArchiveDigest: testDigest("archive"), ExecutableDigest: testDigest("executable"), ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest("contract")}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: testDigest("config"), ManagedPaths: domain.HeadscaleManagedPaths()}
 	snapshot := managedheadscale.IdentitySnapshot{SchemaVersion: managedheadscale.IdentitySnapshotSchema, InstallationID: "ins_00000000000000000000000000000001", HeadscaleID: candidate.ID, ControlDomain: candidate.ControlDomain, MagicDNSNamespace: candidate.MagicDNSNamespace, Policy: candidate.Policy, Artifact: candidate.Artifact, DatabaseUUID: candidate.Database.UUID, SQLitePath: candidate.Database.SQLitePath, DatabaseGeneration: candidate.Database.Generation, DesiredConfigDigest: candidate.DesiredDigest}
 	snapshotBytes, _ := json.Marshal(snapshot)
 	candidate.Database.IdentityBundleDigest = testDigestBytes(snapshotBytes)

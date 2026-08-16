@@ -64,13 +64,14 @@ type ClosingConvergenceProof struct {
 }
 
 type HeadscaleConvergenceProof struct {
-	PlanID                string
-	Generation            uint64
-	ControlGeneration     uint64
-	CertificateGeneration uint64
-	CandidateDigest       string
-	CandidateBundle       string
-	RuntimeClosureDigest  string
+	PlanID                 string
+	Generation             uint64
+	ControlGeneration      uint64
+	CertificateGeneration  uint64
+	CertificateFingerprint string
+	CandidateDigest        string
+	CandidateBundle        string
+	RuntimeClosureDigest   string
 }
 
 type DeleteConvergenceProof struct {
@@ -696,7 +697,18 @@ func sameStopFenceBinding(left, right StopFence) bool {
 }
 
 func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, proof *HeadscaleConvergenceProof) error {
-	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, headscaleGenerations(before), headscaleGenerations(after)); err != nil {
+	if role == RoleCertificateHandoff && !reflect.DeepEqual(before, after) {
+		pending, active := before.ChallengePending, after.Reactivating
+		if pending == nil || before.Reactivating != nil || after.ChallengePending != nil || active == nil || active.PlanID != pending.PlanID || active.Generation != pending.Generation || active.PriorGeneration+1 != pending.Generation || active.CandidateDigest != pending.ConfigDigest || !reflect.DeepEqual(active.BaseMarkers, pending.BaseMarkers) || !isDigest(active.CandidateBundle) || active.ControlGeneration == 0 || active.CertificateGeneration == 0 || !isDigest(active.CertificateFingerprint) || active.CertificateUntil.IsZero() {
+			return fmt.Errorf("Headscale certificate handoff does not exactly replace challenge authority")
+		}
+	}
+	beforeGenerations := headscaleGenerations(before)
+	if role == RoleCertificateHandoff && before.ChallengePending != nil && after.Reactivating != nil {
+		delete(beforeGenerations, "challenge_pending")
+		beforeGenerations["reactivating"] = before.ChallengePending.Generation
+	}
+	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, beforeGenerations, headscaleGenerations(after)); err != nil {
 		return fmt.Errorf("Headscale: %w", err)
 	}
 	if !reflect.DeepEqual(before.CertificateExpiry, after.CertificateExpiry) {
@@ -715,10 +727,10 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 		return fmt.Errorf("Headscale: %w", err)
 	}
 	if !reflect.DeepEqual(before.Reactivating, after.Reactivating) {
-		if role != RolePublish {
+		if role != RolePublish && role != RoleCertificateHandoff {
 			return fmt.Errorf("wrong Headscale reactivation writer")
 		}
-		if after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
+		if role != RoleCertificateHandoff && after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
 			return fmt.Errorf("Headscale reactivation does not bind the exact prior generation")
 		}
 	}
@@ -948,7 +960,7 @@ func validClosingProof(before, after ResourceSafety, proof *ClosingConvergencePr
 
 func validHeadscaleProof(before, after HeadscaleSafety, proof *HeadscaleConvergenceProof) bool {
 	intent := before.Reactivating
-	return proof != nil && intent != nil && after.Reactivating == nil && proof.PlanID == intent.PlanID && proof.Generation == intent.Generation && proof.ControlGeneration == intent.ControlGeneration && proof.CertificateGeneration == intent.CertificateGeneration && proof.CandidateDigest == intent.CandidateDigest && proof.CandidateBundle == intent.CandidateBundle && isDigest(proof.RuntimeClosureDigest) && headscaleSnapshotMatches(intent.BaseMarkers, before)
+	return proof != nil && intent != nil && after.Reactivating == nil && proof.PlanID == intent.PlanID && proof.Generation == intent.Generation && proof.ControlGeneration == intent.ControlGeneration && proof.CertificateGeneration == intent.CertificateGeneration && proof.CertificateFingerprint == intent.CertificateFingerprint && isDigest(proof.CertificateFingerprint) && proof.CandidateDigest == intent.CandidateDigest && proof.CandidateBundle == intent.CandidateBundle && isDigest(proof.RuntimeClosureDigest) && headscaleSnapshotMatches(intent.BaseMarkers, before)
 }
 
 func validDeleteProof(before ResourceSafety, proof *DeleteConvergenceProof) bool {

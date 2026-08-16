@@ -17,7 +17,7 @@ import (
 )
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleAdmin, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -32,6 +32,17 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	stop, err := ResolveProfile(ProfileSystemctlNginxStop, Identities{})
 	if err != nil || !stop.Complete || !reflect.DeepEqual(stop.Arguments, []string{"stop", "lanpanel-nginx.service"}) || !reflect.DeepEqual(stop.AllowedAddressFamilies, []int{1}) {
 		t.Fatalf("Nginx stop profile=%#v error=%v", stop, err)
+	}
+	headscaleInvocation := Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: "hds_00000000000000000000000000000001"}}
+	for profileID, wantArguments := range map[ProfileID][]string{ProfileHeadscaleStart: {"start", "lanpanel-headscale.service"}, ProfileHeadscaleStop: {"stop", "lanpanel-headscale.service"}} {
+		profile, err := ResolveInvocation(profileID, Identities{}, headscaleInvocation)
+		if err != nil || !profile.Complete || !profile.RootTCB || !reflect.DeepEqual(profile.Arguments, wantArguments) {
+			t.Fatalf("Headscale profile %s=%#v error=%v", profileID, profile, err)
+		}
+	}
+	show, err := ResolveInvocation(ProfileHeadscaleShow, Identities{}, headscaleInvocation)
+	if err != nil || !show.Complete || len(show.Arguments) != 4 || show.Arguments[3] != "lanpanel-headscale.service" {
+		t.Fatalf("Headscale show profile=%#v error=%v", show, err)
 	}
 	htpasswd, err := ResolveInvocation(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 30000001, GID: 30000001}}, Invocation{HTPasswd: &HTPasswdInvocation{Username: "admin", Cost: 12}})
 	if err != nil || !htpasswd.Complete || !reflect.DeepEqual(htpasswd.Arguments, []string{"-n", "-i", "-B", "-C", "12", "admin"}) || htpasswd.MaximumInputBytes != 72 || htpasswd.RootTCB || htpasswd.UID != 30000001 || htpasswd.GID != 30000001 || len(htpasswd.AllowedCapabilities) != 0 {

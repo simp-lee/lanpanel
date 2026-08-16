@@ -35,6 +35,9 @@ const (
 	ProfileNginxReloadSignal     ProfileID = "nginx_reload_signal"
 	ProfileNginxQuitSignal       ProfileID = "nginx_quit_signal"
 	ProfileHeadscaleAccounts     ProfileID = "headscale_accounts"
+	ProfileHeadscaleStart        ProfileID = "headscale_start"
+	ProfileHeadscaleStop         ProfileID = "headscale_stop"
+	ProfileHeadscaleShow         ProfileID = "headscale_show"
 	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
 	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
 	ProfileGoAccessAccounts      ProfileID = "goaccess_accounts"
@@ -189,6 +192,9 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxReload:  {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAccounts:     {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleStart:        {ID: ProfileHeadscaleStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleStop:         {ID: ProfileHeadscaleStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleShow:         {ID: ProfileHeadscaleShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileGoAccessAccounts:      {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -267,11 +273,21 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	if id == ProfileHeadscaleAccounts {
+	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow
+	if headscaleProfile {
 		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
-			return Profile{}, fmt.Errorf("Headscale account child invocation authority is invalid")
+			return Profile{}, fmt.Errorf("Headscale child invocation authority is invalid")
 		}
-		profile.Arguments = []string{"/etc/sysusers.d/lanpanel-headscale.conf"}
+		switch id {
+		case ProfileHeadscaleAccounts:
+			profile.Arguments = []string{"/etc/sysusers.d/lanpanel-headscale.conf"}
+		case ProfileHeadscaleStart:
+			profile.Arguments = []string{"start", "lanpanel-headscale.service"}
+		case ProfileHeadscaleStop:
+			profile.Arguments = []string{"stop", "lanpanel-headscale.service"}
+		case ProfileHeadscaleShow:
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,RuntimeDirectory,RuntimeDirectoryMode,ProtectSystem,ProtectHome", "--property=ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartPost,FragmentPath,DropInPaths", "lanpanel-headscale.service"}
+		}
 		profile.Complete = true
 		return profile, validateProfile(profile)
 	}

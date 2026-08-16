@@ -34,16 +34,17 @@ const (
 )
 
 type GuardInput struct {
-	State                 State
-	Action                Action
-	ResourceID            string
-	CandidateDigest       string
-	CandidateBundle       string
-	PlanID                string
-	Generation            uint64
-	ControlGeneration     uint64
-	CertificateGeneration uint64
-	Now                   time.Time
+	State                  State
+	Action                 Action
+	ResourceID             string
+	CandidateDigest        string
+	CandidateBundle        string
+	PlanID                 string
+	Generation             uint64
+	ControlGeneration      uint64
+	CertificateGeneration  uint64
+	CertificateFingerprint string
+	Now                    time.Time
 }
 
 type Decision struct {
@@ -140,7 +141,7 @@ func checkHeadscaleChallenge(input GuardInput) Decision {
 
 func checkHeadscaleReactivate(input GuardInput) Decision {
 	intent := input.State.Headscale.Reactivating
-	if intent == nil || input.State.Headscale.ChallengePending != nil || intent.Generation != input.Generation || intent.CandidateDigest != input.CandidateDigest || intent.CandidateBundle != input.CandidateBundle || intent.PlanID != input.PlanID || intent.ControlGeneration != input.ControlGeneration || intent.CertificateGeneration != input.CertificateGeneration || !headscaleSnapshotMatches(intent.BaseMarkers, input.State.Headscale) {
+	if intent == nil || input.State.Headscale.ChallengePending != nil || intent.Generation != input.Generation || intent.CandidateDigest != input.CandidateDigest || intent.CandidateBundle != input.CandidateBundle || intent.PlanID != input.PlanID || intent.ControlGeneration != input.ControlGeneration || intent.CertificateGeneration != input.CertificateGeneration || intent.CertificateFingerprint != input.CertificateFingerprint || !headscaleSnapshotMatches(intent.BaseMarkers, input.State.Headscale) {
 		return Decision{Priority: PriorityBaseContraction, Reason: "matching Headscale reactivation identity is missing or stale"}
 	}
 	if !future(intent.CertificateUntil, input.Now) {

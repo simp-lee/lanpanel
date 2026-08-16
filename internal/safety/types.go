@@ -88,17 +88,18 @@ type Reactivating struct {
 }
 
 type HeadscaleReactivating struct {
-	Generation            uint64           `json:"generation"`
-	PriorGeneration       uint64           `json:"prior_generation"`
-	PlanID                string           `json:"plan_id"`
-	ControlGeneration     uint64           `json:"control_generation"`
-	CertificateGeneration uint64           `json:"certificate_generation"`
-	CandidateDigest       string           `json:"candidate_digest"`
-	CandidateBundle       string           `json:"candidate_bundle"`
-	BaseMarkers           []MarkerSnapshot `json:"base_markers"`
-	ProbePending          bool             `json:"probe_pending"`
-	ProbeCorrelation      string           `json:"probe_correlation,omitempty"`
-	CertificateUntil      time.Time        `json:"certificate_until"`
+	Generation             uint64           `json:"generation"`
+	PriorGeneration        uint64           `json:"prior_generation"`
+	PlanID                 string           `json:"plan_id"`
+	ControlGeneration      uint64           `json:"control_generation"`
+	CertificateGeneration  uint64           `json:"certificate_generation"`
+	CertificateFingerprint string           `json:"certificate_fingerprint"`
+	CandidateDigest        string           `json:"candidate_digest"`
+	CandidateBundle        string           `json:"candidate_bundle"`
+	BaseMarkers            []MarkerSnapshot `json:"base_markers"`
+	ProbePending           bool             `json:"probe_pending"`
+	ProbeCorrelation       string           `json:"probe_correlation,omitempty"`
+	CertificateUntil       time.Time        `json:"certificate_until"`
 }
 
 type EdgeOneSafety struct {

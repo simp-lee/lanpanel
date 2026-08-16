@@ -235,14 +235,14 @@ func TestSafetyConvergenceProofs(t *testing.T) {
 		current := EmptyState()
 		current.Headscale.GenerationSequence = 4
 		current.Headscale.CertificateExpiry = &DeadlineMarker{Generation: 4, Deadline: time.Now().UTC().Add(-time.Minute), Binding: "certificate"}
-		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan", ControlGeneration: 7, CertificateGeneration: 4, CertificateFingerprint: digest("certificate"), CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		next := current
 		next.Headscale.CertificateExpiry = nil
 		next.Headscale.Reactivating = nil
 		if err := validateTransition(RolePublish, current, next, TransitionProof{}); err == nil {
 			t.Fatal("Headscale expiry cleared without convergence proof")
 		}
-		proof := &HeadscaleConvergenceProof{PlanID: "plan", Generation: 2, ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), RuntimeClosureDigest: digest("closure")}
+		proof := &HeadscaleConvergenceProof{PlanID: "plan", Generation: 2, ControlGeneration: 7, CertificateGeneration: 4, CertificateFingerprint: digest("certificate"), CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), RuntimeClosureDigest: digest("closure")}
 		if err := validateTransition(RolePublish, current, next, TransitionProof{Headscale: proof}); err != nil {
 			t.Fatalf("Headscale convergence: %v", err)
 		}
@@ -365,7 +365,7 @@ func TestSafetyTransitionOwnershipRejectsReplacementBypass(t *testing.T) {
 
 		current = EmptyState()
 		current.Headscale.GenerationSequence = 1
-		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: "headscale", ControlGeneration: 1, CertificateGeneration: 1, CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		current.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: "headscale", ControlGeneration: 1, CertificateGeneration: 1, CertificateFingerprint: digest("certificate"), CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Now().UTC().Add(time.Hour)}
 		next = current
 		next.Headscale.Reactivating = nil
 		if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{}); err == nil {
@@ -413,6 +413,27 @@ func TestCertificateHandoffAtomicallyReplacesChallengeWithSameGeneration(t *test
 		t.Fatal("mismatched certificate handoff accepted")
 	}
 }
+func TestHeadscaleCertificateHandoffPreservesGenerationAndBaseMarkers(t *testing.T) {
+	current := EmptyState()
+	current.Headscale.GenerationSequence = 1
+	current.Headscale.ChallengePending = &ChallengePending{Generation: 1, PlanID: "plan_headscale", Method: "http-01", ConfigDigest: digest("config"), SANIdentity: digest("san"), ACMEBinding: digest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: digest("bootstrap"), BaseMarkers: absentBaseSnapshot()}
+	next := current
+	next.Revision++
+	pending := current.Headscale.ChallengePending
+	next.Headscale.ChallengePending = nil
+	next.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: pending.PlanID, ControlGeneration: 1, CertificateGeneration: 1, CertificateFingerprint: digest("certificate"), CandidateDigest: pending.ConfigDigest, CandidateBundle: digest("bundle"), BaseMarkers: append([]MarkerSnapshot(nil), pending.BaseMarkers...), CertificateUntil: time.Now().UTC().Add(time.Hour)}
+	if err := validateTransition(RoleCertificateHandoff, current, next, TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	changed := next
+	active := *changed.Headscale.Reactivating
+	active.PlanID = "other"
+	changed.Headscale.Reactivating = &active
+	if err := validateTransition(RoleCertificateHandoff, current, changed, TransitionProof{}); err == nil {
+		t.Fatal("mismatched Headscale certificate handoff accepted")
+	}
+}
+
 func TestSafetyPriorityAndGuardContract(t *testing.T) {
 	t.Run("pairwise_priority_is_fail_closed", func(t *testing.T) {
 		base := stateWithResource()
@@ -519,12 +540,12 @@ func TestSafetyPriorityAndGuardContract(t *testing.T) {
 		state.Headscale.ChallengePending = nil
 		state.Headscale.GenerationSequence = 4
 		state.Headscale.CertificateExpiry = &DeadlineMarker{Generation: 4, Deadline: time.Now().UTC().Add(-time.Minute), Binding: "headscale-cert"}
-		state.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "headscale-reactivate", ControlGeneration: 7, CertificateGeneration: 4, CandidateDigest: digest("headscale-candidate"), CandidateBundle: digest("headscale-bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
-		headscale = Check(GuardInput{State: state, Action: ActionHeadscaleReactivate, CandidateDigest: state.Headscale.Reactivating.CandidateDigest, CandidateBundle: state.Headscale.Reactivating.CandidateBundle, PlanID: state.Headscale.Reactivating.PlanID, Generation: state.Headscale.Reactivating.Generation, ControlGeneration: 7, CertificateGeneration: 4, Now: time.Now().UTC()})
+		state.Headscale.Reactivating = &HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "headscale-reactivate", ControlGeneration: 7, CertificateGeneration: 4, CertificateFingerprint: digest("headscale-certificate"), CandidateDigest: digest("headscale-candidate"), CandidateBundle: digest("headscale-bundle"), BaseMarkers: []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotAbsent}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotPresent, Generation: 4}, {Kind: MarkerEdgeOneExpiry, State: SnapshotAbsent}}, CertificateUntil: time.Now().UTC().Add(time.Hour)}
+		headscale = Check(GuardInput{State: state, Action: ActionHeadscaleReactivate, CertificateFingerprint: state.Headscale.Reactivating.CertificateFingerprint, CandidateDigest: state.Headscale.Reactivating.CandidateDigest, CandidateBundle: state.Headscale.Reactivating.CandidateBundle, PlanID: state.Headscale.Reactivating.PlanID, Generation: state.Headscale.Reactivating.Generation, ControlGeneration: 7, CertificateGeneration: 4, Now: time.Now().UTC()})
 		if !headscale.Allowed {
 			t.Fatalf("matching Headscale reactivation blocked: %#v", headscale)
 		}
-		if headscale = Check(GuardInput{State: state, Action: ActionHeadscaleReactivate, CandidateDigest: state.Headscale.Reactivating.CandidateDigest, CandidateBundle: state.Headscale.Reactivating.CandidateBundle, PlanID: state.Headscale.Reactivating.PlanID, Generation: state.Headscale.Reactivating.Generation, ControlGeneration: 8, CertificateGeneration: 4, Now: time.Now().UTC()}); headscale.Allowed {
+		if headscale = Check(GuardInput{State: state, Action: ActionHeadscaleReactivate, CertificateFingerprint: state.Headscale.Reactivating.CertificateFingerprint, CandidateDigest: state.Headscale.Reactivating.CandidateDigest, CandidateBundle: state.Headscale.Reactivating.CandidateBundle, PlanID: state.Headscale.Reactivating.PlanID, Generation: state.Headscale.Reactivating.Generation, ControlGeneration: 8, CertificateGeneration: 4, Now: time.Now().UTC()}); headscale.Allowed {
 			t.Fatalf("mismatched Headscale control generation allowed: %#v", headscale)
 		}
 	})

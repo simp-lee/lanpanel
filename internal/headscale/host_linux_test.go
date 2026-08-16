@@ -94,7 +94,7 @@ func TestInstallRejectsForeignDatabaseAndArtifactBeforeIdentityCommit(t *testing
 }
 
 func fixturePaths(root string) Paths {
-	return Paths{Root: root, Staging: filepath.Join(root, "var/lib/lanpanel/headscale/.filetxn"), Executable: filepath.Join(root, "usr/lib/lanpanel/dependencies/headscale"), IdentityParent: filepath.Join(root, "var/lib/lanpanel/headscale"), IdentityName: "identity", SQLite: filepath.Join(root, "var/lib/lanpanel/headscale/db.sqlite")}
+	return Paths{Root: root, Staging: filepath.Join(root, "var/lib/lanpanel/headscale/.filetxn"), Executable: filepath.Join(root, "usr/lib/lanpanel/dependencies/headscale"), IdentityParent: filepath.Join(root, "var/lib/lanpanel/headscale"), IdentityName: "identity", SQLite: filepath.Join(root, "var/lib/lanpanel/headscale-runtime/db.sqlite")}
 }
 
 func prepareDirectories(t *testing.T, paths Paths) {
@@ -102,7 +102,7 @@ func prepareDirectories(t *testing.T, paths Paths) {
 	if err := os.Chmod(paths.Root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{paths.Staging, filepath.Dir(paths.Executable), paths.IdentityParent} {
+	for _, path := range []string{paths.Staging, filepath.Dir(paths.Executable), paths.IdentityParent, filepath.Dir(paths.SQLite)} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}

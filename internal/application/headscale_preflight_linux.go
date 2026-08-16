@@ -7,12 +7,13 @@ import (
 	"context"
 	"fmt"
 	"lanpanel/internal/activation"
+	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"slices"
 )
 
-func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallIdentity, controlDomain string, generation uint64) (preflight.ExpansionRequest, preflight.Result, error) {
+func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallIdentity, controlDomain string, generation uint64, additionalPaths ...preflight.ManagedPathRequirement) (preflight.ExpansionRequest, preflight.Result, error) {
 	profile := installed.Profile
 	authority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + installed.ProfileDigest, LiveQualified: true}
 	if installed.Kind == release.EnvelopeQualificationCandidate {
@@ -47,9 +48,11 @@ func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallId
 		Scope: preflight.ExpansionHeadscale, Target: "headscale", Generation: generation,
 		Profile: preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: profile.Architecture, SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), QualificationDigest: "sha256:" + confinement.QualificationDigest}, Authority: authority},
 		Domains: []string{controlDomain}, OwnedListeners: owned,
-		ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/lanpanel/headscale", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true}, {Path: "/etc/sysusers.d/lanpanel-headscale.conf", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o600, MaximumMode: 0o600, AllowAbsent: true}, {Path: "/usr/lib/lanpanel/dependencies/headscale", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o755, MaximumMode: 0o755, AllowAbsent: true}, {Path: "/var/lib/lanpanel/headscale", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true}},
+		ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/sysusers.d/lanpanel-headscale.conf", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o600, MaximumMode: 0o600, AllowAbsent: true}, {Path: "/usr/lib/lanpanel/dependencies/headscale", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o755, MaximumMode: 0o755, AllowAbsent: true}, {Path: "/var/lib/lanpanel/headscale", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true}},
 		Disks:        []preflight.DiskRequirement{{Path: "/usr/lib/lanpanel/dependencies", MinimumAvailableBytes: maximum}, {Path: "/var/lib/lanpanel", MinimumAvailableBytes: maximum}}, LastTrustedWall: installed.AuthorityCreatedAt,
 	}
+	request.ManagedPaths = append(request.ManagedPaths, additionalPaths...)
+	slices.SortFunc(request.ManagedPaths, func(left, right preflight.ManagedPathRequirement) int { return cmp.Compare(left.Path, right.Path) })
 	observer, err := preflight.NewLinuxObserver(func(ctx context.Context) (preflight.PackageObservation, error) {
 		return preflight.ObserveBootstrapReadiness(ctx)
 	})
@@ -65,4 +68,17 @@ func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallId
 		err = preflight.RequireExpansionResultForRequest(result, request, observed.Clock.Now)
 	}
 	return request, result, err
+}
+
+func evaluateHeadscaleDeployPreflight(ctx context.Context, installed release.InstallIdentity, installationID, headscaleID, controlDomain string, generation uint64) (preflight.ExpansionRequest, preflight.Result, error) {
+	account, err := managedheadscale.ValidateAccount(installationID, headscaleID)
+	if err != nil {
+		return preflight.ExpansionRequest{}, preflight.Result{}, err
+	}
+	return evaluateHeadscalePreflight(ctx, installed, controlDomain, generation,
+		preflight.ManagedPathRequirement{Path: "/etc/lanpanel-headscale", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: account.GID, RequiredMode: 0o710, MaximumMode: 0o710, AllowAbsent: true},
+		preflight.ManagedPathRequirement{Path: "/etc/systemd/system/lanpanel-headscale.service", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o644, MaximumMode: 0o644, AllowAbsent: true},
+		preflight.ManagedPathRequirement{Path: "/var/lib/lanpanel/headscale-control", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true},
+		preflight.ManagedPathRequirement{Path: "/var/lib/lanpanel/headscale-runtime", Kind: preflight.ManagedPathDirectory, OwnerUID: account.UID, OwnerGID: account.GID, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true},
+	)
 }

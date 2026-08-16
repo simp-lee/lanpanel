@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration
+.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/closure ./internal/confinement ./internal/contraction ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/headscale ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/process ./internal/relay ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/target ./internal/ui
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./internal/application ./internal/archive ./internal/bootstrap ./internal/child ./internal/closure ./internal/confinement ./internal/contraction ./internal/control ./internal/dependencies ./internal/domain ./internal/download ./internal/filetxn ./internal/headscale ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/preflight ./internal/process ./internal/relay ./internal/release ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/target ./internal/ui
 GA_REWRITE_PACKAGES := ./internal/acme ./internal/activation ./internal/basic ./internal/certificates ./internal/challenge ./internal/goaccess ./internal/htpasswdref ./internal/publication ./internal/renewal ./internal/static ./internal/realip ./internal/realip/edgeone ./internal/realiprender ./internal/resource
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realipassets internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
@@ -147,6 +147,18 @@ ga-goaccess-integration:
 	@grep -Fq 'context.WithDeadline(ctx, execution.ActivationDeadline)' internal/application/publication_linux.go
 	@! grep -R -n -E --include='*.go' --exclude='*_test.go' '127\.0\.0\.1:7890' internal/nginx
 
+ga-headscale-candidate-integration:
+	$(GO) test -count=1 ./internal/control ./internal/headscale ./internal/preflight ./internal/domain ./internal/certificates ./internal/challenge ./internal/acme ./internal/safety ./internal/operations ./internal/plans ./internal/child ./internal/roles ./internal/application
+	@grep -Fq 'PrivateNetwork=yes' internal/control/control.go
+	@grep -Fq 'headscale-private-probe' internal/control/control.go
+	@grep -Fq 'UnixSocketPermission: "0700"' internal/control/control.go
+	@grep -Fq 'PublicSTUN: false' internal/control/control.go
+	@grep -Fq 'ProfileHeadscaleStart' internal/child/profiles_linux.go
+	@grep -Fq 'HeadscaleDeployCertificatePending' internal/domain/ga.go
+	@grep -Fq 'RoleCertificateHandoff' internal/application/headscale_stage_linux.go
+	@! grep -R -n -E 'BeginHeadscaleDeploy|CreateHeadscaleDeployPlan|HeadscaleDeployPayload' internal/helperproto internal/helper internal/ui
+	@! grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command|os\.StartProcess|/bin/(sh|bash|dash)' internal/control
+
 ga-headscale-integration:
 	$(GO) test -count=1 ./internal/dependencies ./internal/release ./internal/headscale ./internal/domain ./internal/reservations ./internal/preflight ./internal/operations ./internal/helperproto ./internal/application ./internal/helper ./internal/ui ./internal/child ./internal/bootstrap ./internal/download ./internal/archive
 	@grep -Fq 'SupportedHeadscaleConfigContract' internal/release/identity.go
@@ -163,4 +175,4 @@ ga-managed-process-integration:
 	@grep -Fq 'SocketBindDeny=any' internal/confinement/policy_linux.go
 	@grep -Fq 'PR_SET_NO_NEW_PRIVS' internal/process/managed_exec_linux.go
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-temporary-publication-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-temporary-publication-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit

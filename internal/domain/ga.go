@@ -214,10 +214,25 @@ type HeadscaleAppliedIdentity struct {
 	CertificateID   string `json:"certificate_id"`
 }
 
+type HeadscaleDeployPhase string
+
+const (
+	HeadscaleDeployPrepared           HeadscaleDeployPhase = "prepared"
+	HeadscaleDeployCertificatePending HeadscaleDeployPhase = "certificate_pending"
+	HeadscaleDeployCertificateStaged  HeadscaleDeployPhase = "certificate_staged"
+	HeadscaleDeployContracted         HeadscaleDeployPhase = "contracted"
+)
+
 type HeadscaleDeployIntent struct {
-	Generation uint64                    `json:"generation"`
-	Candidate  HeadscaleAppliedIdentity  `json:"candidate"`
-	Prior      *HeadscaleAppliedIdentity `json:"prior,omitempty"`
+	Generation             uint64                    `json:"generation"`
+	PlanID                 string                    `json:"plan_id"`
+	JobID                  string                    `json:"job_id"`
+	Phase                  HeadscaleDeployPhase      `json:"phase"`
+	PreflightDigest        string                    `json:"preflight_digest"`
+	CertificateBinding     string                    `json:"certificate_binding"`
+	CertificateFingerprint string                    `json:"certificate_fingerprint,omitempty"`
+	Candidate              HeadscaleAppliedIdentity  `json:"candidate"`
+	Prior                  *HeadscaleAppliedIdentity `json:"prior,omitempty"`
 }
 
 type HeadscaleDomain struct {
@@ -237,7 +252,7 @@ type HeadscaleDomain struct {
 }
 
 func HeadscaleManagedPaths() []string {
-	return []string{"/etc/lanpanel/headscale", "/etc/sysusers.d/lanpanel-headscale.conf", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-initialize.json"}
+	return []string{"/etc/lanpanel-headscale", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
 }
 
 type TailnetConnector struct {
@@ -729,7 +744,7 @@ func validateHeadscale(value HeadscaleDomain) error {
 	if !validSHA256Digest(value.Artifact.BaselineDigest) || !headscaleVersionPattern.MatchString(value.Artifact.Version) || !validSHA256Digest(value.Artifact.ArchiveDigest) || !validSHA256Digest(value.Artifact.ExecutableDigest) || !headscaleRefPattern.MatchString(value.Artifact.ConfigContract) || !validSHA256Digest(value.Artifact.ConfigContractDigest) {
 		return fmt.Errorf("headscale.artifact identity is incomplete")
 	}
-	if len(value.Database.UUID) != 36 || !strings.HasPrefix(value.Database.UUID, "hdb_") || !idPattern.MatchString("hds_"+value.Database.UUID[4:]) || value.Database.SQLitePath != "/var/lib/lanpanel/headscale/db.sqlite" || !validSHA256Digest(value.Database.IdentityBundleDigest) || value.Database.Generation == 0 {
+	if len(value.Database.UUID) != 36 || !strings.HasPrefix(value.Database.UUID, "hdb_") || !idPattern.MatchString("hds_"+value.Database.UUID[4:]) || value.Database.SQLitePath != "/var/lib/lanpanel/headscale-runtime/db.sqlite" || !validSHA256Digest(value.Database.IdentityBundleDigest) || value.Database.Generation == 0 {
 		return fmt.Errorf("headscale.database identity is incomplete")
 	}
 	switch value.Database.Phase {
@@ -756,7 +771,13 @@ func validateHeadscale(value HeadscaleDomain) error {
 		return fmt.Errorf("headscale enabled and applied identity must agree")
 	}
 	if value.DeployIntent != nil {
-		if value.DeployIntent.Generation == 0 || value.DeployIntent.Generation != value.DeployIntent.Candidate.Generation || validateHeadscaleApplied(value.DeployIntent.Candidate) != nil || value.DeployIntent.Prior != nil && (value.Applied == nil || !reflect.DeepEqual(value.DeployIntent.Prior, value.Applied) || validateHeadscaleApplied(*value.DeployIntent.Prior) != nil) {
+		intent := value.DeployIntent
+		validPhase := intent.Phase == HeadscaleDeployPrepared || intent.Phase == HeadscaleDeployCertificatePending || intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployContracted
+		validFingerprint := intent.CertificateFingerprint == ""
+		if intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployContracted && intent.CertificateFingerprint != "" {
+			validFingerprint = validSHA256Digest(intent.CertificateFingerprint)
+		}
+		if intent.Generation == 0 || intent.Generation != intent.Candidate.Generation || !validOpaqueTargetID(intent.PlanID) || !validOpaqueTargetID(intent.JobID) || !validPhase || !validSHA256Digest(intent.PreflightDigest) || !validSHA256Digest(intent.CertificateBinding) || !validFingerprint || validateHeadscaleApplied(intent.Candidate) != nil || intent.Prior != nil && (value.Applied == nil || !reflect.DeepEqual(intent.Prior, value.Applied) || validateHeadscaleApplied(*intent.Prior) != nil) || intent.Prior == nil && value.Applied != nil {
 			return fmt.Errorf("headscale deploy intent is invalid")
 		}
 	}
@@ -764,6 +785,22 @@ func validateHeadscale(value HeadscaleDomain) error {
 		return fmt.Errorf("headscale last operation identity is invalid")
 	}
 	return nil
+}
+
+func ValidateHeadscale(value HeadscaleDomain) error {
+	if !strings.HasPrefix(value.ID, "hds_") || !idPattern.MatchString(value.ID) {
+		return fmt.Errorf("headscale.id is invalid")
+	}
+	if err := validateDomain(value.ControlDomain); err != nil {
+		return fmt.Errorf("headscale.control_domain: %w", err)
+	}
+	if err := validateDomain(value.MagicDNSNamespace); err != nil {
+		return fmt.Errorf("headscale.magicdns_namespace: %w", err)
+	}
+	if value.ControlDomain == value.MagicDNSNamespace {
+		return fmt.Errorf("headscale control and MagicDNS domains conflict")
+	}
+	return validateHeadscale(value)
 }
 
 func validateHeadscaleApplied(value HeadscaleAppliedIdentity) error {

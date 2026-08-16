@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/jobs"
@@ -56,6 +57,7 @@ const (
 	StartupContraction       Type = "startup_activation_contraction"
 	GoAccessRetirement       Type = "goaccess_retirement_reconciliation"
 	HeadscaleInitialize      Type = "headscale_initialize"
+	HeadscaleDeploy          Type = "deploy"
 	ResourceCreate           Type = "resource_create"
 	ResourceUpdate           Type = "resource_update"
 	ProcessStart             Type = "process_start"
@@ -94,6 +96,7 @@ type SafetyBinding struct {
 	CandidateBundle         string                              `json:"candidate_bundle,omitempty"`
 	ChallengeMethod         string                              `json:"challenge_method,omitempty"`
 	CertificateIdentity     string                              `json:"certificate_identity,omitempty"`
+	ACMEBinding             string                              `json:"acme_binding,omitempty"`
 	InstallationID          string                              `json:"installation_id,omitempty"`
 	GoAccessSource          string                              `json:"goaccess_source,omitempty"`
 	GoAccessSourceJobID     string                              `json:"goaccess_source_job_id,omitempty"`
@@ -136,6 +139,11 @@ type HeadscaleInitializationBinding struct {
 	PreflightRequest preflight.ExpansionRequest `json:"preflight_request"`
 	PreflightResult  preflight.Result           `json:"preflight_result"`
 }
+type HeadscaleDeployBinding struct {
+	Candidate        control.Candidate          `json:"candidate"`
+	PreflightRequest preflight.ExpansionRequest `json:"preflight_request"`
+	PreflightResult  preflight.Result           `json:"preflight_result"`
+}
 
 type Reservation struct {
 	SchemaVersion       string                          `json:"schema_version"`
@@ -144,6 +152,7 @@ type Reservation struct {
 	OperationBinding    string                          `json:"operation_binding,omitempty"`
 	CertificateHandoff  *CertificatePublicationHandoff  `json:"certificate_handoff,omitempty"`
 	HeadscaleBinding    *HeadscaleInitializationBinding `json:"headscale_initialization,omitempty"`
+	HeadscaleDeploy     *HeadscaleDeployBinding         `json:"headscale_deploy,omitempty"`
 	AdmissionSource     AdmissionSource                 `json:"admission_source"`
 	Operation           Type                            `json:"operation"`
 	Target              string                          `json:"target"`
@@ -166,6 +175,18 @@ type ContractionCommit struct {
 
 type HeadscaleInitializeCommit struct {
 	Headscale domain.HeadscaleDomain
+}
+type HeadscaleDeployBeginCommit struct {
+	HeadscaleID string
+	Intent      domain.HeadscaleDeployIntent
+}
+type HeadscaleDeployStagedCommit struct {
+	HeadscaleID       string
+	InitializedDigest string
+}
+type HeadscaleCertificateStagedCommit struct {
+	HeadscaleID string
+	Fingerprint string
 }
 
 type ResourceCreateCommit struct {
@@ -273,6 +294,7 @@ type AdmitRequest struct {
 	Source           AdmissionSource
 	SafetyBinding    SafetyBinding
 	HeadscaleBinding *HeadscaleInitializationBinding
+	HeadscaleDeploy  *HeadscaleDeployBinding
 	ExpectedRevision uint64
 }
 type ConsumeRequest struct {
@@ -492,8 +514,16 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err := validateHeadscaleInitializationBinding(request.Operation, request.SafetyBinding, request.HeadscaleBinding); err != nil {
 		return jobs.Record{}, err
 	}
+	if err := validateHeadscaleDeployBinding(request.Operation, request.SafetyBinding, request.HeadscaleDeploy); err != nil {
+		return jobs.Record{}, err
+	}
 	if request.Operation == HeadscaleInitialize {
 		if err := preflight.RequireExpansionResultForRequest(request.HeadscaleBinding.PreflightResult, request.HeadscaleBinding.PreflightRequest, observedNow); err != nil {
+			return jobs.Record{}, err
+		}
+	}
+	if request.Operation == HeadscaleDeploy {
+		if err := preflight.RequireExpansionResultForRequest(request.HeadscaleDeploy.PreflightResult, request.HeadscaleDeploy.PreflightRequest, observedNow); err != nil {
 			return jobs.Record{}, err
 		}
 	}
@@ -512,7 +542,7 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, CreatedAt: observedNow}
+	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
 		active, err := activeGraphCount(transaction)
 		if err != nil {
@@ -945,6 +975,168 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 		return nil
 	})
 	return result, err
+}
+
+func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID, childID, closureDigest string) (Reservation, ChildRecord, *MutationLease, *locks.Lease, error) {
+	if admitter == nil || mutationSet == nil || manager == nil || !exactDigest(closureDigest) {
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge contraction authority is invalid")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return Reservation{}, ChildRecord{}, nil, nil, err
+	}
+	document, err := admitter.normal.Read()
+	if err != nil || document.Revision != expectedRevision {
+		return Reservation{}, ChildRecord{}, nil, nil, errors.Join(err, persist.ErrRevision)
+	}
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || intent.Consumption == nil || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered && intent.Phase != PhaseTerminal) {
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge is not contraction-recoverable")
+	}
+	state, err := admitter.safety.Read()
+	if err != nil || !exactCertificateChallenge(state, intent.SafetyBinding) {
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge contraction safety authority changed")
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
+	if err != nil {
+		return Reservation{}, ChildRecord{}, nil, nil, err
+	}
+	fail := func(cause error) (Reservation, ChildRecord, *MutationLease, *locks.Lease, error) {
+		return Reservation{}, ChildRecord{}, nil, nil, errors.Join(cause, ReleaseExposure(mutation, exposure))
+	}
+	if intent.Phase == PhaseTerminal {
+		rawChild, present := document.Entries["children/"+childID]
+		var current ChildRecord
+		if !present || decodeStrict(rawChild, &current) != nil || current.ID != childID || current.JobID != jobID || current.State != ChildTerminal {
+			return fail(fmt.Errorf("terminal Headscale contraction child authority changed"))
+		}
+		return intent, current, mutation, exposure, nil
+	}
+	var result Reservation
+	var childResult ChildRecord
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		fresh, err := loadReservation(transaction, jobID)
+		if err != nil || !reflect.DeepEqual(fresh, intent) {
+			return errors.Join(err, fmt.Errorf("Headscale contraction intent changed"))
+		}
+		rawChild, present := transaction.Get("children/" + childID)
+		if !present {
+			return fmt.Errorf("Headscale contraction child is missing")
+		}
+		var current ChildRecord
+		if err := decodeStrict(rawChild, &current); err != nil || current.ID != childID || current.JobID != jobID || current.Operation != HeadscaleDeploy || current.Target != fresh.Target || current.IntentGeneration != fresh.IntentGeneration {
+			return fmt.Errorf("Headscale contraction child authority changed")
+		}
+		if current.State != ChildTerminal {
+			current.State = ChildTerminal
+			current.TerminalAt = &observedNow
+			current.Outcome = ChildUnknown
+			current.ResultDigest = closureDigest
+			encodedChild, err := persist.EncodeEntry(current)
+			if err != nil {
+				return err
+			}
+			if err := transaction.Replace("children/"+childID, encodedChild); err != nil {
+				return err
+			}
+		}
+		if fresh.Phase == PhaseRemoteWait {
+			fresh.Phase = PhaseReentered
+		}
+		encodedIntent, err := persist.EncodeEntry(fresh)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), encodedIntent); err != nil {
+			return err
+		}
+		result, childResult = fresh, current
+		return nil
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return result, childResult, mutation, exposure, nil
+}
+
+func (admitter *Admitter) ContractHeadscaleDeployChallenge(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, journalID string) error {
+	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("Headscale challenge terminal contraction requires exact locks")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
+			return fmt.Errorf("Headscale challenge contraction intent changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil || installation.Headscale == nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID {
+			return fmt.Errorf("Headscale challenge contraction domain authority changed")
+		}
+		journalRaw, present := transaction.Get("journals/" + journalID)
+		var journal JournalRecord
+		if !present || decodeStrict(journalRaw, &journal) != nil || journal.ID != journalID || journal.JobID != jobID || journal.Kind != JournalCertificateActivation || (journal.Phase != JournalPrepared && journal.Phase != JournalActive && journal.Phase != JournalTerminal) {
+			return fmt.Errorf("Headscale challenge contraction journal changed")
+		}
+		if intent.Phase == PhaseTerminal {
+			record, recordErr := jobs.Load(transaction, jobID)
+			if recordErr != nil || record.Status != jobs.StatusTerminal || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployContracted || journal.Phase != JournalTerminal {
+				return fmt.Errorf("Headscale challenge terminal authority is incomplete")
+			}
+			return nil
+		}
+		if (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || (installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged) {
+			return fmt.Errorf("Headscale challenge is not terminal-contractible")
+		}
+		for _, childID := range journal.ChildIDs {
+			rawChild, present := transaction.Get("children/" + childID)
+			var child ChildRecord
+			if !present || decodeStrict(rawChild, &child) != nil || child.JobID != jobID || child.State != ChildTerminal {
+				return fmt.Errorf("Headscale challenge child closure is incomplete")
+			}
+		}
+		journal.Phase = JournalTerminal
+		encodedJournal, err := persist.EncodeEntry(journal)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("journals/"+journalID, encodedJournal); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "headscale_candidate_contracted", Status: jobs.PostconditionVerified, Identity: jobID}}, ErrorCode: "certificate_executor_interrupted"}, observedNow)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		encodedIntent, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), encodedIntent); err != nil {
+			return err
+		}
+		headscale := *installation.Headscale
+		deploy := *headscale.DeployIntent
+		deploy.Phase = domain.HeadscaleDeployContracted
+		headscale.DeployIntent = &deploy
+		installation.Headscale = &headscale
+		encodedInstallation, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", encodedInstallation)
+	})
+	return err
 }
 
 func (admitter *Admitter) EnterRemoteWait(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
@@ -3203,6 +3395,112 @@ func (admitter *Admitter) CommitHeadscaleInitialize(ctx context.Context, mutatio
 	return err
 }
 
+func (admitter *Admitter) CommitHeadscaleDeployBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployBeginCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || commit.Intent.JobID != jobID || commit.Intent.Phase != domain.HeadscaleDeployPrepared {
+		return fmt.Errorf("Headscale deploy begin requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleDeploy || intent.AdmissionSource != AdmissionPlan || intent.Phase != PhaseLocalIntent || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target || intent.Target != string(plans.TargetHeadscale)+"/"+commit.HeadscaleID || commit.Intent.PlanID != intent.PlanID || commit.Intent.Generation != intent.HeadscaleDeploy.Candidate.Generation || commit.Intent.PreflightDigest != intent.HeadscaleDeploy.PreflightResult.RequestDigest || commit.Intent.CertificateBinding != intent.HeadscaleDeploy.Candidate.CertificateBinding {
+			return fmt.Errorf("Headscale deploy begin intent mismatched")
+		}
+		applied, err := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
+		if err != nil || !reflect.DeepEqual(applied, commit.Intent.Candidate) {
+			return fmt.Errorf("Headscale deploy candidate changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.Database.Phase != domain.HeadscaleIdentityCommitted || installation.Headscale.DeployIntent != nil || installation.Headscale.Applied != nil || installation.Headscale.Enabled {
+			return fmt.Errorf("Headscale deploy prior authority changed")
+		}
+		headscale := *installation.Headscale
+		headscale.DeployIntent = &commit.Intent
+		headscale.LastOperation = domain.OperationDeploy
+		headscale.LastJobID = jobID
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitHeadscaleDeployStaged(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployStagedCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.InitializedDigest) {
+		return fmt.Errorf("Headscale staged commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseLocalIntent || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
+			return fmt.Errorf("Headscale staged operation intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployPrepared {
+			return fmt.Errorf("Headscale staged domain intent mismatched")
+		}
+		headscale := *installation.Headscale
+		nextIntent := *headscale.DeployIntent
+		nextIntent.Phase = domain.HeadscaleDeployCertificatePending
+		headscale.DeployIntent = &nextIntent
+		headscale.Database.Phase = domain.HeadscaleInitialized
+		headscale.Database.InitializedDigest = commit.InitializedDigest
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitHeadscaleCertificateStaged(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleCertificateStagedCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.Fingerprint) {
+		return fmt.Errorf("Headscale certificate staged commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseReentered || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
+			return fmt.Errorf("Headscale certificate reentry mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending || installation.Headscale.DeployIntent.Candidate.CertificateID != intent.HeadscaleDeploy.Candidate.CertificateID {
+			return fmt.Errorf("Headscale certificate domain intent mismatched")
+		}
+		headscale := *installation.Headscale
+		nextIntent := *headscale.DeployIntent
+		nextIntent.Phase = domain.HeadscaleDeployCertificateStaged
+		nextIntent.CertificateFingerprint = commit.Fingerprint
+		headscale.DeployIntent = &nextIntent
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ResourceCreateCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Resource.ID == "" {
 		return fmt.Errorf("resource creation commit requires exact authority")
@@ -4053,6 +4351,10 @@ func exactCertificatePublicationAuthority(state safety.State, intent Reservation
 	return false
 }
 func exactCertificateChallenge(state safety.State, binding SafetyBinding) bool {
+	if binding.ResourceID == "headscale" {
+		pending := state.Headscale.ChallengePending
+		return pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.ConfigDigest == binding.CandidateDigest && pending.ACMEBinding == binding.ACMEBinding && pending.CertificateIdentity == binding.CertificateIdentity
+	}
 	for _, resource := range state.Resources {
 		pending := resource.ChallengePending
 		if resource.ResourceID == binding.ResourceID && pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle {
@@ -4078,7 +4380,7 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 		return err
 	}
 	if !isContraction(intent.Operation) && currentDigest != intent.Consumption.SafetyDigest {
-		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew) && exactCertificateChallenge(state, intent.SafetyBinding)
+		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew || intent.Operation == HeadscaleDeploy) && exactCertificateChallenge(state, intent.SafetyBinding)
 		certificateHandoff := intent.Operation == Publish && exactCertificatePublicationAuthority(state, intent)
 		if !ownedChallenge && !certificateHandoff {
 			return fmt.Errorf("contraction or safety transition preempted operation authority")
@@ -4167,6 +4469,15 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		}
 		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil || resource.ChallengePending != nil || resource.Reactivating != nil {
 			return fmt.Errorf("resource lifecycle or expansion authority blocks process operation")
+		}
+	}
+	if operation == HeadscaleDeploy {
+		if state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported {
+			return fmt.Errorf("global safety authority blocks Headscale deploy")
+		}
+		ownedChallenge := exactCertificateChallenge(state, binding)
+		if state.Headscale.CertificateExpiry != nil || state.Headscale.Reactivating != nil || state.Headscale.ChallengePending != nil && !ownedChallenge {
+			return fmt.Errorf("Headscale marker authority blocks deploy")
 		}
 	}
 	if operation == CertificateRenew {
@@ -4258,6 +4569,8 @@ func requirePreflightEvidence(operation Type, target string, evidence []plans.Ev
 	switch operation {
 	case Publish:
 		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionDomainHTTPS, preflight.ExpansionTemporaryHTTP}, target, evidence, now)
+	case HeadscaleDeploy:
+		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionHeadscale}, "headscale", evidence, now)
 	case PackageTransaction:
 		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, target, evidence, now)
 	case Unpublish:
@@ -4704,8 +5017,8 @@ func validateJournalRecord(value JournalRecord) error {
 			return err
 		}
 		exactResource := len(value.ResourceIDs) == 1 && value.Target == "resource/"+value.ResourceIDs[0]
-		exactHeadscale := len(value.ResourceIDs) == 0 && value.Target == "headscale"
-		if value.Operation != Publish && value.Operation != CertificateRenew || !exactResource && !exactHeadscale {
+		exactHeadscale := len(value.ResourceIDs) == 0 && (value.Target == "headscale" || strings.HasPrefix(value.Target, "headscale/"))
+		if value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy || !exactResource && !exactHeadscale {
 			return fmt.Errorf("certificate activation journal identity is invalid")
 		}
 	} else if value.Kind == JournalAppActivation {
@@ -4875,6 +5188,59 @@ func validateLinks(document persist.Document) error {
 			return fmt.Errorf("job %q has no operation intent", record.ID)
 		}
 	}
+	if raw, present := document.Entries["installations/current"]; present {
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return err
+		}
+		if installation.Headscale != nil && installation.Headscale.DeployIntent != nil {
+			deploy := installation.Headscale.DeployIntent
+			intent, ok := intents[deploy.JobID]
+			if !ok || intent.Operation != HeadscaleDeploy || intent.PlanID != deploy.PlanID || intent.HeadscaleDeploy == nil || intent.HeadscaleDeploy.Candidate.HeadscaleID != installation.Headscale.ID || intent.HeadscaleDeploy.Candidate.CertificateBinding != deploy.CertificateBinding || intent.HeadscaleDeploy.PreflightResult.RequestDigest != deploy.PreflightDigest {
+				return fmt.Errorf("Headscale deploy domain intent has no exact operation authority")
+			}
+			applied, err := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
+			if err != nil || !reflect.DeepEqual(applied, deploy.Candidate) {
+				return fmt.Errorf("Headscale deploy candidate authority changed")
+			}
+			switch deploy.Phase {
+			case domain.HeadscaleDeployPrepared:
+				if intent.Phase != PhaseLocalIntent {
+					return fmt.Errorf("prepared Headscale deploy is outside local intent")
+				}
+			case domain.HeadscaleDeployCertificatePending:
+				if intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered {
+					return fmt.Errorf("pending Headscale certificate is outside remote authority")
+				}
+			case domain.HeadscaleDeployContracted:
+				if intent.Phase != PhaseTerminal {
+					return fmt.Errorf("contracted Headscale deploy is not terminal")
+				}
+				rawJournal, present := document.Entries["journals/certificate-"+deploy.JobID]
+				if !present {
+					return fmt.Errorf("contracted Headscale certificate journal is missing")
+				}
+				var journal JournalRecord
+				if err := decodeStrict(rawJournal, &journal); err != nil || journal.Phase != JournalTerminal {
+					return fmt.Errorf("contracted Headscale certificate journal is not terminal")
+				}
+			case domain.HeadscaleDeployCertificateStaged:
+				if intent.Phase != PhaseReentered {
+					return fmt.Errorf("staged Headscale certificate is outside reentry authority")
+				}
+				rawJournal, present := document.Entries["journals/certificate-"+deploy.JobID]
+				if !present {
+					return fmt.Errorf("staged Headscale certificate journal is missing")
+				}
+				var journal JournalRecord
+				if err := decodeStrict(rawJournal, &journal); err != nil || journal.Certificate == nil || journal.Certificate.CandidateFingerprint != deploy.CertificateFingerprint {
+					return fmt.Errorf("staged Headscale certificate fingerprint changed")
+				}
+			default:
+				return fmt.Errorf("Headscale deploy domain phase is invalid")
+			}
+		}
+	}
 	childKeys := persist.EntryKeys(document, "children")
 	journalKeys := persist.EntryKeys(document, "journals")
 	var installationID string
@@ -5012,31 +5378,91 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		return fmt.Errorf("installation authority outside Headscale/resources changed")
 	}
 	if !reflect.DeepEqual(oldInstallation.Headscale, newInstallation.Headscale) {
-		if oldInstallation.Headscale != nil || newInstallation.Headscale == nil {
-			return fmt.Errorf("Headscale identity cannot be removed or changed by initialization")
-		}
-		headscale := newInstallation.Headscale
-		if headscale.LastJobID == "" || headscale.LastOperation != domain.OperationDeploy {
-			return fmt.Errorf("Headscale initialization lacks durable job identity")
-		}
-		beforeIntent, err := loadReservationEntries(before.Entries, headscale.LastJobID)
-		if err != nil {
-			return err
-		}
-		afterIntent, err := loadReservationEntries(after.Entries, headscale.LastJobID)
-		if err != nil {
-			return err
-		}
-		beforeRecord, err := jobs.LoadEntries(before.Entries, headscale.LastJobID)
-		if err != nil {
-			return err
-		}
-		afterRecord, err := jobs.LoadEntries(after.Entries, headscale.LastJobID)
-		if err != nil {
-			return err
-		}
-		if beforeIntent.Operation != HeadscaleInitialize || afterIntent.Operation != HeadscaleInitialize || beforeIntent.Target != string(plans.TargetInstallation) || afterIntent.Target != string(plans.TargetInstallation) || beforeIntent.Phase != PhaseReentered || afterIntent.Phase != PhaseReentered || beforeRecord.Status != jobs.StatusRunning || afterRecord.Status != jobs.StatusRunning {
-			return fmt.Errorf("Headscale initialization changed outside its running local intent")
+		if oldInstallation.Headscale == nil {
+			if newInstallation.Headscale == nil {
+				return fmt.Errorf("Headscale initialization candidate disappeared")
+			}
+			headscale := newInstallation.Headscale
+			if headscale.LastJobID == "" || headscale.LastOperation != domain.OperationDeploy {
+				return fmt.Errorf("Headscale initialization lacks durable job identity")
+			}
+			beforeIntent, err := loadReservationEntries(before.Entries, headscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			afterIntent, err := loadReservationEntries(after.Entries, headscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			beforeRecord, err := jobs.LoadEntries(before.Entries, headscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			afterRecord, err := jobs.LoadEntries(after.Entries, headscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			if beforeIntent.Operation != HeadscaleInitialize || afterIntent.Operation != HeadscaleInitialize || beforeIntent.Target != string(plans.TargetInstallation) || afterIntent.Target != string(plans.TargetInstallation) || beforeIntent.Phase != PhaseReentered || afterIntent.Phase != PhaseReentered || beforeRecord.Status != jobs.StatusRunning || afterRecord.Status != jobs.StatusRunning {
+				return fmt.Errorf("Headscale initialization changed outside its running local intent")
+			}
+		} else {
+			if newInstallation.Headscale == nil || domain.ValidateHeadscaleTransition(*oldInstallation.Headscale, *newInstallation.Headscale) != nil {
+				return fmt.Errorf("Headscale identity cannot be removed or changed by deploy")
+			}
+			oldHeadscale, newHeadscale := oldInstallation.Headscale, newInstallation.Headscale
+			if newHeadscale.DeployIntent == nil || newHeadscale.LastJobID == "" || newHeadscale.LastOperation != domain.OperationDeploy {
+				return fmt.Errorf("Headscale deploy lacks durable intent")
+			}
+			expected := *oldHeadscale
+			beforePhase, afterPhase := PhaseLocalIntent, PhaseLocalIntent
+			beforeStatus, afterStatus := jobs.StatusRunning, jobs.StatusRunning
+			contracting := false
+			switch {
+			case oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployPrepared:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				expected.LastJobID = newHeadscale.LastJobID
+				expected.LastOperation = domain.OperationDeploy
+			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployPrepared && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				expected.Database.Phase = domain.HeadscaleInitialized
+				expected.Database.InitializedDigest = newHeadscale.Database.InitializedDigest
+			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+			case oldHeadscale.DeployIntent != nil && (oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged) && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployContracted:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				beforePhase, afterPhase = PhaseReentered, PhaseTerminal
+				beforeStatus, afterStatus = jobs.StatusRunning, jobs.StatusTerminal
+				contracting = true
+			default:
+				return fmt.Errorf("Headscale deploy state transition is not owned")
+			}
+			if !reflect.DeepEqual(expected, *newHeadscale) {
+				return fmt.Errorf("Headscale deploy changed unrelated authority")
+			}
+			beforeIntent, err := loadReservationEntries(before.Entries, newHeadscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			afterIntent, err := loadReservationEntries(after.Entries, newHeadscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			beforeRecord, err := jobs.LoadEntries(before.Entries, newHeadscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			afterRecord, err := jobs.LoadEntries(after.Entries, newHeadscale.LastJobID)
+			if err != nil {
+				return err
+			}
+			phaseValid := beforeIntent.Phase == beforePhase && afterIntent.Phase == afterPhase
+			if contracting {
+				phaseValid = (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && afterIntent.Phase == PhaseTerminal
+			}
+			if beforeIntent.Operation != HeadscaleDeploy || afterIntent.Operation != HeadscaleDeploy || beforeIntent.Target != string(plans.TargetHeadscale)+"/"+newHeadscale.ID || afterIntent.Target != string(plans.TargetHeadscale)+"/"+newHeadscale.ID || !phaseValid || beforeRecord.Status != beforeStatus || afterRecord.Status != afterStatus {
+				return fmt.Errorf("Headscale deploy changed outside its running exact intent")
+			}
 		}
 	}
 	oldResources := map[string]domain.AppResource{}
@@ -5514,6 +5940,26 @@ func validateHeadscaleInitializationBinding(operation Type, safetyBinding Safety
 	return nil
 }
 
+func validateHeadscaleDeployBinding(operation Type, safetyBinding SafetyBinding, binding *HeadscaleDeployBinding) error {
+	if operation != HeadscaleDeploy {
+		if binding != nil || safetyBinding.ACMEBinding != "" {
+			return fmt.Errorf("unrelated operation carried Headscale deploy authority")
+		}
+		return nil
+	}
+	if binding == nil || control.Validate(binding.Candidate) != nil || binding.Candidate.ConfigDigest != safetyBinding.CandidateDigest || binding.Candidate.CertificateBinding != safetyBinding.ACMEBinding || binding.Candidate.CertificateID != safetyBinding.CertificateIdentity {
+		return fmt.Errorf("Headscale deploy authority is invalid")
+	}
+	candidateDigest, err := control.Digest(binding.Candidate)
+	if err != nil || candidateDigest != safetyBinding.CandidateBundle || binding.PreflightRequest.Scope != preflight.ExpansionHeadscale || binding.PreflightRequest.Target != "headscale" || binding.PreflightRequest.Generation != binding.Candidate.DatabaseGeneration {
+		return fmt.Errorf("Headscale deploy authority is invalid")
+	}
+	if err := preflight.RequireExpansionResultForRequest(binding.PreflightResult, binding.PreflightRequest, binding.PreflightResult.ObservedAt); err != nil {
+		return fmt.Errorf("Headscale deploy preflight authority is invalid")
+	}
+	return nil
+}
+
 func journalProxy(value string) *sources.Proxy {
 	if value == "" {
 		return nil
@@ -5522,10 +5968,13 @@ func journalProxy(value string) *sources.Proxy {
 }
 
 func validateReservation(value Reservation) error {
-	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
+	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || value.SafetyBinding.ACMEBinding != "" && !exactDigest(value.SafetyBinding.ACMEBinding) || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
 		return fmt.Errorf("operation certificate challenge binding invalid")
 	}
 	if err := validateHeadscaleInitializationBinding(value.Operation, value.SafetyBinding, value.HeadscaleBinding); err != nil {
+		return err
+	}
+	if err := validateHeadscaleDeployBinding(value.Operation, value.SafetyBinding, value.HeadscaleDeploy); err != nil {
 		return err
 	}
 	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || value.OperationBinding != "" && !exactDigest(value.OperationBinding) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
@@ -5560,7 +6009,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, HeadscaleDeploy, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -5629,7 +6078,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("Plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, ManagedBasicDelete, BackupEnter:
+		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, ManagedBasicDelete, BackupEnter, HeadscaleDeploy:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}

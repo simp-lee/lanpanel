@@ -49,6 +49,7 @@ var (
 		"external_htpasswd_registration_interrupted": {},
 		"goaccess_retirement_recovery":               {},
 		"goaccess_stop_failed":                       {},
+		"headscale_deploy_revalidation_failed":       {},
 		"normal_revision_changed":                    {},
 		"plan_consumption_rejected":                  {},
 		"planless_start_rejected":                    {},

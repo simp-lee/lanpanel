@@ -34,7 +34,7 @@ type Paths struct {
 }
 
 func FixedPaths() Paths {
-	return Paths{Root: "/", Staging: "/usr/lib/lanpanel/dependencies/.filetxn", Journal: "/var/lib/lanpanel/headscale-initialize.json", JournalStaging: "/var/lib/lanpanel/.bootstrap-filetxn", Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityParent: "/var/lib/lanpanel/headscale", IdentityName: "identity", SQLite: "/var/lib/lanpanel/headscale/db.sqlite"}
+	return Paths{Root: "/", Staging: "/usr/lib/lanpanel/dependencies/.filetxn", Journal: "/var/lib/lanpanel/headscale-initialize.json", JournalStaging: "/var/lib/lanpanel/.bootstrap-filetxn", Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityParent: "/var/lib/lanpanel/headscale", IdentityName: "identity", SQLite: "/var/lib/lanpanel/headscale-runtime/db.sqlite"}
 }
 
 func EnsureLayout(paths Paths, owner filetxn.Owner) error {
@@ -194,7 +194,7 @@ func Install(ctx context.Context, request InstallRequest) error {
 }
 
 func validateInstallRequest(request InstallRequest) error {
-	if request.Paths.Root == "" || !filepath.IsAbs(request.Paths.Root) || request.Paths.Staging == "" || request.Paths.Executable == "" || request.Paths.IdentityParent == "" || request.Paths.IdentityName != "identity" || request.Paths.SQLite == "" || request.Candidate.Database.SQLitePath != "/var/lib/lanpanel/headscale/db.sqlite" {
+	if request.Paths.Root == "" || !filepath.IsAbs(request.Paths.Root) || request.Paths.Staging == "" || request.Paths.Executable == "" || request.Paths.IdentityParent == "" || request.Paths.IdentityName != "identity" || request.Paths.SQLite == "" || request.Candidate.Database.SQLitePath != "/var/lib/lanpanel/headscale-runtime/db.sqlite" {
 		return fmt.Errorf("Headscale host paths are invalid")
 	}
 	if err := release.ValidateInstallIdentity(request.Release); err != nil {
@@ -203,7 +203,7 @@ func validateInstallRequest(request InstallRequest) error {
 	if err := VerifySnapshot(request.Candidate, request.SnapshotBytes); err != nil {
 		return err
 	}
-	if request.Candidate.Artifact.BaselineDigest != "sha256:"+request.Release.DependencyBaseline.Digest || request.Candidate.Artifact.ArchiveDigest != "sha256:"+request.Release.Headscale.Archive.Digest || request.Candidate.Artifact.ConfigContractDigest != "sha256:"+request.Release.Headscale.ConfigContractDigest || request.Candidate.Artifact.Version != request.Release.Headscale.Version || request.Candidate.Artifact.ConfigContract != request.Release.Headscale.ConfigContract || request.Paths.Executable != rooted(request.Paths.Root, request.Release.Headscale.InstallPath) || request.Paths.SQLite != rooted(request.Paths.Root, "/var/lib/lanpanel/headscale/db.sqlite") {
+	if request.Candidate.Artifact.BaselineDigest != "sha256:"+request.Release.DependencyBaseline.Digest || request.Candidate.Artifact.ArchiveDigest != "sha256:"+request.Release.Headscale.Archive.Digest || request.Candidate.Artifact.ConfigContractDigest != "sha256:"+request.Release.Headscale.ConfigContractDigest || request.Candidate.Artifact.Version != request.Release.Headscale.Version || request.Candidate.Artifact.ConfigContract != request.Release.Headscale.ConfigContract || request.Paths.Executable != rooted(request.Paths.Root, request.Release.Headscale.InstallPath) || request.Paths.SQLite != rooted(request.Paths.Root, "/var/lib/lanpanel/headscale-runtime/db.sqlite") {
 		return fmt.Errorf("Headscale candidate differs from installed release authority")
 	}
 	sum := sha256.Sum256(request.ArchiveBytes)

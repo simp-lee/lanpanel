@@ -2101,9 +2101,21 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		return err
 	}
 	defer service.Close()
+	if err := reconcileInterruptedHeadscaleLocalCandidate(ctx, service); err != nil {
+		return err
+	}
 	state, err := service.safety.Read()
 	if err != nil {
 		return err
+	}
+	if state.Headscale.ChallengePending != nil {
+		if err := reconcileInterruptedHeadscaleChallenge(ctx, service, childClosure); err != nil {
+			return err
+		}
+		state, err = service.safety.Read()
+		if err != nil {
+			return err
+		}
 	}
 	for _, resource := range state.Resources {
 		pending := resource.ChallengePending
