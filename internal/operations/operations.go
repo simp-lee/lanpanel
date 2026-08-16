@@ -129,10 +129,12 @@ type CertificatePublicationHandoff struct {
 	ChallengeSafetyDigest string `json:"challenge_safety_digest"`
 }
 type HeadscaleInitializationBinding struct {
-	Candidate domain.HeadscaleDomain `json:"candidate"`
-	Snapshot  json.RawMessage        `json:"snapshot"`
-	Source    sources.Source         `json:"source"`
-	ProxyURL  string                 `json:"proxy_url,omitempty"`
+	Candidate        domain.HeadscaleDomain     `json:"candidate"`
+	Snapshot         json.RawMessage            `json:"snapshot"`
+	Source           sources.Source             `json:"source"`
+	ProxyURL         string                     `json:"proxy_url,omitempty"`
+	PreflightRequest preflight.ExpansionRequest `json:"preflight_request"`
+	PreflightResult  preflight.Result           `json:"preflight_result"`
 }
 
 type Reservation struct {
@@ -489,6 +491,11 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	}
 	if err := validateHeadscaleInitializationBinding(request.Operation, request.SafetyBinding, request.HeadscaleBinding); err != nil {
 		return jobs.Record{}, err
+	}
+	if request.Operation == HeadscaleInitialize {
+		if err := preflight.RequireExpansionResultForRequest(request.HeadscaleBinding.PreflightResult, request.HeadscaleBinding.PreflightRequest, observedNow); err != nil {
+			return jobs.Record{}, err
+		}
 	}
 	state, err := admitter.safety.Read()
 	if err != nil {
@@ -5496,6 +5503,13 @@ func validateHeadscaleInitializationBinding(operation Type, safetyBinding Safety
 	}
 	if binding == nil || binding.Candidate.LastJobID != "" || binding.Candidate.LastOperation != "" || binding.Candidate.DesiredDigest != safetyBinding.CandidateDigest || binding.Candidate.Artifact.ArchiveDigest != safetyBinding.CandidateBundle || managedheadscale.VerifySnapshot(binding.Candidate, binding.Snapshot) != nil || sources.Validate(binding.Source) != nil || binding.Source.Artifact.Name != "headscale" || binding.Source.Artifact.Version != binding.Candidate.Artifact.Version || "sha256:"+binding.Source.Artifact.Digest != binding.Candidate.Artifact.ArchiveDigest || sources.ValidateProxy(journalProxy(binding.ProxyURL)) != nil {
 		return fmt.Errorf("Headscale initialization authority is invalid")
+	}
+	preflightDigest, err := preflight.ExpansionRequestDigest(binding.PreflightRequest)
+	if err != nil || binding.PreflightRequest.Scope != preflight.ExpansionHeadscale || binding.PreflightRequest.Target != "headscale" || binding.PreflightRequest.Generation != binding.Candidate.Database.Generation || binding.PreflightResult.SchemaVersion == "" || binding.PreflightResult.Scope != string(preflight.ExpansionHeadscale) || binding.PreflightResult.Target != "headscale" || binding.PreflightResult.Generation != binding.PreflightRequest.Generation || binding.PreflightResult.RequestDigest != preflightDigest || !binding.PreflightResult.Allowed || binding.PreflightResult.ObservedAt.IsZero() || !binding.PreflightResult.ValidUntil.After(binding.PreflightResult.ObservedAt) {
+		return fmt.Errorf("Headscale initialization authority is invalid")
+	}
+	if err := preflight.RequireExpansionResultForRequest(binding.PreflightResult, binding.PreflightRequest, binding.PreflightResult.ObservedAt); err != nil {
+		return fmt.Errorf("Headscale initialization preflight authority is invalid")
 	}
 	return nil
 }

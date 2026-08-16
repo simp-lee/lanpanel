@@ -16,6 +16,7 @@ import (
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/plans"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"lanpanel/internal/reservations"
 	"lanpanel/internal/sources"
@@ -43,6 +44,7 @@ type HeadscaleExecution struct {
 	Release      release.InstallIdentity
 	Source       sources.Source
 	ProxyURL     string
+	Preflight    preflight.ExpansionRequest
 	RemoteWait   bool
 	Resuming     bool
 }
@@ -130,6 +132,13 @@ func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInit
 	}
 	execution.Mutation, execution.Exposure = mutation, exposure
 	execution.Revision = document.Revision + 1
+	freshPreflight, _, err := evaluateHeadscalePreflight(ctx, installed, execution.Candidate.ControlDomain, execution.Candidate.Database.Generation)
+	if err != nil {
+		return jobs.Record{}, "", "", err
+	}
+	if !sameHeadscalePreflightPolicy(freshPreflight, execution.Preflight) {
+		return jobs.Record{}, "", "", fmt.Errorf("fresh Headscale preflight policy authority changed")
+	}
 	if err := managedheadscale.ValidateInitializationEvidence(execution.Installation.InstallationID, execution.Candidate, installed, execution.Snapshot, paths, filetxn.Owner{UID: 0, GID: 0}, false); err != nil {
 		return jobs.Record{ID: execution.JobID}, "", "", fmt.Errorf("%w: %v", managedheadscale.ErrForeignEvidence, err)
 	}
@@ -181,6 +190,12 @@ type installationBundleWire struct {
 	Management       identity.ManagementAuthority `json:"management_authority"`
 	Release          release.InstallIdentity      `json:"release"`
 	PreflightDigest  string                       `json:"preflight_digest"`
+}
+
+func sameHeadscalePreflightPolicy(left, right preflight.ExpansionRequest) bool {
+	left.OwnedListeners = nil
+	right.OwnedListeners = nil
+	return reflect.DeepEqual(left, right)
 }
 
 func readCommittedReleaseIdentity() (release.InstallIdentity, error) {
@@ -277,6 +292,10 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 			return fail(err)
 		}
 	}
+	preflightRequest, preflightResult, err := evaluateHeadscalePreflight(ctx, installed, candidate.ControlDomain, candidate.Database.Generation)
+	if err != nil {
+		return fail(err)
+	}
 	next := installation
 	next.Headscale = &candidate
 	if err := domain.ValidateInstallation(next); err != nil {
@@ -295,14 +314,14 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 			return fail(fmt.Errorf("pending Headscale initialization job authority is unavailable"))
 		}
 		intent, err := admitter.OperationIntent(journal.JobID)
-		if err != nil || intent.Operation != operations.HeadscaleInitialize || intent.Target != string(plans.TargetInstallation) || intent.SafetyBinding.CandidateDigest != candidate.DesiredDigest || intent.SafetyBinding.CandidateBundle != candidate.Artifact.ArchiveDigest || intent.HeadscaleBinding == nil || intent.HeadscaleBinding.Candidate.ID != candidate.ID || !slices.Equal(intent.HeadscaleBinding.Snapshot, snapshot) || !reflect.DeepEqual(intent.HeadscaleBinding.Source, journal.Source) || intent.HeadscaleBinding.ProxyURL != journal.ProxyURL {
+		if err != nil || intent.Operation != operations.HeadscaleInitialize || intent.Target != string(plans.TargetInstallation) || intent.SafetyBinding.CandidateDigest != candidate.DesiredDigest || intent.SafetyBinding.CandidateBundle != candidate.Artifact.ArchiveDigest || intent.HeadscaleBinding == nil || intent.HeadscaleBinding.Candidate.ID != candidate.ID || !slices.Equal(intent.HeadscaleBinding.Snapshot, snapshot) || !reflect.DeepEqual(intent.HeadscaleBinding.Source, journal.Source) || intent.HeadscaleBinding.ProxyURL != journal.ProxyURL || !sameHeadscalePreflightPolicy(intent.HeadscaleBinding.PreflightRequest, preflightRequest) {
 			return fail(fmt.Errorf("pending Headscale initialization intent changed"))
 		}
 		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
 		if err != nil {
 			return fail(err)
 		}
-		execution := &HeadscaleExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, JobID: journal.JobID, Revision: document.Revision, Installation: installation, Candidate: candidate, Snapshot: snapshot, Release: installed, Source: journal.Source, ProxyURL: journal.ProxyURL, Resuming: journal.FreshValidated}
+		execution := &HeadscaleExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, JobID: journal.JobID, Revision: document.Revision, Installation: installation, Candidate: candidate, Snapshot: snapshot, Release: installed, Source: journal.Source, ProxyURL: journal.ProxyURL, Preflight: preflightRequest, Resuming: journal.FreshValidated}
 		switch intent.Phase {
 		case operations.PhaseRemoteWait:
 			execution.RemoteWait = true
@@ -333,7 +352,7 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 	if err != nil {
 		return fail(err)
 	}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.HeadscaleInitialize, Target: string(plans.TargetInstallation), ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{CandidateDigest: candidate.DesiredDigest, CandidateBundle: candidate.Artifact.ArchiveDigest}, HeadscaleBinding: &operations.HeadscaleInitializationBinding{Candidate: candidate, Snapshot: append(json.RawMessage(nil), snapshot...), Source: source, ProxyURL: proxyURL}, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.HeadscaleInitialize, Target: string(plans.TargetInstallation), ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{CandidateDigest: candidate.DesiredDigest, CandidateBundle: candidate.Artifact.ArchiveDigest}, HeadscaleBinding: &operations.HeadscaleInitializationBinding{Candidate: candidate, Snapshot: append(json.RawMessage(nil), snapshot...), Source: source, ProxyURL: proxyURL, PreflightRequest: preflightRequest, PreflightResult: preflightResult}, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
@@ -359,7 +378,7 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 		mutationSet.Close()
 		return fail(err)
 	}
-	return &HeadscaleExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Installation: installation, Candidate: candidate, Snapshot: snapshot, Release: installed, Source: source, ProxyURL: proxyURL}, nil
+	return &HeadscaleExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Installation: installation, Candidate: candidate, Snapshot: snapshot, Release: installed, Source: source, ProxyURL: proxyURL, Preflight: preflightRequest}, nil
 }
 
 func (execution *HeadscaleExecution) fail(ctx context.Context, branch, code string, cause error) error {
