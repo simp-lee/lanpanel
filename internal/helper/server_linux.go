@@ -38,6 +38,8 @@ type ExecutionResult struct {
 	Secret       *helperproto.Secret
 	Action       *helperproto.ActionResult
 	Resource     *helperproto.ResourceResult
+	ErrorCode    string
+	ErrorJobID   string
 }
 
 type Executor func(context.Context, helperproto.Caller, helperproto.Request, *helperproto.Secret) (ExecutionResult, error)
@@ -145,6 +147,9 @@ func ContractionCloseHandler(r Revalidator, e Executor) Registration {
 }
 func StartupContractionHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationStartupContraction, r, e)
+}
+func HeadscaleInitializeHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationHeadscaleInitialize, r, e)
 }
 func ResourceMutationHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationResourceMutation, r, e)
@@ -305,6 +310,13 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			if result.Secret != nil {
 				result.Secret.Destroy()
 			}
+			if request.Operation == helperproto.OperationHeadscaleInitialize && result.ErrorCode == "foreign_database_evidence" {
+				response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseRejected, ErrorCode: result.ErrorCode, ErrorJobID: result.ErrorJobID}
+				return helperproto.WriteResponse(connection, request.Operation, response, nil)
+			}
+			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
+		}
+		if result.ErrorCode != "" || result.ErrorJobID != "" {
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
 		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource}

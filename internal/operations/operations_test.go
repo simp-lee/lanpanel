@@ -3,16 +3,20 @@ package operations
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
+	"lanpanel/internal/sources"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1246,12 +1250,77 @@ func testRegistry(t *testing.T) *Registry {
 	return registry
 }
 
+func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer normal.Close()
+	defer mutationSet.Close()
+	defer manager.Close()
+	table, err := NewBranchTable([]ResultBranch{{"complete", jobs.ResultSucceeded, jobs.PostconditionVerified}, {"no_effect", jobs.ResultFailed, jobs.PostconditionVerified}, {"known_residual", jobs.ResultPartial, jobs.PostconditionKnown}, {"executor_died", jobs.ResultInterrupted, jobs.PostconditionKnown}, {"source_unknown", jobs.ResultUnknown, jobs.PostconditionUnobserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry([]Registration{{Operation: HeadscaleInitialize, Owner: "headscale", Results: table}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{8}, 64)), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, _ := normal.Read()
+	candidate := domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.test", MagicDNSNamespace: "mesh.example.test", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: testDigest("baseline"), Version: "0.25.1", ArchiveDigest: testDigest("archive"), ExecutableDigest: testDigest("executable"), ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest("contract")}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: testDigest("config"), ManagedPaths: domain.HeadscaleManagedPaths()}
+	snapshot := managedheadscale.IdentitySnapshot{SchemaVersion: managedheadscale.IdentitySnapshotSchema, InstallationID: "ins_00000000000000000000000000000001", HeadscaleID: candidate.ID, ControlDomain: candidate.ControlDomain, MagicDNSNamespace: candidate.MagicDNSNamespace, Policy: candidate.Policy, Artifact: candidate.Artifact, DatabaseUUID: candidate.Database.UUID, SQLitePath: candidate.Database.SQLitePath, DatabaseGeneration: candidate.Database.Generation, DesiredConfigDigest: candidate.DesiredDigest}
+	snapshotBytes, _ := json.Marshal(snapshot)
+	candidate.Database.IdentityBundleDigest = testDigestBytes(snapshotBytes)
+	snapshot.Artifact = candidate.Artifact
+	snapshotBytes, _ = json.Marshal(snapshot)
+	source := sources.Source{Kind: sources.OfficialCanonical, URL: "https://downloads.example.test/headscale.tar.gz", OfficialAuthorities: []string{"downloads.example.test"}, Artifact: sources.Artifact{Name: "headscale", Version: candidate.Artifact.Version, OperatingOS: "linux", Architecture: "amd64", Digest: strings.TrimPrefix(candidate.Artifact.ArchiveDigest, "sha256:")}}
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: HeadscaleInitialize, Target: "installation", ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: SafetyBinding{CandidateDigest: candidate.DesiredDigest, CandidateBundle: candidate.Artifact.ArchiveDigest}, HeadscaleBinding: &HeadscaleInitializationBinding{Candidate: candidate, Snapshot: snapshotBytes, Source: source}, ExpectedRevision: document.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), "installation", manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, _ = normal.Read()
+	intent, err := admitter.BeginUI(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admitter.EnterRemoteWait(context.Background(), mutation, exposure, intent.IntentGeneration, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	document, _ = normal.Read()
+	_, mutation, exposure, err = admitter.Reenter(context.Background(), mutationSet, manager, document.Revision, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, _ = normal.Read()
+	if _, err := admitter.EnterRemoteWait(context.Background(), mutation, exposure, document.Revision, job.ID); err != nil {
+		t.Fatalf("same durable job could not resume acquisition: %v", err)
+	}
+	resumed, err := admitter.OperationIntent(job.ID)
+	if err != nil || resumed.Phase != PhaseRemoteWait {
+		t.Fatalf("resumed intent=%#v error=%v", resumed, err)
+	}
+}
+
 func operationPlanSpec(now time.Time) plans.Spec {
 	return plans.Spec{Operation: "publish", Target: plans.Target{Kind: plans.TargetResource, ID: "res_00000000000000000000000000000001"}, ActorIdentity: "session-one", Config: plans.DigestBinding{Applicable: true, Digest: testDigest("config")}, Applied: plans.DigestBinding{Applicable: true, Digest: testDigest("applied")}, Evidence: []plans.Evidence{
 		{Kind: "config", Identity: "res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("evidence"), ObservedAt: now},
 		{Kind: preflight.ExpansionEvidencePrefix + string(preflight.ExpansionDomainHTTPS), Identity: "resource/res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("preflight"), ObservedAt: now},
 	}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
 }
+func testDigestBytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }

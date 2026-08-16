@@ -10,6 +10,13 @@ import (
 	"lanpanel/internal/helperproto"
 )
 
+type HelperRejection struct {
+	Code  string
+	JobID string
+}
+
+func (value HelperRejection) Error() string { return "helper rejected request: " + value.Code }
+
 type HelperReply struct {
 	Digest   string
 	Action   *helperproto.ActionResult
@@ -20,6 +27,15 @@ type HelperClient func(context.Context, helperproto.Operation, helperproto.Actio
 type ResourceHelperClient func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error)
 type ResourceMutationPayload struct{ Resource any }
 type ProcessMutationPayload struct{}
+type HeadscaleInitializePayload struct {
+	ControlDomain     string `json:"control_domain"`
+	MagicDNSNamespace string `json:"magicdns_namespace"`
+	SourceKind        string `json:"source_kind"`
+	MirrorURL         string `json:"mirror_url,omitempty"`
+	OfflinePath       string `json:"offline_path,omitempty"`
+	ProxyURL          string `json:"proxy_url,omitempty"`
+	Confirmation      string `json:"confirmation"`
+}
 type ManagedBasicPayload struct {
 	Username     string `json:"username,omitempty"`
 	PlanID       string `json:"plan_id,omitempty"`
@@ -135,6 +151,22 @@ func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelp
 	unpublish, _ := RegisterAction("unpublish", ConfirmationPayload{}, true, false, contractionAction)
 	registrations := []Registration{plan, rotate, basicCreate, basicRotate, basicDelete, staticRootAction, externalHTPasswdAction, domainStatusAction, closeAll, unpublish}
 	if resourceClient != nil {
+		headscaleAction, _ := RegisterAction(domain.OperationDeploy, HeadscaleInitializePayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+			payload := call.Payload.(HeadscaleInitializePayload)
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				return Result{}, err
+			}
+			reply, err := resourceClient(ctx, helperproto.OperationHeadscaleInitialize, helperproto.ResourcePayload{Operation: string(domain.OperationDeploy), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: "initialize", Resource: raw}, "installation")
+			if err != nil {
+				return Result{}, err
+			}
+			if reply.Action == nil || reply.Action.JobID == "" || reply.Action.TargetID == "" || len(reply.Secret) != 0 {
+				return Result{}, fmt.Errorf("Headscale initialization failed")
+			}
+			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
+		})
+		registrations = append(registrations, headscaleAction)
 		resourceAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ResourceMutationPayload)
 			raw, err := json.Marshal(payload.Resource)

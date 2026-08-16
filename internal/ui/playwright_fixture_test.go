@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/session"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,7 +44,7 @@ func TestPlaywrightFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actions, err := application.HelperService(func(_ context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
+	actions, err := application.HelperServiceWithResources(func(_ context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
 		switch operation {
 		case helperproto.OperationApplicationPlan:
 			return application.HelperReply{Digest: InputDigest("plan"), Action: &helperproto.ActionResult{PlanID: "plan-fixture", Confirmation: InputDigest("confirmation"), Operation: string(domain.OperationAdminTokenRotate), TargetKind: string(domain.OperationTargetInstallation), ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_destructive_confirmation", ExpiresAt: time.Now().Add(time.Minute)}}, nil
@@ -53,6 +54,14 @@ func TestPlaywrightFixture(t *testing.T) {
 		default:
 			return application.HelperReply{}, fmt.Errorf("unsupported fixture operation %q", operation)
 		}
+	}, func(_ context.Context, operation helperproto.Operation, payload helperproto.ResourcePayload, target string) (application.HelperReply, error) {
+		if operation != helperproto.OperationHeadscaleInitialize || payload.Operation != string(domain.OperationDeploy) || target != "installation" {
+			return application.HelperReply{}, fmt.Errorf("unsupported fixture resource operation %q", operation)
+		}
+		if strings.Contains(string(payload.Resource), `"control_domain":"foreign.example.test"`) {
+			return application.HelperReply{}, application.HelperRejection{Code: "foreign_database_evidence", JobID: "job_foreign_headscale_fixture"}
+		}
+		return application.HelperReply{Digest: InputDigest("headscale"), Action: &helperproto.ActionResult{JobID: "job-headscale-fixture", Operation: string(domain.OperationDeploy), TargetKind: string(domain.OperationTargetInstallation), TargetID: "hds_00000000000000000000000000000001"}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)

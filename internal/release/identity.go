@@ -5,6 +5,8 @@ import (
 	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/dependencies"
 	"lanpanel/internal/filetxn"
+	"net/url"
+	"os"
 	"reflect"
 	"regexp"
 	"slices"
@@ -29,6 +31,35 @@ type AssetIdentity struct {
 	Path   string `json:"path"`
 	Digest string `json:"digest"`
 	Bytes  uint64 `json:"bytes"`
+}
+
+type ArchiveMemberAuthority struct {
+	Path        string        `json:"path"`
+	Asset       AssetIdentity `json:"asset"`
+	Destination string        `json:"destination"`
+	Mode        uint32        `json:"mode"`
+}
+
+const SupportedHeadscaleConfigContract = "headscale-trusted-mesh-v1"
+
+var supportedHeadscaleConfigContractBytes = []byte(`{"schema_version":"lanpanel.headscale.config-contract.v1","control_backend":"isolated","database":"sqlite","policy":"trusted_mesh","privileged_endpoint":"unix"}`)
+
+func SupportedHeadscaleConfigContractDigest() string {
+	return DigestBytes(supportedHeadscaleConfigContractBytes)
+}
+
+type HeadscaleArtifactAuthority struct {
+	Version               string                   `json:"version"`
+	ArtifactIdentity      string                   `json:"artifact_identity"`
+	Archive               AssetIdentity            `json:"archive"`
+	ArchiveFormat         string                   `json:"archive_format"`
+	MaximumExtractedBytes uint64                   `json:"maximum_extracted_bytes"`
+	RedirectAuthorities   []string                 `json:"redirect_authorities"`
+	Members               []ArchiveMemberAuthority `json:"members"`
+	ExecutableAsset       string                   `json:"executable_asset"`
+	InstallPath           string                   `json:"install_path"`
+	ConfigContract        string                   `json:"config_contract"`
+	ConfigContractDigest  string                   `json:"config_contract_digest"`
 }
 
 type OSProfile struct {
@@ -101,25 +132,26 @@ type NetworkPolicy struct {
 }
 
 type Envelope struct {
-	SchemaVersion             string               `json:"schema_version"`
-	Kind                      EnvelopeKind         `json:"kind"`
-	ReleaseTag                string               `json:"release_tag"`
-	Binary                    AssetIdentity        `json:"binary"`
-	SourceArchive             AssetIdentity        `json:"source_archive"`
-	License                   AssetIdentity        `json:"license"`
-	Notice                    AssetIdentity        `json:"notice"`
-	SBOM                      AssetIdentity        `json:"sbom"`
-	DependencyBaseline        AssetIdentity        `json:"dependency_baseline"`
-	StableChecklist           AssetIdentity        `json:"stable_checklist"`
-	SecurityReport            *AssetIdentity       `json:"security_report,omitempty"`
-	AdditionalAssets          []AssetIdentity      `json:"additional_assets"`
-	Checksums                 AssetIdentity        `json:"checksums"`
-	SourceTreeDigest          string               `json:"source_tree_digest"`
-	EdgeOne                   EdgeOneCapability    `json:"edgeone"`
-	Network                   NetworkPolicy        `json:"network"`
-	QualificationTarget       *OSProfile           `json:"qualification_target_os_profile,omitempty"`
-	SupportedProfiles         []QualifiedOSProfile `json:"supported_os_profiles"`
-	QualificationCandidateOID string               `json:"qualification_candidate_digest,omitempty"`
+	SchemaVersion             string                     `json:"schema_version"`
+	Kind                      EnvelopeKind               `json:"kind"`
+	ReleaseTag                string                     `json:"release_tag"`
+	Binary                    AssetIdentity              `json:"binary"`
+	SourceArchive             AssetIdentity              `json:"source_archive"`
+	License                   AssetIdentity              `json:"license"`
+	Notice                    AssetIdentity              `json:"notice"`
+	SBOM                      AssetIdentity              `json:"sbom"`
+	DependencyBaseline        AssetIdentity              `json:"dependency_baseline"`
+	Headscale                 HeadscaleArtifactAuthority `json:"headscale"`
+	StableChecklist           AssetIdentity              `json:"stable_checklist"`
+	SecurityReport            *AssetIdentity             `json:"security_report,omitempty"`
+	AdditionalAssets          []AssetIdentity            `json:"additional_assets"`
+	Checksums                 AssetIdentity              `json:"checksums"`
+	SourceTreeDigest          string                     `json:"source_tree_digest"`
+	EdgeOne                   EdgeOneCapability          `json:"edgeone"`
+	Network                   NetworkPolicy              `json:"network"`
+	QualificationTarget       *OSProfile                 `json:"qualification_target_os_profile,omitempty"`
+	SupportedProfiles         []QualifiedOSProfile       `json:"supported_os_profiles"`
+	QualificationCandidateOID string                     `json:"qualification_candidate_digest,omitempty"`
 }
 
 type Manifest struct {
@@ -208,6 +240,8 @@ func (verified *VerifiedFinalRelease) ManifestDigest() string {
 func cloneEnvelope(source Envelope) Envelope {
 	cloned := source
 	cloned.AdditionalAssets = append([]AssetIdentity(nil), source.AdditionalAssets...)
+	cloned.Headscale.RedirectAuthorities = append([]string(nil), source.Headscale.RedirectAuthorities...)
+	cloned.Headscale.Members = append([]ArchiveMemberAuthority(nil), source.Headscale.Members...)
 	cloned.SupportedProfiles = append([]QualifiedOSProfile(nil), source.SupportedProfiles...)
 	cloned.Network.ExternalPurposes = append([]string(nil), source.Network.ExternalPurposes...)
 	if source.SecurityReport != nil {
@@ -360,10 +394,20 @@ func verifyEnvelopeAssets(envelope Envelope, checksumBytes []byte, assets map[st
 		return fmt.Errorf("dependency baseline does not bind the exact release OS profile")
 	}
 	var selected *dependencies.Selection
+	var selectedHeadscale *dependencies.Selection
 	for index := range baseline.Selections {
 		if baseline.Selections[index].Component == "lego" {
 			selected = &baseline.Selections[index]
 		}
+		if baseline.Selections[index].Component == "headscale" {
+			selectedHeadscale = &baseline.Selections[index]
+		}
+	}
+	if selectedHeadscale == nil {
+		return fmt.Errorf("dependency baseline omits Headscale authority")
+	}
+	if err := verifyHeadscaleArtifact(envelope.Headscale, *selectedHeadscale, assets); err != nil {
+		return err
 	}
 	var legoArchive, lego *AssetIdentity
 	for index := range envelope.AdditionalAssets {
@@ -393,6 +437,71 @@ func verifyEnvelopeAssets(envelope Envelope, checksumBytes []byte, assets map[st
 	return nil
 }
 
+func validateHeadscaleAuthorityShape(authority HeadscaleArtifactAuthority) error {
+	if !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
+		return fmt.Errorf("Headscale artifact authority shape is invalid")
+	}
+	previousAuthority := ""
+	for _, value := range authority.RedirectAuthorities {
+		parsed, err := url.Parse("https://" + value)
+		if err != nil || parsed.Host != value || parsed.Hostname() == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || previousAuthority != "" && strings.Compare(previousAuthority, value) >= 0 {
+			return fmt.Errorf("Headscale redirect authority is invalid, duplicated, or unsorted")
+		}
+		previousAuthority = value
+	}
+	if len(authority.RedirectAuthorities) == 0 || len(authority.RedirectAuthorities) > 8 || len(authority.Members) == 0 || len(authority.Members) > 16 {
+		return fmt.Errorf("Headscale artifact contract is incomplete or unbounded")
+	}
+	previousMember := ""
+	executableFound := false
+	for _, member := range authority.Members {
+		if validateAsset(member.Asset) != nil || previousMember != "" && strings.Compare(previousMember, member.Path) >= 0 || member.Mode != 0o644 && member.Mode != 0o755 {
+			return fmt.Errorf("Headscale archive member authority is invalid or unsorted")
+		}
+		if member.Asset.Path == authority.ExecutableAsset {
+			if executableFound || member.Destination != authority.InstallPath || member.Mode != 0o755 {
+				return fmt.Errorf("Headscale executable member authority is invalid")
+			}
+			executableFound = true
+		} else if !strings.HasPrefix(member.Destination, "/usr/share/doc/lanpanel/headscale/") || member.Mode != 0o644 {
+			return fmt.Errorf("Headscale non-executable member destination is invalid")
+		}
+		previousMember = member.Path
+	}
+	if !executableFound {
+		return fmt.Errorf("Headscale executable member is missing")
+	}
+	return nil
+}
+
+func verifyHeadscaleArtifact(authority HeadscaleArtifactAuthority, selection dependencies.Selection, assets map[string][]byte) error {
+	if validateHeadscaleAuthorityShape(authority) != nil || selection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Version != selection.SelectedVersion || authority.ArtifactIdentity != selection.ArtifactIdentity || authority.Archive.Digest != selection.ArtifactDigest {
+		return fmt.Errorf("Headscale artifact does not match exact dependency authority")
+	}
+	archiveBytes, present := assets[authority.Archive.Path]
+	if !present || validateAsset(authority.Archive) != nil || uint64(len(archiveBytes)) != authority.Archive.Bytes || DigestBytes(archiveBytes) != authority.Archive.Digest {
+		return fmt.Errorf("Headscale archive identity is missing or mismatched")
+	}
+	spec := managedarchive.Spec{Format: managedarchive.TarGzip, MaximumArchiveBytes: int64(authority.MaximumExtractedBytes), MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(authority.Members)}
+	for _, member := range authority.Members {
+		data, exists := assets[member.Asset.Path]
+		if !exists || uint64(len(data)) != member.Asset.Bytes || DigestBytes(data) != member.Asset.Digest {
+			return fmt.Errorf("Headscale archive member authority is invalid or unsorted")
+		}
+		spec.Members = append(spec.Members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(authority.MaximumExtractedBytes), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)}})
+	}
+	extracted, err := managedarchive.Extract(archiveBytes, spec)
+	if err != nil {
+		return fmt.Errorf("extract Headscale artifact: %w", err)
+	}
+	for _, member := range authority.Members {
+		if !slices.Equal(extracted[member.Path], assets[member.Asset.Path]) {
+			return fmt.Errorf("Headscale extracted member differs from its release asset")
+		}
+	}
+	return nil
+}
+
 func VerifyFinalization(final *VerifiedFinalRelease, candidate *VerifiedCandidateRelease) (*VerifiedFinalizedRelease, error) {
 	if final == nil || candidate == nil {
 		return nil, fmt.Errorf("finalization lacks verified final or candidate release")
@@ -407,7 +516,7 @@ func VerifyFinalFromCandidate(final, candidate *VerifiedEnvelope) error {
 	if final == nil || candidate == nil || final.value.Kind != EnvelopeFinal || candidate.value.Kind != EnvelopeQualificationCandidate {
 		return fmt.Errorf("candidate/final envelope kinds are invalid")
 	}
-	if final.value.QualificationCandidateOID != candidate.digest || final.value.ReleaseTag != candidate.value.ReleaseTag || final.value.Binary != candidate.value.Binary || final.value.SourceArchive != candidate.value.SourceArchive || final.value.SourceTreeDigest != candidate.value.SourceTreeDigest || final.value.DependencyBaseline != candidate.value.DependencyBaseline || final.value.SBOM != candidate.value.SBOM || final.value.License != candidate.value.License || final.value.Notice != candidate.value.Notice || !reflect.DeepEqual(final.value.AdditionalAssets, candidate.value.AdditionalAssets) {
+	if final.value.QualificationCandidateOID != candidate.digest || final.value.ReleaseTag != candidate.value.ReleaseTag || final.value.Binary != candidate.value.Binary || final.value.SourceArchive != candidate.value.SourceArchive || final.value.SourceTreeDigest != candidate.value.SourceTreeDigest || final.value.DependencyBaseline != candidate.value.DependencyBaseline || !reflect.DeepEqual(final.value.Headscale, candidate.value.Headscale) || final.value.SBOM != candidate.value.SBOM || final.value.License != candidate.value.License || final.value.Notice != candidate.value.Notice || !reflect.DeepEqual(final.value.AdditionalAssets, candidate.value.AdditionalAssets) {
 		return fmt.Errorf("final envelope does not wrap unchanged candidate source, binary, and baseline")
 	}
 	if len(final.value.SupportedProfiles) != 1 || candidate.value.QualificationTarget == nil || !reflect.DeepEqual(final.value.SupportedProfiles[0].Profile, *candidate.value.QualificationTarget) {
@@ -433,6 +542,9 @@ func validateEnvelope(envelope Envelope) error {
 		return err
 	}
 	if err := validateNetworkPolicy(envelope.Network); err != nil {
+		return err
+	}
+	if err := validateHeadscaleAuthorityShape(envelope.Headscale); err != nil {
 		return err
 	}
 	switch envelope.Kind {

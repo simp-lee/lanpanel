@@ -34,6 +34,7 @@ const (
 	ProfileNginxDump             ProfileID = "nginx_dump"
 	ProfileNginxReloadSignal     ProfileID = "nginx_reload_signal"
 	ProfileNginxQuitSignal       ProfileID = "nginx_quit_signal"
+	ProfileHeadscaleAccounts     ProfileID = "headscale_accounts"
 	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
 	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
 	ProfileGoAccessAccounts      ProfileID = "goaccess_accounts"
@@ -101,10 +102,14 @@ type PackageArgument struct {
 }
 
 type Invocation struct {
-	Package  *PackageInvocation  `json:"package,omitempty"`
-	Resource *ResourceInvocation `json:"resource,omitempty"`
-	Lego     *LegoInvocation     `json:"lego,omitempty"`
-	HTPasswd *HTPasswdInvocation `json:"htpasswd,omitempty"`
+	Package   *PackageInvocation   `json:"package,omitempty"`
+	Resource  *ResourceInvocation  `json:"resource,omitempty"`
+	Headscale *HeadscaleInvocation `json:"headscale,omitempty"`
+	Lego      *LegoInvocation      `json:"lego,omitempty"`
+	HTPasswd  *HTPasswdInvocation  `json:"htpasswd,omitempty"`
+}
+type HeadscaleInvocation struct {
+	HeadscaleID string `json:"headscale_id"`
 }
 type HTPasswdInvocation struct {
 	Username string `json:"username"`
@@ -183,7 +188,8 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxStart:   {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxReload:  {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/bin/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
+	ProfileHeadscaleAccounts:     {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
 	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileGoAccessAccounts:      {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileGoAccessStart:         {ID: ProfileGoAccessStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -261,6 +267,14 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
+	if id == ProfileHeadscaleAccounts {
+		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
+			return Profile{}, fmt.Errorf("Headscale account child invocation authority is invalid")
+		}
+		profile.Arguments = []string{"/etc/sysusers.d/lanpanel-headscale.conf"}
+		profile.Complete = true
+		return profile, validateProfile(profile)
+	}
 	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow || id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
 	if resourceProfile {
 		if invocation.Package != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
@@ -332,13 +346,13 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		return resolveHTPasswdInvocation(profile, invocation)
 	}
 	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
-		if invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
+		if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
 			return Profile{}, fmt.Errorf("external child profile rejects typed invocation")
 		}
 		return profile, nil
 	}
-	if invocation.Resource != nil {
-		return Profile{}, fmt.Errorf("package child rejects resource invocation")
+	if invocation.Resource != nil || invocation.Headscale != nil {
+		return Profile{}, fmt.Errorf("package child rejects resource or Headscale invocation")
 	}
 	if invocation.Package == nil || !packageTransactionPattern.MatchString(invocation.Package.TransactionID) || invocation.Package.LockWaitSeconds == 0 || invocation.Package.LockWaitSeconds > 300 || len(invocation.Package.Packages) == 0 || len(invocation.Package.Packages) > 256 || (id == ProfileAPTDownload || id == ProfileAPTTransaction) && invocation.Package.Staged || id == ProfileAPTOfflineTransaction && !invocation.Package.Staged {
 		return Profile{}, fmt.Errorf("package child invocation authority is invalid")
@@ -393,7 +407,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 }
 
 func resolveHTPasswdInvocation(profile Profile, invocation Invocation) (Profile, error) {
-	if invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd == nil {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd == nil {
 		return Profile{}, fmt.Errorf("htpasswd invocation authority invalid")
 	}
 	value := invocation.HTPasswd
@@ -408,7 +422,7 @@ func resolveHTPasswdInvocation(profile Profile, invocation Invocation) (Profile,
 	return profile, nil
 }
 func resolveLegoInvocation(profile Profile, invocation Invocation) (Profile, error) {
-	if invocation.Package != nil || invocation.Resource != nil || invocation.HTPasswd != nil || invocation.Lego == nil {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.HTPasswd != nil || invocation.Lego == nil {
 		return Profile{}, fmt.Errorf("lego child invocation authority invalid")
 	}
 	value := invocation.Lego

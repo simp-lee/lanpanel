@@ -17,7 +17,7 @@ import (
 )
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleAdmin, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -42,6 +42,17 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	}
 	if _, err := ResolveProfile(ProfileID("shell"), Identities{}); err == nil {
 		t.Fatal("unknown arbitrary executable profile was accepted")
+	}
+}
+
+func TestHeadscaleAccountInvocationUsesOnlyFixedAuthorityPath(t *testing.T) {
+	id := "hds_00000000000000000000000000000001"
+	profile, err := ResolveInvocation(ProfileHeadscaleAccounts, Identities{}, Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: id}})
+	if err != nil || !profile.Complete || !reflect.DeepEqual(profile.Arguments, []string{"/etc/sysusers.d/lanpanel-headscale.conf"}) {
+		t.Fatalf("Headscale account profile=%#v error=%v", profile, err)
+	}
+	if _, err := ResolveInvocation(ProfileHeadscaleAccounts, Identities{}, Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: "res_00000000000000000000000000000001"}}); err == nil {
+		t.Fatal("arbitrary Headscale account identity was accepted")
 	}
 }
 

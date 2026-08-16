@@ -52,10 +52,11 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		case <-finished:
 		}
 	}()
-	deadline := time.Now().Add(75 * time.Second)
-	if operation == helperproto.OperationPublicationActivate {
-		deadline = time.Now().Add(11 * time.Minute)
+	policy, known := helperproto.PolicyFor(operation)
+	if !known || policy.MaximumDuration <= 0 {
+		return application.HelperReply{}, fmt.Errorf("helper operation policy is unavailable")
 	}
+	deadline := time.Now().Add(policy.MaximumDuration + 15*time.Second)
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
 		deadline = value
 	}
@@ -81,13 +82,7 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	}
 	defer clear(random)
 	nonce := hex.EncodeToString(random)
-	requestDeadline := time.Now().UTC().Add(time.Minute)
-	if operation == helperproto.OperationPublicationActivate {
-		requestDeadline = time.Now().UTC().Add(11 * time.Minute)
-	}
-	if operation == helperproto.OperationAdminTokenReconcile {
-		requestDeadline = time.Now().UTC().Add(30 * time.Second)
-	}
+	requestDeadline := time.Now().UTC().Add(policy.MaximumDuration)
 	target := "installation"
 	if action != nil && action.TargetID != "" && (action.TargetKind == "resource" || action.TargetKind == "credential") {
 		target = action.TargetKind + "/" + action.TargetID
@@ -109,6 +104,9 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 	if err != nil || response.RequestID != request.RequestID || response.Code != helperproto.ResponseSucceeded {
 		if responseSecret != nil {
 			responseSecret.Destroy()
+		}
+		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected && response.ErrorCode == "foreign_database_evidence" {
+			return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
 		}
 		return application.HelperReply{}, fmt.Errorf("helper request rejected")
 	}

@@ -180,11 +180,64 @@ type ManagementAuthority struct {
 	ManagedPaths []string `json:"managed_paths,omitempty"`
 }
 
+type HeadscaleInitializationPhase string
+
+const (
+	HeadscaleIdentityCommitted HeadscaleInitializationPhase = "identity_committed"
+	HeadscaleInitialized       HeadscaleInitializationPhase = "initialized"
+)
+
+type HeadscaleArtifactIdentity struct {
+	BaselineDigest       string `json:"baseline_digest"`
+	Version              string `json:"version"`
+	ArchiveDigest        string `json:"archive_digest"`
+	ExecutableDigest     string `json:"executable_digest"`
+	ConfigContract       string `json:"config_contract"`
+	ConfigContractDigest string `json:"config_contract_digest"`
+}
+
+type HeadscaleDatabaseIdentity struct {
+	UUID                 string                       `json:"uuid"`
+	SQLitePath           string                       `json:"sqlite_path"`
+	IdentityBundleDigest string                       `json:"identity_bundle_digest"`
+	Generation           uint64                       `json:"generation"`
+	Phase                HeadscaleInitializationPhase `json:"phase"`
+	InitializedDigest    string                       `json:"initialized_digest,omitempty"`
+}
+
+type HeadscaleAppliedIdentity struct {
+	Generation      uint64 `json:"generation"`
+	ConfigDigest    string `json:"config_digest"`
+	ArtifactDigest  string `json:"artifact_digest"`
+	ServiceIdentity string `json:"service_identity"`
+	ControlIdentity string `json:"control_identity"`
+	CertificateID   string `json:"certificate_id"`
+}
+
+type HeadscaleDeployIntent struct {
+	Generation uint64                    `json:"generation"`
+	Candidate  HeadscaleAppliedIdentity  `json:"candidate"`
+	Prior      *HeadscaleAppliedIdentity `json:"prior,omitempty"`
+}
+
 type HeadscaleDomain struct {
-	ID                string   `json:"id"`
-	ControlDomain     string   `json:"control_domain"`
-	MagicDNSNamespace string   `json:"magicdns_namespace"`
-	ManagedPaths      []string `json:"managed_paths,omitempty"`
+	ID                string                    `json:"id"`
+	ControlDomain     string                    `json:"control_domain"`
+	MagicDNSNamespace string                    `json:"magicdns_namespace"`
+	Policy            string                    `json:"policy"`
+	Artifact          HeadscaleArtifactIdentity `json:"artifact"`
+	Database          HeadscaleDatabaseIdentity `json:"database"`
+	DesiredDigest     string                    `json:"desired_digest"`
+	Applied           *HeadscaleAppliedIdentity `json:"applied,omitempty"`
+	Enabled           bool                      `json:"enabled"`
+	DeployIntent      *HeadscaleDeployIntent    `json:"deploy_intent,omitempty"`
+	LastOperation     OperationCode             `json:"last_operation,omitempty"`
+	LastJobID         string                    `json:"last_job_id,omitempty"`
+	ManagedPaths      []string                  `json:"managed_paths"`
+}
+
+func HeadscaleManagedPaths() []string {
+	return []string{"/etc/lanpanel/headscale", "/etc/sysusers.d/lanpanel-headscale.conf", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-initialize.json"}
 }
 
 type TailnetConnector struct {
@@ -666,6 +719,75 @@ func PublicationPrerequisites(installation Installation, resourceID string) erro
 }
 
 var idPattern = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
+var headscaleVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+var headscaleRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+
+func validateHeadscale(value HeadscaleDomain) error {
+	if value.Policy != "trusted_mesh" {
+		return fmt.Errorf("headscale.policy must be trusted_mesh")
+	}
+	if !validSHA256Digest(value.Artifact.BaselineDigest) || !headscaleVersionPattern.MatchString(value.Artifact.Version) || !validSHA256Digest(value.Artifact.ArchiveDigest) || !validSHA256Digest(value.Artifact.ExecutableDigest) || !headscaleRefPattern.MatchString(value.Artifact.ConfigContract) || !validSHA256Digest(value.Artifact.ConfigContractDigest) {
+		return fmt.Errorf("headscale.artifact identity is incomplete")
+	}
+	if len(value.Database.UUID) != 36 || !strings.HasPrefix(value.Database.UUID, "hdb_") || !idPattern.MatchString("hds_"+value.Database.UUID[4:]) || value.Database.SQLitePath != "/var/lib/lanpanel/headscale/db.sqlite" || !validSHA256Digest(value.Database.IdentityBundleDigest) || value.Database.Generation == 0 {
+		return fmt.Errorf("headscale.database identity is incomplete")
+	}
+	switch value.Database.Phase {
+	case HeadscaleIdentityCommitted:
+		if value.Database.InitializedDigest != "" {
+			return fmt.Errorf("identity-committed Headscale database cannot carry initialized digest")
+		}
+	case HeadscaleInitialized:
+		if !validSHA256Digest(value.Database.InitializedDigest) {
+			return fmt.Errorf("initialized Headscale database lacks commit digest")
+		}
+	default:
+		return fmt.Errorf("headscale.database phase is invalid")
+	}
+	if !validSHA256Digest(value.DesiredDigest) || !slices.Equal(value.ManagedPaths, HeadscaleManagedPaths()) {
+		return fmt.Errorf("headscale desired identity or managed paths are invalid")
+	}
+	if value.Applied != nil {
+		if err := validateHeadscaleApplied(*value.Applied); err != nil {
+			return err
+		}
+	}
+	if value.Enabled != (value.Applied != nil) {
+		return fmt.Errorf("headscale enabled and applied identity must agree")
+	}
+	if value.DeployIntent != nil {
+		if value.DeployIntent.Generation == 0 || value.DeployIntent.Generation != value.DeployIntent.Candidate.Generation || validateHeadscaleApplied(value.DeployIntent.Candidate) != nil || value.DeployIntent.Prior != nil && (value.Applied == nil || !reflect.DeepEqual(value.DeployIntent.Prior, value.Applied) || validateHeadscaleApplied(*value.DeployIntent.Prior) != nil) {
+			return fmt.Errorf("headscale deploy intent is invalid")
+		}
+	}
+	if value.LastOperation != "" && value.LastOperation != OperationDeploy || value.LastJobID != "" && !validOpaqueTargetID(value.LastJobID) {
+		return fmt.Errorf("headscale last operation identity is invalid")
+	}
+	return nil
+}
+
+func validateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
+	if value.Generation == 0 || !validSHA256Digest(value.ConfigDigest) || !validSHA256Digest(value.ArtifactDigest) || !validSHA256Digest(value.ServiceIdentity) || !validSHA256Digest(value.ControlIdentity) || !headscaleRefPattern.MatchString(value.CertificateID) {
+		return fmt.Errorf("headscale applied identity is incomplete")
+	}
+	return nil
+}
+
+func ValidateHeadscaleTransition(prior, candidate HeadscaleDomain) error {
+	if err := validateHeadscale(prior); err != nil {
+		return fmt.Errorf("prior Headscale identity: %w", err)
+	}
+	if err := validateHeadscale(candidate); err != nil {
+		return fmt.Errorf("candidate Headscale identity: %w", err)
+	}
+	if prior.ID != candidate.ID || prior.ControlDomain != candidate.ControlDomain || prior.MagicDNSNamespace != candidate.MagicDNSNamespace || prior.Policy != candidate.Policy || !reflect.DeepEqual(prior.Artifact, candidate.Artifact) || prior.Database.UUID != candidate.Database.UUID || prior.Database.SQLitePath != candidate.Database.SQLitePath || prior.Database.IdentityBundleDigest != candidate.Database.IdentityBundleDigest || prior.Database.Generation != candidate.Database.Generation || !slices.Equal(prior.ManagedPaths, candidate.ManagedPaths) {
+		return fmt.Errorf("Headscale trust-domain, artifact, and database identity are immutable")
+	}
+	if prior.Database.Phase == HeadscaleInitialized && candidate.Database.Phase != HeadscaleInitialized {
+		return fmt.Errorf("initialized Headscale database cannot return to an initializing phase")
+	}
+	return nil
+}
 
 func ValidateInstallation(installation Installation) error {
 	if installation.SchemaVersion != InstallationSchemaVersion {
@@ -690,7 +812,7 @@ func ValidateInstallation(installation Installation) error {
 		if err := validateDomain(installation.Headscale.MagicDNSNamespace); err != nil {
 			return fmt.Errorf("headscale.magicdns_namespace: %w", err)
 		}
-		if err := validatePaths("headscale.managed_paths", installation.Headscale.ManagedPaths); err != nil {
+		if err := validateHeadscale(*installation.Headscale); err != nil {
 			return err
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/domain"
+	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
@@ -21,6 +22,7 @@ import (
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
+	"lanpanel/internal/sources"
 	"reflect"
 	"slices"
 	"sort"
@@ -53,6 +55,7 @@ const (
 	AutomaticReconciliation  Type = "automatic_exact_journal_reconciliation"
 	StartupContraction       Type = "startup_activation_contraction"
 	GoAccessRetirement       Type = "goaccess_retirement_reconciliation"
+	HeadscaleInitialize      Type = "headscale_initialize"
 	ResourceCreate           Type = "resource_create"
 	ResourceUpdate           Type = "resource_update"
 	ProcessStart             Type = "process_start"
@@ -125,30 +128,42 @@ type CertificatePublicationHandoff struct {
 	Fingerprint           string `json:"fingerprint"`
 	ChallengeSafetyDigest string `json:"challenge_safety_digest"`
 }
+type HeadscaleInitializationBinding struct {
+	Candidate domain.HeadscaleDomain `json:"candidate"`
+	Snapshot  json.RawMessage        `json:"snapshot"`
+	Source    sources.Source         `json:"source"`
+	ProxyURL  string                 `json:"proxy_url,omitempty"`
+}
+
 type Reservation struct {
-	SchemaVersion       string                         `json:"schema_version"`
-	JobID               string                         `json:"job_id"`
-	PlanID              string                         `json:"plan_id,omitempty"`
-	OperationBinding    string                         `json:"operation_binding,omitempty"`
-	CertificateHandoff  *CertificatePublicationHandoff `json:"certificate_handoff,omitempty"`
-	AdmissionSource     AdmissionSource                `json:"admission_source"`
-	Operation           Type                           `json:"operation"`
-	Target              string                         `json:"target"`
-	Phase               Phase                          `json:"phase"`
-	SafetyDigest        string                         `json:"safety_digest"`
-	JournalSafetyDigest string                         `json:"journal_safety_digest,omitempty"`
-	ContractionDigest   string                         `json:"contraction_digest,omitempty"`
-	SecretFingerprint   string                         `json:"secret_fingerprint,omitempty"`
-	SecretCommitted     bool                           `json:"secret_committed,omitempty"`
-	SafetyBinding       SafetyBinding                  `json:"safety_binding"`
-	CreatedAt           time.Time                      `json:"created_at"`
-	IntentGeneration    uint64                         `json:"intent_generation,omitempty"`
-	Consumption         *ConsumptionSnapshot           `json:"consumption,omitempty"`
+	SchemaVersion       string                          `json:"schema_version"`
+	JobID               string                          `json:"job_id"`
+	PlanID              string                          `json:"plan_id,omitempty"`
+	OperationBinding    string                          `json:"operation_binding,omitempty"`
+	CertificateHandoff  *CertificatePublicationHandoff  `json:"certificate_handoff,omitempty"`
+	HeadscaleBinding    *HeadscaleInitializationBinding `json:"headscale_initialization,omitempty"`
+	AdmissionSource     AdmissionSource                 `json:"admission_source"`
+	Operation           Type                            `json:"operation"`
+	Target              string                          `json:"target"`
+	Phase               Phase                           `json:"phase"`
+	SafetyDigest        string                          `json:"safety_digest"`
+	JournalSafetyDigest string                          `json:"journal_safety_digest,omitempty"`
+	ContractionDigest   string                          `json:"contraction_digest,omitempty"`
+	SecretFingerprint   string                          `json:"secret_fingerprint,omitempty"`
+	SecretCommitted     bool                            `json:"secret_committed,omitempty"`
+	SafetyBinding       SafetyBinding                   `json:"safety_binding"`
+	CreatedAt           time.Time                       `json:"created_at"`
+	IntentGeneration    uint64                          `json:"intent_generation,omitempty"`
+	Consumption         *ConsumptionSnapshot            `json:"consumption,omitempty"`
 }
 
 type ContractionCommit struct {
 	ClosureAuthorityDigest string
 	UnpublishedGenerations map[string]uint64
+}
+
+type HeadscaleInitializeCommit struct {
+	Headscale domain.HeadscaleDomain
 }
 
 type ResourceCreateCommit struct {
@@ -255,6 +270,7 @@ type AdmitRequest struct {
 	PlanID           string
 	Source           AdmissionSource
 	SafetyBinding    SafetyBinding
+	HeadscaleBinding *HeadscaleInitializationBinding
 	ExpectedRevision uint64
 }
 type ConsumeRequest struct {
@@ -471,6 +487,9 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err := validateSafetyTargetBinding(request); err != nil {
 		return jobs.Record{}, err
 	}
+	if err := validateHeadscaleInitializationBinding(request.Operation, request.SafetyBinding, request.HeadscaleBinding); err != nil {
+		return jobs.Record{}, err
+	}
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return jobs.Record{}, err
@@ -486,7 +505,7 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, CreatedAt: observedNow}
+	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
 		active, err := activeGraphCount(transaction)
 		if err != nil {
@@ -904,7 +923,7 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 		if err != nil {
 			return err
 		}
-		if reservation.Phase != PhaseLocalIntent || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew)) {
+		if (reservation.Phase != PhaseLocalIntent && reservation.Phase != PhaseReentered) || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew) && (reservation.AdmissionSource != AdmissionUI || reservation.Operation != HeadscaleInitialize)) {
 			return fmt.Errorf("remote wait requires Plan issuance or timer renewal authority")
 		}
 		reservation.Phase = PhaseRemoteWait
@@ -986,7 +1005,7 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 		if !plans.SameBindingIdentity(binding, snapshot) {
 			return fail(fmt.Errorf("Plan-derived binding changed during remote wait"))
 		}
-	} else if intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew {
+	} else if (intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew) && (intent.AdmissionSource != AdmissionUI || intent.Operation != HeadscaleInitialize) {
 		return fail(fmt.Errorf("remote wait admission source invalid"))
 	}
 	var result Reservation
@@ -3148,6 +3167,35 @@ func (admitter *Admitter) ValidateActive(ctx context.Context, mutation *Mutation
 	return admitter.validateFreshAuthority(document, intent)
 }
 
+func (admitter *Admitter) CommitHeadscaleInitialize(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleInitializeCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Headscale.ID == "" || commit.Headscale.LastJobID != jobID || commit.Headscale.LastOperation != domain.OperationDeploy {
+		return fmt.Errorf("Headscale initialization commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleInitialize || intent.AdmissionSource != AdmissionUI || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || mutation.Target() != intent.Target || intent.Target != string(plans.TargetInstallation) {
+			return fmt.Errorf("Headscale initialization intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Headscale != nil {
+			return fmt.Errorf("Headscale trust domain is already initialized")
+		}
+		installation.Headscale = &commit.Headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ResourceCreateCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Resource.ID == "" {
 		return fmt.Errorf("resource creation commit requires exact authority")
@@ -3296,6 +3344,26 @@ func CompleteInterruptedLifecycle(transaction *persist.Transaction, jobID string
 	}
 	return transaction.Replace(reservationKey(jobID), raw)
 }
+func FindRunningHeadscaleInitialization(document persist.Document) (Reservation, jobs.Record, bool, error) {
+	var found Reservation
+	var record jobs.Record
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return Reservation{}, jobs.Record{}, false, err
+		}
+		if intent.Operation != HeadscaleInitialize || intent.Phase == PhaseRejected || intent.Phase == PhaseTerminal {
+			continue
+		}
+		candidate, err := jobs.LoadEntries(document.Entries, intent.JobID)
+		if err != nil || candidate.Status != jobs.StatusRunning || found.JobID != "" {
+			return Reservation{}, jobs.Record{}, false, fmt.Errorf("running Headscale initialization authority is invalid or duplicated")
+		}
+		found, record = intent, candidate
+	}
+	return found, record, found.JobID != "", nil
+}
+
 func PendingResourceUpdates(document persist.Document) ([]Reservation, error) {
 	result := []Reservation{}
 	for _, key := range persist.EntryKeys(document, "intents") {
@@ -4930,6 +4998,40 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	if err != nil {
 		return err
 	}
+	oldBase, newBase := oldInstallation, newInstallation
+	oldBase.Headscale, newBase.Headscale = nil, nil
+	oldBase.Resources, newBase.Resources = nil, nil
+	if !reflect.DeepEqual(oldBase, newBase) {
+		return fmt.Errorf("installation authority outside Headscale/resources changed")
+	}
+	if !reflect.DeepEqual(oldInstallation.Headscale, newInstallation.Headscale) {
+		if oldInstallation.Headscale != nil || newInstallation.Headscale == nil {
+			return fmt.Errorf("Headscale identity cannot be removed or changed by initialization")
+		}
+		headscale := newInstallation.Headscale
+		if headscale.LastJobID == "" || headscale.LastOperation != domain.OperationDeploy {
+			return fmt.Errorf("Headscale initialization lacks durable job identity")
+		}
+		beforeIntent, err := loadReservationEntries(before.Entries, headscale.LastJobID)
+		if err != nil {
+			return err
+		}
+		afterIntent, err := loadReservationEntries(after.Entries, headscale.LastJobID)
+		if err != nil {
+			return err
+		}
+		beforeRecord, err := jobs.LoadEntries(before.Entries, headscale.LastJobID)
+		if err != nil {
+			return err
+		}
+		afterRecord, err := jobs.LoadEntries(after.Entries, headscale.LastJobID)
+		if err != nil {
+			return err
+		}
+		if beforeIntent.Operation != HeadscaleInitialize || afterIntent.Operation != HeadscaleInitialize || beforeIntent.Target != string(plans.TargetInstallation) || afterIntent.Target != string(plans.TargetInstallation) || beforeIntent.Phase != PhaseReentered || afterIntent.Phase != PhaseReentered || beforeRecord.Status != jobs.StatusRunning || afterRecord.Status != jobs.StatusRunning {
+			return fmt.Errorf("Headscale initialization changed outside its running local intent")
+		}
+	}
 	oldResources := map[string]domain.AppResource{}
 	for _, resource := range oldInstallation.Resources {
 		oldResources[resource.ID] = resource
@@ -5385,9 +5487,32 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 	}
 }
 
+func validateHeadscaleInitializationBinding(operation Type, safetyBinding SafetyBinding, binding *HeadscaleInitializationBinding) error {
+	if operation != HeadscaleInitialize {
+		if binding != nil {
+			return fmt.Errorf("unrelated operation carried Headscale initialization authority")
+		}
+		return nil
+	}
+	if binding == nil || binding.Candidate.LastJobID != "" || binding.Candidate.LastOperation != "" || binding.Candidate.DesiredDigest != safetyBinding.CandidateDigest || binding.Candidate.Artifact.ArchiveDigest != safetyBinding.CandidateBundle || managedheadscale.VerifySnapshot(binding.Candidate, binding.Snapshot) != nil || sources.Validate(binding.Source) != nil || binding.Source.Artifact.Name != "headscale" || binding.Source.Artifact.Version != binding.Candidate.Artifact.Version || "sha256:"+binding.Source.Artifact.Digest != binding.Candidate.Artifact.ArchiveDigest || sources.ValidateProxy(journalProxy(binding.ProxyURL)) != nil {
+		return fmt.Errorf("Headscale initialization authority is invalid")
+	}
+	return nil
+}
+
+func journalProxy(value string) *sources.Proxy {
+	if value == "" {
+		return nil
+	}
+	return &sources.Proxy{URL: value}
+}
+
 func validateReservation(value Reservation) error {
 	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
 		return fmt.Errorf("operation certificate challenge binding invalid")
+	}
+	if err := validateHeadscaleInitializationBinding(value.Operation, value.SafetyBinding, value.HeadscaleBinding); err != nil {
+		return err
 	}
 	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || value.OperationBinding != "" && !exactDigest(value.OperationBinding) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {
 		return fmt.Errorf("operation reservation is invalid")
@@ -5421,7 +5546,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -5458,6 +5583,12 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 			return fmt.Errorf("GoAccess retirement must be startup-bound")
 		}
 		return validateGoAccessRetirementBinding(binding)
+	}
+	if request.Operation == HeadscaleInitialize && request.Source == AdmissionUI {
+		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
+			return fmt.Errorf("authenticated Headscale initialization requires exact config and release authority")
+		}
+		return nil
 	}
 	if request.Operation == ResourceUpdate && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
@@ -5497,7 +5628,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("startup admission is not authorized for operation")
 		}
 	case AdmissionUI:
-		if planID != "" || operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
+		if planID != "" || operation != HeadscaleInitialize && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
 			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:

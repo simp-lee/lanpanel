@@ -59,9 +59,19 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if response.Code != http.StatusOK {
 		t.Fatal(response.Code)
 	}
-	for _, id := range []string{"domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
+	for _, id := range []string{"headscale-initialize", "domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
 		if !strings.Contains(response.Body.String(), `id="`+id+`"`) {
 			t.Fatalf("management control %s missing", id)
+		}
+	}
+	for _, field := range []string{"control_domain", "magicdns_namespace", "source_kind", "mirror_url", "offline_path", "proxy_url"} {
+		if !strings.Contains(response.Body.String(), `name="`+field+`"`) {
+			t.Fatalf("Headscale UI field %s missing", field)
+		}
+	}
+	for _, required := range []string{"trusted_mesh", "/api/actions/deploy", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence"} {
+		if !strings.Contains(response.Body.String(), required) && !strings.Contains(appJS, required) {
+			t.Fatalf("Headscale initialization warning/action missing %q", required)
 		}
 	}
 	if !strings.Contains(response.Body.String(), "Static mappings (one URL|relative") {

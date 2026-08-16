@@ -220,6 +220,16 @@ func TestCandidateAndFinalVerificationRejectTamperedOrSelfConsistentReplacementB
 	}
 }
 
+func TestReleaseRejectsUnsupportedHeadscaleConfigContract(t *testing.T) {
+	envelope, _, _ := candidateMaterial(t)
+	envelope.Headscale.ConfigContract = "headscale-other-v1"
+	envelope.Headscale.ConfigContractDigest = digest("self-consistent-other-contract")
+	encoded, _ := MarshalCanonical(envelope)
+	if _, err := DecodeEnvelope(encoded); err == nil {
+		t.Fatal("unsupported Headscale config contract was accepted")
+	}
+}
+
 func TestFinalizationRejectsEdgeOneResultFromAnotherRun(t *testing.T) {
 	candidate := buildCandidate(t)
 	envelope, _, _ := finalEnvelopeMaterial(t, candidate, ResolutionNotAffected)
@@ -388,6 +398,8 @@ func baseAssets() map[string][]byte {
 		"NOTICE":                   []byte("notice"),
 		"dependency-baseline.json": validDependencyBaseline(),
 		"lanpanel-linux-amd64":     []byte("binary"),
+		"headscale":                []byte("artifact-headscale"),
+		"headscale.tar.gz":         headscaleArchive(),
 		"lego":                     []byte("artifact-lego"),
 		"lego.tar.gz":              legoArchive(),
 		"lanpanel-v1.0.0.tar.gz":   []byte("source"),
@@ -397,7 +409,8 @@ func baseAssets() map[string][]byte {
 }
 
 func setCoreAssets(envelope *Envelope, assets map[string][]byte) {
-	envelope.AdditionalAssets = []AssetIdentity{identity("lego", assets["lego"]), identity("lego.tar.gz", assets["lego.tar.gz"])}
+	envelope.AdditionalAssets = []AssetIdentity{identity("headscale", assets["headscale"]), identity("headscale.tar.gz", assets["headscale.tar.gz"]), identity("lego", assets["lego"]), identity("lego.tar.gz", assets["lego.tar.gz"])}
+	envelope.Headscale = HeadscaleArtifactAuthority{Version: "0.25.1", ArtifactIdentity: "https://downloads.example.test/headscale-0.25.1", Archive: identity("headscale.tar.gz", assets["headscale.tar.gz"]), ArchiveFormat: "tar_gzip", MaximumExtractedBytes: 1 << 20, RedirectAuthorities: []string{"downloads.example.test"}, Members: []ArchiveMemberAuthority{{Path: "headscale", Asset: identity("headscale", assets["headscale"]), Destination: "/usr/lib/lanpanel/dependencies/headscale", Mode: 0o755}}, ExecutableAsset: "headscale", InstallPath: "/usr/lib/lanpanel/dependencies/headscale", ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: SupportedHeadscaleConfigContractDigest()}
 	envelope.Binary = identity("lanpanel-linux-amd64", assets["lanpanel-linux-amd64"])
 	envelope.SourceArchive = identity("lanpanel-v1.0.0.tar.gz", assets["lanpanel-v1.0.0.tar.gz"])
 	envelope.License = identity("LICENSE", assets["LICENSE"])
@@ -442,6 +455,9 @@ func validDependencyBaseline() []byte {
 	profileDigest, _ := ProfileDigest(testProfile())
 	selection := func(component string, kind dependencies.SourceKind, version, artifact string) dependencies.Selection {
 		value := dependencies.Selection{Component: component, SourceKind: kind, SelectedVersion: version, LatestStableVersion: version, LatestStablePublishedAt: published, MetadataSource: "https://metadata.example.test/releases", MetadataSnapshotDigest: digest("metadata-" + component), ArtifactIdentity: artifact, ArtifactDigest: digest("artifact-" + component)}
+		if component == "headscale" {
+			value.ArtifactDigest = DigestBytes(headscaleArchive())
+		}
 		if component == "lego" {
 			value.ArtifactDigest = DigestBytes(legoArchive())
 		}
@@ -466,6 +482,19 @@ func validDependencyBaseline() []byte {
 		panic(err)
 	}
 	return data
+}
+
+func headscaleArchive() []byte {
+	var output bytes.Buffer
+	compressed := gzip.NewWriter(&output)
+	compressed.Header.ModTime = time.Unix(0, 0).UTC()
+	archive := tar.NewWriter(compressed)
+	data := []byte("artifact-headscale")
+	_ = archive.WriteHeader(&tar.Header{Name: "headscale", Mode: 0o755, Size: int64(len(data)), ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR})
+	_, _ = archive.Write(data)
+	_ = archive.Close()
+	_ = compressed.Close()
+	return output.Bytes()
 }
 
 func legoArchive() []byte {

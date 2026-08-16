@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
@@ -393,12 +394,15 @@ func RunRole(args []string) error {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("startup contraction carried secret")
 		}
-		if normal, normalErr := application.OpenFixed(); normalErr == nil {
-			allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
-			recoveryErr := normal.PendingPublicationRecovery()
-			_ = normal.Close()
-			if guardErr == nil && recoveryErr == nil && allowed {
-				return ExecutionResult{ResultDigest: request.InputDigest}, nil
+		headscaleErr := application.ReconcileHeadscaleInitialization(ctx)
+		if headscaleErr == nil {
+			if normal, normalErr := application.OpenFixed(); normalErr == nil {
+				allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+				recoveryErr := normal.PendingPublicationRecovery()
+				_ = normal.Close()
+				if guardErr == nil && recoveryErr == nil && allowed {
+					return ExecutionResult{ResultDigest: request.InputDigest}, nil
+				}
 			}
 		}
 		service, err := contraction.OpenEmergency(ctx)
@@ -421,6 +425,30 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, runErr
 		}
 		return ExecutionResult{ResultDigest: result.ClosureDigest}, nil
+	})
+	headscaleHandler := HeadscaleInitializeHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil || request.Target != "installation" {
+			return fmt.Errorf("Headscale initialization caller is unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil || request.Resource.Operation != string(domain.OperationDeploy) {
+			return ExecutionResult{}, fmt.Errorf("Headscale initialization payload is invalid")
+		}
+		var payload application.HeadscaleInitializePayload
+		decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			return ExecutionResult{}, fmt.Errorf("Headscale initialization config is invalid")
+		}
+		job, headscaleID, authorityDigest, err := application.InitializeHeadscale(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, payload)
+		if err != nil {
+			if errors.Is(err, managedheadscale.ErrForeignEvidence) {
+				return ExecutionResult{ErrorCode: "foreign_database_evidence", ErrorJobID: job.ID}, err
+			}
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: authorityDigest, Action: &helperproto.ActionResult{JobID: job.ID, Operation: string(domain.OperationDeploy), TargetKind: string(domain.OperationTargetInstallation), TargetID: headscaleID}}, nil
 	})
 	resourceMutationHandler := ResourceMutationHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil {
@@ -870,7 +898,7 @@ func RunRole(args []string) error {
 		tokenMu.Unlock()
 		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, renewalHandler, profileHandler}, Options{})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, renewalHandler, profileHandler}, Options{})
 	if err != nil {
 		return err
 	}

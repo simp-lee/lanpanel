@@ -248,12 +248,7 @@ func validInstallation() domain.Installation {
 			Port:         23456,
 			ManagedPaths: []string{"/var/lib/lanpanel/ui"},
 		},
-		Headscale: &domain.HeadscaleDomain{
-			ID:                "hds_00000000000000000000000000000001",
-			ControlDomain:     "control.example.com",
-			MagicDNSNamespace: "tail.example.net",
-			ManagedPaths:      []string{"/var/lib/lanpanel/headscale"},
-		},
+		Headscale: &domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: digest, Version: "0.25.1", ArchiveDigest: digest, ExecutableDigest: digest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: digest}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", IdentityBundleDigest: digest, Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: digest, ManagedPaths: domain.HeadscaleManagedPaths()},
 		Connector: &domain.TailnetConnector{
 			ID:           "con_00000000000000000000000000000001",
 			LoginServer:  "https://control.example.com",

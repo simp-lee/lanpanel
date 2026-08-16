@@ -798,7 +798,7 @@ func (s *FixedService) resourceAdmitter() (*operations.Admitter, error) {
 	if err != nil {
 		return nil, err
 	}
-	registry, err := operations.NewRegistry([]operations.Registration{{Operation: operations.ResourceCreate, Owner: "application.resource", Results: table}, {Operation: operations.ResourceUpdate, Owner: "application.resource", Results: table}, {Operation: operations.ProcessStart, Owner: "application.process", Results: table}, {Operation: operations.ProcessStop, Owner: "application.process", Results: table}})
+	registry, err := operations.NewRegistry([]operations.Registration{{Operation: operations.HeadscaleInitialize, Owner: "application.headscale", Results: table}, {Operation: operations.ResourceCreate, Owner: "application.resource", Results: table}, {Operation: operations.ResourceUpdate, Owner: "application.resource", Results: table}, {Operation: operations.ProcessStart, Owner: "application.process", Results: table}, {Operation: operations.ProcessStop, Owner: "application.process", Results: table}})
 	if err != nil {
 		return nil, err
 	}

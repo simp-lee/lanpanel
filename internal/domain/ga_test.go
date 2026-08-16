@@ -562,6 +562,31 @@ func TestInstallationRejectsResourcesBeyondRecoveryCapacity(t *testing.T) {
 	}
 }
 
+func TestHeadscaleIdentityCannotBeRenamedAdoptedOrDisabled(t *testing.T) {
+	prior := *testHeadscaleDomain()
+	for name, mutate := range map[string]func(*HeadscaleDomain){
+		"control domain": func(value *HeadscaleDomain) { value.ControlDomain = "other.example.com" },
+		"database UUID":  func(value *HeadscaleDomain) { value.Database.UUID = "hdb_00000000000000000000000000000002" },
+		"SQLite path":    func(value *HeadscaleDomain) { value.Database.SQLitePath = "/var/lib/lanpanel/headscale/other.sqlite" },
+		"artifact":       func(value *HeadscaleDomain) { value.Artifact.Version = "0.25.2" },
+	} {
+		candidate := prior
+		mutate(&candidate)
+		if err := ValidateHeadscaleTransition(prior, candidate); err == nil {
+			t.Fatalf("%s mutation accepted", name)
+		}
+	}
+	initialized := prior
+	initialized.Database.Phase = HeadscaleInitialized
+	initialized.Database.InitializedDigest = testDigest
+	candidate := initialized
+	candidate.Database.Phase = HeadscaleIdentityCommitted
+	candidate.Database.InitializedDigest = ""
+	if err := ValidateHeadscaleTransition(initialized, candidate); err == nil {
+		t.Fatal("initialized database was returned to pre-initialized phase")
+	}
+}
+
 func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
 	installation := validGAInstallation()
 	installation.Resources[0].Publication.DomainHTTPS.GoAccess.DashboardPath = "/__lanpanel/goaccess/"
@@ -579,12 +604,7 @@ func validGAInstallation() Installation {
 			Port:         23456,
 			ManagedPaths: []string{"/var/lib/lanpanel/ui"},
 		},
-		Headscale: &HeadscaleDomain{
-			ID:                "hds_00000000000000000000000000000001",
-			ControlDomain:     "control.example.com",
-			MagicDNSNamespace: "tail.example.net",
-			ManagedPaths:      []string{"/var/lib/lanpanel/headscale"},
-		},
+		Headscale: testHeadscaleDomain(),
 		Connector: &TailnetConnector{
 			ID:           "con_00000000000000000000000000000001",
 			LoginServer:  "https://control.example.com",
@@ -625,6 +645,10 @@ func validGAInstallation() Installation {
 			ManagedPaths:  []string{"/var/lib/lanpanel/resources/example"},
 		}},
 	}
+}
+
+func testHeadscaleDomain() *HeadscaleDomain {
+	return &HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: HeadscaleArtifactIdentity{BaselineDigest: testDigest, Version: "0.25.1", ArchiveDigest: testDigest, ExecutableDigest: testDigest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest}, Database: HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale/db.sqlite", IdentityBundleDigest: testDigest, Generation: 1, Phase: HeadscaleIdentityCommitted}, DesiredDigest: testDigest, ManagedPaths: HeadscaleManagedPaths()}
 }
 
 func publishedResource(health RuntimeHealth) AppResource {

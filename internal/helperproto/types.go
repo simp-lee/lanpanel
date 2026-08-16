@@ -58,6 +58,7 @@ const (
 	OperationDomainStatus             Operation = "domain_status"
 	OperationContractionClose         Operation = "contraction_close"
 	OperationStartupContraction       Operation = "startup_contraction"
+	OperationHeadscaleInitialize      Operation = "headscale_initialize"
 	OperationResourceMutation         Operation = "resource_mutation"
 	OperationProcessLifecycle         Operation = "process_lifecycle"
 	OperationPublicationActivate      Operation = "publication_activate"
@@ -101,6 +102,7 @@ var policies = map[Operation]Policy{
 	OperationDomainStatus:             {Callers: []Caller{CallerUI}},
 	OperationContractionClose:         {Callers: []Caller{CallerUI}},
 	OperationStartupContraction:       {Callers: []Caller{CallerRecovery}},
+	OperationHeadscaleInitialize:      {Callers: []Caller{CallerUI}, MaximumDuration: 6 * time.Minute},
 	OperationResourceMutation:         {Callers: []Caller{CallerUI}},
 	OperationProcessLifecycle:         {Callers: []Caller{CallerUI}},
 	OperationPublicationActivate:      {Callers: []Caller{CallerUI}, MaximumDuration: 11 * time.Minute},
@@ -192,6 +194,7 @@ type Response struct {
 	Code          ResponseCode    `json:"code"`
 	ResultDigest  string          `json:"result_digest,omitempty"`
 	ErrorCode     string          `json:"error_code,omitempty"`
+	ErrorJobID    string          `json:"error_job_id,omitempty"`
 	Action        *ActionResult   `json:"action,omitempty"`
 	Resource      *ResourceResult `json:"resource,omitempty"`
 }
@@ -226,7 +229,7 @@ func ValidateRequest(request Request, now time.Time) error {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
 	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose || request.Operation == OperationManagedBasicGenerate || request.Operation == OperationManagedBasicDelete || request.Operation == OperationStaticRootRegister || request.Operation == OperationExternalHTPasswdRegister || request.Operation == OperationDomainStatus
-	resourceOperation := request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
+	resourceOperation := request.Operation == OperationHeadscaleInitialize || request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
 	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
 		return fmt.Errorf("helper typed payload shape is invalid")
 	}
@@ -258,7 +261,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
+	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationHeadscaleInitialize && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -278,6 +281,8 @@ func maximumDuration(operation Operation) time.Duration {
 		return 10 * time.Minute
 	case OperationPublicationActivate:
 		return 11 * time.Minute
+	case OperationHeadscaleInitialize, OperationStartupContraction:
+		return 6 * time.Minute
 	default:
 		return time.Minute
 	}
@@ -317,6 +322,8 @@ func validOperationTarget(operation Operation, target string) bool {
 		return exactID && kind == "resource"
 	case OperationStartupContraction:
 		return target == "installation" || target == "headscale" || exactID && kind == "resource"
+	case OperationHeadscaleInitialize:
+		return target == "installation"
 	case OperationResourceMutation:
 		return target == "installation" || exactID && kind == "resource"
 	case OperationProcessLifecycle, OperationPublicationActivate:
@@ -331,6 +338,8 @@ func validResourcePayload(operation Operation, value ResourcePayload) bool {
 		return false
 	}
 	switch operation {
+	case OperationHeadscaleInitialize:
+		return value.Operation == "deploy" && len(value.Resource) != 0 && value.PlanID == "" && value.Confirmation == "initialize"
 	case OperationResourceMutation:
 		return (value.Operation == "resource_create" || value.Operation == "resource_update") && len(value.Resource) != 0
 	case OperationProcessLifecycle:
@@ -409,7 +418,7 @@ func ValidateResponse(operation Operation, response Response) error {
 	}
 	switch response.Code {
 	case ResponseSucceeded:
-		if !digestPattern.MatchString(response.ResultDigest) || response.ErrorCode != "" {
+		if !digestPattern.MatchString(response.ResultDigest) || response.ErrorCode != "" || response.ErrorJobID != "" {
 			return fmt.Errorf("successful helper response is incomplete")
 		}
 		if operation != OperationPublicationActivate && response.Action != nil && response.Action.JobResult != "" {
@@ -453,6 +462,10 @@ func ValidateResponse(operation Operation, response Response) error {
 			if response.Action == nil || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.JobID != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || !validContractionOutcome(response.Action.ContractionOutcome, response.Action.AccessClosed, response.Action.SharedIngressDown, response.Action.AccessMayRemain) {
 				return fmt.Errorf("contraction response shape is invalid")
 			}
+		case OperationHeadscaleInitialize:
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.Operation != "deploy" || response.Action.TargetKind != "installation" || !strings.HasPrefix(response.Action.TargetID, "hds_") || !refPattern.MatchString(response.Action.TargetID) || response.Resource != nil || response.Action.JobResult != "" || response.Action.PublicURL != "" {
+				return fmt.Errorf("Headscale initialization response shape invalid")
+			}
 		case OperationResourceMutation:
 			if response.Action != nil || response.Resource == nil || !strings.HasPrefix(response.Resource.ResourceID, "res_") || !refPattern.MatchString(response.Resource.ResourceID) {
 				return fmt.Errorf("resource helper response shape invalid")
@@ -471,7 +484,9 @@ func ValidateResponse(operation Operation, response Response) error {
 			}
 		}
 	case ResponseRejected, ResponseFailed:
-		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil {
+		foreignCode := operation == OperationHeadscaleInitialize && response.ErrorCode == "foreign_database_evidence"
+		headscaleEvidence := foreignCode && strings.HasPrefix(response.ErrorJobID, "job_") && refPattern.MatchString(response.ErrorJobID)
+		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil || foreignCode != headscaleEvidence || response.ErrorJobID != "" && !headscaleEvidence {
 			return fmt.Errorf("failed helper response is not redacted")
 		}
 	default:

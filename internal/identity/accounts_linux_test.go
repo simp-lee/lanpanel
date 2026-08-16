@@ -32,8 +32,8 @@ func TestInstallationAccountsAreCollisionSafeAndExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(rendered), "sudo") || strings.Contains(string(rendered), " /bin/") || !strings.Contains(string(rendered), NoLoginShell) {
-		t.Fatalf("unsafe sysusers content: %s", rendered)
+	if strings.Contains(string(rendered), "sudo") || strings.Contains(string(rendered), " /bin/") || !strings.Contains(string(rendered), NoLoginShell) || strings.Contains(string(rendered), "headscale") {
+		t.Fatalf("unsafe or premature sysusers content: %s", rendered)
 	}
 
 	root := t.TempDir()
@@ -80,6 +80,17 @@ func TestInstallationAccountsAreCollisionSafeAndExact(t *testing.T) {
 	write(group, groupData.String()+"wheel:x:4000:"+set.Specs[0].User+"\n")
 	if _, _, err := InspectAccountFiles(set, passwd, group, shadow); err == nil {
 		t.Fatal("supplementary privilege was accepted")
+	}
+}
+
+func TestHeadscaleAccountIsSeparateAndBoundToInitializedDomain(t *testing.T) {
+	installation := "ins_00000000000000000000000000000001"
+	set, err := HeadscaleAccounts(installation, "hds_00000000000000000000000000000001")
+	if err != nil || len(set.Specs) != 1 || set.Specs[0].Role != RoleHeadscale || !strings.Contains(set.Specs[0].Comment, installation) {
+		t.Fatalf("HeadscaleAccounts() = %#v, %v", set, err)
+	}
+	if _, err := HeadscaleAccounts(installation, "res_00000000000000000000000000000001"); err == nil {
+		t.Fatal("non-Headscale identity was accepted")
 	}
 }
 

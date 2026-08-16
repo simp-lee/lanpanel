@@ -493,6 +493,9 @@ func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	if err := s.PendingCertificateRecovery(); err != nil {
 		return false, err
 	}
+	if err := s.PendingHeadscaleRecovery(); err != nil {
+		return false, err
+	}
 	raw, present := document.Entries["installations/current"]
 	if !present {
 		return false, fmt.Errorf("normal installation authority is missing")

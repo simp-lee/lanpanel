@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -67,7 +68,7 @@ func InstallationAccounts(installationID string) (AccountSet, error) {
 	roles := []struct {
 		role   AccountRole
 		suffix string
-	}{{RoleUI, "ui"}, {RoleTimer, "timer"}, {RoleRecovery, "recovery"}, {RoleHeadscale, "headscale"}, {RoleHTPasswd, "htp"}, {RoleTailscale, "tailscale"}}
+	}{{RoleUI, "ui"}, {RoleTimer, "timer"}, {RoleRecovery, "recovery"}, {RoleHTPasswd, "htp"}, {RoleTailscale, "tailscale"}}
 	set := AccountSet{HelperClientGroup: clientGroup, Specs: make([]AccountSpec, 0, len(roles))}
 	for _, value := range roles {
 		name := prefix + "-" + value.suffix
@@ -78,6 +79,16 @@ func InstallationAccounts(installationID string) (AccountSet, error) {
 		set.Specs = append(set.Specs, AccountSpec{Role: value.role, User: name, Group: group, Comment: "LanPanel " + installationID + " " + string(value.role), Home: LockedHome, Shell: NoLoginShell})
 	}
 	return set, nil
+}
+
+func HeadscaleAccounts(installationID, headscaleID string) (AccountSet, error) {
+	fingerprint, err := Fingerprint(installationID)
+	if err != nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(headscaleID) {
+		return AccountSet{}, fmt.Errorf("Headscale account identity is invalid")
+	}
+	prefix := "lp-" + fingerprint[:10]
+	name := prefix + "-headscale"
+	return AccountSet{HelperClientGroup: prefix + "-clients", Specs: []AccountSpec{{Role: RoleHeadscale, User: name, Group: name, Comment: "LanPanel " + installationID + " headscale " + headscaleID, Home: LockedHome, Shell: NoLoginShell}}}, nil
 }
 
 func RenderSysusers(set AccountSet) ([]byte, error) {
@@ -108,6 +119,48 @@ func InspectAccounts(set AccountSet) (present bool, identities []AccountIdentity
 // bootstrap account transaction before rerunning the same fixed child.
 func InspectPartialAccounts(set AccountSet) (complete bool, identities []AccountIdentity, err error) {
 	return inspectAccountFiles(set, "/etc/passwd", "/etc/group", "/etc/shadow", true)
+}
+
+func PartialAccountEvidencePresent(set AccountSet) (bool, error) {
+	if err := validateAccountSet(set, false); err != nil {
+		return false, err
+	}
+	passwdBytes, err := readAccountFile("/etc/passwd")
+	if err != nil {
+		return false, err
+	}
+	groupBytes, err := readAccountFile("/etc/group")
+	if err != nil {
+		return false, err
+	}
+	shadowBytes, err := readAccountFile("/etc/shadow")
+	if err != nil {
+		return false, err
+	}
+	users, err := parsePasswd(passwdBytes)
+	if err != nil {
+		return false, err
+	}
+	groups, err := parseGroups(groupBytes)
+	if err != nil {
+		return false, err
+	}
+	shadow, err := parseShadow(shadowBytes)
+	if err != nil {
+		return false, err
+	}
+	for _, spec := range set.Specs {
+		if _, present := users[spec.User]; present {
+			return true, nil
+		}
+		if _, present := groups[spec.Group]; present {
+			return true, nil
+		}
+		if _, present := shadow[spec.User]; present {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func InspectAccountFiles(set AccountSet, passwdPath, groupPath, shadowPath string) (bool, []AccountIdentity, error) {
@@ -144,7 +197,7 @@ func inspectAccountFiles(set AccountSet, passwdPath, groupPath, shadowPath strin
 	}
 	identities := make([]AccountIdentity, 0, len(set.Specs))
 	client, clientExists := groups[set.HelperClientGroup]
-	foundAny := clientExists
+	foundAny := false
 	if clientExists {
 		if len(client.members) != 0 || client.gid == 0 {
 			return false, nil, fmt.Errorf("helper client group is unsafe")
@@ -333,7 +386,7 @@ func readAccountFile(path string) ([]byte, error) {
 }
 
 func validateAccountSet(set AccountSet, requireIdentities bool) error {
-	if set.HelperClientGroup == "" || len(set.HelperClientGroup) > 31 || len(set.Specs) != 6 || requireIdentities && len(set.Identities) != len(set.Specs) {
+	if set.HelperClientGroup == "" || len(set.HelperClientGroup) > 31 || len(set.Specs) == 0 || len(set.Specs) > 6 || requireIdentities && len(set.Identities) != len(set.Specs) {
 		return fmt.Errorf("installation account set is incomplete")
 	}
 	seenRole, seenName := map[AccountRole]bool{}, map[string]bool{}
@@ -342,6 +395,11 @@ func validateAccountSet(set AccountSet, requireIdentities bool) error {
 			return fmt.Errorf("installation account specification is invalid or duplicated")
 		}
 		seenRole[spec.Role], seenName[spec.User] = true, true
+	}
+	installationSet := len(set.Specs) == 5 && seenRole[RoleUI] && seenRole[RoleTimer] && seenRole[RoleRecovery] && seenRole[RoleHTPasswd] && seenRole[RoleTailscale]
+	headscaleSet := len(set.Specs) == 1 && seenRole[RoleHeadscale]
+	if !installationSet && !headscaleSet {
+		return fmt.Errorf("account set role closure is invalid")
 	}
 	if requireIdentities {
 		for _, value := range set.Identities {

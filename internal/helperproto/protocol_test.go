@@ -74,6 +74,37 @@ func TestManagedBasicAndStaticRequestsAreClosed(t *testing.T) {
 	}
 }
 
+func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
+	now := time.Now().UTC()
+	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","source_kind":"official_canonical_artifact","confirmation":"initialize"}`)
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "headscale-initialize", Operation: OperationHeadscaleInitialize, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "deploy", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "initialize", Resource: payload}}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatal(err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("headscale"), Action: &ActionResult{JobID: "job_00000000000000000000000000000001", Operation: "deploy", TargetKind: "installation", TargetID: "hds_00000000000000000000000000000001"}}
+	if err := ValidateResponse(OperationHeadscaleInitialize, response); err != nil {
+		t.Fatal(err)
+	}
+	failure := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseRejected, ErrorCode: "foreign_database_evidence", ErrorJobID: "job_00000000000000000000000000000001"}
+	if err := ValidateResponse(OperationHeadscaleInitialize, failure); err != nil {
+		t.Fatal(err)
+	}
+	failure.ErrorJobID = ""
+	if ValidateResponse(OperationHeadscaleInitialize, failure) == nil {
+		t.Fatal("foreign-evidence failure omitted its job identity")
+	}
+	request.Resource.Operation = "publish"
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if ValidateRequest(request, now) == nil {
+		t.Fatal("non-deploy Headscale request accepted")
+	}
+	response.Action.TargetID = "res_00000000000000000000000000000001"
+	if ValidateResponse(OperationHeadscaleInitialize, response) == nil {
+		t.Fatal("non-Headscale result identity accepted")
+	}
+}
+
 func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	now := time.Now().UTC()
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "domain-status", Operation: OperationDomainStatus, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "status", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1}}
