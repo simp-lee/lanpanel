@@ -39,7 +39,7 @@ func TestDispatcherExposesOnlyCompleteFixedRoles(t *testing.T) {
 
 func TestFixedRoleCensus(t *testing.T) {
 	t.Run("release_fixed_roles", func(t *testing.T) {
-		want := []Name{ChildExecutor, FencedRecovery, GoAccessAccountGuard, GoAccessRelay, GoAccessRetention, HeadscalePrivateProbe, Helper, Installer, ManagedExecutor, PackageNoAutostart, ProcessGuard, Relay, ReloadGuard, RuntimeGuard, StartupGuard, Timer, UI, Upgrade}
+		want := []Name{ChildExecutor, FencedRecovery, GoAccessAccountGuard, GoAccessRelay, GoAccessRetention, HeadscaleControlRelay, HeadscalePrivateProbe, HeadscaleSTUNRelay, Helper, Installer, ManagedExecutor, PackageNoAutostart, ProcessGuard, Relay, ReloadGuard, RuntimeGuard, StartupGuard, Timer, UI, Upgrade}
 		if !slices.Equal(FixedNames(), want) {
 			t.Fatalf("fixed roles=%v want %v", FixedNames(), want)
 		}

@@ -188,6 +188,15 @@ type HeadscaleCertificateStagedCommit struct {
 	HeadscaleID string
 	Fingerprint string
 }
+type HeadscaleActivationIntentCommit struct {
+	HeadscaleID      string
+	ActivationDigest string
+}
+type HeadscaleActivatedCommit struct {
+	HeadscaleID   string
+	RuntimeDigest string
+	Applied       domain.HeadscaleAppliedIdentity
+}
 
 type ResourceCreateCommit struct {
 	Resource domain.AppResource
@@ -415,6 +424,7 @@ func Register(normal *persist.Store) error {
 	return nil
 }
 
+func (admitter *Admitter) TrustedNow() (time.Time, error) { return admitter.trustedNow() }
 func (admitter *Admitter) trustedNow() (time.Time, error) {
 	admitter.timeMu.Lock()
 	defer admitter.timeMu.Unlock()
@@ -1088,7 +1098,7 @@ func (admitter *Admitter) ContractHeadscaleDeployChallenge(ctx context.Context, 
 			}
 			return nil
 		}
-		if (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || (installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged) {
+		if (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || (installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivating && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivated) {
 			return fmt.Errorf("Headscale challenge is not terminal-contractible")
 		}
 		for _, childID := range journal.ChildIDs {
@@ -1128,6 +1138,15 @@ func (admitter *Admitter) ContractHeadscaleDeployChallenge(ctx context.Context, 
 		headscale := *installation.Headscale
 		deploy := *headscale.DeployIntent
 		deploy.Phase = domain.HeadscaleDeployContracted
+		deploy.RuntimeDigest = ""
+		if deploy.Prior == nil {
+			headscale.Applied = nil
+			headscale.Enabled = false
+		} else {
+			prior := *deploy.Prior
+			headscale.Applied = &prior
+			headscale.Enabled = true
+		}
 		headscale.DeployIntent = &deploy
 		installation.Headscale = &headscale
 		encodedInstallation, err := persist.EncodeEntry(installation)
@@ -1143,6 +1162,45 @@ func (admitter *Admitter) EnterRemoteWait(ctx context.Context, mutation *Mutatio
 	reservation, err := admitter.markRemoteWait(ctx, mutation, exposure, expectedRevision, jobID)
 	releaseErr := ReleaseExposure(mutation, exposure)
 	return reservation, errors.Join(err, releaseErr)
+}
+
+func (admitter *Admitter) ReenterHeadscaleActivationContraction(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID string) (Reservation, *MutationLease, *locks.Lease, error) {
+	if admitter == nil || mutationSet == nil || manager == nil {
+		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation contraction authority invalid")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil || document.Revision != expectedRevision {
+		return Reservation{}, nil, nil, errors.Join(err, persist.ErrRevision)
+	}
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || intent.Consumption == nil || (intent.Phase != PhaseReentered && intent.Phase != PhaseTerminal) {
+		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation is not contraction-recoverable")
+	}
+	installationRaw, present := document.Entries["installations/current"]
+	installation, decodeErr := domain.DecodeInstallation(installationRaw)
+	if !present || decodeErr != nil || installation.Headscale == nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID {
+		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation contraction domain authority changed")
+	}
+	phase := installation.Headscale.DeployIntent.Phase
+	if phase != domain.HeadscaleDeployCertificateStaged && phase != domain.HeadscaleDeployActivating && phase != domain.HeadscaleDeployActivated && phase != domain.HeadscaleDeployContracted || intent.Phase == PhaseTerminal && phase != domain.HeadscaleDeployContracted {
+		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation domain phase is not recoverable")
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
+	if err != nil {
+		return Reservation{}, nil, nil, err
+	}
+	fail := func(cause error) (Reservation, *MutationLease, *locks.Lease, error) {
+		return Reservation{}, nil, nil, errors.Join(cause, ReleaseExposure(mutation, exposure))
+	}
+	fresh, err := admitter.normal.Read()
+	if err != nil || fresh.Revision != expectedRevision {
+		return fail(errors.Join(err, persist.ErrRevision))
+	}
+	state, err := admitter.safety.Read()
+	if err != nil || !validStartupBinding(state, intent.SafetyBinding) {
+		return fail(fmt.Errorf("Headscale activation contraction safety authority changed: %w", err))
+	}
+	return intent, mutation, exposure, nil
 }
 
 func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID string) (Reservation, *MutationLease, *locks.Lease, error) {
@@ -3501,6 +3559,71 @@ func (admitter *Admitter) CommitHeadscaleCertificateStaged(ctx context.Context, 
 	return err
 }
 
+func (admitter *Admitter) CommitHeadscaleActivationIntent(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleActivationIntentCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.ActivationDigest) {
+		return fmt.Errorf("Headscale activation intent requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		reservation, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if reservation.Operation != HeadscaleDeploy || reservation.Phase != PhaseReentered || reservation.HeadscaleDeploy == nil || mutation.Target() != reservation.Target || installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged {
+			return fmt.Errorf("Headscale activation intent identity mismatched")
+		}
+		headscale := *installation.Headscale
+		next := *headscale.DeployIntent
+		next.Phase = domain.HeadscaleDeployActivating
+		next.ActivationDigest = commit.ActivationDigest
+		headscale.DeployIntent = &next
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitHeadscaleActivated(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleActivatedCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.RuntimeDigest) || domain.ValidateHeadscaleApplied(commit.Applied) != nil {
+		return fmt.Errorf("Headscale activated commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		reservation, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if reservation.Operation != HeadscaleDeploy || reservation.Phase != PhaseReentered || mutation.Target() != reservation.Target || installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivating || !reflect.DeepEqual(installation.Headscale.DeployIntent.Candidate, commit.Applied) {
+			return fmt.Errorf("Headscale activated identity mismatched")
+		}
+		headscale := *installation.Headscale
+		next := *headscale.DeployIntent
+		next.Phase = domain.HeadscaleDeployActivated
+		next.RuntimeDigest = commit.RuntimeDigest
+		headscale.DeployIntent = &next
+		applied := commit.Applied
+		headscale.Applied = &applied
+		headscale.Enabled = true
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ResourceCreateCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Resource.ID == "" {
 		return fmt.Errorf("resource creation commit requires exact authority")
@@ -5224,9 +5347,9 @@ func validateLinks(document persist.Document) error {
 				if err := decodeStrict(rawJournal, &journal); err != nil || journal.Phase != JournalTerminal {
 					return fmt.Errorf("contracted Headscale certificate journal is not terminal")
 				}
-			case domain.HeadscaleDeployCertificateStaged:
+			case domain.HeadscaleDeployCertificateStaged, domain.HeadscaleDeployActivating, domain.HeadscaleDeployActivated:
 				if intent.Phase != PhaseReentered {
-					return fmt.Errorf("staged Headscale certificate is outside reentry authority")
+					return fmt.Errorf("staged or activating Headscale certificate is outside reentry authority")
 				}
 				rawJournal, present := document.Entries["journals/certificate-"+deploy.JobID]
 				if !present {
@@ -5429,8 +5552,16 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged:
 				expected.DeployIntent = newHeadscale.DeployIntent
 				beforePhase, afterPhase = PhaseReentered, PhaseReentered
-			case oldHeadscale.DeployIntent != nil && (oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged) && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployContracted:
+			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating:
 				expected.DeployIntent = newHeadscale.DeployIntent
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				expected.Applied, expected.Enabled = newHeadscale.Applied, newHeadscale.Enabled
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+			case oldHeadscale.DeployIntent != nil && (oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated) && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployContracted:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				expected.Applied, expected.Enabled = newHeadscale.Applied, newHeadscale.Enabled
 				beforePhase, afterPhase = PhaseReentered, PhaseTerminal
 				beforeStatus, afterStatus = jobs.StatusRunning, jobs.StatusTerminal
 				contracting = true

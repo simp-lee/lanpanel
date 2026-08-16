@@ -727,10 +727,17 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 		return fmt.Errorf("Headscale: %w", err)
 	}
 	if !reflect.DeepEqual(before.Reactivating, after.Reactivating) {
-		if role != RolePublish && role != RoleCertificateHandoff {
+		bindingOnly := false
+		if role == RoleIngressActivation && before.Reactivating != nil && after.Reactivating != nil && before.Reactivating.ActivationDigest == "" && before.Reactivating.ControlEntryDigest == "" && isDigest(after.Reactivating.ActivationDigest) && isDigest(after.Reactivating.ControlEntryDigest) {
+			left, right := *before.Reactivating, *after.Reactivating
+			left.ActivationDigest, left.ControlEntryDigest = "", ""
+			right.ActivationDigest, right.ControlEntryDigest = "", ""
+			bindingOnly = reflect.DeepEqual(left, right)
+		}
+		if !bindingOnly && role != RolePublish && role != RoleCertificateHandoff {
 			return fmt.Errorf("wrong Headscale reactivation writer")
 		}
-		if role != RoleCertificateHandoff && after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
+		if !bindingOnly && role != RoleCertificateHandoff && after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
 			return fmt.Errorf("Headscale reactivation does not bind the exact prior generation")
 		}
 	}

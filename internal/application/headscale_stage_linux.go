@@ -691,7 +691,11 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 				next.Revision++
 				next.Headscale.ChallengePending = nil
 				next.Headscale.Reactivating = nil
-				_, contractErr = execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleContraction, state.Revision, next, safety.TransitionProof{})
+				proof := safety.TransitionProof{}
+				if active := state.Headscale.Reactivating; active != nil {
+					proof.Headscale = headscaleConvergenceProof(*active, headscaleFailureDigest("headscale-candidate-closed"))
+				}
+				_, contractErr = execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleContraction, state.Revision, next, proof)
 			}
 			err = contractErr
 		}
@@ -737,10 +741,16 @@ func reconcileInterruptedHeadscaleLocalCandidate(ctx context.Context, service *F
 			return readErr
 		}
 		installation, readErr := loadHeadscaleInstallation(document)
-		if readErr != nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != journal.JobID || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployContracted || state.Headscale.Reactivating != nil {
-			return fmt.Errorf("contracted Headscale local journal lacks terminal authority")
+		if readErr == nil && installation.Headscale.DeployIntent != nil && installation.Headscale.DeployIntent.JobID == journal.JobID && installation.Headscale.DeployIntent.Phase == domain.HeadscaleDeployContracted && state.Headscale.Reactivating == nil {
+			return nil
 		}
-		return nil
+		if state.Headscale.Reactivating != nil {
+			return reconcileInterruptedHeadscaleActivation(ctx, service, journal, state)
+		}
+		return fmt.Errorf("contracted Headscale local journal lacks terminal authority")
+	}
+	if journal.Phase == control.PhaseActivationIntent || journal.Phase == control.PhaseActivated || journal.Phase == control.PhaseCertificateStaged && state.Headscale.Reactivating != nil && state.Headscale.Reactivating.ActivationDigest != "" {
+		return reconcileInterruptedHeadscaleActivation(ctx, service, journal, state)
 	}
 	if journal.Phase == control.PhaseCertificateStaged {
 		active := state.Headscale.Reactivating

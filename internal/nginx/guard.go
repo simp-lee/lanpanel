@@ -57,7 +57,11 @@ func Guard(input GuardInput) GuardDecision {
 	}
 	for _, entry := range input.Manifest.Entries {
 		if entry.Kind == EntryControl {
-			return GuardDecision{Reason: "control ingress authority is unavailable"}
+			active := input.Safety.Headscale.Reactivating
+			if active == nil || entry.Domain == nil || active.ControlGeneration != entry.Generation || active.CertificateGeneration == 0 || active.CertificateFingerprint == "" || active.CandidateBundle == "" || active.ActivationDigest == "" || active.ControlEntryDigest != entry.Digest {
+				return GuardDecision{Reason: "control ingress lacks exact Headscale reactivation authority"}
+			}
+			continue
 		}
 		resource := findSafetyResource(input.Safety, entry.ResourceID)
 		if resource == nil {

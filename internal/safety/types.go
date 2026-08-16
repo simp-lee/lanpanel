@@ -96,6 +96,8 @@ type HeadscaleReactivating struct {
 	CertificateFingerprint string           `json:"certificate_fingerprint"`
 	CandidateDigest        string           `json:"candidate_digest"`
 	CandidateBundle        string           `json:"candidate_bundle"`
+	ActivationDigest       string           `json:"activation_digest,omitempty"`
+	ControlEntryDigest     string           `json:"control_entry_digest,omitempty"`
 	BaseMarkers            []MarkerSnapshot `json:"base_markers"`
 	ProbePending           bool             `json:"probe_pending"`
 	ProbeCorrelation       string           `json:"probe_correlation,omitempty"`

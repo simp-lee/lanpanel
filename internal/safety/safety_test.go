@@ -12,6 +12,18 @@ import (
 	"time"
 )
 
+func TestInitialHeadscaleActivationMayFencePriorNullExposure(t *testing.T) {
+	state := EmptyState()
+	state.Headscale.GenerationSequence = 1
+	state.Headscale.Reactivating = &HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: "plan_control", ControlGeneration: 1, CertificateGeneration: 1, CertificateFingerprint: digest("certificate"), CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), BaseMarkers: absentBaseSnapshot(), CertificateUntil: time.Unix(500, 0).UTC()}
+	fence := StopFence{Kind: StopFenceIngressActivation, OriginOperation: "headscale_deploy", Scope: FenceScope{Kind: "headscale"}, FenceGeneration: 1, CreatedAt: time.Unix(100, 0).UTC(), SafetyGenerations: []MarkerGeneration{{Kind: "reactivating", Generation: 1}}, OwnedGraphDigest: digest("graph"), InventoryDigest: digest("inventory"), Observation: StopObservation{ObservedAt: time.Unix(101, 0).UTC()}, AccessMayRemain: true, IngressActivation: &IngressActivationFence{IntentRef: "plan_control", CandidateGeneration: 1, PriorGeneration: 0}}
+	state.StopFenceSequence = 1
+	state.StopFence = &fence
+	if err := Validate(state); err != nil {
+		t.Fatalf("prior-null Headscale ingress fence invalid: %v", err)
+	}
+}
+
 func TestSafetySchemaContract(t *testing.T) {
 	t.Run("closed_stop_fence_payloads", func(t *testing.T) {
 		for _, kind := range []StopFenceKind{StopFenceContraction, StopFenceIngressActivation, StopFenceCertificateActivation, StopFenceEdgeOneRefresh, StopFenceMaintenanceTransition, StopFenceGenerationUpgrade} {

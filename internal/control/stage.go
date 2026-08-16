@@ -16,6 +16,7 @@ type CandidateHost interface {
 	CommitFreshBoundary(context.Context, Rendered) error
 	InitializeDatabase(context.Context, Rendered) (DatabaseEvidence, error)
 	StagePrivateService(context.Context, Rendered, DatabaseEvidence) (ServiceEvidence, error)
+	VerifyActiveCandidate(context.Context, Rendered, DatabaseEvidence, ServiceEvidence) error
 	StopPrivateService(context.Context, Candidate) error
 }
 
@@ -150,6 +151,13 @@ func ResumeStoppedLocal(ctx context.Context, store *Store, host CandidateHost, r
 		return nil, errors.Join(err, fmt.Errorf("Headscale stopped local recovery probe mismatched"))
 	}
 	return execution, nil
+}
+
+func (execution *Execution) VerifyPrivateCandidate(ctx context.Context) error {
+	if execution == nil || execution.host == nil || execution.journal.Phase != PhaseCertificateStaged || execution.journal.Database == nil || execution.journal.Service == nil {
+		return fmt.Errorf("Headscale activation candidate authority incomplete")
+	}
+	return execution.host.VerifyActiveCandidate(ctx, execution.rendered, *execution.journal.Database, *execution.journal.Service)
 }
 
 func (execution *Execution) IssueRequest() (IssueRequest, error) {

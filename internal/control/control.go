@@ -57,7 +57,7 @@ func FixedPaths() Paths {
 		DERPKey:        "/var/lib/lanpanel/headscale-runtime/derp-private.key",
 		Journal:        "/var/lib/lanpanel/headscale-control/deploy.json",
 		JournalStaging: "/var/lib/lanpanel/headscale-control/.lanpanel-deploy-filetxn",
-		ControlSocket:  "/run/lanpanel/headscale/control.sock",
+		ControlSocket:  "/run/lanpanel-headscale-control/control.sock",
 		AdminSocket:    "/run/lanpanel/headscale/admin.sock",
 		MetricsSocket:  "/run/lanpanel/headscale/metrics.sock",
 		Executable:     "/usr/lib/lanpanel/dependencies/headscale",

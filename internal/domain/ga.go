@@ -220,6 +220,8 @@ const (
 	HeadscaleDeployPrepared           HeadscaleDeployPhase = "prepared"
 	HeadscaleDeployCertificatePending HeadscaleDeployPhase = "certificate_pending"
 	HeadscaleDeployCertificateStaged  HeadscaleDeployPhase = "certificate_staged"
+	HeadscaleDeployActivating         HeadscaleDeployPhase = "activating"
+	HeadscaleDeployActivated          HeadscaleDeployPhase = "activated"
 	HeadscaleDeployContracted         HeadscaleDeployPhase = "contracted"
 )
 
@@ -231,6 +233,8 @@ type HeadscaleDeployIntent struct {
 	PreflightDigest        string                    `json:"preflight_digest"`
 	CertificateBinding     string                    `json:"certificate_binding"`
 	CertificateFingerprint string                    `json:"certificate_fingerprint,omitempty"`
+	ActivationDigest       string                    `json:"activation_digest,omitempty"`
+	RuntimeDigest          string                    `json:"runtime_digest,omitempty"`
 	Candidate              HeadscaleAppliedIdentity  `json:"candidate"`
 	Prior                  *HeadscaleAppliedIdentity `json:"prior,omitempty"`
 }
@@ -252,7 +256,7 @@ type HeadscaleDomain struct {
 }
 
 func HeadscaleManagedPaths() []string {
-	return []string{"/etc/lanpanel-headscale", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
+	return []string{"/etc/lanpanel-headscale", "/etc/lanpanel/nginx/control-enabled/headscale.conf", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/run/lanpanel-headscale-control", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
 }
 
 type TailnetConnector struct {
@@ -772,12 +776,25 @@ func validateHeadscale(value HeadscaleDomain) error {
 	}
 	if value.DeployIntent != nil {
 		intent := value.DeployIntent
-		validPhase := intent.Phase == HeadscaleDeployPrepared || intent.Phase == HeadscaleDeployCertificatePending || intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployContracted
+		validPhase := intent.Phase == HeadscaleDeployPrepared || intent.Phase == HeadscaleDeployCertificatePending || intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployActivating || intent.Phase == HeadscaleDeployActivated || intent.Phase == HeadscaleDeployContracted
+		fingerprintRequired := intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployActivating || intent.Phase == HeadscaleDeployActivated
 		validFingerprint := intent.CertificateFingerprint == ""
-		if intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployContracted && intent.CertificateFingerprint != "" {
+		if fingerprintRequired || intent.Phase == HeadscaleDeployContracted && intent.CertificateFingerprint != "" {
 			validFingerprint = validSHA256Digest(intent.CertificateFingerprint)
 		}
-		if intent.Generation == 0 || intent.Generation != intent.Candidate.Generation || !validOpaqueTargetID(intent.PlanID) || !validOpaqueTargetID(intent.JobID) || !validPhase || !validSHA256Digest(intent.PreflightDigest) || !validSHA256Digest(intent.CertificateBinding) || !validFingerprint || validateHeadscaleApplied(intent.Candidate) != nil || intent.Prior != nil && (value.Applied == nil || !reflect.DeepEqual(intent.Prior, value.Applied) || validateHeadscaleApplied(*intent.Prior) != nil) || intent.Prior == nil && value.Applied != nil {
+		validActivation := intent.ActivationDigest == "" && intent.RuntimeDigest == ""
+		if intent.Phase == HeadscaleDeployActivating {
+			validActivation = validSHA256Digest(intent.ActivationDigest) && intent.RuntimeDigest == ""
+		} else if intent.Phase == HeadscaleDeployActivated {
+			validActivation = validSHA256Digest(intent.ActivationDigest) && validSHA256Digest(intent.RuntimeDigest)
+		} else if intent.Phase == HeadscaleDeployContracted {
+			validActivation = (intent.ActivationDigest == "" || validSHA256Digest(intent.ActivationDigest)) && intent.RuntimeDigest == ""
+		}
+		validAppliedRelation := intent.Prior != nil && value.Applied != nil && reflect.DeepEqual(intent.Prior, value.Applied) && validateHeadscaleApplied(*intent.Prior) == nil || intent.Prior == nil && value.Applied == nil
+		if intent.Phase == HeadscaleDeployActivated {
+			validAppliedRelation = value.Applied != nil && reflect.DeepEqual(intent.Candidate, *value.Applied)
+		}
+		if intent.Generation == 0 || intent.Generation != intent.Candidate.Generation || !validOpaqueTargetID(intent.PlanID) || !validOpaqueTargetID(intent.JobID) || !validPhase || !validSHA256Digest(intent.PreflightDigest) || !validSHA256Digest(intent.CertificateBinding) || !validFingerprint || !validActivation || validateHeadscaleApplied(intent.Candidate) != nil || !validAppliedRelation {
 			return fmt.Errorf("headscale deploy intent is invalid")
 		}
 	}
@@ -803,6 +820,9 @@ func ValidateHeadscale(value HeadscaleDomain) error {
 	return validateHeadscale(value)
 }
 
+func ValidateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
+	return validateHeadscaleApplied(value)
+}
 func validateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
 	if value.Generation == 0 || !validSHA256Digest(value.ConfigDigest) || !validSHA256Digest(value.ArtifactDigest) || !validSHA256Digest(value.ServiceIdentity) || !validSHA256Digest(value.ControlIdentity) || !headscaleRefPattern.MatchString(value.CertificateID) {
 		return fmt.Errorf("headscale applied identity is incomplete")

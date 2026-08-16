@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration
+.PHONY: build test vet lint check tidy ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
@@ -159,6 +159,16 @@ ga-headscale-candidate-integration:
 	@! grep -R -n -E 'BeginHeadscaleDeploy|CreateHeadscaleDeployPlan|HeadscaleDeployPayload' internal/helperproto internal/helper internal/ui
 	@! grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command|os\.StartProcess|/bin/(sh|bash|dash)' internal/control
 
+ga-headscale-control-integration:
+	$(GO) test -count=1 ./internal/control ./internal/nginx ./internal/domain ./internal/safety ./internal/operations ./internal/child ./internal/roles ./internal/application
+	@grep -Fq 'ListenDatagram=0.0.0.0:3478' internal/control/activation.go
+	@grep -Fq 'JoinsNamespaceOf=lanpanel-headscale.service' internal/control/activation.go
+	@grep -Fq 'proxy_set_header Cookie' internal/nginx/graph.go
+	@grep -Fq 'CommitHeadscaleActivated' internal/operations/operations.go
+	@grep -Fq 'contractActivationFailure' internal/application/headscale_activate_linux.go
+	@! grep -R -n -E 'BeginHeadscaleDeploy|CreateHeadscaleDeployPlan|HeadscaleDeployPayload' internal/helperproto internal/helper internal/ui
+	@! grep -R -n -E --include='*.go' --exclude='*_test.go' 'exec\.Command|os\.StartProcess|/bin/(sh|bash|dash)' internal/control
+
 ga-headscale-integration:
 	$(GO) test -count=1 ./internal/dependencies ./internal/release ./internal/headscale ./internal/domain ./internal/reservations ./internal/preflight ./internal/operations ./internal/helperproto ./internal/application ./internal/helper ./internal/ui ./internal/child ./internal/bootstrap ./internal/download ./internal/archive
 	@grep -Fq 'SupportedHeadscaleConfigContract' internal/release/identity.go
@@ -175,4 +185,4 @@ ga-managed-process-integration:
 	@grep -Fq 'SocketBindDeny=any' internal/confinement/policy_linux.go
 	@grep -Fq 'PR_SET_NO_NEW_PRIVS' internal/process/managed_exec_linux.go
 
-check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-temporary-publication-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit
+check: build test vet ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-target-readiness-integration ga-temporary-publication-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-playwright-auth ga-playwright-action-boundary ga-forbidden-utility-audit

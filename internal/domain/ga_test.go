@@ -612,6 +612,24 @@ func TestHeadscaleDeployIntentIsExactAndNonApplied(t *testing.T) {
 	if err := ValidateHeadscale(changed); err == nil {
 		t.Fatal("Headscale deploy with incomplete control identity accepted")
 	}
+	activated := value
+	activatedIntent := *activated.DeployIntent
+	activatedIntent.Phase = HeadscaleDeployActivated
+	activatedIntent.CertificateFingerprint = testDigest
+	activatedIntent.ActivationDigest = testDigest
+	activatedIntent.RuntimeDigest = testDigest
+	activated.DeployIntent = &activatedIntent
+	applied := activatedIntent.Candidate
+	activated.Applied = &applied
+	activated.Enabled = true
+	if err := ValidateHeadscale(activated); err != nil {
+		t.Fatalf("activated Headscale authority invalid: %v", err)
+	}
+	activatedIntent.RuntimeDigest = ""
+	activated.DeployIntent = &activatedIntent
+	if err := ValidateHeadscale(activated); err == nil {
+		t.Fatal("activated Headscale without runtime proof accepted")
+	}
 }
 
 func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {

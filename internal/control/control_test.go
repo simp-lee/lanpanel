@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/domain"
@@ -103,9 +104,28 @@ func TestCertificateResultMustMatchSameDeployAuthority(t *testing.T) {
 	if execution.Journal().Phase != PhaseCertificateStaged {
 		t.Fatal("exact certificate did not stage")
 	}
-	contracted, err := store.Contract(context.Background(), execution.Journal())
-	if err != nil || contracted.Phase != PhaseContracted || contracted.Certificate == nil || contracted.Certificate.Fingerprint != identity.Fingerprint {
-		t.Fatalf("staged certificate contraction lost durable identity: %+v err=%v", contracted, err)
+	if err := execution.VerifyPrivateCandidate(context.Background()); err != nil || host.serviceCalls != 2 {
+		t.Fatalf("activation-time private verification failed: calls=%d err=%v", host.serviceCalls, err)
+	}
+	activationBundle, bundleErr := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, identity)
+	if bundleErr != nil {
+		t.Fatal(bundleErr)
+	}
+	activationIntent := execution.Journal()
+	activationIntent.Phase = PhaseActivationIntent
+	activationIntent.ActivationDigest = activationBundle.Digest
+	if err := store.Replace(context.Background(), execution.Journal(), activationIntent); err != nil {
+		t.Fatal(err)
+	}
+	activated := activationIntent
+	activated.Phase = PhaseActivated
+	activated.RuntimeDigest = testDigest("runtime")
+	if err := store.Replace(context.Background(), activationIntent, activated); err != nil {
+		t.Fatal(err)
+	}
+	contracted, err := store.Contract(context.Background(), activated)
+	if err != nil || contracted.Phase != PhaseContracted || contracted.Certificate == nil || contracted.Certificate.Fingerprint != identity.Fingerprint || contracted.RuntimeDigest != "" || contracted.ActivationDigest != activationIntent.ActivationDigest {
+		t.Fatalf("activated certificate contraction lost durable identity: %+v err=%v", contracted, err)
 	}
 	if repeated, err := store.Contract(context.Background(), contracted); err != nil || repeated.Phase != PhaseContracted {
 		t.Fatalf("contracted journal was not idempotent: %+v err=%v", repeated, err)
@@ -128,6 +148,14 @@ func (host *fakeCandidateHost) InitializeDatabase(_ context.Context, rendered Re
 func (host *fakeCandidateHost) StagePrivateService(_ context.Context, rendered Rendered, _ DatabaseEvidence) (ServiceEvidence, error) {
 	host.serviceCalls++
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: testDigest("private-probe"), PublicSTUNOpen: host.public}, nil
+}
+func (host *fakeCandidateHost) VerifyActiveCandidate(_ context.Context, rendered Rendered, _ DatabaseEvidence, expected ServiceEvidence) error {
+	host.serviceCalls++
+	actual := ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: testDigest("private-probe"), PublicSTUNOpen: host.public}
+	if actual != expected {
+		return fmt.Errorf("active evidence changed")
+	}
+	return nil
 }
 func (host *fakeCandidateHost) StopPrivateService(context.Context, Candidate) error {
 	host.stopCalls++

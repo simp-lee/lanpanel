@@ -10,6 +10,7 @@ import (
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/nginx"
 	"os"
 	"path/filepath"
 
@@ -22,6 +23,7 @@ type PrivateRuntime interface {
 	RequireAbsent(context.Context, Candidate, identity.AccountIdentity) error
 	InitializeDatabase(context.Context, Rendered, identity.AccountIdentity) (DatabaseEvidence, error)
 	StartAndProbe(context.Context, Rendered, identity.AccountIdentity) (ServiceEvidence, error)
+	ObserveActive(context.Context, Rendered, identity.AccountIdentity) (ServiceEvidence, error)
 	StopAndVerify(context.Context, Candidate, identity.AccountIdentity) error
 }
 
@@ -49,7 +51,8 @@ func (host *LinuxCandidateHost) ValidateFreshCandidate(_ context.Context, render
 	if err != nil {
 		return err
 	}
-	for _, path := range []string{rendered.Candidate.Paths.ConfigRoot, rendered.Candidate.Paths.Unit, rendered.Candidate.Paths.RuntimeRoot, rendered.Candidate.Paths.JournalRoot, bundle, pointer, filepath.Join("/var/lib/lanpanel/certificates/chroot", rendered.Candidate.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", rendered.Candidate.CertificateID)} {
+	activation := FixedActivationPaths()
+	for _, path := range []string{rendered.Candidate.Paths.ConfigRoot, rendered.Candidate.Paths.Unit, rendered.Candidate.Paths.RuntimeRoot, rendered.Candidate.Paths.JournalRoot, activation.ControlRuntime, activation.ControlSocketUnit, activation.ControlRelayUnit, activation.STUNSocketUnit, activation.STUNRelayUnit, filepath.Join(nginx.FixedPaths().ConfigRoot, nginx.ControlDirectory, "headscale.conf"), bundle, pointer, filepath.Join("/var/lib/lanpanel/certificates/chroot", rendered.Candidate.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", rendered.Candidate.CertificateID)} {
 		var stat unix.Stat_t
 		if err := unix.Lstat(path, &stat); errors.Is(err, unix.ENOENT) {
 			continue
@@ -104,6 +107,23 @@ func (host *LinuxCandidateHost) StagePrivateService(ctx context.Context, rendere
 		return ServiceEvidence{}, fmt.Errorf("Headscale private service probe mismatched or exposed public STUN")
 	}
 	return evidence, nil
+}
+
+func (host *LinuxCandidateHost) VerifyActiveCandidate(ctx context.Context, rendered Rendered, database DatabaseEvidence, service ServiceEvidence) error {
+	if host == nil || VerifyRendered(rendered) != nil || !validDatabase(Journal{Candidate: rendered.Candidate, Database: &database}) || !validService(Journal{Candidate: rendered.Candidate, Service: &service}) {
+		return fmt.Errorf("Headscale active candidate authority invalid")
+	}
+	if err := host.verifyCandidateFiles(ctx, rendered); err != nil {
+		return err
+	}
+	observed, err := host.runtime.ObserveActive(ctx, rendered, host.account)
+	if err != nil {
+		return err
+	}
+	if observed != service {
+		return fmt.Errorf("Headscale active candidate evidence changed")
+	}
+	return nil
 }
 
 func (host *LinuxCandidateHost) StopPrivateService(ctx context.Context, candidate Candidate) error {

@@ -200,6 +200,22 @@ func verifyPriorSnapshot(snapshot closure.RuntimeSnapshot, manifest nginx.Manife
 	}
 	return nil
 }
+func (host Host) ObserveRuntime(ctx context.Context, manifest nginx.Manifest) (closure.RuntimeSnapshot, error) {
+	if host.Launcher == nil || nginx.ValidateManifest(manifest) != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("Nginx runtime observation authority invalid")
+	}
+	return host.observer(manifest).Observe(ctx)
+}
+func (host Host) WaitForPriorWorkers(ctx context.Context, manifest nginx.Manifest, prior []closure.ProcessIdentity) (closure.RuntimeSnapshot, error) {
+	if host.Launcher == nil || nginx.ValidateManifest(manifest) != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("Nginx reload observation authority invalid")
+	}
+	snapshot, err := closure.WaitPriorWorkers(ctx, host.observer(manifest), prior, nginx.DefaultWorkerTimeout)
+	if err != nil {
+		return snapshot, err
+	}
+	return snapshot, verifyPriorSnapshot(snapshot, manifest)
+}
 func (host Host) observer(manifest nginx.Manifest) closure.ProcObserver {
 	listeners := []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp::::80", "tcp::::443"}
 	for _, entry := range manifest.Entries {

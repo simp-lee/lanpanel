@@ -18,41 +18,45 @@ import (
 type ProfileID string
 
 const (
-	ProfileSystemdSysusers       ProfileID = "systemd_sysusers"
-	ProfileAPTDownload           ProfileID = "apt_download"
-	ProfileAPTSimulate           ProfileID = "apt_simulate"
-	ProfileAPTTransaction        ProfileID = "apt_transaction"
-	ProfileAPTOfflineTransaction ProfileID = "apt_offline_transaction"
-	ProfileDPKGTransaction       ProfileID = "dpkg_transaction"
-	ProfileSystemctl             ProfileID = "systemctl"
-	ProfileSystemctlBootstrap    ProfileID = "systemctl_bootstrap"
-	ProfileSystemctlNginxStart   ProfileID = "systemctl_nginx_start"
-	ProfileSystemctlNginxReload  ProfileID = "systemctl_nginx_reload"
-	ProfileSystemctlNginxStop    ProfileID = "systemctl_nginx_stop"
-	ProfileNginxStart            ProfileID = "nginx_start"
-	ProfileNginxTest             ProfileID = "nginx_test"
-	ProfileNginxDump             ProfileID = "nginx_dump"
-	ProfileNginxReloadSignal     ProfileID = "nginx_reload_signal"
-	ProfileNginxQuitSignal       ProfileID = "nginx_quit_signal"
-	ProfileHeadscaleAccounts     ProfileID = "headscale_accounts"
-	ProfileHeadscaleStart        ProfileID = "headscale_start"
-	ProfileHeadscaleStop         ProfileID = "headscale_stop"
-	ProfileHeadscaleShow         ProfileID = "headscale_show"
-	ProfileHeadscaleAdmin        ProfileID = "headscale_admin"
-	ProfileGoAccessProbe         ProfileID = "goaccess_probe"
-	ProfileGoAccessAccounts      ProfileID = "goaccess_accounts"
-	ProfileGoAccessStart         ProfileID = "goaccess_start"
-	ProfileGoAccessRetain        ProfileID = "goaccess_retain"
-	ProfileGoAccessStop          ProfileID = "goaccess_stop"
-	ProfileGoAccessShow          ProfileID = "goaccess_show"
-	ProfileLego                  ProfileID = "lego"
-	ProfileHTPasswd              ProfileID = "htpasswd"
-	ProfileTailscaleAdmin        ProfileID = "tailscale_admin"
-	ProfileResourceAccounts      ProfileID = "resource_accounts"
-	ProfileResourceDaemonReload  ProfileID = "resource_daemon_reload"
-	ProfileResourceStart         ProfileID = "resource_start"
-	ProfileResourceStop          ProfileID = "resource_stop"
-	ProfileResourceShow          ProfileID = "resource_show"
+	ProfileSystemdSysusers        ProfileID = "systemd_sysusers"
+	ProfileAPTDownload            ProfileID = "apt_download"
+	ProfileAPTSimulate            ProfileID = "apt_simulate"
+	ProfileAPTTransaction         ProfileID = "apt_transaction"
+	ProfileAPTOfflineTransaction  ProfileID = "apt_offline_transaction"
+	ProfileDPKGTransaction        ProfileID = "dpkg_transaction"
+	ProfileSystemctl              ProfileID = "systemctl"
+	ProfileSystemctlBootstrap     ProfileID = "systemctl_bootstrap"
+	ProfileSystemctlNginxStart    ProfileID = "systemctl_nginx_start"
+	ProfileSystemctlNginxReload   ProfileID = "systemctl_nginx_reload"
+	ProfileSystemctlNginxStop     ProfileID = "systemctl_nginx_stop"
+	ProfileNginxStart             ProfileID = "nginx_start"
+	ProfileNginxTest              ProfileID = "nginx_test"
+	ProfileNginxDump              ProfileID = "nginx_dump"
+	ProfileNginxReloadSignal      ProfileID = "nginx_reload_signal"
+	ProfileNginxQuitSignal        ProfileID = "nginx_quit_signal"
+	ProfileHeadscaleAccounts      ProfileID = "headscale_accounts"
+	ProfileHeadscaleStart         ProfileID = "headscale_start"
+	ProfileHeadscaleStop          ProfileID = "headscale_stop"
+	ProfileHeadscaleShow          ProfileID = "headscale_show"
+	ProfileHeadscaleActivateStart ProfileID = "headscale_activate_start"
+	ProfileHeadscaleActivateStop  ProfileID = "headscale_activate_stop"
+	ProfileHeadscaleActivateShow  ProfileID = "headscale_activate_show"
+	ProfileHeadscaleFallbackStop  ProfileID = "headscale_fallback_stop"
+	ProfileHeadscaleAdmin         ProfileID = "headscale_admin"
+	ProfileGoAccessProbe          ProfileID = "goaccess_probe"
+	ProfileGoAccessAccounts       ProfileID = "goaccess_accounts"
+	ProfileGoAccessStart          ProfileID = "goaccess_start"
+	ProfileGoAccessRetain         ProfileID = "goaccess_retain"
+	ProfileGoAccessStop           ProfileID = "goaccess_stop"
+	ProfileGoAccessShow           ProfileID = "goaccess_show"
+	ProfileLego                   ProfileID = "lego"
+	ProfileHTPasswd               ProfileID = "htpasswd"
+	ProfileTailscaleAdmin         ProfileID = "tailscale_admin"
+	ProfileResourceAccounts       ProfileID = "resource_accounts"
+	ProfileResourceDaemonReload   ProfileID = "resource_daemon_reload"
+	ProfileResourceStart          ProfileID = "resource_start"
+	ProfileResourceStop           ProfileID = "resource_stop"
+	ProfileResourceShow           ProfileID = "resource_show"
 )
 
 type IdentityKind string
@@ -181,35 +185,39 @@ var catalog = map[ProfileID]Profile{
 	// The remaining profiles are deliberately unavailable until their owning
 	// component supplies its release-fixed argv, identity, chroot, and network
 	// qualification. There is no root or generic-exec fallback.
-	ProfileAPTDownload:           {ID: ProfileAPTDownload, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
-	ProfileAPTSimulate:           {ID: ProfileAPTSimulate, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
-	ProfileAPTTransaction:        {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
-	ProfileAPTOfflineTransaction: {ID: ProfileAPTOfflineTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNoSockets, RootTCB: true},
-	ProfileDPKGTransaction:       {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", Arguments: []string{"--audit"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: packageCapabilities(), Timeout: 2 * time.Minute, MaximumOutputBytes: 256 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctl:             {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctlBootstrap:    {ID: ProfileSystemctlBootstrap, Executable: "/usr/bin/systemctl", Arguments: []string{"enable", "--now", "lanpanel-runtime.service", "lanpanel-management.socket", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctlNginxStart:   {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctlNginxReload:  {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileSystemctlNginxStop:    {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileHeadscaleAccounts:     {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileHeadscaleStart:        {ID: ProfileHeadscaleStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileHeadscaleStop:         {ID: ProfileHeadscaleStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileHeadscaleShow:         {ID: ProfileHeadscaleShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileHeadscaleAdmin:        {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
-	ProfileGoAccessProbe:         {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
-	ProfileGoAccessAccounts:      {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileGoAccessStart:         {ID: ProfileGoAccessStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileGoAccessRetain:        {ID: ProfileGoAccessRetain, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileGoAccessStop:          {ID: ProfileGoAccessStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileGoAccessShow:          {ID: ProfileGoAccessShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileLego:                  {ID: ProfileLego, Executable: "/usr/lib/lanpanel/dependencies/lego", IdentityKind: IdentityCertificateStage, Network: NetworkHostQualified, AllowedAddressFamilies: []int{2, 10}, Timeout: 10 * time.Minute, MaximumInputBytes: 32 << 10, MaximumOutputBytes: 64 << 10, MaximumFileBytes: 16 << 20, Umask: 0o022, Complete: true},
-	ProfileHTPasswd:              {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNoSockets, Timeout: 5 * time.Second, MaximumInputBytes: 72, MaximumOutputBytes: 4 << 10, Complete: true},
-	ProfileTailscaleAdmin:        {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
-	ProfileResourceAccounts:      {ID: ProfileResourceAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileResourceDaemonReload:  {ID: ProfileResourceDaemonReload, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileResourceStart:         {ID: ProfileResourceStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileResourceStop:          {ID: ProfileResourceStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileResourceShow:          {ID: ProfileResourceShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileAPTDownload:            {ID: ProfileAPTDownload, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
+	ProfileAPTSimulate:            {ID: ProfileAPTSimulate, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
+	ProfileAPTTransaction:         {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
+	ProfileAPTOfflineTransaction:  {ID: ProfileAPTOfflineTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNoSockets, RootTCB: true},
+	ProfileDPKGTransaction:        {ID: ProfileDPKGTransaction, Executable: "/usr/bin/dpkg", Arguments: []string{"--audit"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedCapabilities: packageCapabilities(), Timeout: 2 * time.Minute, MaximumOutputBytes: 256 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctl:              {ID: ProfileSystemctl, Executable: "/usr/bin/systemctl", Arguments: []string{"daemon-reload"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlBootstrap:     {ID: ProfileSystemctlBootstrap, Executable: "/usr/bin/systemctl", Arguments: []string{"enable", "--now", "lanpanel-runtime.service", "lanpanel-management.socket", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxStart:    {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxReload:   {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileSystemctlNginxStop:     {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileHeadscaleAccounts:      {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleStart:         {ID: ProfileHeadscaleStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleStop:          {ID: ProfileHeadscaleStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleShow:          {ID: ProfileHeadscaleShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleActivateStart: {ID: ProfileHeadscaleActivateStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleActivateStop:  {ID: ProfileHeadscaleActivateStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileHeadscaleFallbackStop:  {ID: ProfileHeadscaleFallbackStop, Executable: "/usr/bin/systemctl", Arguments: []string{"mask", "--runtime", "--now", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileHeadscaleActivateShow:  {ID: ProfileHeadscaleActivateShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 128 << 10, RootTCB: true},
+	ProfileHeadscaleAdmin:         {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
+	ProfileGoAccessProbe:          {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
+	ProfileGoAccessAccounts:       {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessStart:          {ID: ProfileGoAccessStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessRetain:         {ID: ProfileGoAccessRetain, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessStop:           {ID: ProfileGoAccessStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileGoAccessShow:           {ID: ProfileGoAccessShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileLego:                   {ID: ProfileLego, Executable: "/usr/lib/lanpanel/dependencies/lego", IdentityKind: IdentityCertificateStage, Network: NetworkHostQualified, AllowedAddressFamilies: []int{2, 10}, Timeout: 10 * time.Minute, MaximumInputBytes: 32 << 10, MaximumOutputBytes: 64 << 10, MaximumFileBytes: 16 << 20, Umask: 0o022, Complete: true},
+	ProfileHTPasswd:               {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNoSockets, Timeout: 5 * time.Second, MaximumInputBytes: 72, MaximumOutputBytes: 4 << 10, Complete: true},
+	ProfileTailscaleAdmin:         {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
+	ProfileResourceAccounts:       {ID: ProfileResourceAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceDaemonReload:   {ID: ProfileResourceDaemonReload, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceStart:          {ID: ProfileResourceStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceStop:           {ID: ProfileResourceStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceShow:           {ID: ProfileResourceShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 }
 
 func FixedProfileIDs() []ProfileID {
@@ -273,7 +281,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow
+	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow || id == ProfileHeadscaleActivateStart || id == ProfileHeadscaleActivateStop || id == ProfileHeadscaleActivateShow
 	if headscaleProfile {
 		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
 			return Profile{}, fmt.Errorf("Headscale child invocation authority is invalid")
@@ -287,6 +295,12 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			profile.Arguments = []string{"stop", "lanpanel-headscale.service"}
 		case ProfileHeadscaleShow:
 			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,RuntimeDirectory,RuntimeDirectoryMode,ProtectSystem,ProtectHome", "--property=ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartPost,FragmentPath,DropInPaths", "lanpanel-headscale.service"}
+		case ProfileHeadscaleActivateStart:
+			profile.Arguments = []string{"start", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"}
+		case ProfileHeadscaleActivateStop:
+			profile.Arguments = []string{"stop", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service"}
+		case ProfileHeadscaleActivateShow:
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,PrivateNetwork,JoinsNamespaceOf,RestrictAddressFamilies,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictSUIDSGID,KillMode,Restart,ExecStart,Sockets,Listen,SocketMode,SocketUser,SocketGroup,RemoveOnStop,FreeBind,ReusePort,FragmentPath,DropInPaths", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service"}
 		}
 		profile.Complete = true
 		return profile, validateProfile(profile)

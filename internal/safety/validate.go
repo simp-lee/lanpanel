@@ -275,7 +275,7 @@ func validateReactivating(reactivating Reactivating) error {
 }
 
 func validateHeadscaleReactivating(reactivating HeadscaleReactivating) error {
-	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CertificateFingerprint) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || reactivating.CertificateUntil.IsZero() {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CertificateFingerprint) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || !((reactivating.ActivationDigest == "" && reactivating.ControlEntryDigest == "") || (isDigest(reactivating.ActivationDigest) && isDigest(reactivating.ControlEntryDigest))) || reactivating.CertificateUntil.IsZero() {
 		return fmt.Errorf("Headscale reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {
@@ -380,7 +380,7 @@ func validateStopFence(fence StopFence, state State) error {
 		if fence.Scope.Kind != "app" && fence.Scope.Kind != "headscale" {
 			return fmt.Errorf("ingress activation stop fence requires App or Headscale scope")
 		}
-		if p == nil || !validRef(p.IntentRef) || p.CandidateGeneration == 0 || p.PriorGeneration == 0 || p.PriorGeneration+1 != p.CandidateGeneration {
+		if p == nil || !validRef(p.IntentRef) || p.CandidateGeneration == 0 || p.PriorGeneration+1 != p.CandidateGeneration || fence.Scope.Kind == "app" && p.PriorGeneration == 0 {
 			return fmt.Errorf("ingress activation stop fence payload is incomplete or generation-invalid")
 		}
 		if fence.Scope.Kind == "app" {

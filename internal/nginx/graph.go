@@ -637,7 +637,7 @@ func validEntry(entry Entry) bool {
 			return false
 		}
 	case EntryControl:
-		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 {
+		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}) || entry.Domain == nil || !validDomainSite(*entry.Domain, entry.Domains) || entry.Domain.AuthMode != "application_managed" || entry.Domain.UpstreamNetwork != "unix" || !entry.Domain.WebSocket || len(entry.Domain.Static) != 0 || entry.Domain.GoAccess != nil {
 			return false
 		}
 	case EntryTemporary:
@@ -887,6 +887,18 @@ func RenderEntry(entry Entry) ([]byte, error) {
 	}
 	if entry.Kind == EntryChallenge {
 		return renderChallenge(entry)
+	}
+	if entry.Kind == EntryControl && entry.Domain != nil {
+		data, err := renderDomain(entry)
+		if err != nil {
+			return nil, err
+		}
+		authorization := []byte("    proxy_set_header Authorization $http_authorization;\n")
+		if bytes.Count(data, authorization) != 1 {
+			return nil, fmt.Errorf("Headscale control sanitizer rendering changed")
+		}
+		explicit := append(append([]byte(nil), authorization...), []byte("    proxy_set_header Cookie \"\";\n")...)
+		return bytes.Replace(data, authorization, explicit, 1), nil
 	}
 	if entry.Kind == EntryApp && entry.Domain != nil {
 		return renderDomain(entry)

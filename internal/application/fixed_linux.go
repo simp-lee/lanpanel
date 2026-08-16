@@ -217,6 +217,72 @@ func (s *FixedService) WriteIngressActivationFence(ctx context.Context, lease *l
 	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+func (s *FixedService) BindHeadscaleIngressActivation(ctx context.Context, lease *locks.Lease, planID, activationDigest, entryDigest string) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil || state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported || state.Headscale.Reactivating == nil || state.Headscale.Reactivating.PlanID != planID || state.Headscale.Reactivating.ActivationDigest != "" || state.Headscale.Reactivating.ControlEntryDigest != "" {
+		return fmt.Errorf("Headscale ingress activation safety authority changed: %w", err)
+	}
+	next := state
+	next.Revision++
+	active := *next.Headscale.Reactivating
+	active.ActivationDigest = activationDigest
+	active.ControlEntryDigest = entryDigest
+	next.Headscale.Reactivating = &active
+	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+
+func (s *FixedService) WriteHeadscaleIngressActivationFence(ctx context.Context, lease *locks.Lease, intentRef, graphDigest string, candidate, prior uint64, observed safety.StopObservation, accessMayRemain bool) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil || state.Headscale.Reactivating == nil || state.Headscale.Reactivating.PlanID != intentRef || state.Headscale.Reactivating.Generation != candidate || state.Headscale.Reactivating.PriorGeneration != prior {
+		return fmt.Errorf("Headscale ingress fence authority changed: %w", err)
+	}
+	inventoryDigest := shaDigest([]byte(fmt.Sprintf("%s/%t/%t/%t/%t/%s", graphDigest, observed.MasterStopped, observed.WorkersStopped, observed.ListenersStopped, accessMayRemain, observed.ObservedAt.UTC().Format(time.RFC3339Nano))))
+	fence := &safety.StopFence{Kind: safety.StopFenceIngressActivation, OriginOperation: "headscale_deploy", Scope: safety.FenceScope{Kind: "headscale"}, FenceGeneration: state.StopFenceSequence + 1, CreatedAt: time.Now().UTC(), SafetyGenerations: applicableHeadscaleMarkers(state), OwnedGraphDigest: graphDigest, InventoryDigest: inventoryDigest, Observation: observed, AccessMayRemain: accessMayRemain, IngressActivation: &safety.IngressActivationFence{IntentRef: intentRef, CandidateGeneration: candidate, PriorGeneration: prior}}
+	authority, err := safety.ReserveEmergencyStopFenceGeneration(lease, s.emergency, safety.RoleIngressActivation, safety.StopFenceIngressActivation, safety.StopFenceDigest(*fence), state.StopFenceSequence)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = authority.Sequence
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.StopFence = fence
+	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+func applicableHeadscaleMarkers(state safety.State) []safety.MarkerGeneration {
+	result := []safety.MarkerGeneration{}
+	if state.GlobalClose.Phase != safety.GlobalCloseNone {
+		result = append(result, safety.MarkerGeneration{Kind: "global_close", Generation: state.GlobalClose.Generation})
+	}
+	for _, value := range []struct {
+		kind   string
+		marker *safety.TransitionMarker
+	}{{"maintenance_pending", state.MaintenancePending}, {"dependency_transition_pending", state.DependencyTransitionPending}, {"upgrade_pending", state.UpgradePending}} {
+		if value.marker != nil {
+			result = append(result, safety.MarkerGeneration{Kind: value.kind, Generation: value.marker.Generation})
+		}
+	}
+	if state.BackupQuiescence != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "backup_quiescence", Generation: state.BackupQuiescence.Generation})
+	}
+	if state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported {
+		result = append(result, safety.MarkerGeneration{Kind: "backup_transition", Generation: state.BackupTransition.Generation})
+	}
+	if state.Headscale.CertificateExpiry != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: state.Headscale.CertificateExpiry.Generation})
+	}
+	if state.Headscale.ChallengePending != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "challenge_pending", Generation: state.Headscale.ChallengePending.Generation})
+	}
+	if state.Headscale.Reactivating != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "reactivating", Generation: state.Headscale.Reactivating.Generation})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Kind < result[j].Kind })
+	return result
+}
+
 func activeCertificateAuthority(certificate domain.CertificateBundleIdentity) (*safety.ActiveCertificateAuthority, error) {
 	notAfter, deadlineErr := time.Parse(time.RFC3339, certificate.NotAfter)
 	lastWall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)

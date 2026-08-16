@@ -26,6 +26,8 @@ const (
 	PhaseServiceStaged      Phase = "service_staged"
 	PhaseCertificatePending Phase = "certificate_pending"
 	PhaseCertificateStaged  Phase = "certificate_staged"
+	PhaseActivationIntent   Phase = "activation_intent"
+	PhaseActivated          Phase = "activated"
 	PhaseContracted         Phase = "contracted"
 )
 
@@ -59,6 +61,8 @@ type Journal struct {
 	Database         *DatabaseEvidence          `json:"database,omitempty"`
 	Service          *ServiceEvidence           `json:"service,omitempty"`
 	Certificate      *certificates.Identity     `json:"certificate,omitempty"`
+	ActivationDigest string                     `json:"activation_digest,omitempty"`
+	RuntimeDigest    string                     `json:"runtime_digest,omitempty"`
 }
 
 type Store struct {
@@ -109,9 +113,18 @@ func ValidateJournal(value Journal) error {
 		if !validDatabase(value) || !validService(value) || value.Certificate != nil {
 			return fmt.Errorf("service Headscale journal evidence invalid")
 		}
-	case PhaseCertificateStaged, PhaseContracted:
-		if !validDatabase(value) || !validService(value) || value.Certificate != nil && (certificates.ValidateIdentity(*value.Certificate) != nil || value.Certificate.ID != value.Candidate.CertificateID || value.Certificate.BindingIdentity != value.Candidate.CertificateBinding || !slices.Equal(value.Certificate.Domains, []string{value.Candidate.ControlDomain})) || value.Phase == PhaseCertificateStaged && value.Certificate == nil {
+	case PhaseCertificateStaged, PhaseActivationIntent, PhaseActivated, PhaseContracted:
+		if !validDatabase(value) || !validService(value) || value.Certificate != nil && (certificates.ValidateIdentity(*value.Certificate) != nil || value.Certificate.ID != value.Candidate.CertificateID || value.Certificate.BindingIdentity != value.Candidate.CertificateBinding || !slices.Equal(value.Certificate.Domains, []string{value.Candidate.ControlDomain})) || value.Phase != PhaseContracted && value.Certificate == nil {
 			return fmt.Errorf("staged or contracted Headscale certificate evidence invalid")
+		}
+		if value.Phase == PhaseCertificateStaged && (value.ActivationDigest != "" || value.RuntimeDigest != "") || value.Phase == PhaseActivationIntent && (!digestValue(value.ActivationDigest) || value.RuntimeDigest != "") || value.Phase == PhaseActivated && (!digestValue(value.ActivationDigest) || !digestValue(value.RuntimeDigest)) || value.Phase == PhaseContracted && (value.ActivationDigest != "" && !digestValue(value.ActivationDigest) || value.RuntimeDigest != "") {
+			return fmt.Errorf("Headscale activation evidence invalid")
+		}
+		if value.ActivationDigest != "" {
+			bundle, bundleErr := BuildActivation(value.InstallationID, value.Candidate, *value.Certificate)
+			if bundleErr != nil || bundle.Digest != value.ActivationDigest {
+				return fmt.Errorf("Headscale activation bundle evidence changed")
+			}
 		}
 	default:
 		return fmt.Errorf("Headscale control journal phase invalid")
@@ -168,7 +181,7 @@ func (store *Store) Replace(ctx context.Context, prior, next Journal) error {
 }
 
 func (store *Store) Contract(ctx context.Context, prior Journal) (Journal, error) {
-	if err := ValidateJournal(prior); err != nil || (prior.Phase != PhaseCertificatePending && prior.Phase != PhaseCertificateStaged && prior.Phase != PhaseContracted) {
+	if err := ValidateJournal(prior); err != nil || (prior.Phase != PhaseCertificatePending && prior.Phase != PhaseCertificateStaged && prior.Phase != PhaseActivationIntent && prior.Phase != PhaseActivated && prior.Phase != PhaseContracted) {
 		return Journal{}, fmt.Errorf("Headscale control journal is not contractible")
 	}
 	if prior.Phase == PhaseContracted {
@@ -176,6 +189,7 @@ func (store *Store) Contract(ctx context.Context, prior Journal) (Journal, error
 	}
 	next := prior
 	next.Phase = PhaseContracted
+	next.RuntimeDigest = ""
 	if err := store.Replace(ctx, prior, next); err != nil {
 		return Journal{}, err
 	}
@@ -248,8 +262,10 @@ func sameJournalAuthority(left, right Journal) bool {
 	left.Database, right.Database = nil, nil
 	left.Service, right.Service = nil, nil
 	left.Certificate, right.Certificate = nil, nil
+	left.ActivationDigest, right.ActivationDigest = "", ""
+	left.RuntimeDigest, right.RuntimeDigest = "", ""
 	return reflect.DeepEqual(left, right)
 }
 func validPhaseAdvance(left, right Phase) bool {
-	return left == PhasePrepared && right == PhaseDatabaseCommitted || left == PhaseDatabaseCommitted && right == PhaseServiceStaged || left == PhaseServiceStaged && right == PhaseCertificatePending || left == PhaseCertificatePending && right == PhaseCertificateStaged || (left == PhaseCertificatePending || left == PhaseCertificateStaged) && right == PhaseContracted
+	return left == PhasePrepared && right == PhaseDatabaseCommitted || left == PhaseDatabaseCommitted && right == PhaseServiceStaged || left == PhaseServiceStaged && right == PhaseCertificatePending || left == PhaseCertificatePending && right == PhaseCertificateStaged || left == PhaseCertificateStaged && right == PhaseActivationIntent || left == PhaseActivationIntent && right == PhaseActivated || (left == PhaseCertificatePending || left == PhaseCertificateStaged || left == PhaseActivationIntent || left == PhaseActivated) && right == PhaseContracted
 }

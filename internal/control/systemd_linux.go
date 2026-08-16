@@ -101,6 +101,21 @@ func (runtime *SystemdRuntime) StartAndProbe(ctx context.Context, rendered Rende
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: hashBytes(append([]byte(rendered.Candidate.ServiceIdentity+"\x00"), show...)), PublicSTUNOpen: false}, nil
 }
 
+func (runtime *SystemdRuntime) ObserveActive(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (ServiceEvidence, error) {
+	if runtime == nil || runtime.launcher == nil || VerifyRendered(rendered) != nil {
+		return ServiceEvidence{}, fmt.Errorf("Headscale active observation authority invalid")
+	}
+	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
+	show, err := runtime.show(ctx, invocation, rendered, account, true)
+	if err != nil {
+		return ServiceEvidence{}, err
+	}
+	if err := requireHostCandidateListenersAbsent(); err != nil {
+		return ServiceEvidence{}, err
+	}
+	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: hashBytes(append([]byte(rendered.Candidate.ServiceIdentity+"\x00"), show...)), PublicSTUNOpen: false}, nil
+}
+
 func (runtime *SystemdRuntime) StopAndVerify(ctx context.Context, candidate Candidate, account identity.AccountIdentity) error {
 	var unitStat unix.Stat_t
 	if err := unix.Lstat(candidate.Paths.Unit, &unitStat); errors.Is(err, unix.ENOENT) {
