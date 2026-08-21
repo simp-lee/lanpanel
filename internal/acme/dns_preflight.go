@@ -69,6 +69,7 @@ func PreflightDNS01(ctx context.Context, observer DNSObserver, zone string, owne
 	identity := zone + "\x00" + strings.Join(owners, "\x00") + "\x00" + strings.Join(servers, "\x00")
 	return DNSPreflight{Zone: zone, Owners: owners, Servers: servers, Digest: digestValue(identity)}, nil
 }
+
 func VerifyDNS01Cleanup(ctx context.Context, observer DNSObserver, preflight DNSPreflight) error {
 	current, err := PreflightDNS01(ctx, observer, preflight.Zone, preflight.Owners)
 	if err != nil {
@@ -93,6 +94,7 @@ func (NetDNSObserver) AuthoritativeServers(ctx context.Context, zone string) ([]
 	}
 	return result, nil
 }
+
 func (NetDNSObserver) Observe(ctx context.Context, server, owner string) (DNSObservation, error) {
 	answers := []DNSObservation{}
 	for _, kind := range []uint16{16, 5, 39} {
@@ -112,6 +114,7 @@ func (NetDNSObserver) Observe(ctx context.Context, server, owner string) (DNSObs
 	}
 	return result, nil
 }
+
 func rawDNSQuery(ctx context.Context, server, owner string, kind uint16) (DNSObservation, error) {
 	name, err := dnsName(owner)
 	if err != nil {
@@ -128,7 +131,7 @@ func rawDNSQuery(ctx context.Context, server, owner string, kind uint16) (DNSObs
 	if err != nil {
 		return DNSObservation{}, err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	deadline := time.Now().Add(5 * time.Second)
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
 		deadline = value
@@ -193,6 +196,7 @@ func rawDNSQuery(ctx context.Context, server, owner string, kind uint16) (DNSObs
 	}
 	return result, nil
 }
+
 func dnsName(value string) ([]byte, error) {
 	value = strings.TrimSuffix(strings.ToLower(value), ".")
 	parts := strings.Split(value, ".")
@@ -206,6 +210,7 @@ func dnsName(value string) ([]byte, error) {
 	}
 	return append(result, 0), nil
 }
+
 func skipDNSName(message []byte, offset int) (int, error) {
 	for steps := 0; steps < 128; steps++ {
 		if offset >= len(message) {
@@ -229,6 +234,7 @@ func skipDNSName(message []byte, offset int) (int, error) {
 	}
 	return 0, fmt.Errorf("DNS name unbounded")
 }
+
 func decodeDNSName(message []byte, offset int) (string, error) {
 	labels := []string{}
 	visited := map[int]bool{}
@@ -257,6 +263,7 @@ func decodeDNSName(message []byte, offset int) (string, error) {
 	}
 	return "", fmt.Errorf("DNS name unbounded")
 }
+
 func decodeTXT(data []byte) ([]string, error) {
 	result := []string{}
 	for len(data) != 0 {
@@ -270,6 +277,7 @@ func decodeTXT(data []byte) ([]string, error) {
 	}
 	return result, nil
 }
+
 func digestValue(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])

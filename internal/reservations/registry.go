@@ -161,9 +161,8 @@ func BuildClaims(installation domain.Installation) ([]Claim, error) {
 		sharedIngress = true
 	}
 	if installation.Connector != nil {
-		owner := installationOwner + ":connector:" + installation.Connector.ID
 		for _, path := range installation.Connector.ManagedPaths {
-			claims = append(claims, Claim{Kind: KindManagedPath, Value: path, Owner: owner})
+			claims = append(claims, Claim{Kind: KindManagedPath, Value: path, Owner: installationOwner + ":connector:" + installation.Connector.ID})
 		}
 	}
 	for _, credential := range installation.Credentials {

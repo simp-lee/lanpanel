@@ -112,12 +112,12 @@ func TestOwnershipEvidenceContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer otherManager.Close()
+		defer func(ignore func() error) { _ = ignore() }(otherManager.Close)
 		otherLease, err := otherManager.Acquire(context.Background(), locks.Exposure)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer otherLease.Release()
+		defer func(ignore func() error) { _ = ignore() }(otherLease.Release)
 		if _, err := store.Write(context.Background(), otherLease, ActivationWriter, 0, record); err == nil {
 			t.Fatal("Write() accepted an exposure lease from another installation authority")
 		}
@@ -201,7 +201,6 @@ func TestOwnershipEvidenceContract(t *testing.T) {
 			t.Fatal("Write() accepted wildcard/specific cross-resource listener collision")
 		}
 	})
-
 }
 
 func newTestStore(t *testing.T) (*Store, *locks.Manager, *locks.Lease, Record) {
@@ -236,7 +235,8 @@ func newTestStore(t *testing.T) (*Store, *locks.Manager, *locks.Lease, Record) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(managed, "site.conf")
-	record := Record{SchemaVersion: SchemaVersion, Revision: 1, ResourceID: "app-one", State: Owned,
+	record := Record{
+		SchemaVersion: SchemaVersion, Revision: 1, ResourceID: "app-one", State: Owned,
 		Paths:     []OwnedPath{{Kind: PathSite, Path: path, IdentityDigest: PathIdentity("app-one", PathSite, path)}},
 		Listeners: []OwnedListener{{Protocol: "tcp", Address: "0.0.0.0", Port: 443, IdentityDigest: ListenerIdentity("app-one", "tcp", "0.0.0.0", 443)}},
 	}

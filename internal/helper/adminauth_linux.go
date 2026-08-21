@@ -38,7 +38,7 @@ func readAdminToken() ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if unix.Fstat(parentFD, &parentStat) != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Gid != 0 || parentStat.Mode&0o777 != 0o711 {
 		return nil, "", fmt.Errorf("admin token parent identity is unsafe")
@@ -52,7 +52,7 @@ func readAdminToken() ([]byte, string, error) {
 		_ = unix.Close(fd)
 		return nil, "", fmt.Errorf("admin token descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != 64 {
 		return nil, "", fmt.Errorf("admin token source identity is unsafe")

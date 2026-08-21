@@ -72,7 +72,7 @@ func (staging *StagingFile) CloseVerified(expectedDigest string, expectedBytes i
 	}
 	file := staging.file
 	staging.file = nil
-	defer staging.closeDirectory()
+	defer func(ignore func() error) { _ = ignore() }(staging.closeDirectory)
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		return "", fmt.Errorf("sync download staging file")

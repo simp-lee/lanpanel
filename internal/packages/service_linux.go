@@ -8,24 +8,35 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/child"
+	"lanpanel/internal/filetxn"
+	"lanpanel/internal/preflight"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"lanpanel/internal/child"
-	"lanpanel/internal/filetxn"
-	"lanpanel/internal/helperproto"
-	"lanpanel/internal/preflight"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	FixedPackageRoot        = "/var/lib/lanpanel/packages"
-	FixedPackageFileStaging = "/var/lib/lanpanel/packages/.filetxn"
-	FixedPackageJournalRoot = "/var/lib/lanpanel/packages/journals"
-	FixedPackagePlanRoot    = "/var/lib/lanpanel/packages/plans"
+	PackageRequestSchemaVersion = "lanpanel.package.transaction.request.v1"
+	FixedPackageRoot            = "/var/lib/lanpanel/packages"
+	FixedPackageFileStaging     = "/var/lib/lanpanel/packages/.filetxn"
+	FixedPackageJournalRoot     = "/var/lib/lanpanel/packages/journals"
+	FixedPackagePlanRoot        = "/var/lib/lanpanel/packages/plans"
 )
+
+type Request struct {
+	SchemaVersion    string    `json:"schema_version"`
+	IntentGeneration uint64    `json:"intent_generation"`
+	Deadline         time.Time `json:"deadline"`
+	InputDigest      string    `json:"input_digest"`
+}
 
 type Service struct {
 	files    *filetxn.Store
@@ -38,6 +49,10 @@ type Service struct {
 }
 
 func OpenFixedService() (*Service, error) {
+	return openFixedService(true)
+}
+
+func openFixedService(requireNoPending bool) (*Service, error) {
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	files, err := filetxn.Open(filetxn.Config{
 		RootPath: FixedPackageRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700},
@@ -79,10 +94,64 @@ func OpenFixedService() (*Service, error) {
 	if err != nil {
 		return fail(fmt.Errorf("audit package recovery journals: %w", err))
 	}
-	if len(pending) != 0 {
+	if requireNoPending && len(pending) != 0 {
 		return fail(fmt.Errorf("unresolved package transaction journal blocks helper startup"))
 	}
 	return service, nil
+}
+
+// ExecuteFixedInstallerTransaction is the fixed root-installer boundary. It
+// reuses the same typed transaction engine and resumes only an exact matching
+// package journal; it does not expose a runtime helper operation.
+func ExecuteFixedInstallerTransaction(ctx context.Context, plan Plan, result preflight.Result) (Journal, error) {
+	if err := prepareFixedInstallerLayout(); err != nil {
+		return Journal{}, err
+	}
+	service, err := openFixedService(false)
+	if err != nil {
+		return Journal{}, err
+	}
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := ValidatePlan(plan); err != nil {
+		return Journal{}, err
+	}
+	resultDigest, err := result.Digest()
+	if err != nil || resultDigest != plan.PreflightDigest || result.RequestDigest != plan.PreflightRequestDigest {
+		return Journal{}, fmt.Errorf("installer package Plan does not bind exact preflight authority")
+	}
+	pending, err := service.journal.Pending(ctx)
+	if err != nil {
+		return Journal{}, err
+	}
+	if len(pending) > 1 || len(pending) == 1 && pending[0].TransactionID != plan.TransactionID {
+		return Journal{}, fmt.Errorf("foreign pending package transaction blocks clean installer")
+	}
+	if len(pending) == 1 {
+		return service.engine.Resume(ctx, plan, result, pending[0])
+	}
+	if existing, readErr := service.journal.Read(ctx, plan.TransactionID); readErr == nil {
+		return service.engine.Resume(ctx, plan, result, existing)
+	}
+	return service.engine.Execute(ctx, plan, result)
+}
+
+func prepareFixedInstallerLayout() error {
+	ownerUID, ownerGID := uint32(os.Geteuid()), uint32(os.Getegid())
+	if ownerUID != 0 || ownerGID != 0 {
+		return fmt.Errorf("package installer layout requires root")
+	}
+	for _, path := range []string{FixedPackageRoot, FixedPackageFileStaging, FixedPackageJournalRoot, FixedPackagePlanRoot, FixedPackageTransactionRoot, FixedPackageStagingRoot} {
+		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		var stat unix.Stat_t
+		if err := unix.Lstat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != ownerUID || stat.Gid != ownerGID {
+			return fmt.Errorf("package installer directory %q is unsafe: %w", path, err)
+		}
+	}
+	return nil
 }
 
 func (service *Service) Close() error {
@@ -92,14 +161,14 @@ func (service *Service) Close() error {
 	return service.files.Close()
 }
 
-func (service *Service) ValidateRequest(ctx context.Context, request helperproto.Request) error {
+func (service *Service) ValidateRequest(ctx context.Context, request Request) error {
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	_, err := service.loadPlan(ctx, request)
 	return err
 }
 
-func (service *Service) Execute(ctx context.Context, request helperproto.Request) (string, error) {
+func (service *Service) Execute(ctx context.Context, request Request) (string, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	plan, err := service.loadPlan(ctx, request)
@@ -122,7 +191,7 @@ func (service *Service) Execute(ctx context.Context, request helperproto.Request
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func (service *Service) loadPreflight(ctx context.Context, request helperproto.Request, plan Plan) (preflight.Result, error) {
+func (service *Service) loadPreflight(ctx context.Context, request Request, plan Plan) (preflight.Result, error) {
 	if service == nil || service.files == nil {
 		return preflight.Result{}, fmt.Errorf("package preflight authority is unavailable")
 	}
@@ -156,12 +225,11 @@ func (service *Service) loadPreflight(ctx context.Context, request helperproto.R
 	return result, nil
 }
 
-func (service *Service) loadPlan(ctx context.Context, request helperproto.Request) (Plan, error) {
-	if service == nil || service.files == nil || request.Operation != helperproto.OperationPackageTransaction || request.Target != "installation" {
-		return Plan{}, fmt.Errorf("package helper request authority is invalid")
-	}
-	if err := helperproto.ValidateRequest(request, time.Now().UTC()); err != nil {
-		return Plan{}, err
+func (service *Service) loadPlan(ctx context.Context, request Request) (Plan, error) {
+	now := time.Now().UTC()
+	encodedDigest, digestErr := hex.DecodeString(strings.TrimPrefix(request.InputDigest, "sha256:"))
+	if service == nil || service.files == nil || request.SchemaVersion != PackageRequestSchemaVersion || request.IntentGeneration == 0 || request.Deadline.IsZero() || !request.Deadline.After(now) || request.Deadline.Sub(now) > 30*time.Minute || !strings.HasPrefix(request.InputDigest, "sha256:") || len(encodedDigest) != sha256.Size || digestErr != nil {
+		return Plan{}, fmt.Errorf("package transaction request authority is invalid")
 	}
 	if pending, err := service.journal.Pending(ctx); err != nil {
 		return Plan{}, fmt.Errorf("audit pending package transactions: %w", err)
@@ -218,21 +286,21 @@ func (service *Service) verifyCurrentAuthority(plan Plan) error {
 		return fmt.Errorf("package Plan binary authority differs from the running generation")
 	}
 	for path, expected := range map[string]string{
-		"/var/lib/lanpanel/installation/release-envelope.digest": plan.Authority.EnvelopeDigest,
-		"/var/lib/lanpanel/installation/os-profile.digest":       plan.OSProfileDigest,
-		"/var/lib/lanpanel/installation/host-fingerprint":        plan.Authority.HostFingerprint,
+		"/var/lib/lanpanel/installation/release-authority.digest": plan.Authority.ReleaseAuthorityDigest,
+		"/var/lib/lanpanel/installation/os-profile.digest":        plan.OSProfileDigest,
+		"/var/lib/lanpanel/installation/host-fingerprint":         plan.Authority.HostFingerprint,
 	} {
 		value, stat, err := service.auditor.readFileAndStat(path, 4096)
 		if err != nil || stat.Mode&0o777 != 0o600 || string(value) != expected {
 			return fmt.Errorf("package Plan release, host, or OS authority differs from installation")
 		}
 	}
-	if plan.Authority.Kind == QualificationCandidate {
+	if plan.Authority.Kind == QualificationTarget {
 		path := filepath.Join("/var/lib/lanpanel/qualification/package-authorities", plan.TransactionID+".json")
 		binding, stat, err := service.auditor.readFileAndStat(path, maximumJournalBytes)
 		expected, encodeErr := json.Marshal(plan.Authority)
 		if err != nil || encodeErr != nil || stat.Mode&0o777 != 0o600 || !bytes.Equal(binding, expected) {
-			return fmt.Errorf("package qualification manifest authority is missing or mismatched")
+			return fmt.Errorf("package qualification install authority is missing or mismatched")
 		}
 	}
 	return nil

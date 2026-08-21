@@ -44,27 +44,6 @@ func TestExactJournalReconciliationIsClosedAndFailClosed(t *testing.T) {
 		t.Fatalf("DecideExactReconciliation(App) = %#v, %v", decision, err)
 	}
 
-	local := base
-	local.Kind = JournalNonIngressLocalCommit
-	local.Operation = Maintenance
-	local.ResourceIDs = nil
-	local.Phase = JournalTerminal
-	decision, err = decideExactReconciliation(reconciliationDocument(t, local, []ChildRecord{child}), local.ID, observation)
-	if err != nil || decision.Action != ReconcileFinalizeNonIngressCommit || decision.Target != local.Target {
-		t.Fatalf("DecideExactReconciliation(local commit) = %#v, %v", decision, err)
-	}
-
-	failedChild := child
-	failedChild.Outcome = ChildFailed
-	if decision, err := decideExactReconciliation(reconciliationDocument(t, local, []ChildRecord{failedChild}), local.ID, observation); err == nil || decision.Action != "" {
-		t.Fatalf("DecideExactReconciliation(failed local child) = %#v, %v", decision, err)
-	}
-	emptyLocal := local
-	emptyLocal.ChildIDs = nil
-	if decision, err := decideExactReconciliation(reconciliationDocument(t, emptyLocal, nil), emptyLocal.ID, observation); err == nil || decision.Action != "" {
-		t.Fatalf("DecideExactReconciliation(empty local child inventory) = %#v, %v", decision, err)
-	}
-
 	t.Run("observed artifact mismatch", func(t *testing.T) {
 		mismatch := observation
 		mismatch.ArtifactDigest = testDigest("other")

@@ -203,7 +203,7 @@ func (store *Store) Put(ctx context.Context, request Request, data []byte, dispo
 	if err != nil {
 		return result, txError("", result, err)
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil {
 		return result, txError("", result, err)
@@ -348,7 +348,7 @@ func (store *Store) Read(ctx context.Context, request Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil {
 		return nil, err
@@ -369,7 +369,7 @@ func (store *Store) Read(ctx context.Context, request Request) ([]byte, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("file transaction read descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	data, err := io.ReadAll(io.LimitReader(file, request.MaxBytes+1))
 	if err != nil || int64(len(data)) > request.MaxBytes {
 		return nil, fmt.Errorf("file transaction read is unavailable or oversized")
@@ -401,7 +401,7 @@ func (store *Store) Remove(ctx context.Context, request Request) (Result, error)
 	if err != nil {
 		return result, txError("", result, err)
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil {
 		return result, txError("", result, err)
@@ -491,7 +491,7 @@ func (store *Store) revalidateProtectedPaths() error {
 	if err != nil {
 		return fmt.Errorf("reopen transaction root: %w", err)
 	}
-	defer unix.Close(freshRootFD)
+	defer func() { _ = unix.Close(freshRootFD) }()
 	if err := validateDirectoryMetadata(freshRoot, store.rootExpected); err != nil {
 		return fmt.Errorf("configured transaction root metadata changed: %w", err)
 	}
@@ -506,7 +506,7 @@ func (store *Store) revalidateProtectedPaths() error {
 	if err != nil {
 		return fmt.Errorf("reopen staging directory: %w", err)
 	}
-	defer unix.Close(freshStagingFD)
+	defer func() { _ = unix.Close(freshStagingFD) }()
 	if err := validateDirectoryMetadata(freshStaging, store.stagingExpected); err != nil {
 		return fmt.Errorf("configured staging directory metadata changed: %w", err)
 	}
@@ -613,39 +613,6 @@ func openDirectoryTreeAllowMounts(rootFD int, relative string, policy DirectoryP
 	return fd, stat, nil
 }
 
-func openDirectoryTree(rootFD int, rootStat unix.Stat_t, relative string, policy DirectoryPolicy) (int, unix.Stat_t, error) {
-	if err := validateDirectoryStat(rootStat, policy); err != nil {
-		return -1, unix.Stat_t{}, fmt.Errorf("root: %w", err)
-	}
-	fd, err := unix.Dup(rootFD)
-	if err != nil {
-		return -1, unix.Stat_t{}, err
-	}
-	unix.CloseOnExec(fd)
-	stat := rootStat
-	for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
-		next, openErr := openComponent(fd, component)
-		_ = unix.Close(fd)
-		if openErr != nil {
-			return -1, unix.Stat_t{}, openErr
-		}
-		fd = next
-		if err := unix.Fstat(fd, &stat); err != nil {
-			_ = unix.Close(fd)
-			return -1, unix.Stat_t{}, err
-		}
-		if uint64(stat.Dev) != uint64(rootStat.Dev) {
-			_ = unix.Close(fd)
-			return -1, unix.Stat_t{}, fmt.Errorf("crosses a filesystem")
-		}
-		if err := validateDirectoryStat(stat, policy); err != nil {
-			_ = unix.Close(fd)
-			return -1, unix.Stat_t{}, err
-		}
-	}
-	return fd, stat, nil
-}
-
 func openComponent(parentFD int, component string) (int, error) {
 	return unix.Openat2(parentFD, component, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS})
 }
@@ -658,7 +625,7 @@ func inspectTarget(parentFD int, base string, rootDev uint64, expected *Metadata
 	if err != nil {
 		return unix.Stat_t{}, false, fmt.Errorf("open target without following links: %w", err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return unix.Stat_t{}, false, err
@@ -699,7 +666,7 @@ func revalidateTarget(parentFD int, base string, expected unix.Stat_t, exists bo
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return err
@@ -712,7 +679,7 @@ func revalidateIdentity(dirFD int, name string, expected unix.Stat_t) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return err
@@ -903,7 +870,7 @@ func verifyFile(dirFD int, name string, rootDev uint64, metadata Metadata, maxBy
 		_ = unix.Close(fd)
 		return unix.Stat_t{}, fmt.Errorf("wrap staging descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return unix.Stat_t{}, err

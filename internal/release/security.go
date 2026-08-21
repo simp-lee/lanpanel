@@ -119,11 +119,11 @@ func CheckSecurityGate(report SecurityReport) error {
 	return nil
 }
 
-func AuthorizePublication(finalized *VerifiedFinalizedRelease) error {
-	if finalized == nil || finalized.final == nil || finalized.final.envelope == nil || finalized.final.manifest == nil || finalized.final.security.CandidateDigest != finalized.final.envelope.value.QualificationCandidateOID {
-		return fmt.Errorf("publication requires a candidate-compared finalized release")
+func AuthorizePublication(verified *VerifiedRelease) error {
+	if verified == nil || verified.security.CandidateDigest != verified.value.Binary.Digest || !verified.qualification.JourneySucceeded || verified.qualification.CandidateDigest != verified.value.Binary.Digest {
+		return fmt.Errorf("publication requires one fully verified release.json and exact binary")
 	}
-	return CheckSecurityGate(finalized.final.security)
+	return CheckSecurityGate(verified.security)
 }
 
 func validSeverity(severity Severity) bool {

@@ -151,14 +151,15 @@ func cgroupHasProcesses(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("observe package unit cgroup: %w", err)
 	}
-	for _, field := range strings.Fields(string(data)) {
-		pid, err := strconv.Atoi(field)
-		if err != nil || pid <= 0 {
-			return false, fmt.Errorf("package unit cgroup process inventory is malformed")
-		}
-		return true, nil
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false, nil
 	}
-	return false, nil
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return false, fmt.Errorf("package unit cgroup process inventory is malformed")
+	}
+	return true, nil
 }
 
 func readBoundListeners(root string) (map[string]bool, error) {

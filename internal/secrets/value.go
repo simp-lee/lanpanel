@@ -19,6 +19,7 @@ func New(value []byte) (*Value, error) {
 	}
 	return &Value{value: append([]byte(nil), value...)}, nil
 }
+
 func (value *Value) Use(consumer func([]byte) error) error {
 	if value == nil || consumer == nil {
 		return fmt.Errorf("secret value is unavailable")
@@ -31,6 +32,7 @@ func (value *Value) Use(consumer func([]byte) error) error {
 	defer value.destroyLocked()
 	return consumer(value.value)
 }
+
 func (value *Value) Fingerprint() (string, error) {
 	if value == nil {
 		return "", fmt.Errorf("secret value is unavailable")
@@ -43,6 +45,7 @@ func (value *Value) Fingerprint() (string, error) {
 	digest := sha256.Sum256(value.value)
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
+
 func (value *Value) Destroy() {
 	if value == nil {
 		return

@@ -18,18 +18,23 @@ type traceAuthority struct {
 func (value *traceAuthority) PersistClosing(context.Context, closure.Inventory) error {
 	return value.step("closing")
 }
+
 func (value *traceAuthority) CommitUnpublished(context.Context, closure.Inventory) error {
 	return value.step("unpublished")
 }
+
 func (value *traceAuthority) PersistStopFence(context.Context, closure.Inventory) error {
 	return value.step("fence")
 }
+
 func (value *traceAuthority) UpdateStopObservation(context.Context, closure.RuntimeSnapshot, bool) error {
 	return value.step("stop_observation")
 }
+
 func (value *traceAuthority) FinalizeClosure(context.Context, closure.Inventory, string) error {
 	return value.step("finalize")
 }
+
 func (value *traceAuthority) step(step string) error {
 	value.steps = append(value.steps, step)
 	if value.fail == step {
@@ -54,6 +59,7 @@ func (value *traceRuntime) ContractDisk(context.Context, closure.Inventory) ([]s
 	}
 	return []string{"/etc/lanpanel/nginx/apps-enabled/app.conf"}, nil
 }
+
 func (value *traceRuntime) TestClosedGraph(context.Context) error {
 	value.steps = append(value.steps, "test")
 	if value.fail == "test" {
@@ -61,6 +67,7 @@ func (value *traceRuntime) TestClosedGraph(context.Context) error {
 	}
 	return nil
 }
+
 func (value *traceRuntime) ReloadAndDrain(context.Context) error {
 	value.steps = append(value.steps, "reload_drain")
 	if value.fail == "reload_drain" {
@@ -68,6 +75,7 @@ func (value *traceRuntime) ReloadAndDrain(context.Context) error {
 	}
 	return nil
 }
+
 func (value *traceRuntime) ProbeSelectiveClosure(context.Context, closure.Inventory) (string, error) {
 	value.steps = append(value.steps, "probe")
 	if value.fail == "probe" {
@@ -75,6 +83,7 @@ func (value *traceRuntime) ProbeSelectiveClosure(context.Context, closure.Invent
 	}
 	return testDigest("closure"), nil
 }
+
 func (value *traceRuntime) Stop(context.Context) error {
 	value.steps = append(value.steps, "stop")
 	if value.fail == "stop" {
@@ -83,6 +92,7 @@ func (value *traceRuntime) Stop(context.Context) error {
 	value.stopped = true
 	return nil
 }
+
 func (value *traceRuntime) Observe(context.Context) (closure.RuntimeSnapshot, error) {
 	value.steps = append(value.steps, "observe")
 	if value.fail == "observe" {
@@ -127,6 +137,7 @@ func TestContractionOrdersAuthorityBeforeRuntimeAndClassifiesBranches(t *testing
 		t.Fatalf("fence failure skipped stop: result=%#v authority=%v runtime=%v err=%v", result, authority.steps, runtime.steps, err)
 	}
 }
+
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }

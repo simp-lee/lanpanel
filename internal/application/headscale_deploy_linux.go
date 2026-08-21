@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/locks"
@@ -25,8 +26,6 @@ import (
 type HeadscaleCertificateConfig struct {
 	ChallengeMethod     string `json:"challenge_method"`
 	DirectoryURL        string `json:"directory_url"`
-	AccountKeyPath      string `json:"account_key_path"`
-	AccountEmail        string `json:"account_email"`
 	TermsAccepted       bool   `json:"terms_accepted"`
 	DNSProvider         string `json:"dns_provider,omitempty"`
 	ProviderProfilePath string `json:"provider_profile_path,omitempty"`
@@ -34,6 +33,11 @@ type HeadscaleCertificateConfig struct {
 }
 
 type HeadscaleDeployPayload struct {
+	PlanID       string                     `json:"plan_id"`
+	Confirmation string                     `json:"confirmation"`
+	Certificate  HeadscaleCertificateConfig `json:"certificate"`
+}
+type HeadscaleReissuePayload struct {
 	PlanID       string                     `json:"plan_id"`
 	Confirmation string                     `json:"confirmation"`
 	Certificate  HeadscaleCertificateConfig `json:"certificate"`
@@ -48,26 +52,54 @@ type HeadscaleDeployAuthority struct {
 }
 
 func loadHeadscaleCertificateBinding(request HeadscaleCertificateConfig) (acme.Binding, error) {
+	accountContact, accountKeyFingerprint, contactErr := readManagedACMEAccountAuthority()
+	if contactErr != nil {
+		return acme.Binding{}, contactErr
+	}
 	method, err := acme.ParseChallengeMethod(request.ChallengeMethod)
 	if err != nil {
 		return acme.Binding{}, err
 	}
+	var binding acme.Binding
 	if method == acme.ChallengeHTTP01 {
 		if request.DNSProvider != "" || request.ProviderProfilePath != "" || request.AuthoritativeZone != "" {
 			return acme.Binding{}, fmt.Errorf("HTTP-01 Headscale certificate carries DNS authority")
 		}
-		return acme.LoadHTTPBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted)
+		binding, err = acme.LoadHTTPBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted)
+	} else {
+		provider, parseErr := acme.ParseDNSProvider(request.DNSProvider)
+		if parseErr != nil {
+			return acme.Binding{}, parseErr
+		}
+		binding, err = acme.LoadDNSBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
 	}
-	provider, err := acme.ParseDNSProvider(request.DNSProvider)
 	if err != nil {
 		return acme.Binding{}, err
 	}
-	return acme.LoadDNSBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
+	if binding.AccountKeyFingerprint != accountKeyFingerprint {
+		return acme.Binding{}, fmt.Errorf("managed ACME account key changed after installation verification")
+	}
+	return binding, nil
+}
+
+func verifyManagedACMEBinding(binding acme.Binding) error {
+	contact, fingerprint, err := readManagedACMEAccountAuthority()
+	if err != nil {
+		return err
+	}
+	if binding.AccountKeyPath != acmeaccount.ManagedKeyPath || binding.AccountEmail != contact || binding.AccountKeyFingerprint != fingerprint {
+		return fmt.Errorf("managed ACME account binding changed")
+	}
+	if _, err := acme.BuildEnvironment(binding); err != nil {
+		return err
+	}
+	_, err = acme.BindingDigest(binding)
+	return err
 }
 
 func buildHeadscaleDeployAuthority(installation domain.Installation, binding acme.Binding, certificateID, actor string, request preflight.ExpansionRequest, result preflight.Result, safetyState safety.State, now time.Time) (HeadscaleDeployAuthority, error) {
 	if installation.Headscale == nil || installation.Headscale.Database.Phase != domain.HeadscaleIdentityCommitted || installation.Headscale.Applied != nil || installation.Headscale.Enabled || installation.Headscale.DeployIntent != nil {
-		return HeadscaleDeployAuthority{}, fmt.Errorf("Headscale initial deploy requires an identity-committed inactive trust domain")
+		return HeadscaleDeployAuthority{}, fmt.Errorf("headscale initial deploy requires an identity-committed inactive trust domain")
 	}
 	if err := preflight.RequireExpansionResultForRequest(result, request, now); err != nil {
 		return HeadscaleDeployAuthority{}, err
@@ -110,7 +142,7 @@ func buildHeadscaleDeployAuthority(installation domain.Installation, binding acm
 		return evidence[left].Identity < evidence[right].Identity
 	})
 	summary := fmt.Sprintf("headscale=%s control=https://%s/ listeners=80/tcp,443/tcp,3478/udp certificate=%s challenge=%s service=private-candidate", installation.Headscale.ID, installation.Headscale.ControlDomain, certificateID, binding.Method)
-	spec := plans.Spec{Operation: string(domain.OperationDeploy), Target: plans.Target{Kind: plans.TargetHeadscale, ID: installation.Headscale.ID}, ActorIdentity: actor, Config: plans.DigestBinding{Applicable: true, Digest: rendered.Candidate.ConfigDigest}, Applied: plans.DigestBinding{}, Evidence: evidence, ExposureSummary: summary, Prerequisites: "Exact Headscale release/config/database, fresh expansion preflight, isolated private service probe, and first real control certificate are required before control/STUN activation.", Lifetime: 10 * time.Minute}
+	spec := plans.Spec{Operation: string(domain.OperationHeadscaleControlDeploy), Target: plans.Target{Kind: plans.TargetHeadscale, ID: installation.Headscale.ID}, ActorIdentity: actor, Config: plans.DigestBinding{Applicable: true, Digest: rendered.Candidate.ConfigDigest}, Applied: plans.DigestBinding{}, Evidence: evidence, ExposureSummary: summary, Prerequisites: "Exact Headscale release/config/database, fresh expansion preflight, isolated private service probe, and first real control certificate are required before control/STUN activation.", Lifetime: 10 * time.Minute}
 	return HeadscaleDeployAuthority{Rendered: rendered, Binding: binding, Preflight: request, Result: result, Spec: spec}, nil
 }
 
@@ -157,7 +189,7 @@ func (s *FixedService) CreateHeadscaleDeployPlan(ctx context.Context, actor Acto
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	defer admission.Release()
+	defer func(ignore func() error) { _ = ignore() }(admission.Release)
 	return s.plans.Create(ctx, admission, document.Revision, planAuthority.Spec)
 }
 
@@ -168,24 +200,19 @@ func loadHeadscaleInstallation(document persist.Document) (domain.Installation, 
 	}
 	installation, err := domain.DecodeInstallation(raw)
 	if err != nil || installation.Headscale == nil {
-		return domain.Installation{}, fmt.Errorf("Headscale identity authority is missing")
+		return domain.Installation{}, fmt.Errorf("headscale identity authority is missing")
 	}
 	return installation, nil
 }
 
 func headscaleDeploySafetyEvidence(state safety.State, candidateGeneration uint64, now time.Time) (plans.Evidence, error) {
-	if candidateGeneration != 1 || state.Headscale.GenerationSequence != 0 || state.Headscale.CertificateExpiry != nil || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil || state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil {
-		return plans.Evidence{}, fmt.Errorf("Headscale first-deploy safety authority is unavailable")
+	if candidateGeneration != 1 || state.Headscale.GenerationSequence != 0 || state.Headscale.CertificateExpiry != nil || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil || state.StopFence != nil {
+		return plans.Evidence{}, fmt.Errorf("headscale first-deploy safety authority is unavailable")
 	}
 	binding := struct {
-		Headscale                   safety.HeadscaleSafety   `json:"headscale"`
-		MaintenancePending          *safety.TransitionMarker `json:"maintenance_pending,omitempty"`
-		DependencyTransitionPending *safety.TransitionMarker `json:"dependency_transition_pending,omitempty"`
-		UpgradePending              *safety.TransitionMarker `json:"upgrade_pending,omitempty"`
-		BackupQuiescence            *safety.BackupQuiescence `json:"backup_quiescence,omitempty"`
-		BackupTransition            *safety.BackupTransition `json:"backup_transition,omitempty"`
-		StopFence                   *safety.StopFence        `json:"stop_fence,omitempty"`
-	}{state.Headscale, state.MaintenancePending, state.DependencyTransitionPending, state.UpgradePending, state.BackupQuiescence, state.BackupTransition, state.StopFence}
+		Headscale safety.HeadscaleSafety `json:"headscale"`
+		StopFence *safety.StopFence      `json:"stop_fence,omitempty"`
+	}{state.Headscale, state.StopFence}
 	encoded, err := json.Marshal(binding)
 	if err != nil {
 		return plans.Evidence{}, err
@@ -226,13 +253,13 @@ func headscalePlanCandidateEvidence(plan plans.Plan) (certificateID, digest stri
 	for _, evidence := range plan.Evidence {
 		if evidence.Kind == "headscale_control_candidate" {
 			if certificateID != "" {
-				return "", "", fmt.Errorf("Headscale Plan has duplicate candidate evidence")
+				return "", "", fmt.Errorf("headscale Plan has duplicate candidate evidence")
 			}
 			certificateID, digest = evidence.Identity, evidence.Digest
 		}
 	}
 	if !strings.HasPrefix(certificateID, "cert_") || digest == "" {
-		return "", "", fmt.Errorf("Headscale Plan candidate evidence is missing")
+		return "", "", fmt.Errorf("headscale Plan candidate evidence is missing")
 	}
 	return certificateID, digest, nil
 }

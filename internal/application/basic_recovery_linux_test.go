@@ -3,11 +3,12 @@
 package application
 
 import (
-	"golang.org/x/sys/unix"
 	"lanpanel/internal/domain"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func recoveryFixture(operation string) (BasicJournal, domain.Credential) {
@@ -46,6 +47,7 @@ func TestCommittedManagedBasicCreateResponseLossRetainsCredentialForRotateAgain(
 		t.Fatalf("unexpected decision: %#v", decision)
 	}
 }
+
 func TestUncommittedManagedBasicCreateResponseLossDeletesCandidate(t *testing.T) {
 	journal, credential := recoveryFixture("create")
 	decision, err := decideManagedBasicRecovery(journal, false, credential, journal.CandidateFingerprint)
@@ -56,6 +58,7 @@ func TestUncommittedManagedBasicCreateResponseLossDeletesCandidate(t *testing.T)
 		t.Fatalf("unexpected decision: %#v", decision)
 	}
 }
+
 func TestCommittedManagedBasicRotateResponseLossConvergesFingerprint(t *testing.T) {
 	journal, credential := recoveryFixture("rotate")
 	decision, err := decideManagedBasicRecovery(journal, true, credential, journal.CandidateFingerprint)
@@ -66,6 +69,7 @@ func TestCommittedManagedBasicRotateResponseLossConvergesFingerprint(t *testing.
 		t.Fatalf("unexpected decision: %#v", decision)
 	}
 }
+
 func TestManagedBasicRecoveryRejectsAmbiguousRotateState(t *testing.T) {
 	journal, credential := recoveryFixture("rotate")
 	credential.Fingerprint = "sha256:other"
@@ -73,6 +77,7 @@ func TestManagedBasicRecoveryRejectsAmbiguousRotateState(t *testing.T) {
 		t.Fatal("ambiguous rotate accepted")
 	}
 }
+
 func TestInterruptedManagedBasicDeleteConvergesMetadataAndFile(t *testing.T) {
 	journal, credential := recoveryFixture("delete")
 	decision, err := decideManagedBasicRecovery(journal, true, credential, journal.PriorFingerprint)

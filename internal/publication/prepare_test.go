@@ -11,6 +11,7 @@ const testDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 func temporaryResource() domain.AppResource {
 	return domain.AppResource{ID: "res_00000000000000000000000000000001", Name: "temporary", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: testDigest, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation}}, Publication: domain.AppPublication{Kind: domain.PublicationTemporaryHTTP, TemporaryHTTP: &domain.TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 18080}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, ManagedProcess: &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{Generation: 1, ConfigDigest: testDigest, PolicyDigest: testDigest, FrontendEndpoint: "/var/lib/lanpanel/resources/res_00000000000000000000000000000001/frontend/http.sock", FrontendUID: 33, FrontendGID: 33, FrontendMode: 0o660}}}
 }
+
 func TestPrepareTemporaryBindsExactPublicSurface(t *testing.T) {
 	candidate, err := PrepareTemporary(temporaryResource(), 2)
 	if err != nil {
@@ -26,6 +27,20 @@ func TestPrepareTemporaryBindsExactPublicSurface(t *testing.T) {
 		t.Fatalf("candidate identity mismatch: %#v", candidate)
 	}
 }
+
+func TestPrepareTemporaryUsesExactTailnetPeerWithoutLocalProcess(t *testing.T) {
+	resource := temporaryResource()
+	resource.Target = domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}
+	resource.ManagedProcess = nil
+	candidate, err := PrepareTemporary(resource, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Entry.Temporary.UpstreamNetwork != "tcp" || candidate.Entry.Temporary.UpstreamAddress != "100.64.0.2:8080" || !strings.Contains(string(candidate.EntryBytes), "proxy_pass http://100.64.0.2:8080") || !strings.Contains(string(candidate.EntryBytes), "proxy_bind 100.64.0.1") {
+		t.Fatalf("tailnet candidate=%#v", candidate)
+	}
+}
+
 func TestPrepareTemporaryRejectsRetainedGoAccessAuthority(t *testing.T) {
 	resource := temporaryResource()
 	resource.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest, RetiredUnitIdentities: []string{testDigest, testDigest, testDigest, testDigest, testDigest}}}}
@@ -46,6 +61,7 @@ func TestPrepareTemporaryRejectsWebSocketAndNonpublicAddress(t *testing.T) {
 		t.Fatal("documentation IPv4 accepted")
 	}
 }
+
 func TestBundleDigestRejectsDifferentListener(t *testing.T) {
 	candidate, err := PrepareTemporary(temporaryResource(), 2)
 	if err != nil {

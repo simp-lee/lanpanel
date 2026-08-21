@@ -66,6 +66,7 @@ func BuildEnvironment(binding Binding) ([]string, error) {
 	slices.Sort(environment[2:])
 	return environment, nil
 }
+
 func EncodeEnvironmentFrame(environment []string) ([]byte, error) {
 	if len(environment) < 2 || len(environment) > 32 {
 		return nil, fmt.Errorf("ACME environment invalid")
@@ -84,6 +85,7 @@ func EncodeEnvironmentFrame(environment []string) ([]byte, error) {
 	}
 	return output.Bytes(), nil
 }
+
 func DecodeEnvironmentFrame(reader io.Reader) ([]string, error) {
 	payload, err := io.ReadAll(io.LimitReader(reader, 64<<10+1))
 	if err != nil || len(payload) > 64<<10 {

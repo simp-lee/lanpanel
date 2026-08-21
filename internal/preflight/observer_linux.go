@@ -61,8 +61,14 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 		path string
 		dir  bool
 	}{
-		{"/etc/apt/apt.conf", false}, {"/etc/apt/apt.conf.d", true}, {"/etc/apt/auth.conf", false}, {"/etc/apt/auth.conf.d", true},
-		{"/etc/apt/sources.list", false}, {"/etc/apt/sources.list.d", true}, {"/etc/dpkg/dpkg.cfg", false}, {"/etc/dpkg/dpkg.cfg.d", true},
+		{"/etc/apt/apt.conf", false},
+		{"/etc/apt/apt.conf.d", true},
+		{"/etc/apt/auth.conf", false},
+		{"/etc/apt/auth.conf.d", true},
+		{"/etc/apt/sources.list", false},
+		{"/etc/apt/sources.list.d", true},
+		{"/etc/dpkg/dpkg.cfg", false},
+		{"/etc/dpkg/dpkg.cfg.d", true},
 	}
 	hasher := sha256.New()
 	for _, entry := range configuration {
@@ -110,12 +116,12 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 			if name == "nginx" || name == "nginx-core" {
 				nginxVersion = version
 			}
-			fmt.Fprintf(hasher, "%s=%s@%s\n", name, version, architecture)
+			_, _ = fmt.Fprintf(hasher, "%s=%s@%s\n", name, version, architecture)
 		}
 	}
 	_, _ = hasher.Write(status)
 	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	return PackageObservation{Ready: systemdVersion != "" && nginxVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
+	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
 }
 
 func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
@@ -136,7 +142,7 @@ func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
 		return nil, fmt.Errorf("APT/dpkg configuration directory is unsafe")
@@ -162,7 +168,7 @@ func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
 
 func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request ExpansionRequest) (ExpansionObservations, error) {
 	if observer == nil || observer.packageRead == nil || observer.now == nil {
-		return ExpansionObservations{}, fmt.Errorf("Linux preflight observer is unavailable")
+		return ExpansionObservations{}, fmt.Errorf("linux preflight observer is unavailable")
 	}
 	if err := validateExpansionRequest(request); err != nil {
 		return ExpansionObservations{}, err
@@ -465,7 +471,7 @@ func readBoundedProcFile(path string, maximum int64) ([]byte, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("procfs preflight descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var before, after unix.Stat_t
 	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, fmt.Errorf("procfs preflight file identity is unsafe")
@@ -490,7 +496,7 @@ func readSafeBoundedFile(path string, maximum int64, requireRoot bool) ([]byte, 
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("read-only preflight descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var before, after unix.Stat_t
 	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Size < 0 || before.Size > maximum || requireRoot && (before.Uid != 0 || before.Mode&0o022 != 0) {
 		return nil, fmt.Errorf("read-only preflight file identity is unsafe")

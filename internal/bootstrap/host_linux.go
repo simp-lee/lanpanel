@@ -48,6 +48,7 @@ func observeBeforeInventory(paths Paths) (string, error) {
 	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		roots = append(roots, filepath.Join(paths.SystemdRoot, name))
 	}
+	roots = append(roots, filepath.Join(paths.SystemdRoot, "nginx.service"))
 	sort.Strings(roots)
 	hasher := sha256.New()
 	for _, path := range roots {
@@ -55,12 +56,12 @@ func observeBeforeInventory(paths Paths) (string, error) {
 		err := unix.Lstat(path, &stat)
 		if err != nil {
 			if os.IsNotExist(err) {
-				fmt.Fprintf(hasher, "absent:%s\n", path)
+				_, _ = fmt.Fprintf(hasher, "absent:%s\n", path)
 				continue
 			}
 			return "", err
 		}
-		fmt.Fprintf(hasher, "present:%s:%d:%d:%o:%d:%d:%d\n", path, stat.Uid, stat.Gid, stat.Mode, stat.Dev, stat.Ino, stat.Size)
+		_, _ = fmt.Fprintf(hasher, "present:%s:%d:%d:%o:%d:%d:%d\n", path, stat.Uid, stat.Gid, stat.Mode, stat.Dev, stat.Ino, stat.Size)
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
@@ -79,7 +80,7 @@ func readRootRegular(path string, maximum int64, maximumMode uint32) ([]byte, er
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("host identity descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var before, after unix.Stat_t
 	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != 0 || before.Mode&0o022 != 0 || before.Mode&0o777&^maximumMode != 0 || before.Size <= 0 || before.Size > maximum {
 		return nil, fmt.Errorf("host identity source is unsafe")

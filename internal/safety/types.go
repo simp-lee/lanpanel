@@ -24,7 +24,6 @@ const (
 	MarkerClosing           MarkerKind = "closing"
 	MarkerContraction       MarkerKind = "contraction"
 	MarkerCertificateExpiry MarkerKind = "certificate_expiry"
-	MarkerEdgeOneExpiry     MarkerKind = "edgeone_expiry"
 	MarkerDeleting          MarkerKind = "deleting"
 )
 
@@ -83,31 +82,25 @@ type Reactivating struct {
 	ProbePending     bool             `json:"probe_pending"`
 	ProbeCorrelation string           `json:"probe_correlation,omitempty"`
 	CertificateUntil time.Time        `json:"certificate_until,omitzero"`
-	ACLUntil         time.Time        `json:"acl_until,omitzero"`
 	TemporaryHTTP    bool             `json:"temporary_http,omitempty"`
 }
 
 type HeadscaleReactivating struct {
-	Generation             uint64           `json:"generation"`
-	PriorGeneration        uint64           `json:"prior_generation"`
-	PlanID                 string           `json:"plan_id"`
-	ControlGeneration      uint64           `json:"control_generation"`
-	CertificateGeneration  uint64           `json:"certificate_generation"`
-	CertificateFingerprint string           `json:"certificate_fingerprint"`
-	CandidateDigest        string           `json:"candidate_digest"`
-	CandidateBundle        string           `json:"candidate_bundle"`
-	ActivationDigest       string           `json:"activation_digest,omitempty"`
-	ControlEntryDigest     string           `json:"control_entry_digest,omitempty"`
-	BaseMarkers            []MarkerSnapshot `json:"base_markers"`
-	ProbePending           bool             `json:"probe_pending"`
-	ProbeCorrelation       string           `json:"probe_correlation,omitempty"`
-	CertificateUntil       time.Time        `json:"certificate_until"`
-}
-
-type EdgeOneSafety struct {
-	RefreshJournal string          `json:"refresh_journal,omitempty"`
-	Deadline       time.Time       `json:"deadline"`
-	Expiry         *DeadlineMarker `json:"expiry,omitempty"`
+	Generation                 uint64           `json:"generation"`
+	PriorGeneration            uint64           `json:"prior_generation"`
+	PlanID                     string           `json:"plan_id"`
+	ControlGeneration          uint64           `json:"control_generation"`
+	CertificateGeneration      uint64           `json:"certificate_generation"`
+	CertificateFingerprint     string           `json:"certificate_fingerprint"`
+	CandidateDigest            string           `json:"candidate_digest"`
+	CandidateBundle            string           `json:"candidate_bundle"`
+	ActivationDigest           string           `json:"activation_digest,omitempty"`
+	ControlEntryDigest         string           `json:"control_entry_digest,omitempty"`
+	BaseMarkers                []MarkerSnapshot `json:"base_markers"`
+	ProbePending               bool             `json:"probe_pending"`
+	ProbeCorrelation           string           `json:"probe_correlation,omitempty"`
+	CertificateUntil           time.Time        `json:"certificate_until"`
+	CertificateLastTrustedWall time.Time        `json:"certificate_last_trusted_wall"`
 }
 
 type ResourceState string
@@ -142,53 +135,18 @@ type ResourceSafety struct {
 	Contraction        *GenerationMarker           `json:"contraction,omitempty"`
 	ActiveCertificate  *ActiveCertificateAuthority `json:"active_certificate,omitempty"`
 	CertificateExpiry  *DeadlineMarker             `json:"certificate_expiry,omitempty"`
-	EdgeOne            EdgeOneSafety               `json:"edgeone"`
 	ChallengePending   *ChallengePending           `json:"challenge_pending,omitempty"`
 	Reactivating       *Reactivating               `json:"reactivating,omitempty"`
 	DeletionTombstone  string                      `json:"deletion_tombstone,omitempty"`
 }
 
 type HeadscaleSafety struct {
-	GenerationSequence uint64                 `json:"generation_sequence,omitempty"`
-	CertificateExpiry  *DeadlineMarker        `json:"certificate_expiry,omitempty"`
-	ChallengePending   *ChallengePending      `json:"challenge_pending,omitempty"`
-	Reactivating       *HeadscaleReactivating `json:"reactivating,omitempty"`
-}
-
-type TransitionMarker struct {
-	Generation      uint64    `json:"generation"`
-	JournalRef      string    `json:"journal_ref"`
-	CurrentEnvelope string    `json:"current_envelope"`
-	TargetEnvelope  string    `json:"target_envelope"`
-	Deadline        time.Time `json:"deadline"`
-}
-
-type BackupQuiescencePhase string
-
-const (
-	BackupPreparing BackupQuiescencePhase = "preparing"
-	BackupSealed    BackupQuiescencePhase = "sealed"
-)
-
-type BackupQuiescence struct {
-	Generation     uint64                `json:"generation"`
-	Phase          BackupQuiescencePhase `json:"phase"`
-	ManifestDigest string                `json:"manifest_digest,omitempty"`
-	PayloadDigest  string                `json:"payload_digest,omitempty"`
-}
-
-type BackupTransitionPhase string
-
-const (
-	BackupTransitionPrepared  BackupTransitionPhase = "prepared"
-	BackupTransitionCommitted BackupTransitionPhase = "committed"
-	BackupTransitionImported  BackupTransitionPhase = "imported"
-)
-
-type BackupTransition struct {
-	Generation uint64                `json:"generation"`
-	Phase      BackupTransitionPhase `json:"phase"`
-	JournalRef string                `json:"journal_ref"`
+	GenerationSequence uint64                      `json:"generation_sequence,omitempty"`
+	ActiveCertificate  *ActiveCertificateAuthority `json:"active_certificate,omitempty"`
+	ControlEntryDigest string                      `json:"control_entry_digest,omitempty"`
+	CertificateExpiry  *DeadlineMarker             `json:"certificate_expiry,omitempty"`
+	ChallengePending   *ChallengePending           `json:"challenge_pending,omitempty"`
+	Reactivating       *HeadscaleReactivating      `json:"reactivating,omitempty"`
 }
 
 type StopFenceKind string
@@ -197,9 +155,6 @@ const (
 	StopFenceContraction           StopFenceKind = "contraction"
 	StopFenceIngressActivation     StopFenceKind = "ingress_activation"
 	StopFenceCertificateActivation StopFenceKind = "certificate_activation"
-	StopFenceEdgeOneRefresh        StopFenceKind = "edgeone_refresh"
-	StopFenceMaintenanceTransition StopFenceKind = "maintenance_transition"
-	StopFenceGenerationUpgrade     StopFenceKind = "generation_upgrade"
 )
 
 type FenceScope struct {
@@ -220,8 +175,11 @@ type StopObservation struct {
 }
 
 type ContractionFence struct {
-	Authorities     []MarkerGeneration `json:"authorities"`
-	OwnershipDigest string             `json:"ownership_digest"`
+	Authorities            []MarkerGeneration `json:"authorities"`
+	OwnershipDigest        string             `json:"ownership_digest"`
+	OperationRef           string             `json:"operation_ref,omitempty"`
+	SafetyIntentID         string             `json:"safety_intent_id,omitempty"`
+	SafetyIntentGeneration uint64             `json:"safety_intent_generation,omitempty"`
 }
 
 type IngressActivationFence struct {
@@ -238,23 +196,6 @@ type CertificateActivationFence struct {
 	ExpiryGeneration   uint64 `json:"expiry_generation"`
 }
 
-type EdgeOneRefreshFence struct {
-	JournalRef         string    `json:"journal_ref"`
-	ResourceGeneration uint64    `json:"resource_generation"`
-	PriorACL           string    `json:"prior_acl"`
-	CandidateACL       string    `json:"candidate_acl"`
-	PriorDeadline      time.Time `json:"prior_deadline"`
-	CandidateDeadline  time.Time `json:"candidate_deadline"`
-}
-
-type TransitionFence struct {
-	JournalRef              string `json:"journal_ref"`
-	CurrentEnvelope         string `json:"current_envelope"`
-	TargetEnvelope          string `json:"target_envelope"`
-	RuntimeClosureDigest    string `json:"runtime_closure_digest"`
-	GenerationClosureDigest string `json:"generation_closure_digest"`
-}
-
 type StopFence struct {
 	Kind                  StopFenceKind               `json:"kind"`
 	OriginOperation       string                      `json:"origin_operation"`
@@ -269,25 +210,18 @@ type StopFence struct {
 	Contraction           *ContractionFence           `json:"contraction,omitempty"`
 	IngressActivation     *IngressActivationFence     `json:"ingress_activation,omitempty"`
 	CertificateActivation *CertificateActivationFence `json:"certificate_activation,omitempty"`
-	EdgeOneRefresh        *EdgeOneRefreshFence        `json:"edgeone_refresh,omitempty"`
-	Transition            *TransitionFence            `json:"transition,omitempty"`
 }
 
 type State struct {
-	SchemaVersion               string            `json:"schema_version"`
-	Revision                    uint64            `json:"revision"`
-	AuthoritySequence           uint64            `json:"authority_sequence"`
-	Checksum                    string            `json:"checksum,omitempty"`
-	GlobalClose                 GlobalClose       `json:"global_close"`
-	MaintenancePending          *TransitionMarker `json:"maintenance_pending,omitempty"`
-	DependencyTransitionPending *TransitionMarker `json:"dependency_transition_pending,omitempty"`
-	UpgradePending              *TransitionMarker `json:"upgrade_pending,omitempty"`
-	BackupQuiescence            *BackupQuiescence `json:"backup_quiescence,omitempty"`
-	BackupTransition            *BackupTransition `json:"backup_transition,omitempty"`
-	StopFenceSequence           uint64            `json:"stop_fence_sequence"`
-	StopFence                   *StopFence        `json:"stop_fence,omitempty"`
-	Headscale                   HeadscaleSafety   `json:"headscale"`
-	Resources                   []ResourceSafety  `json:"resources"`
+	SchemaVersion     string           `json:"schema_version"`
+	Revision          uint64           `json:"revision"`
+	AuthoritySequence uint64           `json:"authority_sequence"`
+	Checksum          string           `json:"checksum,omitempty"`
+	GlobalClose       GlobalClose      `json:"global_close"`
+	StopFenceSequence uint64           `json:"stop_fence_sequence"`
+	StopFence         *StopFence       `json:"stop_fence,omitempty"`
+	Headscale         HeadscaleSafety  `json:"headscale"`
+	Resources         []ResourceSafety `json:"resources"`
 }
 
 func EmptyState() State {

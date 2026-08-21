@@ -19,8 +19,7 @@ const (
 	RuntimeGuard          Name = "runtime-guard"
 	ProcessGuard          Name = "process-guard"
 	Installer             Name = "installer"
-	Upgrade               Name = "upgrade"
-	FencedRecovery        Name = "fenced-recovery"
+	StartupRecovery       Name = "startup-recovery"
 	Timer                 Name = "timer"
 	Relay                 Name = "relay"
 	GoAccessRelay         Name = "goaccess-relay"
@@ -35,7 +34,7 @@ const (
 
 var fixed = map[Name]struct{}{
 	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
-	Upgrade: {}, FencedRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {},
+	StartupRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {},
 }
 
 type Handler func(args []string, stdout, stderr io.Writer) error
@@ -69,6 +68,7 @@ func FixedNames() []Name {
 	slices.Sort(names)
 	return names
 }
+
 func (registry *Registry) Names() []Name {
 	if registry == nil {
 		return nil

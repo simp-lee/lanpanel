@@ -13,9 +13,9 @@ import (
 func TestClosedRecoveryAcceptsEqualAlreadyUnpublishedGeneration(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	normal, manager, admission, mutationSet := newOperationStores(t)
-	defer normal.Close()
-	defer manager.Close()
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(normal.Close)
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	if err := Register(normal); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestClosedRecoveryAcceptsEqualAlreadyUnpublishedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer exposure.Release()
+	defer func(ignore func() error) { _ = ignore() }(exposure.Release)
 	closureDigest := testDigest("closure")
 	if err := RecoverClosedInstallation(context.Background(), normal, exposure, map[string]uint64{installation.Resources[0].ID: installation.Resources[0].PublicationRecord.UnpublishedGeneration}, closureDigest, testDigest("safety"), now, bytes.NewReader(bytes.Repeat([]byte{9}, 64))); err != nil {
 		t.Fatal(err)

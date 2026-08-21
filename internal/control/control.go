@@ -172,10 +172,10 @@ type policyACL struct {
 func Build(request BuildRequest) (Rendered, error) {
 	value := request.Headscale
 	if request.InstallationID == "" || domain.ValidateHeadscale(value) != nil || value.Policy != "trusted_mesh" || value.Database.Phase != domain.HeadscaleIdentityCommitted || value.Database.SQLitePath != FixedPaths().Database || value.DeployIntent != nil || value.Applied != nil || value.Enabled || value.Artifact.ConfigContract != ConfigContract || !certificatePattern.MatchString(request.CertificateID) {
-		return Rendered{}, fmt.Errorf("Headscale control candidate requires exact uncommitted identity authority")
+		return Rendered{}, fmt.Errorf("headscale control candidate requires exact uncommitted identity authority")
 	}
 	if err := acme.ValidateBinding(request.Binding); err != nil {
-		return Rendered{}, fmt.Errorf("Headscale certificate binding: %w", err)
+		return Rendered{}, fmt.Errorf("headscale certificate binding: %w", err)
 	}
 	bindingDigest, err := acme.BindingDigest(request.Binding)
 	if err != nil {
@@ -183,7 +183,7 @@ func Build(request BuildRequest) (Rendered, error) {
 	}
 	accounts, err := identity.HeadscaleAccounts(request.InstallationID, value.ID)
 	if err != nil || len(accounts.Specs) != 1 {
-		return Rendered{}, fmt.Errorf("Headscale service account authority unavailable")
+		return Rendered{}, fmt.Errorf("headscale service account authority unavailable")
 	}
 	paths := FixedPaths()
 	configValue := headscaleConfig{
@@ -227,7 +227,7 @@ func Build(request BuildRequest) (Rendered, error) {
 
 func Validate(value Candidate) error {
 	if value.SchemaVersion != CandidateSchema || value.HeadscaleID == "" || value.DatabaseUUID == "" || value.DatabaseGeneration == 0 || value.Generation == 0 || value.ControlDomain == "" || value.MagicDNSNamespace == "" || value.Artifact.ConfigContract != ConfigContract || !digestValue(value.ConfigDigest) || !digestValue(value.PolicyDigest) || !digestValue(value.UnitDigest) || !digestValue(value.ServiceIdentity) || !digestValue(value.ControlIdentity) || !certificatePattern.MatchString(value.CertificateID) || !digestValue(value.CertificateBinding) || value.Paths != FixedPaths() || value.ControlBackend != ControlBackend || value.AdminBackend != AdminBackend || value.MetricsBackend != MetricsBackend || value.STUNBackend != STUNBackend || value.PublicSTUN {
-		return fmt.Errorf("Headscale control candidate is invalid")
+		return fmt.Errorf("headscale control candidate is invalid")
 	}
 	return nil
 }
@@ -255,12 +255,12 @@ func VerifyRendered(value Rendered) error {
 		return err
 	}
 	if digest(value.Config) != value.Candidate.ConfigDigest || digest(value.Policy) != value.Candidate.PolicyDigest || digest(value.Unit) != value.Candidate.UnitDigest || !json.Valid(value.Config) || !json.Valid(value.Policy) {
-		return fmt.Errorf("Headscale rendered candidate differs from authority")
+		return fmt.Errorf("headscale rendered candidate differs from authority")
 	}
 	var config headscaleConfig
 	var policy trustedPolicy
 	if json.Unmarshal(value.Config, &config) != nil || json.Unmarshal(value.Policy, &policy) != nil || config.ListenAddr != ControlBackend || config.GRPCListenAddr != AdminBackend || config.UnixSocket != value.Candidate.Paths.AdminSocket || config.UnixSocketPermission != "0700" || config.MetricsListenAddr != MetricsBackend || config.DERP.Server.STUNListenAddr != STUNBackend || len(config.DERP.URLs) != 0 || config.DERP.AutoUpdateEnabled || len(policy.ACLs) != 1 || policy.ACLs[0].Action != "accept" || !slices.Equal(policy.ACLs[0].Sources, []string{"*"}) || !slices.Equal(policy.ACLs[0].Destinations, []string{"*:*"}) {
-		return fmt.Errorf("Headscale rendered contract changed")
+		return fmt.Errorf("headscale rendered contract changed")
 	}
 	return nil
 }
@@ -278,6 +278,7 @@ func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func digestValue(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
 		return false
@@ -288,7 +289,7 @@ func digestValue(value string) bool {
 
 func ValidateRelease(authority release.InstallIdentity, candidate Candidate) error {
 	if err := release.ValidateInstallIdentity(authority); err != nil || candidate.Artifact.Version != authority.Headscale.Version || candidate.Artifact.ConfigContract != authority.Headscale.ConfigContract || candidate.Artifact.ConfigContractDigest != "sha256:"+authority.Headscale.ConfigContractDigest || candidate.Paths.Executable != authority.Headscale.InstallPath {
-		return fmt.Errorf("Headscale candidate differs from release authority")
+		return fmt.Errorf("headscale candidate differs from release authority")
 	}
 	return nil
 }

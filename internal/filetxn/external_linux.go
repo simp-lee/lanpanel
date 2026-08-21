@@ -48,7 +48,7 @@ func OpenExternalArtifact(path string, owner Owner, maximumBytes int64, expected
 	if err != nil {
 		return nil, ExternalIdentity{}, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	fd, err := unix.Openat(parentFD, base, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, ExternalIdentity{}, fmt.Errorf("open external artifact no-follow")

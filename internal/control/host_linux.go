@@ -34,14 +34,14 @@ type LinuxCandidateHost struct {
 
 func NewLinuxCandidateHost(account identity.AccountIdentity, runtime PrivateRuntime) (*LinuxCandidateHost, error) {
 	if account.Role != identity.RoleHeadscale || account.UID == 0 || account.GID == 0 || runtime == nil {
-		return nil, fmt.Errorf("Headscale Linux candidate host authority is invalid")
+		return nil, fmt.Errorf("headscale Linux candidate host authority is invalid")
 	}
 	return &LinuxCandidateHost{account: account, runtime: runtime}, nil
 }
 
 func (host *LinuxCandidateHost) ValidateFreshCandidate(_ context.Context, rendered Rendered) error {
 	if host == nil || VerifyRendered(rendered) != nil {
-		return fmt.Errorf("Headscale fresh candidate authority is invalid")
+		return fmt.Errorf("headscale fresh candidate authority is invalid")
 	}
 	bundle, err := certificates.BundlePath(rendered.Candidate.CertificateID, 1)
 	if err != nil {
@@ -59,21 +59,21 @@ func (host *LinuxCandidateHost) ValidateFreshCandidate(_ context.Context, render
 		} else if err != nil {
 			return err
 		}
-		return fmt.Errorf("Headscale first-deploy output already exists: %s", filepath.Base(path))
+		return fmt.Errorf("headscale first-deploy output already exists: %s", filepath.Base(path))
 	}
 	return nil
 }
 
 func (host *LinuxCandidateHost) CommitFreshBoundary(ctx context.Context, rendered Rendered) error {
 	if host == nil || VerifyRendered(rendered) != nil {
-		return fmt.Errorf("Headscale fresh boundary authority is invalid")
+		return fmt.Errorf("headscale fresh boundary authority is invalid")
 	}
 	return host.runtime.RequireAbsent(ctx, rendered.Candidate, host.account)
 }
 
 func (host *LinuxCandidateHost) InitializeDatabase(ctx context.Context, rendered Rendered) (DatabaseEvidence, error) {
 	if host == nil || VerifyRendered(rendered) != nil {
-		return DatabaseEvidence{}, fmt.Errorf("Headscale database candidate is invalid")
+		return DatabaseEvidence{}, fmt.Errorf("headscale database candidate is invalid")
 	}
 	if err := ensureFixedDirectory(rendered.Candidate.Paths.RuntimeRoot, filetxn.Owner{UID: host.account.UID, GID: host.account.GID}, 0o700); err != nil {
 		return DatabaseEvidence{}, err
@@ -87,14 +87,14 @@ func (host *LinuxCandidateHost) InitializeDatabase(ctx context.Context, rendered
 	}
 	journal := Journal{Candidate: rendered.Candidate, Database: &evidence}
 	if !validDatabase(journal) {
-		return DatabaseEvidence{}, fmt.Errorf("Headscale database runtime evidence mismatched")
+		return DatabaseEvidence{}, fmt.Errorf("headscale database runtime evidence mismatched")
 	}
 	return evidence, nil
 }
 
 func (host *LinuxCandidateHost) StagePrivateService(ctx context.Context, rendered Rendered, database DatabaseEvidence) (ServiceEvidence, error) {
 	if host == nil || VerifyRendered(rendered) != nil || !validDatabase(Journal{Candidate: rendered.Candidate, Database: &database}) {
-		return ServiceEvidence{}, fmt.Errorf("Headscale private service authority is invalid")
+		return ServiceEvidence{}, fmt.Errorf("headscale private service authority is invalid")
 	}
 	if err := host.verifyCandidateFiles(ctx, rendered); err != nil {
 		return ServiceEvidence{}, err
@@ -104,14 +104,14 @@ func (host *LinuxCandidateHost) StagePrivateService(ctx context.Context, rendere
 		return ServiceEvidence{}, err
 	}
 	if !validService(Journal{Candidate: rendered.Candidate, Service: &evidence}) {
-		return ServiceEvidence{}, fmt.Errorf("Headscale private service probe mismatched or exposed public STUN")
+		return ServiceEvidence{}, fmt.Errorf("headscale private service probe mismatched or exposed public STUN")
 	}
 	return evidence, nil
 }
 
 func (host *LinuxCandidateHost) VerifyActiveCandidate(ctx context.Context, rendered Rendered, database DatabaseEvidence, service ServiceEvidence) error {
 	if host == nil || VerifyRendered(rendered) != nil || !validDatabase(Journal{Candidate: rendered.Candidate, Database: &database}) || !validService(Journal{Candidate: rendered.Candidate, Service: &service}) {
-		return fmt.Errorf("Headscale active candidate authority invalid")
+		return fmt.Errorf("headscale active candidate authority invalid")
 	}
 	if err := host.verifyCandidateFiles(ctx, rendered); err != nil {
 		return err
@@ -121,14 +121,14 @@ func (host *LinuxCandidateHost) VerifyActiveCandidate(ctx context.Context, rende
 		return err
 	}
 	if observed != service {
-		return fmt.Errorf("Headscale active candidate evidence changed")
+		return fmt.Errorf("headscale active candidate evidence changed")
 	}
 	return nil
 }
 
 func (host *LinuxCandidateHost) StopPrivateService(ctx context.Context, candidate Candidate) error {
 	if host == nil || Validate(candidate) != nil {
-		return fmt.Errorf("Headscale candidate stop authority is invalid")
+		return fmt.Errorf("headscale candidate stop authority is invalid")
 	}
 	return host.runtime.StopAndVerify(ctx, candidate, host.account)
 }
@@ -148,7 +148,7 @@ func (host *LinuxCandidateHost) commitCandidateFiles(ctx context.Context, render
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	files := []struct {
 		path  string
 		data  []byte
@@ -167,7 +167,7 @@ func (host *LinuxCandidateHost) commitCandidateFiles(ctx context.Context, render
 			request.Existing = &filetxn.Metadata{Owner: value.owner, Mode: value.mode}
 			actual, readErr := store.Read(ctx, request)
 			if readErr != nil || !bytes.Equal(actual, value.data) {
-				return fmt.Errorf("Headscale candidate file differs from exact authority")
+				return fmt.Errorf("headscale candidate file differs from exact authority")
 			}
 		}
 	}
@@ -182,7 +182,7 @@ func (host *LinuxCandidateHost) verifyCandidateFiles(ctx context.Context, render
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	service := filetxn.Owner{UID: host.account.UID, GID: host.account.GID}
 	for _, value := range []struct {
 		path  string
@@ -196,7 +196,7 @@ func (host *LinuxCandidateHost) verifyCandidateFiles(ctx context.Context, render
 		}
 		actual, err := store.Read(ctx, filetxn.Request{Path: value.path, Parents: parents, Existing: &filetxn.Metadata{Owner: value.owner, Mode: value.mode}, MaxBytes: int64(len(value.data))})
 		if err != nil || !bytes.Equal(actual, value.data) {
-			return fmt.Errorf("Headscale candidate file verification failed")
+			return fmt.Errorf("headscale candidate file verification failed")
 		}
 	}
 	return nil
@@ -207,7 +207,7 @@ func ensureFixedDirectory(path string, owner filetxn.Owner, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	name := filepath.Base(path)
 	created := false
 	if err := unix.Mkdirat(parent, name, mode); err != nil {
@@ -221,7 +221,7 @@ func ensureFixedDirectory(path string, owner filetxn.Owner, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	if created {
 		if err := unix.Fchown(fd, int(owner.UID), int(owner.GID)); err != nil {
 			return err
@@ -235,7 +235,7 @@ func ensureFixedDirectory(path string, owner filetxn.Owner, mode uint32) error {
 	}
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != mode {
-		return fmt.Errorf("Headscale fixed directory metadata is unsafe")
+		return fmt.Errorf("headscale fixed directory metadata is unsafe")
 	}
 	return unix.Fsync(parent)
 }

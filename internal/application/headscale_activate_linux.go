@@ -33,12 +33,15 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	if execution == nil || execution.Mutation == nil || execution.Exposure == nil || !execution.CertificateStaged || execution.Local == nil || execution.Host == nil || host == nil {
-		return fmt.Errorf("Headscale control activation phase is invalid")
+		return fmt.Errorf("headscale control activation phase is invalid")
+	}
+	if err := verifyManagedACMEBinding(execution.Authority.Binding); err != nil {
+		return err
 	}
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	journal, err := store.Read()
 	if err != nil || journal.JobID != execution.JobID || journal.PlanID != execution.Plan.ID || journal.IntentGeneration != execution.Child.IntentGeneration || journal.Phase != control.PhaseCertificateStaged || journal.Certificate == nil {
-		return fmt.Errorf("Headscale staged certificate authority changed: %w", err)
+		return fmt.Errorf("headscale staged certificate authority changed: %w", err)
 	}
 	bundle, err := control.BuildActivation(execution.Installation.InstallationID, execution.Authority.Rendered.Candidate, *journal.Certificate)
 	if err != nil {
@@ -61,16 +64,16 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 	}
 	freshRequest, freshResult, err := evaluateHeadscaleDeployPreflight(ctx, installed, installation.InstallationID, installation.Headscale.ID, installation.Headscale.ControlDomain, installation.Headscale.Database.Generation)
 	if err != nil || !reflect.DeepEqual(freshRequest, execution.Authority.Preflight) {
-		return fmt.Errorf("Headscale activation preflight policy changed: %w", err)
+		return fmt.Errorf("headscale activation preflight policy changed: %w", err)
 	}
 	if err := preflight.RequireExpansionResultForRequest(freshResult, freshRequest, freshResult.ObservedAt); err != nil {
 		return err
 	}
 	if !freshResult.ObservedAt.Before(execution.Plan.ExpiresAt) {
-		return fmt.Errorf("Headscale activation Plan deadline elapsed")
+		return fmt.Errorf("headscale activation Plan deadline elapsed")
 	}
 	if err := execution.Local.VerifyPrivateCandidate(ctx); err != nil {
-		return fmt.Errorf("Headscale private candidate changed before activation: %w", err)
+		return fmt.Errorf("headscale private candidate changed before activation: %w", err)
 	}
 	if err := host.Stage(ctx, bundle); err != nil {
 		return err
@@ -102,9 +105,16 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 	}
 	trustedNow, timeErr := execution.Admitter.TrustedNow()
 	if timeErr != nil || !trustedNow.Before(execution.Plan.ExpiresAt) {
-		return errors.Join(fmt.Errorf("Headscale activation deadline changed: %w", timeErr), execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
+		return errors.Join(fmt.Errorf("headscale activation deadline changed: %w", timeErr), execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
 	}
-	runtimeAuthority := control.ActivationAuthority{Safety: activationSafety, Installation: activationInstallation, ObservedAt: trustedNow}
+	ownershipAuthority, ownershipErr := fixedOwnershipAuthority(execution.Service.ownership)
+	if ownershipErr != nil {
+		return errors.Join(ownershipErr, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
+	}
+	runtimeAuthority := control.ActivationAuthority{Safety: activationSafety, Installation: activationInstallation, Ownership: ownershipAuthority, ObservedAt: trustedNow}
+	if err := verifyManagedACMEBinding(execution.Authority.Binding); err != nil {
+		return errors.Join(err, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
+	}
 	result, err := host.Activate(ctx, bundle, runtimeAuthority)
 	if err != nil {
 		return errors.Join(err, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
@@ -203,7 +213,7 @@ func reconcileInterruptedHeadscaleActivation(ctx context.Context, service *Fixed
 	}
 	freshSafety, err := service.safety.ReadForRecovery(exposure)
 	if err != nil || freshSafety.Headscale.Reactivating == nil || freshSafety.Headscale.Reactivating.PlanID != journal.PlanID {
-		return fmt.Errorf("Headscale activation contraction safety changed: %w", err)
+		return fmt.Errorf("headscale activation contraction safety changed: %w", err)
 	}
 	next := freshSafety
 	next.Revision++
@@ -231,7 +241,7 @@ func (execution *HeadscaleDeployExecution) contractActivationFailure(ctx context
 		}
 		fenceErr := execution.Service.WriteHeadscaleIngressActivationFence(ctx, execution.Exposure, execution.Plan.ID, bundle.Digest, execution.Challenge.Safety.Generation, execution.Challenge.Safety.Generation-1, observed, accessMayRemain)
 		execution.ClosureUncertain = true
-		return errors.Join(fmt.Errorf("Headscale ingress activation closure uncertain: %w", physicalErr), fallbackErr, fenceErr)
+		return errors.Join(fmt.Errorf("headscale ingress activation closure uncertain: %w", physicalErr), fallbackErr, fenceErr)
 	}
 	return execution.removeFailedChallenge(ctx, execution.Host)
 }

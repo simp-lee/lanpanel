@@ -12,6 +12,7 @@ func legoTestEnvironment(provider string) []string {
 	values := map[string][]string{"cloudflare": {"CF_DNS_API_TOKEN_FILE=/secret"}, "route53": {"AWS_EC2_METADATA_DISABLED=true", "AWS_HOSTED_ZONE_ID=zone", "AWS_PROFILE=lanpanel", "AWS_REGION=us-east-1", "AWS_SHARED_CREDENTIALS_FILE=/secret"}, "digitalocean": {"DO_AUTH_TOKEN_FILE=/secret"}, "gcloud": {"GCE_PROJECT=project", "GCE_SERVICE_ACCOUNT_FILE=/secret"}, "tencentcloud": {"TENCENTCLOUD_SECRET_ID_FILE=/id", "TENCENTCLOUD_SECRET_KEY_FILE=/key"}}[provider]
 	return append([]string{"LANG=C", "LC_ALL=C"}, values...)
 }
+
 func TestLegoRendersEveryBuiltInDNSProviderWithoutFallback(t *testing.T) {
 	id := "cert_00000000000000000000000000000000"
 	identities := Identities{CertificateStage: Identity{UID: 1200, GID: 1200, Chroot: "/var/lib/lanpanel/certificates/chroot/" + id}}
@@ -40,6 +41,7 @@ func TestLegoRendersEveryBuiltInDNSProviderWithoutFallback(t *testing.T) {
 		})
 	}
 }
+
 func TestLegoInvocationIsPinnedPerCertificateAndRejectsProviderFallback(t *testing.T) {
 	id := "cert_00000000000000000000000000000000"
 	identities := Identities{CertificateStage: Identity{UID: 1200, GID: 1200, Chroot: "/var/lib/lanpanel/certificates/chroot/" + id}}

@@ -32,13 +32,15 @@ type Result struct {
 	JobID     string
 	Payload   any
 }
-type Handler func(context.Context, Actor, Call) (Result, error)
-type registration struct {
-	operation domain.OperationCode
-	payload   reflect.Type
-	ui, timer bool
-	handler   Handler
-}
+type (
+	Handler      func(context.Context, Actor, Call) (Result, error)
+	registration struct {
+		operation domain.OperationCode
+		payload   reflect.Type
+		ui, timer bool
+		handler   Handler
+	}
+)
 type Registration struct{ value registration }
 
 func RegisterAction(operation domain.OperationCode, payload any, ui, timer bool, handler Handler) (Registration, error) {
@@ -66,6 +68,7 @@ func New(registrations []Registration) (*Service, error) {
 	}
 	return service, nil
 }
+
 func (service *Service) Available(actor Actor) []domain.OperationCode {
 	result := []domain.OperationCode{}
 	if service == nil {
@@ -79,6 +82,7 @@ func (service *Service) Available(actor Actor) []domain.OperationCode {
 	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
 	return result
 }
+
 func (service *Service) Invoke(ctx context.Context, actor Actor, call Call) (Result, error) {
 	if service == nil || actor.Identity == "" || actor.Generation == 0 || actor.Kind != ActorUI && actor.Kind != ActorTimer {
 		return Result{}, fmt.Errorf("application actor is invalid")

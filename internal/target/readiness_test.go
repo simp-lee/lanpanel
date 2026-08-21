@@ -46,6 +46,20 @@ func TestSharedReadinessSkipsDisabledWebSocketAndRejectsRedirect(t *testing.T) {
 	}
 }
 
+func TestTailnetReadinessUsesExactVerifiedTransportIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) }))
+	defer server.Close()
+	address := strings.TrimPrefix(server.URL, "http://")
+	request := ProbeRequest{ResourceID: "res_00000000000000000000000000000001", ConfigDigest: digest("config"), EndpointIdentity: digest("route"), Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{204}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}, AccessMode: domain.AppAccessPublic, Host: "app.example.test"}
+	identity := request.EndpointIdentity + "/tailnet/100.64.0.2:8080"
+	if _, err := Probe(context.Background(), request, dialTransport{address, identity}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tailnet/100.64.0.3:8080"}); err == nil {
+		t.Fatal("mismatched tailnet transport identity accepted")
+	}
+}
+
 func TestReadinessIdentityIsStableAcrossFreshObservationTimes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) }))
 	defer server.Close()
@@ -60,7 +74,7 @@ func TestReadinessIdentityIsStableAcrossFreshObservationTimes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Digest != second.Digest || first.ObservedAt == second.ObservedAt {
+	if first.Digest != second.Digest || first.ObservedAt.Equal(second.ObservedAt) {
 		t.Fatalf("readiness identity changed across observation times: %#v %#v", first, second)
 	}
 }
@@ -70,7 +84,7 @@ func TestSharedReadinessValidatesWebSocketAndApplicationBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -116,9 +130,10 @@ func TestSharedReadinessValidatesWebSocketAndApplicationBoundary(t *testing.T) {
 func validProbeRequest(authority string) ProbeRequest {
 	host, portText, _ := net.SplitHostPort(authority)
 	var port uint16
-	fmt.Sscan(portText, &port)
+	_, _ = fmt.Sscan(portText, &port)
 	return ProbeRequest{ResourceID: "res_00000000000000000000000000000001", ConfigDigest: digest("config"), EndpointIdentity: digest("endpoint"), Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{204}, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointTCPSocketActivation, TCPAddress: host, TCPPort: port}}, AccessMode: domain.AppAccessPublic, Host: "readiness.lanpanel.invalid", Now: func() time.Time { return time.Unix(1700000000, 0).UTC() }}
 }
+
 func digest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }

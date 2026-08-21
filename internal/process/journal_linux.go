@@ -35,6 +35,7 @@ type Journal struct {
 func journalPath(resourceID string) string {
 	return filepath.Join("/var/lib/lanpanel/safety/process", resourceID+".json")
 }
+
 func JournalPresent(resourceID string) (bool, error) {
 	path := journalPath(resourceID)
 	info, err := os.Lstat(path)
@@ -49,6 +50,7 @@ func JournalPresent(resourceID string) (bool, error) {
 	}
 	return true, nil
 }
+
 func WriteJournal(ctx context.Context, value Journal) error {
 	if value.SchemaVersion != processJournalSchema || value.JobID == "" || value.ResourceID == "" || (value.Operation != "process_start" && value.Operation != "process_stop") || (value.Phase != "prepared" && value.Phase != "activating" && value.Phase != "host_mutated") {
 		return fmt.Errorf("process journal invalid")
@@ -76,7 +78,7 @@ func WriteJournal(ctx context.Context, value Journal) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	meta := filetxn.Metadata{Owner: owner, Mode: 0o600}
 	disposition := filetxn.CreateOnly
 	if _, err := os.Lstat(path); err == nil {
@@ -139,6 +141,7 @@ func ReconcileJournals(ctx context.Context, host Host, commit ReconcileState) er
 	}
 	return nil
 }
+
 func RemoveJournal(resourceID string) error {
 	path := journalPath(resourceID)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -148,6 +151,6 @@ func RemoveJournal(resourceID string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func(ignore func() error) { _ = ignore() }(directory.Close)
 	return directory.Sync()
 }

@@ -25,7 +25,7 @@ func DomainPublicationCandidate(update DomainPublicationUpdate) (domain.AppResou
 	if err != nil {
 		return domain.AppResource{}, err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return domain.AppResource{}, err

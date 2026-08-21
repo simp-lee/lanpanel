@@ -39,7 +39,7 @@ func ValidateServiceReferences(service domain.ManagedService, processUID uint32,
 	if err != nil {
 		return ReferenceEvidence{}, fmt.Errorf("service executable: %w", err)
 	}
-	defer executable.Close()
+	defer func(ignore func() error) { _ = ignore() }(executable.Close)
 	var executableStat unix.Stat_t
 	if unix.Fstat(int(executable.Fd()), &executableStat) != nil || executableStat.Mode&unix.S_IFMT != unix.S_IFREG || executableStat.Uid != 0 || executableStat.Mode&0o022 != 0 || executableStat.Mode&0o6000 != 0 || executableStat.Mode&0o111 == 0 || executableStat.Nlink != 1 {
 		return ReferenceEvidence{}, fmt.Errorf("service executable type, owner, mode, links, or executable bit is unsafe")
@@ -56,7 +56,7 @@ func ValidateServiceReferences(service domain.ManagedService, processUID uint32,
 	if err != nil {
 		return ReferenceEvidence{}, fmt.Errorf("service working directory: %w", err)
 	}
-	defer working.Close()
+	defer func(ignore func() error) { _ = ignore() }(working.Close)
 	var workingStat unix.Stat_t
 	if unix.Fstat(int(working.Fd()), &workingStat) != nil || workingStat.Mode&unix.S_IFMT != unix.S_IFDIR || workingStat.Uid != 0 || workingStat.Mode&0o022 != 0 {
 		return ReferenceEvidence{}, fmt.Errorf("service working directory is unsafe")
@@ -131,7 +131,7 @@ func ReadEnvironmentFile(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Mode&0o077 != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumEnvironmentBytes {
 		return nil, fmt.Errorf("environment file is unsafe")
@@ -170,7 +170,7 @@ func validateEnvironmentFile(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("environment file: %w", err)
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Mode&0o077 != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumEnvironmentBytes {
 		return "", fmt.Errorf("environment file type, owner, mode, link, or size is unsafe")

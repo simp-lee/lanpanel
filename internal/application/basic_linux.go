@@ -49,6 +49,7 @@ func (value *basicExecution) Close() error {
 	}
 	return err
 }
+
 func beginBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding) (*basicExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -95,6 +96,7 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	}
 	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job, revision: intent.IntentGeneration}, nil
 }
+
 func (value *basicExecution) reserveHTPasswdChild(ctx context.Context, username string, password []byte) error {
 	if value.mutation == nil || value.exposure == nil {
 		return fmt.Errorf("managed Basic operation locks missing")
@@ -143,6 +145,7 @@ func (value *basicExecution) reserveHTPasswdChild(ctx context.Context, username 
 	value.child = &childRecord
 	return nil
 }
+
 func (value *basicExecution) terminalHTPasswdChild(ctx context.Context, outcome operations.ChildOutcome, resultDigest string) error {
 	if value.child == nil {
 		return fmt.Errorf("managed Basic child missing")
@@ -160,6 +163,7 @@ func (value *basicExecution) terminalHTPasswdChild(ctx context.Context, outcome 
 	value.child = &childRecord
 	return nil
 }
+
 func hashBasic(ctx context.Context, credentialID, username string, password []byte) (basic.Generated, error) {
 	ephemeral, err := identity.EphemeralHTPasswdIdentityFor(credentialID)
 	if err != nil {
@@ -174,6 +178,7 @@ func hashBasic(ctx context.Context, credentialID, username string, password []by
 	}
 	return basic.Hash(ctx, launcher, username, password)
 }
+
 func newCredentialID() (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
@@ -181,6 +186,7 @@ func newCredentialID() (string, error) {
 	}
 	return "cred_" + hex.EncodeToString(raw), nil
 }
+
 func basicCredential(installation domain.Installation, credentialID string) (domain.Credential, error) {
 	for _, credential := range installation.Credentials {
 		if credential.ID == credentialID && credential.Kind == "managed_basic" {
@@ -189,6 +195,7 @@ func basicCredential(installation domain.Installation, credentialID string) (dom
 	}
 	return domain.Credential{}, fmt.Errorf("managed Basic credential missing")
 }
+
 func loadBasicInstallation(service *FixedService) (domain.Installation, error) {
 	document, err := service.normal.Read()
 	if err != nil {
@@ -200,6 +207,7 @@ func loadBasicInstallation(service *FixedService) (domain.Installation, error) {
 	}
 	return domain.DecodeInstallation(raw)
 }
+
 func CreateManagedBasic(ctx context.Context, resourceID, username, actor string) (result ManagedBasicResult, resultErr error) {
 	if err := requireNoDegradedAppliedSource(resourceID); err != nil {
 		return result, err
@@ -266,6 +274,7 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	}
 	return ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: generated.Fingerprint, Password: password}, nil
 }
+
 func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result ManagedBasicResult, resultErr error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -339,6 +348,7 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 	}
 	return ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: generated.Fingerprint, Password: password}, nil
 }
+
 func beginBasicDelete(ctx context.Context, credential domain.Credential, actor, planID string) (*basicExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -372,19 +382,19 @@ func beginBasicDelete(ctx context.Context, credential domain.Credential, actor, 
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "credential/"+credential.ID, service.manager)
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.normal.Read()
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: plan.NonceDigest})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job}, nil

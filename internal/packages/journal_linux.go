@@ -7,14 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"lanpanel/internal/filetxn"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
-
-	"lanpanel/internal/filetxn"
 )
 
 const maximumJournalBytes = 64 << 10

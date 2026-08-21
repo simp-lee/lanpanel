@@ -39,7 +39,7 @@ func RunRuntimeGuard(args []string) error {
 	}
 	nginxGID, parseErr := strconv.ParseUint(nginxGroup.Gid, 10, 32)
 	if parseErr != nil || nginxGID == 0 {
-		return fmt.Errorf("Nginx runtime group invalid")
+		return fmt.Errorf("nginx runtime group invalid")
 	}
 	if _, err = ensureDirectory("/run/lanpanel-goaccess", filetxn.Owner{UID: 0, GID: uint32(nginxGID)}, 0o750); err != nil {
 		return err

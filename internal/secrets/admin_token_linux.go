@@ -16,9 +16,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const AdminTokenPath = "/var/lib/lanpanel/installation/admin-token"
-const tokenBytes = 64
-const candidateName = ".admin-token.rotate"
+const (
+	AdminTokenPath = "/var/lib/lanpanel/installation/admin-token"
+	tokenBytes     = 64
+	candidateName  = ".admin-token.rotate"
+)
 
 type AdminTokenOptions struct {
 	Random              io.Reader
@@ -76,8 +78,8 @@ func prepareAdminToken(encoded []byte, options AdminTokenOptions) (AdminTokenCom
 	if err != nil {
 		return AdminTokenCommit{}, err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	if _, err := readCandidate(parentFD); err == nil {
 		return AdminTokenCommit{}, fmt.Errorf("admin token recovery candidate already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -88,12 +90,12 @@ func prepareAdminToken(encoded []byte, options AdminTokenOptions) (AdminTokenCom
 		return AdminTokenCommit{}, err
 	}
 	if err := writeFull(fd, encoded); err != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		_ = removeCandidate(parentFD)
 		return AdminTokenCommit{}, err
 	}
 	if unix.Fsync(fd) != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		_ = removeCandidate(parentFD)
 		return AdminTokenCommit{}, fmt.Errorf("sync admin token candidate")
 	}
@@ -161,8 +163,8 @@ func FinalizeAdminToken(expectedOldFingerprint, expectedNewFingerprint string) e
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	current, err := readFD(oldFD)
 	if err != nil {
 		return err
@@ -186,8 +188,8 @@ func RestorePreparedAdminToken(expectedOldFingerprint, expectedNewFingerprint st
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	current, err := readFD(oldFD)
 	if err != nil {
 		return err
@@ -217,8 +219,8 @@ func ReconcileAdminTokenCandidate(priorFingerprint, candidateFingerprint, curren
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	candidate, candidateErr := readCandidate(parentFD)
 	candidateAbsent := errors.Is(candidateErr, os.ErrNotExist)
 	candidateDigest := ""
@@ -267,13 +269,14 @@ func removeCandidate(parentFD int) error {
 	}
 	return nil
 }
+
 func RequireNoAdminTokenCandidate() error {
 	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	candidate, err := readCandidate(parentFD)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -284,13 +287,14 @@ func RequireNoAdminTokenCandidate() error {
 	}
 	return fmt.Errorf("orphan admin token recovery candidate exists")
 }
+
 func KnownHostSecretDigests() (map[string]struct{}, error) {
 	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	data, err := readFD(oldFD)
 	if err != nil {
 		return nil, err
@@ -298,13 +302,14 @@ func KnownHostSecretDigests() (map[string]struct{}, error) {
 	defer clear(data)
 	return map[string]struct{}{digest(data): {}}, nil
 }
+
 func CurrentAdminTokenFingerprint() (string, error) {
 	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
 	if err != nil {
 		return "", err
 	}
-	defer unix.Close(parentFD)
-	defer unix.Close(oldFD)
+	defer func() { _ = unix.Close(parentFD) }()
+	defer func() { _ = unix.Close(oldFD) }()
 	data, err := readFD(oldFD)
 	if err != nil {
 		return "", err
@@ -312,6 +317,7 @@ func CurrentAdminTokenFingerprint() (string, error) {
 	defer clear(data)
 	return digest(data), nil
 }
+
 func openAdminToken(parent string) (int, int, unix.Stat_t, error) {
 	if parent != "/var/lib/lanpanel/installation" {
 		return -1, -1, unix.Stat_t{}, fmt.Errorf("admin token parent is not fixed")
@@ -322,46 +328,49 @@ func openAdminToken(parent string) (int, int, unix.Stat_t, error) {
 	}
 	var p unix.Stat_t
 	if unix.Fstat(parentFD, &p) != nil || p.Mode&unix.S_IFMT != unix.S_IFDIR || p.Uid != 0 || p.Gid != 0 || p.Mode&0o777 != 0o711 {
-		unix.Close(parentFD)
+		_ = unix.Close(parentFD)
 		return -1, -1, unix.Stat_t{}, fmt.Errorf("admin token parent is unsafe")
 	}
 	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		unix.Close(parentFD)
+		_ = unix.Close(parentFD)
 		return -1, -1, unix.Stat_t{}, err
 	}
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != tokenBytes {
-		unix.Close(fd)
-		unix.Close(parentFD)
+		_ = unix.Close(fd)
+		_ = unix.Close(parentFD)
 		return -1, -1, unix.Stat_t{}, fmt.Errorf("admin token source is unsafe")
 	}
 	return parentFD, fd, stat, nil
 }
+
 func readAdminToken(parentFD int) ([]byte, error) {
 	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != tokenBytes {
 		return nil, fmt.Errorf("admin token source is unsafe")
 	}
 	return readFD(fd)
 }
+
 func readCandidate(parentFD int) ([]byte, error) {
 	fd, err := unix.Openat(parentFD, candidateName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != tokenBytes {
 		return nil, fmt.Errorf("admin token recovery candidate is unsafe")
 	}
 	return readFD(fd)
 }
+
 func readFD(fd int) ([]byte, error) {
 	duplicate, err := unix.Dup(fd)
 	if err != nil {
@@ -369,10 +378,10 @@ func readFD(fd int) ([]byte, error) {
 	}
 	reader := os.NewFile(uintptr(duplicate), "admin-token-read")
 	if reader == nil {
-		unix.Close(duplicate)
+		_ = unix.Close(duplicate)
 		return nil, fmt.Errorf("admin token reader invalid")
 	}
-	defer reader.Close()
+	defer func(ignore func() error) { _ = ignore() }(reader.Close)
 	data, err := io.ReadAll(io.LimitReader(reader, tokenBytes+1))
 	if err != nil || len(data) != tokenBytes {
 		return nil, fmt.Errorf("read admin token")
@@ -383,6 +392,7 @@ func readFD(fd int) ([]byte, error) {
 	}
 	return data, nil
 }
+
 func writeFull(fd int, value []byte) error {
 	for len(value) > 0 {
 		written, err := unix.Write(fd, value)
@@ -396,6 +406,7 @@ func writeFull(fd int, value []byte) error {
 	}
 	return nil
 }
+
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])

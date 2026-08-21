@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"lanpanel/internal/child"
 	"lanpanel/internal/identity"
@@ -21,23 +20,27 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type invocationLauncher interface {
 	RunInvocation(context.Context, child.ProfileID, child.Invocation, []byte) (child.Result, error)
 }
-type Host struct{ launcher invocationLauncher }
-type ServiceGeneration struct {
-	ResourceID string
-	Generation uint64
-}
+type (
+	Host              struct{ launcher invocationLauncher }
+	ServiceGeneration struct {
+		ResourceID string
+		Generation uint64
+	}
+)
 
 func boundedDirectoryEntries(ctx context.Context, path string, count *int) ([]os.DirEntry, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	result := []os.DirEntry{}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -103,6 +106,7 @@ func NewFixedHost() (Host, error) {
 	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
 	return Host{launcher: launcher}, err
 }
+
 func (host Host) Stage(ctx context.Context, resourceID string, candidate Candidate) error {
 	if host.launcher == nil || candidate.ServiceIdentity == "" || resourceID != candidate.ResourceID || !validInstallationID(candidate.InstallationID) {
 		return fmt.Errorf("GoAccess host authority incomplete")
@@ -186,6 +190,7 @@ func (host Host) Stage(ctx context.Context, resourceID string, candidate Candida
 	}
 	return probeWebSocket(ctx, candidate.Paths.Endpoint, candidate.WebSocketPath)
 }
+
 func verifyAbsentAccountTraces(candidate Candidate) error {
 	names := map[string]bool{candidate.User: true, candidate.RelayUser: true}
 	for _, path := range []string{"/etc/shadow", "/etc/gshadow"} {
@@ -202,6 +207,7 @@ func verifyAbsentAccountTraces(candidate Candidate) error {
 	}
 	return nil
 }
+
 func verifyAccountAuthority(candidate Candidate, requireComplete, requireLocked bool) error {
 	markerInfo, observeMarkerErr := os.Lstat(candidate.Paths.Sysusers)
 	markerPresent := observeMarkerErr == nil
@@ -344,6 +350,7 @@ func verifyAccountAuthority(candidate Candidate, requireComplete, requireLocked 
 	}
 	return nil
 }
+
 func RunAccountGuard(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("goaccess-account-guard accepts no arguments")
@@ -379,6 +386,7 @@ func Installed(resourceID string, generation uint64) (bool, error) {
 	}
 	return true, nil
 }
+
 func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	if err := verifyAccountAuthority(candidate, true, true); err != nil {
 		return err
@@ -449,6 +457,7 @@ func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	}
 	return host.waitEndpoint(ctx, paths.Endpoint, true)
 }
+
 func enablementLinks(paths Paths) map[string]string {
 	return map[string]string{paths.ServiceEnablement: paths.ServiceUnit, paths.RelayEnablement: paths.RelayUnit, paths.SocketEnablement: paths.SocketUnit, paths.RetentionEnablement: paths.RetentionTimer}
 }
@@ -569,6 +578,7 @@ func (host Host) CleanupCandidate(ctx context.Context, candidate Candidate) erro
 	}
 	return nil
 }
+
 func cleanupCandidateStaging(candidate Candidate) error {
 	files := []struct {
 		path string
@@ -626,6 +636,7 @@ func cleanupExactStaging(staging string, expected []byte, uid, gid uint32) error
 func removeCandidateState(ctx context.Context, candidate Candidate) error {
 	return removeOwnedTree(ctx, candidate.Paths.StateRoot, 0, 0, 0o711)
 }
+
 func (host Host) ensureRetainedStateStopped(ctx context.Context, candidate Candidate) error {
 	if candidate.RetainedServiceGeneration == 0 || candidate.RetainedServiceGeneration >= candidate.Generation || candidate.RetainedServiceIdentity == "" || len(candidate.RetainedUnitIdentities) != 5 {
 		return fmt.Errorf("retained GoAccess service authority incomplete")
@@ -763,6 +774,7 @@ func (host Host) Retire(ctx context.Context, resourceID string, generation uint6
 	}
 	return nil
 }
+
 func (host Host) RemoveGenerationState(ctx context.Context, resourceID string, generation uint64) error {
 	paths, err := DerivePaths(resourceID, generation)
 	if err != nil {
@@ -799,12 +811,14 @@ func (host Host) CleanupRetained(ctx context.Context, installationID, resourceID
 	}
 	return host.cleanupRetainedShared(ctx, installationID, resourceID)
 }
+
 func (host Host) CleanupUncommittedShared(ctx context.Context, installationID, resourceID string) error {
 	if err := verifyRetainedInventory(ctx, installationID, resourceID, nil); err != nil {
 		return err
 	}
 	return host.cleanupRetainedShared(ctx, installationID, resourceID)
 }
+
 func (host Host) cleanupRetainedShared(ctx context.Context, installationID, resourceID string) error {
 	paths, err := DerivePaths(resourceID, 1)
 	if err != nil {
@@ -824,6 +838,7 @@ func (host Host) cleanupRetainedShared(ctx context.Context, installationID, reso
 	candidate := Candidate{InstallationID: installationID, ResourceID: resourceID, Paths: paths, UID: authority.uid, GID: authority.gid, RelayUID: authority.relayUID, RelayGID: authority.relayGID, User: authority.user, Group: authority.group, RelayUser: authority.relayUser, RelayGroup: authority.relayGroup, Accounts: authority.accounts, Sysusers: authority.sysusers}
 	return host.cleanupAccounts(ctx, candidate)
 }
+
 func (host Host) cleanupAccounts(ctx context.Context, candidate Candidate) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -849,7 +864,7 @@ func (host Host) cleanupAccounts(ctx context.Context, candidate Candidate) error
 	if lockErr != nil {
 		return lockErr
 	}
-	defer unix.Close(lockFD)
+	defer func() { _ = unix.Close(lockFD) }()
 	var lockStat unix.Stat_t
 	if lockErr = unix.Fstat(lockFD, &lockStat); lockErr != nil || lockStat.Mode&unix.S_IFMT != unix.S_IFREG || lockStat.Nlink != 1 || lockStat.Uid != 0 || lockStat.Gid != 0 || lockStat.Mode&0o7777 != 0o600 {
 		return fmt.Errorf("GoAccess account lock unsafe")
@@ -857,7 +872,7 @@ func (host Host) cleanupAccounts(ctx context.Context, candidate Candidate) error
 	if lockErr = acquireBoundedFlock(ctx, lockFD, 5*time.Second); lockErr != nil {
 		return lockErr
 	}
-	defer unix.Flock(lockFD, unix.LOCK_UN)
+	defer func() { _ = unix.Flock(lockFD, unix.LOCK_UN) }()
 	observe := func() (identity.AccountDeletionState, error) {
 		state, err := identity.InspectResourceAccountDeletionFiles(candidate.Accounts, "/etc/passwd", "/etc/group", "/etc/shadow")
 		if err != nil {
@@ -877,7 +892,7 @@ func (host Host) cleanupAccounts(ctx context.Context, candidate Candidate) error
 		groups := []string{candidate.Group, candidate.RelayGroup}
 		for index, name := range groups {
 			fields, present := entries[name]
-			if present && (!(strings.HasPrefix(fields[1], "!") || strings.HasPrefix(fields[1], "*")) || fields[2] != "" || fields[3] != "") {
+			if present && ((!strings.HasPrefix(fields[1], "!") && !strings.HasPrefix(fields[1], "*")) || fields[2] != "" || fields[3] != "") {
 				return state, fmt.Errorf("GoAccess gshadow cleanup identity differs")
 			}
 			state.Groups[index] = state.Groups[index] || present
@@ -938,12 +953,13 @@ func (host Host) cleanupAccounts(ctx context.Context, candidate Candidate) error
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	if err = unix.Unlinkat(parent, filepath.Base(candidate.Paths.Sysusers), 0); err != nil {
 		return err
 	}
 	return unix.Fsync(parent)
 }
+
 func deleteAccountRecords(candidate Candidate, index int, user bool) error {
 	if index < 0 || index > 1 {
 		return fmt.Errorf("GoAccess account deletion index invalid")
@@ -965,6 +981,7 @@ func deleteAccountRecords(candidate Candidate, index int, user bool) error {
 	}
 	return nil
 }
+
 func acquireBoundedFlock(ctx context.Context, fd int, maximum time.Duration) error {
 	if maximum <= 0 {
 		return fmt.Errorf("account lock deadline invalid")
@@ -1037,7 +1054,7 @@ func removeAccountLine(path, name string) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	temp := "." + filepath.Base(path) + ".lanpanel-goaccess-account"
 	fd, openErr := unix.Openat(parent, temp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(info.Mode().Perm()))
 	staged := false
@@ -1100,7 +1117,7 @@ func removeOwnedTree(ctx context.Context, path string, uid, gid, mode uint32) er
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil {
 		return err
@@ -1271,7 +1288,7 @@ func rejectDescendantMounts(root string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	root = filepath.Clean(root)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -1303,7 +1320,7 @@ func removeDirectoryContents(ctx context.Context, fd int, device uint64, count *
 		return err
 	}
 	file := os.NewFile(uintptr(duplicate), "goaccess-cleanup")
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	for {
 		names, readErr := file.Readdirnames(128)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
@@ -1514,6 +1531,7 @@ func verifyRemovedUnitOutput(output []byte) error {
 	}
 	return nil
 }
+
 func (host Host) RetirementComplete(ctx context.Context, resourceID string, generation, stateGeneration uint64, removeState bool) (bool, error) {
 	if stateGeneration == 0 || stateGeneration > generation {
 		return false, fmt.Errorf("GoAccess retirement state generation invalid")
@@ -1558,6 +1576,7 @@ func (host Host) RetirementComplete(ctx context.Context, resourceID string, gene
 	}
 	return true, nil
 }
+
 func (host Host) waitEndpoint(ctx context.Context, path string, present bool) error {
 	deadline := time.NewTicker(50 * time.Millisecond)
 	defer deadline.Stop()
@@ -1575,6 +1594,7 @@ func (host Host) waitEndpoint(ctx context.Context, path string, present bool) er
 		}
 	}
 }
+
 func verifyRuntimePaths(ctx context.Context, candidate Candidate) error {
 	checks := []struct {
 		path           string
@@ -1605,6 +1625,7 @@ func verifyRuntimePaths(ctx context.Context, candidate Candidate) error {
 		}
 	}
 }
+
 func verifyManagedServiceFiles(paths Paths, expectedIdentity string) error {
 	contents := [][]byte{}
 	for _, path := range []string{paths.ServiceUnit, paths.RelayUnit, paths.SocketUnit, paths.Sysusers, paths.RetentionUnit, paths.RetentionTimer} {
@@ -1627,6 +1648,7 @@ func verifyManagedServiceFiles(paths Paths, expectedIdentity string) error {
 	}
 	return nil
 }
+
 func parseEffectiveUnits(value string) (map[string]map[string]string, error) {
 	result := map[string]map[string]string{}
 	for _, block := range strings.Split(strings.TrimSpace(value), "\n\n") {
@@ -1649,12 +1671,13 @@ func parseEffectiveUnits(value string) (map[string]map[string]string, error) {
 	}
 	return result, nil
 }
+
 func probeWebSocket(ctx context.Context, endpoint, path string) error {
 	connection, err := (&net.Dialer{}).DialContext(ctx, "unix", endpoint)
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = connection.SetDeadline(deadline)
 	}
@@ -1667,6 +1690,7 @@ func probeWebSocket(ctx context.Context, endpoint, path string) error {
 	}
 	return nil
 }
+
 func verifyParentChain(path string, finalUID, finalGID uint32, allowFinalOwner bool) error {
 	parent := filepath.Dir(filepath.Clean(path))
 	if !filepath.IsAbs(parent) || parent == "/" {
@@ -1694,6 +1718,7 @@ func verifyParentChain(path string, finalUID, finalGID uint32, allowFinalOwner b
 	}
 	return nil
 }
+
 func ensureDirectory(path string, uid, gid, mode uint32) error {
 	if err := verifyParentChain(path, 0, 0, false); err != nil {
 		return err
@@ -1708,7 +1733,7 @@ func ensureDirectory(path string, uid, gid, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil {
 		return err
@@ -1727,6 +1752,7 @@ func ensureDirectory(path string, uid, gid, mode uint32) error {
 	}
 	return unix.Fsync(fd)
 }
+
 func ensureFile(path string, uid, gid, mode uint32) error {
 	if err := verifyParentChain(path, uid, gid, true); err != nil {
 		return err
@@ -1746,7 +1772,7 @@ func ensureFile(path string, uid, gid, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil {
 		return err
@@ -1766,6 +1792,7 @@ func ensureFile(path string, uid, gid, mode uint32) error {
 	}
 	return unix.Fsync(fd)
 }
+
 func replaceFile(path string, data []byte, uid, gid, mode uint32) error {
 	if err := verifyParentChain(path, 0, 0, false); err != nil {
 		return err
@@ -1800,7 +1827,7 @@ func replaceFile(path string, data []byte, uid, gid, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	name := "." + filepath.Base(path) + ".lanpanel"
 	out, err := unix.Openat(fd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, mode)
 	if err != nil {
@@ -1810,7 +1837,7 @@ func replaceFile(path string, data []byte, uid, gid, mode uint32) error {
 		err = unix.Fchmod(out, mode)
 	}
 	if err != nil {
-		unix.Close(out)
+		_ = unix.Close(out)
 		_ = unix.Unlinkat(fd, name, 0)
 		return err
 	}

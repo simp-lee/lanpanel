@@ -28,7 +28,7 @@ func RunReloadGuard(args []string) error  { return runGuardRole(args, nginx.Guar
 func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	stop := len(args) == 1 && args[0] == "stop" && action == nginx.GuardReload
 	if len(args) != 0 && !stop || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
-		return fmt.Errorf("Nginx guard requires its fixed root unit invocation")
+		return fmt.Errorf("nginx guard requires its fixed root unit invocation")
 	}
 	defer func() {
 		if returnErr != nil && !stop {
@@ -54,12 +54,12 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	exposure, err := manager.Acquire(context.Background(), locks.Exposure)
 	if err != nil {
 		return err
 	}
-	defer exposure.Release()
+	defer func(ignore func() error) { _ = ignore() }(exposure.Release)
 	manifest, err := nginx.Audit(paths, owner)
 	if err != nil {
 		return err
@@ -68,20 +68,24 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	defer ownershipStore.Close()
+	defer func(ignore func() error) { _ = ignore() }(ownershipStore.Close)
 	emergency, err := safety.OpenEmergency("/var/lib/lanpanel/safety/emergency", owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
 	if err != nil {
 		return err
 	}
-	defer emergency.Close()
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
 	store, err := safety.OpenStore(safety.StoreConfig{RootPath: "/var/lib/lanpanel/safety", StagingPath: "/var/lib/lanpanel/safety/.filetxn", StatePath: "/var/lib/lanpanel/safety/state.json", Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: ownershipStore})
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	state, err := store.Read()
 	if err != nil {
 		return err
+	}
+	ownershipAuthority, complete, err := ownershipStore.InventoryAuthority()
+	if err != nil || !complete {
+		return fmt.Errorf("ownership authority inventory is incomplete: %w", err)
 	}
 	var installation *domain.Installation
 	normal, normalErr := persist.Open(persist.Config{RootPath: "/var/lib/lanpanel/state", StagingPath: "/var/lib/lanpanel/state/.filetxn", StatePath: "/var/lib/lanpanel/state/normal.json", Owner: owner, LockAuthority: manager.Authority()})
@@ -104,9 +108,9 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	if normalErr != nil || installation == nil {
 		return fmt.Errorf("normal operation authority is unavailable to Nginx guard: %w", normalErr)
 	}
-	decision := nginx.Guard(nginx.GuardInput{Action: action, Manifest: manifest, Safety: state, Installation: installation, Now: time.Now().UTC()})
+	decision := nginx.Guard(nginx.GuardInput{Action: action, Manifest: manifest, Safety: state, Installation: installation, Ownership: ownershipAuthority, Now: time.Now().UTC()})
 	if !decision.Allowed {
-		return fmt.Errorf("Nginx guard rejected: %s", decision.Reason)
+		return fmt.Errorf("nginx guard rejected: %s", decision.Reason)
 	}
 	if err := runProfile(context.Background(), launcher, child.ProfileNginxTest); err != nil {
 		return err
@@ -139,7 +143,7 @@ func fencedGuardFailure() error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	snapshot, err := service.Snapshot()
 	if err != nil {
 		return err

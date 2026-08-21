@@ -76,10 +76,10 @@ func LoadConfinementProfile() (confinement.Profile, error) {
 	}
 	file := os.NewFile(uintptr(fd), filepath.Base(path))
 	if file == nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return confinement.Profile{}, fmt.Errorf("confinement descriptor invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > 64<<10 {
 		return confinement.Profile{}, fmt.Errorf("confinement authority file is unsafe")
@@ -173,7 +173,7 @@ func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) 
 		if _, statErr := os.Lstat(item.path); statErr == nil {
 			disposition = filetxn.ReplaceOnly
 		} else if !errors.Is(statErr, os.ErrNotExist) {
-			store.Close()
+			_ = store.Close()
 			return modified, statErr
 		}
 		_, err = store.Put(ctx, filetxn.Request{Path: item.path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}, Existing: &metadata, New: metadata, MaxBytes: int64(len(item.data))}, item.data, disposition)
@@ -192,6 +192,7 @@ func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) 
 	}
 	return modified, nil
 }
+
 func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) error {
 	relay := units.Bundle.RelayRequired
 	if err := ensureListenGuard(resourceID, units.ApplicationUID, units.Confinement); err != nil {
@@ -216,6 +217,7 @@ func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) er
 	}
 	return nil
 }
+
 func (host Host) VerifyApplied(ctx context.Context, resourceID string, bundle domain.ProcessBundle, policy confinement.UnitPolicy) error {
 	if err := host.verifyEffectiveUnit(ctx, resourceID, false, policy); err != nil {
 		return err
@@ -229,6 +231,7 @@ func (host Host) VerifyApplied(ctx context.Context, resourceID string, bundle do
 	}
 	return nil
 }
+
 func (host Host) VerifyCommittedJournal(ctx context.Context, journal Journal, running bool) error {
 	if journal.Applied == nil {
 		if running {
@@ -347,6 +350,7 @@ func removeStoppedBackend(path string) error {
 	}
 	return unix.Unlink(path)
 }
+
 func (host Host) run(ctx context.Context, profile child.ProfileID, resourceID string, relay bool) error {
 	if host.Launcher == nil {
 		return fmt.Errorf("managed-process host launcher is missing")
@@ -405,6 +409,7 @@ func (host Host) waitApplicationIdentity(ctx context.Context, resourceID string,
 		}
 	}
 }
+
 func (host Host) showResource(ctx context.Context, resourceID string, relay bool) (map[string][]string, error) {
 	result, err := host.Launcher.RunInvocation(ctx, child.ProfileResourceShow, child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Relay: relay}}, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
@@ -414,6 +419,7 @@ func (host Host) showResource(ctx context.Context, resourceID string, relay bool
 	clear(result.Stdout)
 	return effective, parseErr
 }
+
 func verifyApplicationIdentity(effective map[string][]string, units UnitSet) error {
 	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") || !singleProperty(effective, "ControlGroup", units.Confinement.Cgroup) {
 		return fmt.Errorf("managed application unit is not active in exact cgroup")
@@ -438,12 +444,14 @@ func verifyApplicationIdentity(effective map[string][]string, units UnitSet) err
 	}
 	return nil
 }
+
 func singleValue(values map[string][]string, name string) string {
 	if len(values[name]) != 1 {
 		return ""
 	}
 	return values[name][0]
 }
+
 func processIdentity(pid int) (uint32, uint32, error) {
 	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
 	if err != nil {
@@ -484,12 +492,13 @@ func processIdentity(pid int) (uint32, uint32, error) {
 	}
 	return uint32(uid), uint32(gid), nil
 }
+
 func processExecutableDigest(pid int) (string, error) {
 	file, err := os.Open(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
@@ -513,6 +522,7 @@ func (host Host) verifyEffectiveRelay(ctx context.Context, resourceID string, un
 	}
 	return nil
 }
+
 func (host Host) verifyEffectiveRelayUnit(ctx context.Context, resourceID string, policy confinement.UnitPolicy) error {
 	result, err := host.Launcher.RunInvocation(ctx, child.ProfileResourceShow, child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Relay: true}}, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
@@ -536,6 +546,7 @@ func (host Host) verifyEffectiveRelayUnit(ctx context.Context, resourceID string
 func singleProperty(values map[string][]string, name, want string) bool {
 	return len(values[name]) == 1 && values[name][0] == want
 }
+
 func parseShowProperties(data []byte) (map[string][]string, error) {
 	result := map[string][]string{}
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
@@ -546,14 +557,6 @@ func parseShowProperties(data []byte) (map[string][]string, error) {
 		result[name] = append(result[name], value)
 	}
 	return result, nil
-}
-func parseUnitProperties(values []string) map[string][]string {
-	result := map[string][]string{}
-	for _, directive := range values {
-		name, value, _ := strings.Cut(directive, "=")
-		result[name] = append(result[name], value)
-	}
-	return result
 }
 
 func putManagedFile(ctx context.Context, path string, data []byte, mode os.FileMode) error {
@@ -569,7 +572,7 @@ func putManagedFile(ctx context.Context, path string, data []byte, mode os.FileM
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: mode}
 	disposition := filetxn.CreateOnly
 	if _, statErr := os.Lstat(path); statErr == nil {
@@ -631,6 +634,7 @@ func ensureDirectory(path string, mode uint32, owner, group int) error {
 	}
 	return validateOwnedDirectory(path, mode, owner, group)
 }
+
 func validateOwnedDirectory(path string, mode uint32, owner, group int) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -642,6 +646,7 @@ func validateOwnedDirectory(path string, mode uint32, owner, group int) error {
 	}
 	return nil
 }
+
 func ensureRootDirectory(path string, mode uint32) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
 		return fmt.Errorf("managed-process directory is invalid")
@@ -651,7 +656,7 @@ func ensureRootDirectory(path string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	for index, component := range components {
 		wanted := uint32(0o755)
 		if index == len(components)-1 {
@@ -669,22 +674,22 @@ func ensureRootDirectory(path string, mode uint32) error {
 		}
 		var stat unix.Stat_t
 		if unix.Fstat(next, &stat) != nil {
-			unix.Close(next)
+			_ = unix.Close(next)
 			return fmt.Errorf("inspect managed-process directory")
 		}
 		writableAllowed := index == len(components)-1 && mode == 0o777
 		trustedBootstrapGroup := stat.Uid == 0 && stat.Gid != 0 && (strings.HasPrefix(path, "/etc/lanpanel") || strings.HasPrefix(path, "/run/lanpanel"))
 		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Gid != 0 && !trustedBootstrapGroup || !writableAllowed && stat.Mode&0o022 != 0 || index == len(components)-1 && stat.Mode&0o777 != mode {
-			unix.Close(next)
+			_ = unix.Close(next)
 			return fmt.Errorf("managed-process directory identity is unsafe")
 		}
 		if created {
 			if unix.Fsync(fd) != nil {
-				unix.Close(next)
+				_ = unix.Close(next)
 				return fmt.Errorf("sync managed-process directory parent")
 			}
 		}
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		fd = next
 	}
 	return nil

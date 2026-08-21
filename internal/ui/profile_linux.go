@@ -26,6 +26,7 @@ func (FixedProfileProvider) Current(ctx context.Context) (Profile, error) {
 	}
 	return ProfileEmergency, fmt.Errorf("helper returned unknown Management profile")
 }
+
 func profileDigest(profile Profile) string {
 	digest := sha256.Sum256([]byte("lanpanel.management.profile/" + string(profile)))
 	return "sha256:" + hex.EncodeToString(digest[:])

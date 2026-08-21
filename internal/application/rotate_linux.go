@@ -33,7 +33,7 @@ func BeginAdminTokenRotation(ctx context.Context, actor Actor, payload Confirmat
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*Rotation, error) { service.Close(); return nil, err }
+	fail := func(err error) (*Rotation, error) { _ = service.Close(); return nil, err }
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -86,23 +86,25 @@ func BeginAdminTokenRotation(ctx context.Context, actor Actor, payload Confirmat
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "installation", service.Manager())
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return rejectReserved(err)
 	}
 	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: reservedRevision, IntentGeneration: reservedRevision + 1, ConfirmationProof: plan.NonceDigest})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	return &Rotation{Service: service, Admitter: admitter, MutationSet: mutationSet, Plan: plan, Job: job, Mutation: mutation, Exposure: exposure, Revision: intent.IntentGeneration}, nil
 }
+
 func (value *Rotation) PriorFingerprint() string {
 	if value == nil || !value.Plan.Applied.Applicable {
 		return ""
 	}
 	return value.Plan.Applied.Digest
 }
+
 func (value *Rotation) BindFingerprint(ctx context.Context, fingerprint string) error {
 	if value == nil || value.Mutation == nil {
 		return fmt.Errorf("rotation is not active")
@@ -113,6 +115,7 @@ func (value *Rotation) BindFingerprint(ctx context.Context, fingerprint string) 
 	value.Revision++
 	return nil
 }
+
 func (value *Rotation) MarkCommitted(ctx context.Context, fingerprint string) error {
 	if value == nil || value.Mutation == nil {
 		return fmt.Errorf("rotation is not active")
@@ -123,6 +126,7 @@ func (value *Rotation) MarkCommitted(ctx context.Context, fingerprint string) er
 	value.Revision++
 	return nil
 }
+
 func (value *Rotation) Fail(ctx context.Context, committed bool, fingerprint string) (jobs.Record, error) {
 	if value == nil || value.Mutation == nil {
 		return jobs.Record{}, fmt.Errorf("rotation is not active")
@@ -139,6 +143,7 @@ func (value *Rotation) Fail(ctx context.Context, committed bool, fingerprint str
 	}
 	return record, err
 }
+
 func (value *Rotation) Finish(ctx context.Context, fingerprint string) (jobs.Record, error) {
 	if value == nil || value.Mutation == nil {
 		return jobs.Record{}, fmt.Errorf("rotation is not active")
@@ -149,12 +154,13 @@ func (value *Rotation) Finish(ctx context.Context, fingerprint string) (jobs.Rec
 	}
 	return result, err
 }
+
 func ReconcileAdminTokenRotation(ctx context.Context, fingerprint string) error {
 	service, err := OpenFixed()
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.Normal().Read()
 	if err != nil {
 		return err
@@ -196,7 +202,7 @@ func ReconcileAdminTokenRotation(ctx context.Context, fingerprint string) error 
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "installation", service.Manager())
 	if err != nil {
 		return err

@@ -34,7 +34,7 @@ func NewSystemdRuntime() (*SystemdRuntime, error) {
 
 func (runtime *SystemdRuntime) RequireAbsent(ctx context.Context, candidate Candidate, _ identity.AccountIdentity) error {
 	if runtime == nil || runtime.launcher == nil || Validate(candidate) != nil {
-		return fmt.Errorf("Headscale absent-unit authority invalid")
+		return fmt.Errorf("headscale absent-unit authority invalid")
 	}
 	if err := runtime.run(ctx, child.ProfileSystemctl, child.Invocation{}); err != nil {
 		return err
@@ -56,7 +56,7 @@ func (runtime *SystemdRuntime) RequireAbsent(ctx context.Context, candidate Cand
 
 func (runtime *SystemdRuntime) InitializeDatabase(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (DatabaseEvidence, error) {
 	if runtime == nil || runtime.launcher == nil || VerifyRendered(rendered) != nil {
-		return DatabaseEvidence{}, fmt.Errorf("Headscale systemd database authority invalid")
+		return DatabaseEvidence{}, fmt.Errorf("headscale systemd database authority invalid")
 	}
 	if err := runtime.run(ctx, child.ProfileSystemctl, child.Invocation{}); err != nil {
 		return DatabaseEvidence{}, err
@@ -103,7 +103,7 @@ func (runtime *SystemdRuntime) StartAndProbe(ctx context.Context, rendered Rende
 
 func (runtime *SystemdRuntime) ObserveActive(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (ServiceEvidence, error) {
 	if runtime == nil || runtime.launcher == nil || VerifyRendered(rendered) != nil {
-		return ServiceEvidence{}, fmt.Errorf("Headscale active observation authority invalid")
+		return ServiceEvidence{}, fmt.Errorf("headscale active observation authority invalid")
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
 	show, err := runtime.show(ctx, invocation, rendered, account, true)
@@ -123,7 +123,7 @@ func (runtime *SystemdRuntime) StopAndVerify(ctx context.Context, candidate Cand
 	} else if err != nil {
 		return err
 	} else if unitStat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("Headscale unit path is not regular")
+		return fmt.Errorf("headscale unit path is not regular")
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: candidate.HeadscaleID}}
 	stopErr := runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
@@ -166,10 +166,10 @@ func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invoca
 	}
 	if active {
 		if properties["ActiveState"] != "active" || properties["SubState"] != "running" || properties["MainPID"] == "" || properties["MainPID"] == "0" {
-			return nil, fmt.Errorf("Headscale candidate service is not privately probed")
+			return nil, fmt.Errorf("headscale candidate service is not privately probed")
 		}
 	} else if properties["ActiveState"] != "inactive" || properties["SubState"] == "running" || properties["MainPID"] != "0" {
-		return nil, fmt.Errorf("Headscale candidate service remained active")
+		return nil, fmt.Errorf("headscale candidate service remained active")
 	}
 	return result.Stdout, nil
 }
@@ -214,7 +214,7 @@ func observeDatabase(candidate Candidate, account identity.AccountIdentity) (Dat
 	for _, item := range paths {
 		digest, present, err := protectedRuntimeFile(item.path, account, item.required)
 		if err != nil || item.required && !present {
-			return DatabaseEvidence{}, errors.Join(err, fmt.Errorf("Headscale SQLite evidence incomplete"))
+			return DatabaseEvidence{}, errors.Join(err, fmt.Errorf("headscale SQLite evidence incomplete"))
 		}
 		if present {
 			*item.target = digest
@@ -245,7 +245,7 @@ func protectedRuntimeFile(path string, account identity.AccountIdentity, sqliteM
 		_ = unix.Close(fd)
 		return "", false, fmt.Errorf("SQLite descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != account.UID || stat.Gid != account.GID || stat.Mode&0o7777 != 0o600 || stat.Size <= 0 || stat.Size > 4<<30 {
 		return "", false, fmt.Errorf("SQLite file metadata unsafe")
@@ -253,14 +253,14 @@ func protectedRuntimeFile(path string, account identity.AccountIdentity, sqliteM
 	if sqliteMain {
 		header := make([]byte, 100)
 		if _, err := file.ReadAt(header, 0); err != nil || string(header[:16]) != "SQLite format 3\x00" {
-			return "", false, fmt.Errorf("Headscale SQLite header is invalid")
+			return "", false, fmt.Errorf("headscale SQLite header is invalid")
 		}
 		pageSize := uint64(binary.BigEndian.Uint16(header[16:18]))
 		if pageSize == 1 {
 			pageSize = 65536
 		}
 		if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 || stat.Size%int64(pageSize) != 0 || (header[18] != 1 && header[18] != 2) || (header[19] != 1 && header[19] != 2) || header[20] > 32 || header[21] != 64 || header[22] != 32 || header[23] != 32 || binary.BigEndian.Uint32(header[44:48]) < 1 || binary.BigEndian.Uint32(header[44:48]) > 4 || binary.BigEndian.Uint32(header[56:60]) < 1 || binary.BigEndian.Uint32(header[56:60]) > 3 {
-			return "", false, fmt.Errorf("Headscale SQLite structural envelope is invalid")
+			return "", false, fmt.Errorf("headscale SQLite structural envelope is invalid")
 		}
 	}
 	hash := sha256.New()
@@ -299,7 +299,7 @@ func requireHostCandidateListenersAbsent() error {
 				continue
 			}
 			if port == "1F90" || port == "C50B" || port == "2382" || port == "0D96" {
-				return fmt.Errorf("Headscale candidate endpoint escaped private network namespace")
+				return fmt.Errorf("headscale candidate endpoint escaped private network namespace")
 			}
 		}
 	}

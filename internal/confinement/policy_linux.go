@@ -168,7 +168,7 @@ func ObserveCgroup(root, cgroup string) (CgroupObservation, error) {
 	if err != nil {
 		return CgroupObservation{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	read := func(name string, maximum int64) ([]byte, error) {
 		child, err := unix.Openat(fd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
@@ -176,10 +176,10 @@ func ObserveCgroup(root, cgroup string) (CgroupObservation, error) {
 		}
 		file := os.NewFile(uintptr(child), name)
 		if file == nil {
-			unix.Close(child)
+			_ = unix.Close(child)
 			return nil, fmt.Errorf("cgroup descriptor invalid")
 		}
-		defer file.Close()
+		defer func(ignore func() error) { _ = ignore() }(file.Close)
 		return io.ReadAll(io.LimitReader(file, maximum+1))
 	}
 	processes, err := read("cgroup.procs", 1<<20)
@@ -248,6 +248,7 @@ func listProperty(name string) bool {
 	}
 	return false
 }
+
 func splitPropertyValues(values []string) []string {
 	result := []string{}
 	for _, value := range values {
@@ -259,6 +260,7 @@ func splitPropertyValues(values []string) []string {
 	}
 	return result
 }
+
 func validManagedCgroup(value string) bool {
 	if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
 		return false
@@ -285,25 +287,30 @@ func validManagedCgroup(value string) bool {
 			return false
 		}
 		for _, character := range part {
-			if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || strings.ContainsRune("_.:@-", character)) {
+			allowed := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune("_.:@-", character)
+			if !allowed {
 				return false
 			}
 		}
 	}
 	return true
 }
+
 func lowerHex(value string) bool {
 	for _, character := range value {
-		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+		allowed := character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
+		if !allowed {
 			return false
 		}
 	}
 	return true
 }
+
 func validCIDR(value string) bool {
 	prefix, err := netip.ParsePrefix(value)
 	return err == nil && prefix.String() == value
 }
+
 func validDigest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
 		return false

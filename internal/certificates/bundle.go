@@ -13,19 +13,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/filetxn"
 	"math/big"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-const SchemaVersion = "lanpanel.certificate.bundle.v1"
-const minimumIssuedLifetime = time.Hour
+const (
+	SchemaVersion         = "lanpanel.certificate.bundle.v1"
+	minimumIssuedLifetime = time.Hour
+)
 
 type Identity struct {
 	SchemaVersion     string    `json:"schema_version"`
@@ -61,6 +67,7 @@ type IssuedMaterial struct {
 func (material BootstrapMaterial) CertificatePEM() []byte {
 	return append([]byte(nil), material.certificatePEM...)
 }
+
 func (material BootstrapMaterial) PrivateKeyPEM() []byte {
 	return append([]byte(nil), material.privateKeyPEM...)
 }
@@ -69,6 +76,7 @@ func (material BootstrapMaterial) NotAfter() time.Time { return material.notAfte
 func (material IssuedMaterial) CertificatePEM() []byte {
 	return append([]byte(nil), material.certificatePEM...)
 }
+
 func (material IssuedMaterial) PrivateKeyPEM() []byte {
 	return append([]byte(nil), material.privateKeyPEM...)
 }
@@ -131,6 +139,7 @@ func JoinLegoChain(leafPEM, issuerPEM []byte) ([]byte, error) {
 	result = append(result, issuerPEM...)
 	return result, nil
 }
+
 func ValidateIssued(certificateChainPEM, privateKeyPEM []byte, domains []string, now time.Time, directoryURL string) (IssuedMaterial, error) {
 	roots, err := x509.SystemCertPool()
 	if err != nil || roots == nil {
@@ -138,6 +147,7 @@ func ValidateIssued(certificateChainPEM, privateKeyPEM []byte, domains []string,
 	}
 	return ValidateIssuedWithRoots(certificateChainPEM, privateKeyPEM, domains, now, directoryURL, roots)
 }
+
 func ValidateIssuedWithRoots(certificateChainPEM, privateKeyPEM []byte, domains []string, now time.Time, directoryURL string, roots *x509.CertPool) (IssuedMaterial, error) {
 	domains, err := validateDomains(domains)
 	if err != nil || now.IsZero() {
@@ -203,18 +213,119 @@ func StageIssued(ctx context.Context, parent, id string, generation uint64, bind
 	}
 	return identity, nil
 }
+
+func ObserveIdentity(parent, id string, generation uint64, owner filetxn.Owner) (Identity, error) {
+	if !cleanAbsolute(parent) || id == "" || generation == 0 {
+		return Identity{}, fmt.Errorf("certificate bundle observation authority invalid")
+	}
+	name := fmt.Sprintf("%s-%020d", id, generation)
+	base := filepath.Join(parent, name)
+	members, err := readCertificateBundle(parent, name, owner)
+	if err != nil {
+		return Identity{}, err
+	}
+	identityRaw := members["identity.json"]
+	certificateRaw := members["certificate.pem"]
+	privateRaw := members["private-key.pem"]
+	var identity Identity
+	decoder := json.NewDecoder(bytes.NewReader(identityRaw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || ValidateIdentity(identity) != nil || identity.ID != id || identity.Generation != generation || identity.CertificatePath != filepath.Join(base, "certificate.pem") || identity.PrivateKeyPath != filepath.Join(base, "private-key.pem") {
+		return Identity{}, fmt.Errorf("certificate identity observation invalid")
+	}
+	request := filetxn.DirectoryRequest{ParentPath: parent, Parent: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o700}, TargetName: name, Directory: filetxn.Metadata{Owner: owner, Mode: 0o700}, Members: []filetxn.DirectoryMember{{Name: "certificate.pem", Data: certificateRaw, Owner: owner, Mode: 0o600, Maximum: 1 << 20}, {Name: "identity.json", Data: identityRaw, Owner: owner, Mode: 0o600, Maximum: 64 << 10}, {Name: "private-key.pem", Data: privateRaw, Owner: owner, Mode: 0o600, Maximum: 1 << 20}}}
+	if _, err := filetxn.VerifyDirectory(request); err != nil {
+		return Identity{}, err
+	}
+	return identity, nil
+}
+
+func readCertificateBundle(parent, name string, owner filetxn.Owner) (map[string][]byte, error) {
+	current, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unix.Close(current) }()
+	for _, component := range strings.Split(strings.TrimPrefix(parent, "/"), "/") {
+		next, openErr := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			return nil, openErr
+		}
+		_ = unix.Close(current)
+		current = next
+	}
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(current, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Mode&0o7777 != 0o700 || parentStat.Uid != 0 || parentStat.Gid != 0 {
+		return nil, fmt.Errorf("certificate bundle parent metadata is unsafe: %w", err)
+	}
+	directory, err := unix.Openat(current, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unix.Close(directory) }()
+	var beforeDirectory unix.Stat_t
+	if err := unix.Fstat(directory, &beforeDirectory); err != nil || beforeDirectory.Mode&unix.S_IFMT != unix.S_IFDIR || beforeDirectory.Mode&0o7777 != 0o700 || beforeDirectory.Uid != owner.UID || beforeDirectory.Gid != owner.GID {
+		return nil, fmt.Errorf("certificate bundle directory metadata is unsafe: %w", err)
+	}
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", directory))
+	if err != nil {
+		return nil, err
+	}
+	expected := map[string]int64{"certificate.pem": 1 << 20, "identity.json": 64 << 10, "private-key.pem": 1 << 20}
+	if len(entries) != len(expected) {
+		return nil, fmt.Errorf("certificate bundle inventory is incomplete or contains foreign members")
+	}
+	for _, entry := range entries {
+		if _, present := expected[entry.Name()]; !present {
+			return nil, fmt.Errorf("certificate bundle contains foreign member %q", entry.Name())
+		}
+	}
+	result := make(map[string][]byte, len(expected))
+	for _, name := range []string{"certificate.pem", "identity.json", "private-key.pem"} {
+		maximum := expected[name]
+		fd, openErr := unix.Openat(directory, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			return nil, openErr
+		}
+		var before, after unix.Stat_t
+		if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Mode&0o7777 != 0o600 || before.Uid != owner.UID || before.Gid != owner.GID || before.Nlink != 1 || before.Size <= 0 || before.Size > maximum {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("certificate bundle member %q metadata is unsafe", name)
+		}
+		file := os.NewFile(uintptr(fd), name)
+		if file == nil {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("wrap certificate bundle member %q", name)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(file, maximum+1))
+		statErr := unix.Fstat(fd, &after)
+		closeErr := file.Close()
+		if readErr != nil || statErr != nil || closeErr != nil || int64(len(data)) != before.Size || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim {
+			return nil, fmt.Errorf("certificate bundle member %q changed while reading: %w", name, errors.Join(readErr, statErr, closeErr))
+		}
+		result[name] = data
+	}
+	var afterDirectory unix.Stat_t
+	if err := unix.Fstat(directory, &afterDirectory); err != nil || beforeDirectory.Dev != afterDirectory.Dev || beforeDirectory.Ino != afterDirectory.Ino || beforeDirectory.Mtim != afterDirectory.Mtim || beforeDirectory.Ctim != afterDirectory.Ctim {
+		return nil, fmt.Errorf("certificate bundle directory changed while reading: %w", err)
+	}
+	return result, nil
+}
+
 func ValidateIdentity(identity Identity) error {
 	if identity.SchemaVersion != SchemaVersion || identity.ID == "" || identity.Generation == 0 || len(identity.Domains) == 0 || !digest(identity.SANIdentity) || !digest(identity.Fingerprint) || !digest(identity.ChainIdentity) || !digest(identity.IssuerIdentity) || !digest(identity.BindingIdentity) || !cleanAbsolute(identity.CertificatePath) || !cleanAbsolute(identity.PrivateKeyPath) || identity.LastTrustedWall.IsZero() || identity.NotBefore.IsZero() || !identity.NotAfter.After(identity.NotBefore) || !digest(identity.DirectoryIdentity) || identity.DirectoryIdentity != identityDigest(identity) {
 		return fmt.Errorf("certificate bundle identity incomplete")
 	}
 	return nil
 }
+
 func identityDigest(identity Identity) string {
 	copy := identity
 	copy.DirectoryIdentity = ""
 	raw, _ := json.Marshal(copy)
 	return sum(raw)
 }
+
 func parseCertificateChain(value []byte) ([]*x509.Certificate, error) {
 	remaining := value
 	result := []*x509.Certificate{}
@@ -232,6 +343,7 @@ func parseCertificateChain(value []byte) ([]*x509.Certificate, error) {
 	}
 	return result, nil
 }
+
 func parsePrivateKey(value []byte) (crypto.Signer, error) {
 	block, rest := pem.Decode(value)
 	if block == nil || len(bytes.TrimSpace(rest)) != 0 {
@@ -255,11 +367,13 @@ func parsePrivateKey(value []byte) (crypto.Signer, error) {
 	}
 	return signer, nil
 }
+
 func publicKeysEqual(left, right crypto.PublicKey) bool {
 	a, errA := x509.MarshalPKIXPublicKey(left)
 	b, errB := x509.MarshalPKIXPublicKey(right)
 	return errA == nil && errB == nil && bytes.Equal(a, b)
 }
+
 func validateDomains(values []string) ([]string, error) {
 	result := canonicalDomains(values)
 	if len(result) == 0 || len(result) != len(values) {
@@ -272,6 +386,7 @@ func validateDomains(values []string) ([]string, error) {
 	}
 	return result, nil
 }
+
 func canonicalDomains(values []string) []string {
 	result := append([]string(nil), values...)
 	for i := range result {
@@ -280,10 +395,12 @@ func canonicalDomains(values []string) []string {
 	slices.Sort(result)
 	return slices.Compact(result)
 }
+
 func sum(data []byte) string {
 	value := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(value[:])
 }
+
 func digest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
 		return false
@@ -291,6 +408,7 @@ func digest(value string) bool {
 	_, err := hex.DecodeString(value[7:])
 	return err == nil
 }
+
 func cleanAbsolute(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && value != "/"
 }

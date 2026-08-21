@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/release"
 	"path/filepath"
@@ -31,6 +32,11 @@ func readCommittedReleaseIdentity(paths Paths) (release.InstallIdentity, error) 
 	var bundle Bundle
 	if decodeCanonical(bundleBytes, &bundle) != nil || validateBundle(bundle) != nil || bundle.AttemptID != commit.AttemptID || bundle.InstallationID != commit.InstallationID || bundle.GenerationID != commit.GenerationID || commit.BundleDigest != release.DigestBytes(bundleBytes) || release.ValidateInstallIdentity(bundle.Release) != nil {
 		return release.InstallIdentity{}, fmt.Errorf("installation release authority does not match bootstrap commit")
+	}
+	accountKey, keyErr := readCommittedArtifact(paths.ACMEAccountKey, acmeaccount.MaximumKeyBytes, 0o600)
+	accountFingerprint, fingerprintErr := acmeaccount.Fingerprint(accountKey)
+	if keyErr != nil || fingerprintErr != nil || accountFingerprint != bundle.ACMEAccountKeyFingerprint {
+		return release.InstallIdentity{}, fmt.Errorf("managed ACME account key does not match release authority")
 	}
 	return bundle.Release, nil
 }

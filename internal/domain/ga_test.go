@@ -26,7 +26,6 @@ func TestInstallationSchema(t *testing.T) {
 	t.Run("optional_headscale_allows_local_app", func(t *testing.T) {
 		installation := validGAInstallation()
 		installation.Headscale = nil
-		installation.Connector = nil
 		data, err := json.Marshal(installation)
 		if err != nil {
 			t.Fatal(err)
@@ -35,7 +34,7 @@ func TestInstallationSchema(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DecodeInstallation() error = %v", err)
 		}
-		if decoded.Headscale != nil || decoded.Connector != nil || len(decoded.Resources) != 1 {
+		if decoded.Headscale != nil || len(decoded.Resources) != 1 {
 			t.Fatalf("decoded installation = %#v", decoded)
 		}
 		if err := PublicationPrerequisites(decoded, decoded.Resources[0].ID); err != nil {
@@ -46,14 +45,10 @@ func TestInstallationSchema(t *testing.T) {
 	t.Run("concrete_prerequisite_codes", func(t *testing.T) {
 		installation := validGAInstallation()
 		installation.Headscale = nil
-		installation.Connector = nil
 		if err := RequireHeadscale(installation); !errors.As(err, new(PrerequisiteError)) || err.Error() != "headscale_not_configured" {
 			t.Fatalf("RequireHeadscale() error = %v", err)
 		}
-		if err := RequireConnector(installation); !errors.As(err, new(PrerequisiteError)) || err.Error() != "connector_required" {
-			t.Fatalf("RequireConnector() error = %v", err)
-		}
-		for _, code := range []string{"headscale_not_configured", "connector_required", "os_profile_live_unqualified", "dependency_transition_required"} {
+		for _, code := range []string{"headscale_not_configured", "os_profile_live_unqualified", "package_identity_drift"} {
 			if _, err := ParsePrerequisiteCode(code); err != nil {
 				t.Fatalf("ParsePrerequisiteCode(%q) error = %v", code, err)
 			}
@@ -134,9 +129,9 @@ func TestInstallationSchema(t *testing.T) {
 	t.Run("target_union_is_closed", func(t *testing.T) {
 		installation := validGAInstallation()
 		resource := &installation.Resources[0]
-		resource.Target.TailnetHTTP = &TailnetHTTPTarget{IP: "100.64.0.2", Port: 8080}
-		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must contain only local_http") {
-			t.Fatalf("ValidateInstallation(mixed target) error = %v", err)
+		resource.Target.LocalHTTP = nil
+		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must contain local_http") {
+			t.Fatalf("ValidateInstallation(incomplete target) error = %v", err)
 		}
 		installation = validGAInstallation()
 		resource = &installation.Resources[0]
@@ -297,23 +292,6 @@ func TestInstallationSchema(t *testing.T) {
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "host_authority") {
 			t.Fatalf("ValidateInstallation(incomplete temporary bundle) error = %v", err)
 		}
-
-		installation = validGAInstallation()
-		resource = &installation.Resources[0]
-		edgeBundle := domainBundle("edge-bundle", testDigest)
-		edgeBundle.DomainHTTPS.EdgeOne = EdgeOneBundleIdentity{Enabled: true, PublishBinding: "edge-binding", InitialACLGeneration: 7}
-		resource.PublicationRecord.State = PublicationPublished
-		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
-		resource.PublicationRecord.LastAppliedBundle = pointerBundle(edgeBundle)
-		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "requires effective_security") {
-			t.Fatalf("ValidateInstallation(EdgeOne without effective security) error = %v", err)
-		}
-		resource.PublicationRecord.EffectiveSecurity = &EffectiveSecurityIdentity{
-			Generation: 7, ACLVersion: "acl-v7", CIDRs: []string{"1.1.1.0/24"}, EffectiveDeadline: "2026-08-17T00:00:00Z",
-		}
-		if err := ValidateInstallation(installation); err != nil {
-			t.Fatalf("ValidateInstallation(complete EdgeOne identity) error = %v", err)
-		}
 	})
 
 	t.Run("activation_prior_matches_applied_identity", func(t *testing.T) {
@@ -453,19 +431,15 @@ func TestInstallationSchema(t *testing.T) {
 
 	t.Run("action_vocabulary_is_closed", func(t *testing.T) {
 		for _, operation := range []string{
-			"instance_config_create", "instance_config_update", "validate", "plan", "deploy", "status", "diagnostics", "configuration_export",
-			"admin_token_rotate", "headscale_certificate_reissue", "dependency_upload", "dependency_import", "maintenance",
-			"backup_enter", "backup_preparing_abort", "backup_exit", "restore_evidence_import", "restore_cutover",
-			"connector_verify", "connector_auth_key_import", "connector_auth_key_adopt", "connector_auth_key_discard", "connector_login", "connector_disconnect", "connector_rebind",
-			"resource_create", "resource_update", "resource_delete", "publish", "unpublish", "close_all", "process_start", "process_stop", "unpublish_and_stop",
-			"headscale_user_create", "headscale_user_list", "preauth_key_create", "preauth_key_list", "preauth_key_revoke", "device_list", "device_expire",
-			"managed_basic_create", "managed_basic_rotate", "managed_basic_delete", "edgeone_diagnostics", "edgeone_refresh", "job_list", "job_detail", "session_logout",
+			"plan", "status", "admin_token_rotate", "headscale_initialize", "headscale_control_deploy", "headscale_certificate_reissue", "headscale_user_create", "headscale_user_list", "preauth_key_create", "preauth_key_list", "preauth_key_revoke", "device_list", "device_expire", "connector_binding_set", "connector_verify", "connector_login", "resource_delete", "diagnostics", "configuration_export", "job_list", "job_detail",
+			"resource_create", "resource_update", "publish", "unpublish", "close_all", "process_start", "process_stop",
+			"managed_basic_create", "managed_basic_rotate", "managed_basic_delete", "static_root_register", "external_htpasswd_register",
 		} {
 			if _, err := ParseOperationCode(operation); err != nil {
 				t.Fatalf("ParseOperationCode(%q) error = %v", operation, err)
 			}
 		}
-		for _, operation := range []string{"repair", "fix_host", "shell", "mode_incompatible", "license_check", "", " publish"} {
+		for _, operation := range []string{"deploy", "session_logout", "edgeone_refresh", "maintenance", "backup_enter", "repair", "fix_host", "shell", "mode_incompatible", "license_check", "", " publish"} {
 			if _, err := ParseOperationCode(operation); err == nil {
 				t.Fatalf("ParseOperationCode(%q) error = nil", operation)
 			}
@@ -477,14 +451,14 @@ func TestInstallationSchema(t *testing.T) {
 			operation OperationCode
 			target    OperationTarget
 		}{
-			{OperationDeploy, OperationTarget{Kind: OperationTargetInstallation}},
+			{OperationHeadscaleInitialize, OperationTarget{Kind: OperationTargetInstallation}},
 			{OperationPlan, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
 			{OperationPublish, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
 			{OperationManagedBasicRotate, OperationTarget{Kind: OperationTargetCredential, ID: "cred_00000000000000000000000000000001"}},
-			{OperationPreauthKeyCreate, OperationTarget{Kind: OperationTargetHeadscaleUser, ID: "user-17"}},
-			{OperationPreauthKeyRevoke, OperationTarget{Kind: OperationTargetPreauthKey, ID: "key-23"}},
-			{OperationDeviceExpire, OperationTarget{Kind: OperationTargetDevice, ID: "node-42"}},
-			{OperationJobDetail, OperationTarget{Kind: OperationTargetJob, ID: "job-99"}},
+			{OperationPreauthKeyCreate, OperationTarget{Kind: OperationTargetHeadscaleUser, ID: "17"}},
+			{OperationPreauthKeyRevoke, OperationTarget{Kind: OperationTargetPreauthKey, ID: "23"}},
+			{OperationDeviceExpire, OperationTarget{Kind: OperationTargetDevice, ID: "42"}},
+			{OperationConnectorVerify, OperationTarget{Kind: OperationTargetConnector}},
 		}
 		for _, item := range valid {
 			if err := ValidateOperationTarget(item.operation, item.target); err != nil {
@@ -497,8 +471,9 @@ func TestInstallationSchema(t *testing.T) {
 		}{
 			{OperationPublish, OperationTarget{Kind: OperationTargetInstallation}},
 			{OperationCloseAll, OperationTarget{Kind: OperationTargetResource, ID: "res_00000000000000000000000000000001"}},
-			{OperationResourceDelete, OperationTarget{Kind: OperationTargetResource, ID: "resource-by-filename"}},
-			{OperationJobDetail, OperationTarget{Kind: OperationTargetJob, ID: ""}},
+			{OperationResourceUpdate, OperationTarget{Kind: OperationTargetResource, ID: "resource-by-filename"}},
+			{OperationManagedBasicDelete, OperationTarget{Kind: OperationTargetCredential, ID: ""}},
+			{OperationPreauthKeyRevoke, OperationTarget{Kind: OperationTargetPreauthKey, ID: "key-secret"}},
 		} {
 			if err := ValidateOperationTarget(invalid.operation, invalid.target); err == nil {
 				t.Fatalf("ValidateOperationTarget(%s, %#v) error = nil", invalid.operation, invalid.target)
@@ -552,6 +527,7 @@ func TestGoAccessRequiresIndependentOwnedExternalCredential(t *testing.T) {
 		t.Fatal("GoAccess dashboard prefix shadowing target readiness accepted")
 	}
 }
+
 func TestInstallationRejectsResourcesBeyondRecoveryCapacity(t *testing.T) {
 	installation := validGAInstallation()
 	for len(installation.Resources) <= MaximumResources {
@@ -590,7 +566,7 @@ func TestHeadscaleIdentityCannotBeRenamedAdoptedOrDisabled(t *testing.T) {
 func TestHeadscaleDeployIntentIsExactAndNonApplied(t *testing.T) {
 	value := *testHeadscaleDomain()
 	value.DeployIntent = &HeadscaleDeployIntent{Generation: 1, PlanID: "plan_control", JobID: "job_control", Phase: HeadscaleDeployPrepared, PreflightDigest: testDigest, CertificateBinding: testDigest, Candidate: HeadscaleAppliedIdentity{Generation: 1, ConfigDigest: testDigest, ArtifactDigest: testDigest, ServiceIdentity: testDigest, ControlIdentity: testDigest, CertificateID: "cert_00000000000000000000000000000001"}}
-	value.LastOperation = OperationDeploy
+	value.LastOperation = OperationHeadscaleControlDeploy
 	value.LastJobID = "job_control"
 	if err := ValidateHeadscale(value); err != nil {
 		t.Fatal(err)
@@ -649,12 +625,7 @@ func validGAInstallation() Installation {
 			Port:         23456,
 			ManagedPaths: []string{"/var/lib/lanpanel/ui"},
 		},
-		Headscale: testHeadscaleDomain(),
-		Connector: &TailnetConnector{
-			ID:           "con_00000000000000000000000000000001",
-			LoginServer:  "https://control.example.com",
-			ManagedPaths: []string{"/var/lib/lanpanel/connector"},
-		},
+		Headscale:    testHeadscaleDomain(),
 		Credentials:  []Credential{{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: "res_00000000000000000000000000000001", Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: testDigest}},
 		ManagedPaths: []string{"/var/lib/lanpanel/state"},
 		Resources: []AppResource{{
@@ -736,7 +707,6 @@ func domainBundle(id, configDigest string) PublicationBundle {
 			Auth:         AuthBundleIdentity{Mode: AppAccessPublic},
 			Static:       StaticBundleIdentity{RouteIdentities: []string{}},
 			GoAccess:     GoAccessBundleIdentity{Enabled: false},
-			EdgeOne:      EdgeOneBundleIdentity{Enabled: false},
 		},
 	}
 }

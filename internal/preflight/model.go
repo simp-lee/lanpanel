@@ -5,18 +5,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"lanpanel/internal/plans"
 	"net/netip"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
-
-	"lanpanel/internal/plans"
 )
 
-const SchemaVersion = "lanpanel.preflight.v1"
-const MaximumAge = time.Minute
+const (
+	SchemaVersion = "lanpanel.preflight.v1"
+	MaximumAge    = time.Minute
+)
 
 const (
 	MaximumDomains           = 256
@@ -56,18 +57,19 @@ const (
 type ProfileAuthorityKind string
 
 const (
-	FinalSupportedProfile  ProfileAuthorityKind = "final_supported_profile"
-	QualificationCandidate ProfileAuthorityKind = "qualification_candidate"
+	FinalSupportedProfile ProfileAuthorityKind = "final_supported_profile"
+	QualificationTarget   ProfileAuthorityKind = "qualification_target_profile"
 )
 
 type ProfileAuthority struct {
-	Kind            ProfileAuthorityKind `json:"kind"`
-	Digest          string               `json:"digest"`
-	LiveQualified   bool                 `json:"live_qualified"`
-	CandidateDigest string               `json:"candidate_digest,omitempty"`
-	ManifestDigest  string               `json:"manifest_digest,omitempty"`
-	HostFingerprint string               `json:"host_fingerprint,omitempty"`
-	CaseID          string               `json:"case_id,omitempty"`
+	Kind                  ProfileAuthorityKind `json:"kind"`
+	Digest                string               `json:"digest"`
+	LiveQualified         bool                 `json:"live_qualified"`
+	CandidateDigest       string               `json:"candidate_digest,omitempty"`
+	InstallManifestDigest string               `json:"install_manifest_digest,omitempty"`
+	SideEffectPlanDigest  string               `json:"side_effect_plan_digest,omitempty"`
+	HostFingerprint       string               `json:"host_fingerprint,omitempty"`
+	RunID                 string               `json:"run_id,omitempty"`
 }
 
 type ExpectedProfile struct {
@@ -522,19 +524,24 @@ func validDigest(value string) bool { return digestPattern.MatchString(value) }
 func validSummary(value string) bool {
 	return value != "" && value == strings.TrimSpace(value) && len(value) <= 512 && !strings.ContainsAny(value, "\x00\r\n")
 }
+
 func validIdentity(value string) bool {
 	return value != "" && value == strings.TrimSpace(value) && len(value) <= 1024 && !strings.ContainsAny(value, "\x00\r\n")
 }
+
 func cleanAbsolute(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && value != "/" && !strings.ContainsAny(value, "\x00\r\n")
 }
+
 func canonicalDomain(value string) bool {
 	return domainPattern.MatchString(value) && len(value) <= 253 && !strings.Contains(value, "*")
 }
+
 func canonicalIP(value string) bool {
 	address, err := netip.ParseAddr(value)
 	return err == nil && address.String() == value
 }
+
 func canonicalStringSet(values []string, valid func(string) bool) bool {
 	for index, value := range values {
 		if !valid(value) || index > 0 && values[index-1] >= value {

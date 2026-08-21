@@ -20,19 +20,20 @@ const MaximumIdentities = 4096
 type IdentityKind string
 
 const (
-	IdentityResourceScope        IdentityKind = "resource_scope"
-	IdentityNormalPrior          IdentityKind = "normal_prior"
-	IdentityNormalCandidate      IdentityKind = "normal_candidate"
-	IdentityContractionPrior     IdentityKind = "contraction_prior"
-	IdentityContractionCandidate IdentityKind = "contraction_candidate"
-	IdentityPublicationKind      IdentityKind = "publication_kind"
-	IdentityDomain               IdentityKind = "domain"
-	IdentityListener             IdentityKind = "listener"
-	IdentityTemporaryListener    IdentityKind = "temporary_listener"
-	IdentityChallenge            IdentityKind = "challenge"
-	IdentityOwnershipPath        IdentityKind = "ownership_path"
-	IdentityOwnershipListener    IdentityKind = "ownership_listener"
-	IdentityDiskGraph            IdentityKind = "disk_graph"
+	IdentityResourceScope          IdentityKind = "resource_scope"
+	IdentityNormalPrior            IdentityKind = "normal_prior"
+	IdentityNormalCandidate        IdentityKind = "normal_candidate"
+	IdentityContractionPrior       IdentityKind = "contraction_prior"
+	IdentityContractionCandidate   IdentityKind = "contraction_candidate"
+	IdentityPublicationKind        IdentityKind = "publication_kind"
+	IdentityDomain                 IdentityKind = "domain"
+	IdentityPreservedControlDomain IdentityKind = "preserved_control_domain"
+	IdentityListener               IdentityKind = "listener"
+	IdentityTemporaryListener      IdentityKind = "temporary_listener"
+	IdentityChallenge              IdentityKind = "challenge"
+	IdentityOwnershipPath          IdentityKind = "ownership_path"
+	IdentityOwnershipListener      IdentityKind = "ownership_listener"
+	IdentityDiskGraph              IdentityKind = "disk_graph"
 )
 
 type Identity struct {
@@ -228,7 +229,26 @@ func BuildInventory(input Inputs) (Inventory, error) {
 			for _, listener := range entry.Listeners {
 				fallbackListeners[listener] = true
 			}
-			if entry.ResourceID == "" || entry.Kind == nginx.EntryControl || !all && !selected[entry.ResourceID] {
+			if entry.Kind == nginx.EntryControl {
+				if !all {
+					continue
+				}
+				if err := add("headscale", IdentityDiskGraph, entry.Relative, entry.Digest); err != nil {
+					return Inventory{}, err
+				}
+				for _, domainName := range entry.Domains {
+					if err := add("headscale", IdentityPreservedControlDomain, domainName, digest([]byte("domain\x00"+domainName))); err != nil {
+						return Inventory{}, err
+					}
+				}
+				for _, listener := range entry.Listeners {
+					if err := add("headscale", IdentityListener, listener, digest([]byte("listener\x00"+listener))); err != nil {
+						return Inventory{}, err
+					}
+				}
+				continue
+			}
+			if entry.ResourceID == "" || !all && !selected[entry.ResourceID] {
 				continue
 			}
 			requiresOwnership[entry.ResourceID] = true
@@ -304,6 +324,7 @@ func selectedResources(values []Identity) []string {
 	sort.Strings(result)
 	return result
 }
+
 func inventoryContradiction(resourceID string, values []Identity) *Uncertainty {
 	domains := map[string]bool{}
 	listeners, ownershipListeners := map[string]bool{}, map[string]bool{}
@@ -444,6 +465,7 @@ func canonicalIdentities(values []Identity) []Identity {
 	})
 	return slices.Compact(result)
 }
+
 func canonicalUncertainties(values []Uncertainty) []Uncertainty {
 	result := append([]Uncertainty(nil), values...)
 	sort.Slice(result, func(left, right int) bool {
@@ -454,10 +476,12 @@ func canonicalUncertainties(values []Uncertainty) []Uncertainty {
 	})
 	return slices.Compact(result)
 }
+
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func validDigest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
 		return false

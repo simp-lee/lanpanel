@@ -19,10 +19,12 @@ import (
 	"time"
 )
 
-const SchemaVersion = "lanpanel.plan.v1"
-const MaximumLifetime = 10 * time.Minute
-const MaximumEvidenceAge = 10 * time.Minute
-const MaximumRecords = 512
+const (
+	SchemaVersion      = "lanpanel.plan.v1"
+	MaximumLifetime    = 10 * time.Minute
+	MaximumEvidenceAge = 10 * time.Minute
+	MaximumRecords     = 512
+)
 
 var (
 	ErrMissing  = errors.New("Plan is missing")
@@ -35,10 +37,14 @@ var (
 type TargetKind string
 
 const (
-	TargetInstallation TargetKind = "installation"
-	TargetResource     TargetKind = "resource"
-	TargetHeadscale    TargetKind = "headscale"
-	TargetCredential   TargetKind = "credential"
+	TargetInstallation  TargetKind = "installation"
+	TargetResource      TargetKind = "resource"
+	TargetHeadscale     TargetKind = "headscale"
+	TargetCredential    TargetKind = "credential"
+	TargetHeadscaleUser TargetKind = "headscale_user"
+	TargetPreauthKey    TargetKind = "preauth_key"
+	TargetDevice        TargetKind = "device"
+	TargetConnector     TargetKind = "connector"
 )
 
 type Target struct {
@@ -169,6 +175,7 @@ func Register(normal *persist.Store) error {
 	}
 	return normal.RegisterCanonicalDocumentTransitionValidator("plans.retention.v1", validateRetentionTransition)
 }
+
 func validateEntry(key string, raw json.RawMessage) error {
 	plan, err := decode(raw)
 	if err != nil {
@@ -179,6 +186,7 @@ func validateEntry(key string, raw json.RawMessage) error {
 	}
 	return Validate(plan, plan.CreatedAt)
 }
+
 func validatePlanTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		plan, err := decode(after)
@@ -387,6 +395,7 @@ func Load(transaction *persist.Transaction, id string) (Plan, error) {
 	}
 	return decode(raw)
 }
+
 func Reserve(transaction *persist.Transaction, id, jobID, operation, target, actor string, now time.Time) (Plan, error) {
 	plan, err := Load(transaction, id)
 	if err != nil {
@@ -413,6 +422,7 @@ func Reserve(transaction *persist.Transaction, id, jobID, operation, target, act
 	}
 	return plan, nil
 }
+
 func Reject(transaction *persist.Transaction, id, jobID string, now time.Time) (Plan, error) {
 	plan, err := Load(transaction, id)
 	if err != nil {
@@ -433,6 +443,7 @@ func Reject(transaction *persist.Transaction, id, jobID string, now time.Time) (
 	}
 	return plan, nil
 }
+
 func Consume(transaction *persist.Transaction, id, jobID string, binding Binding, now time.Time) (Plan, error) {
 	plan, err := Load(transaction, id)
 	if err != nil {
@@ -526,6 +537,7 @@ func randomIdentities(reader io.Reader) (string, string, error) {
 	}
 	return "plan_" + hex.EncodeToString(bytes[:32]), digestBytes(bytes[32:]), nil
 }
+
 func digestBytes(value []byte) string {
 	sum := sha256Sum(value)
 	return "sha256:" + hex.EncodeToString(sum[:])
@@ -540,14 +552,17 @@ func planTarget(target Target) string {
 }
 func key(id string) string { return "plans/" + id }
 func validTarget(target Target) bool {
-	return target.Kind == TargetInstallation && target.ID == "" || (target.Kind == TargetResource || target.Kind == TargetHeadscale || target.Kind == TargetCredential) && validRef(target.ID)
+	return (target.Kind == TargetInstallation || target.Kind == TargetConnector) && target.ID == "" || (target.Kind == TargetResource || target.Kind == TargetHeadscale || target.Kind == TargetCredential || target.Kind == TargetHeadscaleUser || target.Kind == TargetPreauthKey || target.Kind == TargetDevice) && validRef(target.ID)
 }
+
 func digestBindingValid(value DigestBinding) bool {
 	return value.Applicable && digest(value.Digest) || !value.Applicable && value.Digest == ""
 }
+
 func validEvidence(value Evidence) bool {
 	return validRef(value.Kind) && validRef(value.Identity) && value.Generation != 0 && digest(value.Digest) && !value.ObservedAt.IsZero()
 }
+
 func canonicalEvidence(values []Evidence) []Evidence {
 	result := append([]Evidence(nil), values...)
 	sort.Slice(result, func(i, j int) bool {
@@ -558,6 +573,7 @@ func canonicalEvidence(values []Evidence) []Evidence {
 	})
 	return result
 }
+
 func ValidateBindingFreshness(binding Binding, now time.Time) error {
 	for _, evidence := range binding.Evidence {
 		if !validEvidence(evidence) || evidence.ObservedAt.After(now) || now.Sub(evidence.ObservedAt) > MaximumEvidenceAge {
@@ -572,6 +588,7 @@ func SameBindingIdentity(left, right Binding) bool {
 	right.Evidence = canonicalEvidence(right.Evidence)
 	return left.Operation == right.Operation && left.Target == right.Target && left.ActorIdentity == right.ActorIdentity && left.Config == right.Config && left.Applied == right.Applied && evidenceIdentityEqual(left.Evidence, right.Evidence)
 }
+
 func evidenceIdentityEqual(left, right []Evidence) bool {
 	if len(left) != len(right) {
 		return false
@@ -584,6 +601,7 @@ func evidenceIdentityEqual(left, right []Evidence) bool {
 	}
 	return true
 }
+
 func evidenceEqual(left, right []Evidence) bool {
 	if len(left) != len(right) {
 		return false
@@ -595,6 +613,7 @@ func evidenceEqual(left, right []Evidence) bool {
 	}
 	return true
 }
+
 func digest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
 		return false

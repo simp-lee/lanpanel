@@ -95,7 +95,7 @@ func (observer ProcObserver) Observe(ctx context.Context) (RuntimeSnapshot, erro
 			return RuntimeSnapshot{}, err
 		}
 		if identity.Executable == observer.Executable && identity.Cgroup != observer.UnitCgroup {
-			return RuntimeSnapshot{}, fmt.Errorf("Nginx executable exists outside its fixed unit cgroup")
+			return RuntimeSnapshot{}, fmt.Errorf("nginx executable exists outside its fixed unit cgroup")
 		}
 		if identity.Cgroup == observer.UnitCgroup {
 			processes = append(processes, identity)
@@ -188,7 +188,7 @@ func WaitPriorWorkers(ctx context.Context, observer RuntimeObserver, prior []Pro
 
 func VerifyStopped(snapshot RuntimeSnapshot) error {
 	if !snapshot.Complete || snapshot.Master != nil || len(snapshot.Workers) != 0 || len(snapshot.Listeners) != 0 || snapshot.ObservedAt.IsZero() || snapshot.Generation == "" {
-		return fmt.Errorf("Nginx master, workers, or owned listeners may remain")
+		return fmt.Errorf("nginx master, workers, or owned listeners may remain")
 	}
 	return nil
 }
@@ -287,10 +287,10 @@ func readMasterPID(path string) (int, error) {
 		_ = unix.Close(fd)
 		return 0, fmt.Errorf("wrap Nginx PID descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > 32 {
-		return 0, fmt.Errorf("Nginx PID file identity is unsafe")
+		return 0, fmt.Errorf("nginx PID file identity is unsafe")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, 33))
 	if err != nil {
@@ -298,7 +298,7 @@ func readMasterPID(path string) (int, error) {
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil || pid <= 1 {
-		return 0, fmt.Errorf("Nginx PID file is malformed")
+		return 0, fmt.Errorf("nginx PID file is malformed")
 	}
 	return pid, nil
 }

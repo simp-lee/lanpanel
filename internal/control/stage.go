@@ -43,7 +43,7 @@ type Execution struct {
 // separately and supplies its verified terminal identity to StageCertificate.
 func Prepare(ctx context.Context, store *Store, host CandidateHost, request StageRequest) (*Execution, error) {
 	if store == nil || host == nil || VerifyRendered(request.Rendered) != nil {
-		return nil, fmt.Errorf("Headscale candidate staging authority is incomplete")
+		return nil, fmt.Errorf("headscale candidate staging authority is incomplete")
 	}
 	if err := preflight.RequireExpansionResultForRequest(request.PreflightResult, request.Preflight, request.PreflightResult.ObservedAt); err != nil {
 		return nil, err
@@ -73,11 +73,11 @@ func Prepare(ctx context.Context, store *Store, host CandidateHost, request Stag
 // acquisition. It is used by explicit same-job re-entry or startup contraction.
 func ResumeLocal(ctx context.Context, store *Store, host CandidateHost, rendered Rendered) (*Execution, error) {
 	if store == nil || host == nil || VerifyRendered(rendered) != nil {
-		return nil, fmt.Errorf("Headscale local resume authority incomplete")
+		return nil, fmt.Errorf("headscale local resume authority incomplete")
 	}
 	journal, err := store.Read()
 	if err != nil || journal.CandidateDigest == "" || journal.Candidate != rendered.Candidate {
-		return nil, fmt.Errorf("Headscale local resume authority changed")
+		return nil, fmt.Errorf("headscale local resume authority changed")
 	}
 	execution := &Execution{store: store, host: host, journal: journal, rendered: rendered}
 	if journal.Phase == PhaseCertificatePending || journal.Phase == PhaseCertificateStaged {
@@ -111,7 +111,7 @@ func (execution *Execution) advanceLocal(ctx context.Context) error {
 				return err
 			}
 			if evidence.PublicSTUNOpen {
-				return fmt.Errorf("Headscale candidate exposed public STUN before activation")
+				return fmt.Errorf("headscale candidate exposed public STUN before activation")
 			}
 			next := execution.journal
 			next.Phase = PhaseServiceStaged
@@ -130,7 +130,7 @@ func (execution *Execution) advanceLocal(ctx context.Context) error {
 		case PhaseCertificatePending, PhaseCertificateStaged:
 			return nil
 		default:
-			return fmt.Errorf("Headscale local candidate phase is not resumable")
+			return fmt.Errorf("headscale local candidate phase is not resumable")
 		}
 	}
 }
@@ -144,25 +144,25 @@ func ResumeStoppedLocal(ctx context.Context, store *Store, host CandidateHost, r
 		return nil, err
 	}
 	if execution.journal.Phase != PhaseCertificatePending || execution.journal.Database == nil {
-		return nil, fmt.Errorf("Headscale stopped local recovery is not certificate-pending")
+		return nil, fmt.Errorf("headscale stopped local recovery is not certificate-pending")
 	}
 	evidence, err := host.StagePrivateService(ctx, rendered, *execution.journal.Database)
 	if err != nil || evidence.Identity != execution.journal.Candidate.ServiceIdentity || evidence.PublicSTUNOpen {
-		return nil, errors.Join(err, fmt.Errorf("Headscale stopped local recovery probe mismatched"))
+		return nil, errors.Join(err, fmt.Errorf("headscale stopped local recovery probe mismatched"))
 	}
 	return execution, nil
 }
 
 func (execution *Execution) VerifyPrivateCandidate(ctx context.Context) error {
 	if execution == nil || execution.host == nil || execution.journal.Phase != PhaseCertificateStaged || execution.journal.Database == nil || execution.journal.Service == nil {
-		return fmt.Errorf("Headscale activation candidate authority incomplete")
+		return fmt.Errorf("headscale activation candidate authority incomplete")
 	}
 	return execution.host.VerifyActiveCandidate(ctx, execution.rendered, *execution.journal.Database, *execution.journal.Service)
 }
 
 func (execution *Execution) IssueRequest() (IssueRequest, error) {
 	if execution == nil || execution.journal.Phase != PhaseCertificatePending {
-		return IssueRequest{}, fmt.Errorf("Headscale certificate issuance is not pending")
+		return IssueRequest{}, fmt.Errorf("headscale certificate issuance is not pending")
 	}
 	return IssueRequest{JobID: execution.journal.JobID, PlanID: execution.journal.PlanID, IntentGeneration: execution.journal.IntentGeneration, CertificateID: execution.journal.Candidate.CertificateID, BindingDigest: execution.journal.Candidate.CertificateBinding, Domain: execution.journal.Candidate.ControlDomain}, nil
 }
@@ -180,11 +180,11 @@ type IssueRequest struct {
 // same job/generation/binding and never activates the certificate pointer.
 func (execution *Execution) StageCertificate(ctx context.Context, request IssueRequest, identity certificates.Identity) error {
 	if execution == nil || execution.journal.Phase != PhaseCertificatePending {
-		return fmt.Errorf("Headscale certificate result has no pending authority")
+		return fmt.Errorf("headscale certificate result has no pending authority")
 	}
 	expected, err := execution.IssueRequest()
 	if err != nil || request != expected || certificates.ValidateIdentity(identity) != nil || identity.ID != request.CertificateID || identity.BindingIdentity != request.BindingDigest || !equalDomains(identity.Domains, []string{request.Domain}) {
-		return fmt.Errorf("Headscale certificate result differs from deploy authority")
+		return fmt.Errorf("headscale certificate result differs from deploy authority")
 	}
 	next := execution.journal
 	next.Phase = PhaseCertificateStaged
@@ -202,6 +202,7 @@ func (execution *Execution) Journal() Journal {
 	}
 	return execution.journal
 }
+
 func equalDomains(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

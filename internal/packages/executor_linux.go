@@ -5,7 +5,6 @@ package packages
 import (
 	"context"
 	"fmt"
-
 	"lanpanel/internal/child"
 )
 
@@ -82,6 +81,16 @@ func (executor *HostExecutor) Mask(ctx context.Context, units []string, persist 
 		return result, fmt.Errorf("PID 1 did not observe exact package masks: %w", err)
 	}
 	return result, nil
+}
+
+func (executor *HostExecutor) VerifyMasks(ctx context.Context, masks []MaskIdentity) error {
+	if executor == nil || executor.Masks == nil || executor.Auditor == nil {
+		return fmt.Errorf("package mask controller or PID 1 verifier is unavailable")
+	}
+	if err := executor.Masks.Verify(ctx, masks); err != nil {
+		return err
+	}
+	return executor.Auditor.VerifyPackageMasks(ctx, masks, true)
 }
 
 func (executor *HostExecutor) Run(ctx context.Context, profile child.ProfileID, invocation child.Invocation) (child.Result, error) {

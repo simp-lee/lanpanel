@@ -39,7 +39,7 @@ func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(M
 	if err != nil {
 		return MaskResult{}, err
 	}
-	defer unix.Close(directory)
+	defer func() { _ = unix.Close(directory) }()
 	result := MaskResult{Masks: []MaskIdentity{}}
 	for _, unit := range units {
 		if err := ctx.Err(); err != nil {
@@ -53,7 +53,7 @@ func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(M
 			if stat.Mode&unix.S_IFMT != unix.S_IFLNK || readErr != nil || target != "/dev/null" {
 				return result, fmt.Errorf("package unit mask collides with a non-mask systemd override")
 			}
-			identity := MaskIdentity{Unit: unit, Preexisting: true, Device: uint64(stat.Dev), Inode: stat.Ino}
+			identity := MaskIdentity{Unit: unit, Preexisting: true, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
 			if err := persist(identity); err != nil {
 				return result, fmt.Errorf("persist preexisting package mask identity: %w", err)
 			}
@@ -65,7 +65,7 @@ func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(M
 			if err := unix.Fstatat(directory, unit, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK {
 				return result, fmt.Errorf("observe created package no-autostart mask")
 			}
-			identity := MaskIdentity{Unit: unit, Device: uint64(stat.Dev), Inode: stat.Ino}
+			identity := MaskIdentity{Unit: unit, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
 			if err := persist(identity); err != nil {
 				return result, fmt.Errorf("persist created package mask identity: %w", err)
 			}
@@ -80,6 +80,31 @@ func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(M
 	return result, nil
 }
 
+func (masks *UnitMasks) Verify(ctx context.Context, identities []MaskIdentity) error {
+	if masks == nil || !validMaskIdentities(identities) {
+		return fmt.Errorf("package unit mask verification request is invalid")
+	}
+	directory, err := openMaskDirectory(masks.directory, masks.strict)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(directory) }()
+	for _, identity := range identities {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstatat(directory, identity.Unit, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK || uint64(stat.Dev) != identity.Device || stat.Ino != identity.Inode || stat.Ctim.Sec != identity.CTimeSec || stat.Ctim.Nsec != identity.CTimeNsec {
+			return fmt.Errorf("package unit mask %q is missing, replaced, or changed", identity.Unit)
+		}
+		target, err := readlinkAt(directory, identity.Unit)
+		if err != nil || target != "/dev/null" {
+			return fmt.Errorf("package unit mask %q target changed", identity.Unit)
+		}
+	}
+	return nil
+}
+
 func (masks *UnitMasks) Unmask(ctx context.Context, identities []MaskIdentity) error {
 	if masks == nil || !validMaskIdentities(identities) {
 		return fmt.Errorf("package unit unmask request is invalid")
@@ -88,7 +113,7 @@ func (masks *UnitMasks) Unmask(ctx context.Context, identities []MaskIdentity) e
 	if err != nil {
 		return err
 	}
-	defer unix.Close(directory)
+	defer func() { _ = unix.Close(directory) }()
 	for _, identity := range identities {
 		if identity.Preexisting {
 			return fmt.Errorf("package transaction cannot remove a preexisting mask")
@@ -97,8 +122,12 @@ func (masks *UnitMasks) Unmask(ctx context.Context, identities []MaskIdentity) e
 			return err
 		}
 		var stat unix.Stat_t
-		if err := unix.Fstatat(directory, identity.Unit, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK || uint64(stat.Dev) != identity.Device || stat.Ino != identity.Inode {
-			return fmt.Errorf("transaction-created package mask is missing, replaced, or changed")
+		statErr := unix.Fstatat(directory, identity.Unit, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(statErr, unix.ENOENT) {
+			continue
+		}
+		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK || uint64(stat.Dev) != identity.Device || stat.Ino != identity.Inode || stat.Ctim.Sec != identity.CTimeSec || stat.Ctim.Nsec != identity.CTimeNsec {
+			return fmt.Errorf("transaction-created package mask is replaced or changed")
 		}
 		target, err := readlinkAt(directory, identity.Unit)
 		if err != nil || target != "/dev/null" {

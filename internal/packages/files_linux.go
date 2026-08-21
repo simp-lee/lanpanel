@@ -50,12 +50,12 @@ func (files *TransactionFiles) EnsureStaging(ctx context.Context, plan Plan) (st
 	if err != nil {
 		return "", err
 	}
-	defer unix.Close(rootFD)
+	defer func() { _ = unix.Close(rootFD) }()
 	directoryFD, created, err := openOrCreateTransactionDirectory(rootFD, plan.TransactionID, files.strict)
 	if err != nil {
 		return "", err
 	}
-	defer unix.Close(directoryFD)
+	defer func() { _ = unix.Close(directoryFD) }()
 	if created {
 		if err := unix.Fsync(rootFD); err != nil {
 			return "", fmt.Errorf("sync package staging directory creation: %w", err)
@@ -86,12 +86,12 @@ func (files *TransactionFiles) Prepare(ctx context.Context, plan Plan, config, s
 	if err != nil {
 		return err
 	}
-	defer unix.Close(rootFD)
+	defer func() { _ = unix.Close(rootFD) }()
 	transactionFD, created, err := openOrCreateTransactionDirectory(rootFD, plan.TransactionID, files.strict)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(transactionFD)
+	defer func() { _ = unix.Close(transactionFD) }()
 	if created {
 		if err := unix.Fsync(rootFD); err != nil {
 			return fmt.Errorf("sync package transaction directory creation: %w", err)
@@ -130,12 +130,12 @@ func (files *TransactionFiles) validateStagedClosure(ctx context.Context, plan P
 	if err != nil {
 		return err
 	}
-	defer unix.Close(rootFD)
+	defer func() { _ = unix.Close(rootFD) }()
 	directoryFD, err := unix.Openat(rootFD, plan.TransactionID, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open exact staged package closure: %w", err)
 	}
-	defer unix.Close(directoryFD)
+	defer func() { _ = unix.Close(directoryFD) }()
 	if err := validateOwnedDirectory(directoryFD, files.strict); err != nil {
 		return err
 	}
@@ -225,7 +225,7 @@ func putExactFile(ctx context.Context, directoryFD int, name string, data []byte
 		_ = unix.Close(fd)
 		return fmt.Errorf("package transaction file descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	owner := 0
 	if !strict {
 		owner = os.Geteuid()
@@ -261,7 +261,7 @@ func verifyExactFile(ctx context.Context, directoryFD int, name string, expected
 	if err != nil {
 		return fmt.Errorf("open existing package transaction file: %w", err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	return verifyExactFD(fd, expected, strict)
 }
 
@@ -287,7 +287,7 @@ func validateStagedPackage(directoryFD int, name string, pkg Package, strict boo
 	if err != nil {
 		return fmt.Errorf("open staged package no-follow: %w", err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	owner, group := uint32(0), uint32(0)
 	if !strict {

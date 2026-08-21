@@ -7,14 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"lanpanel/internal/child"
+	"lanpanel/internal/preflight"
 	"reflect"
 	"slices"
 	"strings"
 	"time"
-
-	"lanpanel/internal/child"
-	"lanpanel/internal/preflight"
 )
+
+const PackageJournalSchemaVersion = "lanpanel.package.journal.v2"
 
 type JournalPhase string
 
@@ -91,6 +92,8 @@ type MaskIdentity struct {
 	Preexisting bool   `json:"preexisting"`
 	Device      uint64 `json:"device"`
 	Inode       uint64 `json:"inode"`
+	CTimeSec    int64  `json:"ctime_sec"`
+	CTimeNsec   int64  `json:"ctime_nsec"`
 }
 
 type MaskResult struct {
@@ -103,6 +106,7 @@ type Executor interface {
 	Prepare(context.Context, Plan, []byte, []byte) error
 	Resolve(context.Context, Plan) ([]Package, error)
 	Mask(context.Context, []string, func(MaskIdentity) error) (MaskResult, error)
+	VerifyMasks(context.Context, []MaskIdentity) error
 	Run(context.Context, child.ProfileID, child.Invocation) (child.Result, error)
 	Observe(context.Context, Plan) (Postcondition, error)
 	Unmask(context.Context, []MaskIdentity) error
@@ -136,6 +140,12 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return Journal{}, fmt.Errorf("package transaction expansion preflight: %w", err)
 	}
 	deadline := observedNow.Add(plan.TotalTimeout)
+	if plan.Deadline.Before(deadline) {
+		deadline = plan.Deadline
+	}
+	if !deadline.After(observedNow) {
+		return Journal{}, fmt.Errorf("package transaction deadline elapsed")
+	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
@@ -162,7 +172,7 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	profile := child.ProfileAPTOfflineTransaction
 	normalJournalID := "package-" + plan.TransactionID
 	childID := "package-child-" + plan.TransactionID
-	journal := Journal{SchemaVersion: "lanpanel.package.journal.v1", TransactionID: plan.TransactionID, NormalJournalID: normalJournalID, ChildID: childID, JobID: plan.JobID, PlanDigest: planDigest, AuthorityDigest: authorityDigest, PackageProfile: profile, Prior: cloneRuntimeSnapshot(audit.Before), Phase: JournalPrepared, Masks: []MaskIdentity{}}
+	journal := Journal{SchemaVersion: PackageJournalSchemaVersion, TransactionID: plan.TransactionID, NormalJournalID: normalJournalID, ChildID: childID, JobID: plan.JobID, PlanDigest: planDigest, AuthorityDigest: authorityDigest, PackageProfile: profile, Prior: cloneRuntimeSnapshot(audit.Before), Phase: JournalPrepared, Masks: []MaskIdentity{}}
 	if err := ValidateJournal(journal); err != nil {
 		return Journal{}, err
 	}
@@ -301,6 +311,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist committed package transaction before mask cleanup: %w", err)
 	}
 	journal = next
+	if err := engine.Executor.VerifyMasks(ctx, preexistingMasks(masks.Masks)); err != nil {
+		return journal, fmt.Errorf("verify preexisting package masks before cleanup: %w", err)
+	}
 	if err := engine.Executor.Unmask(ctx, createdMasks(masks.Masks)); err != nil {
 		return journal, fmt.Errorf("remove only exact transaction-created package masks: %w", err)
 	}
@@ -312,8 +325,237 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	return next, nil
 }
 
+// Resume continues only the exact persisted package transaction. It performs
+// no rollback, plan substitution, package re-resolution outside the frozen
+// closure, or unit-mask adoption.
+func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult preflight.Result, journal Journal) (Journal, error) {
+	if engine.Journals == nil || engine.Executor == nil || engine.MonitorRequired && engine.Monitor == nil {
+		return Journal{}, fmt.Errorf("package transaction dependencies are incomplete")
+	}
+	if err := ValidatePlan(plan); err != nil {
+		return Journal{}, err
+	}
+	if err := ValidateJournal(journal); err != nil {
+		return Journal{}, err
+	}
+	planDigest, authorityDigest, err := transactionDigests(plan)
+	if err != nil || journal.TransactionID != plan.TransactionID || journal.JobID != plan.JobID || journal.PlanDigest != planDigest || journal.AuthorityDigest != authorityDigest {
+		return Journal{}, fmt.Errorf("package resume authority differs from the exact journal")
+	}
+	if journal.Phase == JournalCleaned {
+		return journal, nil
+	}
+	if journal.Phase == JournalCommitted {
+		if err := engine.Executor.VerifyMasks(ctx, preexistingMasks(journal.Masks)); err != nil {
+			return journal, err
+		}
+		if err := engine.Executor.Unmask(ctx, createdMasks(journal.Masks)); err != nil {
+			return journal, err
+		}
+		next := journal
+		next.Phase = JournalCleaned
+		if err := engine.Journals.Advance(context.WithoutCancel(ctx), journal, next); err != nil {
+			return journal, err
+		}
+		return next, nil
+	}
+	now := time.Now().UTC
+	if engine.Now != nil {
+		now = engine.Now
+	}
+	observedNow := now().UTC()
+	terminalRecovery := journal.Phase == JournalChildSubmitted || journal.Phase == JournalChildTerminal && journal.ChildSucceeded || journal.Phase == JournalVerified
+	cancel := func() {}
+	if !terminalRecovery {
+		if err := preflight.RequireExpansionResult(preflightResult, []preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, "installation", plan.IntentGeneration, observedNow); err != nil {
+			return Journal{}, fmt.Errorf("package resume expansion preflight: %w", err)
+		}
+		deadline := observedNow.Add(plan.TotalTimeout)
+		if plan.Deadline.Before(deadline) {
+			deadline = plan.Deadline
+		}
+		if !deadline.After(observedNow) {
+			return Journal{}, fmt.Errorf("package resume deadline elapsed")
+		}
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	}
+	defer cancel()
+	advance := func(next Journal) error {
+		if err := engine.Journals.Advance(context.WithoutCancel(ctx), journal, next); err != nil {
+			return err
+		}
+		journal = next
+		return nil
+	}
+	units := affectedUnits(plan.Packages)
+	for {
+		switch journal.Phase {
+		case JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking:
+			audit, auditErr := engine.Executor.Audit(ctx, plan)
+			if auditErr != nil || ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories) != nil || ValidateDPKGReady(audit.DPKG) != nil {
+				return journal, errors.Join(auditErr, fmt.Errorf("package resume pre-child audit failed"))
+			}
+			if audit.NoAutostart.Path != "/usr/sbin/policy-rc.d" || audit.NoAutostart.Digest != plan.NoAutostartPolicyDigest || !audit.NoAutostart.SameLanPanelBinary {
+				return journal, fmt.Errorf("package resume no-autostart authority changed")
+			}
+			if journal.Phase == JournalPrepared && !reflect.DeepEqual(audit.Before, journal.Prior) {
+				return journal, fmt.Errorf("package resume prior runtime changed before local preparation")
+			}
+			switch journal.Phase {
+			case JournalPrepared:
+				aptConfig, aptSources, renderErr := RenderAPTConfiguration(plan)
+				if renderErr != nil {
+					return journal, renderErr
+				}
+				if err := engine.Executor.Prepare(ctx, plan, aptConfig, aptSources); err != nil {
+					return journal, err
+				}
+				next := journal
+				next.Phase = JournalFilesPrepared
+				if err := advance(next); err != nil {
+					return journal, err
+				}
+			case JournalFilesPrepared:
+				if err := engine.Executor.Stage(ctx, plan); err != nil {
+					return journal, err
+				}
+				next := journal
+				next.Phase = JournalArtifactsStaged
+				if err := advance(next); err != nil {
+					return journal, err
+				}
+			case JournalArtifactsStaged:
+				resolved, err := engine.Executor.Resolve(ctx, plan)
+				if err != nil || !reflectPackages(resolved, plan.Packages) {
+					return journal, errors.Join(err, fmt.Errorf("package resume closure differs from the frozen Plan"))
+				}
+				next := journal
+				next.Phase = JournalMasking
+				if err := advance(next); err != nil {
+					return journal, err
+				}
+			case JournalMasking:
+				if len(journal.Masks) > len(units) || !slices.Equal(maskNames(journal.Masks), units[:len(journal.Masks)]) {
+					return journal, fmt.Errorf("package resume mask journal is not an exact unit prefix")
+				}
+				if len(journal.Masks) != 0 {
+					if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
+						return journal, err
+					}
+				}
+				remaining := units[len(journal.Masks):]
+				result := MaskResult{Masks: append([]MaskIdentity(nil), journal.Masks...)}
+				if len(remaining) != 0 {
+					created, err := engine.Executor.Mask(ctx, remaining, func(identity MaskIdentity) error {
+						next := journal
+						next.Masks = append(append([]MaskIdentity(nil), journal.Masks...), identity)
+						return advance(next)
+					})
+					if err != nil {
+						return journal, err
+					}
+					result.Masks = append(result.Masks, created.Masks...)
+				}
+				if err := validateMasks(units, journal.Prior, result); err != nil {
+					return journal, err
+				}
+				next := journal
+				next.Phase = JournalMasksApplied
+				next.Masks = append([]MaskIdentity(nil), result.Masks...)
+				next.MasksComplete = true
+				if err := advance(next); err != nil {
+					return journal, err
+				}
+			}
+		case JournalMasksApplied:
+			if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
+				return journal, err
+			}
+			monitoredCtx := ctx
+			stopMonitor := func() error { return nil }
+			if engine.Monitor != nil {
+				monitoredCtx, stopMonitor, err = engine.Monitor.Start(ctx, units, possibleListeners(plan.Packages))
+				if err != nil {
+					return journal, err
+				}
+			}
+			next := journal
+			next.Phase = JournalChildSubmitted
+			if err := advance(next); err != nil {
+				_ = stopMonitor()
+				return journal, err
+			}
+			result, runErr := engine.Executor.Run(monitoredCtx, journal.PackageProfile, packageInvocation(plan, true))
+			monitorErr := stopMonitor()
+			next = journal
+			next.Phase = JournalChildTerminal
+			next.ChildResultDigest = childResultDigest(result)
+			next.ChildSucceeded = runErr == nil && result.ExitCode == 0 && !result.OutputCutOff && monitorErr == nil
+			if !next.ChildSucceeded {
+				next.ErrorCode = packageFailureCode(runErr, monitorErr, result)
+			}
+			if err := advance(next); err != nil {
+				return journal, errors.Join(runErr, monitorErr, err)
+			}
+			if !journal.ChildSucceeded {
+				return journal, errors.Join(runErr, monitorErr, fmt.Errorf("exact package child failed under retained masks"))
+			}
+		case JournalChildSubmitted:
+			if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
+				return journal, err
+			}
+			return journal, fmt.Errorf("submitted package child terminal result is unknown and remains fenced")
+		case JournalChildTerminal:
+			if !journal.ChildSucceeded {
+				return journal, fmt.Errorf("failed package child remains fenced and is not retryable as success")
+			}
+			observed, err := engine.Executor.Observe(ctx, plan)
+			if err != nil {
+				return journal, err
+			}
+			observed.RetainedMasks = maskNames(journal.Masks)
+			if err := ValidatePostcondition(plan, journal.Prior, observed, createdMaskNames(journal.Masks)); err != nil {
+				return journal, err
+			}
+			postDigest, err := digestValue(observed)
+			if err != nil {
+				return journal, err
+			}
+			next := journal
+			next.Phase = JournalVerified
+			next.PostconditionDigest = postDigest
+			next.ErrorCode = ""
+			if err := advance(next); err != nil {
+				return journal, err
+			}
+		case JournalVerified:
+			next := journal
+			next.Phase = JournalCommitted
+			if err := advance(next); err != nil {
+				return journal, err
+			}
+		case JournalCommitted:
+			if err := engine.Executor.VerifyMasks(ctx, preexistingMasks(journal.Masks)); err != nil {
+				return journal, err
+			}
+			if err := engine.Executor.Unmask(ctx, createdMasks(journal.Masks)); err != nil {
+				return journal, err
+			}
+			next := journal
+			next.Phase = JournalCleaned
+			if err := advance(next); err != nil {
+				return journal, err
+			}
+		case JournalCleaned:
+			return journal, nil
+		default:
+			return journal, fmt.Errorf("package resume phase is unsupported")
+		}
+	}
+}
+
 func ValidateJournal(journal Journal) error {
-	if journal.SchemaVersion != "lanpanel.package.journal.v1" || !transactionPattern.MatchString(journal.TransactionID) || journal.NormalJournalID != "package-"+journal.TransactionID || journal.ChildID != "package-child-"+journal.TransactionID || !jobPattern.MatchString(journal.JobID) || !digestPattern.MatchString(journal.PlanDigest) || !digestPattern.MatchString(journal.AuthorityDigest) || journal.PackageProfile != child.ProfileAPTTransaction && journal.PackageProfile != child.ProfileAPTOfflineTransaction || validateRuntime(journal.Prior) != nil || len(journal.Prior.Units) > 4096 || len(journal.Prior.Listeners) > 4096 || !validMaskIdentities(journal.Masks) {
+	if journal.SchemaVersion != PackageJournalSchemaVersion || !transactionPattern.MatchString(journal.TransactionID) || journal.NormalJournalID != "package-"+journal.TransactionID || journal.ChildID != "package-child-"+journal.TransactionID || !jobPattern.MatchString(journal.JobID) || !digestPattern.MatchString(journal.PlanDigest) || !digestPattern.MatchString(journal.AuthorityDigest) || journal.PackageProfile != child.ProfileAPTTransaction && journal.PackageProfile != child.ProfileAPTOfflineTransaction || validateRuntime(journal.Prior) != nil || len(journal.Prior.Units) > 4096 || len(journal.Prior.Listeners) > 4096 || !validMaskIdentities(journal.Masks) {
 		return fmt.Errorf("package journal identity, prior state, or mask authority is invalid")
 	}
 	switch journal.Phase {
@@ -422,6 +664,20 @@ func validateMasks(expected []string, before RuntimeSnapshot, result MaskResult)
 	return nil
 }
 
+func PlanDigest(plan Plan) (string, error) {
+	if err := ValidatePlan(plan); err != nil {
+		return "", err
+	}
+	return digestValue(plan)
+}
+
+func JournalDigest(journal Journal) (string, error) {
+	if err := ValidateJournal(journal); err != nil {
+		return "", err
+	}
+	return digestValue(journal)
+}
+
 func transactionDigests(plan Plan) (string, string, error) {
 	planDigest, err := digestValue(plan)
 	if err != nil {
@@ -480,7 +736,7 @@ func sortedUniqueUnits(values []string) bool {
 func validMaskIdentities(values []MaskIdentity) bool {
 	previous := ""
 	for _, value := range values {
-		if !unitPattern.MatchString(value.Unit) || value.Device == 0 || value.Inode == 0 || previous != "" && strings.Compare(previous, value.Unit) >= 0 {
+		if !unitPattern.MatchString(value.Unit) || value.Device == 0 || value.Inode == 0 || value.CTimeSec == 0 || previous != "" && strings.Compare(previous, value.Unit) >= 0 {
 			return false
 		}
 		previous = value.Unit
@@ -492,6 +748,16 @@ func maskNames(values []MaskIdentity) []string {
 	result := make([]string, 0, len(values))
 	for _, value := range values {
 		result = append(result, value.Unit)
+	}
+	return result
+}
+
+func preexistingMasks(values []MaskIdentity) []MaskIdentity {
+	result := []MaskIdentity{}
+	for _, value := range values {
+		if value.Preexisting {
+			result = append(result, value)
+		}
 	}
 	return result
 }

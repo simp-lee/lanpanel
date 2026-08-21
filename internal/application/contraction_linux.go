@@ -37,15 +37,20 @@ type CloseAllExecution struct {
 	Exposure            *locks.Lease
 	Authority           *contraction.NormalAuthority
 	Inventory           closure.Inventory
+	Installation        domain.Installation
+	SafetyState         safety.State
+	OwnershipAuthority  map[string]string
 	GoAccessGenerations map[string][]goaccessGeneration
 }
 
 func BeginCloseAll(ctx context.Context, actor Actor, payload ConfirmationPayload) (*CloseAllExecution, error) {
 	return beginContraction(ctx, actor, domain.OperationCloseAll, domain.OperationTarget{Kind: domain.OperationTargetInstallation}, payload)
 }
+
 func BeginUnpublish(ctx context.Context, actor Actor, target domain.OperationTarget, payload ConfirmationPayload) (*CloseAllExecution, error) {
 	return beginContraction(ctx, actor, domain.OperationUnpublish, target, payload)
 }
+
 func beginContraction(ctx context.Context, actor Actor, operation domain.OperationCode, target domain.OperationTarget, payload ConfirmationPayload) (*CloseAllExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -148,8 +153,15 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 		return fail(err)
 	}
 	goaccessIDs := goAccessContractionInventory(freshInstallation, resourceIDs)
-	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, GoAccessGenerations: goaccessIDs, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
+	ownershipAuthority := map[string]string{}
+	if freshOwnership.Complete {
+		for _, record := range freshOwnership.Records {
+			ownershipAuthority[record.ResourceID] = record.Checksum
+		}
+	}
+	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, Installation: freshInstallation, SafetyState: freshState, OwnershipAuthority: ownershipAuthority, GoAccessGenerations: goaccessIDs, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, PlanID: plan.ID, Operation: operations.Type(operation), Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
 }
+
 func contractionGenerations(installation domain.Installation, state safety.State, selectedIDs []string) (map[string]uint64, error) {
 	normal := make(map[string]uint64, len(installation.Resources))
 	for _, resource := range installation.Resources {
@@ -207,6 +219,13 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 		}
 		return result, errors.Join(err, runErr, completeErr, closeErr)
 	}
+	host.Guard = func(manifest nginx.Manifest) error {
+		decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: execution.SafetyState, Installation: &execution.Installation, Ownership: execution.OwnershipAuthority, Now: time.Now().UTC()})
+		if !decision.Allowed {
+			return fmt.Errorf("selective closure preserved control is unsafe: %s", decision.Reason)
+		}
+		return nil
+	}
 	result, runErr := (contraction.Engine{Authority: execution.Authority, Runtime: host}).Run(ctx, execution.Inventory)
 	result, runErr, cleanupComplete := execution.stopGoAccessAfterClosure(ctx, result, runErr)
 	if !cleanupComplete && !result.AccessClosed {
@@ -222,6 +241,7 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 	}
 	return result, runErr
 }
+
 func goAccessContractionInventory(installation domain.Installation, resourceIDs []string) map[string][]goaccessGeneration {
 	result := map[string][]goaccessGeneration{}
 	selected := func(id string) bool {
@@ -286,6 +306,7 @@ func goAccessContractionInventory(installation domain.Installation, resourceIDs 
 	}
 	return result
 }
+
 func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goaccessGeneration, result contraction.Result, runErr error) (contraction.Result, error, bool) {
 	if len(generations) == 0 {
 		return result, runErr, true
@@ -328,6 +349,7 @@ func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goacce
 	}
 	return result, runErr, complete
 }
+
 func pruneGoAccessContractionOwnership(_ context.Context, service *FixedService, exposure *locks.Lease, sourceJobID string, generations map[string][]goaccessGeneration) error {
 	pruneCtx, cancelPrune := context.WithTimeout(context.Background(), time.Minute)
 	defer cancelPrune()
@@ -341,6 +363,7 @@ func pruneGoAccessContractionOwnership(_ context.Context, service *FixedService,
 	}
 	return result
 }
+
 func (execution *CloseAllExecution) stopGoAccessAfterClosure(ctx context.Context, result contraction.Result, runErr error) (contraction.Result, error, bool) {
 	var cleanupComplete bool
 	result, runErr, cleanupComplete = stopGoAccessAfterClosure(ctx, execution.GoAccessGenerations, result, runErr)
@@ -356,6 +379,7 @@ func (execution *CloseAllExecution) stopGoAccessAfterClosure(ctx context.Context
 	}
 	return result, runErr, cleanupComplete
 }
+
 func (execution *CloseAllExecution) Close() error {
 	if execution == nil {
 		return nil

@@ -27,13 +27,14 @@ func (f *fakeRunner) RunInvocation(_ context.Context, _ child.ProfileID, inv chi
 	empty := sha256.Sum256(nil)
 	return child.Result{ExitCode: 0, Stdout: []byte("admin:$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234\n"), StderrDigest: "sha256:" + hex.EncodeToString(empty[:])}, nil
 }
+
 func TestManagedBasicFreshRootCreatesPrivateFileTransactionDirectory(t *testing.T) {
 	root := t.TempDir()
 	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil {
 		t.Fatal(err)
@@ -42,12 +43,12 @@ func TestManagedBasicFreshRootCreatesPrivateFileTransactionDirectory(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(basicFD)
+	defer func() { _ = unix.Close(basicFD) }()
 	txnFD, err := ensureOwnedBasicDirectory(basicFD, ".txn", stat.Uid, stat.Gid, 0o700)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(txnFD)
+	defer func() { _ = unix.Close(txnFD) }()
 	if err = unix.Fstat(txnFD, &stat); err != nil || stat.Mode&0o7777 != 0o700 {
 		t.Fatalf("private staging metadata invalid: %#v %v", stat, err)
 	}
@@ -60,6 +61,7 @@ func TestManagedBasicFreshRootCreatesPrivateFileTransactionDirectory(t *testing.
 		t.Fatal(err)
 	}
 }
+
 func TestManagedBasicExistingDirectoryDriftFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(root+"/basic", 0o755); err != nil {
@@ -69,13 +71,13 @@ func TestManagedBasicExistingDirectoryDriftFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil {
 		t.Fatal(err)
 	}
 	if child, err := ensureOwnedBasicDirectory(fd, "basic", stat.Uid, stat.Gid, 0o750); err == nil {
-		unix.Close(child)
+		_ = unix.Close(child)
 		t.Fatal("drifted directory was normalized")
 	}
 }

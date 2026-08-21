@@ -50,10 +50,10 @@ func RunRelay(args []string) error {
 	}
 	unixListener, ok := listener.(*net.UnixListener)
 	if !ok {
-		listener.Close()
+		_ = listener.Close()
 		return fmt.Errorf("GoAccess relay frontend is not Unix")
 	}
-	defer unixListener.Close()
+	defer func(ignore func() error) { _ = ignore() }(unixListener.Close)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	for {
@@ -73,13 +73,14 @@ func RunRelay(args []string) error {
 		go relayOne(ctx, frontend)
 	}
 }
+
 func relayOne(ctx context.Context, frontend *net.UnixConn) {
-	defer frontend.Close()
+	defer func(ignore func() error) { _ = ignore() }(frontend.Close)
 	backend, err := (&net.Dialer{}).DialContext(ctx, "tcp4", Backend)
 	if err != nil {
 		return
 	}
-	defer backend.Close()
+	defer func(ignore func() error) { _ = ignore() }(backend.Close)
 	var wait sync.WaitGroup
 	wait.Add(2)
 	go func() {

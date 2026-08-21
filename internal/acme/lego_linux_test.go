@@ -4,12 +4,11 @@ package acme
 
 import (
 	"context"
+	"lanpanel/internal/child"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"lanpanel/internal/child"
 )
 
 type fakeLegoRunner struct {

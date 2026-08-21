@@ -4,11 +4,10 @@ package acme
 
 import (
 	"context"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/acmeaccount"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -94,6 +93,7 @@ func PrepareStage(ctx context.Context, certificateID string, binding Binding, ui
 	}
 	return stage, nil
 }
+
 func RemoveStage(certificateID string, uid, gid uint32) error {
 	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 {
 		return fmt.Errorf("ACME cleanup identity invalid")
@@ -101,6 +101,7 @@ func RemoveStage(certificateID string, uid, gid uint32) error {
 	root := filepath.Join("/var/lib/lanpanel/certificates/chroot", certificateID)
 	return removeOwnedTree(root, uid, gid, 4096)
 }
+
 func VerifyWebrootEmpty(certificateID string, uid, gid uint32) error {
 	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 {
 		return fmt.Errorf("ACME webroot identity invalid")
@@ -153,9 +154,10 @@ func VerifyWebrootEmpty(certificateID string, uid, gid uint32) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func(ignore func() error) { _ = ignore() }(directory.Close)
 	return directory.Sync()
 }
+
 func RemoveWebroot(certificateID string, uid, gid uint32) error {
 	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 {
 		return fmt.Errorf("ACME webroot cleanup identity invalid")
@@ -163,6 +165,7 @@ func RemoveWebroot(certificateID string, uid, gid uint32) error {
 	root := filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID)
 	return removeOwnedTree(root, uid, gid, 1024)
 }
+
 func removeOwnedTree(root string, uid, gid uint32, remaining int) error {
 	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -214,15 +217,17 @@ func removeOwnedTree(root string, uid, gid uint32, remaining int) error {
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
+	defer func(ignore func() error) { _ = ignore() }(parent.Close)
 	return parent.Sync()
 }
+
 func (stage Stage) Close() error {
 	if !certificateIDPattern(stage.CertificateID) || stage.Root != "/var/lib/lanpanel/certificates/chroot/"+stage.CertificateID {
 		return fmt.Errorf("ACME stage identity invalid")
 	}
 	return nil
 }
+
 func ensureStageDirectory(path string, uid, gid uint32) error {
 	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
@@ -236,6 +241,7 @@ func ensureStageDirectory(path string, uid, gid uint32) error {
 	}
 	return os.Chmod(path, 0o700)
 }
+
 func LegoAccountKeyPath(binding Binding) (string, error) {
 	if err := ValidateBinding(binding); err != nil {
 		return "", err
@@ -250,6 +256,7 @@ func LegoAccountKeyPath(binding Binding) (string, error) {
 	}
 	return filepath.Join("/work/accounts", server, binding.AccountEmail, "keys", binding.AccountEmail+".key"), nil
 }
+
 func (stage Stage) installAccountKey(binding Binding) error {
 	target, err := LegoAccountKeyPath(binding)
 	if err != nil {
@@ -263,17 +270,19 @@ func (stage Stage) installAccountKey(binding Binding) error {
 			return err
 		}
 	}
-	return stage.copyProtectedTo(binding.AccountKeyPath, target, stage.UID, stage.GID, true)
+	return stage.copyProtectedTo(binding.AccountKeyPath, target, stage.UID, stage.GID, binding.AccountKeyFingerprint)
 }
+
 func (stage Stage) copyProtected(source string, uid, gid uint32) error {
-	return stage.copyProtectedTo(source, source, uid, gid, false)
+	return stage.copyProtectedTo(source, source, uid, gid, "")
 }
-func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, accountKey bool) error {
+
+func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, accountKeyFingerprint string) error {
 	input, err := openProtected(source)
 	if err != nil {
 		return err
 	}
-	defer input.Close()
+	defer func(ignore func() error) { _ = ignore() }(input.Close)
 	target := filepath.Join(stage.Root, strings.TrimPrefix(targetPath, "/"))
 	if err := os.MkdirAll(filepath.Dir(target), 0o711); err != nil {
 		return err
@@ -284,24 +293,14 @@ func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, a
 	}
 	data, readErr := io.ReadAll(io.LimitReader(input, 64<<10+1))
 	if readErr != nil || len(data) == 0 || len(data) > 64<<10 {
-		output.Close()
+		_ = output.Close()
 		return fmt.Errorf("ACME protected input invalid")
 	}
-	if accountKey {
-		block, rest := pem.Decode(data)
-		valid := false
-		if block != nil && len(strings.TrimSpace(string(rest))) == 0 {
-			if block.Type == "RSA PRIVATE KEY" {
-				_, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-				valid = err == nil
-			} else if block.Type == "EC PRIVATE KEY" {
-				_, err = x509.ParseECPrivateKey(block.Bytes)
-				valid = err == nil
-			}
-		}
-		if !valid {
-			output.Close()
-			return fmt.Errorf("ACME account key format invalid")
+	if accountKeyFingerprint != "" {
+		fingerprint, fingerprintErr := acmeaccount.Fingerprint(data)
+		if fingerprintErr != nil || fingerprint != accountKeyFingerprint {
+			_ = output.Close()
+			return fmt.Errorf("ACME account key changed before staging")
 		}
 	}
 	writeErr := writeFull(output, data)
@@ -311,6 +310,7 @@ func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, a
 	closeErr := output.Close()
 	return errors.Join(writeErr, ownerErr, modeErr, syncErr, closeErr)
 }
+
 func writeFull(output *os.File, data []byte) error {
 	for len(data) > 0 {
 		n, err := output.Write(data)
@@ -324,6 +324,7 @@ func writeFull(output *os.File, data []byte) error {
 	}
 	return nil
 }
+
 func (stage Stage) prepareMountTarget(source string) error {
 	if !filepath.IsAbs(source) || filepath.Clean(source) != source {
 		return fmt.Errorf("ACME mount source invalid")
@@ -349,6 +350,7 @@ func (stage Stage) prepareMountTarget(source string) error {
 	}
 	return nil
 }
+
 func credentialPaths(binding Binding) []string {
 	result := make([]string, len(binding.CredentialFiles))
 	for index, file := range binding.CredentialFiles {
@@ -357,6 +359,7 @@ func credentialPaths(binding Binding) []string {
 	slices.Sort(result)
 	return result
 }
+
 func certificateIDPattern(value string) bool {
 	if len(value) != 37 || !strings.HasPrefix(value, "cert_") {
 		return false

@@ -14,6 +14,7 @@ func TestAdminTokenEntropyFailurePrecedesSourceMutation(t *testing.T) {
 		t.Fatal("entropy failure accepted")
 	}
 }
+
 func TestAdminTokenGenerationFaultIsFailure(t *testing.T) {
 	_, err := GenerateAdminToken(AdminTokenOptions{Random: bytes.NewReader(make([]byte, 32)), Fault: func(phase string) error {
 		if phase == "generated" {

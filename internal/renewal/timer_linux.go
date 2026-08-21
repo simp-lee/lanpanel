@@ -24,7 +24,7 @@ func RunTimer(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	if err := connection.SetDeadline(request.Deadline); err != nil {
 		return err
 	}
@@ -41,6 +41,7 @@ func RunTimer(args []string) error {
 	}
 	return nil
 }
+
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])

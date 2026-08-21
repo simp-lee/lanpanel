@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	managedheadscale "lanpanel/internal/headscale"
@@ -51,7 +52,7 @@ type HeadscaleExecution struct {
 
 func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInitializePayload) (result jobs.Record, headscaleID, authorityDigest string, err error) {
 	if payload.Confirmation != "initialize" {
-		return jobs.Record{}, "", "", fmt.Errorf("Headscale initialization confirmation is invalid")
+		return jobs.Record{}, "", "", fmt.Errorf("headscale initialization confirmation is invalid")
 	}
 	installed, err := readCommittedReleaseIdentity()
 	if err != nil {
@@ -111,10 +112,10 @@ func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInit
 	}
 	if !execution.RemoteWait {
 		intent, err = execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+		execution.Mutation, execution.Exposure = nil, nil
 		if err != nil {
 			return jobs.Record{}, "", "", err
 		}
-		execution.Mutation, execution.Exposure = nil, nil
 		execution.Revision++
 		execution.RemoteWait = true
 	}
@@ -152,7 +153,7 @@ func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInit
 		return jobs.Record{}, "", "", err
 	}
 	committedCandidate := execution.Candidate
-	committedCandidate.LastOperation = domain.OperationDeploy
+	committedCandidate.LastOperation = domain.OperationHeadscaleInitialize
 	committedCandidate.LastJobID = execution.JobID
 	if err := execution.Admitter.CommitHeadscaleInitialize(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.HeadscaleInitializeCommit{Headscale: committedCandidate}); err != nil {
 		return jobs.Record{}, "", "", err
@@ -181,15 +182,17 @@ type bootstrapCommitWire struct {
 }
 
 type installationBundleWire struct {
-	SchemaVersion    string                       `json:"schema_version"`
-	AttemptID        string                       `json:"attempt_id"`
-	InstallationID   string                       `json:"installation_id"`
-	GenerationID     string                       `json:"generation_id"`
-	SafetyGeneration uint64                       `json:"safety_generation"`
-	Fingerprint      string                       `json:"fingerprint"`
-	Management       identity.ManagementAuthority `json:"management_authority"`
-	Release          release.InstallIdentity      `json:"release"`
-	PreflightDigest  string                       `json:"preflight_digest"`
+	SchemaVersion             string                       `json:"schema_version"`
+	AttemptID                 string                       `json:"attempt_id"`
+	InstallationID            string                       `json:"installation_id"`
+	GenerationID              string                       `json:"generation_id"`
+	SafetyGeneration          uint64                       `json:"safety_generation"`
+	Fingerprint               string                       `json:"fingerprint"`
+	Management                identity.ManagementAuthority `json:"management_authority"`
+	Release                   release.InstallIdentity      `json:"release"`
+	PreflightDigest           string                       `json:"preflight_digest"`
+	ACMEAccountContact        string                       `json:"acme_account_contact"`
+	ACMEAccountKeyFingerprint string                       `json:"acme_account_key_fingerprint"`
 }
 
 func sameHeadscalePreflightPolicy(left, right preflight.ExpansionRequest) bool {
@@ -198,22 +201,37 @@ func sameHeadscalePreflightPolicy(left, right preflight.ExpansionRequest) bool {
 	return reflect.DeepEqual(left, right)
 }
 
-func readCommittedReleaseIdentity() (release.InstallIdentity, error) {
+func readCommittedInstallationAuthority() (installationBundleWire, error) {
 	commitBytes, err := readProtectedBytes("/var/lib/lanpanel/bootstrap-commit.json", 0o644)
 	var commit bootstrapCommitWire
 	if err != nil || decodeProtectedCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != "lanpanel.bootstrap.commit.v1" || !identity.ValidateAttemptID(commit.AttemptID) || !identity.ValidateInstallationID(commit.InstallationID) || !identity.ValidateGenerationID(commit.GenerationID) || commit.JournalSequence == 0 || !release.ValidDigest(commit.BundleDigest) || !release.ValidDigest(commit.ArtifactDigest) || commit.CommittedAt.IsZero() {
-		return release.InstallIdentity{}, fmt.Errorf("bootstrap commit authority is unavailable")
+		return installationBundleWire{}, fmt.Errorf("bootstrap commit authority is unavailable")
 	}
 	bundleBytes, err := readProtectedBytes("/var/lib/lanpanel/installation/bundle.json", 0o600)
 	var bundle installationBundleWire
-	if err != nil || decodeProtectedCanonical(bundleBytes, &bundle) != nil || bundle.SchemaVersion != "lanpanel.installation.bundle.v1" || bundle.AttemptID != commit.AttemptID || bundle.InstallationID != commit.InstallationID || bundle.GenerationID != commit.GenerationID || bundle.SafetyGeneration == 0 || commit.BundleDigest != release.DigestBytes(bundleBytes) || identity.ValidateManagementAuthority(bundle.Management) != nil || release.ValidateInstallIdentity(bundle.Release) != nil || bundle.PreflightDigest == "" {
-		return release.InstallIdentity{}, fmt.Errorf("installation bundle does not match bootstrap commit")
+	if err != nil || decodeProtectedCanonical(bundleBytes, &bundle) != nil || bundle.SchemaVersion != "lanpanel.installation.bundle.v2" || bundle.AttemptID != commit.AttemptID || bundle.InstallationID != commit.InstallationID || bundle.GenerationID != commit.GenerationID || bundle.SafetyGeneration == 0 || commit.BundleDigest != release.DigestBytes(bundleBytes) || identity.ValidateManagementAuthority(bundle.Management) != nil || release.ValidateInstallIdentity(bundle.Release) != nil || bundle.PreflightDigest == "" || !acmeaccount.ValidContact(bundle.ACMEAccountContact) {
+		return installationBundleWire{}, fmt.Errorf("installation bundle does not match bootstrap commit")
+	}
+	accountKey, keyErr := readProtectedBytes(acmeaccount.ManagedKeyPath, 0o600)
+	accountFingerprint, fingerprintErr := acmeaccount.Fingerprint(accountKey)
+	if keyErr != nil || fingerprintErr != nil || accountFingerprint != bundle.ACMEAccountKeyFingerprint {
+		return installationBundleWire{}, fmt.Errorf("managed ACME account key does not match installation bundle")
 	}
 	fingerprint, err := identity.Fingerprint(bundle.InstallationID)
 	if err != nil || bundle.Fingerprint != fingerprint {
-		return release.InstallIdentity{}, fmt.Errorf("installation bundle fingerprint changed")
+		return installationBundleWire{}, fmt.Errorf("installation bundle fingerprint changed")
 	}
-	return bundle.Release, nil
+	return bundle, nil
+}
+
+func readCommittedReleaseIdentity() (release.InstallIdentity, error) {
+	bundle, err := readCommittedInstallationAuthority()
+	return bundle.Release, err
+}
+
+func readManagedACMEAccountAuthority() (string, string, error) {
+	bundle, err := readCommittedInstallationAuthority()
+	return bundle.ACMEAccountContact, bundle.ACMEAccountKeyFingerprint, err
 }
 
 func decodeProtectedCanonical(data []byte, destination any) error {
@@ -242,7 +260,7 @@ func readProtectedBytes(path string, mode uint32) ([]byte, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("protected authority descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o7777 != mode || stat.Size <= 0 || stat.Size > 4<<20 {
 		return nil, fmt.Errorf("protected authority file metadata is unsafe")
@@ -274,7 +292,7 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 	}
 	installation, err := domain.DecodeInstallation(raw)
 	if err != nil || installation.Headscale != nil {
-		return fail(errors.Join(err, fmt.Errorf("Headscale trust domain is already configured")))
+		return fail(errors.Join(err, fmt.Errorf("headscale trust domain is already configured")))
 	}
 	journal, snapshot, err := managedheadscale.LoadInitializationJournal(managedheadscale.FixedPaths(), installed)
 	var candidate domain.HeadscaleDomain
@@ -329,18 +347,18 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 		case operations.PhaseLocalIntent, operations.PhaseReentered:
 			mutation, exposure, err := mutationSet.AcquireExposure(ctx, string(plans.TargetInstallation), service.Manager())
 			if err != nil {
-				mutationSet.Close()
+				_ = mutationSet.Close()
 				return fail(err)
 			}
 			if _, err := admitter.EnterRemoteWait(ctx, mutation, exposure, document.Revision, journal.JobID); err != nil {
-				mutationSet.Close()
+				_ = mutationSet.Close()
 				return fail(err)
 			}
 			execution.Revision++
 			execution.RemoteWait = true
 			return execution, nil
 		default:
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return fail(fmt.Errorf("pending Headscale initialization phase is not resumable"))
 		}
 	}
@@ -363,19 +381,19 @@ func beginHeadscaleInitialize(ctx context.Context, actor Actor, payload Headscal
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, string(plans.TargetInstallation), service.Manager())
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.Normal().Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
-		return fail(fmt.Errorf("Headscale initialization authority changed"))
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
+		return fail(fmt.Errorf("headscale initialization authority changed"))
 	}
 	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	return &HeadscaleExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Installation: installation, Candidate: candidate, Snapshot: snapshot, Release: installed, Source: source, ProxyURL: proxyURL, Preflight: preflightRequest}, nil

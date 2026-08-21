@@ -10,7 +10,10 @@ import (
 	"fmt"
 	nginxactivation "lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/challenge"
 	"lanpanel/internal/child"
+	"lanpanel/internal/closure"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/safety"
@@ -25,6 +28,7 @@ type ActivationResult struct {
 	NginxDigest       string
 	RuntimeDigest     string
 	CertificateTarget string
+	PriorRestored     bool
 }
 type ActivationHost struct {
 	launcher   *child.Launcher
@@ -42,7 +46,7 @@ func NewActivationHost() (*ActivationHost, error) {
 
 func (host *ActivationHost) Stage(ctx context.Context, bundle ActivationBundle) (returnErr error) {
 	if host == nil || host.launcher == nil || ValidateActivation(bundle) != nil {
-		return fmt.Errorf("Headscale activation staging authority invalid")
+		return fmt.Errorf("headscale activation staging authority invalid")
 	}
 	root := filetxn.Owner{UID: 0, GID: 0}
 	if err := ensureFixedDirectory(bundle.Paths.ControlRuntime, root, 0o711); err != nil {
@@ -69,7 +73,7 @@ func (host *ActivationHost) Stage(ctx context.Context, bundle ActivationBundle) 
 			req.Existing = &filetxn.Metadata{Owner: root, Mode: 0o644}
 			actual, readErr := store.Read(ctx, req)
 			if readErr != nil || !bytes.Equal(actual, value.data) {
-				return fmt.Errorf("Headscale activation unit differs from exact authority")
+				return fmt.Errorf("headscale activation unit differs from exact authority")
 			}
 		}
 	}
@@ -97,7 +101,14 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 			return result, fmt.Errorf("foreign Headscale control ingress already exists")
 		}
 	}
-	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, ExpectedPriorGeneration: 0}
+	priorGeneration := uint64(0)
+	if bundle.Prior != nil {
+		if bundle.Certificate.Generation < 2 {
+			return result, fmt.Errorf("headscale reactivation certificate generation invalid")
+		}
+		priorGeneration = bundle.Certificate.Generation - 1
+	}
+	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, ExpectedPriorGeneration: priorGeneration}
 	pointerResult, err := certificates.ActivatePointer(ctx, pointer)
 	if err != nil {
 		return result, err
@@ -119,6 +130,7 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 			cleanup = errors.Join(cleanup, removeErr, host.run(recovery, child.ProfileNginxTest, child.Invocation{}), host.run(recovery, child.ProfileNginxReloadSignal, child.Invocation{}))
 		}
 		cleanup = errors.Join(cleanup, certificates.RestorePointer(recovery, pointer, pointerResult.CandidateTarget))
+		result.PriorRestored = cleanup == nil
 		resultErr = errors.Join(resultErr, cleanup)
 	}()
 	manifest, _, err := nginx.InstallEntry(ctx, host.nginxPaths, host.owner, bundle.Entry)
@@ -129,8 +141,8 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	if err := ValidateActivationAuthority(bundle, authority); err != nil {
 		return result, err
 	}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: authority.Safety, Installation: &authority.Installation, Now: authority.ObservedAt}); !decision.Allowed {
-		return result, fmt.Errorf("Headscale control reload rejected: %s", decision.Reason)
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: authority.Safety, Installation: &authority.Installation, Ownership: authority.Ownership, Now: authority.ObservedAt}); !decision.Allowed {
+		return result, fmt.Errorf("headscale control reload rejected: %s", decision.Reason)
 	}
 	if err := host.runBoundedOutput(ctx, child.ProfileNginxDump, child.Invocation{}); err != nil {
 		return result, err
@@ -147,7 +159,7 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 		return result, err
 	}
 	if _, err := runtimeHost.WaitForPriorWorkers(ctx, manifest, priorRuntime.Workers); err != nil {
-		return result, fmt.Errorf("Headscale control Nginx generation unavailable: %w", err)
+		return result, fmt.Errorf("headscale control Nginx generation unavailable: %w", err)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -167,9 +179,125 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	return result, nil
 }
 
+func headscaleChallengeEntry(bundle ActivationBundle, prepared challenge.Prepared) (nginx.Entry, error) {
+	if prepared.Entry == nil || prepared.Entry.ResourceID != "headscale" || prepared.Safety.Method != "http-01" || len(prepared.Safety.Hosts) != 1 || prepared.Safety.Hosts[0] != bundle.Candidate.ControlDomain {
+		return nginx.Entry{}, fmt.Errorf("headscale renewal challenge authority invalid")
+	}
+	entry := bundle.Entry
+	entry.Challenge = &nginx.ChallengeSite{Hosts: append([]string(nil), prepared.Safety.Hosts...), Webroot: prepared.Safety.Webroot}
+	entry.Digest = controlZeroDigest()
+	digest, err := nginx.DigestEntry(entry)
+	if err != nil {
+		return nginx.Entry{}, err
+	}
+	entry.Digest = digest
+	return entry, nil
+}
+
+func (host *ActivationHost) ActivateCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared, state safety.State, installation domain.Installation, ownershipAuthority map[string]string) error {
+	entry, err := headscaleChallengeEntry(bundle, prepared)
+	if err != nil {
+		return err
+	}
+	prior, err := nginx.Audit(host.nginxPaths, host.owner)
+	if err != nil {
+		return err
+	}
+	runtimeHost, err := nginxactivation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	snapshot, err := runtimeHost.ObserveRuntime(ctx, prior)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := nginx.InstallEntry(ctx, host.nginxPaths, host.owner, entry)
+	if err != nil {
+		return err
+	}
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: &installation, Ownership: ownershipAuthority, Now: time.Now().UTC()}); !decision.Allowed {
+		return fmt.Errorf("headscale challenge reload rejected: %s", decision.Reason)
+	}
+	if err := host.run(ctx, child.ProfileNginxTest, child.Invocation{}); err != nil {
+		return err
+	}
+	if err := host.run(ctx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
+		return err
+	}
+	_, err = runtimeHost.WaitForPriorWorkers(ctx, manifest, snapshot.Workers)
+	return err
+}
+
+func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared) error {
+	entry, err := headscaleChallengeEntry(bundle, prepared)
+	if err != nil {
+		return err
+	}
+	prior, err := nginx.Audit(host.nginxPaths, host.owner)
+	if err != nil {
+		return err
+	}
+	runtimeHost, err := nginxactivation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	snapshot, err := runtimeHost.ObserveRuntime(ctx, prior)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := nginx.InstallEntry(ctx, host.nginxPaths, host.owner, bundle.Entry)
+	if err != nil {
+		return err
+	}
+	_ = entry
+	if err := host.run(ctx, child.ProfileNginxTest, child.Invocation{}); err != nil {
+		return err
+	}
+	if err := host.run(ctx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
+		return err
+	}
+	_, err = runtimeHost.WaitForPriorWorkers(ctx, manifest, snapshot.Workers)
+	return err
+}
+
+func (host *ActivationHost) CloseControl(ctx context.Context, bundle ActivationBundle) error {
+	if host == nil || ValidateActivation(bundle) != nil {
+		return fmt.Errorf("headscale control closure authority invalid")
+	}
+	runtimeHost, err := nginxactivation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	prior, err := nginx.Audit(host.nginxPaths, host.owner)
+	if err != nil {
+		return err
+	}
+	runtime, err := runtimeHost.ObserveRuntime(ctx, prior)
+	if err != nil {
+		return err
+	}
+	manifest, _, err := nginx.RemoveEntry(ctx, host.nginxPaths, host.owner, bundle.Entry)
+	if err != nil {
+		return err
+	}
+	if err := host.run(ctx, child.ProfileNginxTest, child.Invocation{}); err != nil {
+		return err
+	}
+	if err := host.run(ctx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
+		return err
+	}
+	if _, err := runtimeHost.WaitForPriorWorkers(ctx, manifest, runtime.Workers); err != nil {
+		return err
+	}
+	inventory := closure.Inventory{Complete: true, Digest: bundle.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: bundle.Candidate.ControlDomain, Digest: bundle.Entry.Digest}}}
+	probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: host.nginxPaths.AuditPath, TargetObserved: func(context.Context, closure.Inventory, string, string) (bool, error) { return false, nil }}
+	_, err = probe.Run(ctx, inventory)
+	return err
+}
+
 func (host *ActivationHost) Contract(ctx context.Context, bundle ActivationBundle) error {
 	if host == nil || ValidateActivation(bundle) != nil {
-		return fmt.Errorf("Headscale activation host authority unavailable")
+		return fmt.Errorf("headscale activation host authority unavailable")
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: bundle.Candidate.HeadscaleID}}
 	runtimeHost, runtimeHostErr := nginxactivation.NewFixedHost()
@@ -201,16 +329,17 @@ func (host *ActivationHost) Contract(ctx context.Context, bundle ActivationBundl
 	listenerErr := requirePublicSTUNAbsent()
 	return errors.Join(stopErr, removeErr, reloadErr, controlAbsentErr, serviceErr, observeErr, pointerErr, listenerErr)
 }
+
 func (host *ActivationHost) FallbackStop(ctx context.Context, bundle ActivationBundle) (safety.StopObservation, error) {
 	observed := safety.StopObservation{ObservedAt: time.Now().UTC()}
 	if host == nil || ValidateActivation(bundle) != nil {
-		return observed, fmt.Errorf("Headscale fallback-stop authority invalid")
+		return observed, fmt.Errorf("headscale fallback-stop authority invalid")
 	}
 	if err := host.run(context.WithoutCancel(ctx), child.ProfileHeadscaleFallbackStop, child.Invocation{}); err != nil {
 		return observed, err
 	}
 	if _, err := os.Lstat(host.nginxPaths.PIDPath); !errors.Is(err, os.ErrNotExist) {
-		return observed, fmt.Errorf("Nginx PID authority remained after fallback stop: %w", err)
+		return observed, fmt.Errorf("nginx PID authority remained after fallback stop: %w", err)
 	}
 	if err := requirePublicListenersAbsent(); err != nil {
 		return observed, err
@@ -226,6 +355,7 @@ func (host *ActivationHost) runBoundedOutput(ctx context.Context, profile child.
 	}
 	return nil
 }
+
 func (host *ActivationHost) run(ctx context.Context, profile child.ProfileID, invocation child.Invocation) error {
 	result, err := host.launcher.RunInvocation(ctx, profile, invocation, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff || len(result.Stdout) != 0 {
@@ -233,6 +363,7 @@ func (host *ActivationHost) run(ctx context.Context, profile child.ProfileID, in
 	}
 	return nil
 }
+
 func (host *ActivationHost) verifyEffectiveActivation(ctx context.Context, bundle ActivationBundle, invocation child.Invocation) (string, error) {
 	result, err := host.launcher.RunInvocation(ctx, child.ProfileHeadscaleActivateShow, invocation, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
@@ -264,13 +395,13 @@ func (host *ActivationHost) verifyEffectiveActivation(ctx context.Context, bundl
 		}
 		if strings.HasSuffix(id, ".socket") {
 			if value["SubState"] != "listening" || value["SocketMode"] != "0600" || value["RemoveOnStop"] != "yes" || value["FreeBind"] != "no" || value["ReusePort"] != "no" {
-				return "", fmt.Errorf("Headscale activation socket is not exact")
+				return "", fmt.Errorf("headscale activation socket is not exact")
 			}
 			if id == "lanpanel-headscale-control.socket" && (value["SocketUser"] != "www-data" || value["SocketGroup"] != "www-data" || !strings.Contains(value["Listen"], bundle.Candidate.Paths.ControlSocket)) {
-				return "", fmt.Errorf("Headscale control socket identity changed")
+				return "", fmt.Errorf("headscale control socket identity changed")
 			}
 			if id == "lanpanel-headscale-stun.socket" && (value["SocketUser"] != bundle.ServiceUser || value["SocketGroup"] != bundle.ServiceGroup || !strings.Contains(value["Listen"], "0.0.0.0:3478")) {
-				return "", fmt.Errorf("Headscale STUN socket identity changed")
+				return "", fmt.Errorf("headscale STUN socket identity changed")
 			}
 		} else if value["SubState"] != "running" || value["User"] != bundle.ServiceUser || value["Group"] != bundle.ServiceGroup || value["NoNewPrivileges"] != "yes" || value["PrivateNetwork"] != "yes" || !strings.Contains(value["JoinsNamespaceOf"], "lanpanel-headscale.service") || value["CapabilityBoundingSet"] != "" || value["AmbientCapabilities"] != "" || value["ProtectSystem"] != "strict" || value["ProtectHome"] != "yes" || value["ProtectProc"] != "invisible" || value["ProcSubset"] != "pid" || value["ProtectKernelTunables"] != "yes" || value["ProtectKernelModules"] != "yes" || value["ProtectControlGroups"] != "yes" || value["LockPersonality"] != "yes" || value["MemoryDenyWriteExecute"] != "yes" || value["SystemCallArchitectures"] != "native" || value["RestrictSUIDSGID"] != "yes" || value["KillMode"] != "control-group" || value["Restart"] != "no" || !strings.Contains(value["ExecStart"], "/usr/lib/lanpanel/lanpanel headscale-") {
 			return "", fmt.Errorf("effective Headscale relay %s changed", id)
@@ -291,12 +422,13 @@ func probeActivatedControl(ctx context.Context, domain string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Headscale control HTTPS probe status %d", response.StatusCode)
+		return "", fmt.Errorf("headscale control HTTPS probe status %d", response.StatusCode)
 	}
 	return hashBytes([]byte(fmt.Sprintf("%s/%d/%s", domain, response.StatusCode, response.TLS.PeerCertificates[0].SerialNumber))), nil
 }
+
 func requireControlAbsent(ctx context.Context, domain string) error {
 	deadline := time.Now().Add(12 * time.Second)
 	consecutive := 0
@@ -326,14 +458,17 @@ func requireControlAbsent(ctx context.Context, domain string) error {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("Headscale control ingress remained observable")
+	return fmt.Errorf("headscale control ingress remained observable")
 }
+
 func requirePublicSTUNAbsent() error {
 	return requireProcPortsAbsent(map[string]bool{"0D96": true}, []string{"/proc/net/udp", "/proc/net/udp6"})
 }
+
 func requirePublicListenersAbsent() error {
 	return requireProcPortsAbsent(map[string]bool{"0050": true, "01BB": true, "0D96": true}, []string{"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"})
 }
+
 func requireProcPortsAbsent(ports map[string]bool, paths []string) error {
 	for _, path := range paths {
 		data, err := os.ReadFile(path)

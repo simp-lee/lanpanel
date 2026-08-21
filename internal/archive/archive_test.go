@@ -5,10 +5,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"lanpanel/internal/filetxn"
 	"strings"
 	"testing"
-
-	"lanpanel/internal/filetxn"
 )
 
 func TestArchiveExtractsOnlyExactDeclaredRegularMembers(t *testing.T) {

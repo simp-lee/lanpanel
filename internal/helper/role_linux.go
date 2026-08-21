@@ -14,6 +14,7 @@ import (
 	"lanpanel/internal/application"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/child"
+	managedconnector "lanpanel/internal/connector"
 	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
@@ -21,7 +22,6 @@ import (
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
-	"lanpanel/internal/packages"
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/resource"
@@ -39,9 +39,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const FixedIdentityConfigPath = "/var/lib/lanpanel/installation/helper-identities.json"
-const identityConfigSchema = "lanpanel.helper.identities.v1"
-const maximumIdentityConfigBytes = 4096
+const (
+	FixedIdentityConfigPath    = "/var/lib/lanpanel/installation/helper-identities.json"
+	identityConfigSchema       = "lanpanel.helper.identities.v1"
+	maximumIdentityConfigBytes = 4096
+)
 
 type IdentityConfig struct {
 	SchemaVersion string      `json:"schema_version"`
@@ -63,67 +65,35 @@ func RunRole(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
-	rotationRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
-	if err := application.ReconcileStaticRootRegistrations(context.Background()); err != nil {
-		return err
+	adminRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
+	var otherRecoveryErr error
+	recordRecovery := func(err error) { otherRecoveryErr = errors.Join(otherRecoveryErr, err) }
+	recordRecovery(cleanupConnectorLoginSecrets())
+	recordRecovery(application.ReconcileStaticRootRegistrations(context.Background()))
+	childClosure, childErr := child.ObserveExclusiveCurrentCgroup()
+	recordRecovery(childErr)
+	if childErr == nil {
+		recordRecovery(application.ReconcileInterruptedEntityMutations(context.Background(), childClosure))
+		recordRecovery(application.ReconcileManagedBasic(context.Background(), childClosure))
+		recordRecovery(application.ReconcileCertificateChallenges(context.Background(), childClosure))
+		recordRecovery(application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
+		recordRecovery(application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
 	}
-	childClosure, err := child.ObserveExclusiveCurrentCgroup()
-	if err != nil {
-		return err
+	recordRecovery(application.ReconcileCompletedCertificateRenewals(context.Background()))
+	recordRecovery(application.ReconcileInterruptedDomainPublications(context.Background()))
+	recordRecovery(application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))
+	recordRecovery(application.ReconcileResourceCreates(context.Background()))
+	recordRecovery(application.ReconcileResourceUpdates(context.Background()))
+	recordRecovery(application.ReconcileResourceDeletes(context.Background()))
+	recordRecovery(application.ReconcileJournalLessProcesses(context.Background()))
+	if host, hostErr := managedprocess.NewFixedHost(); hostErr == nil {
+		recordRecovery(managedprocess.ReconcileJournals(context.Background(), host, application.ReconcileInterruptedProcess))
+	} else {
+		recordRecovery(hostErr)
 	}
-	if err := application.ReconcileManagedBasic(context.Background(), childClosure); err != nil {
-		return err
-	}
-	if err := application.ReconcileCertificateChallenges(context.Background(), childClosure); err != nil {
-		return err
-	}
-	if err := application.ReconcileInterruptedDomainPublications(context.Background()); err != nil {
-		return err
-	}
-	if err := application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure); err != nil {
-		return err
-	}
-	if err := application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure); err != nil {
-		return err
-	}
-	if err := application.ReconcileCompletedCertificateRenewals(context.Background()); err != nil {
-		return err
-	}
-	if err := application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()); err != nil {
-		return err
-	}
-	if err := application.ReconcileResourceCreates(context.Background()); err != nil {
-		return err
-	}
-	if err := application.ReconcileResourceUpdates(context.Background()); err != nil {
-		return err
-	}
-	if err := application.ReconcileJournalLessProcesses(context.Background()); err != nil {
-		return err
-	}
-	host, err := managedprocess.NewFixedHost()
-	if err != nil {
-		return err
-	}
-	if err := managedprocess.ReconcileJournals(context.Background(), host, application.ReconcileInterruptedProcess); err != nil {
-		return err
-	}
-	if err := reconcileStartupContraction(context.Background()); err != nil {
-		return err
-	}
-	var packageMu sync.Mutex
+	recordRecovery(reconcileStartupContraction(context.Background()))
 	var tokenMu sync.Mutex
 	contractionPlans := newEmergencyPlanStore()
-	withPackageService := func(use func(*packages.Service) error) error {
-		packageMu.Lock()
-		defer packageMu.Unlock()
-		service, err := packages.OpenFixedService()
-		if err != nil {
-			return fmt.Errorf("open fixed package transaction service: %w", err)
-		}
-		defer service.Close()
-		return use(service)
-	}
 	applicationHandler := ApplicationPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Action == nil {
 			return fmt.Errorf("application caller invalid")
@@ -136,18 +106,24 @@ func RunRole(args []string) error {
 		if request.Action.Operation == "close_all" || request.Action.Operation == "unpublish" {
 			service, normalErr := application.OpenFixed()
 			if normalErr == nil {
-				operation := domain.OperationCloseAll
-				target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
-				if request.Action.Operation == "unpublish" {
-					operation = domain.OperationUnpublish
-					target = domain.OperationTarget{Kind: domain.OperationTargetResource, ID: request.Action.TargetID}
+				if _, readErr := service.Normal().Read(); readErr != nil {
+					if closeErr := service.Close(); closeErr != nil {
+						return ExecutionResult{}, errors.Join(readErr, closeErr)
+					}
+				} else {
+					operation := domain.OperationCloseAll
+					target := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
+					if request.Action.Operation == "unpublish" {
+						operation = domain.OperationUnpublish
+						target = domain.OperationTarget{Kind: domain.OperationTargetResource, ID: request.Action.TargetID}
+					}
+					plan, createErr := service.CreatePlan(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.PlanPayload{Operation: operation, Target: target})
+					closeErr := service.Close()
+					if createErr != nil || closeErr != nil {
+						return ExecutionResult{}, errors.Join(createErr, closeErr)
+					}
+					return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: request.Action.Operation, TargetKind: request.Action.TargetKind, TargetID: request.Action.TargetID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
 				}
-				plan, createErr := service.CreatePlan(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.PlanPayload{Operation: operation, Target: target})
-				closeErr := service.Close()
-				if createErr != nil || closeErr != nil {
-					return ExecutionResult{}, errors.Join(createErr, closeErr)
-				}
-				return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: request.Action.Operation, TargetKind: request.Action.TargetKind, TargetID: request.Action.TargetID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
 			}
 			if request.Action.Operation == "unpublish" {
 				return ExecutionResult{}, fmt.Errorf("normal unpublish authority is unavailable")
@@ -159,7 +135,7 @@ func RunRole(args []string) error {
 			return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.ConfirmationDigest, Operation: "close_all", TargetKind: "installation", ExposureSummary: "closes_all_app_origin_ingress", Prerequisites: "emergency_authenticated_destructive_confirmation", ExpiresAt: plan.ExpiresAt}}, nil
 		}
 		tokenMu.Lock()
-		recoveryErr := rotationRecoveryErr
+		recoveryErr := errors.Join(adminRecoveryErr, otherRecoveryErr)
 		tokenMu.Unlock()
 		if recoveryErr != nil {
 			return ExecutionResult{}, fmt.Errorf("normal application authority is degraded")
@@ -168,7 +144,7 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		defer service.Close()
+		defer func(ignore func() error) { _ = ignore() }(service.Close)
 		operation, err := domain.ParseOperationCode(request.Action.Operation)
 		if err != nil {
 			return ExecutionResult{}, err
@@ -180,26 +156,6 @@ func RunRole(args []string) error {
 		}
 		return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: plan.Operation, TargetKind: string(plan.Target.Kind), TargetID: plan.Target.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
 	})
-	packageHandler := PackageTransactionHandler(
-		func(ctx context.Context, caller helperproto.Caller, request helperproto.Request) error {
-			if caller != helperproto.CallerUI {
-				return fmt.Errorf("package transaction caller is unauthorized")
-			}
-			return withPackageService(func(service *packages.Service) error { return service.ValidateRequest(ctx, request) })
-		},
-		func(ctx context.Context, caller helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
-			if caller != helperproto.CallerUI || secret != nil {
-				return ExecutionResult{}, fmt.Errorf("package transaction execution authority is invalid")
-			}
-			var digest string
-			err := withPackageService(func(service *packages.Service) error {
-				var executeErr error
-				digest, executeErr = service.Execute(ctx, request)
-				return executeErr
-			})
-			return ExecutionResult{ResultDigest: digest}, err
-		},
-	)
 	authRevalidate := func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Target != "installation" {
 			return fmt.Errorf("admin token caller is unauthorized")
@@ -232,8 +188,8 @@ func RunRole(args []string) error {
 	rotateHandler := AdminTokenRotateHandler(authRevalidate, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		tokenMu.Lock()
 		defer tokenMu.Unlock()
-		if rotationRecoveryErr != nil {
-			return ExecutionResult{}, fmt.Errorf("admin token rotation recovery is unresolved")
+		if errors.Join(adminRecoveryErr, otherRecoveryErr) != nil {
+			return ExecutionResult{}, fmt.Errorf("startup recovery is unresolved")
 		}
 		if secret != nil || request.Action == nil || request.Action.Operation != "admin_token_rotate" || request.Action.TargetKind != "installation" {
 			return ExecutionResult{}, fmt.Errorf("admin token rotation input is invalid")
@@ -323,10 +279,10 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		if err := application.ReconcileAdminTokenRotation(ctx, fingerprint); err != nil {
-			rotationRecoveryErr = err
+			adminRecoveryErr = err
 			return ExecutionResult{}, err
 		}
-		rotationRecoveryErr = nil
+		adminRecoveryErr = nil
 		fingerprint, err = secrets.CurrentAdminTokenFingerprint()
 		return ExecutionResult{ResultDigest: fingerprint}, err
 	})
@@ -374,7 +330,7 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		defer service.Close()
+		defer func(ignore func() error) { _ = ignore() }(service.Close)
 		result, runErr := service.Run(ctx, plan.GlobalGeneration, plan.InventoryDigest)
 		action := &helperproto.ActionResult{ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
 		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
@@ -409,7 +365,7 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		defer service.Close()
+		defer func(ignore func() error) { _ = ignore() }(service.Close)
 		snapshot, err := service.Snapshot()
 		if err != nil {
 			return ExecutionResult{}, err
@@ -419,7 +375,7 @@ func RunRole(args []string) error {
 		}
 		result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
 		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
-			return ExecutionResult{ResultDigest: snapshot.Inventory.Digest}, nil
+			return ExecutionResult{}, errors.Join(runErr, fmt.Errorf("startup contraction did not converge: %s", result.Outcome))
 		}
 		if runErr != nil {
 			return ExecutionResult{}, runErr
@@ -428,18 +384,18 @@ func RunRole(args []string) error {
 	})
 	headscaleHandler := HeadscaleInitializeHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil || request.Target != "installation" {
-			return fmt.Errorf("Headscale initialization caller is unauthorized")
+			return fmt.Errorf("headscale initialization caller is unauthorized")
 		}
 		return nil
 	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
-		if secret != nil || request.Resource == nil || request.Resource.Operation != string(domain.OperationDeploy) {
-			return ExecutionResult{}, fmt.Errorf("Headscale initialization payload is invalid")
+		if secret != nil || request.Resource == nil || request.Resource.Operation != string(domain.OperationHeadscaleInitialize) {
+			return ExecutionResult{}, fmt.Errorf("headscale initialization payload is invalid")
 		}
 		var payload application.HeadscaleInitializePayload
 		decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-			return ExecutionResult{}, fmt.Errorf("Headscale initialization config is invalid")
+			return ExecutionResult{}, fmt.Errorf("headscale initialization config is invalid")
 		}
 		job, headscaleID, authorityDigest, err := application.InitializeHeadscale(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, payload)
 		if err != nil {
@@ -448,7 +404,354 @@ func RunRole(args []string) error {
 			}
 			return ExecutionResult{}, err
 		}
-		return ExecutionResult{ResultDigest: authorityDigest, Action: &helperproto.ActionResult{JobID: job.ID, Operation: string(domain.OperationDeploy), TargetKind: string(domain.OperationTargetInstallation), TargetID: headscaleID}}, nil
+		return ExecutionResult{ResultDigest: authorityDigest, Action: &helperproto.ActionResult{JobID: job.ID, Operation: string(domain.OperationHeadscaleInitialize), TargetKind: string(domain.OperationTargetInstallation), TargetID: headscaleID}}, nil
+	})
+	headscaleDeployHandler := HeadscaleDeployHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "headscale" {
+			return fmt.Errorf("headscale deploy caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("headscale deploy payload invalid")
+		}
+		var config application.HeadscaleCertificateConfig
+		decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&config); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			return ExecutionResult{}, fmt.Errorf("headscale certificate config invalid")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		if request.Resource.Confirmation == "plan" {
+			service, err := application.OpenFixed()
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			plan, planErr := service.CreateHeadscaleDeployPlan(ctx, actor, config)
+			closeErr := service.Close()
+			if planErr != nil || closeErr != nil {
+				return ExecutionResult{}, errors.Join(planErr, closeErr)
+			}
+			return ExecutionResult{ResultDigest: digestString(plan.ID), Action: &helperproto.ActionResult{PlanID: plan.ID, Operation: string(domain.OperationHeadscaleControlDeploy), TargetKind: "headscale", ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+		}
+		record, err := application.ExecuteHeadscaleDeploy(ctx, actor, application.HeadscaleDeployPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation, Certificate: config})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(record.ID), Action: &helperproto.ActionResult{JobID: record.ID, JobResult: string(record.Result), Operation: string(domain.OperationHeadscaleControlDeploy), TargetKind: "headscale", TargetID: "headscale"}}, nil
+	})
+	headscaleReissueHandler := HeadscaleReissueHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "headscale" {
+			return fmt.Errorf("headscale reissue caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("headscale reissue payload invalid")
+		}
+		var config application.HeadscaleCertificateConfig
+		decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&config) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			return ExecutionResult{}, fmt.Errorf("headscale reissue config invalid")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		if request.Resource.Confirmation == "plan" {
+			service, err := application.OpenFixed()
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			plan, planErr := service.CreateHeadscaleReissuePlan(ctx, actor, config)
+			closeErr := service.Close()
+			if planErr != nil || closeErr != nil {
+				return ExecutionResult{}, errors.Join(planErr, closeErr)
+			}
+			return ExecutionResult{ResultDigest: digestString(plan.ID), Action: &helperproto.ActionResult{PlanID: plan.ID, Operation: string(domain.OperationHeadscaleReissue), TargetKind: "headscale", ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+		}
+		record, err := application.ExecuteHeadscaleCertificateReissue(ctx, actor, application.HeadscaleReissuePayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation, Certificate: config})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(record.ID), Action: &helperproto.ActionResult{JobID: record.ID, JobResult: string(record.Result), Operation: string(domain.OperationHeadscaleReissue), TargetKind: "headscale", TargetID: "headscale"}}, nil
+	})
+	headscaleReadHandler := HeadscaleReadHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "headscale" {
+			return fmt.Errorf("headscale read caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("headscale read payload invalid")
+		}
+		result := &helperproto.HeadscaleResult{Operation: request.Resource.Operation}
+		switch request.Resource.Operation {
+		case string(domain.OperationHeadscaleUserList):
+			value, err := application.ListHeadscaleUsers(ctx, nil)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			result.Users = helperUsers(value.Users)
+		case string(domain.OperationPreauthKeyList):
+			value, err := application.ListHeadscalePreauthKeys(ctx, nil)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			result.Keys = helperKeys(value.Keys)
+		case string(domain.OperationDeviceList):
+			value, err := application.ListHeadscaleDevices(ctx, nil)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			result.Devices = helperDevices(value.Devices)
+		default:
+			return ExecutionResult{}, fmt.Errorf("headscale read operation unavailable")
+		}
+		return ExecutionResult{ResultDigest: digestString(request.Resource.Operation), Headscale: result}, nil
+	})
+	headscaleMutationHandler := HeadscaleMutationHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil {
+			return fmt.Errorf("headscale mutation caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("headscale mutation payload invalid")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		result := &helperproto.HeadscaleResult{Operation: request.Resource.Operation}
+		switch request.Resource.Operation {
+		case string(domain.OperationHeadscaleUserCreate):
+			var payload application.HeadscaleUserPayload
+			if err := decodeHeadscalePayload(request.Resource.Resource, &payload); err != nil {
+				return ExecutionResult{}, err
+			}
+			value, err := application.CreateHeadscaleUser(ctx, actor, payload, nil)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+			user := helperUser(value.User)
+			result.JobID, result.User = value.JobID, &user
+		case string(domain.OperationPreauthKeyRevoke), string(domain.OperationDeviceExpire):
+			var payload application.HeadscaleLifecyclePayload
+			if err := decodeHeadscalePayload(request.Resource.Resource, &payload); err != nil {
+				return ExecutionResult{}, err
+			}
+			kind, id, _ := strings.Cut(request.Target, "/")
+			target := domain.OperationTarget{Kind: domain.OperationTargetKind(kind), ID: id}
+			operation := domain.OperationCode(request.Resource.Operation)
+			if request.Resource.Confirmation == "plan" {
+				plan, err := application.CreateHeadscaleLifecyclePlan(ctx, actor, operation, target, payload, nil)
+				if err != nil {
+					return ExecutionResult{}, err
+				}
+				result.PlanID, result.ExposureSummary, result.Prerequisites, result.ExpiresAt = plan.ID, plan.ExposureSummary, plan.Prerequisites, plan.ExpiresAt
+				return ExecutionResult{ResultDigest: digestString(plan.ID), Headscale: result}, nil
+			}
+			if operation == domain.OperationPreauthKeyRevoke {
+				value, err := application.RevokeHeadscalePreauthKey(ctx, actor, target, payload, nil)
+				if err != nil {
+					return ExecutionResult{}, err
+				}
+				key := helperKey(value.Key)
+				result.JobID, result.Key = value.JobID, &key
+			} else {
+				value, err := application.ExpireHeadscaleDevice(ctx, actor, target, payload, nil)
+				if err != nil {
+					return ExecutionResult{}, err
+				}
+				device := helperDevice(value.Device)
+				result.JobID, result.Device = value.JobID, &device
+			}
+		default:
+			return ExecutionResult{}, fmt.Errorf("headscale mutation operation unavailable")
+		}
+		return ExecutionResult{ResultDigest: digestString(result.JobID), Headscale: result}, nil
+	})
+	preauthPlanHandler := PreauthKeyPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil {
+			return fmt.Errorf("preauth key Plan caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("preauth key Plan payload invalid")
+		}
+		var payload application.HeadscaleLifecyclePayload
+		if err := decodeHeadscalePayload(request.Resource.Resource, &payload); err != nil {
+			return ExecutionResult{}, err
+		}
+		if payload.ExpirationSeconds == 0 {
+			payload.ExpirationSeconds = 3600
+		}
+		_, id, _ := strings.Cut(request.Target, "/")
+		target := domain.OperationTarget{Kind: domain.OperationTargetHeadscaleUser, ID: id}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		plan, err := application.CreateHeadscaleLifecyclePlan(ctx, actor, domain.OperationPreauthKeyCreate, target, payload, nil)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(plan.ID), Headscale: &helperproto.HeadscaleResult{Operation: string(domain.OperationPreauthKeyCreate), PlanID: plan.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+	})
+	preauthCreateHandler := PreauthKeyCreateHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil {
+			return fmt.Errorf("preauth key create caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("preauth key create payload invalid")
+		}
+		var payload application.HeadscaleLifecyclePayload
+		if err := decodeHeadscalePayload(request.Resource.Resource, &payload); err != nil {
+			return ExecutionResult{}, err
+		}
+		_, id, _ := strings.Cut(request.Target, "/")
+		target := domain.OperationTarget{Kind: domain.OperationTargetHeadscaleUser, ID: id}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		value, err := application.CreateHeadscalePreauthKey(ctx, actor, target, payload, nil)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		output, err := helperproto.NewOutputSecret(value.Secret)
+		clear(value.Secret)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		key := helperKey(value.Key)
+		return ExecutionResult{ResultDigest: digestString(value.JobID), Secret: output, Headscale: &helperproto.HeadscaleResult{Operation: string(domain.OperationPreauthKeyCreate), JobID: value.JobID, Key: &key}}, nil
+	})
+	connectorMutationHandler := ConnectorMutationHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "connector" {
+			return fmt.Errorf("connector binding caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("connector binding payload invalid")
+		}
+		var payload application.ConnectorBindingPayload
+		if err := decodeHeadscalePayload(request.Resource.Resource, &payload); err != nil {
+			return ExecutionResult{}, err
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		value, err := application.SetConnectorBinding(ctx, actor, payload)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(value.JobID), Connector: &helperproto.ConnectorResult{Operation: string(domain.OperationConnectorBindingSet), JobID: value.JobID}}, nil
+	})
+	connectorReadHandler := ConnectorReadHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "connector" {
+			return fmt.Errorf("connector verify caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("connector verify carried secret")
+		}
+		value, err := application.VerifyConnector(ctx, nil, nil)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		result := helperConnectorObservation(value.Observation)
+		return ExecutionResult{ResultDigest: digestString(managedconnector.RedactedSummary(value.Observation)), Connector: &result}, nil
+	})
+	connectorPlanHandler := ConnectorLoginPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "connector" {
+			return fmt.Errorf("connector login Plan caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil {
+			return ExecutionResult{}, fmt.Errorf("connector login Plan carried secret")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		plan, err := application.CreateConnectorLoginPlan(ctx, actor)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(plan.ID), Connector: &helperproto.ConnectorResult{Operation: string(domain.OperationConnectorLogin), PlanID: plan.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
+	})
+	connectorLoginHandler := ConnectorLoginHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || request.Target != "connector" {
+			return fmt.Errorf("connector login caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret == nil {
+			return ExecutionResult{}, fmt.Errorf("connector login auth key missing")
+		}
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		payload := application.ConnectorLoginPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation}
+		login := func(loginCtx context.Context, jobID, controlURL string) error {
+			runner, uid, gid, err := application.OpenConnectorRuntime()
+			if err != nil {
+				return err
+			}
+			return secret.Use(func(value []byte) error {
+				return runConnectorLoginSecret(loginCtx, runner, uid, gid, jobID, controlURL, value)
+			})
+		}
+		value, err := application.ExecuteConnectorLogin(ctx, actor, payload, login, nil, nil)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(value.JobID), Connector: &helperproto.ConnectorResult{Operation: string(domain.OperationConnectorLogin), JobID: value.JobID}}, nil
+	})
+	resourceDeleteHandler := ResourceDeleteHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil || !strings.HasPrefix(request.Target, "resource/") {
+			return fmt.Errorf("resource delete caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("resource delete payload invalid")
+		}
+		id := strings.TrimPrefix(request.Target, "resource/")
+		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
+		value, err := application.DeleteResource(ctx, actor, domain.OperationTarget{Kind: domain.OperationTargetResource, ID: id}, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(value.JobID), Action: &helperproto.ActionResult{JobID: value.JobID}}, nil
+	})
+	productReadHandler := ProductReadHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Resource == nil {
+			return fmt.Errorf("product read caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Resource == nil {
+			return ExecutionResult{}, fmt.Errorf("product read payload invalid")
+		}
+		var value any
+		var err error
+		switch request.Resource.Operation {
+		case string(domain.OperationStatus):
+			if strings.HasPrefix(request.Target, "resource/") {
+				value, err = application.ObserveDomainLiveSources(strings.TrimPrefix(request.Target, "resource/"))
+			} else {
+				value, err = application.ReadSystemStatus(ctx)
+			}
+		case string(domain.OperationDiagnostics):
+			value, err = application.ReadDiagnostics(ctx)
+		case string(domain.OperationConfigurationExport):
+			value, err = application.ExportConfiguration(ctx)
+		case string(domain.OperationJobList):
+			value, err = application.ListJobs(ctx)
+		case string(domain.OperationJobDetail):
+			value, err = application.ReadJob(ctx, strings.TrimPrefix(request.Target, "job/"))
+		default:
+			return ExecutionResult{}, fmt.Errorf("product read operation unavailable")
+		}
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digestString(request.Resource.Operation + "/" + request.Target), Read: &helperproto.ReadResult{Operation: request.Resource.Operation, Payload: raw}}, nil
 	})
 	resourceMutationHandler := ResourceMutationHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil {
@@ -471,14 +774,28 @@ func RunRole(args []string) error {
 			if request.Target != "installation" {
 				return ExecutionResult{}, fmt.Errorf("resource create target is invalid")
 			}
-			var spec resource.LocalSpec
-			decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&spec); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-				return ExecutionResult{}, fmt.Errorf("resource create payload is invalid")
+			var kind struct {
+				TargetKind domain.AppTargetKind `json:"target_kind"`
 			}
-			candidate, err = resource.NewLocal(spec, nil)
-			if err == nil {
+			_ = json.Unmarshal(request.Resource.Resource, &kind)
+			if kind.TargetKind == domain.AppTargetTailnetHTTP {
+				var spec resource.TailnetSpec
+				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&spec); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+					return ExecutionResult{}, fmt.Errorf("tailnet resource create payload is invalid")
+				}
+				candidate, err = resource.NewTailnet(spec, nil)
+			} else {
+				var spec resource.LocalSpec
+				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
+				decoder.DisallowUnknownFields()
+				if err := decoder.Decode(&spec); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+					return ExecutionResult{}, fmt.Errorf("resource create payload is invalid")
+				}
+				candidate, err = resource.NewLocal(spec, nil)
+			}
+			if err == nil && candidate.ManagedProcess != nil {
 				err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
 			}
 			if err == nil {
@@ -507,13 +824,13 @@ func RunRole(args []string) error {
 			if err != nil {
 				return ExecutionResult{}, err
 			}
-			if candidate.ManagedProcess == nil {
-				return ExecutionResult{}, fmt.Errorf("resource update managed process is absent")
-			}
 			if request.Target != "resource/"+candidate.ID {
 				return ExecutionResult{}, fmt.Errorf("resource update target is invalid")
 			}
-			if err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests); err == nil {
+			if candidate.ManagedProcess != nil {
+				err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
+			}
+			if err == nil {
 				execution, err = application.BeginResourceUpdate(ctx, actor, candidate, secretDigests)
 			}
 		default:
@@ -891,14 +1208,31 @@ func RunRole(args []string) error {
 	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
-			return ExecutionResult{}, fmt.Errorf("Management profile request carried secret")
+			return ExecutionResult{}, fmt.Errorf("management profile request carried secret")
 		}
 		tokenMu.Lock()
-		profile := managementProfileWithRecovery(rotationRecoveryErr)
+		profile := managementProfileWithRecovery(errors.Join(adminRecoveryErr, otherRecoveryErr))
 		tokenMu.Unlock()
 		return ExecutionResult{ResultDigest: profileDigest(profile)}, nil
 	})
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, packageHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, renewalHandler, profileHandler}, Options{})
+	mutationGate := func(request helperproto.Request) error {
+		tokenMu.Lock()
+		recoveryErr := errors.Join(adminRecoveryErr, otherRecoveryErr)
+		tokenMu.Unlock()
+		if recoveryErr == nil {
+			return nil
+		}
+		switch request.Operation {
+		case helperproto.OperationAdminTokenVerify, helperproto.OperationAdminTokenSource, helperproto.OperationManagementProfile, helperproto.OperationAdminTokenReconcile, helperproto.OperationDomainStatus, helperproto.OperationHeadscaleRead, helperproto.OperationConnectorRead, helperproto.OperationProductRead, helperproto.OperationContractionClose, helperproto.OperationStartupContraction:
+			return nil
+		case helperproto.OperationApplicationPlan:
+			if request.Action != nil && (request.Action.Operation == "close_all" || request.Action.Operation == "unpublish") {
+				return nil
+			}
+		}
+		return fmt.Errorf("startup recovery is incomplete")
+	}
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, headscaleReadHandler, headscaleMutationHandler, preauthPlanHandler, preauthCreateHandler, connectorMutationHandler, connectorReadHandler, connectorPlanHandler, connectorLoginHandler, resourceDeleteHandler, productReadHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, headscaleDeployHandler, headscaleReissueHandler, renewalHandler, profileHandler}, Options{MutationGate: mutationGate})
 	if err != nil {
 		return err
 	}
@@ -906,7 +1240,7 @@ func RunRole(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	if err := notifyReady(); err != nil {
 		return err
 	}
@@ -928,7 +1262,7 @@ func reconcileStartupContraction(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	snapshot, err := service.Snapshot()
 	if err != nil {
 		return err
@@ -938,7 +1272,7 @@ func reconcileStartupContraction(ctx context.Context) error {
 	}
 	result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
-		return nil
+		return errors.Join(runErr, fmt.Errorf("startup contraction did not converge: %s", result.Outcome))
 	}
 	return runErr
 }
@@ -961,10 +1295,225 @@ func lookupGroupGID(name string) (uint32, error) {
 	return 0, fmt.Errorf("fixed group identity is missing")
 }
 
+func cleanupConnectorLoginSecrets() error {
+	authorities, err := application.ConnectorLoginTempAuthorities()
+	if err != nil {
+		return err
+	}
+	_, uid, gid, err := application.OpenConnectorRuntime()
+	if err != nil {
+		return err
+	}
+	directory, err := unix.Open("/var/lib/lanpanel/connector/auth", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(directory) }()
+	var stat unix.Stat_t
+	if err := unix.Fstat(directory, &stat); err != nil || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != 0o700 {
+		return fmt.Errorf("connector auth temp directory is unsafe")
+	}
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", directory))
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".key") {
+			return fmt.Errorf("connector auth directory contains foreign member")
+		}
+		jobID := strings.TrimSuffix(name, ".key")
+		if !authorities[jobID] {
+			return fmt.Errorf("connector auth temp file lacks exact job authority")
+		}
+		var item unix.Stat_t
+		if err := unix.Fstatat(directory, name, &item, unix.AT_SYMLINK_NOFOLLOW); err != nil || item.Mode&unix.S_IFMT != unix.S_IFREG || item.Mode&0o7777 != 0o600 || item.Uid != uid || item.Gid != gid || item.Nlink != 1 {
+			return fmt.Errorf("connector auth temp file is unsafe")
+		}
+		if err := unix.Unlinkat(directory, name, 0); err != nil {
+			return err
+		}
+	}
+	return unix.Fsync(directory)
+}
+
+func helperConnectorObservation(value managedconnector.Observation) helperproto.ConnectorResult {
+	local, peers := make([]string, len(value.LocalIPs)), make([]string, len(value.Peers))
+	for index, address := range value.LocalIPs {
+		local[index] = address.String()
+	}
+	for index, peer := range value.Peers {
+		peers[index] = peer.IP.String()
+	}
+	slices.Sort(local)
+	slices.Sort(peers)
+	return helperproto.ConnectorResult{Operation: string(domain.OperationConnectorVerify), ClientVersion: value.ClientVersion, ControlURL: value.ControlURL, LocalIPs: local, PeerIPs: peers, ValidUntil: value.ValidUntil}
+}
+
+func runConnectorLoginSecret(ctx context.Context, runner managedconnector.Runner, uid, gid uint32, jobID, controlURL string, secret []byte) (returnErr error) {
+	if runner == nil || uid == 0 || gid == 0 || !strings.HasPrefix(jobID, "job_") || len(jobID) != 68 || len(secret) < 16 || len(secret) > 4096 || connectorSecretHasSeparator(secret) {
+		return fmt.Errorf("connector login secret authority invalid")
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(jobID, "job_")); err != nil {
+		return fmt.Errorf("connector login job ID invalid")
+	}
+	parent, err := unix.Open("/var/lib/lanpanel", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(parent) }()
+	if err := ensureConnectorDirectory(parent, "connector", 0, 0, 0o711); err != nil {
+		return err
+	}
+	connectorFD, err := unix.Openat(parent, "connector", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(connectorFD) }()
+	if err := ensureConnectorDirectory(connectorFD, "auth", uid, gid, 0o700); err != nil {
+		return err
+	}
+	authFD, err := unix.Openat(connectorFD, "auth", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(authFD) }()
+	name := jobID + ".key"
+	fd, err := unix.Openat(authFD, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return err
+	}
+	cleanup := func() error {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+		unlinkErr := unix.Unlinkat(authFD, name, 0)
+		syncErr := unix.Fsync(authFD)
+		var stat unix.Stat_t
+		absenceErr := unix.Fstatat(authFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if absenceErr == nil {
+			return errors.Join(unlinkErr, syncErr, fmt.Errorf("connector auth key temp file remains"))
+		}
+		if !errors.Is(absenceErr, unix.ENOENT) {
+			return errors.Join(unlinkErr, syncErr, absenceErr)
+		}
+		return errors.Join(unlinkErr, syncErr)
+	}
+	defer func() { returnErr = errors.Join(returnErr, cleanup()) }()
+	if err := unix.Fchown(fd, int(uid), int(gid)); err != nil {
+		return err
+	}
+	written := 0
+	for written < len(secret) {
+		n, writeErr := unix.Write(fd, secret[written:])
+		if writeErr != nil {
+			return writeErr
+		}
+		if n == 0 {
+			return fmt.Errorf("short connector auth key write")
+		}
+		written += n
+	}
+	if err := unix.Fsync(fd); err != nil {
+		return err
+	}
+	if err := unix.Close(fd); err != nil {
+		return err
+	}
+	fd = -1
+	return managedconnector.Login(ctx, runner, controlURL, "/var/lib/lanpanel/connector/auth/"+name)
+}
+
+func connectorSecretHasSeparator(value []byte) bool {
+	for _, character := range value {
+		switch character {
+		case 0, '\r', '\n', ' ', '\t':
+			return true
+		}
+	}
+	return false
+}
+
+func ensureConnectorDirectory(parent int, name string, uid, gid uint32, mode uint32) error {
+	if err := unix.Mkdirat(parent, name, mode); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if stat.Uid == 0 && stat.Gid == 0 && (uid != 0 || gid != 0) {
+		if err := unix.Fchown(fd, int(uid), int(gid)); err != nil {
+			return err
+		}
+		if err := unix.Fstat(fd, &stat); err != nil {
+			return err
+		}
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != mode {
+		return fmt.Errorf("connector auth directory metadata is unsafe")
+	}
+	return unix.Fsync(parent)
+}
+
+func decodeHeadscalePayload(raw json.RawMessage, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return fmt.Errorf("headscale lifecycle payload is invalid")
+	}
+	return nil
+}
+
+func helperUser(value managedheadscale.User) helperproto.HeadscaleUserRecord {
+	return helperproto.HeadscaleUserRecord{ID: value.ID, Name: value.Name, CreatedAt: value.CreatedAt, DeviceCount: value.DeviceCount, ActiveKeyCount: value.ActiveKeyCount}
+}
+
+func helperUsers(values []managedheadscale.User) []helperproto.HeadscaleUserRecord {
+	result := make([]helperproto.HeadscaleUserRecord, len(values))
+	for index, value := range values {
+		result[index] = helperUser(value)
+	}
+	return result
+}
+
+func helperKey(value managedheadscale.PreauthKey) helperproto.HeadscaleKeyRecord {
+	return helperproto.HeadscaleKeyRecord{ID: value.ID, UserID: value.UserID, Reusable: value.Reusable, Ephemeral: value.Ephemeral, Used: value.Used, Expiration: value.Expiration, CreatedAt: value.CreatedAt}
+}
+
+func helperKeys(values []managedheadscale.PreauthKey) []helperproto.HeadscaleKeyRecord {
+	result := make([]helperproto.HeadscaleKeyRecord, len(values))
+	for index, value := range values {
+		result[index] = helperKey(value)
+	}
+	return result
+}
+
+func helperDevice(value managedheadscale.Device) helperproto.HeadscaleDeviceRecord {
+	return helperproto.HeadscaleDeviceRecord{ID: value.ID, Name: value.Name, UserID: value.UserID, IPAddresses: append([]string(nil), value.IPAddresses...), Online: value.Online, Expiry: value.Expiry, CreatedAt: value.CreatedAt}
+}
+
+func helperDevices(values []managedheadscale.Device) []helperproto.HeadscaleDeviceRecord {
+	result := make([]helperproto.HeadscaleDeviceRecord, len(values))
+	for index, value := range values {
+		result[index] = helperDevice(value)
+	}
+	return result
+}
+
 func digestString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func executeDomainPublication(ctx context.Context, request helperproto.Request) (output ExecutionResult, resultErr error) {
 	execution, err := application.BeginCertificateIssue(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 	if err != nil {
@@ -1029,28 +1578,36 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		return independent(err)
 	}
 	if err := service.ObserveCertificateTrustedWall(ctx, now); err != nil {
-		service.Close()
+		_ = service.Close()
 		return independent(err)
 	}
 	state, err := service.SafetyState()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return independent(err)
 	}
 	document, err := service.Normal().Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return independent(err)
 	}
 	raw, present := document.Entries["installations/current"]
 	if !present {
-		service.Close()
+		_ = service.Close()
 		return independent(fmt.Errorf("installation authority missing"))
 	}
 	installation, err := domain.DecodeInstallation(raw)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return independent(err)
+	}
+	headscaleDecision, decisionErr := renewal.EvaluateHeadscale(now, 30*24*time.Hour, installation.Headscale, state)
+	if decisionErr != nil {
+		_ = service.Close()
+		return independent(decisionErr)
+	}
+	if state.Headscale.CertificateExpiry != nil {
+		headscaleDecision = renewal.DecisionContract
 	}
 	decisions := map[string]renewal.Decision{}
 	for _, resource := range installation.Resources {
@@ -1064,7 +1621,7 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		}
 		decision, decisionErr := renewal.Evaluate(renewal.Input{Now: now, RenewBefore: 30 * 24 * time.Hour, Publication: resource.PublicationRecord, Safety: state, ResourceID: resource.ID})
 		if decisionErr != nil {
-			service.Close()
+			_ = service.Close()
 			return independent(decisionErr)
 		}
 		if decision != renewal.DecisionIdle {
@@ -1075,6 +1632,19 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		return independent(err)
 	}
 	summary := strings.Builder{}
+	switch headscaleDecision {
+	case renewal.DecisionContract:
+		if err := application.ContractExpiredHeadscaleCertificate(ctx, now); err != nil {
+			return independent(err)
+		}
+		summary.WriteString("headscale:contracted;")
+	case renewal.DecisionRenew:
+		fingerprint, renewErr := application.ExecuteHeadscaleCertificateRenewal(ctx)
+		if renewErr != nil {
+			return independent(renewErr)
+		}
+		fmt.Fprintf(&summary, "headscale:renewed:%s;", fingerprint)
+	}
 	for _, resource := range installation.Resources {
 		if decisions[resource.ID] != renewal.DecisionContract {
 			continue
@@ -1090,7 +1660,7 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		}
 		fingerprint, err := executeCertificateRenewal(ctx, resource.ID)
 		if err != nil {
-			return ExecutionResult{}, err
+			return independent(err)
 		}
 		fmt.Fprintf(&summary, "%s:renewed:%s;", resource.ID, fingerprint)
 		break
@@ -1103,7 +1673,7 @@ func executeCertificateRenewal(ctx context.Context, resourceID string) (string, 
 	if err != nil {
 		return "", err
 	}
-	defer execution.Close()
+	defer func(ignore func() error) { _ = ignore() }(execution.Close)
 	abort := func(cause error) error { return execution.Abort(context.WithoutCancel(ctx), cause) }
 	stageIdentity := child.Identity{UID: execution.StageUID, GID: execution.StageGID, Chroot: "/var/lib/lanpanel/certificates/chroot/" + execution.Challenge.Safety.CertificateIdentity}
 	if err := execution.ActivateChallenge(ctx); err != nil {
@@ -1129,6 +1699,7 @@ func executeCertificateRenewal(ctx context.Context, resourceID string) (string, 
 	}
 	return bundle.Fingerprint, nil
 }
+
 func ReadIdentityConfig() (IdentityConfig, error) {
 	parent := filepath.Dir(FixedIdentityConfigPath)
 	if err := validateRootParentChain(parent, 0, 0o711); err != nil {
@@ -1138,7 +1709,7 @@ func ReadIdentityConfig() (IdentityConfig, error) {
 	if err != nil {
 		return IdentityConfig{}, fmt.Errorf("open helper identity parent: %w", err)
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Uid != 0 || parentStat.Gid != 0 || parentStat.Mode&0o777 != 0o711 {
 		return IdentityConfig{}, fmt.Errorf("helper identity parent is not root-owned mode 0711")
@@ -1152,7 +1723,7 @@ func ReadIdentityConfig() (IdentityConfig, error) {
 		_ = unix.Close(fd)
 		return IdentityConfig{}, fmt.Errorf("helper identity descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size <= 0 || stat.Size > maximumIdentityConfigBytes {
 		return IdentityConfig{}, fmt.Errorf("helper identity config ownership, type, mode, link, or size is invalid")

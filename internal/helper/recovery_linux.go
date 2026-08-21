@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func RunFencedRecovery(args []string) error {
+func RunStartupRecovery(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("fenced recovery rejects arguments")
 	}
@@ -31,7 +31,7 @@ func RunFencedRecovery(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	if err := connection.SetDeadline(request.Deadline); err != nil {
 		return err
 	}

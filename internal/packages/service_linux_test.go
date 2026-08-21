@@ -7,15 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"lanpanel/internal/filetxn"
+	"lanpanel/internal/preflight"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"lanpanel/internal/filetxn"
-	"lanpanel/internal/helperproto"
-	"lanpanel/internal/preflight"
 )
 
 func TestPackageServiceSerializesExecution(t *testing.T) {
@@ -31,7 +29,7 @@ func TestPackageServiceSerializesExecution(t *testing.T) {
 	}()
 	<-locked
 	go func() {
-		_, _ = service.Execute(context.Background(), helperproto.Request{})
+		_, _ = service.Execute(context.Background(), Request{})
 		close(done)
 	}()
 	select {
@@ -65,7 +63,7 @@ func TestPackageServiceBindsCanonicalPlanToHelperIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer files.Close()
+	defer func(ignore func() error) { _ = ignore() }(files.Close)
 	journals, err := NewFileJournalStore(files, journalsPath, owner)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +89,7 @@ func TestPackageServiceBindsCanonicalPlanToHelperIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &Service{files: files, journal: journals, owner: owner, planRoot: plans}
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-one", Operation: helperproto.OperationPackageTransaction, Target: "installation", IntentGeneration: plan.IntentGeneration, Deadline: plan.Deadline, InputDigest: inputDigest}
+	request := Request{SchemaVersion: PackageRequestSchemaVersion, IntentGeneration: plan.IntentGeneration, Deadline: plan.Deadline, InputDigest: inputDigest}
 	// Production adds current installation/release authority verification. This
 	// narrow test proves digest/generation/deadline binding and fails closed
 	// before that verifier when authority is absent.
@@ -111,6 +109,6 @@ func TestPackageServiceBindsCanonicalPlanToHelperIntent(t *testing.T) {
 	}
 	request.IntentGeneration++
 	if _, err := service.loadPlan(context.Background(), request); err == nil {
-		t.Fatal("helper intent generation mismatch was accepted")
+		t.Fatal("package intent generation mismatch was accepted")
 	}
 }

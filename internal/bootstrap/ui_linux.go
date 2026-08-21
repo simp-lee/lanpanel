@@ -34,7 +34,7 @@ func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	verifier := ui.HelperVerifier{}
 	fingerprint := "unavailable"
 	for attempt := 0; attempt < 50; attempt++ {
@@ -56,7 +56,7 @@ func RunUIRole(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	actions, err := application.HelperServiceWithResources(ui.HelperApplicationRequest, ui.HelperResourceRequest)
+	actions, err := application.HelperServiceComplete(ui.HelperApplicationRequest, ui.HelperResourceRequest, ui.HelperSecretResourceRequest)
 	if err != nil {
 		return err
 	}

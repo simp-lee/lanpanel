@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"lanpanel/internal/acmeaccount"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -162,6 +163,7 @@ func LoadDNSBinding(directoryURL, accountKeyPath, accountEmail string, termsAcce
 	}
 	return Binding{DirectoryURL: directory, AccountKeyPath: accountKeyPath, AccountKeyFingerprint: accountFingerprint, AccountEmail: accountEmail, TermsAccepted: true, Method: ChallengeDNS01, Provider: provider, ProfilePath: profilePath, ProfileFingerprint: profileFingerprint, CredentialFiles: credentials, Zone: zone, Principal: principal}, nil
 }
+
 func LoadHTTPBinding(directoryURL, accountKeyPath, accountEmail string, termsAccepted bool) (Binding, error) {
 	directory, err := canonicalDirectory(directoryURL)
 	if err != nil {
@@ -176,6 +178,7 @@ func LoadHTTPBinding(directoryURL, accountKeyPath, accountEmail string, termsAcc
 	}
 	return Binding{DirectoryURL: directory, AccountKeyPath: accountKeyPath, AccountKeyFingerprint: fingerprint, AccountEmail: accountEmail, TermsAccepted: true, Method: ChallengeHTTP01, CredentialFiles: []CredentialFile{}}, nil
 }
+
 func ValidateBinding(binding Binding) error {
 	if _, err := canonicalDirectory(binding.DirectoryURL); err != nil {
 		return err
@@ -220,6 +223,7 @@ func ValidateBinding(binding Binding) error {
 	}
 	return nil
 }
+
 func BindingDigest(binding Binding) (string, error) {
 	if err := ValidateBinding(binding); err != nil {
 		return "", err
@@ -232,6 +236,7 @@ func BindingDigest(binding Binding) (string, error) {
 	sum := sha256.Sum256([]byte(data.String()))
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
+
 func validDNSZone(value string) bool {
 	if value == "" || value != strings.ToLower(value) || strings.HasSuffix(value, ".") || len(value) > 253 {
 		return false
@@ -248,9 +253,9 @@ func validDNSZone(value string) bool {
 	}
 	return true
 }
-func validAccountEmail(value string) bool {
-	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
-}
+
+func validAccountEmail(value string) bool { return acmeaccount.ValidContact(value) }
+
 func canonicalDirectory(value string) (string, error) {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.String() != value {
@@ -258,6 +263,7 @@ func canonicalDirectory(value string) (string, error) {
 	}
 	return value, nil
 }
+
 func parseProfile(path string) (map[string]string, error) {
 	if !cleanAbsolute(path) {
 		return nil, fmt.Errorf("DNS profile path invalid")
@@ -266,7 +272,7 @@ func parseProfile(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 32<<10)
 	values := map[string]string{}
@@ -286,12 +292,13 @@ func parseProfile(path string) (map[string]string, error) {
 	}
 	return values, nil
 }
+
 func validateRoute53Credentials(path, profile string) error {
 	file, err := openProtected(path)
 	if err != nil {
 		return fmt.Errorf("Route53 credentials: %w", err)
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	scanner := bufio.NewScanner(io.LimitReader(file, 64<<10+1))
 	scanner.Buffer(make([]byte, 1024), 64<<10)
 	section := ""
@@ -335,12 +342,13 @@ func validateRoute53Credentials(path, profile string) error {
 	}
 	return nil
 }
+
 func validateGCloudCredentials(path, project string) error {
 	file, err := openProtected(path)
 	if err != nil {
 		return fmt.Errorf("GCloud credentials: %w", err)
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	data, err := io.ReadAll(io.LimitReader(file, 64<<10+1))
 	if err != nil || len(data) == 0 || len(data) > 64<<10 {
 		return fmt.Errorf("GCloud credentials invalid")
@@ -367,12 +375,13 @@ func validateGCloudCredentials(path, project string) error {
 	}
 	return nil
 }
+
 func fingerprintProtected(path string) (string, error) {
 	file, err := openProtected(path)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	sum := sha256.New()
 	buffer := make([]byte, 4096)
 	total := 0
@@ -397,6 +406,7 @@ func fingerprintProtected(path string) (string, error) {
 	}
 	return "sha256:" + hex.EncodeToString(sum.Sum(nil)), nil
 }
+
 func openProtected(path string) (*os.File, error) {
 	if !cleanAbsolute(path) {
 		return nil, fmt.Errorf("protected path invalid")
@@ -410,16 +420,17 @@ func openProtected(path string) (*os.File, error) {
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("protected descriptor invalid")
 	}
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("protected source metadata unsafe")
 	}
 	return file, nil
 }
+
 func safeParents(path string) error {
 	for current := filepath.Dir(path); ; current = filepath.Dir(current) {
 		var stat unix.Stat_t
@@ -431,9 +442,11 @@ func safeParents(path string) error {
 		}
 	}
 }
+
 func cleanAbsolute(value string) bool {
 	return filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.ContainsAny(value, "\x00\r\n")
 }
+
 func digest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
 		return false

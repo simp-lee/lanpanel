@@ -10,13 +10,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"lanpanel/internal/child"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-
-	"lanpanel/internal/child"
 
 	"golang.org/x/sys/unix"
 )
@@ -206,7 +205,7 @@ func (auditor *LinuxAuditor) readConfigEntry(path string, kind ConfigKind, direc
 		if err != nil {
 			return nil, err
 		}
-		defer unix.Close(fd)
+		defer func() { _ = unix.Close(fd) }()
 		entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", fd))
 		if err != nil {
 			return nil, err
@@ -228,7 +227,7 @@ func (auditor *LinuxAuditor) readConfigEntry(path string, kind ConfigKind, direc
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	observed, err := readObservedAt(parentFD, path, filepath.Base(path), kind, auditor.strict)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -244,7 +243,7 @@ func readObservedAt(parentFD int, path, name string, kind ConfigKind, strict boo
 	if err != nil {
 		return ObservedConfig{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	owner, group := uint32(0), uint32(0)
 	if !strict {
@@ -534,12 +533,12 @@ func (auditor *LinuxAuditor) readFileAndStat(path string, maximum int64) ([]byte
 	if err != nil {
 		return nil, unix.Stat_t{}, err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	fd, err := unix.Openat(parent, filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, unix.Stat_t{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var before, after unix.Stat_t
 	owner, group := uint32(0), uint32(0)
 	if !auditor.strict {

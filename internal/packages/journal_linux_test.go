@@ -4,14 +4,19 @@ package packages
 
 import (
 	"context"
+	"lanpanel/internal/child"
+	"lanpanel/internal/filetxn"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"lanpanel/internal/child"
-	"lanpanel/internal/filetxn"
 )
+
+func TestLegacyPackageJournalSchemaIsRejected(t *testing.T) {
+	if ValidateJournal(Journal{SchemaVersion: "lanpanel.package.journal.v1"}) == nil {
+		t.Fatal("legacy package journal schema accepted")
+	}
+}
 
 func TestPackageJournalFileStorePersistsCanonicalCASPhases(t *testing.T) {
 	root := t.TempDir()
@@ -34,13 +39,13 @@ func TestPackageJournalFileStorePersistsCanonicalCASPhases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer files.Close()
+	defer func(ignore func() error) { _ = ignore() }(files.Close)
 	store, err := NewFileJournalStore(files, transactions, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	transactionID := "pkg_" + strings.Repeat("1", 64)
-	prepared := Journal{SchemaVersion: "lanpanel.package.journal.v1", TransactionID: transactionID, NormalJournalID: "package-" + transactionID, ChildID: "package-child-" + transactionID, JobID: "job_" + strings.Repeat("2", 64), PlanDigest: strings.Repeat("3", 64), AuthorityDigest: strings.Repeat("4", 64), PackageProfile: child.ProfileAPTTransaction, Prior: RuntimeSnapshot{Installed: []Package{}, Units: []UnitState{}, Listeners: []Listener{}}, Phase: JournalPrepared, Masks: []MaskIdentity{}}
+	prepared := Journal{SchemaVersion: PackageJournalSchemaVersion, TransactionID: transactionID, NormalJournalID: "package-" + transactionID, ChildID: "package-child-" + transactionID, JobID: "job_" + strings.Repeat("2", 64), PlanDigest: strings.Repeat("3", 64), AuthorityDigest: strings.Repeat("4", 64), PackageProfile: child.ProfileAPTTransaction, Prior: RuntimeSnapshot{Installed: []Package{}, Units: []UnitState{}, Listeners: []Listener{}}, Phase: JournalPrepared, Masks: []MaskIdentity{}}
 	if err := store.Create(context.Background(), prepared); err != nil {
 		t.Fatal(err)
 	}

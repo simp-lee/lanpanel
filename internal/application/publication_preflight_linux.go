@@ -4,10 +4,9 @@ package application
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"lanpanel/internal/activation"
+	managedconnector "lanpanel/internal/connector"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/preflight"
@@ -15,13 +14,12 @@ import (
 	"lanpanel/internal/release"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/target"
+	"net/netip"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 func evaluateTemporaryPreflight(ctx context.Context, installation domain.Installation, resource domain.AppResource, state safety.State, owned *ownership.Record) (preflight.ExpansionRequest, preflight.Result, error) {
@@ -34,10 +32,7 @@ func evaluateTemporaryPreflight(ctx context.Context, installation domain.Install
 		return preflight.ExpansionRequest{}, preflight.Result{}, err
 	}
 	profile := identity.Profile
-	authority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + identity.ProfileDigest, LiveQualified: true}
-	if identity.Kind == release.EnvelopeQualificationCandidate {
-		authority = preflight.ProfileAuthority{Kind: preflight.QualificationCandidate, Digest: "sha256:" + identity.ProfileDigest, CandidateDigest: "sha256:" + identity.CandidateDigest, ManifestDigest: "sha256:" + identity.QualificationManifest, HostFingerprint: identity.HostFingerprint, CaseID: identity.CaseID}
-	}
+	authority := installedProfileAuthority(identity)
 	confinement := profile.ManagedConfinement
 	ownedListeners := []preflight.OwnedListenerAuthority{}
 	if owned != nil {
@@ -88,10 +83,7 @@ func evaluateDomainPreflight(ctx context.Context, installation domain.Installati
 		return preflight.ExpansionRequest{}, preflight.Result{}, err
 	}
 	profile := identity.Profile
-	authority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + identity.ProfileDigest, LiveQualified: true}
-	if identity.Kind == release.EnvelopeQualificationCandidate {
-		authority = preflight.ProfileAuthority{Kind: preflight.QualificationCandidate, Digest: "sha256:" + identity.ProfileDigest, CandidateDigest: "sha256:" + identity.CandidateDigest, ManifestDigest: "sha256:" + identity.QualificationManifest, HostFingerprint: identity.HostFingerprint, CaseID: identity.CaseID}
-	}
+	authority := installedProfileAuthority(identity)
 	domains := append([]string{publication.CanonicalDomain}, publication.Aliases...)
 	slices.Sort(domains)
 	host, err := activation.NewFixedHost()
@@ -159,35 +151,47 @@ func nginxListenerInode(path string, port uint16) (uint64, error) {
 }
 
 func loadInstalledReleaseIdentity() (release.InstallIdentity, error) {
-	path := "/var/lib/lanpanel/installation/bundle.json"
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return release.InstallIdentity{}, err
-	}
-	file := os.NewFile(uintptr(fd), path)
-	if file == nil {
-		unix.Close(fd)
-		return release.InstallIdentity{}, fmt.Errorf("installation release descriptor invalid")
-	}
-	defer file.Close()
-	var stat unix.Stat_t
-	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o777 != 0o600 || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > 4<<20 {
-		return release.InstallIdentity{}, fmt.Errorf("installation release authority is unsafe")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, 4<<20+1))
-	if err != nil || int64(len(data)) != stat.Size {
-		return release.InstallIdentity{}, fmt.Errorf("installation release authority changed")
-	}
-	var bundle struct {
-		Release release.InstallIdentity `json:"release"`
-	}
-	if err := json.Unmarshal(data, &bundle); err != nil || release.ValidateInstallIdentity(bundle.Release) != nil {
-		return release.InstallIdentity{}, fmt.Errorf("installation release authority invalid")
-	}
-	return bundle.Release, nil
+	return readCommittedReleaseIdentity()
 }
 
 func probeResourceTarget(ctx context.Context, resource domain.AppResource) (target.Evidence, error) {
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
+		verified, err := VerifyConnector(ctx, nil, nil)
+		if err != nil {
+			return target.Evidence{}, err
+		}
+		address, err := netip.ParseAddr(resource.Target.TailnetHTTP.IP)
+		if err != nil {
+			return target.Evidence{}, err
+		}
+		if err := managedconnector.VerifyPeer(verified.Observation, address, time.Now().UTC()); err != nil {
+			return target.Evidence{}, err
+		}
+		source, sourceErr := netip.ParseAddr(resource.Target.TailnetHTTP.SourceIP)
+		if sourceErr != nil || !slices.Contains(verified.Observation.LocalIPs, source) {
+			return target.Evidence{}, fmt.Errorf("tailnet source IP is not a fresh local connector identity")
+		}
+		endpointIdentity := digestLifecycle(struct {
+			ControlURL, IP string
+			Port           uint16
+			ValidUntil     time.Time
+		}{verified.Observation.ControlURL, address.String(), resource.Target.TailnetHTTP.Port, verified.Observation.ValidUntil})
+		accessMode := domain.AppAccessPublic
+		hostName := "lanpanel-target.invalid"
+		if resource.Publication.DomainHTTPS != nil {
+			accessMode = resource.Publication.DomainHTTPS.AccessMode
+			hostName = resource.Publication.DomainHTTPS.CanonicalDomain
+		}
+		request := target.ProbeRequest{ResourceID: resource.ID, ConfigDigest: resource.CurrentConfigDigest, EndpointIdentity: endpointIdentity, Target: resource.Target, AccessMode: accessMode, Host: hostName}
+		transport, err := target.NewTailnetTransport(address.String(), resource.Target.TailnetHTTP.SourceIP, resource.Target.TailnetHTTP.Port, endpointIdentity)
+		if err != nil {
+			return target.Evidence{}, err
+		}
+		return target.Probe(ctx, request, transport)
+	}
+	if resource.ManagedProcess == nil {
+		return target.Evidence{}, fmt.Errorf("local target managed process missing")
+	}
 	bundle := resource.ManagedProcess.Applied
 	if bundle == nil {
 		return target.Evidence{}, fmt.Errorf("applied process bundle missing")
@@ -233,4 +237,14 @@ func probeResourceTarget(ctx context.Context, resource domain.AppResource) (targ
 		return target.Evidence{}, err
 	}
 	return target.Probe(ctx, request, transport)
+}
+
+func targetEvidenceGeneration(resource domain.AppResource) uint64 {
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
+		return resource.PublicationRecord.UnpublishedGeneration
+	}
+	if resource.ManagedProcess != nil && resource.ManagedProcess.Applied != nil {
+		return resource.ManagedProcess.Applied.Generation
+	}
+	return 0
 }

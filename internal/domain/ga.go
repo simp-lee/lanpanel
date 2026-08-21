@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"lanpanel/internal/acmeaccount"
 	"net/netip"
 	"net/url"
 	"path/filepath"
@@ -83,10 +84,10 @@ const (
 type PrerequisiteCode string
 
 const (
-	PrerequisiteHeadscaleNotConfigured       PrerequisiteCode = "headscale_not_configured"
-	PrerequisiteConnectorRequired            PrerequisiteCode = "connector_required"
-	PrerequisiteOSProfileLiveUnqualified     PrerequisiteCode = "os_profile_live_unqualified"
-	PrerequisiteDependencyTransitionRequired PrerequisiteCode = "dependency_transition_required"
+	PrerequisiteHeadscaleNotConfigured   PrerequisiteCode = "headscale_not_configured"
+	PrerequisiteConnectorRequired        PrerequisiteCode = "connector_required"
+	PrerequisiteOSProfileLiveUnqualified PrerequisiteCode = "os_profile_live_unqualified"
+	PrerequisitePackageIdentityDrift     PrerequisiteCode = "package_identity_drift"
 )
 
 type OperationCode string
@@ -97,9 +98,11 @@ const (
 	OperationTargetInstallation  OperationTargetKind = "installation"
 	OperationTargetResource      OperationTargetKind = "resource"
 	OperationTargetCredential    OperationTargetKind = "credential"
+	OperationTargetHeadscale     OperationTargetKind = "headscale"
 	OperationTargetHeadscaleUser OperationTargetKind = "headscale_user"
 	OperationTargetPreauthKey    OperationTargetKind = "preauth_key"
 	OperationTargetDevice        OperationTargetKind = "device"
+	OperationTargetConnector     OperationTargetKind = "connector"
 	OperationTargetJob           OperationTargetKind = "job"
 )
 
@@ -109,40 +112,12 @@ type OperationTarget struct {
 }
 
 const (
-	OperationInstanceConfigCreate     OperationCode = "instance_config_create"
-	OperationInstanceConfigUpdate     OperationCode = "instance_config_update"
-	OperationValidate                 OperationCode = "validate"
 	OperationPlan                     OperationCode = "plan"
-	OperationDeploy                   OperationCode = "deploy"
 	OperationStatus                   OperationCode = "status"
-	OperationDiagnostics              OperationCode = "diagnostics"
-	OperationConfigurationExport      OperationCode = "configuration_export"
 	OperationAdminTokenRotate         OperationCode = "admin_token_rotate"
+	OperationHeadscaleInitialize      OperationCode = "headscale_initialize"
+	OperationHeadscaleControlDeploy   OperationCode = "headscale_control_deploy"
 	OperationHeadscaleReissue         OperationCode = "headscale_certificate_reissue"
-	OperationDependencyUpload         OperationCode = "dependency_upload"
-	OperationDependencyImport         OperationCode = "dependency_import"
-	OperationMaintenance              OperationCode = "maintenance"
-	OperationBackupEnter              OperationCode = "backup_enter"
-	OperationBackupPreparingAbort     OperationCode = "backup_preparing_abort"
-	OperationBackupExit               OperationCode = "backup_exit"
-	OperationRestoreEvidenceImport    OperationCode = "restore_evidence_import"
-	OperationRestoreCutover           OperationCode = "restore_cutover"
-	OperationConnectorVerify          OperationCode = "connector_verify"
-	OperationConnectorAuthKeyImport   OperationCode = "connector_auth_key_import"
-	OperationConnectorAuthKeyAdopt    OperationCode = "connector_auth_key_adopt"
-	OperationConnectorAuthKeyDiscard  OperationCode = "connector_auth_key_discard"
-	OperationConnectorLogin           OperationCode = "connector_login"
-	OperationConnectorDisconnect      OperationCode = "connector_disconnect"
-	OperationConnectorRebind          OperationCode = "connector_rebind"
-	OperationResourceCreate           OperationCode = "resource_create"
-	OperationResourceUpdate           OperationCode = "resource_update"
-	OperationResourceDelete           OperationCode = "resource_delete"
-	OperationPublish                  OperationCode = "publish"
-	OperationUnpublish                OperationCode = "unpublish"
-	OperationCloseAll                 OperationCode = "close_all"
-	OperationProcessStart             OperationCode = "process_start"
-	OperationProcessStop              OperationCode = "process_stop"
-	OperationUnpublishAndStop         OperationCode = "unpublish_and_stop"
 	OperationHeadscaleUserCreate      OperationCode = "headscale_user_create"
 	OperationHeadscaleUserList        OperationCode = "headscale_user_list"
 	OperationPreauthKeyCreate         OperationCode = "preauth_key_create"
@@ -150,16 +125,26 @@ const (
 	OperationPreauthKeyRevoke         OperationCode = "preauth_key_revoke"
 	OperationDeviceList               OperationCode = "device_list"
 	OperationDeviceExpire             OperationCode = "device_expire"
+	OperationConnectorBindingSet      OperationCode = "connector_binding_set"
+	OperationConnectorVerify          OperationCode = "connector_verify"
+	OperationConnectorLogin           OperationCode = "connector_login"
+	OperationResourceDelete           OperationCode = "resource_delete"
+	OperationDiagnostics              OperationCode = "diagnostics"
+	OperationConfigurationExport      OperationCode = "configuration_export"
+	OperationJobList                  OperationCode = "job_list"
+	OperationJobDetail                OperationCode = "job_detail"
+	OperationResourceCreate           OperationCode = "resource_create"
+	OperationResourceUpdate           OperationCode = "resource_update"
+	OperationPublish                  OperationCode = "publish"
+	OperationUnpublish                OperationCode = "unpublish"
+	OperationCloseAll                 OperationCode = "close_all"
+	OperationProcessStart             OperationCode = "process_start"
+	OperationProcessStop              OperationCode = "process_stop"
 	OperationManagedBasicCreate       OperationCode = "managed_basic_create"
 	OperationManagedBasicRotate       OperationCode = "managed_basic_rotate"
 	OperationManagedBasicDelete       OperationCode = "managed_basic_delete"
 	OperationStaticRootRegister       OperationCode = "static_root_register"
 	OperationExternalHTPasswdRegister OperationCode = "external_htpasswd_register"
-	OperationEdgeOneDiagnostics       OperationCode = "edgeone_diagnostics"
-	OperationEdgeOneRefresh           OperationCode = "edgeone_refresh"
-	OperationJobList                  OperationCode = "job_list"
-	OperationJobDetail                OperationCode = "job_detail"
-	OperationSessionLogout            OperationCode = "session_logout"
 )
 
 type Installation struct {
@@ -240,29 +225,34 @@ type HeadscaleDeployIntent struct {
 }
 
 type HeadscaleDomain struct {
-	ID                string                    `json:"id"`
-	ControlDomain     string                    `json:"control_domain"`
-	MagicDNSNamespace string                    `json:"magicdns_namespace"`
-	Policy            string                    `json:"policy"`
-	Artifact          HeadscaleArtifactIdentity `json:"artifact"`
-	Database          HeadscaleDatabaseIdentity `json:"database"`
-	DesiredDigest     string                    `json:"desired_digest"`
-	Applied           *HeadscaleAppliedIdentity `json:"applied,omitempty"`
-	Enabled           bool                      `json:"enabled"`
-	DeployIntent      *HeadscaleDeployIntent    `json:"deploy_intent,omitempty"`
-	LastOperation     OperationCode             `json:"last_operation,omitempty"`
-	LastJobID         string                    `json:"last_job_id,omitempty"`
-	ManagedPaths      []string                  `json:"managed_paths"`
-}
-
-func HeadscaleManagedPaths() []string {
-	return []string{"/etc/lanpanel-headscale", "/etc/lanpanel/nginx/control-enabled/headscale.conf", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/run/lanpanel-headscale-control", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
+	ID                string                     `json:"id"`
+	ControlDomain     string                     `json:"control_domain"`
+	MagicDNSNamespace string                     `json:"magicdns_namespace"`
+	Policy            string                     `json:"policy"`
+	Artifact          HeadscaleArtifactIdentity  `json:"artifact"`
+	Database          HeadscaleDatabaseIdentity  `json:"database"`
+	DesiredDigest     string                     `json:"desired_digest"`
+	Applied           *HeadscaleAppliedIdentity  `json:"applied,omitempty"`
+	Enabled           bool                       `json:"enabled"`
+	DeployIntent      *HeadscaleDeployIntent     `json:"deploy_intent,omitempty"`
+	Certificate       *CertificateBundleIdentity `json:"certificate,omitempty"`
+	LastOperation     OperationCode              `json:"last_operation,omitempty"`
+	LastJobID         string                     `json:"last_job_id,omitempty"`
+	ManagedPaths      []string                   `json:"managed_paths"`
 }
 
 type TailnetConnector struct {
-	ID           string   `json:"id"`
-	LoginServer  string   `json:"login_server"`
-	ManagedPaths []string `json:"managed_paths,omitempty"`
+	ID            string        `json:"id"`
+	ControlURL    string        `json:"control_url"`
+	ManagedPaths  []string      `json:"managed_paths"`
+	LastOperation OperationCode `json:"last_operation,omitempty"`
+	LastJobID     string        `json:"last_job_id,omitempty"`
+}
+
+func ConnectorManagedPaths() []string { return []string{"/var/lib/lanpanel/connector"} }
+
+func HeadscaleManagedPaths() []string {
+	return []string{"/etc/lanpanel-headscale", "/etc/lanpanel/nginx/control-enabled/headscale.conf", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/run/lanpanel-headscale-control", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
 }
 
 type Credential struct {
@@ -321,8 +311,9 @@ type LocalHTTPTarget struct {
 }
 
 type TailnetHTTPTarget struct {
-	IP   string `json:"ip"`
-	Port uint16 `json:"port"`
+	IP       string `json:"ip"`
+	SourceIP string `json:"source_ip"`
+	Port     uint16 `json:"port"`
 }
 
 type AppPublication struct {
@@ -352,8 +343,6 @@ type GoAccessPublication struct {
 type CertificateRequest struct {
 	ChallengeMethod     string `json:"challenge_method"`
 	DirectoryURL        string `json:"directory_url"`
-	AccountKeyPath      string `json:"account_key_path"`
-	AccountEmail        string `json:"account_email"`
 	TermsAccepted       bool   `json:"terms_accepted"`
 	DNSProvider         string `json:"dns_provider,omitempty"`
 	ProviderProfilePath string `json:"provider_profile_path,omitempty"`
@@ -425,7 +414,6 @@ type PublicationRecord struct {
 	UnpublishedGeneration             uint64                       `json:"unpublished_generation"`
 	LastAppliedDigest                 *string                      `json:"last_applied_digest,omitempty"`
 	LastAppliedBundle                 *PublicationBundle           `json:"last_applied_bundle,omitempty"`
-	EffectiveSecurity                 *EffectiveSecurityIdentity   `json:"effective_security,omitempty"`
 	ActivationIntent                  *ActivationIntent            `json:"activation_intent,omitempty"`
 	ContractionIntent                 *ContractionIntent           `json:"contraction_intent,omitempty"`
 	RuntimeObservation                *RuntimeObservation          `json:"runtime_observation,omitempty"`
@@ -482,7 +470,6 @@ type DomainHTTPSBundleIdentity struct {
 	Auth         AuthBundleIdentity        `json:"auth"`
 	Static       StaticBundleIdentity      `json:"static"`
 	GoAccess     GoAccessBundleIdentity    `json:"goaccess"`
-	EdgeOne      EdgeOneBundleIdentity     `json:"edgeone"`
 }
 
 type CertificateBundleIdentity struct {
@@ -565,19 +552,6 @@ func (identity GoAccessBundleIdentity) RemovesRetiredState() bool {
 	return identity.RetiredGeneration != 0 && identity.Enabled && identity.StateGeneration != identity.RetiredStateGeneration
 }
 
-type EdgeOneBundleIdentity struct {
-	Enabled              bool   `json:"enabled"`
-	PublishBinding       string `json:"publish_binding,omitempty"`
-	InitialACLGeneration uint64 `json:"initial_acl_generation,omitempty"`
-}
-
-type EffectiveSecurityIdentity struct {
-	Generation        uint64   `json:"generation"`
-	ACLVersion        string   `json:"acl_version"`
-	CIDRs             []string `json:"cidrs"`
-	EffectiveDeadline string   `json:"effective_deadline"`
-}
-
 type TemporaryHTTPBundleIdentity struct {
 	PublicIPv4       string `json:"public_ipv4"`
 	Port             uint16 `json:"port"`
@@ -617,24 +591,16 @@ func (err PrerequisiteError) Error() string { return string(err.Code) }
 
 func ParseOperationCode(value string) (OperationCode, error) {
 	switch OperationCode(value) {
-	case OperationInstanceConfigCreate, OperationInstanceConfigUpdate, OperationValidate,
-		OperationPlan, OperationDeploy, OperationStatus, OperationDiagnostics,
-		OperationConfigurationExport, OperationAdminTokenRotate, OperationHeadscaleReissue,
-		OperationDependencyUpload, OperationDependencyImport, OperationMaintenance,
-		OperationBackupEnter, OperationBackupPreparingAbort, OperationBackupExit,
-		OperationRestoreEvidenceImport, OperationRestoreCutover, OperationConnectorVerify,
-		OperationConnectorAuthKeyImport, OperationConnectorAuthKeyAdopt,
-		OperationConnectorAuthKeyDiscard, OperationConnectorLogin,
-		OperationConnectorDisconnect, OperationConnectorRebind, OperationResourceCreate,
-		OperationResourceUpdate, OperationResourceDelete, OperationPublish,
-		OperationUnpublish, OperationCloseAll, OperationProcessStart,
-		OperationProcessStop, OperationUnpublishAndStop, OperationHeadscaleUserCreate,
-		OperationHeadscaleUserList, OperationPreauthKeyCreate, OperationPreauthKeyList,
-		OperationPreauthKeyRevoke, OperationDeviceList, OperationDeviceExpire,
-		OperationManagedBasicCreate, OperationManagedBasicRotate,
-		OperationManagedBasicDelete, OperationStaticRootRegister, OperationExternalHTPasswdRegister, OperationEdgeOneDiagnostics,
-		OperationEdgeOneRefresh, OperationJobList, OperationJobDetail,
-		OperationSessionLogout:
+	case OperationPlan, OperationStatus, OperationAdminTokenRotate,
+		OperationHeadscaleInitialize, OperationHeadscaleControlDeploy, OperationHeadscaleReissue,
+		OperationHeadscaleUserCreate, OperationHeadscaleUserList, OperationPreauthKeyCreate,
+		OperationPreauthKeyList, OperationPreauthKeyRevoke, OperationDeviceList, OperationDeviceExpire,
+		OperationConnectorBindingSet, OperationConnectorVerify, OperationConnectorLogin,
+		OperationResourceDelete, OperationDiagnostics, OperationConfigurationExport, OperationJobList, OperationJobDetail,
+		OperationResourceCreate, OperationResourceUpdate, OperationPublish, OperationUnpublish,
+		OperationCloseAll, OperationProcessStart, OperationProcessStop,
+		OperationManagedBasicCreate, OperationManagedBasicRotate, OperationManagedBasicDelete,
+		OperationStaticRootRegister, OperationExternalHTPasswdRegister:
 		return OperationCode(value), nil
 	default:
 		return "", fmt.Errorf("operation code %q is not supported", value)
@@ -647,22 +613,27 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 	}
 	allowed := false
 	switch operation {
-	case OperationPlan, OperationStatus, OperationDiagnostics:
+	case OperationPlan, OperationStatus:
 		allowed = target.Kind == OperationTargetInstallation || target.Kind == OperationTargetResource
-	case OperationResourceUpdate, OperationResourceDelete, OperationPublish, OperationUnpublish,
-		OperationProcessStart, OperationProcessStop, OperationUnpublishAndStop,
-		OperationManagedBasicCreate, OperationStaticRootRegister, OperationExternalHTPasswdRegister, OperationEdgeOneDiagnostics, OperationEdgeOneRefresh:
-		allowed = target.Kind == OperationTargetResource
-	case OperationManagedBasicRotate, OperationManagedBasicDelete:
-		allowed = target.Kind == OperationTargetCredential
+	case OperationConnectorBindingSet, OperationConnectorVerify, OperationConnectorLogin:
+		allowed = target.Kind == OperationTargetConnector
+	case OperationHeadscaleControlDeploy, OperationHeadscaleReissue, OperationHeadscaleUserCreate,
+		OperationHeadscaleUserList, OperationPreauthKeyList, OperationDeviceList:
+		allowed = target.Kind == OperationTargetHeadscale
 	case OperationPreauthKeyCreate:
 		allowed = target.Kind == OperationTargetHeadscaleUser
 	case OperationPreauthKeyRevoke:
 		allowed = target.Kind == OperationTargetPreauthKey
 	case OperationDeviceExpire:
 		allowed = target.Kind == OperationTargetDevice
+	case OperationResourceUpdate, OperationResourceDelete, OperationPublish, OperationUnpublish,
+		OperationProcessStart, OperationProcessStop, OperationManagedBasicCreate,
+		OperationStaticRootRegister, OperationExternalHTPasswdRegister:
+		allowed = target.Kind == OperationTargetResource
 	case OperationJobDetail:
 		allowed = target.Kind == OperationTargetJob
+	case OperationManagedBasicRotate, OperationManagedBasicDelete:
+		allowed = target.Kind == OperationTargetCredential
 	default:
 		allowed = target.Kind == OperationTargetInstallation
 	}
@@ -674,6 +645,14 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 		if target.ID != "" {
 			return fmt.Errorf("installation target must not include id")
 		}
+	case OperationTargetHeadscale:
+		if target.ID != "" {
+			return fmt.Errorf("headscale target must not include id")
+		}
+	case OperationTargetConnector:
+		if target.ID != "" {
+			return fmt.Errorf("connector target must not include id")
+		}
 	case OperationTargetResource:
 		if !strings.HasPrefix(target.ID, "res_") || !idPattern.MatchString(target.ID) {
 			return fmt.Errorf("resource target id is invalid")
@@ -682,8 +661,12 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 		if !strings.HasPrefix(target.ID, "cred_") || !idPattern.MatchString(target.ID) {
 			return fmt.Errorf("credential target id is invalid")
 		}
-	case OperationTargetHeadscaleUser, OperationTargetPreauthKey, OperationTargetDevice, OperationTargetJob:
+	case OperationTargetJob:
 		if !validOpaqueTargetID(target.ID) {
+			return fmt.Errorf("job target id is invalid")
+		}
+	case OperationTargetHeadscaleUser, OperationTargetPreauthKey, OperationTargetDevice:
+		if _, err := strconv.ParseUint(target.ID, 10, 64); err != nil || target.ID == "0" || strings.HasPrefix(target.ID, "0") {
 			return fmt.Errorf("%s target id is invalid", target.Kind)
 		}
 	default:
@@ -703,7 +686,7 @@ func ParseOperationResult(value string) (OperationResult, error) {
 
 func ParsePrerequisiteCode(value string) (PrerequisiteCode, error) {
 	switch PrerequisiteCode(value) {
-	case PrerequisiteHeadscaleNotConfigured, PrerequisiteConnectorRequired, PrerequisiteOSProfileLiveUnqualified, PrerequisiteDependencyTransitionRequired:
+	case PrerequisiteHeadscaleNotConfigured, PrerequisiteConnectorRequired, PrerequisiteOSProfileLiveUnqualified, PrerequisitePackageIdentityDrift:
 		return PrerequisiteCode(value), nil
 	default:
 		return "", fmt.Errorf("prerequisite code %q is not supported", value)
@@ -726,20 +709,21 @@ func RequireConnector(installation Installation) error {
 
 func PublicationPrerequisites(installation Installation, resourceID string) error {
 	for _, resource := range installation.Resources {
-		if resource.ID != resourceID {
-			continue
+		if resource.ID == resourceID {
+			if resource.Target.Kind == AppTargetTailnetHTTP {
+				return RequireConnector(installation)
+			}
+			return nil
 		}
-		if resource.Target.Kind == AppTargetTailnetHTTP {
-			return RequireConnector(installation)
-		}
-		return nil
 	}
 	return fmt.Errorf("resource %q does not exist", resourceID)
 }
 
-var idPattern = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
-var headscaleVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
-var headscaleRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+var (
+	idPattern               = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
+	headscaleVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+	headscaleRefPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+)
 
 func validateHeadscale(value HeadscaleDomain) error {
 	if value.Policy != "trusted_mesh" {
@@ -774,6 +758,15 @@ func validateHeadscale(value HeadscaleDomain) error {
 	if value.Enabled != (value.Applied != nil) {
 		return fmt.Errorf("headscale enabled and applied identity must agree")
 	}
+	transitionalCertificate := value.DeployIntent != nil && value.DeployIntent.Phase == HeadscaleDeployActivated
+	if value.Enabled && value.Certificate == nil && !transitionalCertificate || !value.Enabled && value.Certificate != nil {
+		return fmt.Errorf("headscale certificate and enabled state must agree")
+	}
+	if value.Certificate != nil {
+		if err := validateHeadscaleCertificate(*value.Certificate, value.Applied.CertificateID, value.ControlDomain); err != nil {
+			return err
+		}
+	}
 	if value.DeployIntent != nil {
 		intent := value.DeployIntent
 		validPhase := intent.Phase == HeadscaleDeployPrepared || intent.Phase == HeadscaleDeployCertificatePending || intent.Phase == HeadscaleDeployCertificateStaged || intent.Phase == HeadscaleDeployActivating || intent.Phase == HeadscaleDeployActivated || intent.Phase == HeadscaleDeployContracted
@@ -783,11 +776,12 @@ func validateHeadscale(value HeadscaleDomain) error {
 			validFingerprint = validSHA256Digest(intent.CertificateFingerprint)
 		}
 		validActivation := intent.ActivationDigest == "" && intent.RuntimeDigest == ""
-		if intent.Phase == HeadscaleDeployActivating {
+		switch intent.Phase {
+		case HeadscaleDeployActivating:
 			validActivation = validSHA256Digest(intent.ActivationDigest) && intent.RuntimeDigest == ""
-		} else if intent.Phase == HeadscaleDeployActivated {
+		case HeadscaleDeployActivated:
 			validActivation = validSHA256Digest(intent.ActivationDigest) && validSHA256Digest(intent.RuntimeDigest)
-		} else if intent.Phase == HeadscaleDeployContracted {
+		case HeadscaleDeployContracted:
 			validActivation = (intent.ActivationDigest == "" || validSHA256Digest(intent.ActivationDigest)) && intent.RuntimeDigest == ""
 		}
 		validAppliedRelation := intent.Prior != nil && value.Applied != nil && reflect.DeepEqual(intent.Prior, value.Applied) && validateHeadscaleApplied(*intent.Prior) == nil || intent.Prior == nil && value.Applied == nil
@@ -798,7 +792,7 @@ func validateHeadscale(value HeadscaleDomain) error {
 			return fmt.Errorf("headscale deploy intent is invalid")
 		}
 	}
-	if value.LastOperation != "" && value.LastOperation != OperationDeploy || value.LastJobID != "" && !validOpaqueTargetID(value.LastJobID) {
+	if value.LastOperation != "" && value.LastOperation != OperationHeadscaleInitialize && value.LastOperation != OperationHeadscaleControlDeploy && value.LastOperation != OperationHeadscaleReissue || value.LastJobID != "" && !validOpaqueTargetID(value.LastJobID) {
 		return fmt.Errorf("headscale last operation identity is invalid")
 	}
 	return nil
@@ -820,9 +814,23 @@ func ValidateHeadscale(value HeadscaleDomain) error {
 	return validateHeadscale(value)
 }
 
+func validateHeadscaleCertificate(value CertificateBundleIdentity, certificateID, controlDomain string) error {
+	if value.PointerIdentity != "/var/lib/lanpanel/certificates/active/"+certificateID+".current" || !validSHA256Digest(value.BindingIdentity) || value.Generation == 0 || !validSHA256Digest(value.Fingerprint) || !validSHA256Digest(value.SANIdentity) || !validSHA256Digest(value.ChainIdentity) || !validSHA256Digest(value.IssuerIdentity) || value.Authority == nil || value.Authority.CertificateID != certificateID || value.Authority.Method != "http-01" && value.Authority.Method != "dns-01" || value.Authority.DirectoryURL == "" || value.Authority.AccountKeyPath != acmeaccount.ManagedKeyPath || !validSHA256Digest(value.Authority.AccountKeyFingerprint) || !validACMEEmail(value.Authority.AccountEmail) || !value.Authority.TermsAccepted {
+		return fmt.Errorf("headscale certificate authority is incomplete")
+	}
+	deadline, deadlineErr := time.Parse(time.RFC3339, value.NotAfter)
+	wall, wallErr := time.Parse(time.RFC3339, value.LastTrustedWall)
+	if deadlineErr != nil || wallErr != nil || deadline.IsZero() || wall.IsZero() || deadline.Before(wall) {
+		return fmt.Errorf("headscale certificate deadline evidence invalid")
+	}
+	_ = controlDomain
+	return nil
+}
+
 func ValidateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
 	return validateHeadscaleApplied(value)
 }
+
 func validateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
 	if value.Generation == 0 || !validSHA256Digest(value.ConfigDigest) || !validSHA256Digest(value.ArtifactDigest) || !validSHA256Digest(value.ServiceIdentity) || !validSHA256Digest(value.ControlIdentity) || !headscaleRefPattern.MatchString(value.CertificateID) {
 		return fmt.Errorf("headscale applied identity is incomplete")
@@ -838,7 +846,7 @@ func ValidateHeadscaleTransition(prior, candidate HeadscaleDomain) error {
 		return fmt.Errorf("candidate Headscale identity: %w", err)
 	}
 	if prior.ID != candidate.ID || prior.ControlDomain != candidate.ControlDomain || prior.MagicDNSNamespace != candidate.MagicDNSNamespace || prior.Policy != candidate.Policy || !reflect.DeepEqual(prior.Artifact, candidate.Artifact) || prior.Database.UUID != candidate.Database.UUID || prior.Database.SQLitePath != candidate.Database.SQLitePath || prior.Database.IdentityBundleDigest != candidate.Database.IdentityBundleDigest || prior.Database.Generation != candidate.Database.Generation || !slices.Equal(prior.ManagedPaths, candidate.ManagedPaths) {
-		return fmt.Errorf("Headscale trust-domain, artifact, and database identity are immutable")
+		return fmt.Errorf("headscale trust-domain, artifact, and database identity are immutable")
 	}
 	if prior.Database.Phase == HeadscaleInitialized && candidate.Database.Phase != HeadscaleInitialized {
 		return fmt.Errorf("initialized Headscale database cannot return to an initializing phase")
@@ -874,14 +882,14 @@ func ValidateInstallation(installation Installation) error {
 		}
 	}
 	if installation.Connector != nil {
-		if !strings.HasPrefix(installation.Connector.ID, "con_") || !idPattern.MatchString(installation.Connector.ID) {
-			return fmt.Errorf("connector.id is invalid")
+		if !strings.HasPrefix(installation.Connector.ID, "con_") || !idPattern.MatchString(installation.Connector.ID) || !slices.Equal(installation.Connector.ManagedPaths, ConnectorManagedPaths()) {
+			return fmt.Errorf("connector identity or managed paths are invalid")
 		}
-		if err := validateHTTPSURL(installation.Connector.LoginServer); err != nil {
-			return fmt.Errorf("connector.login_server: %w", err)
+		if err := validateHTTPSURL(installation.Connector.ControlURL); err != nil {
+			return fmt.Errorf("connector.control_url: %w", err)
 		}
-		if err := validatePaths("connector.managed_paths", installation.Connector.ManagedPaths); err != nil {
-			return err
+		if installation.Connector.LastOperation != "" && installation.Connector.LastOperation != OperationConnectorBindingSet && installation.Connector.LastOperation != OperationConnectorLogin || installation.Connector.LastJobID != "" && !validOpaqueTargetID(installation.Connector.LastJobID) {
+			return fmt.Errorf("connector last operation identity is invalid")
 		}
 	}
 	credentialIDs := make(map[string]struct{}, len(installation.Credentials))
@@ -932,6 +940,9 @@ func ValidateInstallation(installation Installation) error {
 		resourceIDs[resource.ID] = struct{}{}
 		if err := validateResource(*resource, credentialIDs, credentialOwners, staticRootIDs); err != nil {
 			return fmt.Errorf("resources[%d]: %w", index, err)
+		}
+		if resource.Target.Kind == AppTargetTailnetHTTP && installation.Connector == nil {
+			return fmt.Errorf("resources[%d]: tailnet_http requires connector binding", index)
 		}
 		if publication := resource.Publication.DomainHTTPS; publication != nil && publication.GoAccess.Enabled {
 			credential, present := credentialsByID[publication.GoAccess.CredentialID]
@@ -1027,6 +1038,10 @@ func validateResource(resource AppResource, credentialIDs map[string]struct{}, c
 	if err := validatePublicationRecord(resource.PublicationRecord, resource.Publication, resource.CurrentConfigDigest); err != nil {
 		return err
 	}
+	pendingDelete := resource.PublicationRecord.LastOperation == OperationResourceDelete && resource.PublicationRecord.LastOperationResult == "" && resource.PublicationRecord.LastJobID != ""
+	if (resource.Lifecycle == LifecycleDeleting) != pendingDelete {
+		return fmt.Errorf("deleting lifecycle requires one pending resource_delete operation")
+	}
 	seenCredentials := map[string]struct{}{}
 	for _, credentialID := range resource.CredentialIDs {
 		if _, duplicate := seenCredentials[credentialID]; duplicate {
@@ -1082,7 +1097,7 @@ func validateTarget(target AppTarget) error {
 	switch target.Kind {
 	case AppTargetLocalHTTP:
 		if target.LocalHTTP == nil || target.TailnetHTTP != nil {
-			return fmt.Errorf("target local_http must contain only local_http")
+			return fmt.Errorf("target local_http must contain local_http")
 		}
 		local := target.LocalHTTP
 		switch local.EndpointKind {
@@ -1113,8 +1128,12 @@ func validateTarget(target AppTarget) error {
 			return fmt.Errorf("target tailnet_http must contain only tailnet_http")
 		}
 		address, err := netip.ParseAddr(target.TailnetHTTP.IP)
-		if err != nil || address.IsUnspecified() || address.IsLoopback() || address.IsMulticast() {
-			return fmt.Errorf("tailnet_http.ip must be a non-local IP literal")
+		if err != nil || address.IsUnspecified() || address.IsLoopback() || address.IsMulticast() || !address.IsGlobalUnicast() {
+			return fmt.Errorf("tailnet_http.ip must be a non-local unicast IP literal")
+		}
+		source, sourceErr := netip.ParseAddr(target.TailnetHTTP.SourceIP)
+		if sourceErr != nil || source.IsUnspecified() || source.IsLoopback() || !source.IsGlobalUnicast() || source.BitLen() != address.BitLen() {
+			return fmt.Errorf("tailnet_http.source_ip must be a same-family non-local unicast IP literal")
 		}
 		if target.TailnetHTTP.Port == 0 {
 			return fmt.Errorf("tailnet_http.port must be nonzero")
@@ -1170,7 +1189,7 @@ func validatePublication(publication AppPublication) error {
 		}
 		certificate := publication.DomainHTTPS.Certificate
 		if certificate != nil {
-			if certificate.ChallengeMethod != "http-01" && certificate.ChallengeMethod != "dns-01" || !canonicalHTTPSURL(certificate.DirectoryURL) || !cleanAbsolutePath(certificate.AccountKeyPath) || !validACMEEmail(certificate.AccountEmail) || !certificate.TermsAccepted {
+			if certificate.ChallengeMethod != "http-01" && certificate.ChallengeMethod != "dns-01" || !canonicalHTTPSURL(certificate.DirectoryURL) || !certificate.TermsAccepted {
 				return fmt.Errorf("domain_https certificate authority is invalid")
 			}
 			if certificate.ChallengeMethod == "http-01" && (certificate.DNSProvider != "" || certificate.ProviderProfilePath != "" || certificate.AuthoritativeZone != "") {
@@ -1211,6 +1230,7 @@ func validatePublicationCIDRs(values []string) error {
 	}
 	return nil
 }
+
 func validateGoAccessPublication(publication DomainHTTPSPublication) error {
 	value := publication.GoAccess
 	if !value.Enabled {
@@ -1232,6 +1252,7 @@ func validateGoAccessPublication(publication DomainHTTPSPublication) error {
 	}
 	return nil
 }
+
 func validateStaticMappings(publication DomainHTTPSPublication) error {
 	if len(publication.StaticMappings) > 128 {
 		return fmt.Errorf("static mapping inventory oversized")
@@ -1251,12 +1272,14 @@ func validateStaticMappings(publication DomainHTTPSPublication) error {
 	}
 	return nil
 }
+
 func validStaticURL(value string, directory bool) bool {
 	if value == "" || !strings.HasPrefix(value, "/") || strings.ContainsAny(value, "?#\\%\x00\r\n \t;{}$\"'") || filepath.Clean(value) != strings.TrimSuffix(value, "/") {
 		return false
 	}
 	return directory == (value != "/" && strings.HasSuffix(value, "/"))
 }
+
 func validBasicUsername(value string) bool {
 	if len(value) == 0 || len(value) > 64 {
 		return false
@@ -1272,9 +1295,9 @@ func validBasicUsername(value string) bool {
 	}
 	return true
 }
-func validACMEEmail(value string) bool {
-	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
-}
+
+func validACMEEmail(value string) bool { return acmeaccount.ValidContact(value) }
+
 func validateManagedProcess(process ManagedProcess) error {
 	if !strings.HasPrefix(process.ID, "proc_") || !idPattern.MatchString(process.ID) {
 		return fmt.Errorf("managed_process.id is invalid")
@@ -1312,7 +1335,7 @@ func validateManagedProcess(process ManagedProcess) error {
 		return fmt.Errorf("managed_process operation identity is one-sided")
 	}
 	if process.LastOperation != "" {
-		if process.LastOperation != OperationProcessStart && process.LastOperation != OperationProcessStop && process.LastOperation != OperationUnpublishAndStop {
+		if process.LastOperation != OperationProcessStart && process.LastOperation != OperationProcessStop {
 			return fmt.Errorf("managed_process last_operation is unsupported")
 		}
 		if process.LastOperationResult != "" {
@@ -1363,6 +1386,7 @@ func containsControl(value string) bool {
 	}
 	return false
 }
+
 func validateExternalAbsolute(value, label string) error {
 	if value == "" || value != strings.TrimSpace(value) || !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
 		return fmt.Errorf("%s must be a clean absolute non-root path", label)
@@ -1382,7 +1406,7 @@ func validateProcessBundle(bundle ProcessBundle) error {
 	}
 	if bundle.TCPAddress == "" {
 		if bundle.FrontendUID != 0 || bundle.FrontendGID == 0 || bundle.FrontendMode != 0o660 {
-			return fmt.Errorf("Unix frontend ownership authority is incomplete")
+			return fmt.Errorf("unix frontend ownership authority is incomplete")
 		}
 	} else if bundle.FrontendUID != 0 || bundle.FrontendGID != 0 || bundle.FrontendMode != 0 {
 		return fmt.Errorf("TCP frontend must not carry Unix ownership authority")
@@ -1434,29 +1458,6 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 		}
 		if record.LastAppliedBundle.ConfigDigest != *record.LastAppliedDigest {
 			return fmt.Errorf("last_applied_digest must match last_applied_bundle.config_digest")
-		}
-	}
-	if record.EffectiveSecurity != nil {
-		security := record.EffectiveSecurity
-		if security.Generation == 0 || strings.TrimSpace(security.ACLVersion) == "" {
-			return fmt.Errorf("effective_security generation and ACL version are required")
-		}
-		if len(security.CIDRs) == 0 {
-			return fmt.Errorf("effective_security CIDRs are required")
-		}
-		seenCIDRs := map[string]struct{}{}
-		for _, value := range security.CIDRs {
-			prefix, err := netip.ParsePrefix(value)
-			if err != nil || prefix.String() != value || prefix.Bits() == 0 || !prefix.Addr().IsGlobalUnicast() || prefix.Addr().IsPrivate() {
-				return fmt.Errorf("effective_security CIDR %q must be canonical globally routable unicast and non-default", value)
-			}
-			if _, duplicate := seenCIDRs[value]; duplicate {
-				return fmt.Errorf("effective_security CIDR %q is duplicated", value)
-			}
-			seenCIDRs[value] = struct{}{}
-		}
-		if _, err := time.Parse(time.RFC3339, security.EffectiveDeadline); err != nil {
-			return fmt.Errorf("effective_security.effective_deadline must be RFC3339: %w", err)
 		}
 	}
 	validateRetirements := func(values []GoAccessRetirementIdentity) error {
@@ -1572,30 +1573,22 @@ func validatePublicationRecord(record PublicationRecord, publication AppPublicat
 	default:
 		return fmt.Errorf("publication_record.state %q is not supported", record.State)
 	}
-	appliedEdgeOne := record.LastAppliedBundle != nil && record.LastAppliedBundle.DomainHTTPS != nil && record.LastAppliedBundle.DomainHTTPS.EdgeOne.Enabled
-	if record.EffectiveSecurity != nil && !appliedEdgeOne {
-		return fmt.Errorf("effective_security requires an applied EdgeOne bundle")
-	}
-	if record.State == PublicationPublished && appliedEdgeOne && record.EffectiveSecurity == nil {
-		return fmt.Errorf("published EdgeOne bundle requires effective_security")
-	}
-	if appliedEdgeOne && record.EffectiveSecurity != nil && record.EffectiveSecurity.Generation < record.LastAppliedBundle.DomainHTTPS.EdgeOne.InitialACLGeneration {
-		return fmt.Errorf("effective_security generation predates the applied EdgeOne ACL generation")
-	}
 	if record.RuntimeObservation != nil {
 		if err := validateRuntimeObservation(*record.RuntimeObservation); err != nil {
 			return fmt.Errorf("runtime_observation: %w", err)
 		}
 	}
-	if (record.LastOperation == "") != (record.LastOperationResult == "") {
-		return fmt.Errorf("last_operation and last_operation_result must both be present or absent")
+	if record.LastOperation == "" && record.LastOperationResult != "" {
+		return fmt.Errorf("last_operation_result requires last_operation")
 	}
 	if record.LastOperation != "" {
 		if _, err := ParseOperationCode(string(record.LastOperation)); err != nil {
 			return err
 		}
-		if _, err := ParseOperationResult(string(record.LastOperationResult)); err != nil {
-			return err
+		if record.LastOperationResult != "" {
+			if _, err := ParseOperationResult(string(record.LastOperationResult)); err != nil {
+				return err
+			}
 		}
 	}
 	if record.LastJobID != "" && (record.LastJobID != strings.TrimSpace(record.LastJobID) || strings.ContainsAny(record.LastJobID, "\r\n")) {
@@ -1733,16 +1726,6 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 		} else if len(goaccess.UnitIdentities) != 0 || !retiredUnitsValid || (goaccess.RetiredGeneration == 0) != (goaccess.RetiredServiceIdentity == "") || goaccess.RetiredServiceIdentity != "" && !validSHA256Digest(goaccess.RetiredServiceIdentity) || goaccess.Generation != 0 || goaccess.StateGeneration != 0 || goaccess.CanonicalHost != "" || goaccess.RouteIdentity != "" || goaccess.ServiceIdentity != "" || goaccess.CredentialIdentity != "" || goaccess.ReferenceIdentity != "" || len(goaccess.CIDRs) != 0 || goaccess.DashboardPath != "" || goaccess.WebSocketPath != "" || goaccess.Endpoint != "" || goaccess.AccessLog != "" || goaccess.DatabasePath != "" || goaccess.ReportPath != "" {
 			return fmt.Errorf("disabled GoAccess must not include authority")
 		}
-		if identity.EdgeOne.Enabled {
-			if identity.Auth.Mode != AppAccessPublic || identity.GoAccess.Enabled {
-				return fmt.Errorf("enabled EdgeOne requires public auth and disabled GoAccess")
-			}
-			if identity.EdgeOne.PublishBinding == "" || identity.EdgeOne.InitialACLGeneration == 0 {
-				return fmt.Errorf("enabled EdgeOne requires publish binding and initial ACL generation")
-			}
-		} else if identity.EdgeOne.PublishBinding != "" || identity.EdgeOne.InitialACLGeneration != 0 {
-			return fmt.Errorf("disabled EdgeOne must not include publish binding or ACL generation")
-		}
 	case PublicationTemporaryHTTP:
 		if bundle.TemporaryHTTP == nil || bundle.DomainHTTPS != nil {
 			return fmt.Errorf("temporary_ip_http bundle must contain only temporary_ip_http identity")
@@ -1856,6 +1839,7 @@ func canonicalHTTPSURL(value string) bool {
 	parsed, err := url.Parse(value)
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
 }
+
 func cleanAbsolutePath(value string) bool {
 	if !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
 		return false
@@ -1867,6 +1851,7 @@ func cleanAbsolutePath(value string) bool {
 	}
 	return true
 }
+
 func validDNSProvider(value string) bool {
 	switch value {
 	case "cloudflare", "route53", "digitalocean", "gcloud", "tencentcloud":

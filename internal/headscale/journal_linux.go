@@ -38,7 +38,7 @@ type InitializationJournal struct {
 func BuildInitializationJournal(candidate domain.HeadscaleDomain, installed release.InstallIdentity, snapshot []byte, jobID string, source sources.Source, proxyURL string) (InitializationJournal, []byte, error) {
 	artifact, err := ArtifactIdentity(installed)
 	if err != nil || candidate.Artifact != artifact {
-		return InitializationJournal{}, nil, fmt.Errorf("Headscale candidate release authority mismatched")
+		return InitializationJournal{}, nil, fmt.Errorf("headscale candidate release authority mismatched")
 	}
 	if err := VerifySnapshot(candidate, snapshot); err != nil {
 		return InitializationJournal{}, nil, err
@@ -48,7 +48,7 @@ func BuildInitializationJournal(candidate domain.HeadscaleDomain, installed rele
 		proxy = &sources.Proxy{URL: proxyURL}
 	}
 	if !attemptPattern.MatchString(jobID) || validateJournalSource(installed, source) != nil || sources.ValidateProxy(proxy) != nil {
-		return InitializationJournal{}, nil, fmt.Errorf("Headscale acquisition journal authority is invalid")
+		return InitializationJournal{}, nil, fmt.Errorf("headscale acquisition journal authority is invalid")
 	}
 	digest := sha256.Sum256(snapshot)
 	value := InitializationJournal{SchemaVersion: initializationJournalSchema, Candidate: candidate, JobID: jobID, Source: source, ProxyURL: proxyURL, FreshValidated: false, ArchiveDigest: installed.Headscale.Archive.Digest, Snapshot: append(json.RawMessage(nil), snapshot...), SnapshotDigest: "sha256:" + hex.EncodeToString(digest[:])}
@@ -66,20 +66,20 @@ func LoadInitializationJournal(paths Paths, installed release.InstallIdentity) (
 	}
 	var value InitializationJournal
 	if json.Unmarshal(data, &value) != nil {
-		return nil, nil, fmt.Errorf("Headscale initialization journal is invalid")
+		return nil, nil, fmt.Errorf("headscale initialization journal is invalid")
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil || !slices.Equal(canonical, data) || value.SchemaVersion != initializationJournalSchema || !attemptPattern.MatchString(value.JobID) || validateJournalSource(installed, value.Source) != nil || sources.ValidateProxy(journalProxy(value.ProxyURL)) != nil || value.ArchiveDigest != installed.Headscale.Archive.Digest {
-		return nil, nil, fmt.Errorf("Headscale initialization journal authority mismatched")
+		return nil, nil, fmt.Errorf("headscale initialization journal authority mismatched")
 	}
 	artifact, err := ArtifactIdentity(installed)
 	if err != nil || value.Candidate.Artifact != artifact || VerifySnapshot(value.Candidate, value.Snapshot) != nil {
-		return nil, nil, fmt.Errorf("Headscale initialization journal candidate mismatched")
+		return nil, nil, fmt.Errorf("headscale initialization journal candidate mismatched")
 	}
 	snapshot := []byte(value.Snapshot)
 	digest := sha256.Sum256(snapshot)
 	if value.SnapshotDigest != "sha256:"+hex.EncodeToString(digest[:]) {
-		return nil, nil, fmt.Errorf("Headscale initialization journal snapshot mismatched")
+		return nil, nil, fmt.Errorf("headscale initialization journal snapshot mismatched")
 	}
 	return &value, snapshot, nil
 }
@@ -116,7 +116,7 @@ func CommitInitializationJournal(ctx context.Context, paths Paths, installed rel
 func MarkInitializationFreshValidated(ctx context.Context, paths Paths, installed release.InstallIdentity, candidate domain.HeadscaleDomain, snapshot []byte, jobID string, source sources.Source, proxyURL string) error {
 	current, _, err := LoadInitializationJournal(paths, installed)
 	if err != nil || current == nil || current.JobID != jobID || current.Candidate.ID != candidate.ID || !reflect.DeepEqual(current.Source, source) || current.ProxyURL != proxyURL {
-		return fmt.Errorf("Headscale initialization freshness authority changed")
+		return fmt.Errorf("headscale initialization freshness authority changed")
 	}
 	if current.FreshValidated {
 		return nil
@@ -127,7 +127,7 @@ func MarkInitializationFreshValidated(ctx context.Context, paths Paths, installe
 	}
 	var next InitializationJournal
 	if json.Unmarshal(encoded, &next) != nil {
-		return fmt.Errorf("Headscale initialization freshness encoding failed")
+		return fmt.Errorf("headscale initialization freshness encoding failed")
 	}
 	next.FreshValidated = true
 	data, err := json.Marshal(next)
@@ -151,20 +151,20 @@ func RemoveInitializationJournal(paths Paths, installed release.InstallIdentity,
 	current, err := readJournalFile(paths.Journal)
 	var currentValue, expectedValue InitializationJournal
 	if err != nil || json.Unmarshal(current, &currentValue) != nil || json.Unmarshal(expected, &expectedValue) != nil {
-		return fmt.Errorf("Headscale initialization journal changed")
+		return fmt.Errorf("headscale initialization journal changed")
 	}
 	currentValue.FreshValidated = false
 	expectedValue.FreshValidated = false
 	currentCanonical, _ := json.Marshal(currentValue)
 	expectedCanonical, _ := json.Marshal(expectedValue)
 	if !slices.Equal(currentCanonical, expectedCanonical) {
-		return fmt.Errorf("Headscale initialization journal changed")
+		return fmt.Errorf("headscale initialization journal changed")
 	}
 	parent, err := unix.Open(filepath.Dir(paths.Journal), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	if err := unix.Unlinkat(parent, filepath.Base(paths.Journal), 0); err != nil {
 		return err
 	}
@@ -178,7 +178,7 @@ func validateJournalSource(installed release.InstallIdentity, source sources.Sou
 	}
 	expected, err := BuildSource(installed, choice)
 	if err != nil || !reflect.DeepEqual(expected, source) {
-		return fmt.Errorf("Headscale source differs from release authority")
+		return fmt.Errorf("headscale source differs from release authority")
 	}
 	return nil
 }
@@ -198,12 +198,12 @@ func readJournalFile(path string) ([]byte, error) {
 	file := os.NewFile(uintptr(fd), filepath.Base(path))
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("Headscale initialization journal descriptor unavailable")
+		return nil, fmt.Errorf("headscale initialization journal descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o7777 != 0o600 || stat.Size <= 0 || stat.Size > 1<<20 {
-		return nil, fmt.Errorf("Headscale initialization journal metadata is unsafe")
+		return nil, fmt.Errorf("headscale initialization journal metadata is unsafe")
 	}
 	data := make([]byte, stat.Size)
 	if _, err := file.ReadAt(data, 0); err != nil {
@@ -211,7 +211,7 @@ func readJournalFile(path string) ([]byte, error) {
 	}
 	var after unix.Stat_t
 	if unix.Fstat(fd, &after) != nil || stat.Dev != after.Dev || stat.Ino != after.Ino || stat.Size != after.Size || stat.Mtim != after.Mtim {
-		return nil, fmt.Errorf("Headscale initialization journal changed during read")
+		return nil, fmt.Errorf("headscale initialization journal changed during read")
 	}
 	return data, nil
 }

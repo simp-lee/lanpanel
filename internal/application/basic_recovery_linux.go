@@ -39,6 +39,7 @@ func ReconcileManagedBasic(ctx context.Context, childClosure string) error {
 	}
 	return reconcileJournalLessManagedBasic(ctx, childClosure)
 }
+
 func managedBasicJournalInventory(directory string, uid, gid uint32) ([]string, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -71,7 +72,7 @@ func reconcileJournalLessManagedBasic(ctx context.Context, childClosure string) 
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -117,7 +118,7 @@ func reconcileJournalLessManagedBasic(ctx context.Context, childClosure string) 
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		fresh, err := service.normal.Read()
@@ -151,6 +152,7 @@ func reconcileJournalLessManagedBasic(ctx context.Context, childClosure string) 
 	}
 	return nil
 }
+
 func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	journal, err := readBasicJournal(path)
 	if err != nil {
@@ -160,7 +162,7 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	admitter, err := service.TimerAdmitter()
 	if err != nil {
 		return err
@@ -171,10 +173,11 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	}
 	expectedOperation := operations.ManagedBasicRotate
 	target := "credential/" + journal.CredentialID
-	if journal.Operation == "create" {
+	switch journal.Operation {
+	case "create":
 		expectedOperation = operations.ManagedBasicCreate
 		target = "resource/" + journal.ResourceID
-	} else if journal.Operation == "delete" {
+	case "delete":
 		expectedOperation = operations.ManagedBasicDelete
 	}
 	if intent.Operation != expectedOperation || intent.Target != target {
@@ -184,12 +187,12 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, target, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -359,6 +362,7 @@ func managedBasicChild(document persist.Document, jobID string) (operations.Chil
 	}
 	return result, found, nil
 }
+
 func findBasicCredential(installation domain.Installation, id string) (domain.Credential, bool) {
 	for _, credential := range installation.Credentials {
 		if credential.ID == id {

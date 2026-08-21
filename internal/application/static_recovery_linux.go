@@ -19,7 +19,7 @@ func ReconcileStaticRootRegistrations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -72,7 +72,7 @@ func ReconcileStaticRootRegistrations(ctx context.Context) error {
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		fresh, err := service.normal.Read()

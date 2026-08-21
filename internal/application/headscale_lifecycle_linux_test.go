@@ -1,0 +1,141 @@
+//go:build linux
+
+package application
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"lanpanel/internal/filetxn"
+	"lanpanel/internal/locks"
+	"lanpanel/internal/safety"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+type emptySafetyOwnership struct{}
+
+func (emptySafetyOwnership) InventoryAuthority() (map[string]string, bool, error) {
+	return map[string]string{}, true, nil
+}
+
+func TestHeadscaleCertificateContractionFenceCommitsEmergencyAuthorityFirst(t *testing.T) {
+	ctx := context.Background()
+	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	lockRoot := t.TempDir()
+	if err := os.Chmod(lockRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := locks.Open(locks.Config{RootPath: lockRoot, Owner: owner.UID, Group: owner.GID, Mode: 0o700})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
+	lease, err := manager.Acquire(ctx, locks.Exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(lease.Release)
+
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(root, "staging")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	emergency, err := safety.CreateEmergency(filepath.Join(root, "emergency.slots"), owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
+	store, err := safety.OpenStore(safety.StoreConfig{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: emptySafetyOwnership{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
+	if _, err := store.Initialize(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	binding := applicationTestDigest("binding")
+	config := applicationTestDigest("config")
+	base := headscaleBaseSnapshot(current.Headscale)
+	pending := &safety.ChallengePending{Generation: 1, PlanID: "plan_headscale", Method: "http-01", ConfigDigest: config, SANIdentity: applicationTestDigest("san"), ACMEBinding: binding, CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: applicationTestDigest("bootstrap"), BaseMarkers: base}
+	challenged := current
+	challenged.Revision++
+	challenged.Headscale.GenerationSequence = 1
+	challenged.Headscale.ChallengePending = pending
+	if _, err := store.Commit(ctx, lease, safety.RoleChallenge, current.Revision, challenged, safety.TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	reactivating := &safety.HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: pending.PlanID, ControlGeneration: 1, CertificateGeneration: 1, CertificateFingerprint: applicationTestDigest("certificate"), CandidateDigest: config, CandidateBundle: applicationTestDigest("bundle"), BaseMarkers: base, CertificateUntil: now.Add(time.Hour), CertificateLastTrustedWall: now}
+	handoff := challenged
+	handoff.Revision++
+	handoff.Headscale.ChallengePending = nil
+	handoff.Headscale.Reactivating = reactivating
+	if _, err := store.Commit(ctx, lease, safety.RoleCertificateHandoff, challenged.Revision, handoff, safety.TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	active := handoff
+	active.Revision++
+	active.Headscale.ControlEntryDigest = applicationTestDigest("control-entry")
+	active.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: reactivating.CertificateFingerprint, Binding: binding, LastTrustedWall: now, NotAfter: now.Add(time.Hour)}
+	active.Headscale.Reactivating = nil
+	proof := safety.HeadscaleConvergenceProof{PlanID: reactivating.PlanID, Generation: reactivating.Generation, ControlGeneration: reactivating.ControlGeneration, CertificateGeneration: reactivating.CertificateGeneration, CertificateFingerprint: reactivating.CertificateFingerprint, CandidateDigest: reactivating.CandidateDigest, CandidateBundle: reactivating.CandidateBundle, RuntimeClosureDigest: applicationTestDigest("runtime")}
+	if _, err := store.Commit(ctx, lease, safety.RolePublish, handoff.Revision, active, safety.TransitionProof{Headscale: &proof}); err != nil {
+		t.Fatal(err)
+	}
+	expired := active
+	expired.Revision++
+	expired.Headscale.GenerationSequence = 2
+	expired.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: 2, Deadline: now.Add(-time.Minute), Binding: binding}
+	if _, err := store.Commit(ctx, lease, safety.RoleCertificateActivation, active.Revision, expired, safety.TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+
+	graph := applicationTestDigest("control-graph")
+	observed := safety.StopObservation{ObservedAt: time.Now().UTC()}
+	if err := commitHeadscaleCertificateContractionFence(ctx, lease, emergency, store, graph, observed, true); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := emergency.Authority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.StopFence == nil || authority.StopFence == nil || persisted.StopFence.Kind != safety.StopFenceContraction || !safety.FenceMatchesEmergency(persisted.StopFence, *authority.StopFence) {
+		t.Fatal("normal and emergency Headscale contraction fences did not converge")
+	}
+
+	stopped := safety.StopObservation{MasterStopped: true, WorkersStopped: true, ListenersStopped: true, ObservedAt: time.Now().UTC().Add(time.Second)}
+	if err := updateHeadscaleCertificateContractionFence(ctx, lease, emergency, store, stopped, false); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err = store.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err = emergency.Authority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.StopFence == nil || persisted.StopFence.AccessMayRemain || authority.StopFence == nil || authority.StopFence.AccessMayRemain || !safety.FenceMatchesEmergency(persisted.StopFence, *authority.StopFence) {
+		t.Fatal("verified fallback stop observation was not durably projected")
+	}
+}
+
+func applicationTestDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}

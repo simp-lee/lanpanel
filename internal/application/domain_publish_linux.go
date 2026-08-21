@@ -22,7 +22,7 @@ func CurrentPublicationKind(target string) (domain.PublicationKind, error) {
 	if err != nil {
 		return "", err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return "", err
@@ -33,6 +33,7 @@ func CurrentPublicationKind(target string) (domain.PublicationKind, error) {
 	}
 	return resource.Publication.Kind, nil
 }
+
 func parseResourceTarget(target string) (string, bool) {
 	const prefix = "resource/"
 	if len(target) != len(prefix)+36 || target[:len(prefix)] != prefix {
@@ -40,6 +41,7 @@ func parseResourceTarget(target string) (string, bool) {
 	}
 	return target[len(prefix):], true
 }
+
 func (execution *CertificateExecution) PrepareDomainPublication(ctx context.Context, certificate domain.CertificateBundleIdentity) (*PublicationExecution, error) {
 	document, err := execution.Service.normal.Read()
 	if err != nil {
@@ -95,8 +97,9 @@ func (execution *CertificateExecution) PrepareDomainPublication(ctx context.Cont
 		return nil, err
 	}
 	execution.Resource = resource
-	return execution.ContinueDomainPublication(ctx, candidate, time.Time{})
+	return execution.ContinueDomainPublication(ctx, candidate)
 }
+
 func domainPublicationPlanMatches(plan plans.Plan, resource domain.AppResource, result preflight.Result, ready target.Evidence, acmeDigest string, sourceEvidence plans.Evidence) bool {
 	if preflight.ValidateFreshResult(result, time.Now().UTC()) != nil {
 		return false
@@ -111,7 +114,7 @@ func domainPublicationPlanMatches(plan plans.Plan, resource domain.AppResource, 
 		case evidence.Kind == preflightEvidence.Kind && evidence.Identity == preflightEvidence.Identity && evidence.Generation == preflightEvidence.Generation && evidence.Digest == preflightEvidence.Digest:
 			preflightEvidence.ObservedAt = evidence.ObservedAt
 			matchedPreflight = true
-		case evidence.Kind == "target_readiness" && evidence.Identity == "resource/"+resource.ID && evidence.Generation == resource.ManagedProcess.Applied.Generation && evidence.Digest == ready.Digest:
+		case evidence.Kind == "target_readiness" && evidence.Identity == "resource/"+resource.ID && evidence.Generation == targetEvidenceGeneration(resource) && evidence.Digest == ready.Digest:
 			ready.ObservedAt = evidence.ObservedAt
 			matchedReadiness = true
 		case evidence.Kind == "acme_binding" && evidence.Identity == "resource/"+resource.ID && evidence.Digest == acmeDigest:
@@ -124,7 +127,7 @@ func domainPublicationPlanMatches(plan plans.Plan, resource domain.AppResource, 
 	if !matchedPreflight || !matchedReadiness || !matchedACME || !matchedSources {
 		return false
 	}
-	binding := plans.Binding{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: plan.ActorIdentity, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: ready.Digest, ObservedAt: ready.ObservedAt}, {Kind: "acme_binding", Identity: "resource/" + resource.ID, Generation: executionGeneration(plan), Digest: acmeDigest, ObservedAt: plan.CreatedAt}, sourceEvidence}}
+	binding := plans.Binding{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: plan.ActorIdentity, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: targetEvidenceGeneration(resource), Digest: ready.Digest, ObservedAt: ready.ObservedAt}, {Kind: "acme_binding", Identity: "resource/" + resource.ID, Generation: executionGeneration(plan), Digest: acmeDigest, ObservedAt: plan.CreatedAt}, sourceEvidence}}
 	if resource.PublicationRecord.LastAppliedDigest != nil {
 		binding.Applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
 	}
@@ -139,6 +142,7 @@ func domainPublicationPlanMatches(plan plans.Plan, resource domain.AppResource, 
 	}
 	return plans.SameBindingIdentity(expected, binding)
 }
+
 func executionGeneration(plan plans.Plan) uint64 {
 	for _, evidence := range plan.Evidence {
 		if evidence.Kind == "acme_binding" {

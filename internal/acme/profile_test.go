@@ -20,6 +20,7 @@ func TestChallengeMethodIsClosed(t *testing.T) {
 		}
 	}
 }
+
 func TestProviderSchemasAreClosed(t *testing.T) {
 	for _, provider := range SupportedDNSProviders() {
 		schema, err := ProviderSchemaFor(provider)
@@ -31,6 +32,7 @@ func TestProviderSchemasAreClosed(t *testing.T) {
 		t.Fatal("plugin provider accepted")
 	}
 }
+
 func TestLoadDNSBindingPinsTransitiveCredentialFiles(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
@@ -61,6 +63,7 @@ func TestLoadDNSBindingPinsTransitiveCredentialFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestEveryDNSProviderBindsClosedEnvironment(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
@@ -114,6 +117,7 @@ func TestEveryDNSProviderBindsClosedEnvironment(t *testing.T) {
 		})
 	}
 }
+
 func TestLoadDNSBindingRejectsUnknownAndDirectSecretKeys(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
@@ -130,6 +134,7 @@ func TestLoadDNSBindingRejectsUnknownAndDirectSecretKeys(t *testing.T) {
 		}
 	}
 }
+
 func TestHTTPBindingRejectsNonHTTPSDirectory(t *testing.T) {
 	if _, err := canonicalDirectory("http://acme.example.test/directory"); err == nil {
 		t.Fatal("HTTP ACME directory accepted")

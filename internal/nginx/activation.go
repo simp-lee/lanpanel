@@ -49,7 +49,7 @@ func RestoreActivation(ctx context.Context, paths Paths, owner filetxn.Owner, ca
 	if err != nil {
 		return nil, err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
 	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(candidate.Relative))
 	modified := []string{}

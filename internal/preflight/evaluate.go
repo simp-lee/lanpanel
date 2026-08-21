@@ -43,6 +43,9 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("apt", observed.APT.Available && observed.APT.Identity != "", "apt capability and identity", observed.APT.Identity)
 	add("dpkg", observed.DPKG.Available && observed.DPKG.Identity != "", "dpkg capability and identity", observed.DPKG.Identity)
 	packageExact := observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == request.Profile.NginxVersion && observed.Packages.PackageSnapshotDigest == request.Profile.PackageSnapshotDigest
+	if request.Scope == ExpansionBootstrap {
+		packageExact = observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == ""
+	}
 	add("package_state", packageExact, "apt/dpkg state and exact release package profile are ready", observed.Packages.Identity+"/"+observed.Packages.SystemdVersion+"/"+observed.Packages.NginxVersion+"/"+observed.Packages.PackageSnapshotDigest+"/"+observed.Packages.Reason)
 
 	if len(observed.DNS) != len(request.Domains) {
@@ -70,9 +73,7 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	disksOK, diskIdentity := validateDiskObservations(request.Disks, observed.Disks)
 	add("disk", disksOK, "managed filesystem free-space inventory", diskIdentity)
 
-	for _, responsibility := range publicResponsibilities(request) {
-		findings = append(findings, responsibility)
-	}
+	findings = append(findings, publicResponsibilities(request)...)
 	return newResult(string(request.Scope), request.Target, request.Generation, requestDigest, observed.Clock.Now, findings)
 }
 
@@ -144,7 +145,7 @@ func validateExpansionRequest(request ExpansionRequest) error {
 		}
 	case ExpansionHeadscale:
 		if request.TemporaryPort != 0 || len(request.Domains) != 1 || len(request.BootstrapListeners) != 0 {
-			return fmt.Errorf("Headscale preflight scope is invalid")
+			return fmt.Errorf("headscale preflight scope is invalid")
 		}
 	}
 	if !validListenerRequirements(request.BootstrapListeners) || !validOwnedListeners(request.OwnedListeners) || !validManagedPaths(request.ManagedPaths) || !validDisks(request.Disks) {
@@ -176,10 +177,10 @@ func validProfileAuthority(profile ExpectedProfile) bool {
 	if profile.ID == "" || profile.ID != strings.ToLower(profile.ID) || profile.VersionID == "" || strings.ContainsAny(profile.ID+profile.VersionID, "\x00\r\n") || !validDigest(profile.Authority.Digest) {
 		return false
 	}
-	if profile.Authority.Kind == QualificationCandidate {
-		return !profile.Authority.LiveQualified && validDigest(profile.Authority.CandidateDigest) && validDigest(profile.Authority.ManifestDigest) && refPattern.MatchString(profile.Authority.HostFingerprint) && refPattern.MatchString(profile.Authority.CaseID)
+	if profile.Authority.Kind == QualificationTarget {
+		return !profile.Authority.LiveQualified && validDigest(profile.Authority.CandidateDigest) && validDigest(profile.Authority.InstallManifestDigest) && validDigest(profile.Authority.SideEffectPlanDigest) && refPattern.MatchString(profile.Authority.HostFingerprint) && refPattern.MatchString(profile.Authority.RunID)
 	}
-	return profile.Authority.Kind == FinalSupportedProfile && profile.Authority.LiveQualified && profile.Authority.CandidateDigest == "" && profile.Authority.ManifestDigest == "" && profile.Authority.HostFingerprint == "" && profile.Authority.CaseID == ""
+	return profile.Authority.Kind == FinalSupportedProfile && profile.Authority.LiveQualified && profile.Authority.CandidateDigest == "" && profile.Authority.InstallManifestDigest == "" && profile.Authority.SideEffectPlanDigest == "" && profile.Authority.HostFingerprint == "" && profile.Authority.RunID == ""
 }
 
 func requiredListeners(request ExpansionRequest) []ListenerRequirement {
@@ -308,6 +309,7 @@ func validListenerRequirements(values []ListenerRequirement) bool {
 	}
 	return true
 }
+
 func validOwnedListeners(values []OwnedListenerAuthority) bool {
 	for index, value := range values {
 		if value.Protocol != "tcp" && value.Protocol != "udp" || !canonicalIP(value.Address) || value.Port == 0 || value.SocketInode == 0 || !validDigest(value.IdentityDigest) || index > 0 && compareOwnedListener(values[index-1], value) >= 0 {
@@ -316,6 +318,7 @@ func validOwnedListeners(values []OwnedListenerAuthority) bool {
 	}
 	return true
 }
+
 func validListenerObservations(values []ListenerObservation) bool {
 	for index, value := range values {
 		if value.Protocol != "tcp" && value.Protocol != "udp" || !canonicalIP(value.Address) || value.Port == 0 || value.SocketInode == 0 || index > 0 && compareListenerObservation(values[index-1], value) >= 0 {
@@ -324,6 +327,7 @@ func validListenerObservations(values []ListenerObservation) bool {
 	}
 	return true
 }
+
 func validManagedPaths(values []ManagedPathRequirement) bool {
 	for index, value := range values {
 		if !cleanAbsolute(value.Path) || value.Kind != ManagedPathDirectory && value.Kind != ManagedPathRegular || value.RequiredMode == 0 || value.MaximumMode > 0o7777 || value.RequiredMode&^value.MaximumMode != 0 || index > 0 && values[index-1].Path >= value.Path {
@@ -332,6 +336,7 @@ func validManagedPaths(values []ManagedPathRequirement) bool {
 	}
 	return true
 }
+
 func validDisks(values []DiskRequirement) bool {
 	for index, value := range values {
 		if !cleanAbsolute(value.Path) || value.MinimumAvailableBytes == 0 || index > 0 && values[index-1].Path >= value.Path {
@@ -340,6 +345,7 @@ func validDisks(values []DiskRequirement) bool {
 	}
 	return true
 }
+
 func validOwnedIngress(values []OwnedIngressAuthority) bool {
 	for index, value := range values {
 		if !validTarget(value.ResourceID) || !validDigest(value.RuntimeIdentity) || !validDigest(value.OwnershipDigest) || index > 0 && values[index-1].ResourceID >= value.ResourceID {
@@ -348,6 +354,7 @@ func validOwnedIngress(values []OwnedIngressAuthority) bool {
 	}
 	return true
 }
+
 func validDiagnostic(value Diagnostic) bool {
 	return refPattern.MatchString(value.Code) && validSummary(value.Summary) && validIdentity(value.Identity)
 }
@@ -355,12 +362,15 @@ func validDiagnostic(value Diagnostic) bool {
 func compareListenerRequirement(left, right ListenerRequirement) int {
 	return strings.Compare(listenerIdentity(left.Protocol, left.Address, left.Port, 0), listenerIdentity(right.Protocol, right.Address, right.Port, 0))
 }
+
 func compareOwnedListener(left, right OwnedListenerAuthority) int {
 	return strings.Compare(listenerIdentity(left.Protocol, left.Address, left.Port, left.SocketInode), listenerIdentity(right.Protocol, right.Address, right.Port, right.SocketInode))
 }
+
 func compareListenerObservation(left, right ListenerObservation) int {
 	return strings.Compare(listenerIdentity(left.Protocol, left.Address, left.Port, left.SocketInode), listenerIdentity(right.Protocol, right.Address, right.Port, right.SocketInode))
 }
+
 func listenerIdentity(protocol, address string, port uint16, inode uint64) string {
 	return fmt.Sprintf("%s/%s/%05d/%020d", protocol, address, port, inode)
 }

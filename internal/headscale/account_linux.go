@@ -27,14 +27,14 @@ func ValidateAccount(installationID, headscaleID string) (identity.AccountIdenti
 	}
 	present, identities, err := identity.InspectAccounts(set)
 	if err != nil || !present {
-		return identity.AccountIdentity{}, fmt.Errorf("Headscale account is absent or invalid: %w", err)
+		return identity.AccountIdentity{}, fmt.Errorf("headscale account is absent or invalid: %w", err)
 	}
 	if err := verifyAccountAuthority("/etc/sysusers.d/lanpanel-headscale.conf", data); err != nil {
 		return identity.AccountIdentity{}, err
 	}
 	value, ok := identity.IdentityFor(identity.AccountSet{Identities: identities}, identity.RoleHeadscale)
 	if !ok {
-		return identity.AccountIdentity{}, fmt.Errorf("Headscale numeric account identity is missing")
+		return identity.AccountIdentity{}, fmt.Errorf("headscale numeric account identity is missing")
 	}
 	return value, nil
 }
@@ -69,7 +69,7 @@ func ValidateAccountInitializationEvidence(installationID, headscaleID string, f
 	if errors.Is(authorityErr, unix.ENOENT) && !complete && !found && len(identities) == 0 {
 		return nil
 	}
-	return fmt.Errorf("Headscale account evidence differs from initialization authority")
+	return fmt.Errorf("headscale account evidence differs from initialization authority")
 }
 
 func EnsureAccount(ctx context.Context, installationID, headscaleID string) (identity.AccountIdentity, error) {
@@ -96,7 +96,7 @@ func EnsureAccount(ctx context.Context, installationID, headscaleID string) (ide
 		}
 		value, ok := identity.IdentityFor(identity.AccountSet{Identities: identities}, identity.RoleHeadscale)
 		if !ok {
-			return identity.AccountIdentity{}, fmt.Errorf("Headscale numeric account identity is missing")
+			return identity.AccountIdentity{}, fmt.Errorf("headscale numeric account identity is missing")
 		}
 		return value, nil
 	}
@@ -131,11 +131,11 @@ func EnsureAccount(ctx context.Context, installationID, headscaleID string) (ide
 	}
 	present, identities, err = identity.InspectAccounts(set)
 	if err != nil || !present {
-		return identity.AccountIdentity{}, fmt.Errorf("Headscale account postcondition failed: %w", err)
+		return identity.AccountIdentity{}, fmt.Errorf("headscale account postcondition failed: %w", err)
 	}
 	value, ok := identity.IdentityFor(identity.AccountSet{Identities: identities}, identity.RoleHeadscale)
 	if !ok {
-		return identity.AccountIdentity{}, fmt.Errorf("Headscale numeric account identity is missing")
+		return identity.AccountIdentity{}, fmt.Errorf("headscale numeric account identity is missing")
 	}
 	return value, nil
 }
@@ -148,16 +148,16 @@ func verifyAccountAuthority(path string, expected []byte) error {
 	file := os.NewFile(uintptr(fd), filepath.Base(path))
 	if file == nil {
 		_ = unix.Close(fd)
-		return fmt.Errorf("Headscale account authority descriptor unavailable")
+		return fmt.Errorf("headscale account authority descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o7777 != 0o600 || stat.Size != int64(len(expected)) {
-		return fmt.Errorf("Headscale account authority metadata changed")
+		return fmt.Errorf("headscale account authority metadata changed")
 	}
 	actual := make([]byte, len(expected))
 	if _, err := file.ReadAt(actual, 0); err != nil || !bytes.Equal(actual, expected) {
-		return fmt.Errorf("Headscale account authority changed")
+		return fmt.Errorf("headscale account authority changed")
 	}
 	return nil
 }

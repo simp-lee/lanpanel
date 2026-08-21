@@ -13,7 +13,7 @@ import (
 const (
 	frameHeaderBytes = 16
 	maxRequestBytes  = 16 << 10
-	maxResponseBytes = 16 << 10
+	maxResponseBytes = 16 << 20
 	maxSecretBytes   = 8 << 10
 )
 

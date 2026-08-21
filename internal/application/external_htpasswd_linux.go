@@ -72,7 +72,7 @@ func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor strin
 	if err != nil {
 		return ExternalHTPasswdResult{}, err
 	}
-	defer execution.Close()
+	defer func(ignore func() error) { _ = ignore() }(execution.Close)
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		return ExternalHTPasswdResult{}, err

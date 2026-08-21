@@ -43,10 +43,10 @@ func Validate(path string, nginxGID uint32) (Identity, error) {
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
-		syscall.Close(fd)
+		_ = syscall.Close(fd)
 		return Identity{}, fmt.Errorf("htpasswd descriptor invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat syscall.Stat_t
 	if syscall.Fstat(fd, &stat) != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Size <= 0 || stat.Size > 64<<10 || stat.Uid != 0 || stat.Gid != nginxGID || (stat.Mode&0o7777 != 0o640 && stat.Mode&0o7777 != 0o440) || stat.Nlink != 1 {
 		return Identity{}, fmt.Errorf("htpasswd source ownership or mode invalid")
@@ -66,9 +66,7 @@ func Validate(path string, nginxGID uint32) (Identity, error) {
 				return Identity{}, fmt.Errorf("htpasswd final newline missing")
 			}
 			line = strings.TrimSuffix(line, "\n")
-			if strings.HasSuffix(line, "\r") {
-				line = strings.TrimSuffix(line, "\r")
-			}
+			line = strings.TrimSuffix(line, "\r")
 			username, encoded, found := strings.Cut(line, ":")
 			if !found || !ValidUsername(username) || seen[username] || !validBcrypt(encoded) {
 				return Identity{}, fmt.Errorf("htpasswd record invalid")
@@ -96,6 +94,7 @@ func Validate(path string, nginxGID uint32) (Identity, error) {
 	}
 	return Identity{Path: path, Fingerprint: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Usernames: names, Bytes: size, Mode: uint32(stat.Mode & 0o7777)}, nil
 }
+
 func validBcrypt(value string) bool {
 	if len(value) != 60 || !strings.HasPrefix(value, "$2y$") {
 		return false
@@ -111,6 +110,7 @@ func validBcrypt(value string) bool {
 	}
 	return true
 }
+
 func validateParents(path string, nginxGID uint32) error {
 	current := filepath.Dir(path)
 	for {

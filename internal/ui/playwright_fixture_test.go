@@ -22,6 +22,7 @@ func (value playwrightVerifier) Verify(_ context.Context, token []byte) (string,
 	}
 	return *value.fingerprint, nil
 }
+
 func (value playwrightVerifier) Source(context.Context) (string, error) {
 	return *value.fingerprint, nil
 }
@@ -55,13 +56,13 @@ func TestPlaywrightFixture(t *testing.T) {
 			return application.HelperReply{}, fmt.Errorf("unsupported fixture operation %q", operation)
 		}
 	}, func(_ context.Context, operation helperproto.Operation, payload helperproto.ResourcePayload, target string) (application.HelperReply, error) {
-		if operation != helperproto.OperationHeadscaleInitialize || payload.Operation != string(domain.OperationDeploy) || target != "installation" {
+		if operation != helperproto.OperationHeadscaleInitialize || payload.Operation != string(domain.OperationHeadscaleInitialize) || target != "installation" {
 			return application.HelperReply{}, fmt.Errorf("unsupported fixture resource operation %q", operation)
 		}
 		if strings.Contains(string(payload.Resource), `"control_domain":"foreign.example.test"`) {
 			return application.HelperReply{}, application.HelperRejection{Code: "foreign_database_evidence", JobID: "job_foreign_headscale_fixture"}
 		}
-		return application.HelperReply{Digest: InputDigest("headscale"), Action: &helperproto.ActionResult{JobID: "job-headscale-fixture", Operation: string(domain.OperationDeploy), TargetKind: string(domain.OperationTargetInstallation), TargetID: "hds_00000000000000000000000000000001"}}, nil
+		return application.HelperReply{Digest: InputDigest("headscale"), Action: &helperproto.ActionResult{JobID: "job-headscale-fixture", Operation: string(domain.OperationHeadscaleInitialize), TargetKind: string(domain.OperationTargetInstallation), TargetID: "hds_00000000000000000000000000000001"}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)

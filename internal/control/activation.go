@@ -50,17 +50,18 @@ type ActivationBundle struct {
 type ActivationAuthority struct {
 	Safety       safety.State        `json:"safety"`
 	Installation domain.Installation `json:"installation"`
+	Ownership    map[string]string   `json:"ownership"`
 	ObservedAt   time.Time           `json:"observed_at"`
 }
 
 func ValidateActivationAuthority(bundle ActivationBundle, authority ActivationAuthority) error {
 	if ValidateActivation(bundle) != nil || safety.Validate(authority.Safety) != nil || domain.ValidateInstallation(authority.Installation) != nil || authority.ObservedAt.IsZero() || authority.ObservedAt.Before(bundle.Certificate.LastTrustedWall) || authority.ObservedAt.Before(bundle.Certificate.NotBefore) || !authority.ObservedAt.Before(bundle.Certificate.NotAfter) || authority.Installation.InstallationID != bundle.InstallationID || authority.Installation.Headscale == nil || authority.Installation.Headscale.DeployIntent == nil {
-		return fmt.Errorf("Headscale activation runtime authority invalid")
+		return fmt.Errorf("headscale activation runtime authority invalid")
 	}
 	intent := authority.Installation.Headscale.DeployIntent
 	active := authority.Safety.Headscale.Reactivating
 	if intent.Phase != domain.HeadscaleDeployActivating || intent.ActivationDigest != bundle.Digest || intent.CertificateFingerprint != bundle.Certificate.Fingerprint || !reflect.DeepEqual(intent.Prior, bundle.Prior) || !reflect.DeepEqual(intent.Candidate, AppliedFromActivation(bundle)) || active == nil || active.ActivationDigest != bundle.Digest || active.ControlEntryDigest != bundle.Entry.Digest || active.CertificateFingerprint != bundle.Certificate.Fingerprint || active.ControlGeneration != bundle.Entry.Generation {
-		return fmt.Errorf("Headscale activation runtime binding changed")
+		return fmt.Errorf("headscale activation runtime binding changed")
 	}
 	return nil
 }
@@ -72,13 +73,32 @@ func BuildActivation(installationID string, candidate Candidate, certificate cer
 	}
 	return bundle, ValidateActivation(bundle)
 }
+
+func BuildReactivation(installationID string, candidate Candidate, certificate certificates.Identity, prior domain.HeadscaleAppliedIdentity) (ActivationBundle, error) {
+	applied, appliedErr := AppliedIdentity(candidate)
+	if appliedErr != nil || !reflect.DeepEqual(applied, prior) {
+		return ActivationBundle{}, fmt.Errorf("headscale reactivation prior invalid")
+	}
+	bundle, err := renderActivation(installationID, candidate, certificate)
+	if err != nil {
+		return ActivationBundle{}, err
+	}
+	bundle.Prior = &prior
+	digest, err := ActivationDigest(bundle)
+	if err != nil {
+		return ActivationBundle{}, err
+	}
+	bundle.Digest = digest
+	return bundle, ValidateActivation(bundle)
+}
+
 func renderActivation(installationID string, candidate Candidate, certificate certificates.Identity) (ActivationBundle, error) {
-	if installationID == "" || Validate(candidate) != nil || certificates.ValidateIdentity(certificate) != nil || certificate.ID != candidate.CertificateID || certificate.Generation != 1 || certificate.BindingIdentity != candidate.CertificateBinding || !slices.Equal(certificate.Domains, []string{candidate.ControlDomain}) {
-		return ActivationBundle{}, fmt.Errorf("Headscale control activation authority is invalid")
+	if installationID == "" || Validate(candidate) != nil || certificates.ValidateIdentity(certificate) != nil || certificate.ID != candidate.CertificateID || certificate.Generation == 0 || !slices.Equal(certificate.Domains, []string{candidate.ControlDomain}) {
+		return ActivationBundle{}, fmt.Errorf("headscale control activation authority is invalid")
 	}
 	accounts, err := identity.HeadscaleAccounts(installationID, candidate.HeadscaleID)
 	if err != nil || len(accounts.Specs) != 1 {
-		return ActivationBundle{}, fmt.Errorf("Headscale relay account unavailable")
+		return ActivationBundle{}, fmt.Errorf("headscale relay account unavailable")
 	}
 	user, group := accounts.Specs[0].User, accounts.Specs[0].Group
 	paths := FixedActivationPaths()
@@ -104,16 +124,24 @@ func renderActivation(installationID string, candidate Candidate, certificate ce
 	bundle.Digest = digest
 	return bundle, nil
 }
+
 func ValidateActivation(bundle ActivationBundle) error {
 	if bundle.SchemaVersion != ActivationSchema || bundle.InstallationID == "" {
-		return fmt.Errorf("Headscale activation bundle is invalid")
+		return fmt.Errorf("headscale activation bundle is invalid")
 	}
 	expected, err := renderActivation(bundle.InstallationID, bundle.Candidate, bundle.Certificate)
+	if err == nil && bundle.Prior != nil {
+		prior := *bundle.Prior
+		expected.Prior = &prior
+		expected.Digest = ""
+		expected.Digest, err = ActivationDigest(expected)
+	}
 	if err != nil || !reflect.DeepEqual(expected, bundle) {
-		return fmt.Errorf("Headscale activation bundle changed")
+		return fmt.Errorf("headscale activation bundle changed")
 	}
 	return nil
 }
+
 func ActivationDigest(bundle ActivationBundle) (string, error) {
 	bundle.Digest = ""
 	raw, err := json.Marshal(bundle)

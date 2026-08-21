@@ -17,7 +17,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"io"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/child"
@@ -33,6 +32,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type Result struct {
@@ -54,8 +55,10 @@ type Host struct {
 	Owner    filetxn.Owner
 }
 
-type pointerActivator func(context.Context, certificates.Pointer) (certificates.PointerResult, error)
-type pointerRestorer func(context.Context, certificates.Pointer, string) error
+type (
+	pointerActivator func(context.Context, certificates.Pointer) (certificates.PointerResult, error)
+	pointerRestorer  func(context.Context, certificates.Pointer, string) error
+)
 
 func activateCandidatePointer(ctx context.Context, pointer certificates.Pointer, expected string, activate pointerActivator, restore pointerRestorer) (certificates.PointerResult, error) {
 	result, err := activate(ctx, pointer)
@@ -90,7 +93,7 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	observer := host.observer(priorManifest)
 	prior, err := observer.Observe(ctx)
 	if err != nil || prior.Master == nil {
-		return Result{}, fmt.Errorf("Nginx must be running before App activation: %w", err)
+		return Result{}, fmt.Errorf("nginx must be running before App activation: %w", err)
 	}
 	priorDisk, err := nginx.SnapshotActivation(host.Paths, host.Owner, candidate.Entry)
 	if err != nil {
@@ -119,7 +122,12 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 			restoreErr = errors.Join(restoreErr, certificates.RestorePointer(recoveryCtx, *candidate.CertificatePointer, pointerResult.CandidateTarget))
 		}
 		if restoreErr == nil {
-			restoreErr = host.Reload(recoveryCtx)
+			if routeErr := nginx.VerifyTailnetRoutes(priorDisk.Manifest); routeErr != nil {
+				_, stopErr := host.StopAndVerify(recoveryCtx)
+				restoreErr = errors.Join(routeErr, stopErr)
+			} else {
+				restoreErr = host.Reload(recoveryCtx)
+			}
 		}
 		if restoreErr == nil {
 			priorObserver := host.observer(priorDisk.Manifest)
@@ -153,6 +161,9 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	if err != nil {
 		return Result{}, err
 	}
+	if err := nginx.VerifyTailnetRoutes(manifest); err != nil {
+		return Result{}, err
+	}
 	if err := host.run(ctx, child.ProfileNginxDump); err != nil {
 		return Result{}, err
 	}
@@ -182,6 +193,7 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 func currentWorkers(snapshot closure.RuntimeSnapshot) []closure.ProcessIdentity {
 	return append([]closure.ProcessIdentity(nil), snapshot.Workers...)
 }
+
 func verifyPriorSnapshot(snapshot closure.RuntimeSnapshot, manifest nginx.Manifest) error {
 	if snapshot.Master == nil || snapshot.Generation != manifest.GenerationID {
 		return fmt.Errorf("prior Nginx runtime generation not restored")
@@ -200,15 +212,17 @@ func verifyPriorSnapshot(snapshot closure.RuntimeSnapshot, manifest nginx.Manife
 	}
 	return nil
 }
+
 func (host Host) ObserveRuntime(ctx context.Context, manifest nginx.Manifest) (closure.RuntimeSnapshot, error) {
 	if host.Launcher == nil || nginx.ValidateManifest(manifest) != nil {
-		return closure.RuntimeSnapshot{}, fmt.Errorf("Nginx runtime observation authority invalid")
+		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx runtime observation authority invalid")
 	}
 	return host.observer(manifest).Observe(ctx)
 }
+
 func (host Host) WaitForPriorWorkers(ctx context.Context, manifest nginx.Manifest, prior []closure.ProcessIdentity) (closure.RuntimeSnapshot, error) {
 	if host.Launcher == nil || nginx.ValidateManifest(manifest) != nil {
-		return closure.RuntimeSnapshot{}, fmt.Errorf("Nginx reload observation authority invalid")
+		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx reload observation authority invalid")
 	}
 	snapshot, err := closure.WaitPriorWorkers(ctx, host.observer(manifest), prior, nginx.DefaultWorkerTimeout)
 	if err != nil {
@@ -216,6 +230,7 @@ func (host Host) WaitForPriorWorkers(ctx context.Context, manifest nginx.Manifes
 	}
 	return snapshot, verifyPriorSnapshot(snapshot, manifest)
 }
+
 func (host Host) observer(manifest nginx.Manifest) closure.ProcObserver {
 	listeners := []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp::::80", "tcp::::443"}
 	for _, entry := range manifest.Entries {
@@ -225,6 +240,7 @@ func (host Host) observer(manifest nginx.Manifest) closure.ProcObserver {
 	listeners = slices.Compact(listeners)
 	return closure.ProcObserver{UnitCgroup: "/system.slice/lanpanel-nginx.service", Executable: "/usr/sbin/nginx", ExpectedArgv: "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;", PIDPath: host.Paths.PIDPath, Generation: manifest.GenerationID, OwnedListeners: listeners}
 }
+
 func (host Host) ObserveCurrent(ctx context.Context) (closure.RuntimeSnapshot, error) {
 	manifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
@@ -232,6 +248,7 @@ func (host Host) ObserveCurrent(ctx context.Context) (closure.RuntimeSnapshot, e
 	}
 	return host.observer(manifest).Observe(ctx)
 }
+
 func (host Host) VerifyDomain(ctx context.Context, candidate publication.Candidate, target domain.AppTarget) (string, error) {
 	manifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
@@ -252,6 +269,7 @@ func (host Host) VerifyDomain(ctx context.Context, candidate publication.Candida
 	}
 	return probeDomain(ctx, candidate, target, snapshot)
 }
+
 func (host Host) StopAndVerify(ctx context.Context) (closure.RuntimeSnapshot, error) {
 	if err := host.run(ctx, child.ProfileSystemctlNginxStop); err != nil {
 		return closure.RuntimeSnapshot{}, err
@@ -266,12 +284,14 @@ func (host Host) StopAndVerify(ctx context.Context) (closure.RuntimeSnapshot, er
 	}
 	return snapshot, closure.VerifyStopped(snapshot)
 }
+
 func (host Host) Reload(ctx context.Context) error {
 	if err := host.run(ctx, child.ProfileNginxTest); err != nil {
 		return err
 	}
 	return host.run(ctx, child.ProfileNginxReloadSignal)
 }
+
 func (host Host) ContractResource(ctx context.Context, resourceID string) (Result, error) {
 	priorManifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
@@ -381,18 +401,20 @@ func probeDomain(ctx context.Context, candidate publication.Candidate, target do
 	sum := sha256.Sum256([]byte(data))
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
+
 func probeRejectedLegacyTLS(ctx context.Context, serverName string) error {
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:443")
 	if err != nil {
 		return err
 	}
-	defer raw.Close()
+	defer func(ignore func() error) { _ = ignore() }(raw.Close)
 	connection := tls.Client(raw, &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11})
 	if err := connection.HandshakeContext(ctx); err == nil {
 		return fmt.Errorf("legacy TLS version accepted")
 	}
 	return nil
 }
+
 func fixedRejectionFingerprint(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -409,18 +431,20 @@ func fixedRejectionFingerprint(path string) (string, error) {
 	sum := sha256.Sum256(certificate.Raw)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
+
 func rejectionAuditOffset(path string) (int64, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return 0, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 {
 		return 0, fmt.Errorf("rejection audit identity invalid")
 	}
 	return stat.Size, nil
 }
+
 func verifyRejectionAudit(ctx context.Context, path string, offset int64, validSNI, wrong string) error {
 	expectedHost := " " + validSNI + " " + wrong + " 421 "
 	expectedSNI := " " + wrong + " " + wrong + " 421 "
@@ -432,7 +456,7 @@ func verifyRejectionAudit(ctx context.Context, path string, offset int64, validS
 		}
 		buffer := make([]byte, 64<<10)
 		count, _ := unix.Pread(fd, buffer, offset)
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		text := string(buffer[:count])
 		if strings.Contains(text, expectedHost) && strings.Contains(text, expectedSNI) {
 			return nil
@@ -447,13 +471,14 @@ func verifyRejectionAudit(ctx context.Context, path string, offset int64, validS
 		}
 	}
 }
+
 func probeDomainWebSocket(ctx context.Context, hostName, path, authMode, certificateFingerprint string) (int, error) {
 	dialer := &net.Dialer{}
 	raw, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:443")
 	if err != nil {
 		return 0, err
 	}
-	defer raw.Close()
+	defer func(ignore func() error) { _ = ignore() }(raw.Close)
 	connection := tls.Client(raw, &tls.Config{ServerName: hostName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	deadline := time.Now().Add(5 * time.Second)
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
@@ -487,7 +512,7 @@ func probeDomainWebSocket(ctx context.Context, hostName, path, authMode, certifi
 	if err != nil {
 		return 0, err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	if authMode == "public" || authMode == "application_managed" && response.StatusCode == http.StatusSwitchingProtocols {
 		expected := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
 		accept := base64.StdEncoding.EncodeToString(expected[:])
@@ -501,6 +526,7 @@ func probeDomainWebSocket(ctx context.Context, hostName, path, authMode, certifi
 	}
 	return response.StatusCode, nil
 }
+
 func headerContainsToken(values []string, want string) bool {
 	for _, value := range values {
 		for _, token := range strings.Split(value, ",") {
@@ -511,6 +537,7 @@ func headerContainsToken(values []string, want string) bool {
 	}
 	return false
 }
+
 func probeDomainHTTP(ctx context.Context, hostName, path string) (int, string, string, error) {
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -523,9 +550,10 @@ func probeDomainHTTP(ctx context.Context, hostName, path string) (int, string, s
 	if err != nil {
 		return 0, "", "", err
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	return response.StatusCode, response.Header.Get("Location"), response.Header.Get("X-LanPanel-Rejection"), nil
 }
+
 func probeDomainRequest(ctx context.Context, serverName, hostName, path string) (int, string, error) {
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, TLSClientConfig: &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -538,7 +566,7 @@ func probeDomainRequest(ctx context.Context, serverName, hostName, path string) 
 	if err != nil {
 		return 0, "", err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	if response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
 		return 0, "", fmt.Errorf("domain runtime TLS evidence missing")
 	}
@@ -562,7 +590,7 @@ func probeTemporary(ctx context.Context, candidate publication.Candidate, target
 		return "", err
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-	response.Body.Close()
+	_ = response.Body.Close()
 	if response.Header.Get("X-LanPanel-Plaintext-Warning") != "public_http_anyone_no_credentials" || !strings.Contains(response.Header.Get("Warning"), "Public plaintext HTTP") {
 		return "", fmt.Errorf("temporary plaintext warning missing")
 	}
@@ -583,7 +611,7 @@ func probeTemporary(ctx context.Context, candidate publication.Candidate, target
 		return "", err
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(rejected.Body, 4096))
-	rejected.Body.Close()
+	_ = rejected.Body.Close()
 	if rejected.StatusCode != http.StatusMisdirectedRequest || rejected.Header.Get("X-LanPanel-Rejection") != "temporary_default" {
 		return "", fmt.Errorf("temporary wrong Host was not fixed rejection")
 	}
@@ -593,11 +621,11 @@ func probeTemporary(ctx context.Context, candidate publication.Candidate, target
 			return "", err
 		}
 		if _, err = io.WriteString(connection, raw); err != nil {
-			connection.Close()
+			_ = connection.Close()
 			return "", err
 		}
 		parsed, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
-		connection.Close()
+		_ = connection.Close()
 		if err != nil {
 			return "", err
 		}

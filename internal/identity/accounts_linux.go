@@ -84,7 +84,7 @@ func InstallationAccounts(installationID string) (AccountSet, error) {
 func HeadscaleAccounts(installationID, headscaleID string) (AccountSet, error) {
 	fingerprint, err := Fingerprint(installationID)
 	if err != nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(headscaleID) {
-		return AccountSet{}, fmt.Errorf("Headscale account identity is invalid")
+		return AccountSet{}, fmt.Errorf("headscale account identity is invalid")
 	}
 	prefix := "lp-" + fingerprint[:10]
 	name := prefix + "-headscale"
@@ -373,7 +373,7 @@ func readAccountFile(path string) ([]byte, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("account database descriptor is invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var before, after unix.Stat_t
 	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != 0 && before.Uid != uint32(os.Geteuid()) || before.Mode&0o022 != 0 || before.Size < 0 || before.Size > maximumAccountDatabaseBytes {
 		return nil, fmt.Errorf("account database type, owner, mode, link, or size is unsafe")

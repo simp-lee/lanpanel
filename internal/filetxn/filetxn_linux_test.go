@@ -16,7 +16,7 @@ import (
 func TestAtomicFileLifecycle(t *testing.T) {
 	t.Run("create_replace_remove", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 
 		created, err := store.Put(context.Background(), request, []byte("first\n"), CreateOnly)
 		if err != nil || created.State != StateDurable {
@@ -52,7 +52,7 @@ func TestPutFaultBoundariesLeaveCompleteTargetOrInertStaging(t *testing.T) {
 				}
 				return nil
 			})
-			defer store.Close()
+			defer func(ignore func() error) { _ = ignore() }(store.Close)
 			mustWrite(t, request.Path, "old\n", request.New.Mode)
 
 			result, err := store.Put(context.Background(), request, []byte("new\n"), ReplaceOnly)
@@ -107,7 +107,7 @@ func TestRemoveFaultAfterRenameLeavesTombstone(t *testing.T) {
 		}
 		return nil
 	})
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	mustWrite(t, request.Path, "managed\n", request.New.Mode)
 
 	result, err := store.Remove(context.Background(), request)
@@ -124,7 +124,7 @@ func TestRemoveFaultAfterRenameLeavesTombstone(t *testing.T) {
 func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 	t.Run("symlink parent", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		root := filepath.Dir(filepath.Dir(request.Path))
 		if err := os.Symlink(filepath.Join(root, "managed"), filepath.Join(root, "link")); err != nil {
 			t.Fatal(err)
@@ -139,7 +139,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 		for _, kind := range []string{"symlink", "hardlink"} {
 			t.Run(kind, func(t *testing.T) {
 				store, request := newTestStore(t, nil)
-				defer store.Close()
+				defer func(ignore func() error) { _ = ignore() }(store.Close)
 				other := filepath.Join(filepath.Dir(request.Path), "other")
 				mustWrite(t, other, "other", 0o600)
 				var err error
@@ -161,7 +161,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 
 	t.Run("wrong target mode", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		mustWrite(t, request.Path, "old", 0o644)
 		if _, err := store.Put(context.Background(), request, []byte("new"), ReplaceOnly); err == nil || !strings.Contains(err.Error(), "file mode") {
 			t.Fatalf("Put() error = %v", err)
@@ -170,7 +170,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 
 	t.Run("wrong target owner", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		mustWrite(t, request.Path, "old", 0o600)
 		request.Existing.Owner.UID++
 		if _, err := store.Put(context.Background(), request, []byte("new"), ReplaceOnly); err == nil || !strings.Contains(err.Error(), "file owner") {
@@ -180,7 +180,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 
 	t.Run("unclean and outside paths", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		root := filepath.Dir(filepath.Dir(request.Path))
 		request.Path = filepath.Dir(request.Path) + string(filepath.Separator) + ".." + string(filepath.Separator) + "managed" + string(filepath.Separator) + "file"
 		if _, err := store.Put(context.Background(), request, []byte("x"), CreateOnly); err == nil {
@@ -194,7 +194,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 
 	t.Run("parent mode", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		if err := os.Chmod(filepath.Dir(request.Path), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -205,7 +205,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 
 	t.Run("parent owner including root", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request.Path = filepath.Join(filepath.Dir(filepath.Dir(request.Path)), "direct-file")
 		request.Parents.AllowedOwners[0].UID++
 		if _, err := store.Put(context.Background(), request, []byte("x"), CreateOnly); err == nil || !strings.Contains(err.Error(), "not allowed") {
@@ -218,7 +218,7 @@ func TestNoFollowMetadataAndBoundaryValidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer syscall.Close(rootFD)
+		defer func() { _ = syscall.Close(rootFD) }()
 		procFD, err := openComponent(rootFD, "proc")
 		if err != nil {
 			t.Fatalf("safe no-follow mount traversal: %v", err)
@@ -236,7 +236,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request = createdRequest
 		result, err := store.Put(context.Background(), request, []byte("ours\n"), CreateOnly)
 		if err == nil || result.State != StateStaged {
@@ -257,7 +257,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request = createdRequest
 		mustWrite(t, request.Path, "old\n", 0o600)
 		result, err := store.Put(context.Background(), request, []byte("ours\n"), ReplaceOnly)
@@ -284,7 +284,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		staging = filepath.Join(filepath.Dir(filepath.Dir(request.Path)), "staging")
 		result, err := store.Put(context.Background(), request, []byte("ours\n"), CreateOnly)
 		if err == nil || result.State != StateStaged {
@@ -306,7 +306,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request = createdRequest
 		mustWrite(t, request.Path, "old\n", 0o600)
 		result, err := store.Remove(context.Background(), request)
@@ -324,7 +324,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request = createdRequest
 		mustWrite(t, request.Path, "old\n", 0o600)
 		result, err := store.Put(context.Background(), request, []byte("ours\n"), ReplaceOnly)
@@ -347,7 +347,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request = createdRequest
 		mustWrite(t, request.Path, "old\n", 0o600)
 		result, err := store.Put(context.Background(), request, []byte("ours\n"), ReplaceOnly)
@@ -374,7 +374,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		staging = filepath.Join(filepath.Dir(filepath.Dir(request.Path)), "staging")
 		mustWrite(t, request.Path, "old\n", 0o600)
 		result, err := store.Remove(context.Background(), request)
@@ -389,7 +389,7 @@ func TestCreateAndReplaceRejectConcurrentTargetChanges(t *testing.T) {
 func TestProtectedStagingDirectory(t *testing.T) {
 	t.Run("rejects_root_metadata_drift", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		root := filepath.Dir(filepath.Dir(request.Path))
 		if err := os.Chmod(root, 0o755); err != nil {
 			t.Fatal(err)
@@ -403,7 +403,7 @@ func TestProtectedStagingDirectory(t *testing.T) {
 
 	t.Run("rejects_staging_path_replacement", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		root := filepath.Dir(filepath.Dir(request.Path))
 		staging := filepath.Join(root, "staging")
 		if err := os.Rename(staging, staging+"-old"); err != nil {
@@ -427,7 +427,7 @@ func TestProtectedStagingDirectory(t *testing.T) {
 			}
 			return nil
 		})
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request.New.Mode = 0o644
 		result, err := store.Put(context.Background(), request, []byte("secret\n"), CreateOnly)
 		if !errors.Is(err, fault) || result.State != StateStaged {
@@ -444,7 +444,7 @@ func TestProtectedStagingDirectory(t *testing.T) {
 func TestPutEnforcesSizeDispositionAndCancellation(t *testing.T) {
 	t.Run("bounded_input_and_operation", func(t *testing.T) {
 		store, request := newTestStore(t, nil)
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		request.MaxBytes = 2
 		if _, err := store.Put(context.Background(), request, []byte("big"), CreateOnly); err == nil {
 			t.Fatal("Put() accepted oversized content")

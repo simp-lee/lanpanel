@@ -120,7 +120,7 @@ func renderSocket(app domain.AppResource, paths resource.Paths, account identity
 	switch local.EndpointKind {
 	case domain.LocalEndpointUnixSocketActivation, domain.LocalEndpointRelayUnix:
 		if frontendGID == 0 {
-			return nil, fmt.Errorf("Nginx frontend group identity is missing")
+			return nil, fmt.Errorf("nginx frontend group identity is missing")
 		}
 		listen, mode = "ListenStream="+paths.FrontendSocket, "SocketMode=0660\nSocketUser=root\nSocketGroup="+fmt.Sprint(frontendGID)
 	case domain.LocalEndpointTCPSocketActivation:
@@ -145,18 +145,21 @@ func validateAccounts(accounts identity.ResourceAccountSet, resourceID string, r
 	}
 	return nil
 }
+
 func appliedGeneration(process *domain.ManagedProcess) uint64 {
 	if process.Applied == nil {
 		return 1
 	}
 	return process.Applied.Generation + 1
 }
+
 func processEndpoint(kind domain.LocalEndpointKind, paths resource.Paths) string {
 	if kind == domain.LocalEndpointRelayUnix {
 		return paths.BackendSocket
 	}
 	return paths.FrontendSocket
 }
+
 func relayBackend(relay bool, value string) string {
 	if relay {
 		return value

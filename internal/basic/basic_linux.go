@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/htpasswdref"
@@ -18,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const FixedRoot = "/etc/lanpanel-public/basic"
@@ -42,6 +43,7 @@ func NewPassword() ([]byte, error) {
 	clear(secret)
 	return password, nil
 }
+
 func Hash(ctx context.Context, launcher runner, username string, password []byte) (Generated, error) {
 	if launcher == nil || !htpasswdref.ValidUsername(username) || len(password) == 0 || len(password) > 71 {
 		return Generated{}, fmt.Errorf("managed Basic generation authority invalid")
@@ -69,6 +71,7 @@ func Hash(ctx context.Context, launcher runner, username string, password []byte
 	sum := sha256.Sum256(canonical)
 	return Generated{Username: username, Record: canonical, Fingerprint: "sha256:" + hex.EncodeToString(sum[:])}, nil
 }
+
 func Generate(ctx context.Context, launcher runner, username string) (Generated, error) {
 	password, err := NewPassword()
 	if err != nil {
@@ -95,7 +98,7 @@ func Store(ctx context.Context, credentialID string, record []byte, nginxGID uin
 	if err != nil {
 		return "", err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	metadata := filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: nginxGID}, Mode: 0o640}
 	mode := filetxn.CreateOnly
 	if _, err := os.Lstat(path); err == nil {
@@ -109,6 +112,7 @@ func Store(ctx context.Context, credentialID string, record []byte, nginxGID uin
 	}
 	return path, nil
 }
+
 func Delete(ctx context.Context, credentialID string, nginxGID uint32) error {
 	if len(credentialID) != 37 || !strings.HasPrefix(credentialID, "cred_") || nginxGID == 0 {
 		return fmt.Errorf("managed Basic delete identity invalid")
@@ -132,7 +136,7 @@ func Delete(ctx context.Context, credentialID string, nginxGID uint32) error {
 	if err != nil {
 		return err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	metadata := filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: nginxGID}, Mode: 0o640}
 	result, err := txn.Remove(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{{UID: 0, GID: nginxGID}}, AllowedMode: 0o750}, Existing: &metadata})
 	if err != nil || result.State != filetxn.StateDurable {
@@ -140,12 +144,13 @@ func Delete(ctx context.Context, credentialID string, nginxGID uint32) error {
 	}
 	return nil
 }
+
 func ensureRoot(gid uint32) error {
 	etc, err := unix.Open("/etc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(etc)
+	defer func() { _ = unix.Close(etc) }()
 	var etcStat unix.Stat_t
 	if unix.Fstat(etc, &etcStat) != nil || etcStat.Mode&unix.S_IFMT != unix.S_IFDIR || etcStat.Uid != 0 || etcStat.Mode&0o022 != 0 {
 		return fmt.Errorf("managed Basic /etc authority unsafe")
@@ -154,22 +159,24 @@ func ensureRoot(gid uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	child, err := ensureBasicDirectory(parent, "basic", gid)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(child)
+	defer func() { _ = unix.Close(child) }()
 	staging, err := ensureOwnedBasicDirectory(child, ".txn", 0, 0, 0o700)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(staging)
+	defer func() { _ = unix.Close(staging) }()
 	return errors.Join(unix.Fsync(staging), unix.Fsync(child), unix.Fsync(parent), unix.Fsync(etc))
 }
+
 func ensureBasicDirectory(parent int, name string, gid uint32) (int, error) {
 	return ensureOwnedBasicDirectory(parent, name, 0, gid, 0o750)
 }
+
 func ensureOwnedBasicDirectory(parent int, name string, uid, gid uint32, mode uint32) (int, error) {
 	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	created := false
@@ -188,13 +195,13 @@ func ensureOwnedBasicDirectory(parent int, name string, uid, gid uint32, mode ui
 			err = unix.Fchmod(fd, mode)
 		}
 		if err != nil {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 			return -1, err
 		}
 	}
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != mode {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return -1, fmt.Errorf("managed Basic directory identity differs")
 	}
 	return fd, nil

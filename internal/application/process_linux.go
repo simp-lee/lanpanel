@@ -94,19 +94,19 @@ func BeginProcess(ctx context.Context, actor Actor, resourceID string, start boo
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resourceID, service.Manager())
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.Normal().Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(fmt.Errorf("process authority changed"))
 	}
 	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	return &ProcessExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: *candidate, Operation: operation}, nil
@@ -145,11 +145,12 @@ func (execution *ProcessExecution) Commit(ctx context.Context, bundle *domain.Pr
 	}
 	return execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", nil, []jobs.Postcondition{{Kind: "managed_process_" + reason, Status: jobs.PostconditionVerified, Identity: identity}}, "")
 }
+
 func (execution *ProcessExecution) CommitNoEffect(ctx context.Context) error {
 	if execution == nil {
 		return fmt.Errorf("process execution is inactive")
 	}
-	_, err := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_process_not_started", Status: jobs.PostconditionVerified, Identity: execution.Resource.ID}}, "")
+	_, err := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_process_not_started", Status: jobs.PostconditionVerified, Identity: execution.Resource.ID}}, "process_lifecycle_not_started")
 	if err == nil {
 		execution.Revision++
 	}
@@ -210,6 +211,7 @@ func (execution *ProcessExecution) CommitInterrupted(ctx context.Context, bundle
 	}
 	return err
 }
+
 func cloneBundleForProcess(value *domain.ProcessBundle) *domain.ProcessBundle {
 	if value == nil {
 		return nil
@@ -228,11 +230,11 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 	}
 	document, err := service.normal.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	intents, err := operations.PendingProcessLifecycles(document)
-	service.Close()
+	_ = service.Close()
 	if err != nil {
 		return err
 	}
@@ -250,28 +252,28 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 		}
 		document, err := service.normal.Read()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		fresh, err := operations.FindProcessLifecycleAuthority(document, intent.JobID, intent.SafetyBinding.ResourceID)
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		admitter, err := service.resourceAdmitter()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		if fresh.Phase == operations.PhaseReserved {
 			admission, lockErr := service.manager.Acquire(ctx, locks.MutationAdmission)
 			if lockErr != nil {
-				service.Close()
+				_ = service.Close()
 				return lockErr
 			}
 			err = admitter.RejectReservation(ctx, admission, document.Revision, fresh.JobID, "process_lifecycle_not_started")
 			releaseErr := admission.Release()
-			service.Close()
+			_ = service.Close()
 			if err != nil || releaseErr != nil {
 				return errors.Join(err, releaseErr)
 			}
@@ -279,13 +281,13 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 		}
 		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+fresh.SafetyBinding.ResourceID, service.manager)
 		if err != nil {
-			mutationSet.Close()
-			service.Close()
+			_ = mutationSet.Close()
+			_ = service.Close()
 			return err
 		}
 		present, err = process.JournalPresent(fresh.SafetyBinding.ResourceID)
@@ -324,7 +326,7 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 			}
 		}
 		if err == nil {
-			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, fresh.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_process_not_started", Status: jobs.PostconditionVerified, Identity: fresh.SafetyBinding.ResourceID}}, "")
+			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, fresh.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_process_not_started", Status: jobs.PostconditionVerified, Identity: fresh.SafetyBinding.ResourceID}}, "process_lifecycle_not_started")
 		}
 		err = errors.Join(err, operations.ReleaseExposure(mutation, exposure), mutationSet.Close(), service.Close())
 		if err != nil {

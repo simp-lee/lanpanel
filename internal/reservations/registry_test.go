@@ -108,7 +108,6 @@ func TestConflictRegistry(t *testing.T) {
 				Auth:         domain.AuthBundleIdentity{Mode: domain.AppAccessPublic},
 				Static:       domain.StaticBundleIdentity{RouteIdentities: []string{}},
 				GoAccess:     domain.GoAccessBundleIdentity{Enabled: false},
-				EdgeOne:      domain.EdgeOneBundleIdentity{Enabled: false},
 			},
 		}
 		claims, err := BuildClaims(installation)
@@ -248,12 +247,7 @@ func validInstallation() domain.Installation {
 			Port:         23456,
 			ManagedPaths: []string{"/var/lib/lanpanel/ui"},
 		},
-		Headscale: &domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: digest, Version: "0.25.1", ArchiveDigest: digest, ExecutableDigest: digest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: digest}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", IdentityBundleDigest: digest, Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: digest, ManagedPaths: domain.HeadscaleManagedPaths()},
-		Connector: &domain.TailnetConnector{
-			ID:           "con_00000000000000000000000000000001",
-			LoginServer:  "https://control.example.com",
-			ManagedPaths: []string{"/var/lib/lanpanel/connector"},
-		},
+		Headscale:    &domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: digest, Version: "0.25.1", ArchiveDigest: digest, ExecutableDigest: digest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: digest}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", IdentityBundleDigest: digest, Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: digest, ManagedPaths: domain.HeadscaleManagedPaths()},
 		Credentials:  []domain.Credential{{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: "res_00000000000000000000000000000001", Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: "sha256:" + strings.Repeat("e", 64)}},
 		ManagedPaths: []string{"/var/lib/lanpanel/state"},
 		Resources: []domain.AppResource{{

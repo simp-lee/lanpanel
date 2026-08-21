@@ -7,6 +7,7 @@ package child
 
 import (
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -114,9 +115,26 @@ type Invocation struct {
 	Headscale *HeadscaleInvocation `json:"headscale,omitempty"`
 	Lego      *LegoInvocation      `json:"lego,omitempty"`
 	HTPasswd  *HTPasswdInvocation  `json:"htpasswd,omitempty"`
+	Tailscale *TailscaleInvocation `json:"tailscale,omitempty"`
 }
+type HeadscaleAdminAction string
+
+const (
+	HeadscaleUserCreate    HeadscaleAdminAction = "user_create"
+	HeadscaleUserList      HeadscaleAdminAction = "user_list"
+	HeadscalePreauthCreate HeadscaleAdminAction = "preauth_create"
+	HeadscalePreauthList   HeadscaleAdminAction = "preauth_list"
+	HeadscalePreauthRevoke HeadscaleAdminAction = "preauth_revoke"
+	HeadscaleDeviceList    HeadscaleAdminAction = "device_list"
+	HeadscaleDeviceExpire  HeadscaleAdminAction = "device_expire"
+)
+
 type HeadscaleInvocation struct {
-	HeadscaleID string `json:"headscale_id"`
+	HeadscaleID       string               `json:"headscale_id"`
+	AdminAction       HeadscaleAdminAction `json:"admin_action,omitempty"`
+	Name              string               `json:"name,omitempty"`
+	Identifier        string               `json:"identifier,omitempty"`
+	ExpirationSeconds uint32               `json:"expiration_seconds,omitempty"`
 }
 type HTPasswdInvocation struct {
 	Username string `json:"username"`
@@ -143,6 +161,22 @@ type ResourceInvocation struct {
 	Relay      bool   `json:"relay,omitempty"`
 	Generation uint64 `json:"generation,omitempty"`
 	UnitMask   uint8  `json:"unit_mask,omitempty"`
+}
+
+type TailscaleAction string
+
+const (
+	TailscaleVersion TailscaleAction = "version"
+	TailscaleStatus  TailscaleAction = "status"
+	TailscalePrefs   TailscaleAction = "prefs"
+	TailscaleLogin   TailscaleAction = "login"
+)
+
+type TailscaleInvocation struct {
+	Action           TailscaleAction `json:"action"`
+	ControlURL       string          `json:"control_url,omitempty"`
+	AuthKeyPath      string          `json:"auth_key_path,omitempty"`
+	ExecutableDigest string          `json:"executable_digest"`
 }
 
 type PackageInvocation struct {
@@ -203,7 +237,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileHeadscaleActivateStop:  {ID: ProfileHeadscaleActivateStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleFallbackStop:  {ID: ProfileHeadscaleFallbackStop, Executable: "/usr/bin/systemctl", Arguments: []string{"mask", "--runtime", "--now", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleActivateShow:  {ID: ProfileHeadscaleActivateShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 128 << 10, RootTCB: true},
-	ProfileHeadscaleAdmin:         {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityKind: IdentityHeadscale, Network: NetworkNone},
+	ProfileHeadscaleAdmin:         {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityHeadscale, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 1 << 20},
 	ProfileGoAccessProbe:          {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileGoAccessAccounts:       {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileGoAccessStart:          {ID: ProfileGoAccessStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -212,7 +246,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileGoAccessShow:           {ID: ProfileGoAccessShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileLego:                   {ID: ProfileLego, Executable: "/usr/lib/lanpanel/dependencies/lego", IdentityKind: IdentityCertificateStage, Network: NetworkHostQualified, AllowedAddressFamilies: []int{2, 10}, Timeout: 10 * time.Minute, MaximumInputBytes: 32 << 10, MaximumOutputBytes: 64 << 10, MaximumFileBytes: 16 << 20, Umask: 0o022, Complete: true},
 	ProfileHTPasswd:               {ID: ProfileHTPasswd, Executable: "/usr/bin/htpasswd", IdentityKind: IdentityEphemeralHTPasswd, Network: NetworkNoSockets, Timeout: 5 * time.Second, MaximumInputBytes: 72, MaximumOutputBytes: 4 << 10, Complete: true},
-	ProfileTailscaleAdmin:         {ID: ProfileTailscaleAdmin, Executable: "/usr/bin/tailscale", IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly},
+	ProfileTailscaleAdmin:         {ID: ProfileTailscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/tailscale", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityTailscaleOperator, Network: NetworkLocalAPIOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 1 << 20},
 	ProfileResourceAccounts:       {ID: ProfileResourceAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileResourceDaemonReload:   {ID: ProfileResourceDaemonReload, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileResourceStart:          {ID: ProfileResourceStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -281,10 +315,13 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow || id == ProfileHeadscaleActivateStart || id == ProfileHeadscaleActivateStop || id == ProfileHeadscaleActivateShow
+	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow || id == ProfileHeadscaleActivateStart || id == ProfileHeadscaleActivateStop || id == ProfileHeadscaleActivateShow || id == ProfileHeadscaleAdmin
 	if headscaleProfile {
-		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
-			return Profile{}, fmt.Errorf("Headscale child invocation authority is invalid")
+		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil {
+			return Profile{}, fmt.Errorf("headscale child invocation authority is invalid")
+		}
+		if id != ProfileHeadscaleAdmin && (invocation.Headscale.AdminAction != "" || invocation.Headscale.Name != "" || invocation.Headscale.Identifier != "" || invocation.Headscale.ExpirationSeconds != 0) {
+			return Profile{}, fmt.Errorf("non-admin Headscale invocation carried lifecycle authority")
 		}
 		switch id {
 		case ProfileHeadscaleAccounts:
@@ -301,13 +338,18 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			profile.Arguments = []string{"stop", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service"}
 		case ProfileHeadscaleActivateShow:
 			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,PrivateNetwork,JoinsNamespaceOf,RestrictAddressFamilies,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictSUIDSGID,KillMode,Restart,ExecStart,Sockets,Listen,SocketMode,SocketUser,SocketGroup,RemoveOnStop,FreeBind,ReusePort,FragmentPath,DropInPaths", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service"}
+		case ProfileHeadscaleAdmin:
+			profile.Arguments, err = headscaleAdminArguments(*invocation.Headscale)
+			if err != nil {
+				return Profile{}, err
+			}
 		}
 		profile.Complete = true
 		return profile, validateProfile(profile)
 	}
 	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow || id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
 	if resourceProfile {
-		if invocation.Package != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
+		if invocation.Package != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
 			return Profile{}, fmt.Errorf("resource child invocation authority is invalid")
 		}
 		short := strings.TrimPrefix(invocation.Resource.ResourceID, "res_")[:20]
@@ -375,13 +417,16 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if id == ProfileHTPasswd {
 		return resolveHTPasswdInvocation(profile, invocation)
 	}
+	if id == ProfileTailscaleAdmin {
+		return resolveTailscaleInvocation(profile, invocation)
+	}
 	if id != ProfileAPTDownload && id != ProfileAPTSimulate && id != ProfileAPTTransaction && id != ProfileAPTOfflineTransaction {
-		if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd != nil {
+		if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil {
 			return Profile{}, fmt.Errorf("external child profile rejects typed invocation")
 		}
 		return profile, nil
 	}
-	if invocation.Resource != nil || invocation.Headscale != nil {
+	if invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil {
 		return Profile{}, fmt.Errorf("package child rejects resource or Headscale invocation")
 	}
 	if invocation.Package == nil || !packageTransactionPattern.MatchString(invocation.Package.TransactionID) || invocation.Package.LockWaitSeconds == 0 || invocation.Package.LockWaitSeconds > 300 || len(invocation.Package.Packages) == 0 || len(invocation.Package.Packages) > 256 || (id == ProfileAPTDownload || id == ProfileAPTTransaction) && invocation.Package.Staged || id == ProfileAPTOfflineTransaction && !invocation.Package.Staged {
@@ -399,11 +444,12 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		"-o", "DPkg::Lock::Timeout=" + strconv.FormatUint(uint64(invocation.Package.LockWaitSeconds), 10),
 		"--no-remove",
 	}
-	if id == ProfileAPTDownload {
+	switch id {
+	case ProfileAPTDownload:
 		arguments = append(arguments, "--download-only")
-	} else if id == ProfileAPTSimulate {
+	case ProfileAPTSimulate:
 		arguments = append(arguments, "--simulate", "--no-download")
-	} else if id == ProfileAPTOfflineTransaction {
+	case ProfileAPTOfflineTransaction:
 		arguments = append(arguments, "--no-download")
 	}
 	arguments = append(arguments, "install")
@@ -436,8 +482,48 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	return profile, nil
 }
 
+func resolveTailscaleInvocation(profile Profile, invocation Invocation) (Profile, error) {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale == nil {
+		return Profile{}, fmt.Errorf("tailscale invocation authority invalid")
+	}
+	value := invocation.Tailscale
+	if !packageDigestPattern.MatchString(value.ExecutableDigest) {
+		return Profile{}, fmt.Errorf("tailscale executable identity is invalid")
+	}
+	profile.ExecutableDigest = value.ExecutableDigest
+	empty := value.ControlURL == "" && value.AuthKeyPath == ""
+	switch value.Action {
+	case TailscaleVersion:
+		if !empty {
+			return Profile{}, fmt.Errorf("tailscale version invocation carries mutation authority")
+		}
+		profile.Arguments = []string{"version", "--json"}
+	case TailscaleStatus:
+		if !empty {
+			return Profile{}, fmt.Errorf("tailscale status invocation carries mutation authority")
+		}
+		profile.Arguments = []string{"status", "--json"}
+	case TailscalePrefs:
+		if !empty {
+			return Profile{}, fmt.Errorf("tailscale prefs invocation carries mutation authority")
+		}
+		profile.Arguments = []string{"debug", "prefs"}
+	case TailscaleLogin:
+		parsed, err := url.Parse(value.ControlURL)
+		base := filepath.Base(value.AuthKeyPath)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.String() != value.ControlURL || filepath.Dir(value.AuthKeyPath) != "/var/lib/lanpanel/connector/auth" || !regexp.MustCompile(`^job_[0-9a-f]{64}\.key$`).MatchString(base) {
+			return Profile{}, fmt.Errorf("tailscale login authority is invalid")
+		}
+		profile.Arguments = []string{"up", "--login-server=" + value.ControlURL, "--auth-key=file:" + value.AuthKeyPath}
+	default:
+		return Profile{}, fmt.Errorf("tailscale action is unsupported")
+	}
+	profile.Complete = true
+	return profile, validateProfile(profile)
+}
+
 func resolveHTPasswdInvocation(profile Profile, invocation Invocation) (Profile, error) {
-	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.HTPasswd == nil {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.Lego != nil || invocation.Tailscale != nil || invocation.HTPasswd == nil {
 		return Profile{}, fmt.Errorf("htpasswd invocation authority invalid")
 	}
 	value := invocation.HTPasswd
@@ -451,8 +537,9 @@ func resolveHTPasswdInvocation(profile Profile, invocation Invocation) (Profile,
 	}
 	return profile, nil
 }
+
 func resolveLegoInvocation(profile Profile, invocation Invocation) (Profile, error) {
-	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.HTPasswd != nil || invocation.Lego == nil {
+	if invocation.Package != nil || invocation.Resource != nil || invocation.Headscale != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil || invocation.Lego == nil {
 		return Profile{}, fmt.Errorf("lego child invocation authority invalid")
 	}
 	value := invocation.Lego
@@ -545,9 +632,57 @@ func validateLegoEnvironment(provider, method string, environment []string) erro
 	}
 	return nil
 }
+
 func validACMEEmail(value string) bool {
 	return len(value) >= 3 && len(value) <= 254 && strings.Count(value, "@") == 1 && !strings.ContainsAny(value, "\x00\r\n /=")
 }
+
+func headscaleAdminArguments(invocation HeadscaleInvocation) ([]string, error) {
+	namePattern := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
+	identifierPattern := regexp.MustCompile(`^[0-9]{1,20}$`)
+	base := []string{"--config", "/etc/lanpanel-headscale/config.yaml", "--output", "json-line"}
+	empty := invocation.Name == "" && invocation.Identifier == "" && invocation.ExpirationSeconds == 0
+	switch invocation.AdminAction {
+	case HeadscaleUserCreate:
+		if !namePattern.MatchString(invocation.Name) || invocation.Identifier != "" || invocation.ExpirationSeconds != 0 {
+			return nil, fmt.Errorf("headscale user-create invocation is invalid")
+		}
+		return append(base, "users", "create", invocation.Name), nil
+	case HeadscaleUserList:
+		if !empty {
+			return nil, fmt.Errorf("headscale user-list invocation is invalid")
+		}
+		return append(base, "users", "list"), nil
+	case HeadscalePreauthCreate:
+		if invocation.Name != "" || !identifierPattern.MatchString(invocation.Identifier) || invocation.ExpirationSeconds == 0 || invocation.ExpirationSeconds > 24*60*60 {
+			return nil, fmt.Errorf("headscale preauth-create invocation is invalid")
+		}
+		return append(base, "preauthkeys", "create", "--user", invocation.Identifier, "--expiration", strconv.FormatUint(uint64(invocation.ExpirationSeconds), 10)+"s"), nil
+	case HeadscalePreauthList:
+		if !empty {
+			return nil, fmt.Errorf("headscale preauth-list invocation is invalid")
+		}
+		return append(base, "preauthkeys", "list"), nil
+	case HeadscalePreauthRevoke:
+		if invocation.Name != "" || !identifierPattern.MatchString(invocation.Identifier) || invocation.ExpirationSeconds != 0 {
+			return nil, fmt.Errorf("headscale preauth-revoke invocation is invalid")
+		}
+		return append(base, "preauthkeys", "expire", "--id", invocation.Identifier), nil
+	case HeadscaleDeviceList:
+		if !empty {
+			return nil, fmt.Errorf("headscale device-list invocation is invalid")
+		}
+		return append(base, "nodes", "list"), nil
+	case HeadscaleDeviceExpire:
+		if invocation.Name != "" || !identifierPattern.MatchString(invocation.Identifier) || invocation.ExpirationSeconds != 0 {
+			return nil, fmt.Errorf("headscale device-expire invocation is invalid")
+		}
+		return append(base, "nodes", "expire", "--identifier", invocation.Identifier), nil
+	default:
+		return nil, fmt.Errorf("headscale admin action is unsupported")
+	}
+}
+
 func validResourceIdentity(value string) bool {
 	if len(value) != 36 || !strings.HasPrefix(value, "res_") {
 		return false
@@ -578,11 +713,12 @@ func validateProfile(profile Profile) error {
 			return fmt.Errorf("external child clean environment is invalid")
 		}
 	}
-	if profile.Network == NetworkNoSockets {
+	switch profile.Network {
+	case NetworkNoSockets:
 		if len(profile.AllowedAddressFamilies) != 0 {
 			return fmt.Errorf("no-socket child cannot allow an address family")
 		}
-	} else if profile.Network == NetworkNone || profile.Network == NetworkUnixOnly {
+	case NetworkNone, NetworkUnixOnly:
 		if !slices.IsSorted(profile.AllowedAddressFamilies) || len(profile.AllowedAddressFamilies) == 0 {
 			return fmt.Errorf("no-network child lacks an exact address-family policy")
 		}
@@ -592,7 +728,7 @@ func validateProfile(profile Profile) error {
 			}
 		}
 	}
-	if !profile.RootTCB && profile.Complete && (profile.UID == 0 || profile.GID == 0 || (profile.ID != ProfileHTPasswd && profile.Chroot == "") || len(profile.AllowedCapabilities) != 0) {
+	if !profile.RootTCB && profile.Complete && (profile.UID == 0 || profile.GID == 0 || (profile.ID != ProfileHTPasswd && profile.ID != ProfileHeadscaleAdmin && profile.ID != ProfileTailscaleAdmin && profile.Chroot == "") || len(profile.AllowedCapabilities) != 0) {
 		return fmt.Errorf("unprivileged child profile lacks exact confinement")
 	}
 	return nil

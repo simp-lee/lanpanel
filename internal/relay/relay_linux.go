@@ -34,7 +34,7 @@ func Run(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer listeners[0].Close()
+	defer func(ignore func() error) { _ = ignore() }(listeners[0].Close)
 	ctx, cancel := signalContext()
 	defer cancel()
 	for {
@@ -56,7 +56,7 @@ func Run(args []string) error {
 }
 
 func relayConnection(ctx context.Context, frontend *net.UnixConn) {
-	defer frontend.Close()
+	defer func(ignore func() error) { _ = ignore() }(frontend.Close)
 	var before unix.Stat_t
 	if unix.Lstat(fixedBackend, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFSOCK || before.Uid == uint32(os.Geteuid()) || before.Mode&0o777 != 0o660 || before.Nlink != 1 {
 		return
@@ -65,7 +65,7 @@ func relayConnection(ctx context.Context, frontend *net.UnixConn) {
 	if err != nil {
 		return
 	}
-	defer backend.Close()
+	defer func(ignore func() error) { _ = ignore() }(backend.Close)
 	var after unix.Stat_t
 	if unix.Lstat(fixedBackend, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Ctim != after.Ctim {
 		return
@@ -110,6 +110,7 @@ func inheritedListeners() ([]*net.UnixListener, error) {
 	}
 	return []*net.UnixListener{unixListener}, nil
 }
+
 func requireNoProc() error {
 	var stat unix.Stat_t
 	err := unix.Stat("/proc/self", &stat)
@@ -121,6 +122,7 @@ func requireNoProc() error {
 	}
 	return fmt.Errorf("relay confinement exposes proc")
 }
+
 func validResourceID(value string) bool {
 	if len(value) != 36 || !strings.HasPrefix(value, "res_") {
 		return false
@@ -128,6 +130,7 @@ func validResourceID(value string) bool {
 	_, err := hex.DecodeString(value[4:])
 	return err == nil
 }
+
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
+	"slices"
 	"testing"
 )
 
@@ -65,6 +66,7 @@ func TestIncompleteActionsRemainUnavailable(t *testing.T) {
 		t.Fatalf("unregistered action=%v", err)
 	}
 }
+
 func TestActorAuthorityBindsSessionGeneration(t *testing.T) {
 	first, err := actorAuthority(Actor{Kind: ActorUI, Identity: "selector", Generation: 1})
 	if err != nil {
@@ -96,18 +98,28 @@ func TestTypedActionRejectsWrongPayloadAndActor(t *testing.T) {
 		t.Fatal("timer used UI action")
 	}
 }
-func TestCoreActionVocabularyIsClosed(t *testing.T) {
+
+func TestFinalCoreActionVocabularyIsExact(t *testing.T) {
+	expected := []domain.OperationCode{
+		"plan", "status", "admin_token_rotate", "headscale_initialize",
+		"headscale_control_deploy", "headscale_certificate_reissue", "headscale_user_create", "headscale_user_list",
+		"preauth_key_create", "preauth_key_list", "preauth_key_revoke", "device_list", "device_expire",
+		"connector_binding_set", "connector_verify", "connector_login", "resource_create", "resource_update", "publish", "unpublish", "close_all",
+		"process_start", "process_stop", "managed_basic_create", "managed_basic_rotate",
+		"managed_basic_delete", "static_root_register", "external_htpasswd_register", "resource_delete", "diagnostics", "configuration_export", "job_list", "job_detail",
+	}
+	actual := CoreActions()
+	if !slices.Equal(actual, expected) {
+		t.Fatalf("final CoreActions=%v, want %v", actual, expected)
+	}
 	seen := map[domain.OperationCode]bool{}
-	for _, action := range CoreActions() {
+	for _, action := range actual {
 		if seen[action] {
 			t.Fatal("duplicate action")
 		}
 		seen[action] = true
-		if _, err := domain.ParseOperationCode(string(action)); err != nil {
-			t.Fatal(err)
+		if parsed, err := domain.ParseOperationCode(string(action)); err != nil || parsed != action {
+			t.Fatalf("parse action %q: %v", action, err)
 		}
-	}
-	if len(seen) != 51 {
-		t.Fatalf("core actions=%d", len(seen))
 	}
 }

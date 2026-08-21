@@ -5,6 +5,7 @@ import (
 	"lanpanel/internal/closure"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/operations"
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
@@ -31,22 +32,22 @@ func TestStopFenceProjectsCommittedEmergencyGlobalAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	exposure, err := manager.Acquire(context.Background(), locks.Exposure)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer exposure.Release()
+	defer func(ignore func() error) { _ = ignore() }(exposure.Release)
 	emergency, err := safety.CreateEmergency(filepath.Join(safetyRoot, "emergency.slots"), owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer emergency.Close()
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
 	store, err := safety.OpenStore(safety.StoreConfig{RootPath: safetyRoot, StagingPath: filepath.Join(safetyRoot, "staging"), StatePath: filepath.Join(safetyRoot, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: emptyOwnershipAuthority{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	if _, err := store.Initialize(context.Background(), exposure); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestStopFenceProjectsCommittedEmergencyGlobalAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	inventory := closure.Inventory{Digest: testDigest("graph"), FullOwnershipDigest: safety.OwnershipInventoryDigest(map[string]string{}), ResourceOwnership: map[string]string{}}
-	authority := NormalAuthority{Safety: store, Emergency: emergency, Exposure: exposure, SafetyState: staleNormal, Generations: map[string]uint64{}, Global: true, InventoryDigest: inventory.Digest}
+	authority := NormalAuthority{Safety: store, Emergency: emergency, Exposure: exposure, SafetyState: staleNormal, Generations: map[string]uint64{}, Global: true, Operation: operations.CloseAll, InventoryDigest: inventory.Digest}
 	if err := authority.PersistStopFence(context.Background(), inventory); err != nil {
 		t.Fatal(err)
 	}

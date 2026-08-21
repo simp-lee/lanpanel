@@ -42,25 +42,25 @@ func PrepareTemporary(resource domain.AppResource, generation uint64) (Candidate
 	if prior := resource.PublicationRecord.LastAppliedBundle; prior != nil && prior.DomainHTTPS != nil && (prior.DomainHTTPS.GoAccess.Enabled || prior.DomainHTTPS.GoAccess.RetiredGeneration != 0) {
 		return Candidate{}, fmt.Errorf("temporary publication cannot discard retained GoAccess authority")
 	}
-	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationTemporaryHTTP || resource.Publication.TemporaryHTTP == nil || resource.Target.Kind != domain.AppTargetLocalHTTP || resource.Target.LocalHTTP == nil || resource.Target.WebSocket.Enabled || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || generation == 0 {
+	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationTemporaryHTTP || resource.Publication.TemporaryHTTP == nil || resource.Target.WebSocket.Enabled || generation == 0 {
 		return Candidate{}, fmt.Errorf("temporary publication prerequisite is incomplete")
 	}
-	applied := resource.ManagedProcess.Applied
-	if applied.ConfigDigest != resource.CurrentConfigDigest {
-		return Candidate{}, fmt.Errorf("running process bundle does not match current config")
+	upstreamNetwork, upstreamAddress, endpointIdentity, err := publicationUpstream(resource)
+	if err != nil {
+		return Candidate{}, err
 	}
 	publication := resource.Publication.TemporaryHTTP
 	if err := domain.ValidateTemporaryPublicIPv4(publication.PublicIPv4); err != nil {
 		return Candidate{}, err
 	}
-	upstreamNetwork, upstreamAddress := "unix", applied.FrontendEndpoint
-	if applied.TCPAddress != "" {
-		upstreamNetwork = "tcp"
-		upstreamAddress = net.JoinHostPort(applied.TCPAddress, fmt.Sprint(applied.TCPPort))
-	}
 	relative := filepath.ToSlash(filepath.Join(nginx.TemporaryDirectory, resource.ID+".conf"))
 	listener := fmt.Sprintf("tcp:0.0.0.0:%d", publication.Port)
-	site := nginx.TemporarySite{PublicIPv4: publication.PublicIPv4, Port: publication.Port, HostAuthority: fmt.Sprintf("%s:%d", publication.PublicIPv4, publication.Port), UpstreamNetwork: upstreamNetwork, UpstreamAddress: upstreamAddress, ReadinessPath: resource.Target.ReadinessPath}
+	site := nginx.TemporarySite{PublicIPv4: publication.PublicIPv4, Port: publication.Port, HostAuthority: fmt.Sprintf("%s:%d", publication.PublicIPv4, publication.Port), UpstreamNetwork: upstreamNetwork, UpstreamAddress: upstreamAddress, ReadinessPath: resource.Target.ReadinessPath, UpstreamSource: func() string {
+		if resource.Target.TailnetHTTP != nil {
+			return resource.Target.TailnetHTTP.SourceIP
+		}
+		return ""
+	}(), Tailnet: resource.Target.Kind == domain.AppTargetTailnetHTTP}
 	entry := nginx.Entry{Kind: nginx.EntryTemporary, ResourceID: resource.ID, Relative: relative, Digest: "sha256:" + strings.Repeat("0", 64), Listeners: []string{listener}, Generation: generation, Temporary: &site}
 	data, err := nginx.RenderEntry(entry)
 	if err != nil {
@@ -68,7 +68,7 @@ func PrepareTemporary(resource domain.AppResource, generation uint64) (Candidate
 	}
 	entry.Digest = digest(data)
 	entryPath := filepath.Join(nginx.FixedPaths().ConfigRoot, filepath.FromSlash(relative))
-	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationTemporaryHTTP, EndpointIdentity: applied.PolicyDigest, SiteIdentity: entry.Digest, ManagedPaths: []string{entryPath}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: publication.Port}}, TemporaryHTTP: &domain.TemporaryHTTPBundleIdentity{PublicIPv4: publication.PublicIPv4, Port: publication.Port, HostAuthority: site.HostAuthority, ListenerIdentity: listener}}
+	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationTemporaryHTTP, EndpointIdentity: endpointIdentity, SiteIdentity: entry.Digest, ManagedPaths: []string{entryPath}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: publication.Port}}, TemporaryHTTP: &domain.TemporaryHTTPBundleIdentity{PublicIPv4: publication.PublicIPv4, Port: publication.Port, HostAuthority: site.HostAuthority, ListenerIdentity: listener}}
 	raw, err := json.Marshal(bundle)
 	if err != nil {
 		return Candidate{}, err
@@ -84,7 +84,7 @@ func PrepareTemporary(resource domain.AppResource, generation uint64) (Candidate
 
 func PrepareDomain(resource domain.AppResource, generation uint64, certificate domain.CertificateBundleIdentity, credentialPath, credentialFingerprint, goaccessCredentialPath, goaccessCredentialFingerprint string, staticRoutes []nginx.StaticRoute, goaccessCandidate *goaccessruntime.Candidate) (Candidate, error) {
 	publication := resource.Publication.DomainHTTPS
-	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationDomainHTTPS || publication == nil || certificate.Authority == nil || certificate.Authority.CertificateID == "" || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest || generation == 0 {
+	if resource.Lifecycle != domain.LifecycleActive || resource.Publication.Kind != domain.PublicationDomainHTTPS || publication == nil || certificate.Authority == nil || certificate.Authority.CertificateID == "" || generation == 0 {
 		return Candidate{}, fmt.Errorf("domain publication prerequisite incomplete")
 	}
 	hosts := append([]string{publication.CanonicalDomain}, publication.Aliases...)
@@ -98,14 +98,17 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 	} else if credentialPath != "" || credentialFingerprint != "" {
 		return Candidate{}, fmt.Errorf("domain non-Basic carried credential authority")
 	}
-	applied := resource.ManagedProcess.Applied
-	upstreamNetwork, upstreamAddress := "unix", applied.FrontendEndpoint
-	if applied.TCPAddress != "" {
-		upstreamNetwork = "tcp"
-		upstreamAddress = net.JoinHostPort(applied.TCPAddress, fmt.Sprint(applied.TCPPort))
+	upstreamNetwork, upstreamAddress, endpointIdentity, err := publicationUpstream(resource)
+	if err != nil {
+		return Candidate{}, err
 	}
 	relative := filepath.ToSlash(filepath.Join(nginx.AppsDirectory, resource.ID+".conf"))
-	site := nginx.DomainSite{Hosts: hosts, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: nginx.FixedPaths().AuditPath, AuthMode: string(publication.AccessMode), HTPasswdPath: credentialPath, CIDRs: append([]string(nil), publication.CIDRs...), UpstreamNetwork: upstreamNetwork, UpstreamAddress: upstreamAddress, WebSocket: resource.Target.WebSocket.Enabled, Static: append([]nginx.StaticRoute(nil), staticRoutes...)}
+	site := nginx.DomainSite{Hosts: hosts, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: nginx.FixedPaths().AuditPath, AuthMode: string(publication.AccessMode), HTPasswdPath: credentialPath, CIDRs: append([]string(nil), publication.CIDRs...), UpstreamNetwork: upstreamNetwork, UpstreamAddress: upstreamAddress, UpstreamSource: func() string {
+		if resource.Target.TailnetHTTP != nil {
+			return resource.Target.TailnetHTTP.SourceIP
+		}
+		return ""
+	}(), WebSocket: resource.Target.WebSocket.Enabled, Tailnet: resource.Target.Kind == domain.AppTargetTailnetHTTP, Static: append([]nginx.StaticRoute(nil), staticRoutes...)}
 	retiredGoAccessGeneration := uint64(0)
 	retiredGoAccessStateGeneration := uint64(0)
 	retiredGoAccessIdentity := ""
@@ -166,7 +169,7 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 		slices.Sort(managedPaths)
 	}
 	slices.Sort(credentialIDs)
-	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: applied.PolicyDigest, SiteIdentity: entry.Digest, ManagedPaths: managedPaths, CredentialIDs: credentialIDs, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: hosts, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: publication.AccessMode, CredentialIdentity: publication.CredentialID, ReferenceIdentity: authIdentity}, Static: domain.StaticBundleIdentity{RootID: publication.StaticRootID, Routes: routeBundles, RouteIdentities: routeIdentities}, GoAccess: goaccessIdentity, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
+	bundle := domain.PublicationBundle{ID: fmt.Sprintf("pub_%d_%s", generation, strings.TrimPrefix(resource.ID, "res_")), Generation: generation, ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: endpointIdentity, SiteIdentity: entry.Digest, ManagedPaths: managedPaths, CredentialIDs: credentialIDs, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: hosts, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: publication.AccessMode, CredentialIdentity: publication.CredentialID, ReferenceIdentity: authIdentity}, Static: domain.StaticBundleIdentity{RootID: publication.StaticRootID, Routes: routeBundles, RouteIdentities: routeIdentities}, GoAccess: goaccessIdentity}}
 	bundleDigest, err := BundleDigest(bundle)
 	if err != nil {
 		return Candidate{}, err
@@ -186,6 +189,24 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 	}
 	return Candidate{ResourceID: resource.ID, Generation: generation, Bundle: bundle, BundleDigest: bundleDigest, Entry: entry, EntryBytes: data, OwnershipPath: ownershipPaths[0], OwnershipPaths: ownershipPaths, OwnershipListeners: []ownership.OwnedListener{}, PublicURL: "https://" + publication.CanonicalDomain + "/", CertificatePointer: pointer, CertificateCandidatePath: candidatePath, PriorBundle: prior, PriorBundleDigest: priorDigest}, nil
 }
+
+func publicationUpstream(resource domain.AppResource) (string, string, string, error) {
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP && resource.Target.TailnetHTTP != nil {
+		authority := net.JoinHostPort(resource.Target.TailnetHTTP.IP, fmt.Sprint(resource.Target.TailnetHTTP.Port))
+		return "tcp", authority, digest([]byte("tailnet\x00" + authority)), nil
+	}
+	if resource.Target.Kind != domain.AppTargetLocalHTTP || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest {
+		return "", "", "", fmt.Errorf("publication target authority incomplete")
+	}
+	applied := resource.ManagedProcess.Applied
+	network, address := "unix", applied.FrontendEndpoint
+	if applied.TCPAddress != "" {
+		network = "tcp"
+		address = net.JoinHostPort(applied.TCPAddress, fmt.Sprint(applied.TCPPort))
+	}
+	return network, address, applied.PolicyDigest, nil
+}
+
 func priorPublication(resource domain.AppResource) (*domain.PublicationBundle, string, error) {
 	if resource.PublicationRecord.LastAppliedBundle == nil {
 		return nil, "", nil
@@ -205,6 +226,7 @@ func BundleDigest(bundle domain.PublicationBundle) (string, error) {
 	}
 	return digest(raw), nil
 }
+
 func RequireBundleDigest(bundle domain.PublicationBundle, expected string) error {
 	actual, err := BundleDigest(bundle)
 	if err != nil {
@@ -215,6 +237,7 @@ func RequireBundleDigest(bundle domain.PublicationBundle, expected string) error
 	}
 	return nil
 }
+
 func digest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])

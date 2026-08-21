@@ -8,14 +8,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"lanpanel/internal/sources"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
-
-	"lanpanel/internal/sources"
 )
 
 type Timeouts struct {
@@ -128,7 +127,7 @@ func (downloader *Downloader) fetch(ctx context.Context, request Request, destin
 	if err != nil {
 		return Result{}, fmt.Errorf("download artifact: %w", redactedError(err))
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Encoding") != "" || response.ContentLength > request.MaximumBytes || request.ExpectedSize > 0 && response.ContentLength >= 0 && response.ContentLength != request.ExpectedSize {
 		return Result{}, fmt.Errorf("artifact response status or declared size is invalid")
 	}
@@ -188,6 +187,7 @@ func (connection *idleConnection) set(value net.Conn) {
 	defer connection.mu.Unlock()
 	connection.conn = value
 }
+
 func (connection *idleConnection) setReadDeadline(deadline time.Time) error {
 	connection.mu.Lock()
 	defer connection.mu.Unlock()

@@ -14,7 +14,7 @@ import (
 func TestIndependentLockContract(t *testing.T) {
 	t.Run("ordered_handoff_and_reverse_rejection", func(t *testing.T) {
 		manager := newTestManager(t)
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		admission, err := manager.Acquire(context.Background(), MutationAdmission)
 		if err != nil {
 			t.Fatalf("Acquire(admission) error = %v", err)
@@ -48,9 +48,9 @@ func TestIndependentLockContract(t *testing.T) {
 	t.Run("cross_manager_contention_is_bounded", func(t *testing.T) {
 		root := testLockRoot(t)
 		first := openTestManager(t, root)
-		defer first.Close()
+		defer func(ignore func() error) { _ = ignore() }(first.Close)
 		second := openTestManager(t, root)
-		defer second.Close()
+		defer func(ignore func() error) { _ = ignore() }(second.Close)
 		lease, err := first.Acquire(context.Background(), Exposure)
 		if err != nil {
 			t.Fatal(err)
@@ -71,7 +71,7 @@ func TestIndependentLockContract(t *testing.T) {
 	t.Run("path_or_metadata_drift_fails_before_lock", func(t *testing.T) {
 		root := testLockRoot(t)
 		manager := openTestManager(t, root)
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		if err := os.Chmod(filepath.Join(root, "exposure.lock"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +83,7 @@ func TestIndependentLockContract(t *testing.T) {
 	t.Run("held_lease_detects_lock_path_replacement", func(t *testing.T) {
 		root := testLockRoot(t)
 		manager := openTestManager(t, root)
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		lease, err := manager.Acquire(context.Background(), Exposure)
 		if err != nil {
 			t.Fatal(err)
@@ -106,7 +106,7 @@ func TestIndependentLockContract(t *testing.T) {
 	t.Run("lock_files_are_owner_only_regular_files", func(t *testing.T) {
 		root := testLockRoot(t)
 		manager := openTestManager(t, root)
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		for _, name := range []string{"mutation-admission.lock", "exposure.lock"} {
 			info, err := os.Lstat(filepath.Join(root, name))
 			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {

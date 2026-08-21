@@ -15,6 +15,7 @@ type fakeDNS struct {
 func (value fakeDNS) AuthoritativeServers(context.Context, string) ([]string, error) {
 	return []string{"ns2.example.test", "ns1.example.test"}, nil
 }
+
 func (value fakeDNS) Observe(_ context.Context, server, owner string) (DNSObservation, error) {
 	if value.failure == server {
 		return DNSObservation{}, fmt.Errorf("failed")
@@ -24,6 +25,7 @@ func (value fakeDNS) Observe(_ context.Context, server, owner string) (DNSObserv
 	result.Owner = owner
 	return result, nil
 }
+
 func TestDNSPreflightRequiresEveryAuthoritativeServerEmpty(t *testing.T) {
 	observer := fakeDNS{observations: map[string]DNSObservation{"ns1.example.test": {Authoritative: true}, "ns2.example.test": {Authoritative: true}}}
 	result, err := PreflightDNS01(context.Background(), observer, "example.test", []string{"_acme-challenge.app.example.test"})
@@ -39,11 +41,13 @@ func TestDNSPreflightRequiresEveryAuthoritativeServerEmpty(t *testing.T) {
 		t.Fatal("delegation accepted")
 	}
 }
+
 func TestDNSOwnerLockRejectsMismatchedDurableBinding(t *testing.T) {
 	if _, err := AcquireOwnerLocks(context.Background(), t.TempDir(), DNSProviderCloudflare, "example.test", []string{"_acme-challenge.app.example.test"}, "sha256:"+strings.Repeat("0", 64)); err == nil {
 		t.Fatal("mismatched owner-lock binding accepted")
 	}
 }
+
 func TestDNSPreflightRejectsInconsistentAuthority(t *testing.T) {
 	observer := fakeDNS{observations: map[string]DNSObservation{"ns1.example.test": {Authoritative: true}, "ns2.example.test": {Authoritative: false}}}
 	if _, err := PreflightDNS01(context.Background(), observer, "example.test", []string{"_acme-challenge.app.example.test"}); err == nil {

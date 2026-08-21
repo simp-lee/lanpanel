@@ -8,13 +8,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-
 	"lanpanel/internal/child"
 	"lanpanel/internal/download"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/sources"
+	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
@@ -103,7 +102,7 @@ func (stager *ArtifactStager) stageDistroCache(ctx context.Context, plan Plan, s
 	if err != nil {
 		return err
 	}
-	defer unix.Close(cacheFD)
+	defer func() { _ = unix.Close(cacheFD) }()
 	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", cacheFD))
 	if err != nil {
 		return fmt.Errorf("enumerate distro package cache: %w", err)
@@ -173,7 +172,7 @@ func validateStagedPath(path string, pkg Package) error {
 	if err != nil {
 		return fmt.Errorf("open existing staged package no-follow: %w", err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != pkg.ArtifactBytes {
 		return fmt.Errorf("existing staged package identity is unsafe")

@@ -20,7 +20,7 @@ import (
 
 func RunPrivateProbe(args []string) error {
 	if len(args) != 0 || os.Geteuid() == 0 || os.Getenv("LANPANEL_HEADSCALE_CANDIDATE") != "private-v1" || os.Getenv("LANPANEL_HEADSCALE_CONTROL_DOMAIN") == "" {
-		return fmt.Errorf("Headscale private probe requires its fixed non-root PID1 invocation")
+		return fmt.Errorf("headscale private probe requires its fixed non-root PID1 invocation")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -54,11 +54,11 @@ func probePrivateEndpoints(ctx context.Context, controlDomain string) error {
 func probeAdminSocket() error {
 	info, err := os.Lstat(FixedPaths().AdminSocket)
 	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("Headscale admin Unix socket metadata is unsafe")
+		return fmt.Errorf("headscale admin Unix socket metadata is unsafe")
 	}
 	stat, ok := info.Sys().(*unix.Stat_t)
 	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) {
-		return fmt.Errorf("Headscale admin Unix socket owner changed")
+		return fmt.Errorf("headscale admin Unix socket owner changed")
 	}
 	address, err := net.ResolveUnixAddr("unix", FixedPaths().AdminSocket)
 	if err != nil {
@@ -66,9 +66,9 @@ func probeAdminSocket() error {
 	}
 	connection, err := net.DialUnix("unix", nil, address)
 	if err != nil {
-		return fmt.Errorf("Headscale private admin endpoint: %w", err)
+		return fmt.Errorf("headscale private admin endpoint: %w", err)
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	raw, err := connection.SyscallConn()
 	if err != nil {
 		return err
@@ -79,7 +79,7 @@ func probeAdminSocket() error {
 		return err
 	}
 	if socketErr != nil || peer == nil || peer.Pid <= 0 || peer.Uid != uint32(os.Geteuid()) || peer.Gid != uint32(os.Getegid()) {
-		return fmt.Errorf("Headscale admin Unix peer identity changed")
+		return fmt.Errorf("headscale admin Unix peer identity changed")
 	}
 	return nil
 }
@@ -93,10 +93,10 @@ func probeHTTP(ctx context.Context, address, path, host string, allowBody bool) 
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if err != nil || response.StatusCode != http.StatusOK || !allowBody && len(strings.TrimSpace(string(body))) > 4096 || allowBody && !strings.Contains(string(body), "#") {
-		return fmt.Errorf("Headscale private HTTP probe rejected endpoint %s", address)
+		return fmt.Errorf("headscale private HTTP probe rejected endpoint %s", address)
 	}
 	return nil
 }
@@ -115,7 +115,7 @@ func probeSTUN(ctx context.Context) error {
 		clear(transaction)
 		return err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	deadline, _ := ctx.Deadline()
 	_ = connection.SetDeadline(deadline)
 	if _, err := connection.Write(packet); err != nil {
@@ -128,7 +128,7 @@ func probeSTUN(ctx context.Context) error {
 	clear(transaction)
 	clear(packet)
 	if !valid {
-		return fmt.Errorf("Headscale private STUN probe failed")
+		return fmt.Errorf("headscale private STUN probe failed")
 	}
 	return nil
 }

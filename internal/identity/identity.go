@@ -140,7 +140,7 @@ func GenerateManagementAuthority(reader io.Reader) (ManagementAuthority, error) 
 func ValidateManagementAuthority(authority ManagementAuthority) error {
 	address, err := netip.ParseAddr(authority.Address)
 	if err != nil || !address.Is4() || !address.IsLoopback() || address.IsUnspecified() || address.String() != authority.Address || authority.Port < managementPortBase {
-		return fmt.Errorf("Management authority is not an exact random 127/8 literal and high port")
+		return fmt.Errorf("management authority is not an exact random 127/8 literal and high port")
 	}
 	return nil
 }

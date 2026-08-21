@@ -16,14 +16,13 @@ import (
 	"time"
 )
 
-// ExactReconciliationAction is deliberately limited to a local non-ingress
-// commit or contraction. It grants no authority to start a child, contact a
-// provider, mutate an orphan record, start a stopped process, or open ingress.
+// ExactReconciliationAction is deliberately limited to local contraction. It
+// grants no authority to start a child, contact a provider, mutate an orphan
+// record, start a stopped process, or open ingress.
 type ExactReconciliationAction string
 
 const (
-	ReconcileFinalizeNonIngressCommit ExactReconciliationAction = "finalize_non_ingress_local_commit"
-	ReconcileContractApp              ExactReconciliationAction = "contract_app"
+	ReconcileContractApp ExactReconciliationAction = "contract_app"
 )
 
 type ExactResourceClosure struct {
@@ -345,7 +344,7 @@ func validateReconciliationJob(document persist.Document, jobID, journalID strin
 
 // decideExactReconciliation validates journal, installation, intent, and child
 // identities from one already-validated normal-state document. A mismatch
-// leaves the journal and any fence for diagnostics or same-version reinstall.
+// leaves the journal and any fence for diagnostics, export, and clean-host rebuild.
 func decideExactReconciliation(document persist.Document, journalID string, observation ExactReconciliationObservation) (ExactReconciliationDecision, error) {
 	if !validIdentityRef(journalID) {
 		return ExactReconciliationDecision{}, fmt.Errorf("exact reconciliation journal ID is invalid")
@@ -390,7 +389,7 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 				return ExactReconciliationDecision{}, fmt.Errorf("close-all journal resource inventory is not exact")
 			}
 		} else if len(journal.ResourceIDs) != 1 || !slices.Contains(installed, journal.ResourceIDs[0]) {
-			return ExactReconciliationDecision{}, fmt.Errorf("App journal resource is absent from installation authority")
+			return ExactReconciliationDecision{}, fmt.Errorf("app journal resource is absent from installation authority")
 		}
 	}
 	if !observation.Deadline.Equal(journal.Deadline) || observation.ArtifactDigest != journal.ArtifactDigest || observation.SafetyMarkerDigest != journal.SafetyMarkerDigest {
@@ -435,12 +434,6 @@ func decideExactReconciliation(document persist.Document, journalID string, obse
 		ResourceIDs:        append([]string(nil), journal.ResourceIDs...),
 	}
 	switch journal.Kind {
-	case JournalNonIngressLocalCommit, JournalPackageTransaction:
-		if journal.Phase != JournalTerminal || len(journal.ChildIDs) == 0 || !allSucceeded {
-			return ExactReconciliationDecision{}, fmt.Errorf("non-ingress local commit lacks a terminal successful child result")
-		}
-		decision.Action = ReconcileFinalizeNonIngressCommit
-		return decision, nil
 	case JournalAppContraction, JournalAppActivation, JournalCertificateActivation:
 		decision.Action = ReconcileContractApp
 		return decision, nil

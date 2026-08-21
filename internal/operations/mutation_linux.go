@@ -57,12 +57,14 @@ func OpenMutationSet(config MutationConfig) (*MutationSet, error) {
 	}
 	return &MutationSet{config: config, rootFD: fd, rootStat: stat}, nil
 }
+
 func (set *MutationSet) Authority() locks.Authority {
 	if set == nil {
 		return locks.Authority{}
 	}
 	return set.config.Authority
 }
+
 func (set *MutationSet) Close() error {
 	if set.closed.Swap(true) {
 		return nil
@@ -74,18 +76,7 @@ func (set *MutationSet) Close() error {
 // first, then the installation exposure lock. Ordinary operations must have
 // released the short-lived admission lock before entering this phase.
 func (set *MutationSet) AcquireExposure(ctx context.Context, target string, manager *locks.Manager) (*MutationLease, *locks.Lease, error) {
-	return set.acquireExposure(ctx, target, manager, false)
-}
-
-// acquireExposureForHandoff is reserved for the fenced maintenance, upgrade,
-// and backup handoff that deliberately retains admission until its fence is
-// committed.
-func (set *MutationSet) acquireExposureForHandoff(ctx context.Context, target string, manager *locks.Manager) (*MutationLease, *locks.Lease, error) {
-	return set.acquireExposure(ctx, target, manager, true)
-}
-
-func (set *MutationSet) acquireExposure(ctx context.Context, target string, manager *locks.Manager, admissionHandoff bool) (*MutationLease, *locks.Lease, error) {
-	if set == nil || set.closed.Load() || manager == nil || manager.Authority() != set.config.Authority || manager.Held(locks.Exposure) || (!admissionHandoff && manager.Held(locks.MutationAdmission)) || target == "" || target != strings.TrimSpace(target) {
+	if set == nil || set.closed.Load() || manager == nil || manager.Authority() != set.config.Authority || manager.Held(locks.Exposure) || manager.Held(locks.MutationAdmission) || target == "" || target != strings.TrimSpace(target) {
 		return nil, nil, fmt.Errorf("mutation lock request is invalid")
 	}
 	if err := set.revalidate(); err != nil {
@@ -130,27 +121,32 @@ func (set *MutationSet) acquireExposure(ctx context.Context, target string, mana
 	}
 	return mutation, exposure, nil
 }
+
 func (lease *MutationLease) Active() bool {
 	return lease != nil && !lease.released.Load() && lease.fd >= 0
 }
+
 func (lease *MutationLease) Target() string {
 	if lease == nil {
 		return ""
 	}
 	return lease.target
 }
+
 func (lease *MutationLease) Authority() locks.Authority {
 	if lease == nil || !lease.Active() {
 		return locks.Authority{}
 	}
 	return lease.authority
 }
+
 func (lease *MutationLease) Release() error {
 	if lease == nil || !lease.released.CompareAndSwap(false, true) {
 		return fmt.Errorf("mutation lease is not active")
 	}
 	return errors.Join(unix.Flock(lease.fd, unix.LOCK_UN), unix.Close(lease.fd))
 }
+
 func ReleaseExposure(mutation *MutationLease, exposure *locks.Lease) error {
 	var result error
 	if exposure != nil {
@@ -179,12 +175,14 @@ func (set *MutationSet) revalidate() error {
 	}
 	return nil
 }
+
 func validateMutationRoot(stat unix.Stat_t, config MutationConfig) error {
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != uint32(config.Mode.Perm()) || stat.Uid != config.Owner || stat.Gid != config.Group {
 		return fmt.Errorf("mutation lock root must be helper-owned mode 0700")
 	}
 	return nil
 }
+
 func sameMutationRoot(a, b unix.Stat_t) bool {
 	return a.Dev == b.Dev && a.Ino == b.Ino && a.Mode == b.Mode && a.Uid == b.Uid && a.Gid == b.Gid
 }

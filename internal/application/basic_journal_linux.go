@@ -47,6 +47,7 @@ func writeBasicJournal(ctx context.Context, value BasicJournal) error {
 	}
 	return writeBoundedJournal(ctx, basicJournalPath(value.CredentialID), raw)
 }
+
 func readBasicJournal(path string) (BasicJournal, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -54,10 +55,10 @@ func readBasicJournal(path string) (BasicJournal, error) {
 	}
 	file := os.NewFile(uintptr(fd), path)
 	if file == nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return BasicJournal{}, fmt.Errorf("managed Basic journal descriptor invalid")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o777 != 0o600 || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > 4096 {
 		return BasicJournal{}, fmt.Errorf("managed Basic journal identity unsafe")
@@ -82,9 +83,11 @@ func readBasicJournal(path string) (BasicJournal, error) {
 	return value, nil
 }
 
-var basicDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-var basicCredentialPattern = regexp.MustCompile(`^cred_[0-9a-f]{32}$`)
-var basicResourcePattern = regexp.MustCompile(`^res_[0-9a-f]{32}$`)
+var (
+	basicDigestPattern     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	basicCredentialPattern = regexp.MustCompile(`^cred_[0-9a-f]{32}$`)
+	basicResourcePattern   = regexp.MustCompile(`^res_[0-9a-f]{32}$`)
+)
 
 func writeBasicJournalValidation(value BasicJournal) error {
 	if value.SchemaVersion != basicJournalSchema || value.JobID == "" || !basicCredentialPattern.MatchString(value.CredentialID) || !basicResourcePattern.MatchString(value.ResourceID) || !htpasswdref.ValidUsername(value.Username) || value.Path != "/etc/lanpanel-public/basic/"+value.CredentialID+".htpasswd" || (value.Operation != "create" && value.Operation != "rotate" && value.Operation != "delete") || (value.Operation == "delete") != (value.CandidateFingerprint == "") || ((value.Operation == "create") != (value.PriorFingerprint == "") || value.PriorFingerprint != "" && !basicDigestPattern.MatchString(value.PriorFingerprint)) || (value.CandidateFingerprint != "" && !basicDigestPattern.MatchString(value.CandidateFingerprint)) {
@@ -92,6 +95,7 @@ func writeBasicJournalValidation(value BasicJournal) error {
 	}
 	return nil
 }
+
 func removeBasicJournal(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -111,6 +115,6 @@ func removeBasicJournal(path string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func(ignore func() error) { _ = ignore() }(directory.Close)
 	return directory.Sync()
 }

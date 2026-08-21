@@ -50,7 +50,7 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*PublicationExecution, error) { service.Close(); return nil, cause }
+	fail := func(cause error) (*PublicationExecution, error) { _ = service.Close(); return nil, cause }
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -119,7 +119,7 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	activationDeadline := time.Now().UTC().Add(time.Minute)
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	cleanup := func(cause error) (*PublicationExecution, error) {
@@ -316,6 +316,14 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 	if err != nil {
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}
+	if execution.Candidate.Bundle.DomainHTTPS != nil {
+		if _, bindingErr := bindingFromCertificateAuthority(execution.Candidate.Bundle.DomainHTTPS.Certificate.Authority); bindingErr != nil {
+			if stagedGoAccess != nil {
+				bindingErr = errors.Join(bindingErr, goaccessHost.CleanupCandidate(activationCtx, *stagedGoAccess), pruneRetiredGoAccessOwnership(activationCtx, execution.Service, execution.Exposure, execution.Resource.ID, execution.JobID, stagedGoAccess.Generation, stagedGoAccess.StateGeneration, !stagedGoAccess.RetainState, !stagedGoAccess.RetainShared))
+			}
+			return jobs.Record{}, execution.failClosed(ctx, bindingErr)
+		}
+	}
 	result, err := host.Activate(activationCtx, execution.Candidate, execution.Resource.Target)
 	if err != nil {
 		if stagedGoAccess != nil {
@@ -365,7 +373,6 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 				resource.StickyUnpublished = nil
 				resource.Contraction = nil
 				resource.CertificateExpiry = nil
-				resource.EdgeOne.Expiry = nil
 				if execution.Candidate.Bundle.DomainHTTPS != nil {
 					authority, authorityErr := activeCertificateAuthority(execution.Candidate.Bundle.DomainHTTPS.Certificate)
 					if authorityErr != nil {
@@ -432,6 +439,7 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 	}
 	return job, nil
 }
+
 func requireRetiredGoAccessOwnershipComplete(service *FixedService, resourceID string, generation, stateGeneration uint64, removeState bool) error {
 	paths, err := goaccessruntime.DerivePaths(resourceID, generation)
 	if err != nil {
@@ -629,6 +637,7 @@ func (execution *PublicationExecution) Close() error {
 	execution.Exposure = nil
 	return err
 }
+
 func publicationPlanBindingMatches(plan plans.Plan, resource domain.AppResource, result preflight.Result, ready target.Evidence) bool {
 	if err := preflight.ValidateFreshResult(result, time.Now().UTC()); err != nil {
 		return false
@@ -643,7 +652,7 @@ func publicationPlanBindingMatches(plan plans.Plan, resource domain.AppResource,
 			preflightEvidence.Digest = plan.Evidence[index].Digest
 			matchedPreflight = true
 		}
-		if plan.Evidence[index].Kind == "target_readiness" && plan.Evidence[index].Identity == "resource/"+resource.ID && plan.Evidence[index].Generation == resource.ManagedProcess.Applied.Generation {
+		if plan.Evidence[index].Kind == "target_readiness" && plan.Evidence[index].Identity == "resource/"+resource.ID && plan.Evidence[index].Generation == targetEvidenceGeneration(resource) {
 			ready.Digest = plan.Evidence[index].Digest
 			matchedReadiness = true
 		}
@@ -651,18 +660,19 @@ func publicationPlanBindingMatches(plan plans.Plan, resource domain.AppResource,
 	if !matchedPreflight || !matchedReadiness {
 		return false
 	}
-	binding := plans.Binding{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: plan.ActorIdentity, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: ready.Digest, ObservedAt: ready.ObservedAt}}}
+	binding := plans.Binding{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: plan.ActorIdentity, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: targetEvidenceGeneration(resource), Digest: ready.Digest, ObservedAt: ready.ObservedAt}}}
 	if resource.PublicationRecord.LastAppliedDigest != nil {
 		binding.Applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
 	}
 	expected := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 	return plans.SameBindingIdentity(expected, binding)
 }
+
 func baseSnapshot(resource safety.ResourceSafety) []safety.MarkerSnapshot {
 	values := []struct {
 		kind       safety.MarkerKind
 		generation uint64
-	}{{safety.MarkerStickyUnpublished, generation(resource.StickyUnpublished)}, {safety.MarkerContraction, generation(resource.Contraction)}, {safety.MarkerCertificateExpiry, deadlineGeneration(resource.CertificateExpiry)}, {safety.MarkerEdgeOneExpiry, deadlineGeneration(resource.EdgeOne.Expiry)}}
+	}{{safety.MarkerStickyUnpublished, generation(resource.StickyUnpublished)}, {safety.MarkerContraction, generation(resource.Contraction)}, {safety.MarkerCertificateExpiry, deadlineGeneration(resource.CertificateExpiry)}}
 	result := make([]safety.MarkerSnapshot, len(values))
 	for i, value := range values {
 		result[i] = safety.MarkerSnapshot{Kind: value.kind, State: safety.SnapshotAbsent}
@@ -673,18 +683,21 @@ func baseSnapshot(resource safety.ResourceSafety) []safety.MarkerSnapshot {
 	}
 	return result
 }
+
 func generation(marker *safety.GenerationMarker) uint64 {
 	if marker == nil {
 		return 0
 	}
 	return marker.Generation
 }
+
 func deadlineGeneration(marker *safety.DeadlineMarker) uint64 {
 	if marker == nil {
 		return 0
 	}
 	return marker.Generation
 }
+
 func upsertOwnedPath(values []ownership.OwnedPath, candidate ownership.OwnedPath) []ownership.OwnedPath {
 	result := make([]ownership.OwnedPath, 0, len(values)+1)
 	for _, value := range values {
@@ -695,6 +708,7 @@ func upsertOwnedPath(values []ownership.OwnedPath, candidate ownership.OwnedPath
 	}
 	return append(result, candidate)
 }
+
 func upsertOwnedListener(values []ownership.OwnedListener, candidate ownership.OwnedListener) []ownership.OwnedListener {
 	result := make([]ownership.OwnedListener, 0, len(values)+1)
 	for _, value := range values {
@@ -705,6 +719,7 @@ func upsertOwnedListener(values []ownership.OwnedListener, candidate ownership.O
 	}
 	return append(result, candidate)
 }
+
 func compare(a, b string) int {
 	if a < b {
 		return -1

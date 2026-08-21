@@ -11,7 +11,7 @@ jobs:
     name: Refuse incomplete release publication
     runs-on: ubuntu-latest
     steps:
-      - name: Release gate is not implemented
+      - name: Live qualification input is not configured
         run: |
-          echo "Release publication remains disabled until the S31 final asset gate is implemented." >&2
+          echo "Release publication remains disabled until P7 live qualification and final same-bytes readiness complete." >&2
           exit 1

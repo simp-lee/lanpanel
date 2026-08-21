@@ -54,6 +54,7 @@ func TestUnitMasksRefuseToRemoveReplacedMaskIdentity(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	if err := os.Symlink("/dev/null", path); err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +63,24 @@ func TestUnitMasksRefuseToRemoveReplacedMaskIdentity(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatalf("replacement mask was not preserved: %v", err)
+	}
+}
+
+func TestUnitMasksCleanupIsIdempotentAfterExactRemoval(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	masks := newTestUnitMasks(directory)
+	result, err := masks.Mask(context.Background(), []string{"nginx.service"}, func(MaskIdentity) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := masks.Unmask(context.Background(), result.Masks); err != nil {
+		t.Fatal(err)
+	}
+	if err := masks.Unmask(context.Background(), result.Masks); err != nil {
+		t.Fatalf("resume rejected already-cleaned exact mask: %v", err)
 	}
 }
 

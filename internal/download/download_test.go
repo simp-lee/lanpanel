@@ -7,14 +7,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"lanpanel/internal/sources"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"lanpanel/internal/sources"
 )
 
 func TestDownloadStreamsExactBoundedDigestWithoutFallback(t *testing.T) {

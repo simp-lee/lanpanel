@@ -63,7 +63,7 @@ func (s *FixedService) PendingHeadscaleRecovery() error {
 		return nil
 	}
 	if journal != nil && journal.Candidate.ID != installation.Headscale.ID {
-		return fmt.Errorf("Headscale initialization journal conflicts with committed identity")
+		return fmt.Errorf("headscale initialization journal conflicts with committed identity")
 	}
 	return managedheadscale.ValidateCommittedInitialization(installation.InstallationID, *installation.Headscale, installed, paths, filetxn.Owner{UID: 0, GID: 0})
 }
@@ -77,17 +77,17 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 	}
 	document, err := service.Normal().Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	raw, present := document.Entries["installations/current"]
 	if !present {
-		service.Close()
+		_ = service.Close()
 		return fmt.Errorf("normal installation authority is missing")
 	}
 	installation, err := domain.DecodeInstallation(raw)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	paths := managedheadscale.FixedPaths()
@@ -95,12 +95,12 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 	if _, statErr := os.Lstat(paths.Journal); statErr == nil {
 		journalPresent = true
 	} else if !os.IsNotExist(statErr) {
-		service.Close()
+		_ = service.Close()
 		return statErr
 	}
 	pending, _, pendingFound, err := operations.FindRunningHeadscaleInitialization(document)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	if installation.Headscale == nil && !journalPresent && !pendingFound {
@@ -108,24 +108,24 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 	}
 	installed, err := readCommittedReleaseIdentity()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	journal, _, err := managedheadscale.LoadInitializationJournal(paths, installed)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	if installation.Headscale == nil {
 		if !pendingFound || pending.HeadscaleBinding == nil {
-			service.Close()
-			return fmt.Errorf("Headscale initialization journal has no running intent")
+			_ = service.Close()
+			return fmt.Errorf("headscale initialization journal has no running intent")
 		}
 		if pending.Phase == operations.PhaseReserved {
 			admitter, admitterErr := service.resourceAdmitter()
 			admission, lockErr := service.Manager().Acquire(ctx, locks.MutationAdmission)
 			if admitterErr != nil || lockErr != nil {
-				service.Close()
+				_ = service.Close()
 				return errors.Join(admitterErr, lockErr)
 			}
 			rejectErr := admitter.RejectReservation(ctx, admission, document.Revision, pending.JobID, "executor_died")
@@ -135,17 +135,17 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 		binding := pending.HeadscaleBinding
 		if journal == nil {
 			if err := managedheadscale.CommitInitializationJournal(ctx, paths, installed, binding.Candidate, binding.Snapshot, pending.JobID, binding.Source, binding.ProxyURL); err != nil {
-				service.Close()
+				_ = service.Close()
 				return err
 			}
 		} else if journal.JobID != pending.JobID || journal.Candidate.ID != binding.Candidate.ID || !reflect.DeepEqual(journal.Source, binding.Source) || journal.ProxyURL != binding.ProxyURL {
-			service.Close()
-			return fmt.Errorf("Headscale initialization journal differs from running intent")
+			_ = service.Close()
+			return fmt.Errorf("headscale initialization journal differs from running intent")
 		}
-		service.Close()
+		_ = service.Close()
 		return fmt.Errorf("exact Headscale initialization awaits explicit UI resumption")
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	candidate := *installation.Headscale
 	if err := managedheadscale.ValidateCommittedInitialization(installation.InstallationID, candidate, installed, paths, filetxn.Owner{UID: 0, GID: 0}); err != nil {
 		return err
@@ -178,12 +178,12 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, string(plans.TargetInstallation), service.Manager())
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	if journal != nil {
 		if err := managedheadscale.RemoveInitializationJournal(paths, installed, journal.Candidate, journal.Snapshot, journal.JobID, journal.Source, journal.ProxyURL); err != nil {
 			return err

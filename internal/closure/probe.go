@@ -94,10 +94,6 @@ func (probe NegativeProbe) Run(ctx context.Context, inventory Inventory) (string
 			return "", fmt.Errorf("release-owned rejection audit lacks correlation")
 		}
 	}
-	if len(domains) == 0 && len(listeners) == 0 {
-		// A never-published resource has no reachable ingress identity; disk and
-		// runtime graph evidence still binds its selective no-effect closure.
-	}
 	digest := sha256.Sum256([]byte(inventory.Digest + "\x00" + correlation))
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
@@ -107,7 +103,7 @@ func probeDomain(ctx context.Context, probe NegativeProbe, sni, host, correlatio
 	if err != nil {
 		return err
 	}
-	defer raw.Close()
+	defer func(ignore func() error) { _ = ignore() }(raw.Close)
 	connection := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	if err := connection.HandshakeContext(ctx); err != nil {
 		return err
@@ -127,7 +123,7 @@ func probeDomain(ctx context.Context, probe NegativeProbe, sni, host, correlatio
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	_, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	if readErr != nil || response.StatusCode != http.StatusMisdirectedRequest || response.Header.Get("X-LanPanel-Rejection") != "default" {
 		return fmt.Errorf("closure probe did not hit fixed default rejection")

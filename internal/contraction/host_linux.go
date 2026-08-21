@@ -43,6 +43,7 @@ type Host struct {
 	Observer    closure.RuntimeObserver
 	Probe       closure.NegativeProbe
 	StopProfile child.ProfileID
+	Guard       func(nginx.Manifest) error
 }
 
 func (host Host) ContractDisk(ctx context.Context, inventory closure.Inventory) ([]string, error) {
@@ -54,9 +55,13 @@ func (host Host) ContractDisk(ctx context.Context, inventory closure.Inventory) 
 			resourceIDs = append(resourceIDs, identity.ResourceID)
 		}
 	}
-	_, paths, err := nginx.Contract(ctx, host.Paths, host.Owner, resourceIDs)
+	manifest, paths, err := nginx.Contract(ctx, host.Paths, host.Owner, resourceIDs)
+	if err == nil && host.Guard != nil {
+		err = host.Guard(manifest)
+	}
 	return paths, err
 }
+
 func (host Host) TestClosedGraph(ctx context.Context) error {
 	if _, err := nginx.Audit(host.Paths, host.Owner); err != nil {
 		return err
@@ -66,9 +71,10 @@ func (host Host) TestClosedGraph(ctx context.Context) error {
 	}
 	return host.run(ctx, child.ProfileNginxTest)
 }
+
 func (host Host) ReloadAndDrain(ctx context.Context) error {
 	if host.Observer == nil {
-		return fmt.Errorf("Nginx runtime observer is missing")
+		return fmt.Errorf("nginx runtime observer is missing")
 	}
 	prior, err := host.Observer.Observe(ctx)
 	if err != nil {
@@ -93,6 +99,7 @@ func (host Host) ReloadAndDrain(ctx context.Context) error {
 	}
 	return nil
 }
+
 func (host Host) ProbeSelectiveClosure(ctx context.Context, inventory closure.Inventory) (string, error) {
 	snapshot, err := host.Observe(ctx)
 	if err == nil && closure.VerifyStopped(snapshot) == nil {
@@ -100,6 +107,7 @@ func (host Host) ProbeSelectiveClosure(ctx context.Context, inventory closure.In
 	}
 	return host.Probe.Run(ctx, inventory)
 }
+
 func (host Host) Stop(ctx context.Context) error {
 	if snapshot, err := host.Observe(ctx); err == nil && closure.VerifyStopped(snapshot) == nil {
 		return nil
@@ -130,15 +138,17 @@ func (host Host) Stop(ctx context.Context) error {
 		}
 	}
 }
+
 func (host Host) Observe(ctx context.Context) (closure.RuntimeSnapshot, error) {
 	if host.Observer == nil {
-		return closure.RuntimeSnapshot{}, fmt.Errorf("Nginx runtime observer is missing")
+		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx runtime observer is missing")
 	}
 	return host.Observer.Observe(ctx)
 }
+
 func (host Host) run(ctx context.Context, profile child.ProfileID) error {
 	if host.Launcher == nil {
-		return fmt.Errorf("Nginx fixed child launcher is missing")
+		return fmt.Errorf("nginx fixed child launcher is missing")
 	}
 	result, err := host.Launcher.Run(ctx, profile, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {

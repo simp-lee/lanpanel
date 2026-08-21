@@ -16,27 +16,6 @@ func Validate(state State) error {
 	if err := validateGlobalClose(state.GlobalClose); err != nil {
 		return err
 	}
-	for name, marker := range map[string]*TransitionMarker{
-		"maintenance_pending":           state.MaintenancePending,
-		"dependency_transition_pending": state.DependencyTransitionPending,
-		"upgrade_pending":               state.UpgradePending,
-	} {
-		if marker != nil {
-			if err := validateTransitionMarker(*marker); err != nil {
-				return fmt.Errorf("%s: %w", name, err)
-			}
-		}
-	}
-	if state.BackupQuiescence != nil {
-		if err := validateBackupQuiescence(*state.BackupQuiescence); err != nil {
-			return err
-		}
-	}
-	if state.BackupTransition != nil {
-		if err := validateBackupTransition(*state.BackupTransition); err != nil {
-			return err
-		}
-	}
 	if err := validateHeadscale(state.Headscale); err != nil {
 		return err
 	}
@@ -75,51 +54,25 @@ func validateGlobalClose(marker GlobalClose) error {
 	}
 }
 
-func validateTransitionMarker(marker TransitionMarker) error {
-	if marker.Generation == 0 || !validRef(marker.JournalRef) || !isDigest(marker.CurrentEnvelope) || !isDigest(marker.TargetEnvelope) || marker.Deadline.IsZero() {
-		return fmt.Errorf("transition marker requires generation, journal, envelopes, and deadline")
-	}
-	return nil
-}
-
-func validateBackupQuiescence(marker BackupQuiescence) error {
-	if marker.Generation == 0 {
-		return fmt.Errorf("backup quiescence generation is required")
-	}
-	switch marker.Phase {
-	case BackupPreparing:
-		if marker.ManifestDigest != "" || marker.PayloadDigest != "" {
-			return fmt.Errorf("preparing backup must not contain sealed digests")
-		}
-	case BackupSealed:
-		if !isDigest(marker.ManifestDigest) || !isDigest(marker.PayloadDigest) {
-			return fmt.Errorf("sealed backup requires manifest and payload digests")
-		}
-	default:
-		return fmt.Errorf("backup quiescence phase %q is unsupported", marker.Phase)
-	}
-	return nil
-}
-
-func validateBackupTransition(marker BackupTransition) error {
-	if marker.Generation == 0 || !validRef(marker.JournalRef) {
-		return fmt.Errorf("backup transition generation and journal are required")
-	}
-	switch marker.Phase {
-	case BackupTransitionPrepared, BackupTransitionCommitted, BackupTransitionImported:
-		return nil
-	default:
-		return fmt.Errorf("backup transition phase %q is unsupported", marker.Phase)
-	}
-}
-
 func validateHeadscale(headscale HeadscaleSafety) error {
 	if maximumGeneration(headscaleGenerations(headscale)) > headscale.GenerationSequence {
-		return fmt.Errorf("Headscale generation exceeds its monotonic sequence")
+		return fmt.Errorf("headscale generation exceeds its monotonic sequence")
+	}
+	if (headscale.ActiveCertificate == nil) != (headscale.ControlEntryDigest == "") || headscale.ControlEntryDigest != "" && !isDigest(headscale.ControlEntryDigest) {
+		return fmt.Errorf("headscale control entry authority invalid")
+	}
+	if headscale.ActiveCertificate != nil {
+		active := headscale.ActiveCertificate
+		if active.Generation == 0 || !isDigest(active.Fingerprint) || !validRef(active.Binding) || active.NotAfter.IsZero() || active.LastTrustedWall.IsZero() || !active.NotAfter.After(active.LastTrustedWall) {
+			return fmt.Errorf("headscale active certificate authority invalid")
+		}
 	}
 	if headscale.CertificateExpiry != nil {
 		if err := validateDeadlineMarker(*headscale.CertificateExpiry); err != nil {
 			return fmt.Errorf("headscale certificate expiry: %w", err)
+		}
+		if headscale.ActiveCertificate == nil || headscale.CertificateExpiry.Binding != headscale.ActiveCertificate.Binding {
+			return fmt.Errorf("headscale certificate expiry lacks active authority")
 		}
 	}
 	if headscale.ChallengePending != nil {
@@ -133,7 +86,7 @@ func validateHeadscale(headscale HeadscaleSafety) error {
 		}
 	}
 	if headscale.ChallengePending != nil && headscale.Reactivating != nil {
-		return fmt.Errorf("Headscale challenge and reactivation identities are mutually exclusive")
+		return fmt.Errorf("headscale challenge and reactivation identities are mutually exclusive")
 	}
 	return nil
 }
@@ -185,14 +138,6 @@ func validateResource(resource ResourceSafety) error {
 			return fmt.Errorf("certificate expiry lacks matching active authority")
 		}
 	}
-	if resource.EdgeOne.Expiry != nil {
-		if err := validateDeadlineMarker(*resource.EdgeOne.Expiry); err != nil {
-			return fmt.Errorf("EdgeOne expiry: %w", err)
-		}
-	}
-	if resource.EdgeOne.Deadline.IsZero() != (resource.EdgeOne.RefreshJournal == "") {
-		return fmt.Errorf("EdgeOne refresh journal and deadline must be committed as one pair")
-	}
 	if resource.ChallengePending != nil {
 		if err := validateChallenge(*resource.ChallengePending); err != nil {
 			return err
@@ -204,7 +149,7 @@ func validateResource(resource ResourceSafety) error {
 		}
 	}
 	if resource.ChallengePending != nil && resource.Reactivating != nil {
-		return fmt.Errorf("App challenge and reactivation identities are mutually exclusive")
+		return fmt.Errorf("app challenge and reactivation identities are mutually exclusive")
 	}
 	if resource.State == ResourceDeleting && !validRef(resource.DeletionTombstone) {
 		return fmt.Errorf("deleting resource requires tombstone reference")
@@ -265,7 +210,7 @@ func validateChallenge(challenge ChallengePending) error {
 }
 
 func validateReactivating(reactivating Reactivating) error {
-	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || (!reactivating.TemporaryHTTP && (reactivating.CertificateUntil.IsZero() || reactivating.ACLUntil.IsZero())) || (reactivating.TemporaryHTTP && (!reactivating.CertificateUntil.IsZero() || !reactivating.ACLUntil.IsZero())) {
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || (!reactivating.TemporaryHTTP && reactivating.CertificateUntil.IsZero()) || (reactivating.TemporaryHTTP && !reactivating.CertificateUntil.IsZero()) {
 		return fmt.Errorf("reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {
@@ -275,8 +220,9 @@ func validateReactivating(reactivating Reactivating) error {
 }
 
 func validateHeadscaleReactivating(reactivating HeadscaleReactivating) error {
-	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CertificateFingerprint) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || !((reactivating.ActivationDigest == "" && reactivating.ControlEntryDigest == "") || (isDigest(reactivating.ActivationDigest) && isDigest(reactivating.ControlEntryDigest))) || reactivating.CertificateUntil.IsZero() {
-		return fmt.Errorf("Headscale reactivating identity is incomplete")
+	activationPairValid := reactivating.ActivationDigest == "" && reactivating.ControlEntryDigest == "" || isDigest(reactivating.ActivationDigest) && isDigest(reactivating.ControlEntryDigest)
+	if reactivating.Generation == 0 || reactivating.PriorGeneration+1 != reactivating.Generation || !validRef(reactivating.PlanID) || reactivating.ControlGeneration == 0 || reactivating.CertificateGeneration == 0 || !isDigest(reactivating.CertificateFingerprint) || !isDigest(reactivating.CandidateDigest) || !isDigest(reactivating.CandidateBundle) || !activationPairValid || reactivating.CertificateUntil.IsZero() || reactivating.CertificateLastTrustedWall.IsZero() || !reactivating.CertificateUntil.After(reactivating.CertificateLastTrustedWall) {
+		return fmt.Errorf("headscale reactivating identity is incomplete")
 	}
 	if reactivating.ProbePending && !validRef(reactivating.ProbeCorrelation) {
 		return fmt.Errorf("probe-pending Headscale reactivation requires correlation")
@@ -285,7 +231,7 @@ func validateHeadscaleReactivating(reactivating HeadscaleReactivating) error {
 }
 
 func validateBaseSnapshot(snapshot []MarkerSnapshot) error {
-	required := []MarkerKind{MarkerStickyUnpublished, MarkerContraction, MarkerCertificateExpiry, MarkerEdgeOneExpiry}
+	required := []MarkerKind{MarkerStickyUnpublished, MarkerContraction, MarkerCertificateExpiry}
 	if len(snapshot) != len(required) {
 		return fmt.Errorf("base marker snapshot must contain the exact closed marker set")
 	}
@@ -324,7 +270,7 @@ func validateStopFence(fence StopFence, state State) error {
 		return fmt.Errorf("stop fence scope kind is unsupported")
 	}
 	if fence.Scope.Kind == "app" && !validRef(fence.Scope.ResourceID) {
-		return fmt.Errorf("App stop fence requires resource ID")
+		return fmt.Errorf("app stop fence requires resource ID")
 	}
 	if !fence.AccessMayRemain && (!fence.Observation.MasterStopped || !fence.Observation.WorkersStopped || !fence.Observation.ListenersStopped) {
 		return fmt.Errorf("stop fence can clear access_may_remain only with complete stop observation")
@@ -352,7 +298,7 @@ func validateStopFence(fence StopFence, state State) error {
 		}
 	}
 	payloads := 0
-	for _, present := range []bool{fence.Contraction != nil, fence.IngressActivation != nil, fence.CertificateActivation != nil, fence.EdgeOneRefresh != nil, fence.Transition != nil} {
+	for _, present := range []bool{fence.Contraction != nil, fence.IngressActivation != nil, fence.CertificateActivation != nil} {
 		if present {
 			payloads++
 		}
@@ -364,6 +310,11 @@ func validateStopFence(fence StopFence, state State) error {
 	case StopFenceContraction:
 		if fence.Contraction == nil || len(fence.Contraction.Authorities) == 0 || !isDigest(fence.Contraction.OwnershipDigest) {
 			return fmt.Errorf("contraction stop fence payload is incomplete")
+		}
+		normalOperation := validRef(fence.Contraction.OperationRef) && fence.Contraction.SafetyIntentID == "" && fence.Contraction.SafetyIntentGeneration == 0
+		stateIndependent := fence.Contraction.OperationRef == "" && validRef(fence.Contraction.SafetyIntentID) && fence.Contraction.SafetyIntentGeneration != 0
+		if !normalOperation && !stateIndependent {
+			return fmt.Errorf("contraction stop fence lacks exact operation or safety-intent identity")
 		}
 		if err := validateMarkerGenerations(fence.Contraction.Authorities); err != nil {
 			return err
@@ -407,30 +358,6 @@ func validateStopFence(fence StopFence, state State) error {
 		} else if fence.Scope.Kind == "headscale" && (state.Headscale.GenerationSequence != p.ResourceGeneration || state.Headscale.CertificateExpiry == nil || state.Headscale.CertificateExpiry.Generation != p.ExpiryGeneration) {
 			return fmt.Errorf("certificate activation stop fence does not match Headscale generation and expiry authority")
 		}
-	case StopFenceEdgeOneRefresh:
-		p := fence.EdgeOneRefresh
-		if p == nil || !validRef(p.JournalRef) || p.ResourceGeneration == 0 || !isDigest(p.PriorACL) || !isDigest(p.CandidateACL) || p.PriorDeadline.IsZero() || p.CandidateDeadline.IsZero() {
-			return fmt.Errorf("EdgeOne refresh stop fence payload is incomplete")
-		}
-		resource := findResource(state, fence.Scope.ResourceID)
-		if fence.Scope.Kind != "app" || resource == nil || resource.GenerationSequence != p.ResourceGeneration || resource.EdgeOne.RefreshJournal != p.JournalRef || !resource.EdgeOne.Deadline.Equal(p.PriorDeadline) && !resource.EdgeOne.Deadline.Equal(p.CandidateDeadline) {
-			return fmt.Errorf("EdgeOne refresh stop fence does not match journal, generation, and deadline authority")
-		}
-	case StopFenceMaintenanceTransition, StopFenceGenerationUpgrade:
-		p := fence.Transition
-		if fence.Scope.Kind != "installation" {
-			return fmt.Errorf("transition stop fence requires installation scope")
-		}
-		if p == nil || !validRef(p.JournalRef) || !isDigest(p.CurrentEnvelope) || !isDigest(p.TargetEnvelope) || !isDigest(p.RuntimeClosureDigest) || !isDigest(p.GenerationClosureDigest) {
-			return fmt.Errorf("transition stop fence payload is incomplete")
-		}
-		marker := state.MaintenancePending
-		if fence.Kind == StopFenceGenerationUpgrade {
-			marker = state.UpgradePending
-		}
-		if marker == nil || marker.JournalRef != p.JournalRef || marker.CurrentEnvelope != p.CurrentEnvelope || marker.TargetEnvelope != p.TargetEnvelope {
-			return fmt.Errorf("transition stop fence does not match its journal marker")
-		}
 	default:
 		return fmt.Errorf("stop fence kind %q is unsupported", fence.Kind)
 	}
@@ -453,21 +380,6 @@ func applicableMarkerGenerations(scope FenceScope, state State) map[string]uint6
 	if state.GlobalClose.Phase != GlobalCloseNone {
 		result["global_close"] = state.GlobalClose.Generation
 	}
-	if state.MaintenancePending != nil {
-		result["maintenance_pending"] = state.MaintenancePending.Generation
-	}
-	if state.DependencyTransitionPending != nil {
-		result["dependency_transition_pending"] = state.DependencyTransitionPending.Generation
-	}
-	if state.UpgradePending != nil {
-		result["upgrade_pending"] = state.UpgradePending.Generation
-	}
-	if state.BackupQuiescence != nil {
-		result["backup_quiescence"] = state.BackupQuiescence.Generation
-	}
-	if state.BackupTransition != nil && state.BackupTransition.Phase != BackupTransitionImported {
-		result["backup_transition"] = state.BackupTransition.Generation
-	}
 	switch scope.Kind {
 	case "app":
 		if resource := findResource(state, scope.ResourceID); resource != nil {
@@ -482,9 +394,6 @@ func applicableMarkerGenerations(scope FenceScope, state State) map[string]uint6
 			}
 			if resource.CertificateExpiry != nil {
 				result["certificate_expiry"] = resource.CertificateExpiry.Generation
-			}
-			if resource.EdgeOne.Expiry != nil {
-				result["edgeone_expiry"] = resource.EdgeOne.Expiry.Generation
 			}
 			if resource.ChallengePending != nil {
 				result["challenge_pending"] = resource.ChallengePending.Generation
@@ -522,26 +431,6 @@ func bindMarkerGenerations(values []MarkerGeneration, scope FenceScope, state St
 			if state.GlobalClose.Phase != GlobalCloseNone {
 				generation = state.GlobalClose.Generation
 			}
-		case "maintenance_pending":
-			if state.MaintenancePending != nil {
-				generation = state.MaintenancePending.Generation
-			}
-		case "dependency_transition_pending":
-			if state.DependencyTransitionPending != nil {
-				generation = state.DependencyTransitionPending.Generation
-			}
-		case "upgrade_pending":
-			if state.UpgradePending != nil {
-				generation = state.UpgradePending.Generation
-			}
-		case "backup_quiescence":
-			if state.BackupQuiescence != nil {
-				generation = state.BackupQuiescence.Generation
-			}
-		case "backup_transition":
-			if state.BackupTransition != nil {
-				generation = state.BackupTransition.Generation
-			}
 		case "sticky_unpublished":
 			if resource != nil && resource.StickyUnpublished != nil {
 				generation = resource.StickyUnpublished.Generation
@@ -559,10 +448,6 @@ func bindMarkerGenerations(values []MarkerGeneration, scope FenceScope, state St
 				generation = resource.CertificateExpiry.Generation
 			} else if scope.Kind == "headscale" && state.Headscale.CertificateExpiry != nil {
 				generation = state.Headscale.CertificateExpiry.Generation
-			}
-		case "edgeone_expiry":
-			if resource != nil && resource.EdgeOne.Expiry != nil {
-				generation = resource.EdgeOne.Expiry.Generation
 			}
 		case "challenge_pending":
 			if resource != nil && resource.ChallengePending != nil {
@@ -600,9 +485,6 @@ func resourceGenerations(resource ResourceSafety) map[string]uint64 {
 	if resource.CertificateExpiry != nil {
 		values["certificate_expiry"] = resource.CertificateExpiry.Generation
 	}
-	if resource.EdgeOne.Expiry != nil {
-		values["edgeone_expiry"] = resource.EdgeOne.Expiry.Generation
-	}
 	if resource.ChallengePending != nil {
 		values["challenge_pending"] = resource.ChallengePending.Generation
 	}
@@ -638,7 +520,7 @@ func maximumGeneration(values map[string]uint64) uint64 {
 
 func validMarkerKind(kind MarkerKind) bool {
 	switch kind {
-	case MarkerStickyUnpublished, MarkerClosing, MarkerContraction, MarkerCertificateExpiry, MarkerEdgeOneExpiry, MarkerDeleting:
+	case MarkerStickyUnpublished, MarkerClosing, MarkerContraction, MarkerCertificateExpiry, MarkerDeleting:
 		return true
 	default:
 		return false

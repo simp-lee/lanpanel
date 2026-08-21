@@ -28,7 +28,7 @@ func notifySystemd(path string) error {
 	if err != nil {
 		return err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	payload := []byte("READY=1")
 	written, err := connection.Write(payload)
 	if err != nil || written != len(payload) {

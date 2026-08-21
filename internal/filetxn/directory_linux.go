@@ -53,7 +53,7 @@ func CommitNewDirectory(ctx context.Context, request DirectoryRequest) (Director
 	if err != nil {
 		return DirectoryIdentity{}, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	if err := validateDirectoryMetadata(parentStat, request.Parent); err != nil {
 		return DirectoryIdentity{}, err
 	}
@@ -83,7 +83,7 @@ func CommitNewDirectory(ctx context.Context, request DirectoryRequest) (Director
 	if err != nil {
 		return DirectoryIdentity{}, err
 	}
-	defer unix.Close(stagingFD)
+	defer func() { _ = unix.Close(stagingFD) }()
 	if err := unix.Fchown(stagingFD, int(request.Directory.Owner.UID), int(request.Directory.Owner.GID)); err != nil || unix.Fchmod(stagingFD, uint32(request.Directory.Mode.Perm())) != nil {
 		return DirectoryIdentity{}, fmt.Errorf("set bundle staging directory metadata")
 	}
@@ -127,7 +127,7 @@ func CommitNewDirectory(ctx context.Context, request DirectoryRequest) (Director
 	if err != nil {
 		return DirectoryIdentity{}, err
 	}
-	defer unix.Close(committedFD)
+	defer func() { _ = unix.Close(committedFD) }()
 	committed, err := verifyDirectoryFD(committedFD, filepath.Join(request.ParentPath, request.TargetName), request)
 	if err != nil || committed.Device != identity.Device || committed.Inode != identity.Inode || committed.Digest != identity.Digest {
 		return DirectoryIdentity{}, fmt.Errorf("committed directory bundle identity changed")
@@ -143,7 +143,7 @@ func VerifyDirectory(request DirectoryRequest) (DirectoryIdentity, error) {
 	if err != nil {
 		return DirectoryIdentity{}, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	if err := validateDirectoryMetadata(parentStat, request.Parent); err != nil {
 		return DirectoryIdentity{}, err
 	}
@@ -151,7 +151,7 @@ func VerifyDirectory(request DirectoryRequest) (DirectoryIdentity, error) {
 	if err != nil {
 		return DirectoryIdentity{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	return verifyDirectoryFD(fd, filepath.Join(request.ParentPath, request.TargetName), request)
 }
 
@@ -199,7 +199,7 @@ func verifyDirectoryFD(fd int, path string, request DirectoryRequest) (Directory
 		if readErr != nil || statErr != nil || closeErr != nil || !bytes.Equal(data, member.Data) || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim {
 			return DirectoryIdentity{}, fmt.Errorf("directory member %q changed or differs", member.Name)
 		}
-		fmt.Fprintf(hasher, "%d:%s:%04o:%d:", len(member.Name), member.Name, member.Mode.Perm(), len(data))
+		_, _ = fmt.Fprintf(hasher, "%d:%s:%04o:%d:", len(member.Name), member.Name, member.Mode.Perm(), len(data))
 		_, _ = hasher.Write(data)
 	}
 	return DirectoryIdentity{Path: path, Device: uint64(stat.Dev), Inode: stat.Ino, Digest: hex.EncodeToString(hasher.Sum(nil))}, nil
@@ -244,7 +244,7 @@ func removeExactStaging(parentFD int, name string, request DirectoryRequest) err
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	if _, err := verifyDirectoryFD(fd, "", request); err != nil {
 		return err
 	}

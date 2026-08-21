@@ -12,7 +12,7 @@
     "test:auth": "playwright test --project=local_fixture"
   },
   "devDependencies": {
-    "@playwright/test": "1.54.2",
+    "@playwright/test": "1.62.1",
     "vitepress": "1.6.4"
   }
 }

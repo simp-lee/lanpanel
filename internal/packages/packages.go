@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"lanpanel/internal/sources"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -13,8 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"lanpanel/internal/sources"
 )
 
 type Mode string
@@ -28,21 +27,21 @@ const (
 type AuthorityKind string
 
 const (
-	FinalSupportedProfile  AuthorityKind = "final_supported_profile"
-	QualificationCandidate AuthorityKind = "qualification_candidate"
+	FinalSupportedProfile AuthorityKind = "final_supported_profile"
+	QualificationTarget   AuthorityKind = "qualification_target_profile"
 )
 
 type QualificationAuthority struct {
-	Kind                  AuthorityKind `json:"kind"`
-	EnvelopeDigest        string        `json:"envelope_digest"`
-	BinaryDigest          string        `json:"binary_digest"`
-	RunID                 string        `json:"run_id,omitempty"`
-	ManifestDigest        string        `json:"manifest_digest,omitempty"`
-	HostFingerprint       string        `json:"host_fingerprint"`
-	CaseID                string        `json:"case_id,omitempty"`
-	Operation             string        `json:"operation"`
-	TargetOSProfileDigest string        `json:"target_os_profile_digest"`
-	FrozenClosureDigest   string        `json:"frozen_closure_digest"`
+	Kind                   AuthorityKind `json:"kind"`
+	ReleaseAuthorityDigest string        `json:"release_authority_digest"`
+	BinaryDigest           string        `json:"binary_digest"`
+	RunID                  string        `json:"run_id,omitempty"`
+	InstallManifestDigest  string        `json:"install_manifest_digest,omitempty"`
+	SideEffectPlanDigest   string        `json:"side_effect_plan_digest,omitempty"`
+	HostFingerprint        string        `json:"host_fingerprint"`
+	Operation              string        `json:"operation"`
+	TargetOSProfileDigest  string        `json:"target_os_profile_digest"`
+	FrozenClosureDigest    string        `json:"frozen_closure_digest"`
 }
 
 type Package struct {
@@ -59,12 +58,14 @@ type Package struct {
 }
 
 type Repository struct {
-	ID            string   `json:"id"`
-	URI           string   `json:"uri"`
-	Suite         string   `json:"suite"`
-	Components    []string `json:"components"`
-	KeyringPath   string   `json:"keyring_path"`
-	KeyringDigest string   `json:"keyring_digest"`
+	ID             string   `json:"id"`
+	URI            string   `json:"uri"`
+	Suite          string   `json:"suite"`
+	Components     []string `json:"components"`
+	KeyringPath    string   `json:"keyring_path"`
+	KeyringDigest  string   `json:"keyring_digest"`
+	MetadataDigest string   `json:"metadata_digest"`
+	CutoffDigest   string   `json:"cutoff_digest"`
 }
 
 type Plan struct {
@@ -246,16 +247,16 @@ func ValidatePlan(plan Plan) error {
 		return fmt.Errorf("first Nginx package closure omits nginx or apache2-utils")
 	}
 	closureDigest, err := ClosureDigest(plan.Packages)
-	if err != nil || closureDigest != plan.Authority.FrozenClosureDigest || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest || plan.Authority.Operation != "package_transaction" || !digestPattern.MatchString(plan.Authority.EnvelopeDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) {
+	if err != nil || closureDigest != plan.Authority.FrozenClosureDigest || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest || plan.Authority.Operation != "package_transaction" || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) {
 		return fmt.Errorf("package qualification authority does not bind the exact closure and host profile")
 	}
 	switch plan.Authority.Kind {
 	case FinalSupportedProfile:
-		if plan.Authority.RunID != "" || plan.Authority.ManifestDigest != "" || plan.Authority.CaseID != "" {
+		if plan.Authority.RunID != "" || plan.Authority.InstallManifestDigest != "" || plan.Authority.SideEffectPlanDigest != "" {
 			return fmt.Errorf("final supported package authority carries candidate-only fields")
 		}
-	case QualificationCandidate:
-		if !refPattern.MatchString(plan.Authority.RunID) || !digestPattern.MatchString(plan.Authority.ManifestDigest) || !refPattern.MatchString(plan.Authority.CaseID) {
+	case QualificationTarget:
+		if !refPattern.MatchString(plan.Authority.RunID) || !digestPattern.MatchString(plan.Authority.InstallManifestDigest) || !digestPattern.MatchString(plan.Authority.SideEffectPlanDigest) {
 			return fmt.Errorf("qualification candidate package authority is incomplete")
 		}
 	default:
@@ -361,7 +362,7 @@ func validateRepositories(repositories []Repository) error {
 	previous := ""
 	for _, repository := range repositories {
 		parsed, err := url.Parse(repository.URI)
-		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") || !digestPattern.MatchString(repository.KeyringDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 {
+		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 {
 			return fmt.Errorf("package repository authority is invalid, duplicated, or unsorted")
 		}
 		componentPrevious := ""

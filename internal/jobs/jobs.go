@@ -31,12 +31,14 @@ var (
 	errorCodePattern  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	allowedErrorCodes = map[string]struct{}{
 		"activation_contracted":                      {},
+		"activation_restored_prior":                  {},
 		"admin_token_delivery_failed":                {},
 		"admin_token_rotation_failed":                {},
 		"admin_token_rotation_interrupted":           {},
 		"admin_token_source_unknown":                 {},
 		"binding_refresh_failed":                     {},
 		"certificate_remote_failed":                  {},
+		"certificate_handoff_interrupted":            {},
 		"certificate_executor_interrupted":           {},
 		"certificate_setup_failed":                   {},
 		"confirmation_invalid":                       {},
@@ -47,15 +49,30 @@ var (
 		"managed_basic_hash_failed":                  {},
 		"static_root_registration_interrupted":       {},
 		"external_htpasswd_registration_interrupted": {},
+		"foreign_database_evidence":                  {},
 		"goaccess_retirement_recovery":               {},
+		"goaccess_staging_restored_prior":            {},
 		"goaccess_stop_failed":                       {},
+		"headscale_control_stop_fenced":              {},
 		"headscale_deploy_revalidation_failed":       {},
+		"headscale_user_create_failed":               {},
+		"preauth_key_create_failed":                  {},
+		"preauth_key_revoke_failed":                  {},
+		"device_expire_failed":                       {},
+		"connector_login_failed":                     {},
+		"connector_login_unknown":                    {},
+		"headscale_lifecycle_interrupted":            {},
+		"headscale_journal_failed":                   {},
+		"connector_mutation_interrupted":             {},
 		"normal_revision_changed":                    {},
 		"plan_consumption_rejected":                  {},
 		"planless_start_rejected":                    {},
 		"process_lifecycle_not_started":              {},
 		"preflight_rejected":                         {},
+		"publication_revalidation_failed":            {},
+		"contraction_authority_failed":               {},
 		"resource_create_not_started":                {},
+		"resource_delete_not_started":                {},
 		"resource_update_not_started":                {},
 		"safety_authority_changed":                   {},
 		"safety_recheck_unavailable":                 {},
@@ -116,14 +133,17 @@ type Record struct {
 	ErrorCode      string          `json:"error_code,omitempty"`
 	SecretResult   *SecretResult   `json:"secret_result,omitempty"`
 }
-type Spec struct{ Operation, Target, ActorIdentity string }
-type Completion struct {
-	Result         Result
-	ModifiedPaths  []string
-	Postconditions []Postcondition
-	ErrorCode      string
-	SecretResult   *SecretResult
-}
+type (
+	Spec       struct{ Operation, Target, ActorIdentity string }
+	Completion struct {
+		Result         Result
+		ModifiedPaths  []string
+		Postconditions []Postcondition
+		ErrorCode      string
+		SecretResult   *SecretResult
+	}
+)
+
 type Options struct {
 	Now    func() time.Time
 	Random io.Reader
@@ -166,6 +186,7 @@ func Register(normal *persist.Store) error {
 	}
 	return normal.RegisterCanonicalNamespace("jobs", "jobs.v1", validateEntry, validateJobTransition)
 }
+
 func validateEntry(key string, raw json.RawMessage) error {
 	record, err := decode(raw)
 	if err != nil {
@@ -176,6 +197,7 @@ func validateEntry(key string, raw json.RawMessage) error {
 	}
 	return nil
 }
+
 func validateJobTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		record, err := decode(after)
@@ -245,6 +267,7 @@ func Put(transaction *persist.Transaction, record Record) error {
 	}
 	return transaction.Create(key(record.ID), raw)
 }
+
 func Replace(transaction *persist.Transaction, record Record) error {
 	if _, exists := transaction.Get(key(record.ID)); !exists {
 		return ErrMissing
@@ -394,7 +417,7 @@ func validateSecretResult(operation string, value SecretResult) error {
 	}
 	if operation == "managed_basic_create" || operation == "managed_basic_rotate" {
 		if value.Kind != "managed_basic" || value.Remedy != "rotate_again" {
-			return fmt.Errorf("Managed Basic remedy is invalid")
+			return fmt.Errorf("managed Basic remedy is invalid")
 		}
 		return nil
 	}
@@ -439,6 +462,7 @@ func allPostconditions(values []Postcondition, status PostconditionStatus) bool 
 	}
 	return len(values) != 0
 }
+
 func hasPostcondition(values []Postcondition, status PostconditionStatus) bool {
 	for _, value := range values {
 		if value.Status == status {
@@ -447,14 +471,17 @@ func hasPostcondition(values []Postcondition, status PostconditionStatus) bool {
 	}
 	return false
 }
+
 func validResult(result Result) bool {
 	return result == ResultSucceeded || result == ResultFailed || result == ResultPartial || result == ResultInterrupted || result == ResultUnknown
 }
+
 func canonicalPaths(values []string) []string {
 	result := append([]string(nil), values...)
 	sort.Strings(result)
 	return compact(result)
 }
+
 func compact(values []string) []string {
 	if len(values) == 0 {
 		return []string{}
@@ -467,6 +494,7 @@ func compact(values []string) []string {
 	}
 	return out
 }
+
 func canonicalPostconditions(values []Postcondition) []Postcondition {
 	result := append([]Postcondition(nil), values...)
 	sort.Slice(result, func(i, j int) bool {
@@ -477,6 +505,7 @@ func canonicalPostconditions(values []Postcondition) []Postcondition {
 	})
 	return result
 }
+
 func pathsEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -488,6 +517,7 @@ func pathsEqual(a, b []string) bool {
 	}
 	return true
 }
+
 func postconditionsEqual(a, b []Postcondition) bool {
 	if len(a) != len(b) {
 		return false
@@ -499,6 +529,7 @@ func postconditionsEqual(a, b []Postcondition) bool {
 	}
 	return true
 }
+
 func decode(raw json.RawMessage) (Record, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()

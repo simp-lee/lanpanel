@@ -5,15 +5,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"lanpanel/internal/child"
+	"lanpanel/internal/preflight"
+	"lanpanel/internal/sources"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	"lanpanel/internal/child"
-	"lanpanel/internal/preflight"
-	"lanpanel/internal/sources"
 )
 
 func TestPackageNoAutostartRoleAlwaysDeniesMaintainerStarts(t *testing.T) {
@@ -168,6 +167,88 @@ func TestPackageTransactionPreservesPreparedJournalAcrossMaskCommitFault(t *test
 	}
 }
 
+func TestPackageTransactionDoesNotStartAfterPlanDeadline(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	journals := &memoryJournals{}
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	engine.Now = func() time.Time { return plan.Deadline }
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != "" || journals.current != nil {
+		t.Fatalf("expired package Plan started mutation: journal=%#v err=%v", journal, err)
+	}
+}
+
+func TestPackageTransactionResumesOnlyExactMaskAndChildJournals(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	journals := &memoryJournals{failAt: JournalMasksApplied}
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalMasking {
+		t.Fatalf("mask fault journal=%#v err=%v", journal, err)
+	}
+	journals.failAt = ""
+	resumed, err := engine.Resume(context.Background(), plan, result, journal)
+	if err != nil || resumed.Phase != JournalCleaned {
+		t.Fatalf("mask resume journal=%#v err=%v", resumed, err)
+	}
+	changed := plan
+	changed.Authority.BinaryDigest = strings.Repeat("0", 64)
+	if _, err := engine.Resume(context.Background(), changed, result, journal); err == nil {
+		t.Fatal("changed package authority resumed exact journal")
+	}
+
+	executor = newFakeExecutor(plan)
+	journals = &memoryJournals{failAt: JournalChildTerminal}
+	engine, result = testEngine(journals, executor, &fakeMonitor{})
+	journal, err = engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalChildSubmitted {
+		t.Fatalf("child submission fault journal=%#v err=%v", journal, err)
+	}
+	journals.failAt = ""
+	resumed, err = engine.Resume(context.Background(), plan, result, journal)
+	if err == nil || resumed.Phase != JournalChildSubmitted || executor.runCount != 1 {
+		t.Fatalf("unknown submitted child was repeated or accepted: journal=%#v runs=%d err=%v", resumed, executor.runCount, err)
+	}
+}
+
+func TestSuccessfulTerminalPackageRecoveryIgnoresExpiredMutationAuthority(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	journals := &memoryJournals{failAt: JournalVerified}
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalChildTerminal || !journal.ChildSucceeded {
+		t.Fatalf("terminal fixture=%#v err=%v", journal, err)
+	}
+	journals.failAt = ""
+	engine.Now = func() time.Time { return plan.Deadline.Add(time.Hour) }
+	resumed, err := engine.Resume(context.Background(), plan, preflight.Result{}, journal)
+	if err != nil || resumed.Phase != JournalCleaned || executor.runCount != 1 {
+		t.Fatalf("terminal local recovery failed/repeated: %#v runs=%d err=%v", resumed, executor.runCount, err)
+	}
+}
+
+func TestCommittedPackageCleanupResumesAfterPlanAndPreflightExpiry(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	journals := &memoryJournals{failAt: JournalCleaned}
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalCommitted {
+		t.Fatalf("committed cleanup fault journal=%#v err=%v", journal, err)
+	}
+	journals.failAt = ""
+	engine.Now = func() time.Time { return plan.Deadline.Add(time.Hour) }
+	expired := result
+	expired.ObservedAt = plan.Deadline.Add(-time.Hour)
+	resumed, err := engine.Resume(context.Background(), plan, expired, journal)
+	if err != nil || resumed.Phase != JournalCleaned {
+		t.Fatalf("local committed cleanup did not resume after expiry: journal=%#v err=%v", resumed, err)
+	}
+}
+
 func TestPackageTransactionPreservesPartialJournalAndMasksOnTimeout(t *testing.T) {
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
@@ -228,11 +309,11 @@ func testPlan(t *testing.T, mode Mode) Plan {
 	plan := Plan{
 		TransactionID: "pkg_" + strings.Repeat("1", 64), JobID: "job_" + strings.Repeat("2", 64), IntentGeneration: 1, Deadline: time.Unix(2_000_000_000, 0).UTC(), OSProfileDigest: strings.Repeat("a", 64), Mode: mode, Packages: packages, FirstNginxInstall: true,
 		LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoNetwork: noNetwork, NoAutostartPolicyDigest: strings.Repeat("9", 64), PreflightDigest: "sha256:" + strings.Repeat("6", 64), PreflightRequestDigest: "sha256:" + strings.Repeat("6", 64),
-		Authority: QualificationAuthority{Kind: QualificationCandidate, EnvelopeDigest: strings.Repeat("d", 64), BinaryDigest: strings.Repeat("e", 64), RunID: "run-1", ManifestDigest: strings.Repeat("7", 64), HostFingerprint: "host/fingerprint", CaseID: "package-install", Operation: "package_transaction", TargetOSProfileDigest: strings.Repeat("a", 64), FrozenClosureDigest: closure},
+		Authority: QualificationAuthority{Kind: QualificationTarget, ReleaseAuthorityDigest: strings.Repeat("d", 64), BinaryDigest: strings.Repeat("e", 64), RunID: "run-1", InstallManifestDigest: strings.Repeat("7", 64), SideEffectPlanDigest: strings.Repeat("8", 64), HostFingerprint: "host/fingerprint", Operation: "package_transaction", TargetOSProfileDigest: strings.Repeat("a", 64), FrozenClosureDigest: closure},
 	}
 	if mode == DistroRepository {
 		keyringDigest := fmt.Sprintf("%x", sha256.Sum256([]byte("keyring")))
-		plan.Repositories = []Repository{{ID: "debian-stable", URI: "https://deb.example.test/debian", Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: keyringDigest}}
+		plan.Repositories = []Repository{{ID: "debian-stable", URI: "https://deb.example.test/debian", Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: keyringDigest, MetadataDigest: strings.Repeat("6", 64), CutoffDigest: strings.Repeat("7", 64)}}
 	}
 	return plan
 }
@@ -261,6 +342,7 @@ func (store *memoryJournals) Create(_ context.Context, journal Journal) error {
 	store.phases = append(store.phases, journal.Phase)
 	return nil
 }
+
 func (store *memoryJournals) Advance(_ context.Context, before, after Journal) error {
 	if store.failAt == after.Phase {
 		return errors.New("journal fault")
@@ -284,6 +366,7 @@ type fakeExecutor struct {
 	invocation child.Invocation
 	unmasked   []string
 	runErr     error
+	runCount   int
 }
 
 func newFakeExecutor(plan Plan) *fakeExecutor {
@@ -304,6 +387,7 @@ func newFakeExecutor(plan Plan) *fakeExecutor {
 	slices.SortFunc(systemPackages, func(left, right InstalledPackage) int { return strings.Compare(left.Name, right.Name) })
 	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: []UnitState{{Name: "nginx.service", Masked: true}}, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
 }
+
 func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
 	return executor.audit, nil
 }
@@ -314,13 +398,15 @@ func (executor *fakeExecutor) Prepare(_ context.Context, _ Plan, config, _ []byt
 	}
 	return nil
 }
+
 func (executor *fakeExecutor) Resolve(_ context.Context, plan Plan) ([]Package, error) {
 	return clonePackages(plan.Packages), nil
 }
+
 func (executor *fakeExecutor) Mask(_ context.Context, units []string, persist func(MaskIdentity) error) (MaskResult, error) {
 	identities := make([]MaskIdentity, 0, len(units))
 	for index, unit := range units {
-		identity := MaskIdentity{Unit: unit, Device: 1, Inode: uint64(index + 1)}
+		identity := MaskIdentity{Unit: unit, Device: 1, Inode: uint64(index + 1), CTimeSec: 1}
 		if err := persist(identity); err != nil {
 			return MaskResult{Masks: identities}, err
 		}
@@ -328,13 +414,24 @@ func (executor *fakeExecutor) Mask(_ context.Context, units []string, persist fu
 	}
 	return MaskResult{Masks: identities}, nil
 }
+
+func (executor *fakeExecutor) VerifyMasks(_ context.Context, masks []MaskIdentity) error {
+	if !validMaskIdentities(masks) {
+		return errors.New("invalid masks")
+	}
+	return nil
+}
+
 func (executor *fakeExecutor) Run(_ context.Context, profile child.ProfileID, invocation child.Invocation) (child.Result, error) {
+	executor.runCount++
 	executor.profile, executor.invocation = profile, invocation
 	return child.Result{ExitCode: 0, StdoutDigest: "sha256:" + strings.Repeat("1", 64), StderrDigest: "sha256:" + strings.Repeat("2", 64)}, executor.runErr
 }
+
 func (executor *fakeExecutor) Observe(_ context.Context, _ Plan) (Postcondition, error) {
 	return executor.observed, nil
 }
+
 func (executor *fakeExecutor) Unmask(_ context.Context, masks []MaskIdentity) error {
 	executor.unmasked = createdMaskNames(masks)
 	return nil

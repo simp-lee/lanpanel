@@ -20,18 +20,24 @@ const (
 	AbsoluteLimit   = 12 * time.Hour
 )
 
-type Credentials struct{ Selector, Proof, CSRF string }
-type Principal struct {
-	Selector   string
-	Generation uint64
-}
-type Socket interface{ Close() error }
-type SocketSender func() error
-type Options struct {
-	Now           func() time.Time
-	Random        io.Reader
-	SweepInterval time.Duration
-}
+type (
+	Credentials struct{ Selector, Proof, CSRF string }
+	Principal   struct {
+		Selector   string
+		Generation uint64
+	}
+)
+
+type (
+	Socket       interface{ Close() error }
+	SocketSender func() error
+	Options      struct {
+		Now           func() time.Time
+		Random        io.Reader
+		SweepInterval time.Duration
+	}
+)
+
 type entry struct {
 	proof, csrf         [32]byte
 	fingerprint, origin string
@@ -74,6 +80,7 @@ func New(fingerprint string, options Options) (*Manager, error) {
 	go manager.sweep(interval)
 	return manager, nil
 }
+
 func (m *Manager) Issue(origin, fingerprint string) (Credentials, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,6 +103,7 @@ func (m *Manager) Issue(origin, fingerprint string) (Credentials, error) {
 	m.entries[selector] = &entry{proof: sha256.Sum256([]byte(proof)), csrf: sha256.Sum256([]byte(csrf)), fingerprint: fingerprint, origin: origin, generation: m.generation, issued: stamp, last: stamp, sockets: map[Socket]struct{}{}}
 	return Credentials{selector, proof, csrf}, nil
 }
+
 func (m *Manager) Authenticate(selector, proof, csrf, origin, fingerprint string, mutation bool) (Principal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -119,12 +127,14 @@ func (m *Manager) AuthenticateSocket(selector, proof, origin, fingerprint string
 	}
 	return Principal{selector, m.generation}, nil
 }
+
 func (m *Manager) Valid(principal Principal) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	value, ok := m.entries[principal.Selector]
 	return ok && !expired(value, m.now().UTC()) && principal.Generation == m.generation && value.generation == m.generation && value.fingerprint == m.fingerprint
 }
+
 func (m *Manager) Attach(principal Principal, socket Socket) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -135,6 +145,7 @@ func (m *Manager) Attach(principal Principal, socket Socket) error {
 	value.sockets[socket] = struct{}{}
 	return nil
 }
+
 func (m *Manager) Detach(principal Principal, socket Socket) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -142,6 +153,7 @@ func (m *Manager) Detach(principal Principal, socket Socket) {
 		delete(value.sockets, socket)
 	}
 }
+
 func (m *Manager) Send(principal Principal, fingerprint string, send SocketSender) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -151,6 +163,7 @@ func (m *Manager) Send(principal Principal, fingerprint string, send SocketSende
 	}
 	return send()
 }
+
 func (m *Manager) Logout(principal Principal) {
 	m.mu.Lock()
 	sockets := m.removeLocked(principal.Selector, m.entries[principal.Selector])
@@ -164,6 +177,7 @@ func (m *Manager) InvalidateFingerprint(fingerprint string) {
 	m.mu.Unlock()
 	closeSockets(sockets)
 }
+
 func (m *Manager) RequireFingerprint(fingerprint string) bool {
 	m.mu.Lock()
 	if fingerprint != "" && fingerprint == m.fingerprint {
@@ -175,6 +189,7 @@ func (m *Manager) RequireFingerprint(fingerprint string) bool {
 	closeSockets(sockets)
 	return false
 }
+
 func (m *Manager) invalidateLocked(fingerprint string) []Socket {
 	m.generation++
 	m.fingerprint = fingerprint
@@ -184,9 +199,11 @@ func (m *Manager) invalidateLocked(fingerprint string) []Socket {
 	}
 	return sockets
 }
+
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() { close(m.stop); <-m.done; m.InvalidateFingerprint("closed") })
 }
+
 func (m *Manager) sweep(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -209,6 +226,7 @@ func (m *Manager) sweep(interval time.Duration) {
 		}
 	}
 }
+
 func (m *Manager) removeLocked(selector string, value *entry) []Socket {
 	if value == nil {
 		return nil
@@ -220,14 +238,17 @@ func (m *Manager) removeLocked(selector string, value *entry) []Socket {
 	}
 	return sockets
 }
+
 func closeSockets(sockets []Socket) {
 	for _, socket := range sockets {
 		_ = socket.Close()
 	}
 }
+
 func expired(value *entry, now time.Time) bool {
 	return now.Sub(value.last) >= InactivityLimit || now.Sub(value.issued) >= AbsoluteLimit || now.Before(value.issued)
 }
+
 func randomHex(reader io.Reader) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := io.ReadFull(reader, raw); err != nil {
@@ -236,6 +257,7 @@ func randomHex(reader io.Reader) (string, error) {
 	defer clear(raw)
 	return hex.EncodeToString(raw), nil
 }
+
 func digestEqual(expected [32]byte, value string) bool {
 	actual := sha256.Sum256([]byte(value))
 	return subtle.ConstantTimeCompare(expected[:], actual[:]) == 1

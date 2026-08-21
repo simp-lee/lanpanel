@@ -2,6 +2,7 @@ package release
 
 import (
 	"fmt"
+	"lanpanel/internal/acmeaccount"
 	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/dependencies"
 	"lanpanel/internal/filetxn"
@@ -15,16 +16,19 @@ import (
 )
 
 const (
-	EnvelopeSchemaVersion              = "lanpanel.release.envelope.v1"
-	ManifestSchemaVersion              = "lanpanel.release.manifest.v1"
-	QualificationManifestSchemaVersion = "lanpanel.qualification.side-effects.v1"
+	ReleaseManifestSchemaVersion              = "lanpanel.release.v2"
+	QualificationTargetProfileSchemaVersion   = "lanpanel.qualification.target-profile.v1"
+	QualificationInstallManifestSchemaVersion = "lanpanel.qualification.install-manifest.v2"
+	LiveSideEffectPlanSchemaVersion           = "lanpanel.qualification.side-effect-plan.v1"
+	LiveCleanupReportSchemaVersion            = "lanpanel.qualification.cleanup-report.v2"
+	QualificationSummarySchemaVersion         = "lanpanel.qualification.summary.v1"
 )
 
-type EnvelopeKind string
+type InstallKind string
 
 const (
-	EnvelopeQualificationCandidate EnvelopeKind = "qualification_candidate"
-	EnvelopeFinal                  EnvelopeKind = "final_release"
+	InstallPublicRelease InstallKind = "public_release"
+	InstallQualification InstallKind = "qualification"
 )
 
 type AssetIdentity struct {
@@ -40,7 +44,10 @@ type ArchiveMemberAuthority struct {
 	Mode        uint32        `json:"mode"`
 }
 
-const SupportedHeadscaleConfigContract = "headscale-trusted-mesh-v1"
+const (
+	SupportedHeadscaleConfigContract = "headscale-trusted-mesh-v1"
+	SupportedHeadscaleVersion        = "0.29.0"
+)
 
 var supportedHeadscaleConfigContractBytes = []byte(`{"schema_version":"lanpanel.headscale.config-contract.v1","control_backend":"isolated","database":"sqlite","policy":"trusted_mesh","privileged_endpoint":"unix"}`)
 
@@ -62,15 +69,39 @@ type HeadscaleArtifactAuthority struct {
 	ConfigContractDigest  string                   `json:"config_contract_digest"`
 }
 
+type ClientArtifactAuthority struct {
+	Version               string                   `json:"version"`
+	ArtifactIdentity      string                   `json:"artifact_identity"`
+	Archive               AssetIdentity            `json:"archive"`
+	ArchiveFormat         string                   `json:"archive_format"`
+	MaximumExtractedBytes uint64                   `json:"maximum_extracted_bytes"`
+	RedirectAuthorities   []string                 `json:"redirect_authorities"`
+	Members               []ArchiveMemberAuthority `json:"members"`
+	ExecutableAsset       string                   `json:"executable_asset"`
+	InstallPath           string                   `json:"install_path"`
+}
+
+type PackageTuple struct {
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+}
+
 type OSProfile struct {
-	ID                    string             `json:"id"`
-	Family                string             `json:"family"`
-	Release               string             `json:"release"`
-	Architecture          string             `json:"architecture"`
-	SystemdVersion        string             `json:"systemd_version"`
-	NginxVersion          string             `json:"nginx_version"`
-	PackageSnapshotDigest string             `json:"package_snapshot_digest"`
-	ManagedConfinement    ConfinementProfile `json:"managed_confinement"`
+	ID                       string             `json:"id"`
+	Family                   string             `json:"family"`
+	Release                  string             `json:"release"`
+	Architecture             string             `json:"architecture"`
+	SystemdVersion           string             `json:"systemd_version"`
+	NginxVersion             string             `json:"nginx_version"`
+	PackageSnapshotDigest    string             `json:"package_snapshot_digest"`
+	RepositorySource         string             `json:"repository_source"`
+	RepositoryKeyFingerprint string             `json:"repository_key_fingerprint"`
+	RepositoryMetadataDigest string             `json:"repository_metadata_digest"`
+	RepositoryCutoffDigest   string             `json:"repository_cutoff_digest"`
+	PackageClosureDigest     string             `json:"package_closure_digest"`
+	Packages                 []PackageTuple     `json:"packages"`
+	ManagedConfinement       ConfinementProfile `json:"managed_confinement"`
 }
 
 type ConfinementProfile struct {
@@ -84,273 +115,152 @@ type ConfinementProfile struct {
 	QualificationDigest   string   `json:"qualification_digest"`
 }
 
-type QualificationStatus struct {
-	Preflight string `json:"preflight_status"`
-	Gate      string `json:"gate_status"`
-	Live      string `json:"live_status"`
+type SupportedOSProfile struct {
+	Profile                    OSProfile `json:"profile"`
+	QualifiedBinaryDigest      string    `json:"qualified_binary_digest"`
+	QualificationRunID         string    `json:"qualification_run_id"`
+	QualificationSummaryDigest string    `json:"qualification_summary_digest"`
 }
 
-type QualifiedOSProfile struct {
-	Profile            OSProfile           `json:"profile"`
-	Status             QualificationStatus `json:"status"`
-	CandidateDigest    string              `json:"candidate_digest"`
-	ChecklistDigest    string              `json:"checklist_digest"`
-	ChecklistItemID    string              `json:"checklist_item_id"`
-	LiveEvidenceDigest string              `json:"live_evidence_digest"`
+type ProviderLiveTest struct {
+	Provider string `json:"provider"`
+	Status   string `json:"status"`
 }
 
-type EdgeOneVariant string
-
-const (
-	EdgeOneQualificationCandidate EdgeOneVariant = "edgeone_qualification_candidate"
-	EdgeOneEnabled                EdgeOneVariant = "edgeone_enabled"
-	EdgeOneDisabled               EdgeOneVariant = "edgeone_disabled"
-)
-
-type EdgeOneCapability struct {
-	Variant                    EdgeOneVariant      `json:"variant"`
-	Status                     QualificationStatus `json:"status"`
-	Reason                     string              `json:"reason"`
-	RunID                      string              `json:"run_id"`
-	CandidateDigest            string              `json:"candidate_digest,omitempty"`
-	ProfileDigest              string              `json:"profile_digest,omitempty"`
-	ChecklistDigest            string              `json:"checklist_digest,omitempty"`
-	ScopeKind                  string              `json:"scope_kind,omitempty"`
-	ScopeDigest                string              `json:"scope_digest,omitempty"`
-	RawProviderChecklistItemID string              `json:"raw_provider_checklist_item_id,omitempty"`
-	RawProviderProofDigest     string              `json:"raw_provider_proof_digest,omitempty"`
-	ProductChecklistItemID     string              `json:"product_checklist_item_id,omitempty"`
-	ProductProofDigest         string              `json:"product_proof_digest,omitempty"`
-	CleanupChecklistItemID     string              `json:"cleanup_checklist_item_id,omitempty"`
-	CleanupEvidenceDigest      string              `json:"cleanup_evidence_digest,omitempty"`
+type QualificationSummary struct {
+	SchemaVersion         string             `json:"schema_version"`
+	RunID                 string             `json:"run_id"`
+	CandidateDigest       string             `json:"candidate_digest"`
+	SourceTreeDigest      string             `json:"source_tree_digest"`
+	TargetProfileDigest   string             `json:"target_profile_digest"`
+	InstallManifestDigest string             `json:"install_manifest_digest"`
+	SideEffectPlanDigest  string             `json:"side_effect_plan_digest"`
+	ProtectedInputDigest  string             `json:"protected_input_digest"`
+	CleanupReportDigest   string             `json:"cleanup_report_digest"`
+	JourneySucceeded      bool               `json:"journey_succeeded"`
+	ProviderLiveTests     []ProviderLiveTest `json:"provider_live_tests"`
+	CompletedAt           time.Time          `json:"completed_at"`
 }
 
-type NetworkPolicy struct {
-	TelemetryEnabled              bool     `json:"telemetry_enabled"`
-	CommercialControlPlaneEnabled bool     `json:"commercial_control_plane_enabled"`
-	ExternalPurposes              []string `json:"external_purposes"`
-}
-
-type Envelope struct {
-	SchemaVersion             string                     `json:"schema_version"`
-	Kind                      EnvelopeKind               `json:"kind"`
-	ReleaseTag                string                     `json:"release_tag"`
-	Binary                    AssetIdentity              `json:"binary"`
-	SourceArchive             AssetIdentity              `json:"source_archive"`
-	License                   AssetIdentity              `json:"license"`
-	Notice                    AssetIdentity              `json:"notice"`
-	SBOM                      AssetIdentity              `json:"sbom"`
-	DependencyBaseline        AssetIdentity              `json:"dependency_baseline"`
-	Headscale                 HeadscaleArtifactAuthority `json:"headscale"`
-	StableChecklist           AssetIdentity              `json:"stable_checklist"`
-	SecurityReport            *AssetIdentity             `json:"security_report,omitempty"`
-	AdditionalAssets          []AssetIdentity            `json:"additional_assets"`
-	Checksums                 AssetIdentity              `json:"checksums"`
-	SourceTreeDigest          string                     `json:"source_tree_digest"`
-	EdgeOne                   EdgeOneCapability          `json:"edgeone"`
-	Network                   NetworkPolicy              `json:"network"`
-	QualificationTarget       *OSProfile                 `json:"qualification_target_os_profile,omitempty"`
-	SupportedProfiles         []QualifiedOSProfile       `json:"supported_os_profiles"`
-	QualificationCandidateOID string                     `json:"qualification_candidate_digest,omitempty"`
-}
-
-type Manifest struct {
-	SchemaVersion    string          `json:"schema_version"`
-	ReleaseTag       string          `json:"release_tag"`
-	EnvelopeDigest   string          `json:"envelope_digest"`
-	Checksums        AssetIdentity   `json:"checksums"`
-	SourceTreeDigest string          `json:"source_tree_digest"`
-	BinaryDigest     string          `json:"binary_digest"`
-	CandidateDigest  string          `json:"qualification_candidate_digest"`
-	Assets           []AssetIdentity `json:"assets"`
-}
-
-type VerifiedEnvelope struct {
-	value  Envelope
-	digest string
-}
-
-func (verified *VerifiedEnvelope) Value() Envelope {
-	if verified == nil {
-		return Envelope{}
+func DecodeQualificationSummary(data []byte) (QualificationSummary, error) {
+	var value QualificationSummary
+	if DecodeCanonical(data, &value) != nil || value.SchemaVersion != QualificationSummarySchemaVersion || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.SourceTreeDigest) || !ValidDigest(value.TargetProfileDigest) || !ValidDigest(value.InstallManifestDigest) || !ValidDigest(value.SideEffectPlanDigest) || !ValidDigest(value.ProtectedInputDigest) || !ValidDigest(value.CleanupReportDigest) || !value.JourneySucceeded || !sameUTCSecond(value.CompletedAt) {
+		return QualificationSummary{}, fmt.Errorf("qualification summary is invalid")
 	}
-	return cloneEnvelope(verified.value)
+	expected := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
+	if len(value.ProviderLiveTests) != len(expected) {
+		return QualificationSummary{}, fmt.Errorf("qualification summary provider inventory is invalid")
+	}
+	liveCount := 0
+	for index, item := range value.ProviderLiveTests {
+		if item.Status == "live_tested" {
+			liveCount++
+		}
+		if item.Provider != expected[index] || item.Status != "live_tested" && item.Status != "not_live_tested" {
+			return QualificationSummary{}, fmt.Errorf("qualification summary provider inventory is invalid")
+		}
+	}
+	if liveCount != 1 {
+		return QualificationSummary{}, fmt.Errorf("qualification summary must contain exactly one live-tested provider")
+	}
+	return value, nil
 }
-func (verified *VerifiedEnvelope) Digest() string {
+
+type ReleaseManifest struct {
+	SchemaVersion        string                     `json:"schema_version"`
+	ReleaseTag           string                     `json:"release_tag"`
+	Binary               AssetIdentity              `json:"binary"`
+	SourceArchive        AssetIdentity              `json:"source_archive"`
+	License              AssetIdentity              `json:"license"`
+	Notice               AssetIdentity              `json:"notice"`
+	SBOM                 AssetIdentity              `json:"sbom"`
+	DependencyManifest   AssetIdentity              `json:"dependency_manifest"`
+	Headscale            HeadscaleArtifactAuthority `json:"headscale"`
+	SecurityReport       AssetIdentity              `json:"security_report"`
+	QualificationSummary AssetIdentity              `json:"qualification_summary"`
+	ProviderLiveTests    []ProviderLiveTest         `json:"provider_live_tests"`
+	KnownLimitations     AssetIdentity              `json:"known_limitations"`
+	AdditionalAssets     []AssetIdentity            `json:"additional_assets"`
+	Checksums            AssetIdentity              `json:"checksums"`
+	SourceTreeDigest     string                     `json:"source_tree_digest"`
+	SupportedProfiles    []SupportedOSProfile       `json:"supported_os_profiles"`
+}
+
+type VerifiedRelease struct {
+	value         ReleaseManifest
+	digest        string
+	security      SecurityReport
+	qualification QualificationSummary
+}
+
+func (verified *VerifiedRelease) Manifest() ReleaseManifest {
+	if verified == nil {
+		return ReleaseManifest{}
+	}
+	return cloneReleaseManifest(verified.value)
+}
+
+func (verified *VerifiedRelease) Digest() string {
 	if verified == nil {
 		return ""
 	}
 	return verified.digest
 }
 
-type VerifiedManifest struct {
-	value  Manifest
-	digest string
-}
-
-func (verified *VerifiedManifest) Value() Manifest {
-	if verified == nil {
-		return Manifest{}
-	}
-	value := verified.value
-	value.Assets = append([]AssetIdentity(nil), value.Assets...)
-	return value
-}
-func (verified *VerifiedManifest) Digest() string {
-	if verified == nil {
-		return ""
-	}
-	return verified.digest
-}
-
-type VerifiedCandidateRelease struct {
-	envelope *VerifiedEnvelope
-}
-
-func (verified *VerifiedCandidateRelease) Envelope() Envelope {
-	if verified == nil || verified.envelope == nil {
-		return Envelope{}
-	}
-	return cloneEnvelope(verified.envelope.value)
-}
-
-type VerifiedFinalRelease struct {
-	envelope *VerifiedEnvelope
-	manifest *VerifiedManifest
-	security SecurityReport
-}
-
-type VerifiedFinalizedRelease struct {
-	final *VerifiedFinalRelease
-}
-
-func (verified *VerifiedFinalRelease) Envelope() Envelope {
-	if verified == nil || verified.envelope == nil {
-		return Envelope{}
-	}
-	return cloneEnvelope(verified.envelope.value)
-}
-func (verified *VerifiedFinalRelease) ManifestDigest() string {
-	if verified == nil || verified.manifest == nil {
-		return ""
-	}
-	return verified.manifest.digest
-}
-
-func cloneEnvelope(source Envelope) Envelope {
-	cloned := source
-	cloned.AdditionalAssets = append([]AssetIdentity(nil), source.AdditionalAssets...)
-	cloned.Headscale.RedirectAuthorities = append([]string(nil), source.Headscale.RedirectAuthorities...)
-	cloned.Headscale.Members = append([]ArchiveMemberAuthority(nil), source.Headscale.Members...)
-	cloned.SupportedProfiles = append([]QualifiedOSProfile(nil), source.SupportedProfiles...)
-	cloned.Network.ExternalPurposes = append([]string(nil), source.Network.ExternalPurposes...)
-	if source.SecurityReport != nil {
-		security := *source.SecurityReport
-		cloned.SecurityReport = &security
-	}
-	if source.QualificationTarget != nil {
-		profile := *source.QualificationTarget
-		cloned.QualificationTarget = &profile
-	}
-	return cloned
-}
-
-var (
-	releaseTagPattern      = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$`)
-	profileIDPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
-	osReleasePattern       = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,2}$`)
-	concreteVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
-	refPattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
-)
-
-func DecodeEnvelope(data []byte) (*VerifiedEnvelope, error) {
-	var envelope Envelope
-	if err := DecodeCanonical(data, &envelope); err != nil {
-		return nil, err
-	}
-	if err := validateEnvelope(envelope); err != nil {
-		return nil, err
-	}
-	return &VerifiedEnvelope{value: envelope, digest: DigestBytes(data)}, nil
-}
-
-func DecodeManifest(data []byte) (*VerifiedManifest, error) {
-	var manifest Manifest
+func DecodeReleaseManifest(data []byte) (*VerifiedRelease, error) {
+	var manifest ReleaseManifest
 	if err := DecodeCanonical(data, &manifest); err != nil {
 		return nil, err
 	}
-	if err := validateManifest(manifest); err != nil {
+	if err := validateReleaseManifest(manifest); err != nil {
 		return nil, err
 	}
-	return &VerifiedManifest{value: manifest, digest: DigestBytes(data)}, nil
+	return &VerifiedRelease{value: manifest, digest: DigestBytes(data)}, nil
 }
 
-func VerifyCandidateRelease(expectedEnvelopeDigest string, envelopeBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedCandidateRelease, error) {
-	if !ValidDigest(expectedEnvelopeDigest) || DigestBytes(envelopeBytes) != expectedEnvelopeDigest {
-		return nil, fmt.Errorf("candidate envelope differs from its selected digest")
+func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
+	if !ValidDigest(expectedManifestDigest) || DigestBytes(manifestBytes) != expectedManifestDigest {
+		return nil, fmt.Errorf("release.json differs from the selected digest")
 	}
-	envelope, err := DecodeEnvelope(envelopeBytes)
-	if err != nil || envelope.value.Kind != EnvelopeQualificationCandidate {
-		return nil, fmt.Errorf("qualification candidate envelope is invalid")
-	}
-	if err := verifyEnvelopeAssets(envelope.value, checksumBytes, assets); err != nil {
-		return nil, err
-	}
-	return &VerifiedCandidateRelease{envelope: envelope}, nil
-}
-
-func VerifyFinalRelease(expectedManifestDigest, expectedEnvelopeDigest string, manifestBytes, envelopeBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedFinalRelease, error) {
-	if !ValidDigest(expectedManifestDigest) || !ValidDigest(expectedEnvelopeDigest) || DigestBytes(manifestBytes) != expectedManifestDigest || DigestBytes(envelopeBytes) != expectedEnvelopeDigest {
-		return nil, fmt.Errorf("final release differs from administrator-selected root digests")
-	}
-	envelope, err := DecodeEnvelope(envelopeBytes)
-	if err != nil || envelope.value.Kind != EnvelopeFinal {
-		return nil, fmt.Errorf("final release envelope is invalid")
-	}
-	manifest, err := DecodeManifest(manifestBytes)
+	verified, err := DecodeReleaseManifest(manifestBytes)
 	if err != nil {
 		return nil, err
 	}
-	if err := VerifyManifest(manifest, envelope); err != nil {
+	if err := verifyReleaseAssets(verified.value, checksumBytes, assets); err != nil {
 		return nil, err
 	}
-	if err := verifyEnvelopeAssets(envelope.value, checksumBytes, assets); err != nil {
-		return nil, err
+	sbomBytes, present := assets[verified.value.SBOM.Path]
+	if !present || ValidateSPDX(sbomBytes, verified.value.Binary.Digest) != nil {
+		return nil, fmt.Errorf("release SBOM is invalid or bound to other bytes")
 	}
-	if envelope.value.SecurityReport == nil {
-		return nil, fmt.Errorf("final release omits its security report identity")
-	}
-	securityBytes, present := assets[envelope.value.SecurityReport.Path]
+	securityBytes, present := assets[verified.value.SecurityReport.Path]
 	if !present {
-		return nil, fmt.Errorf("final release security report asset is missing")
+		return nil, fmt.Errorf("release security report asset is missing")
 	}
 	security, err := DecodeSecurityReport(securityBytes)
-	if err != nil || security.CandidateDigest != envelope.value.QualificationCandidateOID {
-		return nil, fmt.Errorf("security report is invalid or bound to another candidate")
+	if err != nil || security.CandidateDigest != verified.value.Binary.Digest {
+		return nil, fmt.Errorf("release security report is invalid or bound to other bytes")
 	}
-	return &VerifiedFinalRelease{envelope: envelope, manifest: manifest, security: security}, nil
+	verified.security = security
+	summaryBytes, present := assets[verified.value.QualificationSummary.Path]
+	if !present {
+		return nil, fmt.Errorf("qualification summary asset is missing")
+	}
+	summary, summaryErr := DecodeQualificationSummary(summaryBytes)
+	profile := verified.value.SupportedProfiles[0]
+	profileDigest, _ := ProfileDigest(profile.Profile)
+	if summaryErr != nil || summary.RunID != profile.QualificationRunID || summary.CandidateDigest != verified.value.Binary.Digest || summary.SourceTreeDigest != verified.value.SourceTreeDigest || summary.TargetProfileDigest != profileDigest || !reflect.DeepEqual(summary.ProviderLiveTests, verified.value.ProviderLiveTests) {
+		return nil, fmt.Errorf("qualification summary does not bind the supported release")
+	}
+	verified.qualification = summary
+	return verified, nil
 }
 
-func VerifyManifest(manifest *VerifiedManifest, envelope *VerifiedEnvelope) error {
-	if manifest == nil || envelope == nil || envelope.value.Kind != EnvelopeFinal {
-		return fmt.Errorf("final manifest and envelope are not verified")
+func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte) error {
+	if DigestBytes(checksumBytes) != manifest.Checksums.Digest || uint64(len(checksumBytes)) != manifest.Checksums.Bytes {
+		return fmt.Errorf("SHA256SUMS does not match release.json")
 	}
-	expectedAssets, err := envelopeAssetInventory(envelope.value)
-	if err != nil {
-		return err
-	}
-	value := manifest.value
-	if value.ReleaseTag != envelope.value.ReleaseTag || value.EnvelopeDigest != envelope.digest || value.Checksums != envelope.value.Checksums || value.SourceTreeDigest != envelope.value.SourceTreeDigest || value.BinaryDigest != envelope.value.Binary.Digest || value.CandidateDigest != envelope.value.QualificationCandidateOID || !reflect.DeepEqual(value.Assets, expectedAssets) {
-		return fmt.Errorf("final manifest does not bind the exact envelope and asset identities")
-	}
-	return nil
-}
-
-func verifyEnvelopeAssets(envelope Envelope, checksumBytes []byte, assets map[string][]byte) error {
-	if DigestBytes(checksumBytes) != envelope.Checksums.Digest || uint64(len(checksumBytes)) != envelope.Checksums.Bytes {
-		return fmt.Errorf("checksum file does not match the envelope")
-	}
-	identities, err := envelopeAssetInventory(envelope)
+	identities, err := releaseAssetInventory(manifest)
 	if err != nil {
 		return err
 	}
@@ -364,295 +274,257 @@ func verifyEnvelopeAssets(envelope Envelope, checksumBytes []byte, assets map[st
 	if err != nil {
 		return err
 	}
+	if len(assets) != len(identities) {
+		return fmt.Errorf("release asset inventory differs from release.json")
+	}
 	if err := VerifyAssetBytes(checksums, assets); err != nil {
 		return err
 	}
-	for assetPath, data := range assets {
-		identity := byPath[assetPath]
-		if uint64(len(data)) != identity.Bytes || DigestBytes(data) != identity.Digest {
-			return fmt.Errorf("asset %q size or digest differs from the envelope", assetPath)
+	for path, data := range assets {
+		identity, present := byPath[path]
+		if !present || identity.Bytes != uint64(len(data)) || identity.Digest != DigestBytes(data) {
+			return fmt.Errorf("asset %q size or digest differs from release.json", path)
 		}
 	}
-	baselineBytes, present := assets[envelope.DependencyBaseline.Path]
+	sourceBytes, present := assets[manifest.SourceArchive.Path]
 	if !present {
-		return fmt.Errorf("dependency baseline asset is missing")
+		return fmt.Errorf("source archive asset is missing")
+	}
+	treeDigest, err := sourceArchiveTreeDigest(sourceBytes, "lanpanel-"+manifest.ReleaseTag)
+	if err != nil || treeDigest != manifest.SourceTreeDigest {
+		return fmt.Errorf("source archive does not match source-tree digest: %w", err)
+	}
+	dependencyBytes, present := assets[manifest.DependencyManifest.Path]
+	if !present {
+		return fmt.Errorf("dependency manifest asset is missing")
+	}
+	dependency, err := decodeQualificationDependencyAuthority(dependencyBytes, manifest.DependencyManifest.Digest)
+	if err != nil || !reflect.DeepEqual(dependency.Headscale, manifest.Headscale) {
+		return fmt.Errorf("dependency manifest is invalid or differs from release.json")
+	}
+	baselineBytes, present := assets[dependency.DependencyBaseline.Path]
+	if !present || dependency.DependencyBaseline.Bytes != uint64(len(baselineBytes)) || dependency.DependencyBaseline.Digest != DigestBytes(baselineBytes) {
+		return fmt.Errorf("dependency baseline asset is missing or mismatched")
 	}
 	baseline, err := dependencies.DecodeBaseline(baselineBytes)
 	if err != nil {
-		return fmt.Errorf("dependency baseline asset is invalid: %w", err)
+		return fmt.Errorf("dependency baseline is invalid: %w", err)
 	}
-	var profile OSProfile
-	if envelope.Kind == EnvelopeQualificationCandidate && envelope.QualificationTarget != nil {
-		profile = *envelope.QualificationTarget
-	} else if envelope.Kind == EnvelopeFinal && len(envelope.SupportedProfiles) == 1 {
-		profile = envelope.SupportedProfiles[0].Profile
-	} else {
-		return fmt.Errorf("release envelope lacks one exact dependency OS profile")
-	}
-	profileDigest, err := ProfileDigest(profile)
-	if err != nil || dependencies.ValidateForOSProfile(baseline, profileDigest, profile.NginxVersion) != nil {
-		return fmt.Errorf("dependency baseline does not bind the exact release OS profile")
-	}
-	var selected *dependencies.Selection
-	var selectedHeadscale *dependencies.Selection
-	for index := range baseline.Selections {
-		if baseline.Selections[index].Component == "lego" {
-			selected = &baseline.Selections[index]
-		}
-		if baseline.Selections[index].Component == "headscale" {
-			selectedHeadscale = &baseline.Selections[index]
-		}
-	}
-	if selectedHeadscale == nil {
-		return fmt.Errorf("dependency baseline omits Headscale authority")
-	}
-	if err := verifyHeadscaleArtifact(envelope.Headscale, *selectedHeadscale, assets); err != nil {
-		return err
-	}
-	var legoArchive, lego *AssetIdentity
-	for index := range envelope.AdditionalAssets {
-		asset := &envelope.AdditionalAssets[index]
-		if asset.Path == "lego.tar.gz" {
-			legoArchive = asset
-		} else if asset.Path == "lego" {
-			lego = asset
-		}
-	}
-	expectedLegoArtifact := fmt.Sprintf("https://github.com/go-acme/lego/releases/download/v4.25.2/lego_v4.25.2_linux_%s.tar.gz", profile.Architecture)
-	if selected == nil || legoArchive == nil || lego == nil || selected.SourceKind != dependencies.SourceCanonicalArtifact || selected.SelectedVersion != "4.25.2" || selected.LatestStableVersion != "4.25.2" || selected.OperatingSystem != "linux" || selected.Architecture != profile.Architecture || selected.ArtifactIdentity != expectedLegoArtifact || selected.ArtifactDigest != legoArchive.Digest {
-		return fmt.Errorf("lego archive does not match canonical v4.25.2 dependency authority")
-	}
-	archiveBytes, archivePresent := assets[legoArchive.Path]
-	executableBytes, executablePresent := assets[lego.Path]
-	if !archivePresent || !executablePresent {
-		return fmt.Errorf("lego archive or executable bytes missing")
-	}
-	extracted, err := managedarchive.Extract(archiveBytes, managedarchive.Spec{Format: managedarchive.TarGzip, MaximumArchiveBytes: 256 << 20, MaximumExtractedBytes: 258 << 20, MaximumMembers: 3, Members: []managedarchive.Member{{Path: "CHANGELOG.md", MaximumBytes: 1 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/share/doc/lanpanel/lego/CHANGELOG.md", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644}}, {Path: "LICENSE", MaximumBytes: 1 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/share/doc/lanpanel/lego/LICENSE", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o644}}, {Path: "lego", MaximumBytes: 256 << 20, MaximumPhysicalBytes: 256 << 20, Destination: "/usr/lib/lanpanel/dependencies/lego", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o755}}}})
-	if err != nil {
-		return fmt.Errorf("extract lego executable: %w", err)
-	}
-	if !executablePresent || DigestBytes(extracted["lego"]) != lego.Digest || !slices.Equal(extracted["lego"], executableBytes) {
-		return fmt.Errorf("lego executable is not the exact archive member")
-	}
-	return nil
+	return verifyDependencyAuthority(dependency, manifest.SupportedProfiles[0].Profile, assets, baseline)
 }
 
-func validateHeadscaleAuthorityShape(authority HeadscaleArtifactAuthority) error {
-	if !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
-		return fmt.Errorf("Headscale artifact authority shape is invalid")
+func releaseAssetInventory(manifest ReleaseManifest) ([]AssetIdentity, error) {
+	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.SBOM, manifest.DependencyManifest, manifest.Headscale.Archive, manifest.SecurityReport, manifest.QualificationSummary, manifest.KnownLimitations}
+	for _, member := range manifest.Headscale.Members {
+		assets = append(assets, member.Asset)
 	}
-	previousAuthority := ""
-	for _, value := range authority.RedirectAuthorities {
-		parsed, err := url.Parse("https://" + value)
-		if err != nil || parsed.Host != value || parsed.Hostname() == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || previousAuthority != "" && strings.Compare(previousAuthority, value) >= 0 {
-			return fmt.Errorf("Headscale redirect authority is invalid, duplicated, or unsorted")
-		}
-		previousAuthority = value
-	}
-	if len(authority.RedirectAuthorities) == 0 || len(authority.RedirectAuthorities) > 8 || len(authority.Members) == 0 || len(authority.Members) > 16 {
-		return fmt.Errorf("Headscale artifact contract is incomplete or unbounded")
-	}
-	previousMember := ""
-	executableFound := false
-	for _, member := range authority.Members {
-		if validateAsset(member.Asset) != nil || previousMember != "" && strings.Compare(previousMember, member.Path) >= 0 || member.Mode != 0o644 && member.Mode != 0o755 {
-			return fmt.Errorf("Headscale archive member authority is invalid or unsorted")
-		}
-		if member.Asset.Path == authority.ExecutableAsset {
-			if executableFound || member.Destination != authority.InstallPath || member.Mode != 0o755 {
-				return fmt.Errorf("Headscale executable member authority is invalid")
-			}
-			executableFound = true
-		} else if !strings.HasPrefix(member.Destination, "/usr/share/doc/lanpanel/headscale/") || member.Mode != 0o644 {
-			return fmt.Errorf("Headscale non-executable member destination is invalid")
-		}
-		previousMember = member.Path
-	}
-	if !executableFound {
-		return fmt.Errorf("Headscale executable member is missing")
-	}
-	return nil
-}
-
-func verifyHeadscaleArtifact(authority HeadscaleArtifactAuthority, selection dependencies.Selection, assets map[string][]byte) error {
-	if validateHeadscaleAuthorityShape(authority) != nil || selection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Version != selection.SelectedVersion || authority.ArtifactIdentity != selection.ArtifactIdentity || authority.Archive.Digest != selection.ArtifactDigest {
-		return fmt.Errorf("Headscale artifact does not match exact dependency authority")
-	}
-	archiveBytes, present := assets[authority.Archive.Path]
-	if !present || validateAsset(authority.Archive) != nil || uint64(len(archiveBytes)) != authority.Archive.Bytes || DigestBytes(archiveBytes) != authority.Archive.Digest {
-		return fmt.Errorf("Headscale archive identity is missing or mismatched")
-	}
-	spec := managedarchive.Spec{Format: managedarchive.TarGzip, MaximumArchiveBytes: int64(authority.MaximumExtractedBytes), MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(authority.Members)}
-	for _, member := range authority.Members {
-		data, exists := assets[member.Asset.Path]
-		if !exists || uint64(len(data)) != member.Asset.Bytes || DigestBytes(data) != member.Asset.Digest {
-			return fmt.Errorf("Headscale archive member authority is invalid or unsorted")
-		}
-		spec.Members = append(spec.Members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(authority.MaximumExtractedBytes), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)}})
-	}
-	extracted, err := managedarchive.Extract(archiveBytes, spec)
-	if err != nil {
-		return fmt.Errorf("extract Headscale artifact: %w", err)
-	}
-	for _, member := range authority.Members {
-		if !slices.Equal(extracted[member.Path], assets[member.Asset.Path]) {
-			return fmt.Errorf("Headscale extracted member differs from its release asset")
-		}
-	}
-	return nil
-}
-
-func VerifyFinalization(final *VerifiedFinalRelease, candidate *VerifiedCandidateRelease) (*VerifiedFinalizedRelease, error) {
-	if final == nil || candidate == nil {
-		return nil, fmt.Errorf("finalization lacks verified final or candidate release")
-	}
-	if err := VerifyFinalFromCandidate(final.envelope, candidate.envelope); err != nil {
-		return nil, err
-	}
-	return &VerifiedFinalizedRelease{final: final}, nil
-}
-
-func VerifyFinalFromCandidate(final, candidate *VerifiedEnvelope) error {
-	if final == nil || candidate == nil || final.value.Kind != EnvelopeFinal || candidate.value.Kind != EnvelopeQualificationCandidate {
-		return fmt.Errorf("candidate/final envelope kinds are invalid")
-	}
-	if final.value.QualificationCandidateOID != candidate.digest || final.value.ReleaseTag != candidate.value.ReleaseTag || final.value.Binary != candidate.value.Binary || final.value.SourceArchive != candidate.value.SourceArchive || final.value.SourceTreeDigest != candidate.value.SourceTreeDigest || final.value.DependencyBaseline != candidate.value.DependencyBaseline || !reflect.DeepEqual(final.value.Headscale, candidate.value.Headscale) || final.value.SBOM != candidate.value.SBOM || final.value.License != candidate.value.License || final.value.Notice != candidate.value.Notice || !reflect.DeepEqual(final.value.AdditionalAssets, candidate.value.AdditionalAssets) {
-		return fmt.Errorf("final envelope does not wrap unchanged candidate source, binary, and baseline")
-	}
-	if len(final.value.SupportedProfiles) != 1 || candidate.value.QualificationTarget == nil || !reflect.DeepEqual(final.value.SupportedProfiles[0].Profile, *candidate.value.QualificationTarget) {
-		return fmt.Errorf("final supported profile was not the candidate qualification target")
-	}
-	if final.value.EdgeOne.RunID != candidate.value.EdgeOne.RunID {
-		return fmt.Errorf("final EdgeOne result belongs to another qualification run")
-	}
-	if final.value.EdgeOne.Variant == EdgeOneEnabled && (final.value.EdgeOne.ScopeKind != candidate.value.EdgeOne.ScopeKind || final.value.EdgeOne.ScopeDigest != candidate.value.EdgeOne.ScopeDigest) {
-		return fmt.Errorf("enabled EdgeOne result differs from the candidate prebound scope")
-	}
-	return nil
-}
-
-func validateEnvelope(envelope Envelope) error {
-	if envelope.SchemaVersion != EnvelopeSchemaVersion || !releaseTagPattern.MatchString(envelope.ReleaseTag) || !ValidDigest(envelope.SourceTreeDigest) {
-		return fmt.Errorf("release envelope identity is invalid")
-	}
-	if err := validateAsset(envelope.Checksums); err != nil {
-		return fmt.Errorf("checksums identity: %w", err)
-	}
-	if _, err := envelopeAssetInventory(envelope); err != nil {
-		return err
-	}
-	if err := validateNetworkPolicy(envelope.Network); err != nil {
-		return err
-	}
-	if err := validateHeadscaleAuthorityShape(envelope.Headscale); err != nil {
-		return err
-	}
-	switch envelope.Kind {
-	case EnvelopeQualificationCandidate:
-		if envelope.QualificationTarget == nil || len(envelope.SupportedProfiles) != 0 || envelope.QualificationCandidateOID != "" || envelope.SecurityReport != nil {
-			return fmt.Errorf("qualification candidate profile or security authority is invalid")
-		}
-		if err := validateOSProfile(*envelope.QualificationTarget); err != nil {
-			return err
-		}
-		if envelope.EdgeOne.Variant != EdgeOneQualificationCandidate {
-			return fmt.Errorf("candidate EdgeOne capability is not prebound")
-		}
-	case EnvelopeFinal:
-		if envelope.QualificationTarget != nil || len(envelope.SupportedProfiles) != 1 || !ValidDigest(envelope.QualificationCandidateOID) || envelope.SecurityReport == nil {
-			return fmt.Errorf("final release profile, candidate, or security authority is invalid")
-		}
-		previous := ""
-		for _, qualified := range envelope.SupportedProfiles {
-			if err := validateQualifiedProfile(qualified, envelope); err != nil || previous != "" && strings.Compare(previous, qualified.Profile.ID) >= 0 {
-				return fmt.Errorf("supported OS profiles are invalid, unqualified, duplicated, or unsorted")
-			}
-			previous = qualified.Profile.ID
-		}
-		if envelope.EdgeOne.Variant != EdgeOneEnabled && envelope.EdgeOne.Variant != EdgeOneDisabled {
-			return fmt.Errorf("final EdgeOne capability variant is invalid")
-		}
-	default:
-		return fmt.Errorf("release envelope kind is unknown")
-	}
-	return validateEdgeOneCapability(envelope)
-}
-
-func envelopeAssetInventory(envelope Envelope) ([]AssetIdentity, error) {
-	previousAdditional := ""
-	for _, asset := range envelope.AdditionalAssets {
-		if previousAdditional != "" && strings.Compare(previousAdditional, asset.Path) >= 0 {
-			return nil, fmt.Errorf("additional release assets are duplicated or unsorted")
-		}
-		previousAdditional = asset.Path
-	}
-	assets := []AssetIdentity{envelope.Binary, envelope.SourceArchive, envelope.License, envelope.Notice, envelope.SBOM, envelope.DependencyBaseline, envelope.StableChecklist}
-	if envelope.SecurityReport != nil {
-		assets = append(assets, *envelope.SecurityReport)
-	}
-	assets = append(assets, envelope.AdditionalAssets...)
-	slices.SortFunc(assets, func(left, right AssetIdentity) int { return strings.Compare(left.Path, right.Path) })
-	previous := ""
+	assets = append(assets, manifest.AdditionalAssets...)
+	seen := map[string]bool{}
 	for _, asset := range assets {
-		if err := validateAsset(asset); err != nil || previous != "" && asset.Path == previous || asset.Path == envelope.Checksums.Path {
+		if err := validateAsset(asset); err != nil || seen[asset.Path] || asset.Path == manifest.Checksums.Path || asset.Path == "release.json" {
 			return nil, fmt.Errorf("release asset inventory is invalid or duplicated")
 		}
-		previous = asset.Path
+		seen[asset.Path] = true
 	}
+	slices.SortFunc(assets, func(a, b AssetIdentity) int { return strings.Compare(a.Path, b.Path) })
 	return assets, nil
 }
 
-func validateManifest(manifest Manifest) error {
-	if manifest.SchemaVersion != ManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || !ValidDigest(manifest.EnvelopeDigest) || !ValidDigest(manifest.SourceTreeDigest) || !ValidDigest(manifest.BinaryDigest) || !ValidDigest(manifest.CandidateDigest) {
-		return fmt.Errorf("final release manifest identity is invalid")
+func validateReleaseManifest(manifest ReleaseManifest) error {
+	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || !ValidDigest(manifest.SourceTreeDigest) || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) != 1 || len(manifest.ProviderLiveTests) != 5 {
+		return fmt.Errorf("release.json common identity is invalid")
 	}
-	if err := validateAsset(manifest.Checksums); err != nil {
+	if err := validateHeadscaleAuthority(manifest.Headscale); err != nil {
 		return err
 	}
-	previous := ""
-	for _, asset := range manifest.Assets {
-		if err := validateAsset(asset); err != nil || previous != "" && strings.Compare(previous, asset.Path) >= 0 || asset.Path == manifest.Checksums.Path {
-			return fmt.Errorf("final manifest asset inventory is invalid, duplicated, or unsorted")
-		}
-		previous = asset.Path
+	if _, err := releaseAssetInventory(manifest); err != nil {
+		return err
 	}
-	if len(manifest.Assets) == 0 {
-		return fmt.Errorf("final manifest asset inventory is empty")
+	if manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.License.Path != "LICENSE" || manifest.Notice.Path != "NOTICE" || manifest.SBOM.Path == "" || manifest.DependencyManifest.Path == "" || manifest.SecurityReport.Path == "" || manifest.QualificationSummary.Path == "" || manifest.KnownLimitations.Path == "" {
+		return fmt.Errorf("release mandatory asset paths are invalid")
+	}
+	profile := manifest.SupportedProfiles[0]
+	if validateOSProfile(profile.Profile) != nil || profile.QualifiedBinaryDigest != manifest.Binary.Digest || !refPattern.MatchString(profile.QualificationRunID) || !ValidDigest(profile.QualificationSummaryDigest) || profile.QualificationSummaryDigest != manifest.QualificationSummary.Digest {
+		return fmt.Errorf("supported profile lacks exact same-binary qualification identity")
+	}
+	expectedProviders := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
+	liveProviders := 0
+	for index, provider := range manifest.ProviderLiveTests {
+		if provider.Status == "live_tested" {
+			liveProviders++
+		}
+		if provider.Provider != expectedProviders[index] || provider.Status != "live_tested" && provider.Status != "not_live_tested" {
+			return fmt.Errorf("provider live-test inventory is invalid or noncanonical")
+		}
+	}
+	if liveProviders != 1 {
+		return fmt.Errorf("release must contain exactly one live-tested provider")
 	}
 	return nil
 }
 
 func validateAsset(asset AssetIdentity) error {
 	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 {
-		return fmt.Errorf("asset path, digest, or byte size is invalid")
+		return fmt.Errorf("asset identity is incomplete")
+	}
+	return nil
+}
+
+func validateHeadscaleAuthority(authority HeadscaleArtifactAuthority) error {
+	if authority.Version != SupportedHeadscaleVersion || !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
+		return fmt.Errorf("headscale artifact authority is incomplete")
+	}
+	if !canonicalArtifactURL(authority.ArtifactIdentity) {
+		return fmt.Errorf("headscale artifact identity must be an exact HTTPS URL")
+	}
+	if len(authority.RedirectAuthorities) == 0 || len(authority.RedirectAuthorities) > 16 || len(authority.Members) != 1 || authority.Members[0].Path != authority.ExecutableAsset || authority.Members[0].Destination != authority.InstallPath || authority.Members[0].Mode != 0o755 || validateAsset(authority.Members[0].Asset) != nil {
+		return fmt.Errorf("headscale archive member authority is invalid")
+	}
+	for index, host := range authority.RedirectAuthorities {
+		if host == "" || strings.ToLower(host) != host || strings.ContainsAny(host, "/:@") || index > 0 && authority.RedirectAuthorities[index-1] >= host {
+			return fmt.Errorf("headscale redirect authority is invalid or unsorted")
+		}
+	}
+	return nil
+}
+
+func validateClientArtifactAuthority(authority ClientArtifactAuthority, executable, installPath string) error {
+	if !concreteVersionPattern.MatchString(authority.Version) || !canonicalArtifactURL(authority.ArtifactIdentity) || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.ExecutableAsset != executable || authority.InstallPath != installPath || len(authority.Members) == 0 || len(authority.Members) > 16 {
+		return fmt.Errorf("client artifact authority is incomplete")
+	}
+	found := false
+	previous := ""
+	for _, member := range authority.Members {
+		if validateAsset(member.Asset) != nil || previous != "" && previous >= member.Path || member.Mode != 0o644 && member.Mode != 0o755 {
+			return fmt.Errorf("client archive member authority is invalid")
+		}
+		if member.Asset.Path == executable {
+			found = member.Destination == installPath && member.Mode == 0o755
+		}
+		previous = member.Path
+	}
+	if !found {
+		return fmt.Errorf("client executable member authority is missing")
+	}
+	return nil
+}
+
+func canonicalArtifactURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
+}
+
+func verifyDependencyAuthority(authority QualificationDependencyAuthority, profile OSProfile, assets map[string][]byte, decoded ...dependencies.Baseline) error {
+	baselineBytes, present := assets[authority.DependencyBaseline.Path]
+	if !present || authority.DependencyBaseline.Bytes != uint64(len(baselineBytes)) || authority.DependencyBaseline.Digest != DigestBytes(baselineBytes) {
+		return fmt.Errorf("dependency baseline bytes are missing or mismatched")
+	}
+	var baseline dependencies.Baseline
+	var err error
+	if len(decoded) == 1 {
+		baseline = decoded[0]
+	} else if len(decoded) == 0 {
+		baseline, err = dependencies.DecodeBaseline(baselineBytes)
+	} else {
+		return fmt.Errorf("dependency baseline observation is ambiguous")
+	}
+	if err != nil {
+		return err
+	}
+	profileDigest, err := ProfileDigest(profile)
+	if err != nil || dependencies.ValidateForOSProfile(baseline, profileDigest, profile.NginxVersion) != nil {
+		return fmt.Errorf("dependency baseline does not bind the exact OS profile")
+	}
+	var headscaleSelection, legoSelection, tailscaleSelection *dependencies.Selection
+	for index := range baseline.Selections {
+		switch baseline.Selections[index].Component {
+		case "headscale":
+			headscaleSelection = &baseline.Selections[index]
+		case "lego":
+			legoSelection = &baseline.Selections[index]
+		case "tailscale-client":
+			tailscaleSelection = &baseline.Selections[index]
+		}
+	}
+	if headscaleSelection == nil || headscaleSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Headscale.Version != headscaleSelection.SelectedVersion || authority.Headscale.ArtifactIdentity != headscaleSelection.ArtifactIdentity || authority.Headscale.Archive.Digest != headscaleSelection.ArtifactDigest {
+		return fmt.Errorf("headscale artifact does not match dependency manifest")
+	}
+	if err := verifyArchiveAssets(authority.Headscale.Archive, authority.Headscale.ArchiveFormat, authority.Headscale.MaximumExtractedBytes, authority.Headscale.Members, assets); err != nil {
+		return fmt.Errorf("headscale artifact: %w", err)
+	}
+	if legoSelection == nil || legoSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.LegoVersion != legoSelection.SelectedVersion || authority.LegoArtifactIdentity != legoSelection.ArtifactIdentity || authority.LegoArchive.Digest != legoSelection.ArtifactDigest {
+		return fmt.Errorf("lego artifact does not match dependency manifest")
+	}
+	if err := verifyArchiveAssets(authority.LegoArchive, string(managedarchive.TarGzip), 258<<20, authority.LegoMembers, assets); err != nil {
+		return fmt.Errorf("lego artifact: %w", err)
+	}
+	if tailscaleSelection == nil || tailscaleSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Tailscale.Version != tailscaleSelection.SelectedVersion || authority.Tailscale.ArtifactIdentity != tailscaleSelection.ArtifactIdentity || authority.Tailscale.Archive.Digest != tailscaleSelection.ArtifactDigest {
+		return fmt.Errorf("tailscale artifact does not match dependency manifest")
+	}
+	if err := verifyArchiveAssets(authority.Tailscale.Archive, authority.Tailscale.ArchiveFormat, authority.Tailscale.MaximumExtractedBytes, authority.Tailscale.Members, assets); err != nil {
+		return fmt.Errorf("tailscale artifact: %w", err)
+	}
+	return nil
+}
+
+func verifyArchiveAssets(archive AssetIdentity, format string, maximum uint64, members []ArchiveMemberAuthority, assets map[string][]byte) error {
+	archiveBytes, present := assets[archive.Path]
+	if !present || archive.Bytes != uint64(len(archiveBytes)) || archive.Digest != DigestBytes(archiveBytes) || maximum == 0 || maximum > 1<<30 {
+		return fmt.Errorf("archive bytes are missing, mismatched, or unbounded")
+	}
+	spec := managedarchive.Spec{Format: managedarchive.Format(format), MaximumArchiveBytes: int64(maximum), MaximumExtractedBytes: int64(maximum), MaximumMembers: len(members)}
+	for _, member := range members {
+		data, present := assets[member.Asset.Path]
+		if !present || member.Asset.Bytes != uint64(len(data)) || member.Asset.Digest != DigestBytes(data) {
+			return fmt.Errorf("archive member %q bytes are missing or mismatched", member.Path)
+		}
+		spec.Members = append(spec.Members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(maximum), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)}})
+	}
+	extracted, err := managedarchive.Extract(archiveBytes, spec)
+	if err != nil {
+		return err
+	}
+	for _, member := range members {
+		if !slices.Equal(extracted[member.Path], assets[member.Asset.Path]) {
+			return fmt.Errorf("extracted member %q differs from its fixed identity", member.Path)
+		}
 	}
 	return nil
 }
 
 func validateOSProfile(profile OSProfile) error {
-	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) || !ValidDigest(profile.PackageSnapshotDigest) || validateConfinementProfile(profile.ManagedConfinement) != nil {
-		return fmt.Errorf("OS profile is not an exact Debian/Ubuntu amd64 identity with qualified managed-process confinement")
+	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) {
+		return fmt.Errorf("OS profile platform identity is invalid")
 	}
-	return nil
+	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryKeyFingerprint) || !ValidDigest(profile.RepositoryMetadataDigest) || !ValidDigest(profile.RepositoryCutoffDigest) || !ValidDigest(profile.PackageClosureDigest) {
+		return fmt.Errorf("OS profile repository digest authority is invalid")
+	}
+	if len(profile.Packages) == 0 || len(profile.Packages) > 4096 {
+		return fmt.Errorf("OS profile exact package closure is empty or unbounded")
+	}
+	repository, err := url.Parse(profile.RepositorySource)
+	if err != nil || repository.Scheme != "https" || repository.Host == "" || repository.User != nil || repository.RawQuery != "" || repository.Fragment != "" || repository.String() != profile.RepositorySource {
+		return fmt.Errorf("OS profile repository source is invalid")
+	}
+	previous := ""
+	for _, tuple := range profile.Packages {
+		key := tuple.Name + "\x00" + tuple.Architecture
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+			return fmt.Errorf("OS profile package tuple is invalid, duplicated, or unsorted")
+		}
+		previous = key
+	}
+	return validateConfinementProfile(profile.ManagedConfinement)
 }
 
 func validateConfinementProfile(profile ConfinementProfile) error {
 	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || !concreteVersionPattern.MatchString(profile.KernelRelease) || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !ValidDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
-		return fmt.Errorf("managed-process confinement profile is unqualified")
+		return fmt.Errorf("managed confinement qualification is incomplete")
 	}
-	previous := ""
-	for _, destination := range profile.ProtectedDestinations {
-		if destination == "" || strings.ContainsAny(destination, "\x00\r\n") || previous != "" && strings.Compare(previous, destination) >= 0 {
-			return fmt.Errorf("managed-process protected destinations are noncanonical")
+	for index, destination := range profile.ProtectedDestinations {
+		if destination == "" || index > 0 && profile.ProtectedDestinations[index-1] >= destination {
+			return fmt.Errorf("managed confinement protected destinations are noncanonical")
 		}
-		previous = destination
-	}
-	return nil
-}
-
-func validateQualifiedProfile(qualified QualifiedOSProfile, envelope Envelope) error {
-	if err := validateOSProfile(qualified.Profile); err != nil || qualified.Status != (QualificationStatus{Preflight: "eligible", Gate: "passed", Live: "live_qualified"}) || qualified.CandidateDigest != envelope.QualificationCandidateOID || qualified.ChecklistDigest != envelope.StableChecklist.Digest || !refPattern.MatchString(qualified.ChecklistItemID) || !ValidDigest(qualified.LiveEvidenceDigest) {
-		return fmt.Errorf("supported OS profile lacks exact live-qualified candidate evidence")
 	}
 	return nil
 }
@@ -668,208 +540,180 @@ func ProfileDigest(profile OSProfile) (string, error) {
 	return DigestBytes(data), nil
 }
 
-func validateEdgeOneCapability(envelope Envelope) error {
-	capability := envelope.EdgeOne
-	if !validQualificationStatus(capability.Status) || !refPattern.MatchString(capability.Reason) || !refPattern.MatchString(capability.RunID) {
-		return fmt.Errorf("EdgeOne capability status, reason, or run is invalid")
-	}
-	switch capability.Variant {
-	case EdgeOneQualificationCandidate:
-		if envelope.Kind != EnvelopeQualificationCandidate || capability.Status != (QualificationStatus{Preflight: "not_applicable", Gate: "passed", Live: "not_applicable"}) || (capability.ScopeKind != "exact_zone" && capability.ScopeKind != "provider_contract") || !ValidDigest(capability.ScopeDigest) || capability.CandidateDigest != "" || capability.ProfileDigest != "" || capability.ChecklistDigest != "" || hasEdgeOneProof(capability) {
-			return fmt.Errorf("EdgeOne candidate scope is invalid")
-		}
-	case EdgeOneEnabled:
-		profileDigest, err := ProfileDigest(envelope.SupportedProfiles[0].Profile)
-		if envelope.Kind != EnvelopeFinal || err != nil || capability.Status != (QualificationStatus{Preflight: "eligible", Gate: "passed", Live: "live_qualified"}) || capability.CandidateDigest != envelope.QualificationCandidateOID || capability.ProfileDigest != profileDigest || capability.ChecklistDigest != envelope.StableChecklist.Digest || (capability.ScopeKind != "exact_zone" && capability.ScopeKind != "provider_contract") || !ValidDigest(capability.ScopeDigest) || !refPattern.MatchString(capability.RawProviderChecklistItemID) || !ValidDigest(capability.RawProviderProofDigest) || !refPattern.MatchString(capability.ProductChecklistItemID) || !ValidDigest(capability.ProductProofDigest) || !refPattern.MatchString(capability.CleanupChecklistItemID) || !ValidDigest(capability.CleanupEvidenceDigest) {
-			return fmt.Errorf("enabled EdgeOne capability lacks exact candidate/run/profile/checklist proof")
-		}
-	case EdgeOneDisabled:
-		profileDigest, err := ProfileDigest(envelope.SupportedProfiles[0].Profile)
-		allowedStatus := capability.Status == (QualificationStatus{Preflight: "ineligible", Gate: "deferred", Live: "live_unqualified"}) || capability.Status == (QualificationStatus{Preflight: "eligible", Gate: "deferred", Live: "live_unqualified"})
-		if envelope.Kind != EnvelopeFinal || err != nil || !allowedStatus || capability.CandidateDigest != envelope.QualificationCandidateOID || capability.ProfileDigest != profileDigest || capability.ChecklistDigest != envelope.StableChecklist.Digest || capability.ScopeKind != "" || capability.ScopeDigest != "" || capability.RawProviderChecklistItemID != "" || capability.RawProviderProofDigest != "" || capability.ProductChecklistItemID != "" || capability.ProductProofDigest != "" || !refPattern.MatchString(capability.CleanupChecklistItemID) || !ValidDigest(capability.CleanupEvidenceDigest) {
-			return fmt.Errorf("disabled EdgeOne capability carries enable authority or lacks cleanup evidence")
-		}
-	default:
-		return fmt.Errorf("EdgeOne capability variant is unknown")
-	}
-	return nil
+type QualificationTargetProfile struct {
+	SchemaVersion string    `json:"schema_version"`
+	Profile       OSProfile `json:"profile"`
+	CapturedAt    time.Time `json:"captured_at"`
 }
 
-func hasEdgeOneProof(capability EdgeOneCapability) bool {
-	return capability.RawProviderChecklistItemID != "" || capability.RawProviderProofDigest != "" || capability.ProductChecklistItemID != "" || capability.ProductProofDigest != "" || capability.CleanupChecklistItemID != "" || capability.CleanupEvidenceDigest != ""
+type PlannedMutation struct {
+	ID                    string `json:"id"`
+	ScopeDigest           string `json:"scope_digest"`
+	PriorStateDigest      string `json:"prior_state_digest"`
+	PlannedMutationDigest string `json:"planned_mutation_digest"`
+	SelectorDigest        string `json:"selector_digest"`
+	CleanupPolicy         string `json:"cleanup_policy"`
 }
 
-func validQualificationStatus(status QualificationStatus) bool {
-	switch status {
-	case QualificationStatus{Preflight: "not_applicable", Gate: "passed", Live: "not_applicable"},
-		QualificationStatus{Preflight: "eligible", Gate: "passed", Live: "live_qualified"},
-		QualificationStatus{Preflight: "ineligible", Gate: "deferred", Live: "live_unqualified"},
-		QualificationStatus{Preflight: "eligible", Gate: "deferred", Live: "live_unqualified"},
-		QualificationStatus{Preflight: "ineligible", Gate: "blocked", Live: "live_unqualified"},
-		QualificationStatus{Preflight: "indeterminate", Gate: "blocked", Live: "live_unqualified"},
-		QualificationStatus{Preflight: "eligible", Gate: "blocked", Live: "live_unqualified"}:
-		return true
-	default:
-		return false
-	}
+type LiveSideEffectPlan struct {
+	SchemaVersion             string            `json:"schema_version"`
+	RunID                     string            `json:"run_id"`
+	AuthorizedHostFingerprint string            `json:"authorized_host_fingerprint"`
+	CreatedAt                 time.Time         `json:"created_at"`
+	Mutations                 []PlannedMutation `json:"mutations"`
 }
 
-func validateNetworkPolicy(policy NetworkPolicy) error {
-	if policy.TelemetryEnabled || policy.CommercialControlPlaneEnabled {
-		return fmt.Errorf("community release cannot enable telemetry or a commercial control plane")
-	}
-	allowed := map[string]bool{"acme": true, "dependency_download": true, "dns_provider": true, "edgeone_origin_acl": true, "tailnet_control": true}
-	required := map[string]bool{"acme": true, "dependency_download": true, "dns_provider": true, "tailnet_control": true}
-	seen := map[string]bool{}
-	previous := ""
-	for _, purpose := range policy.ExternalPurposes {
-		if !allowed[purpose] || previous != "" && strings.Compare(previous, purpose) >= 0 {
-			return fmt.Errorf("external connection purposes are unknown, duplicated, or unsorted")
-		}
-		seen[purpose] = true
-		previous = purpose
-	}
-	for purpose := range required {
-		if !seen[purpose] {
-			return fmt.Errorf("release omits required external connection purpose %q", purpose)
-		}
-	}
-	return nil
+type QualificationInstallManifest struct {
+	SchemaVersion             string        `json:"schema_version"`
+	RunID                     string        `json:"run_id"`
+	ReleaseTag                string        `json:"release_tag"`
+	CandidateBinary           AssetIdentity `json:"candidate_binary"`
+	SourceTreeDigest          string        `json:"source_tree_digest"`
+	DependencyManifestDigest  string        `json:"dependency_manifest_digest"`
+	TargetProfileDigest       string        `json:"target_profile_digest"`
+	AuthorizedHostFingerprint string        `json:"authorized_host_fingerprint"`
+	SideEffectPlanDigest      string        `json:"side_effect_plan_digest"`
+	ProtectedAuthorityDigest  string        `json:"protected_authority_digest"`
+	ACMEAccountContact        string        `json:"acme_account_contact"`
+	CreatedAt                 time.Time     `json:"created_at"`
 }
 
-type EffectPhase string
+type CleanupResult string
 
 const (
-	EffectPrepared EffectPhase = "prepared"
+	CleanupSubmitted CleanupResult = "submitted"
+	CleanupExecuted  CleanupResult = "executed"
+	CleanupCleaned   CleanupResult = "cleaned"
+	CleanupRetained  CleanupResult = "retained"
 )
 
-type QualificationEffect struct {
-	ID                    string      `json:"id"`
-	ScopeDigest           string      `json:"scope_digest"`
-	PriorStateDigest      string      `json:"prior_state_digest"`
-	PlannedMutationDigest string      `json:"planned_mutation_digest"`
-	SelectorDigest        string      `json:"selector_digest"`
-	CleanupPolicy         string      `json:"cleanup_policy"`
-	Phase                 EffectPhase `json:"phase"`
+type CleanupItem struct {
+	MutationID       string        `json:"mutation_id"`
+	ObservedIdentity string        `json:"observed_identity"`
+	Result           CleanupResult `json:"result"`
 }
 
-type QualificationManifest struct {
-	SchemaVersion             string                `json:"schema_version"`
-	RunID                     string                `json:"run_id"`
-	AuthorizedHostFingerprint string                `json:"authorized_host_fingerprint"`
-	CaseID                    string                `json:"case_id"`
-	Operation                 string                `json:"operation"`
-	CandidateEnvelopeDigest   string                `json:"candidate_envelope_digest"`
-	BinaryDigest              string                `json:"binary_digest"`
-	SourceTreeDigest          string                `json:"source_tree_digest"`
-	TargetProfileDigest       string                `json:"target_profile_digest"`
-	BeforeInventoryDigest     string                `json:"before_inventory_digest"`
-	CreatedAt                 time.Time             `json:"created_at"`
-	Effects                   []QualificationEffect `json:"effects"`
+type LiveCleanupReport struct {
+	SchemaVersion                      string        `json:"schema_version"`
+	RunID                              string        `json:"run_id"`
+	SideEffectPlanDigest               string        `json:"side_effect_plan_digest"`
+	QualificationInstallManifestDigest string        `json:"qualification_install_manifest_digest"`
+	ProtectedInputDigest               string        `json:"protected_input_digest"`
+	JourneySucceeded                   bool          `json:"journey_succeeded"`
+	UpdatedAt                          time.Time     `json:"updated_at"`
+	Items                              []CleanupItem `json:"items"`
 }
 
-type VerifiedQualificationManifest struct {
-	value  QualificationManifest
-	digest string
+func DecodeQualificationTargetProfile(data []byte) (QualificationTargetProfile, error) {
+	var profile QualificationTargetProfile
+	if err := DecodeCanonical(data, &profile); err != nil {
+		return QualificationTargetProfile{}, err
+	}
+	if profile.SchemaVersion != QualificationTargetProfileSchemaVersion || !sameUTCSecond(profile.CapturedAt) || validateOSProfile(profile.Profile) != nil {
+		return QualificationTargetProfile{}, fmt.Errorf("qualification target profile is invalid")
+	}
+	return profile, nil
 }
 
-func (verified *VerifiedQualificationManifest) Value() QualificationManifest {
-	if verified == nil {
-		return QualificationManifest{}
+func DecodeLiveSideEffectPlan(data []byte) (LiveSideEffectPlan, error) {
+	var plan LiveSideEffectPlan
+	if err := DecodeCanonical(data, &plan); err != nil {
+		return LiveSideEffectPlan{}, err
 	}
-	value := verified.value
-	value.Effects = append([]QualificationEffect(nil), verified.value.Effects...)
-	return value
-}
-func (verified *VerifiedQualificationManifest) Digest() string {
-	if verified == nil {
-		return ""
-	}
-	return verified.digest
-}
-
-func DecodeQualificationManifest(data []byte, expectedDigest string) (*VerifiedQualificationManifest, error) {
-	if !ValidDigest(expectedDigest) || DigestBytes(data) != expectedDigest {
-		return nil, fmt.Errorf("qualification manifest differs from its protected expected digest")
-	}
-	var manifest QualificationManifest
-	if err := DecodeCanonical(data, &manifest); err != nil {
-		return nil, err
-	}
-	if err := validateQualificationManifest(manifest); err != nil {
-		return nil, err
-	}
-	return &VerifiedQualificationManifest{value: manifest, digest: expectedDigest}, nil
-}
-
-func validateQualificationManifest(manifest QualificationManifest) error {
-	if manifest.SchemaVersion != QualificationManifestSchemaVersion || !refPattern.MatchString(manifest.RunID) || !refPattern.MatchString(manifest.AuthorizedHostFingerprint) || !refPattern.MatchString(manifest.CaseID) || !refPattern.MatchString(manifest.Operation) || !ValidDigest(manifest.CandidateEnvelopeDigest) || !ValidDigest(manifest.BinaryDigest) || !ValidDigest(manifest.SourceTreeDigest) || !ValidDigest(manifest.TargetProfileDigest) || !ValidDigest(manifest.BeforeInventoryDigest) || !sameUTCSecond(manifest.CreatedAt) || len(manifest.Effects) == 0 {
-		return fmt.Errorf("qualification manifest identity or before-inventory is invalid")
+	if plan.SchemaVersion != LiveSideEffectPlanSchemaVersion || !refPattern.MatchString(plan.RunID) || !refPattern.MatchString(plan.AuthorizedHostFingerprint) || !sameUTCSecond(plan.CreatedAt) || len(plan.Mutations) == 0 || len(plan.Mutations) > 1024 {
+		return LiveSideEffectPlan{}, fmt.Errorf("live side-effect plan is invalid")
 	}
 	previous := ""
-	for _, effect := range manifest.Effects {
-		if !refPattern.MatchString(effect.ID) || previous != "" && strings.Compare(previous, effect.ID) >= 0 || !ValidDigest(effect.ScopeDigest) || !ValidDigest(effect.PriorStateDigest) || !ValidDigest(effect.PlannedMutationDigest) || !ValidDigest(effect.SelectorDigest) || (effect.CleanupPolicy != "cleanup_required" && effect.CleanupPolicy != "retain_authorized") || effect.Phase != EffectPrepared {
-			return fmt.Errorf("qualification effects are invalid, duplicated, unsorted, or already advanced")
+	for _, mutation := range plan.Mutations {
+		if !refPattern.MatchString(mutation.ID) || !ValidDigest(mutation.ScopeDigest) || !ValidDigest(mutation.PriorStateDigest) || !ValidDigest(mutation.PlannedMutationDigest) || !ValidDigest(mutation.SelectorDigest) || (mutation.CleanupPolicy != "delete_exact" && mutation.CleanupPolicy != "retain_authorized") || previous != "" && previous >= mutation.ID {
+			return LiveSideEffectPlan{}, fmt.Errorf("live side-effect mutation inventory is invalid or noncanonical")
 		}
-		previous = effect.ID
+		previous = mutation.ID
 	}
-	return nil
+	return plan, nil
 }
 
-type QualificationObservation struct {
-	RunID                 string
-	HostFingerprint       string
-	CaseID                string
-	Operation             string
-	ManifestDigest        string
-	BeforeInventoryDigest string
-	ObservedAt            time.Time
-	Profile               OSProfile
-	Effect                QualificationEffect
+func DecodeQualificationInstallManifest(data []byte) (QualificationInstallManifest, error) {
+	var manifest QualificationInstallManifest
+	if err := DecodeCanonical(data, &manifest); err != nil {
+		return QualificationInstallManifest{}, err
+	}
+	if manifest.SchemaVersion != QualificationInstallManifestSchemaVersion || !refPattern.MatchString(manifest.RunID) || !releaseTagPattern.MatchString(manifest.ReleaseTag) || validateAsset(manifest.CandidateBinary) != nil || manifest.CandidateBinary.Path != "lanpanel" || !ValidDigest(manifest.SourceTreeDigest) || !ValidDigest(manifest.DependencyManifestDigest) || !ValidDigest(manifest.TargetProfileDigest) || !refPattern.MatchString(manifest.AuthorizedHostFingerprint) || !ValidDigest(manifest.SideEffectPlanDigest) || !ValidDigest(manifest.ProtectedAuthorityDigest) || !acmeaccount.ValidContact(manifest.ACMEAccountContact) || !sameUTCSecond(manifest.CreatedAt) {
+		return QualificationInstallManifest{}, fmt.Errorf("qualification install manifest is invalid")
+	}
+	return manifest, nil
 }
 
-func AuthorizeCandidateInstall(candidate *VerifiedCandidateRelease, manifest *VerifiedQualificationManifest, observed QualificationObservation) error {
-	if candidate == nil || candidate.envelope == nil || manifest == nil || candidate.envelope.value.QualificationTarget == nil {
-		return fmt.Errorf("candidate install lacks verified release or qualification authority")
+func DecodeLiveCleanupReport(data []byte) (LiveCleanupReport, error) {
+	var report LiveCleanupReport
+	if err := DecodeCanonical(data, &report); err != nil {
+		return LiveCleanupReport{}, err
 	}
-	profileDigest, err := ProfileDigest(observed.Profile)
-	authority := manifest.value
-	effectMatched := false
-	for _, effect := range authority.Effects {
-		if reflect.DeepEqual(effect, observed.Effect) {
-			effectMatched = true
-			break
+	if report.SchemaVersion != LiveCleanupReportSchemaVersion || !refPattern.MatchString(report.RunID) || !ValidDigest(report.SideEffectPlanDigest) || !ValidDigest(report.QualificationInstallManifestDigest) || !ValidDigest(report.ProtectedInputDigest) || !sameUTCSecond(report.UpdatedAt) || len(report.Items) == 0 || len(report.Items) > 1024 {
+		return LiveCleanupReport{}, fmt.Errorf("live cleanup report is invalid")
+	}
+	previous := ""
+	for _, item := range report.Items {
+		if !refPattern.MatchString(item.MutationID) || !refPattern.MatchString(item.ObservedIdentity) || item.Result != CleanupSubmitted && item.Result != CleanupExecuted && item.Result != CleanupCleaned && item.Result != CleanupRetained || previous != "" && previous >= item.MutationID {
+			return LiveCleanupReport{}, fmt.Errorf("live cleanup report inventory is invalid or noncanonical")
+		}
+		previous = item.MutationID
+	}
+	return report, nil
+}
+
+func VerifyLiveCleanup(planBytes, reportBytes []byte, qualificationInstallManifestDigest, protectedInputDigest string) (LiveCleanupReport, error) {
+	plan, err := DecodeLiveSideEffectPlan(planBytes)
+	if err != nil {
+		return LiveCleanupReport{}, err
+	}
+	report, err := DecodeLiveCleanupReport(reportBytes)
+	if err != nil {
+		return LiveCleanupReport{}, err
+	}
+	if !ValidDigest(qualificationInstallManifestDigest) || !ValidDigest(protectedInputDigest) || report.ProtectedInputDigest != protectedInputDigest || report.RunID != plan.RunID || report.SideEffectPlanDigest != DigestBytes(planBytes) || report.QualificationInstallManifestDigest != qualificationInstallManifestDigest || !report.JourneySucceeded || report.UpdatedAt.Before(plan.CreatedAt) || len(report.Items) != len(plan.Mutations) {
+		return LiveCleanupReport{}, fmt.Errorf("live cleanup report does not match immutable plan")
+	}
+	for index, mutation := range plan.Mutations {
+		item := report.Items[index]
+		if item.MutationID != mutation.ID || item.Result != CleanupCleaned && item.Result != CleanupRetained || mutation.CleanupPolicy == "delete_exact" && item.Result != CleanupCleaned {
+			return LiveCleanupReport{}, fmt.Errorf("live cleanup report is incomplete or violates cleanup policy")
 		}
 	}
-	if err != nil || !sameUTCSecond(observed.ObservedAt) || observed.ObservedAt.Before(authority.CreatedAt) || !effectMatched || authority.RunID != candidate.envelope.value.EdgeOne.RunID || observed.RunID != authority.RunID || observed.HostFingerprint != authority.AuthorizedHostFingerprint || observed.CaseID != authority.CaseID || observed.Operation != authority.Operation || observed.ManifestDigest != manifest.digest || observed.BeforeInventoryDigest != authority.BeforeInventoryDigest || profileDigest != authority.TargetProfileDigest || !reflect.DeepEqual(observed.Profile, *candidate.envelope.value.QualificationTarget) || authority.CandidateEnvelopeDigest != candidate.envelope.digest || authority.BinaryDigest != candidate.envelope.value.Binary.Digest || authority.SourceTreeDigest != candidate.envelope.value.SourceTreeDigest {
-		return fmt.Errorf("qualification candidate install authority, effect, or observation mismatched")
+	return report, nil
+}
+
+func ValidateQualificationBinding(manifest QualificationInstallManifest, target QualificationTargetProfile, plan LiveSideEffectPlan, observedHost string) error {
+	profileDigest, profileErr := ProfileDigest(target.Profile)
+	planBytes, planErr := MarshalCanonical(plan)
+	if profileErr != nil || planErr != nil || manifest.TargetProfileDigest != profileDigest || manifest.SideEffectPlanDigest != DigestBytes(planBytes) || manifest.RunID != plan.RunID || manifest.AuthorizedHostFingerprint != plan.AuthorizedHostFingerprint || manifest.AuthorizedHostFingerprint != observedHost || plan.CreatedAt.After(manifest.CreatedAt) {
+		return fmt.Errorf("qualification install authority binding is invalid")
 	}
 	return nil
 }
 
-type FinalInstallObservation struct {
-	ReleaseTag       string
-	ManifestDigest   string
-	EnvelopeDigest   string
-	BinaryDigest     string
-	SourceTreeDigest string
-	HostFingerprint  string
-	ObservedAt       time.Time
-	Profile          OSProfile
-}
-
-func AuthorizeFinalInstall(final *VerifiedFinalRelease, observed FinalInstallObservation) error {
-	if final == nil || final.envelope == nil || final.manifest == nil || len(final.envelope.value.SupportedProfiles) != 1 {
-		return fmt.Errorf("final install lacks a completely verified release")
+func cloneReleaseManifest(source ReleaseManifest) ReleaseManifest {
+	copy := source
+	copy.AdditionalAssets = append([]AssetIdentity(nil), source.AdditionalAssets...)
+	copy.ProviderLiveTests = append([]ProviderLiveTest(nil), source.ProviderLiveTests...)
+	copy.SupportedProfiles = append([]SupportedOSProfile(nil), source.SupportedProfiles...)
+	copy.Headscale.RedirectAuthorities = append([]string(nil), source.Headscale.RedirectAuthorities...)
+	copy.Headscale.Members = append([]ArchiveMemberAuthority(nil), source.Headscale.Members...)
+	for index := range copy.SupportedProfiles {
+		copy.SupportedProfiles[index].Profile.Packages = append([]PackageTuple(nil), source.SupportedProfiles[index].Profile.Packages...)
+		copy.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations = append([]string(nil), source.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations...)
 	}
-	profileDigest, err := ProfileDigest(observed.Profile)
-	supportedDigest, supportedErr := ProfileDigest(final.envelope.value.SupportedProfiles[0].Profile)
-	if err != nil || supportedErr != nil || profileDigest != supportedDigest || !refPattern.MatchString(observed.HostFingerprint) || !sameUTCSecond(observed.ObservedAt) || observed.ReleaseTag != final.envelope.value.ReleaseTag || observed.ManifestDigest != final.manifest.digest || observed.EnvelopeDigest != final.envelope.digest || observed.BinaryDigest != final.envelope.value.Binary.Digest || observed.SourceTreeDigest != final.envelope.value.SourceTreeDigest {
-		return fmt.Errorf("os_profile_live_unqualified")
-	}
-	return nil
+	return copy
 }
 
 func sameUTCSecond(value time.Time) bool {
 	return !value.IsZero() && value.Location() == time.UTC && value.Nanosecond() == 0
 }
+
+var (
+	releaseTagPattern      = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$`)
+	profileIDPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9.+_-]{0,127}$`)
+	osReleasePattern       = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,2}$`)
+	concreteVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+	refPattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+)

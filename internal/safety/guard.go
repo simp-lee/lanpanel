@@ -22,8 +22,6 @@ type EffectivePriority string
 
 const (
 	PriorityStopFence        EffectivePriority = "stop_fence"
-	PriorityMaintenance      EffectivePriority = "maintenance_pending"
-	PriorityBackup           EffectivePriority = "backup_transition_or_quiescence"
 	PriorityGlobalClose      EffectivePriority = "global_close"
 	PriorityClosing          EffectivePriority = "closing"
 	PriorityDeletingOrOrphan EffectivePriority = "deleting_or_ownership_orphan"
@@ -71,12 +69,6 @@ func Check(input GuardInput) Decision {
 	if input.State.StopFence != nil {
 		return Decision{Priority: priority, Reason: "stop fence blocks expansion"}
 	}
-	if input.State.MaintenancePending != nil || input.State.DependencyTransitionPending != nil || input.State.UpgradePending != nil {
-		return Decision{Priority: PriorityMaintenance, Reason: "maintenance or dependency transition blocks expansion"}
-	}
-	if (input.State.BackupTransition != nil && input.State.BackupTransition.Phase != BackupTransitionImported) || input.State.BackupQuiescence != nil {
-		return Decision{Priority: PriorityBackup, Reason: "backup fence blocks expansion"}
-	}
 	if input.Action == ActionHeadscaleChallenge {
 		return checkHeadscaleChallenge(input)
 	}
@@ -100,9 +92,6 @@ func Check(input GuardInput) Decision {
 		if resource.ChallengePending == nil || resource.ChallengePending.Method != "http-01" || resource.ChallengePending.PlanID != input.PlanID || resource.ChallengePending.Generation != input.Generation || resource.ChallengePending.BootstrapIdentity != input.CandidateDigest {
 			return Decision{Priority: priority, Reason: "matching challenge identity is missing"}
 		}
-		if resource.EdgeOne.Expiry != nil || edgeDeadlineExpired(resource, input.Now) {
-			return Decision{Priority: PriorityBaseContraction, Reason: "EdgeOne expiry cannot be crossed by HTTP-01"}
-		}
 		if !snapshotMatches(resource.ChallengePending.BaseMarkers, resource) {
 			return Decision{Priority: PriorityBaseContraction, Reason: "challenge base marker snapshot is stale"}
 		}
@@ -111,7 +100,7 @@ func Check(input GuardInput) Decision {
 		if resource.Reactivating == nil || resource.ChallengePending != nil || resource.Reactivating.PlanID != input.PlanID || resource.Reactivating.Generation != input.Generation || resource.Reactivating.CandidateDigest != input.CandidateDigest || resource.Reactivating.CandidateBundle != input.CandidateBundle || !snapshotMatches(resource.Reactivating.BaseMarkers, resource) {
 			return Decision{Priority: priority, Reason: "matching reactivation identity is missing or stale"}
 		}
-		if !resource.Reactivating.TemporaryHTTP && (!future(resource.Reactivating.CertificateUntil, input.Now) || !future(resource.Reactivating.ACLUntil, input.Now)) {
+		if !resource.Reactivating.TemporaryHTTP && !future(resource.Reactivating.CertificateUntil, input.Now) {
 			return Decision{Priority: PriorityBaseContraction, Reason: "reactivation safety deadline is not future"}
 		}
 		return Decision{Allowed: true, Priority: PriorityReactivating, Reason: "exact complete reactivation candidate is allowed"}
@@ -119,8 +108,8 @@ func Check(input GuardInput) Decision {
 		if resource.ChallengePending != nil || resource.Reactivating != nil {
 			return Decision{Priority: priority, Reason: "ordinary publish cannot bypass a challenge or reactivation intent"}
 		}
-		if hasBaseMarker(resource) || edgeDeadlineExpired(resource, input.Now) {
-			return Decision{Priority: PriorityBaseContraction, Reason: "base contraction or elapsed EdgeOne deadline requires matching reactivation"}
+		if hasBaseMarker(resource) {
+			return Decision{Priority: PriorityBaseContraction, Reason: "base contraction requires matching reactivation"}
 		}
 		return Decision{Allowed: true, Priority: PriorityPublished, Reason: "no independent expansion blocker"}
 	default:
@@ -154,12 +143,6 @@ func effectivePriority(state State, resourceID string, now time.Time) EffectiveP
 	if state.StopFence != nil {
 		return PriorityStopFence
 	}
-	if state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil {
-		return PriorityMaintenance
-	}
-	if (state.BackupTransition != nil && state.BackupTransition.Phase != BackupTransitionImported) || state.BackupQuiescence != nil {
-		return PriorityBackup
-	}
 	if state.GlobalClose.Phase != GlobalCloseNone {
 		return PriorityGlobalClose
 	}
@@ -173,13 +156,13 @@ func effectivePriority(state State, resourceID string, now time.Time) EffectiveP
 	if resource.State == ResourceDeleting || resource.Ownership == OwnershipOrphan {
 		return PriorityDeletingOrOrphan
 	}
-	if resource.ChallengePending != nil && snapshotMatches(resource.ChallengePending.BaseMarkers, resource) && resource.EdgeOne.Expiry == nil && !edgeDeadlineExpired(resource, now) {
+	if resource.ChallengePending != nil && snapshotMatches(resource.ChallengePending.BaseMarkers, resource) {
 		return PriorityChallenge
 	}
-	if resource.Reactivating != nil && snapshotMatches(resource.Reactivating.BaseMarkers, resource) && (resource.Reactivating.TemporaryHTTP || future(resource.Reactivating.CertificateUntil, now) && future(resource.Reactivating.ACLUntil, now)) {
+	if resource.Reactivating != nil && snapshotMatches(resource.Reactivating.BaseMarkers, resource) && (resource.Reactivating.TemporaryHTTP || future(resource.Reactivating.CertificateUntil, now)) {
 		return PriorityReactivating
 	}
-	if hasBaseMarker(resource) || edgeDeadlineExpired(resource, now) || resource.ChallengePending != nil || resource.Reactivating != nil {
+	if hasBaseMarker(resource) || resource.ChallengePending != nil || resource.Reactivating != nil {
 		return PriorityBaseContraction
 	}
 	return PriorityPublished
@@ -194,12 +177,8 @@ func findResource(state State, resourceID string) *ResourceSafety {
 	return nil
 }
 
-func edgeDeadlineExpired(resource *ResourceSafety, now time.Time) bool {
-	return !resource.EdgeOne.Deadline.IsZero() && !resource.EdgeOne.Deadline.After(now)
-}
-
 func hasBaseMarker(resource *ResourceSafety) bool {
-	return resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.EdgeOne.Expiry != nil
+	return resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil
 }
 
 func snapshotMatches(snapshot []MarkerSnapshot, resource *ResourceSafety) bool {
@@ -212,9 +191,6 @@ func snapshotMatches(snapshot []MarkerSnapshot, resource *ResourceSafety) bool {
 	}
 	if resource.CertificateExpiry != nil {
 		current[MarkerCertificateExpiry] = resource.CertificateExpiry.Generation
-	}
-	if resource.EdgeOne.Expiry != nil {
-		current[MarkerEdgeOneExpiry] = resource.EdgeOne.Expiry.Generation
 	}
 	return snapshotsEqual(snapshot, current)
 }
@@ -298,43 +274,32 @@ func validAction(action Action) bool {
 type ClearRole string
 
 const (
-	RoleGlobalCloseConvergence  ClearRole = "global_close_convergence"
-	RoleJournalConvergence      ClearRole = "journal_convergence"
-	RoleOwnershipContraction    ClearRole = "ownership_contraction"
-	RoleOwnershipActivation     ClearRole = "ownership_activation"
-	RoleOwnershipRetirement     ClearRole = "ownership_retirement"
-	RoleUpgradeRecovery         ClearRole = "upgrade_recovery"
-	RoleMaintenance             ClearRole = "maintenance"
-	RoleMaintenanceBegin        ClearRole = "maintenance_begin"
-	RoleMaintenanceToDependency ClearRole = "maintenance_to_dependency"
-	RoleUpgrade                 ClearRole = "upgrade"
-	RoleBackup                  ClearRole = "backup"
-	RolePublish                 ClearRole = "publish"
-	RoleDelete                  ClearRole = "delete"
-	RoleChallenge               ClearRole = "challenge"
-	RoleCertificateHandoff      ClearRole = "certificate_handoff"
-	RoleContraction             ClearRole = "contraction"
-	RoleIngressActivation       ClearRole = "ingress_activation"
-	RoleCertificateActivation   ClearRole = "certificate_activation"
-	RoleCertificateObservation  ClearRole = "certificate_observation"
-	RoleEdgeOneRefresh          ClearRole = "edgeone_refresh"
-	RoleBootstrap               ClearRole = "bootstrap"
-	RoleResourceCreate          ClearRole = "resource_create"
+	RoleGlobalCloseConvergence ClearRole = "global_close_convergence"
+	RoleJournalConvergence     ClearRole = "journal_convergence"
+	RoleOwnershipContraction   ClearRole = "ownership_contraction"
+	RoleOwnershipActivation    ClearRole = "ownership_activation"
+	RoleOwnershipRetirement    ClearRole = "ownership_retirement"
+	RolePublish                ClearRole = "publish"
+	RoleDelete                 ClearRole = "delete"
+	RoleChallenge              ClearRole = "challenge"
+	RoleCertificateHandoff     ClearRole = "certificate_handoff"
+	RoleContraction            ClearRole = "contraction"
+	RoleIngressActivation      ClearRole = "ingress_activation"
+	RoleCertificateActivation  ClearRole = "certificate_activation"
+	RoleCertificateObservation ClearRole = "certificate_observation"
+	RoleBootstrap              ClearRole = "bootstrap"
+	RoleResourceCreate         ClearRole = "resource_create"
 )
 
 type ClearTarget string
 
 const (
-	ClearGlobalClose          ClearTarget = "global_close"
-	ClearStopFence            ClearTarget = "stop_fence"
-	ClearMaintenance          ClearTarget = "maintenance_pending"
-	ClearDependencyTransition ClearTarget = "dependency_transition_pending"
-	ClearUpgrade              ClearTarget = "upgrade_pending"
-	ClearBackup               ClearTarget = "backup"
-	ClearBaseContraction      ClearTarget = "base_contraction"
-	ClearClosing              ClearTarget = "closing"
-	ClearDeletionTombstone    ClearTarget = "deletion_tombstone"
-	ClearChallenge            ClearTarget = "challenge"
+	ClearGlobalClose       ClearTarget = "global_close"
+	ClearStopFence         ClearTarget = "stop_fence"
+	ClearBaseContraction   ClearTarget = "base_contraction"
+	ClearClosing           ClearTarget = "closing"
+	ClearDeletionTombstone ClearTarget = "deletion_tombstone"
+	ClearChallenge         ClearTarget = "challenge"
 )
 
 func AuthorizeClear(role ClearRole, target ClearTarget, fenceKind StopFenceKind) error {
@@ -343,17 +308,7 @@ func AuthorizeClear(role ClearRole, target ClearTarget, fenceKind StopFenceKind)
 	case ClearGlobalClose:
 		allowed = role == RoleGlobalCloseConvergence
 	case ClearStopFence:
-		if fenceKind == StopFenceGenerationUpgrade {
-			allowed = role == RoleUpgradeRecovery
-		} else {
-			allowed = role == RoleJournalConvergence
-		}
-	case ClearMaintenance:
-		allowed = role == RoleMaintenance
-	case ClearDependencyTransition, ClearUpgrade:
-		allowed = role == RoleUpgrade
-	case ClearBackup:
-		allowed = role == RoleBackup
+		allowed = role == RoleJournalConvergence
 	case ClearBaseContraction:
 		allowed = role == RolePublish || role == RoleDelete
 	case ClearClosing:

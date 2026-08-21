@@ -13,7 +13,7 @@ import (
 
 func TestTypedProtocolRejectsQueueingAndGenericSecrets(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationCredentialImport, Target: "credential/basic-one", IntentGeneration: 4, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationAdminTokenVerify, Target: "installation", IntentGeneration: 4, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
 	var wire bytes.Buffer
 	secret := []byte("sentinel-secret")
 	if err := WriteRequest(&wire, request, secret); err != nil {
@@ -33,13 +33,12 @@ func TestTypedProtocolRejectsQueueingAndGenericSecrets(t *testing.T) {
 	if seen != string(secret) || framedSecret.Present() {
 		t.Fatal("secret was not delivered once and destroyed")
 	}
-	if err := WriteRequest(&bytes.Buffer{}, Request{Operation: OperationNginxTest}, secret); err == nil {
+	if err := WriteRequest(&bytes.Buffer{}, Request{Operation: OperationManagementProfile}, secret); err == nil {
 		t.Fatal("generic non-secret request accepted a secret frame")
 	}
 
 	var queued bytes.Buffer
 	first := request
-	first.Operation = OperationCredentialImport
 	if err := WriteRequest(&queued, first, secret); err != nil {
 		t.Fatal(err)
 	}
@@ -77,12 +76,12 @@ func TestManagedBasicAndStaticRequestsAreClosed(t *testing.T) {
 func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	now := time.Now().UTC()
 	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","source_kind":"official_canonical_artifact","confirmation":"initialize"}`)
-	request := Request{SchemaVersion: SchemaVersion, RequestID: "headscale-initialize", Operation: OperationHeadscaleInitialize, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "deploy", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "initialize", Resource: payload}}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "headscale-initialize", Operation: OperationHeadscaleInitialize, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "headscale_initialize", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "initialize", Resource: payload}}
 	request.InputDigest, _ = ApplicationInputDigest(request)
 	if err := ValidateRequest(request, now); err != nil {
 		t.Fatal(err)
 	}
-	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("headscale"), Action: &ActionResult{JobID: "job_00000000000000000000000000000001", Operation: "deploy", TargetKind: "installation", TargetID: "hds_00000000000000000000000000000001"}}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("headscale"), Action: &ActionResult{JobID: "job_00000000000000000000000000000001", Operation: "headscale_initialize", TargetKind: "installation", TargetID: "hds_00000000000000000000000000000001"}}
 	if err := ValidateResponse(OperationHeadscaleInitialize, response); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +96,7 @@ func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	request.Resource.Operation = "publish"
 	request.InputDigest, _ = ApplicationInputDigest(request)
 	if ValidateRequest(request, now) == nil {
-		t.Fatal("non-deploy Headscale request accepted")
+		t.Fatal("non-initialize Headscale request accepted")
 	}
 	response.Action.TargetID = "res_00000000000000000000000000000001"
 	if ValidateResponse(OperationHeadscaleInitialize, response) == nil {
@@ -215,7 +214,7 @@ func TestApplicationResponseShapeIsOperationBound(t *testing.T) {
 	if err := ValidateResponse(OperationAdminTokenRotate, rotation); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateResponse(OperationNginxTest, rotation); err == nil {
+	if err := ValidateResponse(OperationManagementProfile, rotation); err == nil {
 		t.Fatal("action result entered unrelated operation")
 	}
 }
@@ -242,7 +241,7 @@ func TestTruncatedFrameClearsAllocatedPayload(t *testing.T) {
 
 func TestProtocolRequiresCanonicalBoundedTypedJSON(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationNginxTest, Target: "installation", IntentGeneration: 2, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationManagementProfile, Target: "installation", IntentGeneration: 2, Deadline: now.Add(time.Minute), InputDigest: digest("input")}
 	var wire bytes.Buffer
 	if err := WriteRequest(&wire, request, nil); err != nil {
 		t.Fatal(err)
@@ -255,7 +254,7 @@ func TestProtocolRequiresCanonicalBoundedTypedJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	payload := []byte(`{"schema_version":"lanpanel.helper.request.v1","request_id":"one","request_id":"two","operation":"nginx_test","target":"installation","intent_generation":2,"deadline":"2030-01-01T00:00:00Z","input_digest":"` + digest("input") + `"}`)
+	payload := []byte(`{"schema_version":"lanpanel.helper.request.v1","request_id":"one","request_id":"two","operation":"management_profile_status","target":"installation","intent_generation":2,"deadline":"2030-01-01T00:00:00Z","input_digest":"` + digest("input") + `"}`)
 	wire.Reset()
 	if err := writeFrame(&wire, frameRequest, payload, maxRequestBytes); err != nil {
 		t.Fatal(err)
@@ -286,20 +285,37 @@ func TestApplicationPayloadIsOperationBound(t *testing.T) {
 		t.Fatal("application payload changed without invalidating its digest")
 	}
 	request.Action.ActorGeneration--
-	request.Operation = OperationNginxTest
+	request.Operation = OperationManagementProfile
 	if err := ValidateRequest(request, now); err == nil {
 		t.Fatal("application payload entered unrelated operation")
 	}
 }
 
-func TestCallerOperationMatrixIsClosed(t *testing.T) {
-	if Authorized(CallerTimer, OperationPackageTransaction) || Authorized(CallerTimer, OperationCertificateIssue) || Authorized(CallerRecovery, OperationNginxReload) || Authorized(Caller("foreign"), OperationContractionClose) {
-		t.Fatal("caller crossed the fixed helper operation matrix")
+func TestFinalCallerOperationMatrixIsClosed(t *testing.T) {
+	expected := []Operation{
+		"application_plan", "admin_token_verify", "admin_token_source_status", "management_profile_status",
+		"admin_token_rotate", "admin_token_rotate_reconcile", "certificate_renew", "managed_basic_generate",
+		"managed_basic_delete", "static_root_register", "external_htpasswd_register", "domain_status",
+		"contraction_close", "startup_contraction", "headscale_initialize", "headscale_deploy",
+		"headscale_reissue", "headscale_read", "headscale_mutation", "preauth_key_plan", "preauth_key_create", "connector_mutation", "connector_read", "connector_login_plan", "connector_login", "product_read", "resource_delete", "resource_mutation", "process_lifecycle", "publication_activate",
 	}
-	if !Authorized(CallerTimer, OperationCertificateRenew) || !Authorized(CallerRecovery, OperationStartupContraction) || !Authorized(CallerUI, OperationPackageTransaction) {
-		t.Fatal("fixed helper operation matrix omitted an exact caller")
+	if len(policies) != len(expected) {
+		t.Fatalf("final helper operations=%d, want %d", len(policies), len(expected))
 	}
-	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationNginxTest, Target: strings.Repeat("x", 257), IntentGeneration: 1, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}
+	for _, operation := range expected {
+		if _, known := PolicyFor(operation); !known {
+			t.Fatalf("P1 helper operation %q missing", operation)
+		}
+	}
+	for _, removed := range []Operation{"package_transaction", "credential_adopt", "edgeone_refresh", "tailscale_auth_import", "tailscale_auth_adopt", "tailscale_admin", "nginx_test", "systemd_transition", "managed_file_commit"} {
+		if _, known := PolicyFor(removed); known || Authorized(CallerUI, removed) || Authorized(CallerTimer, removed) || Authorized(CallerRecovery, removed) {
+			t.Fatalf("removed helper operation %q remains reachable", removed)
+		}
+	}
+	if Authorized(CallerTimer, OperationApplicationPlan) || Authorized(Caller("foreign"), OperationContractionClose) || !Authorized(CallerTimer, OperationCertificateRenew) || !Authorized(CallerRecovery, OperationStartupContraction) {
+		t.Fatal("caller crossed the fixed final helper operation matrix")
+	}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationManagementProfile, Target: strings.Repeat("x", 257), IntentGeneration: 1, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}
 	if err := ValidateRequest(request, time.Now()); err == nil {
 		t.Fatal("unbounded helper target was accepted")
 	}
@@ -309,35 +325,21 @@ func TestCallerOperationMatrixIsClosed(t *testing.T) {
 		t.Fatal("helper request exceeded its release-fixed operation deadline")
 	}
 	request.Deadline = time.Now().Add(time.Minute)
+	request.Operation = "systemd_transition"
 	request.Target = "service/ssh.service"
-	request.Operation = OperationSystemdTransition
 	if err := ValidateRequest(request, time.Now()); err == nil {
 		t.Fatal("caller-selected systemd unit entered helper schema")
 	}
-	request.Target = "resource/../../etc/shadow"
-	request.Operation = OperationManagedFileCommit
-	if err := ValidateRequest(request, time.Now()); err == nil {
-		t.Fatal("caller-selected path entered helper schema")
+	request.Operation = OperationAdminTokenRotate
+	request.Target = "installation"
+	request.Action = &ActionPayload{Operation: "admin_token_rotate", TargetKind: "installation", ActorIdentity: "session", ActorGeneration: 1, PlanID: "plan-one", Confirmation: "rotate"}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	policy, known := PolicyFor(request.Operation)
+	if !known || !policy.SecretOutput || !Authorized(CallerUI, request.Operation) || Authorized(CallerTimer, request.Operation) || Authorized(CallerRecovery, request.Operation) {
+		t.Fatal("admin token one-time secret policy is invalid")
 	}
-	for operation, target := range map[Operation]string{
-		OperationAdminTokenRotate: "installation",
-		OperationPreauthKeyCreate: "headscale",
-	} {
-		policy, known := PolicyFor(operation)
-		if !known || !policy.SecretOutput || !Authorized(CallerUI, operation) || Authorized(CallerTimer, operation) || Authorized(CallerRecovery, operation) {
-			t.Fatalf("one-time secret operation %q has an invalid policy", operation)
-		}
-		request.Operation = operation
-		request.Target = target
-		if operation == OperationAdminTokenRotate {
-			request.Action = &ActionPayload{Operation: "admin_token_rotate", TargetKind: "installation", ActorIdentity: "session", ActorGeneration: 1, PlanID: "plan-one", Confirmation: "rotate"}
-			request.InputDigest, _ = ApplicationInputDigest(request)
-		} else {
-			request.Action = nil
-		}
-		if err := ValidateRequest(request, time.Now()); err != nil {
-			t.Fatalf("one-time secret operation %q is invalid: %v", operation, err)
-		}
+	if err := ValidateRequest(request, time.Now()); err != nil {
+		t.Fatalf("admin token rotation request is invalid: %v", err)
 	}
 }
 

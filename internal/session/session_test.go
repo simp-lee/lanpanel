@@ -36,6 +36,7 @@ func TestSessionsRequireIndependentProofCSRFAndInvalidateSockets(t *testing.T) {
 		t.Fatal("source drift did not close socket")
 	}
 }
+
 func TestSessionExpiryAndEntropyFailure(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	manager, _ := New("fp", Options{Now: func() time.Time { return now }, Random: bytes.NewReader(make([]byte, 95))})
@@ -51,6 +52,7 @@ func TestSessionExpiryAndEntropyFailure(t *testing.T) {
 		t.Fatal("expired session accepted")
 	}
 }
+
 func TestStalePrincipalCannotSurviveTokenRotation(t *testing.T) {
 	manager, _ := New("fp", Options{Random: bytes.NewReader(make([]byte, 96))})
 	defer manager.Close()

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/htpasswdref"
@@ -41,12 +42,12 @@ type DomainSourceStatus struct {
 }
 
 func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, resultErr error) {
-	result = DomainSourceStatus{ResourceID: resourceID, Status: "healthy", ObservedAt: time.Now().UTC()}
+	result = DomainSourceStatus{ResourceID: resourceID, Status: "unknown", ObservedAt: time.Now().UTC()}
 	service, err := OpenFixed()
 	if err != nil {
 		return result, err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return result, err
@@ -191,7 +192,8 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 			return degradedDomainStatus(result, "static source changed"), nil
 		}
 	}
-	result.Reason = "source identities exact"
+	result.Status = "source_verified_runtime_unknown"
+	result.Reason = "source identities exact; runtime health is not proved by source verification"
 	if result.CredentialChanged && result.GoAccessCredentialChanged {
 		result.Reason = "App and GoAccess external htpasswd fingerprints changed but remain valid"
 	} else if result.CredentialChanged {
@@ -201,6 +203,7 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 	}
 	return result, nil
 }
+
 func requireNoDegradedAppliedSource(resourceID string) error {
 	service, err := OpenFixed()
 	if err != nil {
@@ -217,6 +220,7 @@ func requireNoDegradedAppliedSource(resourceID string) error {
 	}
 	return requireAppliedDomainSourcesHealthy(resource)
 }
+
 func requireAppliedDomainSourcesHealthy(resource domain.AppResource) error {
 	if resource.PublicationRecord.State != domain.PublicationPublished || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
 		return nil
@@ -230,6 +234,7 @@ func requireAppliedDomainSourcesHealthy(resource domain.AppResource) error {
 	}
 	return nil
 }
+
 func degradedDomainStatus(value DomainSourceStatus, reason string) DomainSourceStatus {
 	value.Status = "degraded"
 	value.AccessMayRemain = true
@@ -385,23 +390,31 @@ func candidateACMEBinding(resource domain.AppResource) (acme.Binding, string, er
 		return acme.Binding{}, "", fmt.Errorf("domain certificate request missing")
 	}
 	request := publication.Certificate
+	accountContact, accountKeyFingerprint, contactErr := readManagedACMEAccountAuthority()
+	if contactErr != nil {
+		return acme.Binding{}, "", contactErr
+	}
 	var binding acme.Binding
 	var err error
 	if request.ChallengeMethod == "http-01" {
-		binding, err = acme.LoadHTTPBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted)
+		binding, err = acme.LoadHTTPBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted)
 	} else {
 		provider, parseErr := acme.ParseDNSProvider(request.DNSProvider)
 		if parseErr != nil {
 			return acme.Binding{}, "", parseErr
 		}
-		binding, err = acme.LoadDNSBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
+		binding, err = acme.LoadDNSBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
 	}
 	if err != nil {
 		return acme.Binding{}, "", err
 	}
+	if binding.AccountKeyFingerprint != accountKeyFingerprint {
+		return acme.Binding{}, "", fmt.Errorf("managed ACME account key changed after installation verification")
+	}
 	digest, err := acme.BindingDigest(binding)
 	return binding, digest, err
 }
+
 func prepareDomainCandidate(service *FixedService, resource domain.AppResource, generation uint64, certificate domain.CertificateBundleIdentity) (publication.Candidate, error) {
 	document, err := service.normal.Read()
 	if err != nil {
@@ -519,6 +532,7 @@ func prepareDomainCandidate(service *FixedService, resource domain.AppResource, 
 	}
 	return publication.PrepareDomain(resource, generation, certificate, credentialPath, credentialFingerprint, goaccessPath, goaccessFingerprint, routes, goaccessCandidate)
 }
+
 func nginxGroupGID() (uint32, error) {
 	group, err := user.LookupGroup("www-data")
 	if err != nil {
@@ -526,10 +540,11 @@ func nginxGroupGID() (uint32, error) {
 	}
 	value, err := strconv.ParseUint(group.Gid, 10, 32)
 	if err != nil || value == 0 {
-		return 0, fmt.Errorf("Nginx group identity invalid")
+		return 0, fmt.Errorf("nginx group identity invalid")
 	}
 	return uint32(value), nil
 }
+
 func protectedStaticPaths(installation domain.Installation, excluded ...string) []string {
 	paths := append([]string(nil), installation.ManagedPaths...)
 	paths = append(paths, "/var/lib/lanpanel", "/var/log/lanpanel/goaccess", "/run/lanpanel", "/run/lanpanel-goaccess", "/etc/lanpanel", "/etc/lanpanel-public", "/etc/systemd/system", "/etc/sysusers.d", "/usr/lib/lanpanel")

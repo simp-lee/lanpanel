@@ -45,6 +45,7 @@ const resourceUpdateJournalSchema = "lanpanel.resource.update.v1"
 func resourceUpdateJournalPath(resourceID string) string {
 	return fixedRoot + "/safety/resource-update/" + resourceID + ".json"
 }
+
 func writeResourceUpdateJournal(ctx context.Context, value ResourceUpdateJournal) error {
 	if value.SchemaVersion != resourceUpdateJournalSchema || value.JobID == "" || value.ResourceID == "" || value.Prior.ID != value.ResourceID || value.Candidate.ID != value.ResourceID {
 		return fmt.Errorf("resource update journal invalid")
@@ -55,6 +56,7 @@ func writeResourceUpdateJournal(ctx context.Context, value ResourceUpdateJournal
 	}
 	return writeBoundedJournal(ctx, resourceUpdateJournalPath(value.ResourceID), raw)
 }
+
 func readResourceUpdateJournal(path string) (ResourceUpdateJournal, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -75,6 +77,7 @@ func readResourceUpdateJournal(path string) (ResourceUpdateJournal, error) {
 	}
 	return value, nil
 }
+
 func writeBoundedJournal(ctx context.Context, path string, raw []byte) error {
 	if err := ensureDurableJournalDirectory(filepath.Dir(path)); err != nil {
 		return err
@@ -88,7 +91,7 @@ func writeBoundedJournal(ctx context.Context, path string, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
 	disposition := filetxn.CreateOnly
 	if _, statErr := os.Lstat(path); statErr == nil {
@@ -140,7 +143,7 @@ func removeJournal(path string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func(ignore func() error) { _ = ignore() }(directory.Close)
 	return directory.Sync()
 }
 
@@ -158,6 +161,7 @@ const maximumCreateJournalBytes = 64 << 10
 func resourceCreateJournalPath(resourceID string) string {
 	return fixedRoot + "/safety/resource-create/" + resourceID + ".json"
 }
+
 func readCreateJournal(path string) (ResourceCreateJournal, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -192,6 +196,7 @@ func writeCreateJournal(ctx context.Context, journal ResourceCreateJournal) erro
 	}
 	return writeBoundedJournal(ctx, resourceCreateJournalPath(journal.ResourceID), raw)
 }
+
 func ReconcileResourceUpdates(ctx context.Context) error {
 	if err := reconcileJournalLessResourceUpdates(ctx); err != nil {
 		return err
@@ -207,6 +212,7 @@ func ReconcileResourceUpdates(ctx context.Context) error {
 	}
 	return nil
 }
+
 func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 	service, err := OpenFixed()
 	if err != nil {
@@ -214,11 +220,11 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 	}
 	document, err := service.normal.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	intents, err := operations.PendingResourceUpdates(document)
-	service.Close()
+	_ = service.Close()
 	if err != nil {
 		return err
 	}
@@ -234,28 +240,28 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 		}
 		document, err := service.normal.Read()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		fresh, err := operations.FindResourceUpdateAuthority(document, intent.JobID, intent.SafetyBinding.ResourceID)
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		admitter, err := service.resourceAdmitter()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		if fresh.Phase == operations.PhaseReserved {
 			admission, lockErr := service.manager.Acquire(ctx, locks.MutationAdmission)
 			if lockErr != nil {
-				service.Close()
+				_ = service.Close()
 				return lockErr
 			}
 			err = admitter.RejectReservation(ctx, admission, document.Revision, fresh.JobID, "resource_update_not_started")
 			releaseErr := admission.Release()
-			service.Close()
+			_ = service.Close()
 			if err != nil || releaseErr != nil {
 				return errors.Join(err, releaseErr)
 			}
@@ -263,13 +269,13 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 		}
 		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+fresh.SafetyBinding.ResourceID, service.manager)
 		if err != nil {
-			mutationSet.Close()
-			service.Close()
+			_ = mutationSet.Close()
+			_ = service.Close()
 			return err
 		}
 		document, err = service.normal.Read()
@@ -307,7 +313,11 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 			if branch == "complete" {
 				identity = fresh.SafetyBinding.CandidateDigest
 			}
-			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, fresh.JobID, branch, nil, []jobs.Postcondition{{Kind: condition, Status: status, Identity: identity}}, "")
+			errorCode := ""
+			if branch == "no_effect" {
+				errorCode = "resource_update_not_started"
+			}
+			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, fresh.JobID, branch, nil, []jobs.Postcondition{{Kind: condition, Status: status, Identity: identity}}, errorCode)
 		}
 		err = errors.Join(err, operations.ReleaseExposure(mutation, exposure), mutationSet.Close(), service.Close())
 		if err != nil {
@@ -316,6 +326,7 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 	}
 	return nil
 }
+
 func reconcileResourceUpdate(ctx context.Context, path string) (result error) {
 	journal, err := readResourceUpdateJournal(path)
 	if err != nil {
@@ -327,13 +338,13 @@ func reconcileResourceUpdate(ctx context.Context, path string) (result error) {
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+journal.ResourceID, service.manager)
 	if err != nil {
-		mutationSet.Close()
-		service.Close()
+		_ = mutationSet.Close()
+		_ = service.Close()
 		return err
 	}
 	remove := false
@@ -408,6 +419,7 @@ func reconcileResourceUpdate(ctx context.Context, path string) (result error) {
 	remove = true
 	return nil
 }
+
 func exactSuccessfulResourceUpdate(job jobs.Record, current *domain.AppResource, journal ResourceUpdateJournal) bool {
 	if job.Status != jobs.StatusTerminal || job.Result != jobs.ResultSucceeded || current == nil || len(job.Postconditions) != 1 || job.Postconditions[0] != (jobs.Postcondition{Kind: "resource_config_saved", Status: jobs.PostconditionVerified, Identity: journal.Candidate.CurrentConfigDigest}) {
 		return false
@@ -442,15 +454,15 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 	}
 	document, err := service.normal.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	intents, err := operations.PendingResourceCreates(document)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
-	service.Close()
+	_ = service.Close()
 	for _, intent := range intents {
 		if _, err := os.Lstat(resourceCreateJournalPath(intent.SafetyBinding.ResourceID)); err == nil {
 			continue
@@ -463,7 +475,7 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 		}
 		document, err := service.normal.Read()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		var fresh operations.Reservation
@@ -473,7 +485,7 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 		if intent.Phase == operations.PhaseReserved {
 			admission, lockErr := service.manager.Acquire(ctx, locks.MutationAdmission)
 			if lockErr != nil {
-				service.Close()
+				_ = service.Close()
 				return lockErr
 			}
 			admitter, admitErr := service.resourceAdmitter()
@@ -481,14 +493,14 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 				admitErr = admitter.RejectReservation(ctx, admission, document.Revision, intent.JobID, "resource_create_not_started")
 			}
 			releaseErr := admission.Release()
-			service.Close()
+			_ = service.Close()
 			if admitErr != nil || releaseErr != nil {
 				return errors.Join(admitErr, releaseErr)
 			}
 			continue
 		}
 		if err != nil || fresh.Phase != operations.PhaseLocalIntent {
-			service.Close()
+			_ = service.Close()
 			if err != nil {
 				return err
 			}
@@ -496,37 +508,37 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 		}
 		installation, err := installationFromDocument(document)
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		state, err := service.safety.Read()
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		_, ownedErr := service.ownership.Read(intent.SafetyBinding.ResourceID)
 		if findNormalResource(installation, intent.SafetyBinding.ResourceID) != nil || findSafetyResource(state, intent.SafetyBinding.ResourceID) != nil || ownedErr == nil {
-			service.Close()
+			_ = service.Close()
 			return fmt.Errorf("journal-less resource create %s has residual authority", intent.SafetyBinding.ResourceID)
 		}
 		if !errors.Is(ownedErr, os.ErrNotExist) {
-			service.Close()
+			_ = service.Close()
 			return ownedErr
 		}
 		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 		if err != nil {
-			service.Close()
+			_ = service.Close()
 			return err
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "installation", service.manager)
 		if err != nil {
-			mutationSet.Close()
-			service.Close()
+			_ = mutationSet.Close()
+			_ = service.Close()
 			return err
 		}
 		admitter, err := service.resourceAdmitter()
 		if err == nil {
-			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, intent.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_create_not_committed", Status: jobs.PostconditionVerified, Identity: intent.SafetyBinding.ResourceID}}, "")
+			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, intent.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_create_not_committed", Status: jobs.PostconditionVerified, Identity: intent.SafetyBinding.ResourceID}}, "resource_create_not_started")
 		}
 		err = errors.Join(err, operations.ReleaseExposure(mutation, exposure), mutationSet.Close(), service.Close())
 		if err != nil {
@@ -611,7 +623,7 @@ func reconcileResourceCreate(ctx context.Context, path string) (result error) {
 		if err != nil {
 			return err
 		}
-		if _, err := admitter.Complete(ctx, mutation, exposure, document.Revision, journal.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_create_not_committed", Status: jobs.PostconditionVerified, Identity: journal.ResourceID}}, ""); err != nil {
+		if _, err := admitter.Complete(ctx, mutation, exposure, document.Revision, journal.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_create_not_committed", Status: jobs.PostconditionVerified, Identity: journal.ResourceID}}, "resource_create_not_started"); err != nil {
 			return fmt.Errorf("resource create exact no-effect recovery failed: %w", err)
 		}
 		removeJournal = true
@@ -651,7 +663,6 @@ func reconcileResourceCreate(ctx context.Context, path string) (result error) {
 			return err
 		}
 		state = next
-		safetyResource = findSafetyResource(state, journal.ResourceID)
 	} else if !reflect.DeepEqual(*safetyResource, initialResourceSafety(journal.ResourceID, owned.Checksum)) {
 		return fmt.Errorf("resource create safety authority differs from journal")
 	}
@@ -777,7 +788,7 @@ func removeCreateJournal(path string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func(ignore func() error) { _ = ignore() }(directory.Close)
 	return directory.Sync()
 }
 
@@ -798,7 +809,7 @@ func (s *FixedService) resourceAdmitter() (*operations.Admitter, error) {
 	if err != nil {
 		return nil, err
 	}
-	registry, err := operations.NewRegistry([]operations.Registration{{Operation: operations.HeadscaleInitialize, Owner: "application.headscale", Results: table}, {Operation: operations.ResourceCreate, Owner: "application.resource", Results: table}, {Operation: operations.ResourceUpdate, Owner: "application.resource", Results: table}, {Operation: operations.ProcessStart, Owner: "application.process", Results: table}, {Operation: operations.ProcessStop, Owner: "application.process", Results: table}})
+	registry, err := operations.NewRegistry([]operations.Registration{{Operation: operations.HeadscaleInitialize, Owner: "application.headscale", Results: table}, {Operation: operations.HeadscaleUserCreate, Owner: "application.headscale-user", Results: table}, {Operation: operations.PreauthKeyCreate, Owner: "application.headscale-key-create", Results: table}, {Operation: operations.PreauthKeyRevoke, Owner: "application.headscale-key-revoke", Results: table}, {Operation: operations.DeviceExpire, Owner: "application.headscale-device", Results: table}, {Operation: operations.ConnectorBindingSet, Owner: "application.connector-binding", Results: table}, {Operation: operations.ConnectorLogin, Owner: "application.connector-login", Results: table}, {Operation: operations.ResourceCreate, Owner: "application.resource", Results: table}, {Operation: operations.ResourceUpdate, Owner: "application.resource", Results: table}, {Operation: operations.ResourceDelete, Owner: "application.resource-delete", Results: table}, {Operation: operations.ProcessStart, Owner: "application.process", Results: table}, {Operation: operations.ProcessStop, Owner: "application.process", Results: table}})
 	if err != nil {
 		return nil, err
 	}
@@ -864,27 +875,28 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "installation", service.Manager())
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.Normal().Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(fmt.Errorf("resource creation authority changed"))
 	}
 	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate}, nil
 }
 
 func publicationOnlyResourceUpdate(prior, candidate domain.AppResource) bool {
-	return prior.ID == candidate.ID && prior.Name == candidate.Name && prior.Lifecycle == candidate.Lifecycle && reflect.DeepEqual(prior.Target, candidate.Target) && reflect.DeepEqual(prior.ManagedPaths, candidate.ManagedPaths) && reflect.DeepEqual(nonPublicationCredentials(prior), nonPublicationCredentials(candidate)) && prior.ManagedProcess != nil && candidate.ManagedProcess != nil && reflect.DeepEqual(prior.ManagedProcess, candidate.ManagedProcess)
+	return prior.ID == candidate.ID && prior.Name == candidate.Name && prior.Lifecycle == candidate.Lifecycle && reflect.DeepEqual(prior.Target, candidate.Target) && reflect.DeepEqual(prior.ManagedPaths, candidate.ManagedPaths) && reflect.DeepEqual(nonPublicationCredentials(prior), nonPublicationCredentials(candidate)) && reflect.DeepEqual(prior.ManagedProcess, candidate.ManagedProcess)
 }
+
 func nonPublicationCredentials(resource domain.AppResource) []string {
 	values := append([]string(nil), resource.CredentialIDs...)
 	if publication := resource.Publication.DomainHTTPS; publication != nil {
@@ -941,7 +953,7 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return fail(err)
 	}
-	if prior.ManagedProcess.Applied != nil {
+	if prior.ManagedProcess != nil && prior.ManagedProcess.Applied != nil {
 		relay := candidate.Target.LocalHTTP != nil && candidate.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix
 		accounts, accountErr := identity.ResourceAccounts(installation.InstallationID, candidate.ID, relay)
 		if accountErr != nil {
@@ -992,19 +1004,19 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+candidate.ID, service.Manager())
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.Normal().Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(fmt.Errorf("resource update authority changed"))
 	}
 	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
-		operations.ReleaseExposure(mutation, exposure)
-		mutationSet.Close()
+		_ = operations.ReleaseExposure(mutation, exposure)
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	priorCopy := *prior
@@ -1024,7 +1036,7 @@ func (execution *ResourceExecution) CommitUpdate(ctx context.Context) (jobs.Reco
 	}
 	journal := ResourceUpdateJournal{SchemaVersion: resourceUpdateJournalSchema, JobID: execution.JobID, ResourceID: execution.Resource.ID, Prior: *execution.Prior, Candidate: execution.Resource}
 	if err := writeResourceUpdateJournal(ctx, journal); err != nil {
-		_, terminalErr := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_update_not_committed", Status: jobs.PostconditionVerified, Identity: execution.Resource.ID}}, "")
+		_, terminalErr := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_update_not_committed", Status: jobs.PostconditionVerified, Identity: execution.Resource.ID}}, "resource_update_not_started")
 		closeErr := execution.Close()
 		return jobs.Record{}, errors.Join(err, terminalErr, closeErr)
 	}
@@ -1093,6 +1105,7 @@ func (execution *ResourceExecution) CommitCreate(ctx context.Context) (jobs.Reco
 	}
 	return job, errors.Join(err, closeErr)
 }
+
 func (execution *ResourceExecution) Close() error {
 	if execution == nil {
 		return nil

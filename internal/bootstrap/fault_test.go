@@ -20,6 +20,7 @@ func TestJournalRecoveryUsesLastIntactSlot(t *testing.T) {
 	}
 	journal.Sequence = 2
 	journal.Phase = PhaseBundleCommitted
+	journal.PackageJournalDigest = strings.Repeat("c", 64)
 	journal.ArtifactDigests["bundle"] = strings.Repeat("a", 64)
 	if err := store.update(journal); err != nil {
 		t.Fatal(err)
@@ -36,7 +37,7 @@ func TestJournalRecoveryUsesLastIntactSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer opened.close()
+	defer func(ignore func() error) { _ = ignore() }(opened.close)
 	if loaded.Sequence != 1 {
 		t.Fatalf("loaded sequence=%d", loaded.Sequence)
 	}

@@ -22,7 +22,7 @@ func (host Host) ActivateChallenge(ctx context.Context, candidate challenge.Prep
 	}
 	prior, err := host.observer(priorManifest).Observe(ctx)
 	if err != nil || prior.Master == nil {
-		return Result{}, fmt.Errorf("Nginx unavailable for challenge activation")
+		return Result{}, fmt.Errorf("nginx unavailable for challenge activation")
 	}
 	snapshot, err := nginx.SnapshotActivation(host.Paths, host.Owner, *candidate.Entry)
 	if err != nil {
@@ -67,6 +67,7 @@ func (host Host) ActivateChallenge(ctx context.Context, candidate challenge.Prep
 	}
 	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: candidate.Entry.Digest}, nil
 }
+
 func (host Host) RemoveChallenge(ctx context.Context, candidate challenge.Prepared) (Result, error) {
 	if candidate.Entry == nil {
 		return Result{}, nil

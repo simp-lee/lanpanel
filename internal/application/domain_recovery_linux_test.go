@@ -32,12 +32,14 @@ func TestInterruptedDomainActivationContractionWinsWithFreshGeneration(t *testin
 		t.Fatalf("unexpected contraction marker: %#v", next)
 	}
 }
+
 func TestInterruptedDomainActivationRejectsStaleAuthority(t *testing.T) {
 	item := safety.ResourceSafety{GenerationSequence: 7, Reactivating: &safety.Reactivating{PlanID: "plan_old", Generation: 7}}
 	if _, _, _, err := interruptDomainSafety(item, domain.ActivationIntent{PlanID: "plan_new", Generation: 7}); err == nil {
 		t.Fatal("stale reactivating authority accepted")
 	}
 }
+
 func TestInterruptedDomainClosingResumesWithoutGenerationReuse(t *testing.T) {
 	item := safety.ResourceSafety{GenerationSequence: 8, Closing: &safety.GenerationMarker{Kind: safety.MarkerClosing, Generation: 8, Reason: "interrupted_domain_activation"}}
 	next, generation, changed, err := interruptDomainSafety(item, domain.ActivationIntent{})
@@ -48,6 +50,7 @@ func TestInterruptedDomainClosingResumesWithoutGenerationReuse(t *testing.T) {
 		t.Fatalf("closing was not resumed: %#v", next)
 	}
 }
+
 func TestStickyUnpublishedDomainRecoveryDoesNotReopen(t *testing.T) {
 	item := safety.ResourceSafety{GenerationSequence: 8, StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 8, Reason: "interrupted_domain_activation"}}
 	if _, _, _, err := interruptDomainSafety(item, domain.ActivationIntent{}); err == nil {

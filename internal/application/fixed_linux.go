@@ -44,7 +44,7 @@ type confirmation struct{}
 
 func actorAuthority(actor Actor) (string, error) {
 	if actor.Kind != ActorUI || actor.Identity == "" || actor.Generation == 0 {
-		return "", fmt.Errorf("Plan actor invalid")
+		return "", fmt.Errorf("plan actor invalid")
 	}
 	return fmt.Sprintf("ui/%s/generation/%d", actor.Identity, actor.Generation), nil
 }
@@ -55,12 +55,13 @@ func (confirmation) VerifyConfirmation(plan plans.Plan, actor, proof string, _ t
 	}
 	return plan.NonceDigest, nil
 }
+
 func operationRegistry() (*operations.Registry, error) {
 	table, err := operations.NewBranchTable([]operations.ResultBranch{{Name: "complete", Result: jobs.ResultSucceeded, Postcondition: jobs.PostconditionVerified}, {Name: "no_effect", Result: jobs.ResultFailed, Postcondition: jobs.PostconditionVerified}, {Name: "known_residual", Result: jobs.ResultPartial, Postcondition: jobs.PostconditionKnown}, {Name: "executor_died", Result: jobs.ResultInterrupted, Postcondition: jobs.PostconditionKnown}, {Name: "source_unknown", Result: jobs.ResultUnknown, Postcondition: jobs.PostconditionUnobserved}})
 	if err != nil {
 		return nil, err
 	}
-	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.HeadscaleDeploy, Owner: "application.headscale-control", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}, {Operation: operations.GoAccessRetirement, Owner: "application.goaccess", Results: table}})
+	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.HeadscaleDeploy, Owner: "application.headscale-control", Results: table}, {Operation: operations.PreauthKeyCreate, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.PreauthKeyRevoke, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.DeviceExpire, Owner: "application.headscale-device", Results: table}, {Operation: operations.ConnectorLogin, Owner: "application.connector-login", Results: table}, {Operation: operations.ResourceDelete, Owner: "application.resource-delete", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.CertificateExpiry, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}, {Operation: operations.GoAccessRetirement, Owner: "application.goaccess", Results: table}})
 }
 
 type FixedService struct {
@@ -80,43 +81,44 @@ func OpenFixed() (*FixedService, error) {
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*FixedService, error) { manager.Close(); return nil, err }
+	fail := func(err error) (*FixedService, error) { _ = manager.Close(); return nil, err }
 	normal, err := persist.Open(persist.Config{RootPath: fixedRoot + "/state", StagingPath: fixedRoot + "/state/.filetxn", StatePath: fixedRoot + "/state/normal.json", Owner: owner, LockAuthority: manager.Authority()})
 	if err != nil {
 		return fail(err)
 	}
 	if err := operations.Register(normal); err != nil {
-		normal.Close()
+		_ = normal.Close()
 		return fail(err)
 	}
 	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
-		normal.Close()
+		_ = normal.Close()
 		return fail(err)
 	}
 	emergency, err := safety.OpenEmergency(fixedRoot+"/safety/emergency", owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
 	if err != nil {
-		ownershipStore.Close()
-		normal.Close()
+		_ = ownershipStore.Close()
+		_ = normal.Close()
 		return fail(err)
 	}
 	safetyStore, err := safety.OpenStore(safety.StoreConfig{RootPath: fixedRoot + "/safety", StagingPath: fixedRoot + "/safety/.filetxn", StatePath: fixedRoot + "/safety/state.json", Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: ownershipStore})
 	if err != nil {
-		emergency.Close()
-		ownershipStore.Close()
-		normal.Close()
+		_ = emergency.Close()
+		_ = ownershipStore.Close()
+		_ = normal.Close()
 		return fail(err)
 	}
 	planStore, err := plans.NewStore(normal, plans.Options{})
 	if err != nil {
-		safetyStore.Close()
-		emergency.Close()
-		ownershipStore.Close()
-		normal.Close()
+		_ = safetyStore.Close()
+		_ = emergency.Close()
+		_ = ownershipStore.Close()
+		_ = normal.Close()
 		return fail(err)
 	}
 	return &FixedService{normal: normal, manager: manager, safety: safetyStore, emergency: emergency, ownership: ownershipStore, plans: planStore}, nil
 }
+
 func (s *FixedService) Close() error {
 	if s == nil {
 		return nil
@@ -135,6 +137,7 @@ func (s *FixedService) Admitter(plan plans.Plan) (*operations.Admitter, error) {
 	binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 	return operations.NewAdmitter(s.normal, s.safety, operations.Options{Bindings: planBinding{binding}, Confirmation: confirmation{}, Registry: registry})
 }
+
 func (s *FixedService) TimerAdmitter() (*operations.Admitter, error) {
 	registry, err := operationRegistry()
 	if err != nil {
@@ -181,6 +184,7 @@ func (s *FixedService) RestorePublicationSafety(ctx context.Context, lease *lock
 	_, err = s.safety.Commit(ctx, lease, safety.RoleContraction, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func (s *FixedService) WriteIngressActivationFence(ctx context.Context, lease *locks.Lease, resourceID, intentRef string, candidate, prior uint64, observed safety.StopObservation, accessMayRemain bool) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil {
@@ -217,10 +221,11 @@ func (s *FixedService) WriteIngressActivationFence(ctx context.Context, lease *l
 	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func (s *FixedService) BindHeadscaleIngressActivation(ctx context.Context, lease *locks.Lease, planID, activationDigest, entryDigest string) error {
 	state, err := s.safety.ReadForRecovery(lease)
-	if err != nil || state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported || state.Headscale.Reactivating == nil || state.Headscale.Reactivating.PlanID != planID || state.Headscale.Reactivating.ActivationDigest != "" || state.Headscale.Reactivating.ControlEntryDigest != "" {
-		return fmt.Errorf("Headscale ingress activation safety authority changed: %w", err)
+	if err != nil || state.StopFence != nil || state.Headscale.Reactivating == nil || state.Headscale.Reactivating.PlanID != planID || state.Headscale.Reactivating.ActivationDigest != "" || state.Headscale.Reactivating.ControlEntryDigest != "" {
+		return fmt.Errorf("headscale ingress activation safety authority changed: %w", err)
 	}
 	next := state
 	next.Revision++
@@ -235,7 +240,7 @@ func (s *FixedService) BindHeadscaleIngressActivation(ctx context.Context, lease
 func (s *FixedService) WriteHeadscaleIngressActivationFence(ctx context.Context, lease *locks.Lease, intentRef, graphDigest string, candidate, prior uint64, observed safety.StopObservation, accessMayRemain bool) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil || state.Headscale.Reactivating == nil || state.Headscale.Reactivating.PlanID != intentRef || state.Headscale.Reactivating.Generation != candidate || state.Headscale.Reactivating.PriorGeneration != prior {
-		return fmt.Errorf("Headscale ingress fence authority changed: %w", err)
+		return fmt.Errorf("headscale ingress fence authority changed: %w", err)
 	}
 	inventoryDigest := shaDigest([]byte(fmt.Sprintf("%s/%t/%t/%t/%t/%s", graphDigest, observed.MasterStopped, observed.WorkersStopped, observed.ListenersStopped, accessMayRemain, observed.ObservedAt.UTC().Format(time.RFC3339Nano))))
 	fence := &safety.StopFence{Kind: safety.StopFenceIngressActivation, OriginOperation: "headscale_deploy", Scope: safety.FenceScope{Kind: "headscale"}, FenceGeneration: state.StopFenceSequence + 1, CreatedAt: time.Now().UTC(), SafetyGenerations: applicableHeadscaleMarkers(state), OwnedGraphDigest: graphDigest, InventoryDigest: inventoryDigest, Observation: observed, AccessMayRemain: accessMayRemain, IngressActivation: &safety.IngressActivationFence{IntentRef: intentRef, CandidateGeneration: candidate, PriorGeneration: prior}}
@@ -251,24 +256,142 @@ func (s *FixedService) WriteHeadscaleIngressActivationFence(ctx context.Context,
 	_, err = s.safety.Commit(ctx, lease, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
+func (s *FixedService) MarkHeadscaleCertificateActivationUncertain(ctx context.Context, lease *locks.Lease, binding string, deadline time.Time) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil {
+		return err
+	}
+	if state.Headscale.ActiveCertificate == nil || state.Headscale.ActiveCertificate.Binding != binding {
+		return fmt.Errorf("headscale uncertain certificate binding changed")
+	}
+	next := state
+	next.Revision++
+	next.Headscale.GenerationSequence++
+	next.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: next.Headscale.GenerationSequence, Deadline: deadline, Binding: binding}
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+
+func (s *FixedService) WriteHeadscaleCertificateActivationFence(ctx context.Context, lease *locks.Lease, journalRef, priorPointer, candidatePointer string, observed safety.StopObservation, accessMayRemain bool) error {
+	state, err := s.safety.ReadForRecovery(lease)
+	if err != nil || state.Headscale.CertificateExpiry == nil {
+		return fmt.Errorf("headscale certificate activation fence authority missing: %w", err)
+	}
+	graphDigest := shaDigest([]byte(journalRef + "/" + priorPointer + "/" + candidatePointer))
+	fence := &safety.StopFence{Kind: safety.StopFenceCertificateActivation, OriginOperation: "certificate_renew", Scope: safety.FenceScope{Kind: "headscale"}, FenceGeneration: state.StopFenceSequence + 1, CreatedAt: time.Now().UTC(), SafetyGenerations: applicableHeadscaleMarkers(state), OwnedGraphDigest: graphDigest, InventoryDigest: graphDigest, Observation: observed, AccessMayRemain: accessMayRemain, CertificateActivation: &safety.CertificateActivationFence{JournalRef: journalRef, ResourceGeneration: state.Headscale.GenerationSequence, PriorPointer: priorPointer, CandidatePointer: candidatePointer, ExpiryGeneration: state.Headscale.CertificateExpiry.Generation}}
+	authority, err := safety.ReserveEmergencyStopFenceGeneration(lease, s.emergency, safety.RoleCertificateActivation, safety.StopFenceCertificateActivation, safety.StopFenceDigest(*fence), state.StopFenceSequence)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = authority.Sequence
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.StopFence = fence
+	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+
+func (s *FixedService) WriteHeadscaleCertificateContractionFence(ctx context.Context, lease *locks.Lease, graphDigest string, observed safety.StopObservation, accessMayRemain bool) error {
+	return commitHeadscaleCertificateContractionFence(ctx, lease, s.emergency, s.safety, graphDigest, observed, accessMayRemain)
+}
+
+func (s *FixedService) UpdateHeadscaleCertificateContractionFence(ctx context.Context, lease *locks.Lease, observation safety.StopObservation, accessMayRemain bool) error {
+	return updateHeadscaleCertificateContractionFence(ctx, lease, s.emergency, s.safety, observation, accessMayRemain)
+}
+
+// commitHeadscaleCertificateContractionFence writes the fixed-format emergency
+// authority before projecting the same exact fence into normal safety state.
+// A one-sided emergency commit is projected on retry; it is never replaced by
+// a newly inferred fence.
+func commitHeadscaleCertificateContractionFence(ctx context.Context, lease *locks.Lease, emergency *safety.EmergencyStore, store *safety.Store, graphDigest string, observed safety.StopObservation, accessMayRemain bool) error {
+	state, err := store.ReadForRecovery(lease)
+	if err != nil || state.Headscale.CertificateExpiry == nil || state.StopFence != nil || observed.ObservedAt.IsZero() {
+		return errors.Join(err, fmt.Errorf("headscale certificate contraction fence authority missing"))
+	}
+	marker := safety.MarkerGeneration{Kind: "certificate_expiry", Generation: state.Headscale.CertificateExpiry.Generation}
+	authority, err := emergency.Authority()
+	if err != nil {
+		return err
+	}
+	var emergencyFence safety.EmergencyStopFence
+	if authority.StopFence == nil {
+		if authority.StopFenceSequence != state.StopFenceSequence {
+			return fmt.Errorf("headscale certificate contraction fence high-water changed")
+		}
+		inventoryDigest, inventoryErr := store.OwnershipInventoryDigest()
+		if inventoryErr != nil {
+			return inventoryErr
+		}
+		emergencyFence = safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: "certificate_expiry", ScopeKind: "headscale", Generation: authority.StopFenceSequence + 1, CertificateGeneration: marker.Generation, SafetyIntentGeneration: marker.Generation, SafetyIntentID: "headscale_certificate_expiry", OwnershipDigest: graphDigest, OwnedGraphDigest: graphDigest, InventoryDigest: inventoryDigest, MasterStopped: observed.MasterStopped, WorkersStopped: observed.WorkersStopped, ListenersStopped: observed.ListenersStopped, ObservedUnix: observed.ObservedAt.Unix(), AccessMayRemain: accessMayRemain}
+		nextAuthority := authority
+		nextAuthority.Sequence++
+		nextAuthority.StopFenceSequence++
+		nextAuthority.ReservedStopFenceKind = safety.StopFenceContraction
+		nextAuthority.ReservedStopFenceDigest = ""
+		nextAuthority.StopFence = &emergencyFence
+		if err := emergency.Commit(lease, safety.RoleContraction, authority.Sequence, nextAuthority); err != nil {
+			return err
+		}
+		authority = nextAuthority
+	} else {
+		emergencyFence = *authority.StopFence
+		if emergencyFence.Kind != safety.StopFenceContraction || emergencyFence.OriginOperation != "certificate_expiry" || emergencyFence.ScopeKind != "headscale" || emergencyFence.CertificateGeneration != marker.Generation || emergencyFence.SafetyIntentGeneration != marker.Generation || emergencyFence.SafetyIntentID != "headscale_certificate_expiry" || emergencyFence.OwnershipDigest != graphDigest || emergencyFence.OwnedGraphDigest != graphDigest || authority.StopFenceSequence != state.StopFenceSequence+1 {
+			return fmt.Errorf("one-sided Headscale certificate contraction fence identity changed")
+		}
+	}
+	createdAt := time.Unix(emergencyFence.ObservedUnix, 0).UTC()
+	fence := &safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: safety.FenceScope{Kind: "headscale"}, FenceGeneration: emergencyFence.Generation, CreatedAt: createdAt, SafetyGenerations: applicableHeadscaleMarkers(state), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: createdAt}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: []safety.MarkerGeneration{marker}, OwnershipDigest: emergencyFence.OwnershipDigest, SafetyIntentID: emergencyFence.SafetyIntentID, SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration}}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = authority.Sequence
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.StopFence = fence
+	if _, err := store.Commit(ctx, lease, safety.RoleContraction, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return fmt.Errorf("emergency Headscale certificate contraction fence committed but normal projection failed: %w", err)
+	}
+	return nil
+}
+
+func updateHeadscaleCertificateContractionFence(ctx context.Context, lease *locks.Lease, emergency *safety.EmergencyStore, store *safety.Store, observation safety.StopObservation, accessMayRemain bool) error {
+	state, err := store.ReadForRecovery(lease)
+	if err != nil || observation.ObservedAt.IsZero() || state.StopFence == nil || state.StopFence.Kind != safety.StopFenceContraction || state.StopFence.OriginOperation != "certificate_expiry" || state.StopFence.Scope.Kind != "headscale" {
+		return errors.Join(err, fmt.Errorf("headscale certificate contraction fence missing"))
+	}
+	authority, err := emergency.Authority()
+	if err != nil || authority.StopFence == nil || !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
+		return errors.Join(err, fmt.Errorf("headscale emergency certificate contraction fence missing or mismatched"))
+	}
+	emergencyFence := *authority.StopFence
+	emergencyFence.MasterStopped = observation.MasterStopped
+	emergencyFence.WorkersStopped = observation.WorkersStopped
+	emergencyFence.ListenersStopped = observation.ListenersStopped
+	emergencyFence.ObservedUnix = observation.ObservedAt.Unix()
+	emergencyFence.AccessMayRemain = accessMayRemain
+	nextAuthority := authority
+	nextAuthority.Sequence++
+	nextAuthority.StopFence = &emergencyFence
+	if err := emergency.Commit(lease, safety.RoleContraction, authority.Sequence, nextAuthority); err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = nextAuthority.Sequence
+	copy := *state.StopFence
+	copy.Observation = safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}
+	copy.AccessMayRemain = emergencyFence.AccessMayRemain
+	next.StopFence = &copy
+	if _, err := store.Commit(ctx, lease, safety.RoleContraction, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return fmt.Errorf("emergency Headscale stop observation committed but normal projection failed: %w", err)
+	}
+	return nil
+}
+
 func applicableHeadscaleMarkers(state safety.State) []safety.MarkerGeneration {
 	result := []safety.MarkerGeneration{}
 	if state.GlobalClose.Phase != safety.GlobalCloseNone {
 		result = append(result, safety.MarkerGeneration{Kind: "global_close", Generation: state.GlobalClose.Generation})
-	}
-	for _, value := range []struct {
-		kind   string
-		marker *safety.TransitionMarker
-	}{{"maintenance_pending", state.MaintenancePending}, {"dependency_transition_pending", state.DependencyTransitionPending}, {"upgrade_pending", state.UpgradePending}} {
-		if value.marker != nil {
-			result = append(result, safety.MarkerGeneration{Kind: value.kind, Generation: value.marker.Generation})
-		}
-	}
-	if state.BackupQuiescence != nil {
-		result = append(result, safety.MarkerGeneration{Kind: "backup_quiescence", Generation: state.BackupQuiescence.Generation})
-	}
-	if state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported {
-		result = append(result, safety.MarkerGeneration{Kind: "backup_transition", Generation: state.BackupTransition.Generation})
 	}
 	if state.Headscale.CertificateExpiry != nil {
 		result = append(result, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: state.Headscale.CertificateExpiry.Generation})
@@ -291,6 +414,7 @@ func activeCertificateAuthority(certificate domain.CertificateBundleIdentity) (*
 	}
 	return &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, NotAfter: notAfter, LastTrustedWall: lastWall}, nil
 }
+
 func (s *FixedService) CommitRenewedCertificateAuthority(ctx context.Context, lease *locks.Lease, resourceID string, certificate domain.CertificateBundleIdentity) error {
 	authority, err := activeCertificateAuthority(certificate)
 	if err != nil {
@@ -320,6 +444,7 @@ func (s *FixedService) CommitRenewedCertificateAuthority(ctx context.Context, le
 	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func (s *FixedService) MarkCertificateActivationUncertain(ctx context.Context, lease *locks.Lease, resourceID, binding string, now time.Time) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil {
@@ -343,6 +468,7 @@ func (s *FixedService) MarkCertificateActivationUncertain(ctx context.Context, l
 	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func (s *FixedService) WriteCertificateActivationFence(ctx context.Context, lease *locks.Lease, resourceID, journalRef, priorPointer, candidatePointer string, observed safety.StopObservation, accessMayRemain bool) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil {
@@ -386,6 +512,7 @@ func (s *FixedService) WriteCertificateActivationFence(ctx context.Context, leas
 	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func (s *FixedService) UpdateCertificateActivationFence(ctx context.Context, lease *locks.Lease, observation safety.StopObservation, accessMayRemain bool) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil {
@@ -403,31 +530,18 @@ func (s *FixedService) UpdateCertificateActivationFence(ctx context.Context, lea
 	_, err = s.safety.Commit(ctx, lease, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	return err
 }
+
 func applicablePublicationMarkers(state safety.State, resourceID string) []safety.MarkerGeneration {
 	result := []safety.MarkerGeneration{}
 	if state.GlobalClose.Phase != safety.GlobalCloseNone {
 		result = append(result, safety.MarkerGeneration{Kind: "global_close", Generation: state.GlobalClose.Generation})
-	}
-	for _, value := range []struct {
-		kind   string
-		marker *safety.TransitionMarker
-	}{{"maintenance_pending", state.MaintenancePending}, {"dependency_transition_pending", state.DependencyTransitionPending}, {"upgrade_pending", state.UpgradePending}} {
-		if value.marker != nil {
-			result = append(result, safety.MarkerGeneration{Kind: value.kind, Generation: value.marker.Generation})
-		}
-	}
-	if state.BackupQuiescence != nil {
-		result = append(result, safety.MarkerGeneration{Kind: "backup_quiescence", Generation: state.BackupQuiescence.Generation})
-	}
-	if state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported {
-		result = append(result, safety.MarkerGeneration{Kind: "backup_transition", Generation: state.BackupTransition.Generation})
 	}
 	for _, resource := range state.Resources {
 		if resource.ResourceID == resourceID {
 			for _, value := range []struct {
 				kind       string
 				generation uint64
-			}{{"sticky_unpublished", generation(resource.StickyUnpublished)}, {"closing", generation(resource.Closing)}, {"contraction", generation(resource.Contraction)}, {"certificate_expiry", deadlineGeneration(resource.CertificateExpiry)}, {"edgeone_expiry", deadlineGeneration(resource.EdgeOne.Expiry)}, {"challenge_pending", challengeGeneration(resource.ChallengePending)}, {"reactivating", reactivationGeneration(resource.Reactivating)}} {
+			}{{"sticky_unpublished", generation(resource.StickyUnpublished)}, {"closing", generation(resource.Closing)}, {"contraction", generation(resource.Contraction)}, {"certificate_expiry", deadlineGeneration(resource.CertificateExpiry)}, {"challenge_pending", challengeGeneration(resource.ChallengePending)}, {"reactivating", reactivationGeneration(resource.Reactivating)}} {
 				if value.generation != 0 {
 					result = append(result, safety.MarkerGeneration{Kind: value.kind, Generation: value.generation})
 				}
@@ -437,25 +551,30 @@ func applicablePublicationMarkers(state safety.State, resourceID string) []safet
 	sort.Slice(result, func(i, j int) bool { return result[i].Kind < result[j].Kind })
 	return result
 }
+
 func challengeGeneration(marker *safety.ChallengePending) uint64 {
 	if marker == nil {
 		return 0
 	}
 	return marker.Generation
 }
+
 func reactivationGeneration(marker *safety.Reactivating) uint64 {
 	if marker == nil {
 		return 0
 	}
 	return marker.Generation
 }
+
 func shaDigest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func (s *FixedService) OwnershipInventory() (ownership.Inventory, error) {
 	return s.ownership.Inventory()
 }
+
 func (s *FixedService) PendingCertificateRecovery() error {
 	document, err := s.normal.Read()
 	if err != nil {
@@ -487,6 +606,7 @@ func (s *FixedService) PendingCertificateRecovery() error {
 	sort.Strings(ids)
 	return fmt.Errorf("interrupted certificate operation requires contraction: %s", strings.Join(ids, ","))
 }
+
 func (s *FixedService) PendingPublicationRecovery() error {
 	document, err := s.normal.Read()
 	if err != nil {
@@ -521,15 +641,18 @@ func (s *FixedService) PendingPublicationRecovery() error {
 	sort.Strings(ids)
 	return fmt.Errorf("interrupted publication requires contraction: %s", strings.Join(ids, ","))
 }
+
 func (s *FixedService) OwnershipRead(resourceID string) (ownership.Record, error) {
 	return s.ownership.Read(resourceID)
 }
+
 func (s *FixedService) OwnershipWrite(ctx context.Context, lease *locks.Lease, expected uint64, record ownership.Record) (ownership.Record, error) {
 	if _, err := s.ownership.Write(ctx, lease, ownership.ActivationWriter, expected, record); err != nil {
 		return ownership.Record{}, err
 	}
 	return s.ownership.Read(record.ResourceID)
 }
+
 func (s *FixedService) OwnershipRetireGoAccess(ctx context.Context, lease *locks.Lease, expected uint64, record ownership.Record, removeShared bool) (ownership.Record, error) {
 	role := ownership.GoAccessRetirementWriter
 	if removeShared {
@@ -540,6 +663,7 @@ func (s *FixedService) OwnershipRetireGoAccess(ctx context.Context, lease *locks
 	}
 	return s.ownership.Read(record.ResourceID)
 }
+
 func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	state, err := s.safety.Read()
 	if err != nil {
@@ -574,8 +698,25 @@ func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Now: now}).Allowed, nil
+	ownershipAuthority, err := fixedOwnershipAuthority(s.ownership)
+	if err != nil {
+		return false, err
+	}
+	return nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Ownership: ownershipAuthority, Now: now}).Allowed, nil
 }
+
+func fixedOwnershipAuthority(store *ownership.Store) (map[string]string, error) {
+	inventory, err := store.Inventory()
+	if err != nil || !inventory.Complete {
+		return nil, fmt.Errorf("ownership inventory is incomplete: %w", err)
+	}
+	result := make(map[string]string, len(inventory.Records))
+	for _, record := range inventory.Records {
+		result[record.ResourceID] = record.Checksum
+	}
+	return result, nil
+}
+
 func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload PlanPayload) (plans.Plan, error) {
 	authority, err := actorAuthority(actor)
 	if err != nil {
@@ -584,7 +725,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	if err := domain.ValidateOperationTarget(payload.Operation, payload.Target); err != nil {
 		return plans.Plan{}, err
 	}
-	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish && payload.Operation != domain.OperationManagedBasicDelete {
+	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish && payload.Operation != domain.OperationManagedBasicDelete && payload.Operation != domain.OperationResourceDelete {
 		return plans.Plan{}, ErrUnavailable
 	}
 	document, err := s.normal.Read()
@@ -597,6 +738,37 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	}
 	if payload.Operation == domain.OperationPublish {
 		return s.createPublishPlan(ctx, authority, document, payload.Target)
+	}
+	if payload.Operation == domain.OperationResourceDelete {
+		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
+		if err != nil {
+			return plans.Plan{}, err
+		}
+		var resource *domain.AppResource
+		for index := range installation.Resources {
+			if installation.Resources[index].ID == payload.Target.ID {
+				resource = &installation.Resources[index]
+			}
+		}
+		if resource == nil || resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.ContractionIntent != nil {
+			return plans.Plan{}, fmt.Errorf("resource delete requires fresh unpublished closure")
+		}
+		if resource.ManagedProcess != nil && resource.ManagedProcess.Requested != domain.ProcessRequestedStopped {
+			return plans.Plan{}, fmt.Errorf("resource delete requires stopped process")
+		}
+		if resourceHasManagedCredential(installation, resource.ID) {
+			return plans.Plan{}, fmt.Errorf("resource delete requires managed credentials to be deleted first")
+		}
+		owned, err := s.ownership.Read(resource.ID)
+		if err != nil || owned.State != ownership.Owned {
+			return plans.Plan{}, fmt.Errorf("resource delete ownership authority unavailable: %w", err)
+		}
+		admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
+		if err != nil {
+			return plans.Plan{}, err
+		}
+		defer func(ignore func() error) { _ = ignore() }(admission.Release)
+		return s.plans.Create(ctx, admission, document.Revision, plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: plans.DigestBinding{Applicable: true, Digest: owned.Checksum}, ExposureSummary: "deletes only LanPanel-managed inventory for resource " + resource.ID, Prerequisites: "fresh unpublished closure and stopped local cgroup", Lifetime: 10 * time.Minute})
 	}
 	if payload.Operation == domain.OperationManagedBasicDelete {
 		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
@@ -624,7 +796,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 		if err != nil {
 			return plans.Plan{}, err
 		}
-		defer admission.Release()
+		defer func(ignore func() error) { _ = ignore() }(admission.Release)
 		spec := plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetCredential, ID: credential.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: credential.Fingerprint}, ExposureSummary: "deletes_managed_basic_credential_" + credential.ID, Prerequisites: "credential_has_no_current_applied_or_activating_reference", Lifetime: 10 * time.Minute}
 		return s.plans.Create(ctx, admission, document.Revision, spec)
 	}
@@ -632,7 +804,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	defer admission.Release()
+	defer func(ignore func() error) { _ = ignore() }(admission.Release)
 	spec := plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetInstallation}, ActorIdentity: authority, Config: plans.DigestBinding{}, Applied: plans.DigestBinding{Applicable: true, Digest: fingerprint}, Evidence: []plans.Evidence{}, ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_destructive_confirmation", Lifetime: 10 * time.Minute}
 	if payload.Operation == domain.OperationCloseAll || payload.Operation == domain.OperationUnpublish {
 		state, err := s.safety.Read()
@@ -696,7 +868,7 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	if resource.Publication.Kind != domain.PublicationTemporaryHTTP {
 		return plans.Plan{}, fmt.Errorf("publication type unsupported")
 	}
-	if resource.Target.Kind != domain.AppTargetLocalHTTP || resource.Target.WebSocket.Enabled || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest {
+	if resource.Target.WebSocket.Enabled || !publishTargetConfigured(installation, *resource) {
 		return plans.Plan{}, fmt.Errorf("temporary publication requires exact running local target without WebSocket")
 	}
 	if _, err := reservations.BuildClaims(installation); err != nil {
@@ -730,7 +902,7 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: readiness.Digest, ObservedAt: readiness.ObservedAt}
+	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: targetEvidenceGeneration(*resource), Digest: readiness.Digest, ObservedAt: readiness.ObservedAt}
 	applied := plans.DigestBinding{}
 	if resource.PublicationRecord.LastAppliedDigest != nil {
 		applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
@@ -742,8 +914,15 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	defer admission.Release()
+	defer func(ignore func() error) { _ = ignore() }(admission.Release)
 	return s.plans.Create(ctx, admission, document.Revision, spec)
+}
+
+func publishTargetConfigured(installation domain.Installation, resource domain.AppResource) bool {
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
+		return installation.Connector != nil && resource.ManagedProcess == nil
+	}
+	return resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil && resource.ManagedProcess.Requested == domain.ProcessRequestedRunning && resource.ManagedProcess.Applied != nil && resource.ManagedProcess.Applied.ConfigDigest == resource.CurrentConfigDigest
 }
 
 func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority string, document persist.Document, installation domain.Installation, resource domain.AppResource) (plans.Plan, error) {
@@ -756,7 +935,7 @@ func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority st
 	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
 		return plans.Plan{}, err
 	}
-	if resource.Target.Kind != domain.AppTargetLocalHTTP || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedRunning || resource.ManagedProcess.Applied == nil || resource.ManagedProcess.Applied.ConfigDigest != resource.CurrentConfigDigest {
+	if !publishTargetConfigured(installation, resource) {
 		return plans.Plan{}, fmt.Errorf("domain publication requires exact running target")
 	}
 	if _, err := reservations.BuildClaims(installation); err != nil {
@@ -790,7 +969,7 @@ func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority st
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: resource.ManagedProcess.Applied.Generation, Digest: readiness.Digest, ObservedAt: readiness.ObservedAt}
+	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: targetEvidenceGeneration(resource), Digest: readiness.Digest, ObservedAt: readiness.ObservedAt}
 	acmeEvidence := plans.Evidence{Kind: "acme_binding", Identity: "resource/" + resource.ID, Generation: safetyResource.GenerationSequence + 1, Digest: bindingDigest, ObservedAt: time.Now().UTC()}
 	applied := plans.DigestBinding{}
 	if resource.PublicationRecord.LastAppliedDigest != nil {
@@ -812,7 +991,7 @@ func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority st
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	defer admission.Release()
+	defer func(ignore func() error) { _ = ignore() }(admission.Release)
 	return s.plans.Create(ctx, admission, document.Revision, spec)
 }
 

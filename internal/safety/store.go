@@ -96,6 +96,8 @@ type StopFenceConvergenceProof struct {
 	FenceGeneration        uint64
 	FenceDigest            string
 	JournalRef             string
+	SafetyIntentID         string
+	SafetyIntentGeneration uint64
 	InventoryDigest        string
 	OwnedGraphDigest       string
 	RuntimeClosureDigest   string
@@ -251,7 +253,7 @@ func (store *Store) read(requireAuthority bool) (State, error) {
 		_ = unix.Close(fd)
 		return State{}, fmt.Errorf("wrap independent safety state descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	decoder := json.NewDecoder(io.LimitReader(file, maxStateBytes+1))
 	decoder.DisallowUnknownFields()
 	var state State
@@ -388,6 +390,15 @@ func (store *Store) persist(ctx context.Context, state State, disposition filetx
 	return store.txn.Put(ctx, filetxn.Request{Path: store.config.StatePath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maxStateBytes}, data, disposition)
 }
 
+// OwnershipInventoryDigest returns the exact complete ownership inventory
+// bound to this independent safety store.
+func (store *Store) OwnershipInventoryDigest() (string, error) {
+	if store == nil {
+		return "", fmt.Errorf("independent safety store is nil")
+	}
+	return readOwnershipInventoryDigest(store.config.Ownership)
+}
+
 func readOwnershipInventoryDigest(authority OwnershipAuthority) (string, error) {
 	if authority == nil {
 		return "", fmt.Errorf("independent ownership authority is missing")
@@ -474,11 +485,12 @@ func globalProofMatchesEmergency(normal *GlobalConvergenceProof, emergency *Emer
 func FenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence) bool {
 	return normalFenceMatchesEmergency(normal, emergency)
 }
+
 func normalFenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence) bool {
 	if normal == nil || normal.Kind != StopFenceContraction || normal.Contraction == nil {
 		return false
 	}
-	if normal.OriginOperation != emergency.OriginOperation || normal.Scope.Kind != emergency.ScopeKind || normal.Scope.ResourceID != emergency.ResourceID || normal.FenceGeneration != emergency.Generation || normal.OwnedGraphDigest != emergency.OwnedGraphDigest || normal.InventoryDigest != emergency.InventoryDigest || normal.Contraction.OwnershipDigest != emergency.OwnershipDigest || normal.AccessMayRemain != emergency.AccessMayRemain || normal.Observation.MasterStopped != emergency.MasterStopped || normal.Observation.WorkersStopped != emergency.WorkersStopped || normal.Observation.ListenersStopped != emergency.ListenersStopped || normal.Observation.ObservedAt.Unix() != emergency.ObservedUnix {
+	if normal.OriginOperation != emergency.OriginOperation || normal.Scope.Kind != emergency.ScopeKind || normal.Scope.ResourceID != emergency.ResourceID || normal.FenceGeneration != emergency.Generation || normal.OwnedGraphDigest != emergency.OwnedGraphDigest || normal.InventoryDigest != emergency.InventoryDigest || normal.Contraction.OwnershipDigest != emergency.OwnershipDigest || normal.Contraction.OperationRef != emergency.OperationRef || normal.Contraction.SafetyIntentID != emergency.SafetyIntentID || normal.Contraction.SafetyIntentGeneration != emergency.SafetyIntentGeneration || normal.AccessMayRemain != emergency.AccessMayRemain || normal.Observation.MasterStopped != emergency.MasterStopped || normal.Observation.WorkersStopped != emergency.WorkersStopped || normal.Observation.ListenersStopped != emergency.ListenersStopped || normal.Observation.ObservedAt.Unix() != emergency.ObservedUnix {
 		return false
 	}
 	want := map[string]uint64{}
@@ -490,9 +502,6 @@ func normalFenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence
 	}
 	if emergency.CertificateGeneration != 0 {
 		want["certificate_expiry"] = emergency.CertificateGeneration
-	}
-	if emergency.EdgeOneGeneration != 0 {
-		want["edgeone_expiry"] = emergency.EdgeOneGeneration
 	}
 	if len(normal.Contraction.Authorities) != len(want) {
 		return false
@@ -523,47 +532,11 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			if !validGlobalClearProof(current, proof.GlobalClose) {
 				return fmt.Errorf("global close clear lacks exact convergence proof")
 			}
-		} else if role != RoleContraction && role != RoleMaintenanceBegin {
-			return fmt.Errorf("only contraction or maintenance-begin owns global close creation")
+		} else if role != RoleContraction {
+			return fmt.Errorf("only contraction owns global close creation")
 		}
 	}
 	if err := validateStopFenceTransition(role, current, next, proof.StopFence); err != nil {
-		return err
-	}
-	for _, transition := range []struct {
-		name          string
-		before, after any
-		owner         ClearRole
-	}{
-		{"maintenance_pending", current.MaintenancePending, next.MaintenancePending, RoleMaintenance},
-		{"dependency_transition_pending", current.DependencyTransitionPending, next.DependencyTransitionPending, RoleUpgrade},
-		{"upgrade_pending", current.UpgradePending, next.UpgradePending, RoleUpgrade},
-		{"backup_quiescence", current.BackupQuiescence, next.BackupQuiescence, RoleBackup},
-		{"backup_transition", current.BackupTransition, next.BackupTransition, RoleBackup},
-	} {
-		if transition.name == "maintenance_pending" && transition.before == nil && transition.after != nil && role != RoleMaintenanceBegin {
-			return fmt.Errorf("maintenance creation requires atomic maintenance-begin authority")
-		}
-		if !reflect.DeepEqual(transition.before, transition.after) && role != transition.owner {
-			reconciliationCompound := role == RoleJournalConvergence && current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition && next.StopFence == nil && current.MaintenancePending != nil && next.MaintenancePending == nil && current.DependencyTransitionPending == nil
-			compound := transition.name == "maintenance_pending" && (role == RoleMaintenanceBegin || role == RoleMaintenanceToDependency || reconciliationCompound) || transition.name == "dependency_transition_pending" && (role == RoleMaintenanceToDependency || reconciliationCompound)
-			if !compound {
-				return fmt.Errorf("role %q does not own %s transition", role, transition.name)
-			}
-		}
-	}
-	for name, generations := range map[string][2]uint64{
-		"maintenance_pending":           {transitionGeneration(current.MaintenancePending), transitionGeneration(next.MaintenancePending)},
-		"dependency_transition_pending": {transitionGeneration(current.DependencyTransitionPending), transitionGeneration(next.DependencyTransitionPending)},
-		"upgrade_pending":               {transitionGeneration(current.UpgradePending), transitionGeneration(next.UpgradePending)},
-		"backup_quiescence":             {backupQuiescenceGeneration(current.BackupQuiescence), backupQuiescenceGeneration(next.BackupQuiescence)},
-		"backup_transition":             {backupTransitionGeneration(current.BackupTransition), backupTransitionGeneration(next.BackupTransition)},
-	} {
-		if generations[0] != 0 && generations[1] != 0 && generations[1] < generations[0] {
-			return fmt.Errorf("%s generation regressed", name)
-		}
-	}
-	if err := validateMaintenanceCompound(role, current, next); err != nil {
 		return err
 	}
 	if err := validateHeadscaleTransition(role, current.Headscale, next.Headscale, proof.Headscale); err != nil {
@@ -580,7 +553,7 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 	for id, after := range afterResources {
 		before, present := beforeResources[id]
 		if !present {
-			if role != RoleResourceCreate || after.State != ResourceActive || after.Ownership != OwnershipOwned || after.GenerationSequence != 1 || after.StickyUnpublished == nil || after.StickyUnpublished.Generation != 1 || after.StickyUnpublished.Kind != MarkerStickyUnpublished || after.Closing != nil || after.Contraction != nil || after.CertificateExpiry != nil || after.EdgeOne.RefreshJournal != "" || !after.EdgeOne.Deadline.IsZero() || after.EdgeOne.Expiry != nil || after.ChallengePending != nil || after.Reactivating != nil || after.DeletionTombstone != "" {
+			if role != RoleResourceCreate || after.State != ResourceActive || after.Ownership != OwnershipOwned || after.GenerationSequence != 1 || after.StickyUnpublished == nil || after.StickyUnpublished.Generation != 1 || after.StickyUnpublished.Kind != MarkerStickyUnpublished || after.Closing != nil || after.Contraction != nil || after.CertificateExpiry != nil || after.ChallengePending != nil || after.Reactivating != nil || after.DeletionTombstone != "" {
 				return fmt.Errorf("new resource safety identity must start as exact owned sticky-unpublished generation 1")
 			}
 			continue
@@ -592,40 +565,6 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 	for id := range beforeResources {
 		if _, present := afterResources[id]; !present && (role != RoleDelete || !validDeleteProof(beforeResources[id], proof.Delete)) {
 			return fmt.Errorf("only delete may remove resource safety identity %s", id)
-		}
-	}
-	return nil
-}
-
-func validateMaintenanceCompound(role ClearRole, current, next State) error {
-	switch role {
-	case RoleMaintenanceBegin:
-		if current.MaintenancePending != nil || next.MaintenancePending == nil || current.GlobalClose.Phase != GlobalCloseNone || next.GlobalClose.Phase == GlobalCloseNone {
-			return fmt.Errorf("maintenance-begin requires one atomic new maintenance and global-close authority")
-		}
-		if len(current.Resources) != len(next.Resources) {
-			return fmt.Errorf("maintenance-begin cannot change resource identity inventory")
-		}
-		for index := range next.Resources {
-			if next.Resources[index].StickyUnpublished == nil {
-				return fmt.Errorf("maintenance-begin requires every App to become sticky-unpublished atomically")
-			}
-		}
-	case RoleMaintenanceToDependency:
-		if current.MaintenancePending == nil || next.MaintenancePending != nil || current.DependencyTransitionPending != nil || next.DependencyTransitionPending == nil {
-			return fmt.Errorf("maintenance-to-dependency requires one exact marker replacement")
-		}
-		if next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef {
-			return fmt.Errorf("maintenance-to-dependency identity does not bind the completed maintenance target")
-		}
-	case RoleJournalConvergence:
-		if current.StopFence != nil && current.StopFence.Kind == StopFenceMaintenanceTransition {
-			if current.MaintenancePending == nil || current.DependencyTransitionPending != nil || next.MaintenancePending != nil || next.StopFence != nil {
-				return fmt.Errorf("exact maintenance reconciliation must atomically clear its transition and stop fence")
-			}
-			if next.DependencyTransitionPending != nil && (next.DependencyTransitionPending.CurrentEnvelope != current.MaintenancePending.TargetEnvelope || next.DependencyTransitionPending.JournalRef != current.MaintenancePending.JournalRef) {
-				return fmt.Errorf("exact maintenance reconciliation target branch is not bound to the exact target")
-			}
 		}
 	}
 	return nil
@@ -677,12 +616,6 @@ func stopFenceWriter(kind StopFenceKind) ClearRole {
 		return RoleIngressActivation
 	case StopFenceCertificateActivation:
 		return RoleCertificateActivation
-	case StopFenceEdgeOneRefresh:
-		return RoleEdgeOneRefresh
-	case StopFenceMaintenanceTransition:
-		return RoleMaintenance
-	case StopFenceGenerationUpgrade:
-		return RoleUpgrade
 	default:
 		return ""
 	}
@@ -700,7 +633,33 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 	if role == RoleCertificateHandoff && !reflect.DeepEqual(before, after) {
 		pending, active := before.ChallengePending, after.Reactivating
 		if pending == nil || before.Reactivating != nil || after.ChallengePending != nil || active == nil || active.PlanID != pending.PlanID || active.Generation != pending.Generation || active.PriorGeneration+1 != pending.Generation || active.CandidateDigest != pending.ConfigDigest || !reflect.DeepEqual(active.BaseMarkers, pending.BaseMarkers) || !isDigest(active.CandidateBundle) || active.ControlGeneration == 0 || active.CertificateGeneration == 0 || !isDigest(active.CertificateFingerprint) || active.CertificateUntil.IsZero() {
-			return fmt.Errorf("Headscale certificate handoff does not exactly replace challenge authority")
+			return fmt.Errorf("headscale certificate handoff does not exactly replace challenge authority")
+		}
+	}
+	if before.ControlEntryDigest != after.ControlEntryDigest {
+		if role != RolePublish || before.ControlEntryDigest != "" || !isDigest(after.ControlEntryDigest) || before.Reactivating == nil {
+			return fmt.Errorf("wrong Headscale control-entry writer")
+		}
+	}
+	if !reflect.DeepEqual(before.ActiveCertificate, after.ActiveCertificate) {
+		observation := role == RoleCertificateObservation && before.ActiveCertificate != nil && after.ActiveCertificate != nil && before.ActiveCertificate.Generation == after.ActiveCertificate.Generation && before.ActiveCertificate.Fingerprint == after.ActiveCertificate.Fingerprint && before.ActiveCertificate.Binding == after.ActiveCertificate.Binding && before.ActiveCertificate.NotAfter.Equal(after.ActiveCertificate.NotAfter) && after.ActiveCertificate.LastTrustedWall.After(before.ActiveCertificate.LastTrustedWall) && after.ActiveCertificate.LastTrustedWall.Before(after.ActiveCertificate.NotAfter)
+		if !observation && role != RolePublish && role != RoleCertificateActivation {
+			return fmt.Errorf("wrong Headscale active-certificate writer")
+		}
+		if after.ActiveCertificate == nil {
+			return fmt.Errorf("headscale active certificate cannot be cleared by activation")
+		}
+		if !observation && role == RolePublish {
+			active := before.Reactivating
+			if active == nil || after.ActiveCertificate.Generation != active.CertificateGeneration || after.ActiveCertificate.Fingerprint != active.CertificateFingerprint || !after.ActiveCertificate.NotAfter.Equal(active.CertificateUntil) || !after.ActiveCertificate.LastTrustedWall.Equal(active.CertificateLastTrustedWall) {
+				return fmt.Errorf("headscale active certificate does not match reactivation")
+			}
+		}
+		if !observation && role == RoleCertificateActivation {
+			pending := before.ChallengePending
+			if before.ActiveCertificate == nil || pending == nil || after.ChallengePending != nil || after.ActiveCertificate.Generation != before.ActiveCertificate.Generation+1 || after.ActiveCertificate.Fingerprint == before.ActiveCertificate.Fingerprint || !after.ActiveCertificate.NotAfter.After(after.ActiveCertificate.LastTrustedWall) {
+				return fmt.Errorf("headscale renewal certificate does not replace exact challenge authority")
+			}
 		}
 	}
 	beforeGenerations := headscaleGenerations(before)
@@ -709,22 +668,22 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 		beforeGenerations["reactivating"] = before.ChallengePending.Generation
 	}
 	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, beforeGenerations, headscaleGenerations(after)); err != nil {
-		return fmt.Errorf("Headscale: %w", err)
+		return fmt.Errorf("headscale: %w", err)
 	}
 	if !reflect.DeepEqual(before.CertificateExpiry, after.CertificateExpiry) {
 		if after.CertificateExpiry == nil {
 			if role != RolePublish {
 				return fmt.Errorf("wrong Headscale certificate-expiry clearer")
 			}
-		} else if role != RoleContraction {
+		} else if role != RoleCertificateActivation {
 			return fmt.Errorf("wrong Headscale certificate-expiry writer")
 		}
 		if before.CertificateExpiry != nil && after.CertificateExpiry != nil && after.CertificateExpiry.Generation <= before.CertificateExpiry.Generation {
-			return fmt.Errorf("Headscale certificate-expiry replacement requires fresh generation")
+			return fmt.Errorf("headscale certificate-expiry replacement requires fresh generation")
 		}
 	}
 	if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
-		return fmt.Errorf("Headscale: %w", err)
+		return fmt.Errorf("headscale: %w", err)
 	}
 	if !reflect.DeepEqual(before.Reactivating, after.Reactivating) {
 		bindingOnly := false
@@ -738,11 +697,11 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 			return fmt.Errorf("wrong Headscale reactivation writer")
 		}
 		if !bindingOnly && role != RoleCertificateHandoff && after.Reactivating != nil && (after.Reactivating.PriorGeneration != before.GenerationSequence || after.Reactivating.Generation != before.GenerationSequence+1) {
-			return fmt.Errorf("Headscale reactivation does not bind the exact prior generation")
+			return fmt.Errorf("headscale reactivation does not bind the exact prior generation")
 		}
 	}
 	if (before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.Reactivating != nil && after.Reactivating == nil) && !validHeadscaleProof(before, after, proof) {
-		return fmt.Errorf("Headscale expiry or reactivation clear lacks matching convergence proof")
+		return fmt.Errorf("headscale expiry or reactivation clear lacks matching convergence proof")
 	}
 	return nil
 }
@@ -780,7 +739,7 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 			return fmt.Errorf("ownership authority transition lacks exact contraction or activation proof")
 		}
 	}
-	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction, RoleMaintenanceBegin); err != nil {
+	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction); err != nil {
 		return err
 	}
 	if err := markerTransition(role, before.Closing, after.Closing, RoleContraction, ClearClosing); err != nil {
@@ -818,15 +777,6 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	}
 	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleCertificateActivation, ClearBaseContraction); err != nil {
 		return err
-	}
-	if err := deadlineTransition(role, before.EdgeOne.Expiry, after.EdgeOne.Expiry, RoleContraction, ClearBaseContraction); err != nil {
-		return err
-	}
-	beforeEdge, afterEdge := before.EdgeOne, after.EdgeOne
-	beforeEdge.Expiry = nil
-	afterEdge.Expiry = nil
-	if !reflect.DeepEqual(beforeEdge, afterEdge) && role != RoleEdgeOneRefresh {
-		return fmt.Errorf("wrong EdgeOne journal writer")
 	}
 	if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
 		return err
@@ -895,6 +845,7 @@ func markerTransition(role ClearRole, before, after *GenerationMarker, owner Cle
 	}
 	return nil
 }
+
 func deadlineTransition(role ClearRole, before, after *DeadlineMarker, owner ClearRole, clear ClearTarget) error {
 	if reflect.DeepEqual(before, after) {
 		return nil
@@ -910,11 +861,12 @@ func deadlineTransition(role ClearRole, before, after *DeadlineMarker, owner Cle
 	}
 	return nil
 }
+
 func challengeTransition(role ClearRole, before, after *ChallengePending) error {
 	if reflect.DeepEqual(before, after) {
 		return nil
 	}
-	if (role == RoleContraction || role == RoleCertificateHandoff) && before != nil && after == nil {
+	if (role == RoleContraction || role == RoleCertificateHandoff || role == RoleCertificateActivation) && before != nil && after == nil {
 		return nil
 	}
 	if role != RoleChallenge {
@@ -925,6 +877,7 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 	}
 	return nil
 }
+
 func reactivationTransition(role ClearRole, priorGeneration uint64, before, after *Reactivating) error {
 	if reflect.DeepEqual(before, after) {
 		return nil
@@ -945,7 +898,7 @@ func reactivationTransition(role ClearRole, priorGeneration uint64, before, afte
 }
 
 func baseMarkersRemoved(before, after ResourceSafety) bool {
-	return before.StickyUnpublished != nil && after.StickyUnpublished == nil || before.Contraction != nil && after.Contraction == nil || before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.EdgeOne.Expiry != nil && after.EdgeOne.Expiry == nil
+	return before.StickyUnpublished != nil && after.StickyUnpublished == nil || before.Contraction != nil && after.Contraction == nil || before.CertificateExpiry != nil && after.CertificateExpiry == nil
 }
 
 func validOwnershipRetirementProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {
@@ -1002,14 +955,11 @@ func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenc
 	if fence.CertificateActivation != nil {
 		journal = fence.CertificateActivation.JournalRef
 	}
-	if fence.EdgeOneRefresh != nil {
-		journal = fence.EdgeOneRefresh.JournalRef
-	}
-	if fence.Transition != nil {
-		if proof.RuntimeClosureDigest != fence.Transition.RuntimeClosureDigest {
+	if fence.Contraction != nil {
+		journal = fence.Contraction.OperationRef
+		if proof.SafetyIntentID != fence.Contraction.SafetyIntentID || proof.SafetyIntentGeneration != fence.Contraction.SafetyIntentGeneration {
 			return false
 		}
-		journal = fence.Transition.JournalRef
 	}
 	return proof.JournalRef == journal
 }
@@ -1024,28 +974,9 @@ func StopFenceDigest(fence StopFence) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func transitionGeneration(marker *TransitionMarker) uint64 {
-	if marker == nil {
-		return 0
-	}
-	return marker.Generation
-}
-func backupQuiescenceGeneration(marker *BackupQuiescence) uint64 {
-	if marker == nil {
-		return 0
-	}
-	return marker.Generation
-}
-func backupTransitionGeneration(marker *BackupTransition) uint64 {
-	if marker == nil {
-		return 0
-	}
-	return marker.Generation
-}
-
 func validRole(role ClearRole) bool {
 	switch role {
-	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleOwnershipRetirement, RoleUpgradeRecovery, RoleMaintenance, RoleMaintenanceBegin, RoleMaintenanceToDependency, RoleUpgrade, RoleBackup, RolePublish, RoleDelete, RoleChallenge, RoleCertificateHandoff, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleCertificateObservation, RoleEdgeOneRefresh, RoleResourceCreate:
+	case RoleGlobalCloseConvergence, RoleJournalConvergence, RoleOwnershipContraction, RoleOwnershipActivation, RoleOwnershipRetirement, RolePublish, RoleDelete, RoleChallenge, RoleCertificateHandoff, RoleContraction, RoleIngressActivation, RoleCertificateActivation, RoleCertificateObservation, RoleResourceCreate:
 		return true
 	default:
 		return false

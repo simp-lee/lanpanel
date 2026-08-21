@@ -35,6 +35,7 @@ type emergencyPlanStore struct {
 func newEmergencyPlanStore() *emergencyPlanStore {
 	return &emergencyPlanStore{plans: map[string]emergencyPlan{}, random: rand.Reader, now: func() time.Time { return time.Now().UTC() }}
 }
+
 func (store *emergencyPlanStore) Create(ctx context.Context, actor application.Actor) (emergencyPlan, error) {
 	if actor.Kind != application.ActorUI || actor.Identity == "" || actor.Generation == 0 {
 		return emergencyPlan{}, fmt.Errorf("emergency Plan actor is invalid")
@@ -64,6 +65,7 @@ func (store *emergencyPlanStore) Create(ctx context.Context, actor application.A
 	store.plans[id] = plan
 	return plan, nil
 }
+
 func (store *emergencyPlanStore) Consume(id, actor string, generation uint64, confirmation string, now time.Time) (emergencyPlan, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()

@@ -10,8 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"lanpanel/internal/child"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
@@ -20,6 +18,7 @@ import (
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
+	"lanpanel/internal/release"
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
@@ -57,7 +56,7 @@ func renderArtifacts(journal Journal) (map[string][]byte, error) {
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):        []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service lanpanel-process-guard.service\nRequires=lanpanel-runtime.service lanpanel-process-guard.service\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nKillMode=control-group\nDelegate=yes\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /var/log/lanpanel /run/lanpanel /run/lanpanel-goaccess /sys/fs/bpf/lanpanel /etc/lanpanel /etc/lanpanel-public /etc/systemd/system /etc/sysusers.d /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/.pwd.lock /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.service"):         []byte(serviceUnit("LanPanel timer dispatcher", accounts[identity.RoleTimer], binary+" timer", "", "")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.timer"):           []byte("[Unit]\nDescription=LanPanel persistent timer\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=" + fixedTimerPeriod + "\nPersistent=true\nUnit=lanpanel-timer.service\n\n[Install]\nWantedBy=timers.target\n"),
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):      []byte("[Unit]\nDescription=LanPanel startup contraction recovery\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-helper.service\nRequires=lanpanel-helper.service\nBefore=lanpanel-nginx.service\n\n[Service]\nType=oneshot\nExecStart=" + binary + " fenced-recovery\nUser=" + fmt.Sprint(accounts[identity.RoleRecovery].UID) + "\nGroup=" + fmt.Sprint(accounts[identity.RoleRecovery].GID) + "\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nUMask=0077\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):      []byte("[Unit]\nDescription=LanPanel startup contraction recovery\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-helper.service\nRequires=lanpanel-helper.service\nBefore=lanpanel-nginx.service\n\n[Service]\nType=oneshot\nExecStart=" + binary + " startup-recovery\nUser=" + fmt.Sprint(accounts[identity.RoleRecovery].UID) + "\nGroup=" + fmt.Sprint(accounts[identity.RoleRecovery].GID) + "\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nUMask=0077\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service"):         []byte("[Unit]\nDescription=LanPanel closed Nginx master\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=network.target lanpanel-helper.service lanpanel-recovery.service\nRequires=lanpanel-helper.service lanpanel-recovery.service\nConflicts=nginx.service\n\n[Service]\nType=simple\nPIDFile=" + nginxPaths.PIDPath + "\nExecStart=" + binary + " startup-guard\nExecReload=" + binary + " reload-guard\nExecStop=" + binary + " reload-guard stop\nTimeoutStartSec=60s\nTimeoutStopSec=60s\nKillMode=control-group\nRestart=no\nUser=root\nGroup=root\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=" + nginxPaths.ConfigRoot + " " + nginxPaths.StateRoot + " " + filepath.Dir(nginxPaths.PIDPath) + " " + nginxPaths.AuditPath + " /var/lib/lanpanel/locks /var/lib/lanpanel/safety /var/lib/lanpanel/state /var/lib/lanpanel/ownership /var/lib/lanpanel/certificates /var/log/lanpanel/goaccess\nCapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE\nAmbientCapabilities=\n\n[Install]\nWantedBy=multi-user.target\n"),
 	}
 	return artifacts, nil
@@ -94,7 +93,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	if err != nil {
 		return false, err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 {
 		return false, fmt.Errorf("bootstrap directory parent is unsafe")
@@ -110,7 +109,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	if err != nil {
 		return false, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	if created {
 		if err := unix.Fchown(fd, int(owner.UID), int(owner.GID)); err != nil {
 			return false, err
@@ -135,6 +134,7 @@ func targetStaging(path string) (string, error) {
 	_, err := ensureDirectory(staging, filetxn.Owner{UID: 0, GID: 0}, 0o700)
 	return staging, err
 }
+
 func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32, mode os.FileMode) error {
 	parent := filepath.Dir(path)
 	staging := filepath.Join(parent, ".lanpanel-filetxn")
@@ -147,7 +147,7 @@ func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32,
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	metadata := filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: gid}, Mode: mode}
 	_, err = store.Put(ctx, filetxn.Request{Path: path, Parents: parents, Existing: &metadata, New: metadata, MaxBytes: int64(len(data))}, data, filetxn.CreateOnly)
 	return err
@@ -183,73 +183,52 @@ func putRootFile(ctx context.Context, root, staging, path string, data []byte, m
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: mode}
 	_, err = store.Put(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}, Existing: &metadata, New: metadata, MaxBytes: max(int64(len(data)), 1)}, data, disposition)
 	return err
 }
 
-func verifySourceBinary(source string, expected releaseBinary) error {
-	fd, err := unix.Open(source, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+func copyOrVerifyPolicyBytes(data []byte, expected release.AssetIdentity, paths Paths) error {
+	if uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
+		return fmt.Errorf("package no-autostart policy bytes differ")
+	}
+	destination := "/usr/sbin/policy-rc.d"
+	if paths != FixedPaths() {
+		destination = filepath.Join(paths.PersistentRoot, "sbin", "policy-rc.d")
+		if _, err := ensureDirectory(filepath.Dir(destination), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
+			return err
+		}
+	}
+	return putOrVerifyTargetFile(context.Background(), destination, data, 0o755)
+}
+
+func copyOrVerifyBinaryBytes(data []byte, paths Paths, expected releaseBinary) error {
+	if uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
+		return fmt.Errorf("bootstrap binary bytes differ")
+	}
+	return putOrVerifyTargetFile(context.Background(), paths.BinaryPath, data, 0o755)
+}
+
+func removeBootstrapPolicy(expected release.AssetIdentity, paths Paths) error {
+	path := "/usr/sbin/policy-rc.d"
+	if paths != FixedPaths() {
+		path = filepath.Join(paths.PersistentRoot, "sbin", "policy-rc.d")
+	}
+	data, err := readCommittedArtifact(path, int64(expected.Bytes), 0o755)
+	if err != nil || uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
+		return fmt.Errorf("package no-autostart policy changed before cleanup")
+	}
+	parent := filepath.Dir(path)
+	fd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	file := os.NewFile(uintptr(fd), filepath.Base(source))
-	if file == nil {
-		_ = unix.Close(fd)
-		return fmt.Errorf("source binary descriptor is invalid")
-	}
-	defer file.Close()
-	var stat unix.Stat_t
-	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size != int64(expected.Bytes) || stat.Mode&0o111 == 0 || stat.Mode&0o022 != 0 {
-		return fmt.Errorf("source binary identity is unsafe")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, int64(expected.Bytes)+1))
-	if err != nil || uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
-		return fmt.Errorf("source binary bytes differ from selected release")
-	}
-	return nil
-}
-
-func copyOrVerifyBinary(source string, paths Paths, expected releaseBinary) error {
-	staging, stagingErr := targetStaging(paths.BinaryPath)
-	if stagingErr != nil {
-		return stagingErr
-	}
-	err := copyVerifiedBinary(source, "/", staging, paths.BinaryPath, expected)
-	if !errors.Is(err, os.ErrExist) {
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Unlinkat(fd, filepath.Base(path), 0); err != nil {
 		return err
 	}
-	actual, readErr := readCommittedArtifact(paths.BinaryPath, int64(expected.Bytes), 0o755)
-	if readErr != nil || uint64(len(actual)) != expected.Bytes || digestBytes(actual) != expected.Digest {
-		return fmt.Errorf("existing installed binary is foreign")
-	}
-	return nil
-}
-
-func copyVerifiedBinary(source, destinationRoot, staging, destination string, expected releaseBinary) error {
-	fd, err := unix.Open(source, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	file := os.NewFile(uintptr(fd), filepath.Base(source))
-	if file == nil {
-		_ = unix.Close(fd)
-		return fmt.Errorf("source binary descriptor is invalid")
-	}
-	defer file.Close()
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size != int64(expected.Bytes) || stat.Mode&0o111 == 0 || stat.Mode&0o022 != 0 {
-		return fmt.Errorf("source binary identity is unsafe")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, int64(expected.Bytes)+1))
-	if err != nil || uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
-		return fmt.Errorf("source binary bytes differ from selected release")
-	}
-	if child.FixedLanPanelExecutable != destination {
-		return fmt.Errorf("bootstrap binary destination is not release-fixed")
-	}
-	return putRootFile(context.Background(), destinationRoot, staging, destination, data, 0o755, filetxn.CreateOnly)
+	return unix.Fsync(fd)
 }
 
 type releaseBinary struct {
@@ -268,7 +247,7 @@ func initializeStores(ctx context.Context, journal Journal) error {
 	if err != nil {
 		return err
 	}
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	exposure, err := manager.Acquire(ctx, locks.Exposure)
 	if err != nil {
 		return err
@@ -277,7 +256,7 @@ func initializeStores(ctx context.Context, journal Journal) error {
 	if err != nil {
 		return err
 	}
-	defer ownershipStore.Close()
+	defer func(ignore func() error) { _ = ignore() }(ownershipStore.Close)
 	emergencyPath := filepath.Join(journal.Paths.SafetyRoot, "emergency")
 	emergency, err := safety.CreateEmergency(emergencyPath, owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
 	if errors.Is(err, os.ErrExist) {
@@ -287,12 +266,12 @@ func initializeStores(ctx context.Context, journal Journal) error {
 		_ = exposure.Release()
 		return err
 	}
-	defer emergency.Close()
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
 	safetyStore, err := safety.OpenStore(safety.StoreConfig{RootPath: journal.Paths.SafetyRoot, StagingPath: filepath.Join(journal.Paths.SafetyRoot, ".filetxn"), StatePath: filepath.Join(journal.Paths.SafetyRoot, "state.json"), Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: ownershipStore})
 	if err != nil {
 		return err
 	}
-	defer safetyStore.Close()
+	defer func(ignore func() error) { _ = ignore() }(safetyStore.Close)
 	if _, err := safetyStore.Read(); errors.Is(err, safety.ErrSafetyStateMissing) {
 		if _, err := safetyStore.Initialize(ctx, exposure); err != nil {
 			return err
@@ -307,7 +286,7 @@ func initializeStores(ctx context.Context, journal Journal) error {
 	if err != nil {
 		return err
 	}
-	defer normal.Close()
+	defer func(ignore func() error) { _ = ignore() }(normal.Close)
 	admission, err := manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {
 		return err
@@ -354,10 +333,12 @@ func artifactInventoryDigest(values map[string]string) string {
 	sort.Strings(keys)
 	hasher := sha256.New()
 	for _, key := range keys {
-		fmt.Fprintf(hasher, "%d:%s:%s\n", len(key), key, values[key])
+		_, _ = fmt.Fprintf(hasher, "%d:%s:%s\n", len(key), key, values[key])
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
-var _ = bytes.Equal
-var _ = helper.FixedIdentityConfigPath
+var (
+	_ = bytes.Equal
+	_ = helper.FixedIdentityConfigPath
+)

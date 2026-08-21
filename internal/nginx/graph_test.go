@@ -140,6 +140,62 @@ func TestStartupReloadGuardNeverCrossesContraction(t *testing.T) {
 	}
 }
 
+func TestStartupReloadGuardAllowsOnlyExactDurableDomainAuthority(t *testing.T) {
+	_, manifest := installTestGraph(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	resourceID := "app-one"
+	ownershipDigest := testDigest("owner")
+	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert-one", BindingIdentity: "binding-one", Generation: 3, Fingerprint: testDigest("certificate"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: now.Add(time.Hour).Format(time.RFC3339), LastTrustedWall: now.Add(-time.Minute).Format(time.RFC3339)}
+	bundle := domain.PublicationBundle{ID: "bundle-one", Generation: 2, ConfigDigest: testDigest("config"), Kind: domain.PublicationDomainHTTPS, EndpointIdentity: testDigest("endpoint"), SiteIdentity: testDigest("site"), ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.test"}, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
+	entry := Entry{Kind: EntryApp, ResourceID: resourceID, Relative: AppsDirectory + "/app-one.conf", Digest: bundle.SiteIdentity, Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: bundle.Generation, Domain: &DomainSite{Hosts: []string{"app.example.test"}, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", AuthMode: "public", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel/app-one.sock"}}
+	manifest.Entries = []Entry{entry}
+	app := domain.AppResource{ID: resourceID, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationPublished, UnpublishedGeneration: 1, LastAppliedDigest: &bundle.ConfigDigest, LastAppliedBundle: &bundle}}
+	installation := &domain.Installation{Resources: []domain.AppResource{app}}
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: resourceID, GenerationSequence: 2, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownershipDigest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, LastTrustedWall: now.Add(-time.Minute), NotAfter: now.Add(time.Hour)}}}
+	input := GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Ownership: map[string]string{resourceID: ownershipDigest}, Now: now}
+	if decision := Guard(input); !decision.Allowed {
+		t.Fatalf("exact committed domain App rejected: %#v", decision)
+	}
+	input.Ownership[resourceID] = testDigest("foreign")
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("ownership-mismatched domain App was allowed")
+	}
+	input.Ownership[resourceID] = ownershipDigest
+	input.Safety.Resources[0].StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 2, Reason: "closed"}
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("sticky-unpublished domain App was reopened")
+	}
+	input.Safety.Resources[0].StickyUnpublished = nil
+	input.Safety.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 2, Deadline: now, Binding: certificate.BindingIdentity}
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("certificate-expired domain App was reopened")
+	}
+}
+
+func TestReloadGuardAllowsExactActivatingDomainAndRejectsStalePlan(t *testing.T) {
+	_, manifest := installTestGraph(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	resourceID := "app-one"
+	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert-one", BindingIdentity: "binding-one", Generation: 1, Fingerprint: testDigest("certificate"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: now.Add(time.Hour).Format(time.RFC3339), LastTrustedWall: now.Add(-time.Minute).Format(time.RFC3339)}
+	bundle := domain.PublicationBundle{ID: "candidate", Generation: 2, ConfigDigest: testDigest("config"), Kind: domain.PublicationDomainHTTPS, EndpointIdentity: testDigest("endpoint"), SiteIdentity: testDigest("site"), ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.test"}, Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
+	entry := Entry{Kind: EntryApp, ResourceID: resourceID, Relative: AppsDirectory + "/app-one.conf", Digest: bundle.SiteIdentity, Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: 2, Domain: &DomainSite{Hosts: []string{"app.example.test"}, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", AuthMode: "public", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel/app-one.sock"}}
+	manifest.Entries = []Entry{entry}
+	intent := domain.ActivationIntent{ID: "activation", JobID: "job-one", PlanID: "plan-one", Generation: 2, Candidate: bundle, PriorState: domain.PublicationUnpublished}
+	app := domain.AppResource{ID: resourceID, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationActivating, UnpublishedGeneration: 1, ActivationIntent: &intent}}
+	candidateDigest, _ := publicationBundleDigest(bundle)
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: resourceID, GenerationSequence: 2, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, Reactivating: &safety.Reactivating{Generation: 2, PriorGeneration: 1, PlanID: intent.PlanID, CandidateDigest: bundle.ConfigDigest, CandidateBundle: candidateDigest, BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotPresent, Generation: 1}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}, CertificateUntil: now.Add(time.Hour)}}}
+	input := GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: &domain.Installation{Resources: []domain.AppResource{app}}, Ownership: map[string]string{resourceID: testDigest("owner")}, Now: now}
+	if decision := Guard(input); !decision.Allowed {
+		t.Fatalf("exact activating domain candidate rejected: %#v", decision)
+	}
+	input.Safety.Resources[0].Reactivating.PlanID = "stale-plan"
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("stale activating Plan authority was allowed")
+	}
+}
+
 func installTestGraph(t *testing.T) (Paths, Manifest) {
 	t.Helper()
 	root := t.TempDir()
@@ -190,6 +246,7 @@ func installTestGraph(t *testing.T) (Paths, Manifest) {
 	writeMode(t, paths.ManifestPath(), manifestBytes, 0o600)
 	return paths, manifest
 }
+
 func writeMode(t *testing.T, path string, data []byte, mode os.FileMode) {
 	t.Helper()
 	if err := os.WriteFile(path, data, mode); err != nil {
@@ -199,6 +256,7 @@ func writeMode(t *testing.T, path string, data []byte, mode os.FileMode) {
 		t.Fatal(err)
 	}
 }
+
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }

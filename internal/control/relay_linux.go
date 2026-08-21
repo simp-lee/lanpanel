@@ -22,7 +22,7 @@ import (
 
 func RunControlRelay(args []string) error {
 	if len(args) != 0 || os.Geteuid() == 0 || os.Getenv("LANPANEL_HEADSCALE_RELAY") != "control-v1" {
-		return fmt.Errorf("Headscale control relay requires fixed non-root PID1 invocation")
+		return fmt.Errorf("headscale control relay requires fixed non-root PID1 invocation")
 	}
 	if err := requireSocketActivation("headscale-control", 1); err != nil {
 		return err
@@ -31,11 +31,11 @@ func RunControlRelay(args []string) error {
 	unixAddress, ok := address.(*unix.SockaddrUnix)
 	accepting, acceptErr := unix.GetsockoptInt(3, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
 	if err != nil || !ok || unixAddress.Name != FixedPaths().ControlSocket || acceptErr != nil || accepting != 1 {
-		return fmt.Errorf("Headscale control relay listener identity changed")
+		return fmt.Errorf("headscale control relay listener identity changed")
 	}
 	var listenerStat unix.Stat_t
 	if unix.Lstat(FixedPaths().ControlSocket, &listenerStat) != nil || listenerStat.Uid == 0 || listenerStat.Mode&unix.S_IFMT != unix.S_IFSOCK || listenerStat.Mode&0o7777 != 0o600 {
-		return fmt.Errorf("Headscale control relay listener owner invalid")
+		return fmt.Errorf("headscale control relay listener owner invalid")
 	}
 	file := os.NewFile(3, "headscale-control")
 	listener, err := net.FileListener(file)
@@ -48,10 +48,10 @@ func RunControlRelay(args []string) error {
 	}
 	frontend, ok := listener.(*net.UnixListener)
 	if !ok {
-		listener.Close()
-		return fmt.Errorf("Headscale control relay frontend is not Unix")
+		_ = listener.Close()
+		return fmt.Errorf("headscale control relay frontend is not Unix")
 	}
-	defer frontend.Close()
+	defer func(ignore func() error) { _ = ignore() }(frontend.Close)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	for {
@@ -75,12 +75,12 @@ func RunControlRelay(args []string) error {
 }
 
 func relayControlConnection(ctx context.Context, frontend *net.UnixConn) {
-	defer frontend.Close()
+	defer func(ignore func() error) { _ = ignore() }(frontend.Close)
 	backend, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp4", ControlBackend)
 	if err != nil {
 		return
 	}
-	defer backend.Close()
+	defer func(ignore func() error) { _ = ignore() }(backend.Close)
 	var wait sync.WaitGroup
 	wait.Add(2)
 	go func() {
@@ -96,7 +96,7 @@ func relayControlConnection(ctx context.Context, frontend *net.UnixConn) {
 
 func RunSTUNRelay(args []string) error {
 	if len(args) != 0 || os.Geteuid() == 0 || os.Getenv("LANPANEL_HEADSCALE_RELAY") != "stun-v1" {
-		return fmt.Errorf("Headscale STUN relay requires fixed non-root PID1 invocation")
+		return fmt.Errorf("headscale STUN relay requires fixed non-root PID1 invocation")
 	}
 	if err := requireSocketActivation("headscale-stun", 1); err != nil {
 		return err
@@ -104,7 +104,7 @@ func RunSTUNRelay(args []string) error {
 	address, err := unix.Getsockname(3)
 	inet, ok := address.(*unix.SockaddrInet4)
 	if err != nil || !ok || inet.Port != 3478 || inet.Addr != [4]byte{} {
-		return fmt.Errorf("Headscale STUN listener identity changed")
+		return fmt.Errorf("headscale STUN listener identity changed")
 	}
 	file := os.NewFile(3, "headscale-stun")
 	packet, err := net.FilePacketConn(file)
@@ -115,7 +115,7 @@ func RunSTUNRelay(args []string) error {
 		}
 		return errors.Join(err, closeErr)
 	}
-	defer packet.Close()
+	defer func(ignore func() error) { _ = ignore() }(packet.Close)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	semaphore := make(chan struct{}, 64)
@@ -148,7 +148,7 @@ func relaySTUNPacket(ctx context.Context, frontend net.PacketConn, peer net.Addr
 	if err != nil {
 		return
 	}
-	defer backend.Close()
+	defer func(ignore func() error) { _ = ignore() }(backend.Close)
 	_ = backend.SetDeadline(time.Now().Add(2 * time.Second))
 	if _, err := backend.Write(payload); err != nil {
 		return
@@ -219,7 +219,7 @@ func rewriteSTUNMappedAddress(response, request []byte, peer net.Addr) error {
 
 func requireSocketActivation(name string, count int) error {
 	if os.Getenv("LISTEN_PID") != fmt.Sprint(os.Getpid()) || os.Getenv("LISTEN_FDS") != fmt.Sprint(count) || os.Getenv("LISTEN_FDNAMES") != name {
-		return fmt.Errorf("Headscale relay socket activation authority changed")
+		return fmt.Errorf("headscale relay socket activation authority changed")
 	}
 	for _, name := range []string{"LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"} {
 		if err := os.Unsetenv(name); err != nil {
@@ -228,6 +228,7 @@ func requireSocketActivation(name string, count int) error {
 	}
 	return nil
 }
+
 func unixPeerUID(connection *net.UnixConn, uid uint32) bool {
 	raw, err := connection.SyscallConn()
 	if err != nil {

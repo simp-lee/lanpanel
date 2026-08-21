@@ -28,6 +28,8 @@ const (
 	PhaseCertificateStaged  Phase = "certificate_staged"
 	PhaseActivationIntent   Phase = "activation_intent"
 	PhaseActivated          Phase = "activated"
+	PhaseCommitted          Phase = "committed"
+	PhaseExpired            Phase = "expired"
 	PhaseContracted         Phase = "contracted"
 )
 
@@ -90,15 +92,15 @@ func NewJournal(installationID, jobID, planID string, intentGeneration uint64, c
 
 func ValidateJournal(value Journal) error {
 	if value.SchemaVersion != JournalSchema || value.InstallationID == "" || value.JobID == "" || value.PlanID == "" || value.IntentGeneration == 0 || Validate(value.Candidate) != nil {
-		return fmt.Errorf("Headscale control journal authority is invalid")
+		return fmt.Errorf("headscale control journal authority is invalid")
 	}
 	candidateDigest, err := Digest(value.Candidate)
 	if err != nil || candidateDigest != value.CandidateDigest {
-		return fmt.Errorf("Headscale control journal candidate changed")
+		return fmt.Errorf("headscale control journal candidate changed")
 	}
 	preflightDigest, err := preflight.ExpansionRequestDigest(value.Preflight)
 	if err != nil || preflightDigest != value.PreflightDigest || value.Preflight.Scope != preflight.ExpansionHeadscale || value.Preflight.Target != "headscale" || value.Preflight.Generation != value.Candidate.DatabaseGeneration {
-		return fmt.Errorf("Headscale control journal preflight changed")
+		return fmt.Errorf("headscale control journal preflight changed")
 	}
 	switch value.Phase {
 	case PhasePrepared:
@@ -113,21 +115,21 @@ func ValidateJournal(value Journal) error {
 		if !validDatabase(value) || !validService(value) || value.Certificate != nil {
 			return fmt.Errorf("service Headscale journal evidence invalid")
 		}
-	case PhaseCertificateStaged, PhaseActivationIntent, PhaseActivated, PhaseContracted:
-		if !validDatabase(value) || !validService(value) || value.Certificate != nil && (certificates.ValidateIdentity(*value.Certificate) != nil || value.Certificate.ID != value.Candidate.CertificateID || value.Certificate.BindingIdentity != value.Candidate.CertificateBinding || !slices.Equal(value.Certificate.Domains, []string{value.Candidate.ControlDomain})) || value.Phase != PhaseContracted && value.Certificate == nil {
+	case PhaseCertificateStaged, PhaseActivationIntent, PhaseActivated, PhaseCommitted, PhaseExpired, PhaseContracted:
+		if !validDatabase(value) || !validService(value) || value.Certificate != nil && (certificates.ValidateIdentity(*value.Certificate) != nil || value.Certificate.ID != value.Candidate.CertificateID || !slices.Equal(value.Certificate.Domains, []string{value.Candidate.ControlDomain})) || value.Phase != PhaseContracted && value.Certificate == nil {
 			return fmt.Errorf("staged or contracted Headscale certificate evidence invalid")
 		}
-		if value.Phase == PhaseCertificateStaged && (value.ActivationDigest != "" || value.RuntimeDigest != "") || value.Phase == PhaseActivationIntent && (!digestValue(value.ActivationDigest) || value.RuntimeDigest != "") || value.Phase == PhaseActivated && (!digestValue(value.ActivationDigest) || !digestValue(value.RuntimeDigest)) || value.Phase == PhaseContracted && (value.ActivationDigest != "" && !digestValue(value.ActivationDigest) || value.RuntimeDigest != "") {
-			return fmt.Errorf("Headscale activation evidence invalid")
+		if value.Phase == PhaseCertificateStaged && (value.ActivationDigest != "" || value.RuntimeDigest != "") || value.Phase == PhaseActivationIntent && (!digestValue(value.ActivationDigest) || value.RuntimeDigest != "") || (value.Phase == PhaseActivated || value.Phase == PhaseCommitted || value.Phase == PhaseExpired) && (!digestValue(value.ActivationDigest) || !digestValue(value.RuntimeDigest)) || value.Phase == PhaseContracted && (value.ActivationDigest != "" && !digestValue(value.ActivationDigest) || value.RuntimeDigest != "") {
+			return fmt.Errorf("headscale activation evidence invalid")
 		}
 		if value.ActivationDigest != "" {
 			bundle, bundleErr := BuildActivation(value.InstallationID, value.Candidate, *value.Certificate)
 			if bundleErr != nil || bundle.Digest != value.ActivationDigest {
-				return fmt.Errorf("Headscale activation bundle evidence changed")
+				return fmt.Errorf("headscale activation bundle evidence changed")
 			}
 		}
 	default:
-		return fmt.Errorf("Headscale control journal phase invalid")
+		return fmt.Errorf("headscale control journal phase invalid")
 	}
 	return nil
 }
@@ -165,11 +167,11 @@ func (store *Store) Replace(ctx context.Context, prior, next Journal) error {
 		return err
 	}
 	if !sameJournalAuthority(prior, next) || !validPhaseAdvance(prior.Phase, next.Phase) {
-		return fmt.Errorf("Headscale control journal transition invalid")
+		return fmt.Errorf("headscale control journal transition invalid")
 	}
 	current, err := store.Read()
 	if err != nil || !reflect.DeepEqual(current, prior) {
-		return fmt.Errorf("Headscale control journal changed before replace")
+		return fmt.Errorf("headscale control journal changed before replace")
 	}
 	data, _ := json.Marshal(next)
 	transaction, err := store.open()
@@ -182,7 +184,7 @@ func (store *Store) Replace(ctx context.Context, prior, next Journal) error {
 
 func (store *Store) Contract(ctx context.Context, prior Journal) (Journal, error) {
 	if err := ValidateJournal(prior); err != nil || (prior.Phase != PhaseCertificatePending && prior.Phase != PhaseCertificateStaged && prior.Phase != PhaseActivationIntent && prior.Phase != PhaseActivated && prior.Phase != PhaseContracted) {
-		return Journal{}, fmt.Errorf("Headscale control journal is not contractible")
+		return Journal{}, fmt.Errorf("headscale control journal is not contractible")
 	}
 	if prior.Phase == PhaseContracted {
 		return prior, nil
@@ -190,6 +192,25 @@ func (store *Store) Contract(ctx context.Context, prior Journal) (Journal, error
 	next := prior
 	next.Phase = PhaseContracted
 	next.RuntimeDigest = ""
+	if err := store.Replace(ctx, prior, next); err != nil {
+		return Journal{}, err
+	}
+	return next, nil
+}
+
+func (store *Store) CommitRenewal(ctx context.Context, prior Journal, certificate certificates.Identity, runtimeDigest string) (Journal, error) {
+	if (prior.Phase != PhaseCommitted && prior.Phase != PhaseExpired) || prior.Certificate == nil || certificate.ID != prior.Certificate.ID || certificate.Generation != prior.Certificate.Generation+1 || !digestValue(runtimeDigest) || certificates.ValidateIdentity(certificate) != nil {
+		return Journal{}, fmt.Errorf("headscale renewal journal authority invalid")
+	}
+	next := prior
+	next.Phase = PhaseCommitted
+	next.Certificate = &certificate
+	bundle, err := BuildActivation(next.InstallationID, next.Candidate, certificate)
+	if err != nil {
+		return Journal{}, err
+	}
+	next.ActivationDigest = bundle.Digest
+	next.RuntimeDigest = runtimeDigest
 	if err := store.Replace(ctx, prior, next); err != nil {
 		return Journal{}, err
 	}
@@ -204,12 +225,12 @@ func (store *Store) Read() (Journal, error) {
 	file := os.NewFile(uintptr(fd), filepath.Base(store.paths.Journal))
 	if file == nil {
 		_ = unix.Close(fd)
-		return Journal{}, fmt.Errorf("Headscale control journal descriptor unavailable")
+		return Journal{}, fmt.Errorf("headscale control journal descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != store.owner.UID || stat.Gid != store.owner.GID || stat.Mode&0o7777 != 0o600 || stat.Size <= 0 || stat.Size > 1<<20 {
-		return Journal{}, fmt.Errorf("Headscale control journal metadata is unsafe")
+		return Journal{}, fmt.Errorf("headscale control journal metadata is unsafe")
 	}
 	data := make([]byte, stat.Size)
 	if _, err := file.ReadAt(data, 0); err != nil {
@@ -217,15 +238,15 @@ func (store *Store) Read() (Journal, error) {
 	}
 	var after unix.Stat_t
 	if unix.Fstat(fd, &after) != nil || stat.Dev != after.Dev || stat.Ino != after.Ino || stat.Size != after.Size || stat.Mtim != after.Mtim {
-		return Journal{}, fmt.Errorf("Headscale control journal changed during read")
+		return Journal{}, fmt.Errorf("headscale control journal changed during read")
 	}
 	var value Journal
 	if json.Unmarshal(data, &value) != nil {
-		return Journal{}, fmt.Errorf("Headscale control journal encoding invalid")
+		return Journal{}, fmt.Errorf("headscale control journal encoding invalid")
 	}
 	canonical, err := json.Marshal(value)
 	if err != nil || !slices.Equal(canonical, data) || ValidateJournal(value) != nil {
-		return Journal{}, fmt.Errorf("Headscale control journal authority invalid")
+		return Journal{}, fmt.Errorf("headscale control journal authority invalid")
 	}
 	return value, nil
 }
@@ -235,20 +256,20 @@ func (store *Store) ensureStaging() error {
 		return err
 	}
 	if filepath.Dir(store.paths.JournalStaging) != store.paths.JournalRoot || filepath.Dir(store.paths.Journal) != store.paths.JournalRoot {
-		return fmt.Errorf("Headscale control journal paths leave fixed state root")
+		return fmt.Errorf("headscale control journal paths leave fixed state root")
 	}
 	parent, err := unix.Open(store.paths.JournalRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	name := filepath.Base(store.paths.JournalStaging)
 	if err := unix.Mkdirat(parent, name, 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
 	var stat unix.Stat_t
 	if unix.Fstatat(parent, name, &stat, unix.AT_SYMLINK_NOFOLLOW) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != store.owner.UID || stat.Gid != store.owner.GID || stat.Mode&0o7777 != 0o700 {
-		return fmt.Errorf("Headscale control journal staging metadata is unsafe")
+		return fmt.Errorf("headscale control journal staging metadata is unsafe")
 	}
 	return unix.Fsync(parent)
 }
@@ -266,6 +287,7 @@ func sameJournalAuthority(left, right Journal) bool {
 	left.RuntimeDigest, right.RuntimeDigest = "", ""
 	return reflect.DeepEqual(left, right)
 }
+
 func validPhaseAdvance(left, right Phase) bool {
-	return left == PhasePrepared && right == PhaseDatabaseCommitted || left == PhaseDatabaseCommitted && right == PhaseServiceStaged || left == PhaseServiceStaged && right == PhaseCertificatePending || left == PhaseCertificatePending && right == PhaseCertificateStaged || left == PhaseCertificateStaged && right == PhaseActivationIntent || left == PhaseActivationIntent && right == PhaseActivated || (left == PhaseCertificatePending || left == PhaseCertificateStaged || left == PhaseActivationIntent || left == PhaseActivated) && right == PhaseContracted
+	return left == PhasePrepared && right == PhaseDatabaseCommitted || left == PhaseDatabaseCommitted && right == PhaseServiceStaged || left == PhaseServiceStaged && right == PhaseCertificatePending || left == PhaseCertificatePending && right == PhaseCertificateStaged || left == PhaseCertificateStaged && right == PhaseActivationIntent || left == PhaseActivationIntent && right == PhaseActivated || left == PhaseActivated && right == PhaseCommitted || left == PhaseCommitted && right == PhaseCommitted || left == PhaseCommitted && right == PhaseExpired || left == PhaseExpired && right == PhaseCommitted || (left == PhaseCertificatePending || left == PhaseCertificateStaged || left == PhaseActivationIntent || left == PhaseActivated) && right == PhaseContracted
 }

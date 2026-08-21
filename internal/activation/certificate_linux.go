@@ -32,7 +32,7 @@ func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.P
 	}
 	prior, err := host.observer(manifest).Observe(ctx)
 	if err != nil || prior.Master == nil {
-		return result, fmt.Errorf("Nginx unavailable for certificate activation")
+		return result, fmt.Errorf("nginx unavailable for certificate activation")
 	}
 	pointerResult, err := certificates.ActivatePointer(ctx, pointer)
 	result.Pointer = pointerResult
@@ -77,7 +77,7 @@ func (host Host) RestoreCertificate(ctx context.Context, pointer certificates.Po
 	}
 	prior, err := host.observer(manifest).Observe(ctx)
 	if err != nil || prior.Master == nil {
-		return fmt.Errorf("Nginx unavailable for certificate restoration")
+		return fmt.Errorf("nginx unavailable for certificate restoration")
 	}
 	if err := certificates.RestorePointer(ctx, pointer, expectedCandidate); err != nil {
 		return err
@@ -98,13 +98,14 @@ func (host Host) VerifyServedCertificate(ctx context.Context, serverName, finger
 	}
 	return probeServedCertificate(ctx, serverName, fingerprint)
 }
+
 func probeServedCertificate(ctx context.Context, serverName, expectedFingerprint string) error {
 	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}}
 	connection, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:443")
 	if err != nil {
 		return fmt.Errorf("probe served certificate: %w", err)
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	state := connection.(*tls.Conn).ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return fmt.Errorf("served certificate missing")

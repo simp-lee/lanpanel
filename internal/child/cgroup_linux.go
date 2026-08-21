@@ -47,6 +47,7 @@ func currentUnifiedCgroupPath() (string, error) {
 	}
 	return filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(path, "/")), nil
 }
+
 func createInvocationCgroup(certificateID string, pid int) (*invocationCgroup, error) {
 	if !strings.HasPrefix(certificateID, "cert_") || len(certificateID) != 37 || pid <= 0 {
 		return nil, fmt.Errorf("lego cgroup identity invalid")
@@ -72,6 +73,7 @@ func createInvocationCgroup(certificateID string, pid int) (*invocationCgroup, e
 	}
 	return &invocationCgroup{path: path}, nil
 }
+
 func (group *invocationCgroup) KillAndRemove() error {
 	if group == nil || group.path == "" {
 		return nil
@@ -106,6 +108,7 @@ func (group *invocationCgroup) KillAndRemove() error {
 	group.path = ""
 	return nil
 }
+
 func closeStaleInvocationCgroups(parent string) error {
 	entries, err := os.ReadDir(parent)
 	if err != nil {
@@ -125,6 +128,7 @@ func closeStaleInvocationCgroups(parent string) error {
 	}
 	return nil
 }
+
 func ObserveExclusiveCurrentCgroup() (string, error) {
 	parent, err := currentUnifiedCgroupPath()
 	if err != nil {

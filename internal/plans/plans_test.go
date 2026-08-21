@@ -103,12 +103,15 @@ func TestImmutablePlans(t *testing.T) {
 func validSpec(now time.Time) Spec {
 	return Spec{Operation: "publish", Target: Target{Kind: TargetResource, ID: "app-one"}, ActorIdentity: "session-one", Config: DigestBinding{Applicable: true, Digest: digestFor("config")}, Applied: DigestBinding{Applicable: true, Digest: digestFor("applied")}, Evidence: []Evidence{{Kind: "config", Identity: "app-one", Generation: 1, Digest: digestFor("evidence"), ObservedAt: now}}, ExposureSummary: "expands_ingress", Prerequisites: "qualified", Lifetime: MaximumLifetime}
 }
+
 func bindingFor(plan Plan) Binding {
 	return Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: append([]Evidence(nil), plan.Evidence...)}
 }
+
 func digestFor(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }
+
 func newPlanNormalStore(t *testing.T) (*persist.Store, *locks.Manager, *locks.Lease) {
 	t.Helper()
 	root := t.TempDir()
@@ -135,6 +138,7 @@ func newPlanNormalStore(t *testing.T) (*persist.Store, *locks.Manager, *locks.Le
 	}
 	return normal, manager, admission
 }
+
 func closePlanNormalStore(t *testing.T, normal *persist.Store, manager *locks.Manager, admission *locks.Lease) {
 	t.Helper()
 	if err := normal.Close(); err != nil {

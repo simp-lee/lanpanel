@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/operations"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
@@ -16,16 +18,66 @@ import (
 	"time"
 )
 
+func TestInterruptedHeadscaleChallengeMatchesExactDeployAndRenewalBindings(t *testing.T) {
+	headscale := *headscaleDeployInstallation().Headscale
+	headscale.Applied = &domain.HeadscaleAppliedIdentity{ConfigDigest: deployTestDigest("applied-config")}
+	pending := safety.ChallengePending{Generation: 7, PlanID: "plan_renew", Method: "http-01", ConfigDigest: headscale.Applied.ConfigDigest, SANIdentity: deployTestDigest("san"), ACMEBinding: deployTestDigest("binding"), CertificateIdentity: "cert_00000000000000000000000000000001"}
+	common := operations.SafetyBinding{PlanID: pending.PlanID, IntentGeneration: pending.Generation, ChallengeMethod: pending.Method, CertificateIdentity: pending.CertificateIdentity}
+	renew := operations.Reservation{Operation: operations.CertificateRenew, Target: "headscale/" + headscale.ID, SafetyBinding: common}
+	renew.SafetyBinding.CandidateDigest = pending.SANIdentity
+	renew.SafetyBinding.CandidateBundle = pending.ACMEBinding
+	if !interruptedHeadscaleChallengeIntentMatches(renew, pending, headscale) {
+		t.Fatal("exact interrupted Headscale renewal binding did not match")
+	}
+	legacyWrong := renew
+	legacyWrong.SafetyBinding.CandidateDigest = pending.ConfigDigest
+	legacyWrong.SafetyBinding.CandidateBundle = ""
+	legacyWrong.SafetyBinding.ACMEBinding = pending.ACMEBinding
+	if interruptedHeadscaleChallengeIntentMatches(legacyWrong, pending, headscale) {
+		t.Fatal("renewal matched deploy-only safety fields")
+	}
+	deploy := operations.Reservation{Operation: operations.HeadscaleDeploy, Target: "headscale/" + headscale.ID, SafetyBinding: common, HeadscaleDeploy: &operations.HeadscaleDeployBinding{Candidate: control.Candidate{HeadscaleID: headscale.ID}}}
+	deploy.SafetyBinding.CandidateDigest = pending.ConfigDigest
+	deploy.SafetyBinding.ACMEBinding = pending.ACMEBinding
+	if !interruptedHeadscaleChallengeIntentMatches(deploy, pending, headscale) {
+		t.Fatal("exact interrupted Headscale deploy binding did not match")
+	}
+	deploy.Target = "headscale/hds_wrong"
+	if interruptedHeadscaleChallengeIntentMatches(deploy, pending, headscale) {
+		t.Fatal("wrong Headscale target matched interrupted challenge")
+	}
+}
+
+func TestHeadscaleReissuePlanSafetyEvidenceChangesWithExpiryGeneration(t *testing.T) {
+	now := time.Now().UTC()
+	state := safety.EmptyState()
+	state.Headscale.ControlEntryDigest = deployTestDigest("control")
+	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: deployTestDigest("certificate"), Binding: "binding", LastTrustedWall: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
+	before, err := headscaleReissueSafetyEvidence(state, "hds_00000000000000000000000000000001", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Headscale.GenerationSequence = 1
+	state.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: 1, Deadline: now, Binding: "binding"}
+	after, err := headscaleReissueSafetyEvidence(state, "hds_00000000000000000000000000000001", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Digest == after.Digest || before.Generation == after.Generation {
+		t.Fatal("Headscale reissue Plan did not bind expiry generation")
+	}
+}
+
 func TestHeadscaleDeployPlanBindsFirstCertificateAndPublicScope(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	installation := headscaleDeployInstallation()
-	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/var/lib/lanpanel/credentials/acme-account.key", AccountKeyFingerprint: deployTestDigest("account"), Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}, AccountEmail: "admin@example.test", TermsAccepted: true}
+	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: deployTestDigest("account"), Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}, AccountEmail: "admin@example.test", TermsAccepted: true}
 	request, result := headscaleDeployPreflight(t, now)
 	authority, err := buildHeadscaleDeployAuthority(installation, binding, "cert_00000000000000000000000000000001", "ui/session/generation/1", request, result, safety.EmptyState(), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if authority.Spec.Operation != string(domain.OperationDeploy) || authority.Spec.Target.Kind != plans.TargetHeadscale || authority.Spec.Target.ID != installation.Headscale.ID || !authority.Spec.Config.Applicable || authority.Spec.Config.Digest != authority.Rendered.Candidate.ConfigDigest || authority.Spec.Applied.Applicable {
+	if authority.Spec.Operation != string(domain.OperationHeadscaleControlDeploy) || authority.Spec.Target.Kind != plans.TargetHeadscale || authority.Spec.Target.ID != installation.Headscale.ID || !authority.Spec.Config.Applicable || authority.Spec.Config.Digest != authority.Rendered.Candidate.ConfigDigest || authority.Spec.Applied.Applicable {
 		t.Fatalf("Headscale Plan spec=%+v", authority.Spec)
 	}
 	if !strings.Contains(authority.Spec.ExposureSummary, "80/tcp,443/tcp,3478/udp") || strings.Contains(authority.Spec.ExposureSummary, binding.AccountKeyPath) || !strings.Contains(authority.Spec.Prerequisites, "first real control certificate") {
@@ -98,6 +150,7 @@ func headscaleDeployPreflight(t *testing.T, now time.Time) (preflight.ExpansionR
 	}
 	return request, result
 }
+
 func deployTestDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])

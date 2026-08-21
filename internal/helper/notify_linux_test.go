@@ -14,7 +14,7 @@ func TestSystemdReadinessUsesOnlyExactUnixDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	if err := notifySystemd(path); err != nil {
 		t.Fatal(err)
 	}

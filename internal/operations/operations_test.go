@@ -69,9 +69,9 @@ func (store *fakeSafety) Read() (safety.State, error) { return store.state, stor
 func TestSecretFingerprintBindingIsDurableAndImmutable(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	normal, manager, admission, mutationSet := newOperationStores(t)
-	defer normal.Close()
-	defer mutationSet.Close()
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(normal.Close)
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{1}, 64))})
 	spec := plans.Spec{Operation: string(AdminTokenRotate), Target: plans.Target{Kind: plans.TargetInstallation}, ActorIdentity: "ui/session-one/generation/1", Config: plans.DigestBinding{}, Applied: plans.DigestBinding{}, Evidence: []plans.Evidence{}, ExposureSummary: "admin_token_rotation", Prerequisites: "authenticated_confirmation"}
 	plan, err := planStore.Create(context.Background(), admission, 1, spec)
@@ -163,9 +163,9 @@ func TestOperationAdmissionContract(t *testing.T) {
 	t.Run("reservation_consumption_and_remote_wait_release_locks", func(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()
 		normal, manager, admission, mutation := newOperationStores(t)
-		defer normal.Close()
-		defer mutation.Close()
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(normal.Close)
+		defer func(ignore func() error) { _ = ignore() }(mutation.Close)
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{1}, 64))})
 		spec := operationPlanSpec(now)
 		plan, err := planStore.Create(context.Background(), admission, 1, spec)
@@ -385,10 +385,10 @@ func TestOperationAdmissionContract(t *testing.T) {
 	t.Run("reservation_after_safety_race_is_terminalized_without_mutation", func(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()
 		normal, manager, admission, mutation := newOperationStores(t)
-		defer manager.Close()
-		defer admission.Release()
-		defer mutation.Close()
-		defer normal.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
+		defer func(ignore func() error) { _ = ignore() }(admission.Release)
+		defer func(ignore func() error) { _ = ignore() }(mutation.Close)
+		defer func(ignore func() error) { _ = ignore() }(normal.Close)
 		planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{3}, 64))})
 		plan, err := planStore.Create(context.Background(), admission, 1, operationPlanSpec(now))
 		if err != nil {
@@ -413,9 +413,9 @@ func TestOperationAdmissionContract(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()
 		clock := now
 		normal, manager, admission, mutation := newOperationStores(t)
-		defer normal.Close()
-		defer mutation.Close()
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(normal.Close)
+		defer func(ignore func() error) { _ = ignore() }(mutation.Close)
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return clock }, Random: bytes.NewReader(bytes.Repeat([]byte{5}, 64))})
 		plan, err := planStore.Create(context.Background(), admission, 1, operationPlanSpec(now))
 		if err != nil {
@@ -452,11 +452,6 @@ func TestOperationAdmissionContract(t *testing.T) {
 
 	t.Run("marker_matrix_allows_only_exact_contraction_exceptions", func(t *testing.T) {
 		state := safety.EmptyState()
-		state.MaintenancePending = &safety.TransitionMarker{Generation: 1, JournalRef: "maintenance", CurrentEnvelope: testDigest("current"), TargetEnvelope: testDigest("target"), Deadline: time.Now().Add(time.Hour)}
-		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
-			t.Fatal("ordinary publish crossed maintenance")
-		}
-		state = safety.EmptyState()
 		state.StopFence = &safety.StopFence{Kind: safety.StopFenceContraction, FenceGeneration: 7}
 		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
 			t.Fatal("normal admission crossed a stop fence")
@@ -467,37 +462,30 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err := validateAdmissionSource(StartupContraction, AdmissionPlan, "plan"); err == nil {
 			t.Fatal("startup contraction was exposed through Plan admission")
 		}
-		if err := validateAdmissionSource(Upgrade, AdmissionPlan, "plan"); err == nil {
-			t.Fatal("generation upgrade was exposed through ordinary management Plan admission")
-		}
 		if err := validateSafetyTargetBinding(AdmitRequest{Operation: Publish, Target: "resource/app-a", PlanID: "plan", Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "app-b"}}); err == nil {
 			t.Fatal("resource target was admitted under another resource's safety authority")
 		}
 		state = safety.EmptyState()
-		state.DependencyTransitionPending = &safety.TransitionMarker{Generation: 3}
 		deadline := time.Now().UTC().Add(-time.Minute)
 		state.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 4, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: testDigest("certificate"), Binding: "certificate", LastTrustedWall: deadline.Add(-time.Hour), NotAfter: deadline}, CertificateExpiry: &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}}}
-		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, false, time.Now()); err != nil {
+		if err := authorize(CertificateExpiry, state, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, false, time.Now()); err != nil {
 			t.Fatalf("deadline contraction exception rejected: %v", err)
 		}
 		futureDeadline := time.Now().UTC().Add(time.Hour)
 		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 5, Deadline: futureDeadline, Binding: "future"}
 		state.Resources[0].GenerationSequence = 5
-		if err := authorize(CertificateExpiry, state, SafetyBinding{DependencyGeneration: 3, ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 5, Deadline: futureDeadline}, false, time.Now()); err == nil {
+		if err := authorize(CertificateExpiry, state, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 5, Deadline: futureDeadline}, false, time.Now()); err == nil {
 			t.Fatal("timer expiry contracted before its bound deadline")
 		}
 		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}
 		state.Resources[0].GenerationSequence = 4
-		if err := authorize(Publish, state, SafetyBinding{}, false, time.Now()); err == nil {
-			t.Fatal("publish crossed dependency transition")
-		}
 		independent, _, independentManager := unavailableProof(t)
 		independentSafety := independent.safety.(*fakeSafety)
 		exposure, err := independentManager.Acquire(context.Background(), locks.Exposure)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer exposure.Release()
+		defer func(ignore func() error) { _ = ignore() }(exposure.Release)
 		fresh := func() persist.UnavailableProof {
 			proof, err := independent.normal.ProveUnavailable()
 			if err != nil {
@@ -507,12 +495,12 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		independentSafety.state = state
 		expiryRequest, expiryPreflight := contractionPreflight(preflight.ContractionExpiry, "resource/res_00000000000000000000000000000001", 4, time.Now().UTC())
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		wrongGeneration := expiryPreflight
 		wrongGeneration.Generation++
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, wrongGeneration, fresh(), exposure, func(bool) error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, wrongGeneration, fresh(), exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("state-independent contraction accepted mismatched safety generation")
 		}
 		emergency := safety.EmptyState()
@@ -527,15 +515,8 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if !fallbackCalled {
 			t.Fatal("fallback-stop authority was not delivered to the contraction owner")
 		}
-		edge := safety.EmptyState()
-		edge.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 5, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), EdgeOne: safety.EdgeOneSafety{Expiry: &safety.DeadlineMarker{Generation: 5, Deadline: deadline, Binding: "edgeone"}}}}
-		independentSafety.state = edge
-		edgeExpiryRequest, edgeExpiryPreflight := contractionPreflight(preflight.ContractionExpiry, "resource/res_00000000000000000000000000000001", 5, time.Now().UTC())
-		if err := independent.AuthorizeStateIndependentContraction(EdgeOneExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "edgeone_expiry", ExpiryGeneration: 5, Deadline: deadline}, edgeExpiryRequest, edgeExpiryPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
-			t.Fatal(err)
-		}
 		startup := safety.EmptyState()
-		startup.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 6, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), Reactivating: &safety.Reactivating{Generation: 6, PriorGeneration: 5, PlanID: "plan", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle"), BaseMarkers: absentSafetySnapshot(), CertificateUntil: time.Now().Add(time.Hour), ACLUntil: time.Now().Add(time.Hour)}}}
+		startup.Resources = []safety.ResourceSafety{{ResourceID: "res_00000000000000000000000000000001", GenerationSequence: 6, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), Reactivating: &safety.Reactivating{Generation: 6, PriorGeneration: 5, PlanID: "plan", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle"), BaseMarkers: absentSafetySnapshot(), CertificateUntil: time.Now().Add(time.Hour)}}}
 		independentSafety.state = startup
 		startupRequest, startupPreflight := contractionPreflight(preflight.ContractionStartup, "resource/res_00000000000000000000000000000001", 6, time.Now().UTC())
 		if err := independent.AuthorizeStateIndependentContraction(StartupContraction, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan", IntentGeneration: 6, CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("bundle")}, startupRequest, startupPreflight, fresh(), exposure, func(bool) error { return nil }); err != nil {
@@ -546,66 +527,8 @@ func TestOperationAdmissionContract(t *testing.T) {
 		}
 		_, otherProof, _ := unavailableProof(t)
 		independentSafety.state = state
-		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryKind: "certificate_expiry", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, otherProof, exposure, func(bool) error { return nil }); err == nil {
+		if err := independent.AuthorizeStateIndependentContraction(CertificateExpiry, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: "certificate"}, expiryRequest, expiryPreflight, otherProof, exposure, func(bool) error { return nil }); err == nil {
 			t.Fatal("unavailability proof from another store was accepted")
-		}
-	})
-
-	t.Run("admission_retaining_handoff_rechecks_empty_inventory", func(t *testing.T) {
-		normal, manager, admission, mutation := newOperationStores(t)
-		defer normal.Close()
-		defer mutation.Close()
-		defer manager.Close()
-		defer admission.Release()
-		handoffAdmitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := mutation.AcquireExposure(context.Background(), "installation", manager); err == nil {
-			t.Fatal("ordinary mutation retained the admission lock into exposure acquisition")
-		}
-		committed := false
-		err = handoffAdmitter.FencedHandoff(context.Background(), admission, mutation, manager, HandoffBackupEnter, "installation", "", func(m *MutationLease, e *locks.Lease) error {
-			committed = m.Active() && e.Holds(locks.Exposure)
-			return nil
-		})
-		if err != nil || !committed {
-			t.Fatalf("FencedHandoff() committed=%v err=%v", committed, err)
-		}
-		otherRoot := t.TempDir()
-		_ = os.Chmod(otherRoot, 0o700)
-		otherManager, err := locks.Open(locks.Config{RootPath: otherRoot, Owner: uint32(os.Geteuid()), Group: uint32(os.Getegid()), Mode: 0o700})
-		if err != nil {
-			t.Fatal(err)
-		}
-		otherAdmission, err := otherManager.Acquire(context.Background(), locks.MutationAdmission)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := handoffAdmitter.FencedHandoff(context.Background(), otherAdmission, mutation, manager, HandoffBackupEnter, "installation", "", func(*MutationLease, *locks.Lease) error { return nil }); err == nil {
-			t.Fatal("unrelated admission authority entered handoff")
-		}
-		_ = otherAdmission.Release()
-		_ = otherManager.Close()
-		now := time.Unix(1700000000, 0).UTC()
-		planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{8}, 64))})
-		document, _ := normal.Read()
-		plan, err := planStore.Create(context.Background(), admission, document.Revision, operationPlanSpec(now))
-		if err != nil {
-			t.Fatal(err)
-		}
-		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
-		admitter, _ := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{9}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		document, _ = normal.Read()
-		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: document.Revision}); err != nil {
-			t.Fatal(err)
-		}
-		err = handoffAdmitter.FencedHandoff(context.Background(), admission, mutation, manager, HandoffMaintenance, "installation", "", func(*MutationLease, *locks.Lease) error {
-			t.Fatal("fence committed with nonterminal inventory")
-			return nil
-		})
-		if err == nil {
-			t.Fatal("nonterminal inventory was accepted")
 		}
 	})
 }
@@ -947,7 +870,7 @@ func operationUnitIdentities(label string) []string {
 }
 
 func domainBundleForRetirement(configDigest string) domain.PublicationBundle {
-	return domain.PublicationBundle{ID: "pub_2_00000000000000000000000000000001", Generation: 2, ConfigDigest: configDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest("service"), RetiredUnitIdentities: operationUnitIdentities("service")}, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
+	return domain.PublicationBundle{ID: "pub_2_00000000000000000000000000000001", Generation: 2, ConfigDigest: configDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest("service"), RetiredUnitIdentities: operationUnitIdentities("service")}}}
 }
 
 func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T) {
@@ -955,7 +878,7 @@ func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T
 	installation := operationStateInstallation()
 	resource := &installation.Resources[0]
 	resource.PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}, EdgeOne: domain.EdgeOneBundleIdentity{Enabled: false}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
 	resource.PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	resource.PublicationRecord.LastAppliedBundle = &bundle
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
@@ -1002,11 +925,8 @@ func TestPlanBoundCertificateChallengeStartsAcrossMatchingBaseMarker(t *testing.
 	if err := authorize(Publish, state, ordinary, true, time.Now().UTC()); err == nil {
 		t.Fatal("ordinary publish crossed sticky marker")
 	}
-	state.Resources[0].EdgeOne.Expiry = &safety.DeadlineMarker{Generation: 5, Deadline: time.Now().UTC(), Binding: "edge"}
-	if err := authorize(Publish, state, binding, true, time.Now().UTC()); err == nil {
-		t.Fatal("HTTP challenge crossed EdgeOne expiry")
-	}
 }
+
 func TestCertificatePublicationHandoffTransitionIsExact(t *testing.T) {
 	old := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: "job_00000000000000000000000000000000", PlanID: "plan_0000000000000000000000000000000", OperationBinding: testDigest("acme"), JournalSafetyDigest: testDigest("challenge-safety"), AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/res_00000000000000000000000000000001", Phase: PhaseReentered, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan_0000000000000000000000000000000", IntentGeneration: 2, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), Deadline: time.Now().UTC().Add(time.Hour)}, CreatedAt: time.Now().UTC(), IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: time.Now().UTC(), SafetyDigest: testDigest("safety")}}
 	next := old
@@ -1031,6 +951,7 @@ func TestCertificatePublicationHandoffTransitionIsExact(t *testing.T) {
 		t.Fatal("rewritten certificate handoff accepted")
 	}
 }
+
 func TestInterruptedCertificateRemoteWaitTerminalizesOnlyAfterContraction(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	installation := operationStateInstallation()
@@ -1227,7 +1148,6 @@ func absentSafetySnapshot() []safety.MarkerSnapshot {
 		{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent},
 		{Kind: safety.MarkerContraction, State: safety.SnapshotAbsent},
 		{Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent},
-		{Kind: safety.MarkerEdgeOneExpiry, State: safety.SnapshotAbsent},
 	}
 }
 
@@ -1251,9 +1171,9 @@ func testRegistry(t *testing.T) *Registry {
 }
 
 func TestExactHeadscaleCertificateChallengeAuthority(t *testing.T) {
-	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("candidate"), ACMEBinding: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
+	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
 	state := safety.EmptyState()
-	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, ConfigDigest: binding.CandidateDigest, ACMEBinding: binding.ACMEBinding, CertificateIdentity: binding.CertificateIdentity}
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
 	if !exactCertificateChallenge(state, binding) {
 		t.Fatal("exact Headscale challenge rejected")
 	}
@@ -1266,9 +1186,9 @@ func TestExactHeadscaleCertificateChallengeAuthority(t *testing.T) {
 func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	normal, manager, admission, mutationSet := newOperationStores(t)
-	defer normal.Close()
-	defer mutationSet.Close()
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(normal.Close)
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	table, err := NewBranchTable([]ResultBranch{{"complete", jobs.ResultSucceeded, jobs.PostconditionVerified}, {"no_effect", jobs.ResultFailed, jobs.PostconditionVerified}, {"known_residual", jobs.ResultPartial, jobs.PostconditionKnown}, {"executor_died", jobs.ResultInterrupted, jobs.PostconditionKnown}, {"source_unknown", jobs.ResultUnknown, jobs.PostconditionUnobserved}})
 	if err != nil {
 		t.Fatal(err)
@@ -1334,6 +1254,7 @@ func operationPlanSpec(now time.Time) plans.Spec {
 		{Kind: preflight.ExpansionEvidencePrefix + string(preflight.ExpansionDomainHTTPS), Identity: "resource/res_00000000000000000000000000000001", Generation: 1, Digest: testDigest("preflight"), ObservedAt: now},
 	}, ExposureSummary: "expands_ingress", Prerequisites: "qualified"}
 }
+
 func testDigestBytes(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])
@@ -1342,6 +1263,7 @@ func testDigestBytes(value []byte) string {
 func testDigest(seed string) string {
 	return "sha256:" + strings.Repeat(string("abcdef0123456789"[len(seed)%16]), 64)
 }
+
 func operationStateInstallation() domain.Installation {
 	return domain.Installation{
 		SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001",
@@ -1357,11 +1279,45 @@ func operationStateInstallation() domain.Installation {
 	}
 }
 
+func TestHeadscaleRenewalAdmissionAndChallengeBindingAreExact(t *testing.T) {
+	if err := validateAdmissionSource(CertificateRenew, AdmissionPlan, "plan_renew"); err != nil {
+		t.Fatal(err)
+	}
+	state := safety.EmptyState()
+	state.Headscale.GenerationSequence = 7
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 7, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
+	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_renew", IntentGeneration: 7, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("binding"), CertificateIdentity: state.Headscale.ChallengePending.CertificateIdentity}
+	if !exactCertificateChallenge(state, binding) {
+		t.Fatal("exact Headscale renewal challenge binding rejected")
+	}
+	binding.CandidateBundle = testDigest("other")
+	if exactCertificateChallenge(state, binding) {
+		t.Fatal("changed Headscale renewal binding accepted")
+	}
+}
+
+func TestHeadscaleCertificateExpiryProposalUsesIndependentActiveAuthority(t *testing.T) {
+	now := time.Now().UTC()
+	state := safety.EmptyState()
+	state.Headscale.GenerationSequence = 3
+	state.Headscale.ControlEntryDigest = testDigest("control")
+	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 2, Fingerprint: testDigest("certificate"), Binding: "binding", LastTrustedWall: now.Add(-time.Hour), NotAfter: now}
+	binding := SafetyBinding{ResourceID: "headscale", ExpiryGeneration: 4, Deadline: now, CandidateBundle: "binding"}
+	if !validExpiryProposal(CertificateExpiry, state, binding, now) {
+		t.Fatal("first Headscale certificate expiry proposal rejected")
+	}
+	binding.ExpiryGeneration++
+	if validExpiryProposal(CertificateExpiry, state, binding, now) {
+		t.Fatal("stale Headscale expiry generation accepted")
+	}
+}
+
 func testOperationInstallation() domain.Installation {
 	installation := operationStateInstallation()
 	installation.Resources[0].CurrentConfigDigest = testDigest("operation-config")
 	return installation
 }
+
 func newOperationStores(t *testing.T) (*persist.Store, *locks.Manager, *locks.Lease, *MutationSet) {
 	t.Helper()
 	root := t.TempDir()

@@ -38,26 +38,26 @@ func AcquireOwnerLocks(ctx context.Context, root string, provider DNSProvider, z
 	result := &OwnerLocks{Owners: owners, Binding: binding}
 	for _, owner := range owners {
 		if owner != zone && !strings.HasSuffix(owner, "."+zone) {
-			result.Close()
+			_ = result.Close()
 			return nil, fmt.Errorf("DNS owner outside zone")
 		}
 		sum := sha256.Sum256([]byte(string(provider) + "\x00" + zone + "\x00" + owner))
 		path := filepath.Join(root, "dns-owner-"+hex.EncodeToString(sum[:])+".lock")
 		fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 		if err != nil {
-			result.Close()
+			_ = result.Close()
 			return nil, err
 		}
 		file := os.NewFile(uintptr(fd), path)
 		if file == nil {
-			unix.Close(fd)
-			result.Close()
+			_ = unix.Close(fd)
+			_ = result.Close()
 			return nil, fmt.Errorf("DNS owner lock descriptor invalid")
 		}
 		var stat unix.Stat_t
 		if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 {
-			file.Close()
-			result.Close()
+			_ = file.Close()
+			_ = result.Close()
 			return nil, fmt.Errorf("DNS owner lock file unsafe")
 		}
 		for {
@@ -65,14 +65,14 @@ func AcquireOwnerLocks(ctx context.Context, root string, provider DNSProvider, z
 				break
 			}
 			if !errors.Is(err, syscall.EWOULDBLOCK) {
-				file.Close()
-				result.Close()
+				_ = file.Close()
+				_ = result.Close()
 				return nil, err
 			}
 			select {
 			case <-ctx.Done():
-				file.Close()
-				result.Close()
+				_ = file.Close()
+				_ = result.Close()
 				return nil, ctx.Err()
 			case <-time.After(10 * time.Millisecond):
 			}
@@ -81,6 +81,7 @@ func AcquireOwnerLocks(ctx context.Context, root string, provider DNSProvider, z
 	}
 	return result, nil
 }
+
 func (locks *OwnerLocks) Close() error {
 	if locks == nil {
 		return nil

@@ -47,19 +47,21 @@ const (
 	ManagedBasicDelete       Type = "managed_basic_delete"
 	StaticRootRegister       Type = "static_root_register"
 	ExternalHTPasswdRegister Type = "external_htpasswd_register"
-	EdgeOneExpiry            Type = "edgeone_expiry"
-	Maintenance              Type = "maintenance"
-	PackageTransaction       Type = "package_transaction"
 	AdminTokenRotate         Type = "admin_token_rotate"
-	Upgrade                  Type = "upgrade"
-	BackupEnter              Type = "backup_enter"
 	AutomaticReconciliation  Type = "automatic_exact_journal_reconciliation"
 	StartupContraction       Type = "startup_activation_contraction"
 	GoAccessRetirement       Type = "goaccess_retirement_reconciliation"
 	HeadscaleInitialize      Type = "headscale_initialize"
-	HeadscaleDeploy          Type = "deploy"
+	HeadscaleDeploy          Type = "headscale_control_deploy"
+	HeadscaleUserCreate      Type = "headscale_user_create"
+	PreauthKeyCreate         Type = "preauth_key_create"
+	PreauthKeyRevoke         Type = "preauth_key_revoke"
+	DeviceExpire             Type = "device_expire"
+	ConnectorBindingSet      Type = "connector_binding_set"
+	ConnectorLogin           Type = "connector_login"
 	ResourceCreate           Type = "resource_create"
 	ResourceUpdate           Type = "resource_update"
+	ResourceDelete           Type = "resource_delete"
 	ProcessStart             Type = "process_start"
 	ProcessStop              Type = "process_stop"
 )
@@ -84,8 +86,6 @@ const (
 
 type SafetyBinding struct {
 	GlobalGeneration        uint64                              `json:"global_generation,omitempty"`
-	DependencyGeneration    uint64                              `json:"dependency_generation,omitempty"`
-	ExpiryKind              string                              `json:"expiry_kind,omitempty"`
 	ExpiryGeneration        uint64                              `json:"expiry_generation,omitempty"`
 	ResourceID              string                              `json:"resource_id,omitempty"`
 	Deadline                time.Time                           `json:"deadline"`
@@ -197,6 +197,11 @@ type HeadscaleActivatedCommit struct {
 	RuntimeDigest string
 	Applied       domain.HeadscaleAppliedIdentity
 }
+type HeadscaleDeployCompleteCommit struct {
+	HeadscaleID   string
+	Certificate   domain.CertificateBundleIdentity
+	RuntimeDigest string
+}
 
 type ResourceCreateCommit struct {
 	Resource domain.AppResource
@@ -255,8 +260,6 @@ type JournalKind string
 type JournalPhase string
 
 const (
-	JournalNonIngressLocalCommit JournalKind = "non_ingress_local_commit"
-	JournalPackageTransaction    JournalKind = "package_transaction"
 	JournalAppContraction        JournalKind = "app_contraction"
 	JournalAppActivation         JournalKind = "app_activation"
 	JournalCertificateActivation JournalKind = "certificate_activation"
@@ -289,6 +292,7 @@ type JournalRecord struct {
 	Deadline           time.Time                   `json:"deadline"`
 	ArtifactDigest     string                      `json:"artifact_digest"`
 	SafetyMarkerDigest string                      `json:"safety_marker_digest"`
+	RuntimeDigest      string                      `json:"runtime_digest,omitempty"`
 	ResourceIDs        []string                    `json:"resource_ids,omitempty"`
 	ChildIDs           []string                    `json:"child_ids"`
 	Phase              JournalPhase                `json:"phase"`
@@ -446,6 +450,7 @@ func (admitter *Admitter) trustedNow() (time.Time, error) {
 	admitter.lastTrusted = now
 	return now, nil
 }
+
 func (admitter *Admitter) independentNow() (time.Time, error) {
 	admitter.timeMu.Lock()
 	defer admitter.timeMu.Unlock()
@@ -456,6 +461,7 @@ func (admitter *Admitter) independentNow() (time.Time, error) {
 	admitter.lastTrusted = now
 	return now, nil
 }
+
 func latestDocumentTime(document persist.Document) (time.Time, error) {
 	latest := time.Time{}
 	take := func(value time.Time) {
@@ -758,7 +764,7 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 			return fmt.Errorf("phase intent generation must equal the fresh normal-state revision")
 		}
 		if !planOperationMatches(reservation.Operation, binding.Operation) || reservation.Target != planTarget(binding.Target) {
-			return fmt.Errorf("Plan does not match the reserved operation target")
+			return fmt.Errorf("plan does not match the reserved operation target")
 		}
 		if _, err := plans.Consume(transaction, reservation.PlanID, reservation.JobID, binding, observedNow); err != nil {
 			return err
@@ -970,7 +976,7 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 		if err != nil {
 			return err
 		}
-		if (reservation.Phase != PhaseLocalIntent && reservation.Phase != PhaseReentered) || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew) && (reservation.AdmissionSource != AdmissionUI || reservation.Operation != HeadscaleInitialize)) {
+		if (reservation.Phase != PhaseLocalIntent && reservation.Phase != PhaseReentered) || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew) && (reservation.AdmissionSource != AdmissionUI || reservation.Operation != HeadscaleInitialize && reservation.Operation != HeadscaleUserCreate)) {
 			return fmt.Errorf("remote wait requires Plan issuance or timer renewal authority")
 		}
 		reservation.Phase = PhaseRemoteWait
@@ -989,7 +995,7 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 
 func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID, childID, closureDigest string) (Reservation, ChildRecord, *MutationLease, *locks.Lease, error) {
 	if admitter == nil || mutationSet == nil || manager == nil || !exactDigest(closureDigest) {
-		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge contraction authority is invalid")
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("headscale challenge contraction authority is invalid")
 	}
 	observedNow, err := admitter.trustedNow()
 	if err != nil {
@@ -1000,12 +1006,13 @@ func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Conte
 		return Reservation{}, ChildRecord{}, nil, nil, errors.Join(err, persist.ErrRevision)
 	}
 	intent, err := loadReservationEntries(document.Entries, jobID)
-	if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || intent.Consumption == nil || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered && intent.Phase != PhaseTerminal) {
-		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge is not contraction-recoverable")
+	recoverable := intent.Operation == HeadscaleDeploy && intent.HeadscaleDeploy != nil || intent.Operation == CertificateRenew && strings.HasPrefix(intent.Target, "headscale/")
+	if err != nil || !recoverable || intent.Consumption == nil || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered && intent.Phase != PhaseTerminal) {
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("headscale challenge is not contraction-recoverable")
 	}
 	state, err := admitter.safety.Read()
 	if err != nil || !exactCertificateChallenge(state, intent.SafetyBinding) {
-		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("Headscale challenge contraction safety authority changed")
+		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("headscale challenge contraction safety authority changed")
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
 	if err != nil {
@@ -1027,15 +1034,15 @@ func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Conte
 	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		fresh, err := loadReservation(transaction, jobID)
 		if err != nil || !reflect.DeepEqual(fresh, intent) {
-			return errors.Join(err, fmt.Errorf("Headscale contraction intent changed"))
+			return errors.Join(err, fmt.Errorf("headscale contraction intent changed"))
 		}
 		rawChild, present := transaction.Get("children/" + childID)
 		if !present {
-			return fmt.Errorf("Headscale contraction child is missing")
+			return fmt.Errorf("headscale contraction child is missing")
 		}
 		var current ChildRecord
-		if err := decodeStrict(rawChild, &current); err != nil || current.ID != childID || current.JobID != jobID || current.Operation != HeadscaleDeploy || current.Target != fresh.Target || current.IntentGeneration != fresh.IntentGeneration {
-			return fmt.Errorf("Headscale contraction child authority changed")
+		if err := decodeStrict(rawChild, &current); err != nil || current.ID != childID || current.JobID != jobID || current.Operation != fresh.Operation || current.Target != fresh.Target || current.IntentGeneration != fresh.IntentGeneration {
+			return fmt.Errorf("headscale contraction child authority changed")
 		}
 		if current.State != ChildTerminal {
 			current.State = ChildTerminal
@@ -1071,7 +1078,7 @@ func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Conte
 
 func (admitter *Admitter) ContractHeadscaleDeployChallenge(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, journalID string) error {
 	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
-		return fmt.Errorf("Headscale challenge terminal contraction requires exact locks")
+		return fmt.Errorf("headscale challenge terminal contraction requires exact locks")
 	}
 	observedNow, err := admitter.trustedNow()
 	if err != nil {
@@ -1080,32 +1087,32 @@ func (admitter *Admitter) ContractHeadscaleDeployChallenge(ctx context.Context, 
 	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
 		if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
-			return fmt.Errorf("Headscale challenge contraction intent changed")
+			return fmt.Errorf("headscale challenge contraction intent changed")
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil || installation.Headscale == nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID {
-			return fmt.Errorf("Headscale challenge contraction domain authority changed")
+			return fmt.Errorf("headscale challenge contraction domain authority changed")
 		}
 		journalRaw, present := transaction.Get("journals/" + journalID)
 		var journal JournalRecord
 		if !present || decodeStrict(journalRaw, &journal) != nil || journal.ID != journalID || journal.JobID != jobID || journal.Kind != JournalCertificateActivation || (journal.Phase != JournalPrepared && journal.Phase != JournalActive && journal.Phase != JournalTerminal) {
-			return fmt.Errorf("Headscale challenge contraction journal changed")
+			return fmt.Errorf("headscale challenge contraction journal changed")
 		}
 		if intent.Phase == PhaseTerminal {
 			record, recordErr := jobs.Load(transaction, jobID)
 			if recordErr != nil || record.Status != jobs.StatusTerminal || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployContracted || journal.Phase != JournalTerminal {
-				return fmt.Errorf("Headscale challenge terminal authority is incomplete")
+				return fmt.Errorf("headscale challenge terminal authority is incomplete")
 			}
 			return nil
 		}
 		if (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || (installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivating && installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivated) {
-			return fmt.Errorf("Headscale challenge is not terminal-contractible")
+			return fmt.Errorf("headscale challenge is not terminal-contractible")
 		}
 		for _, childID := range journal.ChildIDs {
 			rawChild, present := transaction.Get("children/" + childID)
 			var child ChildRecord
 			if !present || decodeStrict(rawChild, &child) != nil || child.JobID != jobID || child.State != ChildTerminal {
-				return fmt.Errorf("Headscale challenge child closure is incomplete")
+				return fmt.Errorf("headscale challenge child closure is incomplete")
 			}
 		}
 		journal.Phase = JournalTerminal
@@ -1166,7 +1173,7 @@ func (admitter *Admitter) EnterRemoteWait(ctx context.Context, mutation *Mutatio
 
 func (admitter *Admitter) ReenterHeadscaleActivationContraction(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID string) (Reservation, *MutationLease, *locks.Lease, error) {
 	if admitter == nil || mutationSet == nil || manager == nil {
-		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation contraction authority invalid")
+		return Reservation{}, nil, nil, fmt.Errorf("headscale activation contraction authority invalid")
 	}
 	document, err := admitter.normal.Read()
 	if err != nil || document.Revision != expectedRevision {
@@ -1174,16 +1181,16 @@ func (admitter *Admitter) ReenterHeadscaleActivationContraction(ctx context.Cont
 	}
 	intent, err := loadReservationEntries(document.Entries, jobID)
 	if err != nil || intent.Operation != HeadscaleDeploy || intent.HeadscaleDeploy == nil || intent.Consumption == nil || (intent.Phase != PhaseReentered && intent.Phase != PhaseTerminal) {
-		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation is not contraction-recoverable")
+		return Reservation{}, nil, nil, fmt.Errorf("headscale activation is not contraction-recoverable")
 	}
 	installationRaw, present := document.Entries["installations/current"]
 	installation, decodeErr := domain.DecodeInstallation(installationRaw)
 	if !present || decodeErr != nil || installation.Headscale == nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID {
-		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation contraction domain authority changed")
+		return Reservation{}, nil, nil, fmt.Errorf("headscale activation contraction domain authority changed")
 	}
 	phase := installation.Headscale.DeployIntent.Phase
 	if phase != domain.HeadscaleDeployCertificateStaged && phase != domain.HeadscaleDeployActivating && phase != domain.HeadscaleDeployActivated && phase != domain.HeadscaleDeployContracted || intent.Phase == PhaseTerminal && phase != domain.HeadscaleDeployContracted {
-		return Reservation{}, nil, nil, fmt.Errorf("Headscale activation domain phase is not recoverable")
+		return Reservation{}, nil, nil, fmt.Errorf("headscale activation domain phase is not recoverable")
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
 	if err != nil {
@@ -1198,7 +1205,7 @@ func (admitter *Admitter) ReenterHeadscaleActivationContraction(ctx context.Cont
 	}
 	state, err := admitter.safety.Read()
 	if err != nil || !validStartupBinding(state, intent.SafetyBinding) {
-		return fail(fmt.Errorf("Headscale activation contraction safety authority changed: %w", err))
+		return fail(fmt.Errorf("headscale activation contraction safety authority changed: %w", err))
 	}
 	return intent, mutation, exposure, nil
 }
@@ -1260,9 +1267,9 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 		}
 		snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
 		if !plans.SameBindingIdentity(binding, snapshot) {
-			return fail(fmt.Errorf("Plan-derived binding changed during remote wait"))
+			return fail(fmt.Errorf("plan-derived binding changed during remote wait"))
 		}
-	} else if (intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew) && (intent.AdmissionSource != AdmissionUI || intent.Operation != HeadscaleInitialize) {
+	} else if (intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew) && (intent.AdmissionSource != AdmissionUI || intent.Operation != HeadscaleInitialize && intent.Operation != HeadscaleUserCreate) {
 		return fail(fmt.Errorf("remote wait admission source invalid"))
 	}
 	var result Reservation
@@ -1342,6 +1349,7 @@ func (admitter *Admitter) ReserveChild(ctx context.Context, admission *locks.Lea
 	})
 	return err
 }
+
 func (admitter *Admitter) BindOperationIdentity(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, binding string) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(binding) {
 		return fmt.Errorf("operation identity binding requires exact authority")
@@ -1453,6 +1461,7 @@ func certificateDeadlineAfter(candidate, prior string) bool {
 	priorTime, priorErr := time.Parse(time.RFC3339, prior)
 	return candidateErr == nil && priorErr == nil && candidateTime.After(priorTime)
 }
+
 func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, credential domain.Credential) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || credential.Kind != "managed_basic" || !exactDigest(credential.Fingerprint) {
 		return fmt.Errorf("managed Basic create requires exact authority")
@@ -1589,6 +1598,7 @@ func operationNonPublicationCredentials(resource domain.AppResource) []string {
 	}
 	return values
 }
+
 func credentialReferenced(resource domain.AppResource, credentialID string) bool {
 	if slices.Contains(resource.CredentialIDs, credentialID) || resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID == credentialID {
 		return true
@@ -1815,6 +1825,7 @@ func (admitter *Admitter) CommitCertificateRenewal(ctx context.Context, mutation
 	})
 	return err
 }
+
 func (admitter *Admitter) TerminalizeJournalLessCertificate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, closureIdentity string) (jobs.Record, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(closureIdentity) {
 		return jobs.Record{}, fmt.Errorf("journal-less certificate recovery requires exact authority")
@@ -1891,7 +1902,7 @@ func (admitter *Admitter) TerminalizeContractedCertificate(ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		identityMatches := (intent.Operation == Publish || intent.Operation == CertificateRenew) && intent.Target == "resource/"+intent.SafetyBinding.ResourceID && intent.SafetyBinding.PlanID == pending.PlanID && intent.SafetyBinding.IntentGeneration == pending.Generation && intent.SafetyBinding.CandidateDigest == pending.SANIdentity && intent.SafetyBinding.CandidateBundle == pending.ACMEBinding
+		identityMatches := ((intent.Operation == Publish || intent.Operation == CertificateRenew) && intent.Target == "resource/"+intent.SafetyBinding.ResourceID || intent.Operation == CertificateRenew && strings.HasPrefix(intent.Target, "headscale/") && intent.SafetyBinding.ResourceID == "headscale") && intent.SafetyBinding.PlanID == pending.PlanID && intent.SafetyBinding.IntentGeneration == pending.Generation && intent.SafetyBinding.CandidateDigest == pending.SANIdentity && intent.SafetyBinding.CandidateBundle == pending.ACMEBinding
 		if !identityMatches {
 			return fmt.Errorf("certificate reconciliation intent mismatched")
 		}
@@ -1999,6 +2010,7 @@ func (admitter *Admitter) TerminalizeContractedCertificate(ctx context.Context, 
 	})
 	return completed, err
 }
+
 func (admitter *Admitter) OperationIntent(jobID string) (Reservation, error) {
 	if admitter == nil {
 		return Reservation{}, fmt.Errorf("operation admitter missing")
@@ -2058,6 +2070,7 @@ func validateChildAgainstIntent(transaction *persist.Transaction, child ChildRec
 	}
 	return nil
 }
+
 func (admitter *Admitter) PutJournal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, journal JournalRecord, create bool) error {
 	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return fmt.Errorf("journal write requires authoritative mutation then exposure locks")
@@ -2613,6 +2626,7 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 	}
 	return completed, safetyCommit()
 }
+
 func (admitter *Admitter) InterruptPublicationGoAccessRetirement(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) (jobs.Record, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return jobs.Record{}, fmt.Errorf("GoAccess retirement interruption requires exact authority")
@@ -2956,7 +2970,8 @@ func (admitter *Admitter) CompleteGoAccessRetirementReconciliation(ctx context.C
 			return fmt.Errorf("GoAccess reconciliation resource authority changed")
 		}
 		oldRecord, loadErr := jobs.Load(transaction, oldJobID)
-		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || !((oldRecord.Result == jobs.ResultPartial && oldRecord.ErrorCode == "goaccess_stop_failed") || (oldRecord.Result == jobs.ResultInterrupted && oldRecord.ErrorCode == "goaccess_retirement_recovery")) {
+		priorTerminal := oldRecord.Result == jobs.ResultPartial && oldRecord.ErrorCode == "goaccess_stop_failed" || oldRecord.Result == jobs.ResultInterrupted && oldRecord.ErrorCode == "goaccess_retirement_recovery"
+		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || !priorTerminal {
 			return fmt.Errorf("GoAccess prior retirement result changed")
 		}
 		journalRaw, present := transaction.Get("journals/" + sourceJournalID)
@@ -3191,7 +3206,8 @@ func (admitter *Admitter) ConvergeCommittedPublicationContraction(ctx context.Co
 				return fmt.Errorf("committed publication recovery intent changed")
 			}
 			record, err := jobs.Load(transaction, resource.PublicationRecord.LastJobID)
-			if err != nil || record.Status != jobs.StatusTerminal || !(record.Result == jobs.ResultSucceeded || record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery") {
+			acceptedTerminal := record.Result == jobs.ResultSucceeded || record.Result == jobs.ResultInterrupted && record.ErrorCode == "goaccess_retirement_recovery"
+			if err != nil || record.Status != jobs.StatusTerminal || !acceptedTerminal {
 				return fmt.Errorf("committed publication recovery job changed")
 			}
 			if len(resource.PublicationRecord.PendingGoAccessRetirements) > 0 {
@@ -3424,9 +3440,151 @@ func (admitter *Admitter) ValidateActive(ctx context.Context, mutation *Mutation
 	return admitter.validateFreshAuthority(document, intent)
 }
 
+func (admitter *Admitter) CommitResourceDeleteBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("resource delete begin requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != ResourceDelete || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID || mutation.Target() != intent.Target {
+			return fmt.Errorf("resource delete intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != resourceID {
+				continue
+			}
+			if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished {
+				return fmt.Errorf("resource delete requires unpublished active resource")
+			}
+			resource.Lifecycle = domain.LifecycleDeleting
+			resource.PublicationRecord.LastOperation = domain.OperationResourceDelete
+			resource.PublicationRecord.LastOperationResult = ""
+			resource.PublicationRecord.LastJobID = jobID
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("resource delete target missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitResourceDeleteRemoval(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("resource delete removal requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != ResourceDelete || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+resourceID {
+			return fmt.Errorf("resource delete removal intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		kept := installation.Resources[:0]
+		found := false
+		for _, resource := range installation.Resources {
+			if resource.ID == resourceID {
+				if resource.Lifecycle != domain.LifecycleDeleting || resource.PublicationRecord.LastJobID != jobID {
+					return fmt.Errorf("resource deleting tombstone changed")
+				}
+				found = true
+				continue
+			}
+			kept = append(kept, resource)
+		}
+		if !found {
+			return fmt.Errorf("resource delete target missing")
+		}
+		installation.Resources = kept
+		credentials := installation.Credentials[:0]
+		for _, credential := range installation.Credentials {
+			if credential.OwnerResourceID != resourceID {
+				credentials = append(credentials, credential)
+			}
+		}
+		installation.Credentials = credentials
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitConnectorBinding(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, connector domain.TailnetConnector) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || connector.LastOperation != domain.OperationConnectorBindingSet || connector.LastJobID != jobID {
+		return fmt.Errorf("connector binding commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != ConnectorBindingSet || intent.Phase != PhaseLocalIntent || intent.Target != "connector" || mutation.Target() != intent.Target {
+			return fmt.Errorf("connector binding intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Connector != nil {
+			return fmt.Errorf("connector binding is already committed")
+		}
+		installation.Connector = &connector
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return err
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitConnectorLogin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("connector login commit requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != ConnectorLogin || intent.Phase != PhaseReentered || intent.Target != "connector" || mutation.Target() != intent.Target {
+			return fmt.Errorf("connector login intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if installation.Connector == nil {
+			return fmt.Errorf("connector binding missing")
+		}
+		connector := *installation.Connector
+		connector.LastOperation, connector.LastJobID = domain.OperationConnectorLogin, jobID
+		installation.Connector = &connector
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitHeadscaleInitialize(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleInitializeCommit) error {
-	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Headscale.ID == "" || commit.Headscale.LastJobID != jobID || commit.Headscale.LastOperation != domain.OperationDeploy {
-		return fmt.Errorf("Headscale initialization commit requires exact authority")
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Headscale.ID == "" || commit.Headscale.LastJobID != jobID || commit.Headscale.LastOperation != domain.OperationHeadscaleInitialize {
+		return fmt.Errorf("headscale initialization commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
@@ -3434,14 +3592,14 @@ func (admitter *Admitter) CommitHeadscaleInitialize(ctx context.Context, mutatio
 			return err
 		}
 		if intent.Operation != HeadscaleInitialize || intent.AdmissionSource != AdmissionUI || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseReentered) || mutation.Target() != intent.Target || intent.Target != string(plans.TargetInstallation) {
-			return fmt.Errorf("Headscale initialization intent mismatched")
+			return fmt.Errorf("headscale initialization intent mismatched")
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
 		}
 		if installation.Headscale != nil {
-			return fmt.Errorf("Headscale trust domain is already initialized")
+			return fmt.Errorf("headscale trust domain is already initialized")
 		}
 		installation.Headscale = &commit.Headscale
 		raw, err := persist.EncodeEntry(installation)
@@ -3455,7 +3613,7 @@ func (admitter *Admitter) CommitHeadscaleInitialize(ctx context.Context, mutatio
 
 func (admitter *Admitter) CommitHeadscaleDeployBegin(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployBeginCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || commit.Intent.JobID != jobID || commit.Intent.Phase != domain.HeadscaleDeployPrepared {
-		return fmt.Errorf("Headscale deploy begin requires exact authority")
+		return fmt.Errorf("headscale deploy begin requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
@@ -3463,22 +3621,22 @@ func (admitter *Admitter) CommitHeadscaleDeployBegin(ctx context.Context, mutati
 			return err
 		}
 		if intent.Operation != HeadscaleDeploy || intent.AdmissionSource != AdmissionPlan || intent.Phase != PhaseLocalIntent || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target || intent.Target != string(plans.TargetHeadscale)+"/"+commit.HeadscaleID || commit.Intent.PlanID != intent.PlanID || commit.Intent.Generation != intent.HeadscaleDeploy.Candidate.Generation || commit.Intent.PreflightDigest != intent.HeadscaleDeploy.PreflightResult.RequestDigest || commit.Intent.CertificateBinding != intent.HeadscaleDeploy.Candidate.CertificateBinding {
-			return fmt.Errorf("Headscale deploy begin intent mismatched")
+			return fmt.Errorf("headscale deploy begin intent mismatched")
 		}
 		applied, err := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
 		if err != nil || !reflect.DeepEqual(applied, commit.Intent.Candidate) {
-			return fmt.Errorf("Headscale deploy candidate changed")
+			return fmt.Errorf("headscale deploy candidate changed")
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
 		}
 		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.Database.Phase != domain.HeadscaleIdentityCommitted || installation.Headscale.DeployIntent != nil || installation.Headscale.Applied != nil || installation.Headscale.Enabled {
-			return fmt.Errorf("Headscale deploy prior authority changed")
+			return fmt.Errorf("headscale deploy prior authority changed")
 		}
 		headscale := *installation.Headscale
 		headscale.DeployIntent = &commit.Intent
-		headscale.LastOperation = domain.OperationDeploy
+		headscale.LastOperation = domain.OperationHeadscaleControlDeploy
 		headscale.LastJobID = jobID
 		installation.Headscale = &headscale
 		raw, err := persist.EncodeEntry(installation)
@@ -3492,7 +3650,7 @@ func (admitter *Admitter) CommitHeadscaleDeployBegin(ctx context.Context, mutati
 
 func (admitter *Admitter) CommitHeadscaleDeployStaged(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployStagedCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.InitializedDigest) {
-		return fmt.Errorf("Headscale staged commit requires exact authority")
+		return fmt.Errorf("headscale staged commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
@@ -3500,14 +3658,14 @@ func (admitter *Admitter) CommitHeadscaleDeployStaged(ctx context.Context, mutat
 			return err
 		}
 		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseLocalIntent || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
-			return fmt.Errorf("Headscale staged operation intent mismatched")
+			return fmt.Errorf("headscale staged operation intent mismatched")
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
 		}
 		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployPrepared {
-			return fmt.Errorf("Headscale staged domain intent mismatched")
+			return fmt.Errorf("headscale staged domain intent mismatched")
 		}
 		headscale := *installation.Headscale
 		nextIntent := *headscale.DeployIntent
@@ -3527,7 +3685,7 @@ func (admitter *Admitter) CommitHeadscaleDeployStaged(ctx context.Context, mutat
 
 func (admitter *Admitter) CommitHeadscaleCertificateStaged(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleCertificateStagedCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.Fingerprint) {
-		return fmt.Errorf("Headscale certificate staged commit requires exact authority")
+		return fmt.Errorf("headscale certificate staged commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
@@ -3535,14 +3693,14 @@ func (admitter *Admitter) CommitHeadscaleCertificateStaged(ctx context.Context, 
 			return err
 		}
 		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseReentered || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target {
-			return fmt.Errorf("Headscale certificate reentry mismatched")
+			return fmt.Errorf("headscale certificate reentry mismatched")
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
 		}
 		if installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificatePending || installation.Headscale.DeployIntent.Candidate.CertificateID != intent.HeadscaleDeploy.Candidate.CertificateID {
-			return fmt.Errorf("Headscale certificate domain intent mismatched")
+			return fmt.Errorf("headscale certificate domain intent mismatched")
 		}
 		headscale := *installation.Headscale
 		nextIntent := *headscale.DeployIntent
@@ -3559,9 +3717,138 @@ func (admitter *Admitter) CommitHeadscaleCertificateStaged(ctx context.Context, 
 	return err
 }
 
+func (admitter *Admitter) CommitHeadscaleReissueActivationIntent(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.CertificateBundleIdentity, activationDigest string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(activationDigest) || candidate.Authority == nil {
+		return fmt.Errorf("headscale reissue activation authority invalid")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != CertificateRenew || intent.AdmissionSource != AdmissionPlan || !strings.HasPrefix(intent.Target, "headscale/") || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || installation.Headscale == nil || installation.Headscale.Applied == nil || installation.Headscale.Certificate == nil || installation.Headscale.DeployIntent != nil || candidate.Generation != installation.Headscale.Certificate.Generation+1 || candidate.Authority.CertificateID != installation.Headscale.Certificate.Authority.CertificateID {
+			return fmt.Errorf("headscale reissue activation identity changed")
+		}
+		headscale := *installation.Headscale
+		prior := *headscale.Applied
+		headscale.LastOperation = domain.OperationHeadscaleReissue
+		headscale.LastJobID = jobID
+		headscale.DeployIntent = &domain.HeadscaleDeployIntent{Generation: prior.Generation, PlanID: intent.PlanID, JobID: jobID, Phase: domain.HeadscaleDeployActivating, PreflightDigest: intent.SafetyBinding.CandidateBundle, CertificateBinding: candidate.BindingIdentity, CertificateFingerprint: candidate.Fingerprint, ActivationDigest: activationDigest, Candidate: prior, Prior: &prior}
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) ContractHeadscaleReissueActivation(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("headscale reissue contraction locks invalid")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != CertificateRenew || intent.AdmissionSource != AdmissionPlan || !strings.HasPrefix(intent.Target, "headscale/") || installation.Headscale == nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID {
+			return fmt.Errorf("headscale reissue contraction authority changed")
+		}
+		headscale := *installation.Headscale
+		headscale.DeployIntent = nil
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) RestoreHeadscaleCertificateRenewal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate, prior domain.CertificateBundleIdentity) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return fmt.Errorf("headscale certificate restoration locks invalid")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != CertificateRenew || !strings.HasPrefix(intent.Target, "headscale/") || installation.Headscale == nil || installation.Headscale.Certificate == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, candidate) {
+			return fmt.Errorf("headscale certificate restoration authority changed")
+		}
+		headscale := *installation.Headscale
+		copy := prior
+		headscale.Certificate = &copy
+		headscale.DeployIntent = nil
+		headscale.LastOperation = domain.OperationHeadscaleReissue
+		headscale.LastJobID = jobID
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitHeadscaleCertificateRenewal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, prior, candidate domain.CertificateBundleIdentity) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.Generation != prior.Generation+1 || candidate.Authority == nil || prior.Authority == nil || candidate.Authority.CertificateID != prior.Authority.CertificateID {
+		return fmt.Errorf("headscale renewal commit authority invalid")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != CertificateRenew || !strings.HasPrefix(intent.Target, "headscale/") || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || installation.Headscale == nil || installation.Headscale.Certificate == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, prior) {
+			return fmt.Errorf("headscale renewal identity changed")
+		}
+		headscale := *installation.Headscale
+		next := candidate
+		headscale.Certificate = &next
+		if headscale.DeployIntent != nil {
+			deploy := headscale.DeployIntent
+			if intent.AdmissionSource != AdmissionPlan || deploy.JobID != jobID || deploy.PlanID != intent.PlanID || deploy.Phase != domain.HeadscaleDeployActivating || deploy.CertificateBinding != candidate.BindingIdentity || deploy.CertificateFingerprint != candidate.Fingerprint {
+				return fmt.Errorf("headscale reissue activation intent changed")
+			}
+			headscale.DeployIntent = nil
+		}
+		headscale.LastOperation = domain.OperationHeadscaleReissue
+		headscale.LastJobID = jobID
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitHeadscaleActivationIntent(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleActivationIntentCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.ActivationDigest) {
-		return fmt.Errorf("Headscale activation intent requires exact authority")
+		return fmt.Errorf("headscale activation intent requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		reservation, err := loadReservation(transaction, jobID)
@@ -3573,7 +3860,7 @@ func (admitter *Admitter) CommitHeadscaleActivationIntent(ctx context.Context, m
 			return err
 		}
 		if reservation.Operation != HeadscaleDeploy || reservation.Phase != PhaseReentered || reservation.HeadscaleDeploy == nil || mutation.Target() != reservation.Target || installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployCertificateStaged {
-			return fmt.Errorf("Headscale activation intent identity mismatched")
+			return fmt.Errorf("headscale activation intent identity mismatched")
 		}
 		headscale := *installation.Headscale
 		next := *headscale.DeployIntent
@@ -3592,7 +3879,7 @@ func (admitter *Admitter) CommitHeadscaleActivationIntent(ctx context.Context, m
 
 func (admitter *Admitter) CommitHeadscaleActivated(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleActivatedCommit) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.RuntimeDigest) || domain.ValidateHeadscaleApplied(commit.Applied) != nil {
-		return fmt.Errorf("Headscale activated commit requires exact authority")
+		return fmt.Errorf("headscale activated commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		reservation, err := loadReservation(transaction, jobID)
@@ -3604,7 +3891,7 @@ func (admitter *Admitter) CommitHeadscaleActivated(ctx context.Context, mutation
 			return err
 		}
 		if reservation.Operation != HeadscaleDeploy || reservation.Phase != PhaseReentered || mutation.Target() != reservation.Target || installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivating || !reflect.DeepEqual(installation.Headscale.DeployIntent.Candidate, commit.Applied) {
-			return fmt.Errorf("Headscale activated identity mismatched")
+			return fmt.Errorf("headscale activated identity mismatched")
 		}
 		headscale := *installation.Headscale
 		next := *headscale.DeployIntent
@@ -3622,6 +3909,120 @@ func (admitter *Admitter) CommitHeadscaleActivated(ctx context.Context, mutation
 		return transaction.Replace("installations/current", raw)
 	})
 	return err
+}
+
+func (admitter *Admitter) CommitHeadscaleDeployLifecycle(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployCompleteCommit) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.HeadscaleID == "" || !exactDigest(commit.RuntimeDigest) || commit.Certificate.Authority == nil {
+		return fmt.Errorf("headscale deploy completion requires exact authority")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		reservation, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if reservation.Operation != HeadscaleDeploy || reservation.Phase != PhaseReentered || mutation.Target() != reservation.Target || installation.Headscale == nil || installation.Headscale.ID != commit.HeadscaleID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivated || installation.Headscale.DeployIntent.RuntimeDigest != commit.RuntimeDigest || installation.Headscale.Applied == nil || installation.Headscale.Applied.CertificateID != commit.Certificate.Authority.CertificateID {
+			return fmt.Errorf("headscale deploy completion identity mismatched")
+		}
+		headscale := *installation.Headscale
+		headscale.DeployIntent = nil
+		certificate := commit.Certificate
+		headscale.Certificate = &certificate
+		installation.Headscale = &headscale
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		return nil
+	})
+	return err
+}
+
+func (admitter *Admitter) CompleteHeadscaleDeploy(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployCompleteCommit) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("headscale deploy completion locks invalid")
+	}
+	document, readErr := admitter.normal.Read()
+	if readErr != nil {
+		return jobs.Record{}, readErr
+	}
+	existing, existingErr := loadReservationEntries(document.Entries, jobID)
+	if existingErr == nil && existing.Phase == PhaseTerminal {
+		record, recordErr := jobs.LoadEntries(document.Entries, jobID)
+		raw, present := document.Entries["journals/certificate-"+jobID]
+		var journal JournalRecord
+		if recordErr == nil && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded && present && decodeStrict(raw, &journal) == nil && journal.Phase == JournalTerminal {
+			return record, nil
+		}
+		return jobs.Record{}, fmt.Errorf("terminal Headscale lifecycle authority incomplete")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		state, err := admitter.safety.Read()
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || installation.Headscale == nil || installation.Headscale.DeployIntent != nil || installation.Headscale.Certificate == nil || installation.Headscale.Certificate.Fingerprint != commit.Certificate.Fingerprint || state.Headscale.Reactivating != nil || state.Headscale.ActiveCertificate == nil || state.Headscale.ActiveCertificate.Fingerprint != commit.Certificate.Fingerprint {
+			return fmt.Errorf("headscale lifecycle completion authority incomplete")
+		}
+		journalKey := "journals/certificate-" + jobID
+		raw, present := transaction.Get(journalKey)
+		var journal JournalRecord
+		if !present || decodeStrict(raw, &journal) != nil || journal.Phase != JournalActive {
+			return fmt.Errorf("headscale lifecycle journal changed")
+		}
+		journal.Phase = JournalTerminal
+		encoded, err := persist.EncodeEntry(journal)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(journalKey, encoded); err != nil {
+			return err
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "headscale_control_committed", Status: jobs.PostconditionVerified, Identity: commit.RuntimeDigest}}}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		encoded, err = persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), encoded); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
 }
 
 func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit ResourceCreateCommit) error {
@@ -3772,6 +4173,7 @@ func CompleteInterruptedLifecycle(transaction *persist.Transaction, jobID string
 	}
 	return transaction.Replace(reservationKey(jobID), raw)
 }
+
 func FindRunningHeadscaleInitialization(document persist.Document) (Reservation, jobs.Record, bool, error) {
 	var found Reservation
 	var record jobs.Record
@@ -3806,6 +4208,7 @@ func PendingResourceUpdates(document persist.Document) ([]Reservation, error) {
 	sort.Slice(result, func(i, j int) bool { return result[i].JobID < result[j].JobID })
 	return result, nil
 }
+
 func FindResourceUpdateAuthority(document persist.Document, jobID, resourceID string) (Reservation, error) {
 	intent, err := loadReservationEntries(document.Entries, jobID)
 	if err != nil {
@@ -3933,6 +4336,7 @@ func GoAccessRetirementInventoryDigest(retirements []domain.GoAccessRetirementId
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
+
 func GoAccessRetirementBinding(installationID, resourceID, source, sourceJobID, sourceJournalID, authorityDigest string, retirements []domain.GoAccessRetirementIdentity) (SafetyBinding, error) {
 	binding := SafetyBinding{ResourceID: resourceID, InstallationID: installationID, GoAccessSource: source, GoAccessSourceJobID: sourceJobID, GoAccessSourceJournalID: sourceJournalID, GoAccessAuthorityDigest: authorityDigest, GoAccessRetirements: append([]domain.GoAccessRetirementIdentity(nil), retirements...)}
 	if err := validateGoAccessRetirementBinding(binding); err != nil {
@@ -3940,6 +4344,7 @@ func GoAccessRetirementBinding(installationID, resourceID, source, sourceJobID, 
 	}
 	return binding, nil
 }
+
 func validateGoAccessRetirementBinding(binding SafetyBinding) error {
 	if !validIdentityRef(binding.InstallationID) || !strings.HasPrefix(binding.InstallationID, "ins_") || !validIdentityRef(binding.ResourceID) || !validIdentityRef(binding.GoAccessSourceJobID) || !exactDigest(binding.GoAccessAuthorityDigest) || len(binding.GoAccessRetirements) == 0 {
 		return fmt.Errorf("GoAccess retirement binding incomplete")
@@ -4006,7 +4411,8 @@ func ValidateGoAccessRetirementAuthority(document persist.Document, binding Safe
 			if err := decodeStrict(journalRaw, &journal); err != nil {
 				return err
 			}
-			if journal.JobID != binding.GoAccessSourceJobID || journal.Phase != JournalTerminal || sourceRecord.Status != jobs.StatusTerminal || !((sourceRecord.Result == jobs.ResultPartial && sourceRecord.ErrorCode == "goaccess_stop_failed") || (sourceRecord.Result == jobs.ResultInterrupted && sourceRecord.ErrorCode == "goaccess_retirement_recovery")) {
+			sourceTerminal := sourceRecord.Result == jobs.ResultPartial && sourceRecord.ErrorCode == "goaccess_stop_failed" || sourceRecord.Result == jobs.ResultInterrupted && sourceRecord.ErrorCode == "goaccess_retirement_recovery"
+			if journal.JobID != binding.GoAccessSourceJobID || journal.Phase != JournalTerminal || sourceRecord.Status != jobs.StatusTerminal || !sourceTerminal {
 				return fmt.Errorf("GoAccess publication retirement source changed")
 			}
 		case "contraction":
@@ -4162,9 +4568,141 @@ func cloneBundle(value *domain.PublicationBundle) *domain.PublicationBundle {
 	return &copy
 }
 
+// CompleteInterruptedEntity is a startup-only terminalizer for non-retryable
+// Headscale entity and connector mutations. It relies on independently
+// observed old-helper child closure and the already-consumed intent snapshot;
+// it deliberately does not refresh or re-authorize an expired Plan.
+func (admitter *Admitter) CompleteInterruptedEntity(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, childClosureDigest, errorCode string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(childClosureDigest) {
+		return jobs.Record{}, fmt.Errorf("interrupted entity completion lacks authoritative closure locks")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil {
+			return loadErr
+		}
+		allowed := intent.Operation == HeadscaleUserCreate || intent.Operation == PreauthKeyCreate || intent.Operation == PreauthKeyRevoke || intent.Operation == DeviceExpire || intent.Operation == ConnectorBindingSet || intent.Operation == ConnectorLogin
+		if !allowed || mutation.Target() != intent.Target || intent.Consumption == nil || (intent.Phase != PhaseLocalIntent && intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered) {
+			return fmt.Errorf("interrupted entity intent is not terminalizable")
+		}
+		wantCode := "headscale_lifecycle_interrupted"
+		if intent.Operation == ConnectorBindingSet || intent.Operation == ConnectorLogin {
+			wantCode = "connector_mutation_interrupted"
+		}
+		if errorCode != wantCode {
+			return fmt.Errorf("interrupted entity error code does not match operation")
+		}
+		registration, present := admitter.registry.Registration(intent.Operation)
+		if !present {
+			return fmt.Errorf("interrupted entity operation owner is missing")
+		}
+		branch, present := registration.Results.Branch("source_unknown")
+		if !present || branch.Postcondition != jobs.PostconditionUnobserved {
+			return fmt.Errorf("interrupted entity result branch is invalid")
+		}
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("interrupted entity job is not running")
+		}
+		condition := jobs.Postcondition{Kind: "interrupted_remote_mutation", Status: jobs.PostconditionUnobserved, Identity: childClosureDigest}
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: branch.Result, Postconditions: []jobs.Postcondition{condition}, ErrorCode: errorCode}, observedNow)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, encodeErr := persist.EncodeEntry(intent)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		if encodeErr = transaction.Replace(reservationKey(jobID), raw); encodeErr != nil {
+			return encodeErr
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
+func (admitter *Admitter) CompleteRecoveredResourceDelete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID, closureDigest string, succeeded bool) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || mutation.Target() != "resource/"+resourceID || !exactDigest(closureDigest) {
+		return jobs.Record{}, fmt.Errorf("resource delete recovery lacks exact authority")
+	}
+	observedNow, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
+		intent, loadErr := loadReservation(transaction, jobID)
+		if loadErr != nil || intent.Operation != ResourceDelete || intent.Target != "resource/"+resourceID || intent.Phase != PhaseLocalIntent || intent.Consumption == nil {
+			return fmt.Errorf("resource delete recovery intent changed")
+		}
+		installation, loadErr := loadInstallation(transaction)
+		if loadErr != nil {
+			return loadErr
+		}
+		present := false
+		active := false
+		for _, resource := range installation.Resources {
+			if resource.ID == resourceID {
+				present = true
+				active = resource.Lifecycle == domain.LifecycleActive && resource.PublicationRecord.State == domain.PublicationUnpublished
+			}
+		}
+		condition := jobs.Postcondition{Kind: "resource_delete_not_started", Status: jobs.PostconditionKnown, Identity: closureDigest}
+		completion := jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{condition}, ErrorCode: "resource_delete_not_started"}
+		if succeeded {
+			if present {
+				return fmt.Errorf("recovered resource delete target still exists")
+			}
+			condition = jobs.Postcondition{Kind: "resource_managed_inventory_deleted", Status: jobs.PostconditionVerified, Identity: closureDigest}
+			completion = jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{condition}}
+		} else if !active {
+			return fmt.Errorf("resource delete cannot abort after deletion began")
+		}
+		record, loadErr := jobs.Load(transaction, jobID)
+		if loadErr != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("resource delete recovery job is not running")
+		}
+		record, loadErr = jobs.Finish(record, completion, observedNow)
+		if loadErr != nil {
+			return loadErr
+		}
+		if loadErr = jobs.Replace(transaction, record); loadErr != nil {
+			return loadErr
+		}
+		intent.Phase = PhaseTerminal
+		raw, encodeErr := persist.EncodeEntry(intent)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		if encodeErr = transaction.Replace(reservationKey(jobID), raw); encodeErr != nil {
+			return encodeErr
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
 func (admitter *Admitter) Complete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string) (jobs.Record, error) {
 	return admitter.CompleteWithSecret(ctx, mutation, exposure, expectedRevision, jobID, branchName, paths, postconditions, errorCode, nil)
 }
+
 func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, branchName string, paths []string, postconditions []jobs.Postcondition, errorCode string, secretResult *jobs.SecretResult) (jobs.Record, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return jobs.Record{}, fmt.Errorf("job completion requires authoritative mutation then exposure locks")
@@ -4219,7 +4757,7 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 		}
 		snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: recordView.ActorIdentity, Config: intentView.Consumption.Config, Applied: intentView.Consumption.Applied, Evidence: intentView.Consumption.Evidence}
 		if planTarget(binding.Target) != intentView.Target || !plans.SameBindingIdentity(binding, snapshot) {
-			return jobs.Record{}, fmt.Errorf("Plan-derived binding changed before terminal commit")
+			return jobs.Record{}, fmt.Errorf("plan-derived binding changed before terminal commit")
 		}
 	}
 	var completed jobs.Record
@@ -4454,7 +4992,7 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 
 func exactCertificatePublicationAuthority(state safety.State, intent Reservation) bool {
 	handoff := intent.CertificateHandoff
-	if handoff == nil || state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported || state.GlobalClose.Phase != safety.GlobalCloseNone {
+	if handoff == nil || state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone {
 		return false
 	}
 	for _, resource := range state.Resources {
@@ -4473,10 +5011,11 @@ func exactCertificatePublicationAuthority(state safety.State, intent Reservation
 	}
 	return false
 }
+
 func exactCertificateChallenge(state safety.State, binding SafetyBinding) bool {
 	if binding.ResourceID == "headscale" {
 		pending := state.Headscale.ChallengePending
-		return pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.ConfigDigest == binding.CandidateDigest && pending.ACMEBinding == binding.ACMEBinding && pending.CertificateIdentity == binding.CertificateIdentity
+		return pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle && pending.CertificateIdentity == binding.CertificateIdentity
 	}
 	for _, resource := range state.Resources {
 		pending := resource.ChallengePending
@@ -4486,6 +5025,7 @@ func exactCertificateChallenge(state safety.State, binding SafetyBinding) bool {
 	}
 	return false
 }
+
 func (admitter *Admitter) validateFreshAuthority(document persist.Document, intent Reservation) error {
 	if intent.Consumption == nil {
 		return fmt.Errorf("operation has no consumed immutable authority")
@@ -4528,7 +5068,7 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 	}
 	snapshot := plans.Binding{Operation: binding.Operation, Target: binding.Target, ActorIdentity: record.ActorIdentity, Config: intent.Consumption.Config, Applied: intent.Consumption.Applied, Evidence: intent.Consumption.Evidence}
 	if planTarget(binding.Target) != intent.Target || !plans.SameBindingIdentity(binding, snapshot) {
-		return fmt.Errorf("Plan-derived binding changed after intent commit")
+		return fmt.Errorf("plan-derived binding changed after intent commit")
 	}
 	return nil
 }
@@ -4538,7 +5078,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		return fmt.Errorf("operation is unsupported for normal admission")
 	}
 	contraction := isContraction(operation)
-	if operation == CertificateExpiry || operation == EdgeOneExpiry {
+	if operation == CertificateExpiry {
 		valid := validExpiryBinding(operation, state, binding) || !consuming && validExpiryProposal(operation, state, binding, now)
 		if !valid || binding.Deadline.IsZero() || binding.Deadline.After(now) {
 			return fmt.Errorf("expiry contraction authority binding is stale, absent, or not due")
@@ -4547,13 +5087,8 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	if operation == StartupContraction && !validStartupBinding(state, binding) {
 		return fmt.Errorf("startup contraction authority binding is stale or absent")
 	}
-	if state.MaintenancePending != nil || state.UpgradePending != nil || (state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported) || state.BackupQuiescence != nil || state.StopFence != nil {
-		if !contraction {
-			return fmt.Errorf("independent fence blocks expansion but not contraction")
-		}
-	}
-	if state.DependencyTransitionPending != nil && !contraction {
-		return fmt.Errorf("dependency transition blocks expansion admission")
+	if state.StopFence != nil && !contraction {
+		return fmt.Errorf("independent stop fence blocks expansion but not contraction")
 	}
 	if operation == CloseAll {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone || binding.GlobalGeneration != state.GlobalClose.Generation || binding.ProposedGeneration != state.GlobalClose.Generation+1 {
@@ -4564,7 +5099,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if binding.ResourceID == "" {
 			return fmt.Errorf("resource creation requires a generated stable identity")
 		}
-		if state.GlobalClose.Phase != safety.GlobalCloseNone || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil || state.StopFence != nil {
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || state.StopFence != nil {
 			return fmt.Errorf("independent safety authority blocks resource creation")
 		}
 	}
@@ -4595,15 +5130,25 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		}
 	}
 	if operation == HeadscaleDeploy {
-		if state.StopFence != nil || state.MaintenancePending != nil || state.DependencyTransitionPending != nil || state.UpgradePending != nil || state.BackupQuiescence != nil || state.BackupTransition != nil && state.BackupTransition.Phase != safety.BackupTransitionImported {
+		if state.StopFence != nil {
 			return fmt.Errorf("global safety authority blocks Headscale deploy")
 		}
 		ownedChallenge := exactCertificateChallenge(state, binding)
 		if state.Headscale.CertificateExpiry != nil || state.Headscale.Reactivating != nil || state.Headscale.ChallengePending != nil && !ownedChallenge {
-			return fmt.Errorf("Headscale marker authority blocks deploy")
+			return fmt.Errorf("headscale marker authority blocks deploy")
 		}
 	}
-	if operation == CertificateRenew {
+	if operation == CertificateRenew && binding.ResourceID == "headscale" {
+		if state.StopFence != nil {
+			return fmt.Errorf("headscale renewal blocked by shared safety marker")
+		}
+		ownedChallenge := exactCertificateChallenge(state, binding)
+		expiryChallenge := state.Headscale.CertificateExpiry != nil && binding.ExpiryGeneration == state.Headscale.CertificateExpiry.Generation && (binding.ChallengeMethod == "http-01" || binding.ChallengeMethod == "dns-01")
+		if state.Headscale.CertificateExpiry != nil && !expiryChallenge || state.Headscale.Reactivating != nil || state.Headscale.ChallengePending != nil && !ownedChallenge {
+			return fmt.Errorf("headscale renewal blocked by safety marker")
+		}
+	}
+	if operation == CertificateRenew && binding.ResourceID != "headscale" {
 		var resource *safety.ResourceSafety
 		for index := range state.Resources {
 			if state.Resources[index].ResourceID == binding.ResourceID {
@@ -4613,7 +5158,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil {
 			return fmt.Errorf("certificate safety resource unavailable")
 		}
-		if operation == CertificateRenew && (state.GlobalClose.Phase != safety.GlobalCloseNone || resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.EdgeOne.Expiry != nil || resource.ChallengePending != nil || resource.Reactivating != nil) {
+		if operation == CertificateRenew && (state.GlobalClose.Phase != safety.GlobalCloseNone || resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.ChallengePending != nil || resource.Reactivating != nil) {
 			return fmt.Errorf("certificate renewal blocked by safety marker")
 		}
 	}
@@ -4633,13 +5178,10 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		}
 		ownedChallenge := exactCertificateChallenge(state, binding)
 		challengeStart := consuming && binding.CertificateIdentity != "" && (binding.ChallengeMethod == "http-01" || binding.ChallengeMethod == "dns-01")
-		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan || resource.ChallengePending != nil && !ownedChallenge || ownedChallenge && resource.ChallengePending.Method == "http-01" && resource.EdgeOne.Expiry != nil || challengeStart && binding.ChallengeMethod == "http-01" && resource.EdgeOne.Expiry != nil {
+		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan || resource.ChallengePending != nil && !ownedChallenge {
 			return fmt.Errorf("resource lifecycle or challenge authority blocks publish")
 		}
-		if !resource.EdgeOne.Deadline.IsZero() && resource.EdgeOne.Deadline.Sub(now) < 5*time.Minute {
-			return fmt.Errorf("EdgeOne safety deadline is too near for ordinary activation")
-		}
-		if resource.Reactivating != nil && !resource.Reactivating.TemporaryHTTP && (resource.Reactivating.CertificateUntil.Sub(now) < 5*time.Minute || resource.Reactivating.ACLUntil.Sub(now) < 5*time.Minute) {
+		if resource.Reactivating != nil && !resource.Reactivating.TemporaryHTTP && (resource.Reactivating.CertificateUntil.Sub(now) < 5*time.Minute) {
 			return fmt.Errorf("reactivation safety deadline is too near")
 		}
 		if !consuming || ownedChallenge || challengeStart {
@@ -4661,11 +5203,12 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	return nil
 }
+
 func contractionKind(operation Type) preflight.ContractionKind {
 	switch operation {
 	case CloseAll, EmergencyCloseAll:
 		return preflight.ContractionCloseAll
-	case CertificateExpiry, EdgeOneExpiry:
+	case CertificateExpiry:
 		return preflight.ContractionExpiry
 	case StartupContraction:
 		return preflight.ContractionStartup
@@ -4694,8 +5237,6 @@ func requirePreflightEvidence(operation Type, target string, evidence []plans.Ev
 		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionDomainHTTPS, preflight.ExpansionTemporaryHTTP}, target, evidence, now)
 	case HeadscaleDeploy:
 		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionHeadscale}, "headscale", evidence, now)
-	case PackageTransaction:
-		return preflight.RequireExpansionPlanEvidence([]preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, target, evidence, now)
 	case Unpublish:
 		return preflight.RequireContractionPlanEvidence([]preflight.ContractionKind{preflight.ContractionUnpublish}, target, evidence, now)
 	case CloseAll:
@@ -4707,7 +5248,7 @@ func requirePreflightEvidence(operation Type, target string, evidence []plans.Ev
 
 func requiresContractionPreflight(operation Type) bool {
 	switch operation {
-	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, StartupContraction:
+	case Unpublish, CloseAll, CertificateExpiry, StartupContraction:
 		return true
 	default:
 		return false
@@ -4716,7 +5257,7 @@ func requiresContractionPreflight(operation Type) bool {
 
 func isContraction(operation Type) bool {
 	switch operation {
-	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction, GoAccessRetirement:
+	case Unpublish, CloseAll, CertificateExpiry, AutomaticReconciliation, StartupContraction, GoAccessRetirement:
 		return true
 	default:
 		return false
@@ -4751,45 +5292,44 @@ func validStartupBinding(state safety.State, binding SafetyBinding) bool {
 }
 
 func validExpiryProposal(operation Type, state safety.State, binding SafetyBinding, now time.Time) bool {
-	for _, resource := range state.Resources {
-		if resource.ResourceID != binding.ResourceID {
-			continue
-		}
-		expectedKind := "certificate_expiry"
-		if operation == EdgeOneExpiry {
-			expectedKind = "edgeone_expiry"
-		}
-		if binding.ExpiryKind != expectedKind || binding.ExpiryGeneration != resource.GenerationSequence+1 {
+	if operation != CertificateExpiry {
+		return false
+	}
+	if binding.ResourceID == "headscale" {
+		active := state.Headscale.ActiveCertificate
+		if state.Headscale.CertificateExpiry != nil || active == nil || binding.ExpiryGeneration != state.Headscale.GenerationSequence+1 || binding.CandidateBundle != active.Binding {
 			return false
 		}
-		if operation == CertificateExpiry {
-			if resource.CertificateExpiry != nil || resource.ActiveCertificate == nil || binding.CandidateBundle != resource.ActiveCertificate.Binding {
-				return false
-			}
-			deadline := resource.ActiveCertificate.NotAfter
-			if now.Before(resource.ActiveCertificate.LastTrustedWall) {
-				deadline = now
-			}
-			return binding.Deadline.Equal(deadline)
+		deadline := active.NotAfter
+		if now.Before(active.LastTrustedWall) {
+			deadline = now
 		}
-		return resource.EdgeOne.Expiry == nil
+		return binding.Deadline.Equal(deadline)
+	}
+	for _, resource := range state.Resources {
+		if resource.ResourceID != binding.ResourceID || binding.ExpiryGeneration != resource.GenerationSequence+1 || resource.CertificateExpiry != nil || resource.ActiveCertificate == nil || binding.CandidateBundle != resource.ActiveCertificate.Binding {
+			continue
+		}
+		deadline := resource.ActiveCertificate.NotAfter
+		if now.Before(resource.ActiveCertificate.LastTrustedWall) {
+			deadline = now
+		}
+		return binding.Deadline.Equal(deadline)
 	}
 	return false
 }
+
 func validExpiryBinding(operation Type, state safety.State, binding SafetyBinding) bool {
+	if operation != CertificateExpiry {
+		return false
+	}
 	for _, resource := range state.Resources {
-		if resource.ResourceID != binding.ResourceID {
-			continue
-		}
-		if operation == CertificateExpiry && binding.ExpiryKind == "certificate_expiry" && resource.CertificateExpiry != nil {
+		if resource.ResourceID == binding.ResourceID && resource.CertificateExpiry != nil {
 			return resource.CertificateExpiry.Generation == binding.ExpiryGeneration && resource.CertificateExpiry.Deadline.Equal(binding.Deadline) && resource.CertificateExpiry.Binding == binding.CandidateBundle
 		}
-		if operation == EdgeOneExpiry && binding.ExpiryKind == "edgeone_expiry" && resource.EdgeOne.Expiry != nil {
-			return resource.EdgeOne.Expiry.Generation == binding.ExpiryGeneration && resource.EdgeOne.Expiry.Deadline.Equal(binding.Deadline)
-		}
 	}
-	if operation == CertificateExpiry && binding.ResourceID == "headscale" && binding.ExpiryKind == "certificate_expiry" && state.Headscale.CertificateExpiry != nil {
-		return state.Headscale.CertificateExpiry.Generation == binding.ExpiryGeneration && state.Headscale.CertificateExpiry.Deadline.Equal(binding.Deadline)
+	if binding.ResourceID == "headscale" && state.Headscale.CertificateExpiry != nil {
+		return state.Headscale.CertificateExpiry.Generation == binding.ExpiryGeneration && state.Headscale.CertificateExpiry.Deadline.Equal(binding.Deadline) && state.Headscale.CertificateExpiry.Binding == binding.CandidateBundle
 	}
 	return false
 }
@@ -4810,11 +5350,12 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 	if !admitter.normal.ValidateUnavailable(unavailable) {
 		return fmt.Errorf("state-independent contraction requires proven normal-store unavailability or a failed durable admission write")
 	}
-	preflightKind := map[Type]preflight.ContractionKind{EmergencyCloseAll: preflight.ContractionEmergency, CertificateExpiry: preflight.ContractionExpiry, EdgeOneExpiry: preflight.ContractionExpiry, StartupContraction: preflight.ContractionStartup}[operation]
+	preflightKind := map[Type]preflight.ContractionKind{EmergencyCloseAll: preflight.ContractionEmergency, CertificateExpiry: preflight.ContractionExpiry, StartupContraction: preflight.ContractionStartup}[operation]
 	expectedGeneration := binding.ExpiryGeneration
-	if operation == EmergencyCloseAll {
+	switch operation {
+	case EmergencyCloseAll:
 		expectedGeneration = binding.ProposedGeneration
-	} else if operation == StartupContraction {
+	case StartupContraction:
 		expectedGeneration = binding.IntentGeneration
 	}
 	if contractionRequest.Kind != preflightKind || contractionRequest.Target != stateIndependentTarget(operation, binding) || contractionRequest.Generation != expectedGeneration {
@@ -4839,7 +5380,7 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 		if binding.GlobalGeneration != state.GlobalClose.Generation || binding.ProposedGeneration != state.GlobalClose.Generation+1 {
 			return fmt.Errorf("emergency global generation binding is stale")
 		}
-	case CertificateExpiry, EdgeOneExpiry:
+	case CertificateExpiry:
 		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
 			return fmt.Errorf("state-independent expiry binding is stale or not due")
 		}
@@ -4883,6 +5424,7 @@ func loadReservation(transaction *persist.Transaction, jobID string) (Reservatio
 	}
 	return decodeReservation(raw)
 }
+
 func loadReservationEntries(entries map[string]json.RawMessage, jobID string) (Reservation, error) {
 	raw, ok := entries[reservationKey(jobID)]
 	if !ok {
@@ -4890,6 +5432,7 @@ func loadReservationEntries(entries map[string]json.RawMessage, jobID string) (R
 	}
 	return decodeReservation(raw)
 }
+
 func validateIntentEntry(key string, raw json.RawMessage) error {
 	value, err := decodeReservation(raw)
 	if err != nil {
@@ -4900,6 +5443,7 @@ func validateIntentEntry(key string, raw json.RawMessage) error {
 	}
 	return nil
 }
+
 func validCertificateHandoffTransition(oldValue, newValue Reservation) bool {
 	handoff := newValue.CertificateHandoff
 	if oldValue.Operation != Publish || oldValue.Phase != PhaseReentered || newValue.Phase != PhaseLocalIntent || oldValue.CertificateHandoff != nil || handoff == nil || handoff.PlanID != oldValue.SafetyBinding.PlanID || handoff.Generation != oldValue.SafetyBinding.IntentGeneration || handoff.SANIdentity != oldValue.SafetyBinding.CandidateDigest || handoff.ACMEBinding != oldValue.SafetyBinding.CandidateBundle || handoff.ACMEBinding != oldValue.OperationBinding || handoff.ChallengeSafetyDigest != oldValue.JournalSafetyDigest || !exactDigest(handoff.ChallengeSafetyDigest) || !exactDigest(handoff.SANIdentity) || !exactDigest(handoff.ACMEBinding) || !validIdentityRef(handoff.CertificateID) || !exactDigest(handoff.Fingerprint) || !exactDigest(newValue.SafetyBinding.CandidateDigest) || !exactDigest(newValue.SafetyBinding.CandidateBundle) {
@@ -4920,6 +5464,7 @@ func validCertificateHandoffTransition(oldValue, newValue Reservation) bool {
 	}
 	return reflect.DeepEqual(oldValue, newValue)
 }
+
 func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		value, err := decodeReservation(after)
@@ -5004,6 +5549,7 @@ func validateIntentTransition(_ string, before, after json.RawMessage) error {
 	}
 	return nil
 }
+
 func decodeReservation(raw json.RawMessage) (Reservation, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
@@ -5019,6 +5565,7 @@ func decodeReservation(raw json.RawMessage) (Reservation, error) {
 	}
 	return value, nil
 }
+
 func validateChildEntry(key string, raw json.RawMessage) error {
 	var value ChildRecord
 	if err := decodeStrict(raw, &value); err != nil {
@@ -5044,6 +5591,7 @@ func validateChildRecord(value ChildRecord) error {
 	}
 	return nil
 }
+
 func validateChildTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		var value ChildRecord
@@ -5085,6 +5633,7 @@ func validateChildTransition(_ string, before, after json.RawMessage) error {
 	}
 	return nil
 }
+
 func validateJournalEntry(key string, raw json.RawMessage) error {
 	var value JournalRecord
 	if err := decodeStrict(raw, &value); err != nil {
@@ -5123,19 +5672,13 @@ func validateCertificateJournalIdentity(value JournalRecord) error {
 	}
 	return nil
 }
+
 func validateJournalRecord(value JournalRecord) error {
-	if value.SchemaVersion != "lanpanel.journal.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.InstallationID) || !validIdentityRef(value.Target) || value.Generation == 0 || value.Deadline.IsZero() || !exactDigest(value.ArtifactDigest) || !exactDigest(value.SafetyMarkerDigest) || (value.Phase != JournalPrepared && value.Phase != JournalActive && value.Phase != JournalTerminal) {
+	if value.SchemaVersion != "lanpanel.journal.v1" || !validIdentityRef(value.ID) || !validIdentityRef(value.JobID) || !validIdentityRef(value.InstallationID) || !validIdentityRef(value.Target) || value.Generation == 0 || value.Deadline.IsZero() || !exactDigest(value.ArtifactDigest) || !exactDigest(value.SafetyMarkerDigest) || value.RuntimeDigest != "" && !exactDigest(value.RuntimeDigest) || (value.Phase != JournalPrepared && value.Phase != JournalActive && value.Phase != JournalTerminal) {
 		return fmt.Errorf("operation journal identity is invalid")
 	}
-	if value.Kind == JournalNonIngressLocalCommit {
-		if value.Operation != Maintenance && value.Operation != BackupEnter {
-			return fmt.Errorf("non-ingress journal operation is not allowed")
-		}
-	} else if value.Kind == JournalPackageTransaction {
-		if value.Operation != PackageTransaction || value.Target != string(plans.TargetInstallation) || len(value.ResourceIDs) != 0 {
-			return fmt.Errorf("package journal operation or target is invalid")
-		}
-	} else if value.Kind == JournalCertificateActivation {
+	switch value.Kind {
+	case JournalCertificateActivation:
 		if err := validateCertificateJournalIdentity(value); err != nil {
 			return err
 		}
@@ -5144,17 +5687,20 @@ func validateJournalRecord(value JournalRecord) error {
 		if value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy || !exactResource && !exactHeadscale {
 			return fmt.Errorf("certificate activation journal identity is invalid")
 		}
-	} else if value.Kind == JournalAppActivation {
+		if value.RuntimeDigest != "" && (!exactHeadscale || value.Operation != CertificateRenew || value.Phase != JournalTerminal) {
+			return fmt.Errorf("certificate runtime evidence scope invalid")
+		}
+	case JournalAppActivation:
 		if value.Operation != Publish || len(value.ResourceIDs) != 1 || value.Target != "resource/"+value.ResourceIDs[0] {
-			return fmt.Errorf("App activation journal identity is invalid")
+			return fmt.Errorf("app activation journal identity is invalid")
 		}
-	} else if value.Kind == JournalAppContraction {
+	case JournalAppContraction:
 		switch value.Operation {
-		case Publish, Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
+		case Publish, Unpublish, CloseAll, CertificateExpiry, AutomaticReconciliation, StartupContraction:
 		default:
-			return fmt.Errorf("App contraction journal operation is not allowed")
+			return fmt.Errorf("app contraction journal operation is not allowed")
 		}
-	} else {
+	default:
 		return fmt.Errorf("operation journal kind is not allowed")
 	}
 	if value.Kind != JournalCertificateActivation && value.Certificate != nil {
@@ -5172,7 +5718,7 @@ func validateJournalRecord(value JournalRecord) error {
 		exactApp := len(value.ResourceIDs) == 1 && value.Target == "resource/"+value.ResourceIDs[0]
 		exactCloseAll := value.Operation == CloseAll && len(value.ResourceIDs) != 0 && value.Target == string(plans.TargetInstallation)
 		if !exactApp && !exactCloseAll {
-			return fmt.Errorf("App contraction journal does not exactly identify its affected resources")
+			return fmt.Errorf("app contraction journal does not exactly identify its affected resources")
 		}
 	} else if value.Kind != JournalAppActivation && value.Kind != JournalCertificateActivation && len(value.ResourceIDs) != 0 {
 		return fmt.Errorf("non-ingress journal unexpectedly identifies App resources")
@@ -5187,6 +5733,7 @@ func validateJournalRecord(value JournalRecord) error {
 	}
 	return nil
 }
+
 func validateJournalTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		var value JournalRecord
@@ -5212,6 +5759,9 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 		return err
 	}
 	oldPhase, newPhase := oldValue.Phase, newValue.Phase
+	oldRuntime, newRuntime := oldValue.RuntimeDigest, newValue.RuntimeDigest
+	oldValue.RuntimeDigest = ""
+	newValue.RuntimeDigest = ""
 	oldCandidateFingerprint, newCandidateFingerprint := "", ""
 	var oldUID, oldGID, newUID, newGID uint32
 	if oldValue.Certificate != nil {
@@ -5240,11 +5790,16 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 	if !filledCandidate && !sameCandidate {
 		return fmt.Errorf("journal candidate fingerprint was rewritten")
 	}
+	runtimeFilled := oldRuntime == "" && exactDigest(newRuntime) && oldPhase == JournalActive && newPhase == JournalTerminal
+	if oldRuntime != newRuntime && !runtimeFilled {
+		return fmt.Errorf("journal runtime evidence was rewritten")
+	}
 	if oldPhase == JournalTerminal || oldPhase == JournalPrepared && newPhase != JournalActive && newPhase != JournalTerminal || oldPhase == JournalActive && newPhase != JournalTerminal {
 		return fmt.Errorf("journal transition is invalid")
 	}
 	return nil
 }
+
 func decodeStrict(raw json.RawMessage, value any) error {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
@@ -5320,11 +5875,11 @@ func validateLinks(document persist.Document) error {
 			deploy := installation.Headscale.DeployIntent
 			intent, ok := intents[deploy.JobID]
 			if !ok || intent.Operation != HeadscaleDeploy || intent.PlanID != deploy.PlanID || intent.HeadscaleDeploy == nil || intent.HeadscaleDeploy.Candidate.HeadscaleID != installation.Headscale.ID || intent.HeadscaleDeploy.Candidate.CertificateBinding != deploy.CertificateBinding || intent.HeadscaleDeploy.PreflightResult.RequestDigest != deploy.PreflightDigest {
-				return fmt.Errorf("Headscale deploy domain intent has no exact operation authority")
+				return fmt.Errorf("headscale deploy domain intent has no exact operation authority")
 			}
 			applied, err := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
 			if err != nil || !reflect.DeepEqual(applied, deploy.Candidate) {
-				return fmt.Errorf("Headscale deploy candidate authority changed")
+				return fmt.Errorf("headscale deploy candidate authority changed")
 			}
 			switch deploy.Phase {
 			case domain.HeadscaleDeployPrepared:
@@ -5360,7 +5915,7 @@ func validateLinks(document persist.Document) error {
 					return fmt.Errorf("staged Headscale certificate fingerprint changed")
 				}
 			default:
-				return fmt.Errorf("Headscale deploy domain phase is invalid")
+				return fmt.Errorf("headscale deploy domain phase is invalid")
 			}
 		}
 	}
@@ -5496,18 +6051,31 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	}
 	oldBase, newBase := oldInstallation, newInstallation
 	oldBase.Headscale, newBase.Headscale = nil, nil
+	oldBase.Connector, newBase.Connector = nil, nil
 	oldBase.Resources, newBase.Resources = nil, nil
 	if !reflect.DeepEqual(oldBase, newBase) {
 		return fmt.Errorf("installation authority outside Headscale/resources changed")
 	}
+	if !reflect.DeepEqual(oldInstallation.Connector, newInstallation.Connector) {
+		if newInstallation.Connector == nil || newInstallation.Connector.LastJobID == "" || (newInstallation.Connector.LastOperation != domain.OperationConnectorBindingSet && newInstallation.Connector.LastOperation != domain.OperationConnectorLogin) {
+			return fmt.Errorf("connector transition lacks durable job identity")
+		}
+		intent, err := loadReservationEntries(after.Entries, newInstallation.Connector.LastJobID)
+		if err != nil || (intent.Operation != ConnectorBindingSet && intent.Operation != ConnectorLogin) || intent.Target != "connector" || intent.Operation == ConnectorBindingSet && intent.Phase != PhaseLocalIntent || intent.Operation == ConnectorLogin && intent.Phase != PhaseReentered {
+			return fmt.Errorf("connector transition lacks exact local intent")
+		}
+		if oldInstallation.Connector != nil && (intent.Operation != ConnectorLogin || oldInstallation.Connector.ID != newInstallation.Connector.ID || oldInstallation.Connector.ControlURL != newInstallation.Connector.ControlURL || !slices.Equal(oldInstallation.Connector.ManagedPaths, newInstallation.Connector.ManagedPaths)) {
+			return fmt.Errorf("connector binding is immutable")
+		}
+	}
 	if !reflect.DeepEqual(oldInstallation.Headscale, newInstallation.Headscale) {
 		if oldInstallation.Headscale == nil {
 			if newInstallation.Headscale == nil {
-				return fmt.Errorf("Headscale initialization candidate disappeared")
+				return fmt.Errorf("headscale initialization candidate disappeared")
 			}
 			headscale := newInstallation.Headscale
-			if headscale.LastJobID == "" || headscale.LastOperation != domain.OperationDeploy {
-				return fmt.Errorf("Headscale initialization lacks durable job identity")
+			if headscale.LastJobID == "" || headscale.LastOperation != domain.OperationHeadscaleInitialize {
+				return fmt.Errorf("headscale initialization lacks durable job identity")
 			}
 			beforeIntent, err := loadReservationEntries(before.Entries, headscale.LastJobID)
 			if err != nil {
@@ -5526,25 +6094,51 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 				return err
 			}
 			if beforeIntent.Operation != HeadscaleInitialize || afterIntent.Operation != HeadscaleInitialize || beforeIntent.Target != string(plans.TargetInstallation) || afterIntent.Target != string(plans.TargetInstallation) || beforeIntent.Phase != PhaseReentered || afterIntent.Phase != PhaseReentered || beforeRecord.Status != jobs.StatusRunning || afterRecord.Status != jobs.StatusRunning {
-				return fmt.Errorf("Headscale initialization changed outside its running local intent")
+				return fmt.Errorf("headscale initialization changed outside its running local intent")
 			}
 		} else {
 			if newInstallation.Headscale == nil || domain.ValidateHeadscaleTransition(*oldInstallation.Headscale, *newInstallation.Headscale) != nil {
-				return fmt.Errorf("Headscale identity cannot be removed or changed by deploy")
+				return fmt.Errorf("headscale identity cannot be removed or changed by deploy")
 			}
 			oldHeadscale, newHeadscale := oldInstallation.Headscale, newInstallation.Headscale
-			if newHeadscale.DeployIntent == nil || newHeadscale.LastJobID == "" || newHeadscale.LastOperation != domain.OperationDeploy {
-				return fmt.Errorf("Headscale deploy lacks durable intent")
+			completing := oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated && newHeadscale.DeployIntent == nil
+			renewing := oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent == nil && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
+			reissueActivating := oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent != nil && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
+			reissueCompleting := oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating && newHeadscale.DeployIntent == nil && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
+			if (!completing && !renewing && !reissueActivating && !reissueCompleting && newHeadscale.DeployIntent == nil) || newHeadscale.LastJobID == "" || (!renewing && !reissueActivating && !reissueCompleting && newHeadscale.LastOperation != domain.OperationHeadscaleControlDeploy) {
+				return fmt.Errorf("headscale deploy lacks durable intent")
 			}
 			expected := *oldHeadscale
 			beforePhase, afterPhase := PhaseLocalIntent, PhaseLocalIntent
 			beforeStatus, afterStatus := jobs.StatusRunning, jobs.StatusRunning
 			contracting := false
+			expectedOperation := HeadscaleDeploy
+			expectedTarget := string(plans.TargetHeadscale) + "/" + newHeadscale.ID
 			switch {
+			case reissueActivating:
+				expected.DeployIntent = newHeadscale.DeployIntent
+				expected.LastOperation = newHeadscale.LastOperation
+				expected.LastJobID = newHeadscale.LastJobID
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+				expectedOperation = CertificateRenew
+			case reissueCompleting:
+				expected.DeployIntent = nil
+				expected.Certificate = newHeadscale.Certificate
+				expected.LastOperation = newHeadscale.LastOperation
+				expected.LastJobID = newHeadscale.LastJobID
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+				expectedOperation = CertificateRenew
+			case renewing:
+				expected.Certificate = newHeadscale.Certificate
+				expected.LastOperation = newHeadscale.LastOperation
+				expected.LastJobID = newHeadscale.LastJobID
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+				expectedOperation = CertificateRenew
+				expectedTarget = string(plans.TargetHeadscale) + "/" + newHeadscale.ID
 			case oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployPrepared:
 				expected.DeployIntent = newHeadscale.DeployIntent
 				expected.LastJobID = newHeadscale.LastJobID
-				expected.LastOperation = domain.OperationDeploy
+				expected.LastOperation = domain.OperationHeadscaleControlDeploy
 			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployPrepared && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending:
 				expected.DeployIntent = newHeadscale.DeployIntent
 				expected.Database.Phase = domain.HeadscaleInitialized
@@ -5559,6 +6153,11 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 				expected.DeployIntent = newHeadscale.DeployIntent
 				expected.Applied, expected.Enabled = newHeadscale.Applied, newHeadscale.Enabled
 				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+			case oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated && newHeadscale.DeployIntent == nil:
+				expected.DeployIntent = nil
+				expected.Certificate = newHeadscale.Certificate
+				beforePhase, afterPhase = PhaseReentered, PhaseReentered
+				beforeStatus, afterStatus = jobs.StatusRunning, jobs.StatusRunning
 			case oldHeadscale.DeployIntent != nil && (oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificatePending || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployCertificateStaged || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating || oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated) && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployContracted:
 				expected.DeployIntent = newHeadscale.DeployIntent
 				expected.Applied, expected.Enabled = newHeadscale.Applied, newHeadscale.Enabled
@@ -5566,10 +6165,10 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 				beforeStatus, afterStatus = jobs.StatusRunning, jobs.StatusTerminal
 				contracting = true
 			default:
-				return fmt.Errorf("Headscale deploy state transition is not owned")
+				return fmt.Errorf("headscale deploy state transition is not owned")
 			}
 			if !reflect.DeepEqual(expected, *newHeadscale) {
-				return fmt.Errorf("Headscale deploy changed unrelated authority")
+				return fmt.Errorf("headscale deploy changed unrelated authority")
 			}
 			beforeIntent, err := loadReservationEntries(before.Entries, newHeadscale.LastJobID)
 			if err != nil {
@@ -5591,8 +6190,8 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			if contracting {
 				phaseValid = (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && afterIntent.Phase == PhaseTerminal
 			}
-			if beforeIntent.Operation != HeadscaleDeploy || afterIntent.Operation != HeadscaleDeploy || beforeIntent.Target != string(plans.TargetHeadscale)+"/"+newHeadscale.ID || afterIntent.Target != string(plans.TargetHeadscale)+"/"+newHeadscale.ID || !phaseValid || beforeRecord.Status != beforeStatus || afterRecord.Status != afterStatus {
-				return fmt.Errorf("Headscale deploy changed outside its running exact intent")
+			if beforeIntent.Operation != expectedOperation || afterIntent.Operation != expectedOperation || beforeIntent.Target != expectedTarget || afterIntent.Target != expectedTarget || !phaseValid || beforeRecord.Status != beforeStatus || afterRecord.Status != afterStatus {
+				return fmt.Errorf("headscale deploy changed outside its running exact intent")
 			}
 		}
 	}
@@ -5670,7 +6269,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		terminalContraction := oldResource.PublicationRecord.ContractionIntent != nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		terminalGoAccessContractionReconciliation := oldResource.PublicationRecord.State == domain.PublicationUnpublished && resource.PublicationRecord.State == domain.PublicationUnpublished && len(oldResource.PublicationRecord.PendingGoAccessRetirements) > 0 && len(resource.PublicationRecord.PendingGoAccessRetirements) == 0 && intent.Operation == GoAccessRetirement && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
 		terminalGoAccessReconciliation := oldResource.PublicationRecord.State == domain.PublicationPublished && resource.PublicationRecord.State == domain.PublicationPublished && reflect.DeepEqual(oldResource.PublicationRecord.LastAppliedBundle, resource.PublicationRecord.LastAppliedBundle) && intent.Operation == GoAccessRetirement && beforeIntent.Phase == PhaseLocalIntent && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal && record.Result == jobs.ResultSucceeded
-		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
+		ordinaryLocal := oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && beforeIntent.Phase == intent.Phase && intent.Phase == PhaseLocalIntent && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusRunning && (intent.Operation == ResourceUpdate || intent.Operation == ResourceDelete || intent.Operation == ProcessStart || intent.Operation == ProcessStop)
 		ordinaryTerminal := intent.Operation != Publish && oldResource.PublicationRecord.ContractionIntent == nil && resource.PublicationRecord.ContractionIntent == nil && (beforeIntent.Phase == PhaseLocalIntent || beforeIntent.Phase == PhaseReentered || beforeIntent.Phase == PhaseRemoteWait && intent.Operation == CertificateRenew) && intent.Phase == PhaseTerminal && beforeRecord.Status == jobs.StatusRunning && record.Status == jobs.StatusTerminal
 		switch {
 		case beginningActivation:
@@ -5753,9 +6352,21 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 		}
 		delete(oldResources, resource.ID)
 	}
-	if len(oldResources) != 0 {
-		return fmt.Errorf("resource state cannot disappear outside its typed deletion operation")
+	for resourceID, resource := range oldResources {
+		matched := false
+		for _, key := range persist.EntryKeys(after, "intents") {
+			intent, err := loadReservationEntries(after.Entries, strings.TrimPrefix(key, "intents/"))
+			if err == nil && intent.Operation == ResourceDelete && intent.Target == "resource/"+resourceID && intent.Phase == PhaseLocalIntent {
+				record, recordErr := jobs.LoadEntries(after.Entries, intent.JobID)
+				matched = recordErr == nil && record.Status == jobs.StatusRunning && resource.Lifecycle == domain.LifecycleDeleting && resource.PublicationRecord.LastJobID == intent.JobID
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("resource state cannot disappear outside its typed deletion operation")
+		}
 	}
+
 	return nil
 }
 
@@ -5828,6 +6439,17 @@ func loadInstallationEntries(entries map[string]json.RawMessage) (domain.Install
 }
 
 func validateOperationResourceDelta(before, after domain.AppResource, operation Type) error {
+	if operation == ResourceDelete {
+		beforeCopy, afterCopy := before, after
+		beforeCopy.Lifecycle, afterCopy.Lifecycle = "", ""
+		beforeCopy.PublicationRecord.LastOperation, afterCopy.PublicationRecord.LastOperation = "", ""
+		beforeCopy.PublicationRecord.LastOperationResult, afterCopy.PublicationRecord.LastOperationResult = "", ""
+		beforeCopy.PublicationRecord.LastJobID, afterCopy.PublicationRecord.LastJobID = "", ""
+		if before.Lifecycle != domain.LifecycleActive || after.Lifecycle != domain.LifecycleDeleting || after.PublicationRecord.LastOperation != domain.OperationResourceDelete || after.PublicationRecord.LastOperationResult != "" || after.PublicationRecord.LastJobID == "" || !reflect.DeepEqual(beforeCopy, afterCopy) {
+			return fmt.Errorf("resource delete begin changed unrelated authority")
+		}
+		return nil
+	}
 	if before.Lifecycle != after.Lifecycle {
 		return fmt.Errorf("operation %q does not own lifecycle state", operation)
 	}
@@ -5857,7 +6479,7 @@ func validateOperationResourceDelta(before, after domain.AppResource, operation 
 			return fmt.Errorf("startup contraction did not preserve or advance exact unpublished state")
 		}
 		return nil
-	case Unpublish, CloseAll, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, Maintenance:
+	case Unpublish, CloseAll, CertificateExpiry, AutomaticReconciliation:
 		if after.PublicationRecord.State != domain.PublicationUnpublished || after.PublicationRecord.UnpublishedGeneration <= before.PublicationRecord.UnpublishedGeneration {
 			return fmt.Errorf("contraction operation did not commit unpublished state with a fresh generation")
 		}
@@ -5914,13 +6536,14 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 				continue
 			}
 			jobID := strings.TrimPrefix(key, namespace+"/")
-			if namespace == "children" {
+			switch namespace {
+			case "children":
 				var child ChildRecord
 				if err := decodeStrict(before.Entries[key], &child); err != nil {
 					return err
 				}
 				jobID = child.JobID
-			} else if namespace == "journals" {
+			case "journals":
 				var journal JournalRecord
 				if err := decodeStrict(before.Entries[key], &journal); err != nil {
 					return err
@@ -6034,18 +6657,16 @@ func operationCodeMatchesIntent(code domain.OperationCode, operation Type) bool 
 		return code == domain.OperationResourceCreate
 	case ResourceUpdate:
 		return code == domain.OperationResourceUpdate
+	case ResourceDelete:
+		return code == domain.OperationResourceDelete
 	case ProcessStart:
 		return code == domain.OperationProcessStart
 	case ProcessStop:
 		return code == domain.OperationProcessStop
-	case Unpublish, CertificateExpiry, EdgeOneExpiry, AutomaticReconciliation, StartupContraction:
+	case Unpublish, CertificateExpiry, AutomaticReconciliation, StartupContraction:
 		return code == domain.OperationUnpublish
 	case CloseAll:
 		return code == domain.OperationCloseAll
-	case Maintenance:
-		return code == domain.OperationMaintenance
-	case BackupEnter:
-		return code == domain.OperationBackupEnter
 	default:
 		return string(code) == string(operation)
 	}
@@ -6059,14 +6680,14 @@ func validateHeadscaleInitializationBinding(operation Type, safetyBinding Safety
 		return nil
 	}
 	if binding == nil || binding.Candidate.LastJobID != "" || binding.Candidate.LastOperation != "" || binding.Candidate.DesiredDigest != safetyBinding.CandidateDigest || binding.Candidate.Artifact.ArchiveDigest != safetyBinding.CandidateBundle || managedheadscale.VerifySnapshot(binding.Candidate, binding.Snapshot) != nil || sources.Validate(binding.Source) != nil || binding.Source.Artifact.Name != "headscale" || binding.Source.Artifact.Version != binding.Candidate.Artifact.Version || "sha256:"+binding.Source.Artifact.Digest != binding.Candidate.Artifact.ArchiveDigest || sources.ValidateProxy(journalProxy(binding.ProxyURL)) != nil {
-		return fmt.Errorf("Headscale initialization authority is invalid")
+		return fmt.Errorf("headscale initialization authority is invalid")
 	}
 	preflightDigest, err := preflight.ExpansionRequestDigest(binding.PreflightRequest)
 	if err != nil || binding.PreflightRequest.Scope != preflight.ExpansionHeadscale || binding.PreflightRequest.Target != "headscale" || binding.PreflightRequest.Generation != binding.Candidate.Database.Generation || binding.PreflightResult.SchemaVersion == "" || binding.PreflightResult.Scope != string(preflight.ExpansionHeadscale) || binding.PreflightResult.Target != "headscale" || binding.PreflightResult.Generation != binding.PreflightRequest.Generation || binding.PreflightResult.RequestDigest != preflightDigest || !binding.PreflightResult.Allowed || binding.PreflightResult.ObservedAt.IsZero() || !binding.PreflightResult.ValidUntil.After(binding.PreflightResult.ObservedAt) {
-		return fmt.Errorf("Headscale initialization authority is invalid")
+		return fmt.Errorf("headscale initialization authority is invalid")
 	}
 	if err := preflight.RequireExpansionResultForRequest(binding.PreflightResult, binding.PreflightRequest, binding.PreflightResult.ObservedAt); err != nil {
-		return fmt.Errorf("Headscale initialization preflight authority is invalid")
+		return fmt.Errorf("headscale initialization preflight authority is invalid")
 	}
 	return nil
 }
@@ -6079,14 +6700,14 @@ func validateHeadscaleDeployBinding(operation Type, safetyBinding SafetyBinding,
 		return nil
 	}
 	if binding == nil || control.Validate(binding.Candidate) != nil || binding.Candidate.ConfigDigest != safetyBinding.CandidateDigest || binding.Candidate.CertificateBinding != safetyBinding.ACMEBinding || binding.Candidate.CertificateID != safetyBinding.CertificateIdentity {
-		return fmt.Errorf("Headscale deploy authority is invalid")
+		return fmt.Errorf("headscale deploy authority is invalid")
 	}
 	candidateDigest, err := control.Digest(binding.Candidate)
 	if err != nil || candidateDigest != safetyBinding.CandidateBundle || binding.PreflightRequest.Scope != preflight.ExpansionHeadscale || binding.PreflightRequest.Target != "headscale" || binding.PreflightRequest.Generation != binding.Candidate.DatabaseGeneration {
-		return fmt.Errorf("Headscale deploy authority is invalid")
+		return fmt.Errorf("headscale deploy authority is invalid")
 	}
 	if err := preflight.RequireExpansionResultForRequest(binding.PreflightResult, binding.PreflightRequest, binding.PreflightResult.ObservedAt); err != nil {
-		return fmt.Errorf("Headscale deploy preflight authority is invalid")
+		return fmt.Errorf("headscale deploy preflight authority is invalid")
 	}
 	return nil
 }
@@ -6140,7 +6761,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, EdgeOneExpiry, Maintenance, PackageTransaction, AdminTokenRotate, Upgrade, BackupEnter, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, HeadscaleDeploy, ResourceCreate, ResourceUpdate, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, AdminTokenRotate, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, HeadscaleDeploy, HeadscaleUserCreate, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorBindingSet, ConnectorLogin, ResourceCreate, ResourceUpdate, ResourceDelete, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -6155,7 +6776,15 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 	case string(plans.TargetHeadscale):
 		if identity == "" || request.SafetyBinding.ResourceID != "headscale" {
-			return fmt.Errorf("Headscale target does not match safety authority")
+			return fmt.Errorf("headscale target does not match safety authority")
+		}
+	case "connector":
+		if identity != "" || request.SafetyBinding.ResourceID != "" || (request.Operation != ConnectorBindingSet && request.Operation != ConnectorLogin) {
+			return fmt.Errorf("connector target authority is invalid")
+		}
+	case "headscale_user", "preauth_key", "device":
+		if identity == "" || request.SafetyBinding.ResourceID != "headscale" || (request.Operation != PreauthKeyCreate && request.Operation != PreauthKeyRevoke && request.Operation != DeviceExpire) {
+			return fmt.Errorf("headscale lifecycle target does not match immutable safety authority")
 		}
 	case string(plans.TargetInstallation):
 		resourceCreate := request.Operation == ResourceCreate && identity == "" && request.SafetyBinding.ResourceID != ""
@@ -6184,18 +6813,26 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 		return nil
 	}
-	if request.Operation == ResourceUpdate && request.Source == AdmissionUI {
+	if (request.Operation == ResourceUpdate || request.Operation == HeadscaleUserCreate || request.Operation == ConnectorBindingSet) && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
-			return fmt.Errorf("authenticated resource update requires exact prior and candidate digests")
+			return fmt.Errorf("authenticated direct mutation requires exact prior and candidate digests")
+		}
+		return nil
+	}
+	planMutationWithoutGeneration := request.Operation == PreauthKeyCreate || request.Operation == PreauthKeyRevoke || request.Operation == DeviceExpire || request.Operation == ConnectorLogin || request.Operation == ResourceDelete
+	if planMutationWithoutGeneration {
+		if request.Source != AdmissionPlan || binding.PlanID != request.PlanID || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
+			return fmt.Errorf("plan mutation safety identity is invalid")
 		}
 		return nil
 	}
 	activationBound := binding.PlanID != "" || binding.IntentGeneration != 0 || binding.CandidateDigest != "" || binding.CandidateBundle != ""
 	if activationBound {
 		planBound := request.Source == AdmissionPlan && binding.PlanID == request.PlanID && exactDigest(binding.CandidateBundle)
+		timerBound := request.Source == AdmissionTimer && request.Operation == CertificateRenew && validIdentityRef(binding.PlanID) && exactDigest(binding.CandidateBundle)
 		startupBound := request.Operation == StartupContraction && request.Source == AdmissionStartup && (binding.CandidateBundle == "" || exactDigest(binding.CandidateBundle))
 		exactCandidate := validIdentityRef(binding.PlanID) && binding.IntentGeneration != 0 && exactDigest(binding.CandidateDigest)
-		if !exactCandidate || !planBound && !startupBound {
+		if !exactCandidate || !planBound && !timerBound && !startupBound {
 			return fmt.Errorf("activation safety identity does not match Plan or startup contraction authority")
 		}
 	}
@@ -6206,15 +6843,15 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 	switch source {
 	case AdmissionPlan:
 		if planID == "" {
-			return fmt.Errorf("Plan admission requires a Plan identity")
+			return fmt.Errorf("plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, Maintenance, PackageTransaction, AdminTokenRotate, ManagedBasicDelete, BackupEnter, HeadscaleDeploy:
+		case Publish, Unpublish, CloseAll, AdminTokenRotate, ManagedBasicDelete, HeadscaleDeploy, ResourceDelete, CertificateRenew, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorLogin:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}
 	case AdmissionTimer:
-		if planID != "" || operation != CertificateExpiry && operation != CertificateRenew && operation != EdgeOneExpiry && operation != AutomaticReconciliation {
+		if planID != "" || operation != CertificateExpiry && operation != CertificateRenew && operation != AutomaticReconciliation {
 			return fmt.Errorf("timer admission is not authorized for operation")
 		}
 	case AdmissionStartup:
@@ -6222,7 +6859,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("startup admission is not authorized for operation")
 		}
 	case AdmissionUI:
-		if planID != "" || operation != HeadscaleInitialize && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
+		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
 			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:
@@ -6264,6 +6901,7 @@ func exactDigest(value string) bool {
 	_, err := hex.DecodeString(value[len("sha256:"):])
 	return err == nil
 }
+
 func validIdentityRef(value string) bool {
 	if value == "" || value != strings.TrimSpace(value) || len(value) > 256 {
 		return false
@@ -6275,78 +6913,12 @@ func validIdentityRef(value string) bool {
 	}
 	return true
 }
+
 func planTarget(target plans.Target) string {
 	if target.ID == "" {
 		return string(target.Kind)
 	}
 	return string(target.Kind) + "/" + target.ID
-}
-
-type HandoffVariant string
-
-const (
-	HandoffMaintenance HandoffVariant = "maintenance"
-	HandoffUpgrade     HandoffVariant = "upgrade"
-	HandoffBackupEnter HandoffVariant = "backup_enter"
-)
-
-// FencedHandoff is the sole admission-retaining path. It proves the inventory
-// empty, then acquires resource mutation and exposure in order before the
-// owning step commits its independent transition fence.
-func (admitter *Admitter) FencedHandoff(ctx context.Context, admission *locks.Lease, mutationSet *MutationSet, manager *locks.Manager, variant HandoffVariant, target, exceptJob string, commitFence func(*MutationLease, *locks.Lease) error) error {
-	if admission == nil || !admission.Holds(locks.MutationAdmission) || mutationSet == nil || manager == nil || admitter == nil || admitter.safety.LockAuthority() != manager.Authority() || admission.Authority() != manager.Authority() || admitter.normal.LockAuthority() != manager.Authority() || mutationSet.Authority() != manager.Authority() || commitFence == nil {
-		return fmt.Errorf("fenced handoff authority is incomplete")
-	}
-	if variant != HandoffMaintenance && variant != HandoffUpgrade && variant != HandoffBackupEnter {
-		return fmt.Errorf("admission-retaining handoff variant is unsupported")
-	}
-	normal := admitter.normal
-	document, err := normal.Read()
-	if err != nil {
-		return err
-	}
-	if exceptJob != "" {
-		intent, err := loadReservationEntries(document.Entries, exceptJob)
-		if err != nil {
-			return err
-		}
-		expected := map[HandoffVariant]Type{HandoffMaintenance: Maintenance, HandoffUpgrade: Upgrade, HandoffBackupEnter: BackupEnter}[variant]
-		if intent.Operation != expected || intent.Target != target || intent.Phase != PhaseReserved {
-			return fmt.Errorf("fenced handoff exemption does not match variant, target, and reserved intent")
-		}
-	}
-	empty, err := InventoryEmpty(document, exceptJob)
-	if err != nil {
-		return err
-	}
-	if !empty {
-		return fmt.Errorf("fenced handoff inventory is not empty")
-	}
-	mutation, exposure, err := mutationSet.acquireExposureForHandoff(ctx, target, manager)
-	if err != nil {
-		return err
-	}
-	document, err = normal.Read()
-	if err == nil && exceptJob != "" {
-		intent, loadErr := loadReservationEntries(document.Entries, exceptJob)
-		expected := map[HandoffVariant]Type{HandoffMaintenance: Maintenance, HandoffUpgrade: Upgrade, HandoffBackupEnter: BackupEnter}[variant]
-		if loadErr != nil {
-			err = loadErr
-		} else if intent.Operation != expected || intent.Target != target || intent.Phase != PhaseReserved {
-			err = fmt.Errorf("fenced handoff exemption changed before fence")
-		}
-	}
-	if err == nil {
-		empty, err = InventoryEmpty(document, exceptJob)
-	}
-	if err != nil {
-		return errors.Join(err, ReleaseExposure(mutation, exposure))
-	}
-	if !empty {
-		return errors.Join(fmt.Errorf("fenced handoff inventory changed before fence"), ReleaseExposure(mutation, exposure))
-	}
-	commitErr := commitFence(mutation, exposure)
-	return errors.Join(commitErr, ReleaseExposure(mutation, exposure))
 }
 
 // ResultBranch fixes one non-interchangeable terminal branch.
@@ -6389,6 +6961,7 @@ func NewBranchTable(values []ResultBranch) (*BranchTable, error) {
 	}
 	return result, nil
 }
+
 func (table *BranchTable) Branch(name string) (ResultBranch, bool) {
 	value, ok := table.branches[name]
 	return value, ok
@@ -6417,6 +6990,7 @@ func NewRegistry(values []Registration) (*Registry, error) {
 	}
 	return registry, nil
 }
+
 func (registry *Registry) Registration(operation Type) (Registration, bool) {
 	value, ok := registry.registrations[operation]
 	return value, ok

@@ -56,6 +56,41 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	}
 }
 
+func TestTailscaleLoginUsesOnlyFileAuthKeyAndExactControlURL(t *testing.T) {
+	identities := Identities{TailscaleOperator: Identity{UID: 3200, GID: 3200}}
+	invocation := Invocation{Tailscale: &TailscaleInvocation{Action: TailscaleLogin, ControlURL: "https://control.example.test", AuthKeyPath: "/var/lib/lanpanel/connector/auth/job_0000000000000000000000000000000000000000000000000000000000000001.key", ExecutableDigest: strings.Repeat("a", 64)}}
+	profile, err := ResolveInvocation(ProfileTailscaleAdmin, identities, invocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"up", "--login-server=https://control.example.test", "--auth-key=file:/var/lib/lanpanel/connector/auth/job_0000000000000000000000000000000000000000000000000000000000000001.key"}
+	if !reflect.DeepEqual(profile.Arguments, want) || strings.Contains(strings.Join(profile.Arguments, " "), "tskey-auth-") {
+		t.Fatalf("Tailscale login profile=%#v", profile)
+	}
+	invocation.Tailscale.AuthKeyPath = "/root/key"
+	if _, err := ResolveInvocation(ProfileTailscaleAdmin, identities, invocation); err == nil {
+		t.Fatal("caller-selected Tailscale auth path accepted")
+	}
+}
+
+func TestHeadscaleAdminProfilesUseOnlyTypedImmutableLifecycleArguments(t *testing.T) {
+	identities := Identities{Headscale: Identity{UID: 3100, GID: 3100}}
+	headscaleID := "hds_00000000000000000000000000000001"
+	profile, err := ResolveInvocation(ProfileHeadscaleAdmin, identities, Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: headscaleID, AdminAction: HeadscalePreauthCreate, Identifier: "17", ExpirationSeconds: 3600}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--config", "/etc/lanpanel-headscale/config.yaml", "--output", "json-line", "preauthkeys", "create", "--user", "17", "--expiration", "3600s"}
+	if !reflect.DeepEqual(profile.Arguments, want) || profile.UID != 3100 || profile.Network != NetworkUnixOnly || !profile.Complete {
+		t.Fatalf("Headscale admin profile=%#v", profile)
+	}
+	for _, hostile := range []HeadscaleInvocation{{HeadscaleID: headscaleID, AdminAction: HeadscalePreauthCreate, Identifier: "17", ExpirationSeconds: 86401}, {HeadscaleID: headscaleID, AdminAction: HeadscalePreauthRevoke, Identifier: "key-secret"}, {HeadscaleID: headscaleID, AdminAction: "delete_user", Identifier: "1"}} {
+		if _, err := ResolveInvocation(ProfileHeadscaleAdmin, identities, Invocation{Headscale: &hostile}); err == nil {
+			t.Fatalf("hostile Headscale admin invocation accepted: %#v", hostile)
+		}
+	}
+}
+
 func TestHeadscaleAccountInvocationUsesOnlyFixedAuthorityPath(t *testing.T) {
 	id := "hds_00000000000000000000000000000001"
 	profile, err := ResolveInvocation(ProfileHeadscaleAccounts, Identities{}, Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: id}})

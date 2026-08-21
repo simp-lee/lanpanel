@@ -107,7 +107,9 @@ type DomainSite struct {
 	CIDRs              []string      `json:"cidrs,omitempty"`
 	UpstreamNetwork    string        `json:"upstream_network"`
 	UpstreamAddress    string        `json:"upstream_address"`
+	UpstreamSource     string        `json:"upstream_source,omitempty"`
 	WebSocket          bool          `json:"websocket"`
+	Tailnet            bool          `json:"tailnet,omitempty"`
 	Static             []StaticRoute `json:"static,omitempty"`
 	GoAccess           *GoAccessSite `json:"goaccess,omitempty"`
 }
@@ -141,7 +143,9 @@ type TemporarySite struct {
 	HostAuthority   string `json:"host_authority"`
 	UpstreamNetwork string `json:"upstream_network"`
 	UpstreamAddress string `json:"upstream_address"`
+	UpstreamSource  string `json:"upstream_source,omitempty"`
 	ReadinessPath   string `json:"readiness_path"`
+	Tailnet         bool   `json:"tailnet,omitempty"`
 }
 
 type Manifest struct {
@@ -235,7 +239,7 @@ func ParseDefaultCertificate(certificatePEM, privateKeyPEM []byte) (DefaultCerti
 	parsed, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
 	key, keyOK := parsed.(*ecdsa.PrivateKey)
 	publicKey, publicOK := certificate.PublicKey.(*ecdsa.PublicKey)
-	if err != nil || !keyOK || !publicOK || key.Curve != elliptic.P256() || key.PublicKey.X.Cmp(publicKey.X) != 0 || key.PublicKey.Y.Cmp(publicKey.Y) != 0 {
+	if err != nil || !keyOK || !publicOK || key.Curve != elliptic.P256() || !key.PublicKey.Equal(publicKey) {
 		return DefaultCertificate{}, fmt.Errorf("default rejection certificate and key do not match")
 	}
 	fingerprint := sha256.Sum256(certificate.Raw)
@@ -279,33 +283,33 @@ func DecodeManifest(data []byte) (Manifest, error) {
 		return Manifest{}, err
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Manifest{}, fmt.Errorf("Nginx graph manifest has trailing data")
+		return Manifest{}, fmt.Errorf("nginx graph manifest has trailing data")
 	}
 	canonical, err := EncodeManifest(manifest)
 	if err != nil || !bytes.Equal(canonical, data) {
-		return Manifest{}, fmt.Errorf("Nginx graph manifest is noncanonical")
+		return Manifest{}, fmt.Errorf("nginx graph manifest is noncanonical")
 	}
 	return manifest, nil
 }
 
 func ValidateManifest(manifest Manifest) error {
 	if manifest.SchemaVersion != ManifestSchema || !validRef(manifest.InstallationID) || !validRef(manifest.GenerationID) || !validDigest(manifest.DefaultCertFingerprint) || !validDigest(manifest.MainDigest) || !validDigest(manifest.SanitizerDigest) || len(manifest.Entries) > MaximumGraphEntries {
-		return fmt.Errorf("Nginx graph manifest identity is invalid")
+		return fmt.Errorf("nginx graph manifest identity is invalid")
 	}
 	if !entriesEqual(manifest.Entries, canonicalEntries(manifest.Entries)) {
-		return fmt.Errorf("Nginx graph entries are noncanonical")
+		return fmt.Errorf("nginx graph entries are noncanonical")
 	}
 	seenPath := map[string]bool{}
 	seenDomain := map[string]string{}
 	seenListener := map[string]string{}
 	for _, entry := range manifest.Entries {
 		if !validEntry(entry) || seenPath[entry.Relative] {
-			return fmt.Errorf("Nginx graph entry is invalid or duplicated")
+			return fmt.Errorf("nginx graph entry is invalid or duplicated")
 		}
 		seenPath[entry.Relative] = true
 		for _, domain := range entry.Domains {
 			if owner := seenDomain[domain]; owner != "" && owner != entry.ResourceID {
-				return fmt.Errorf("Nginx domain %q belongs to multiple resources", domain)
+				return fmt.Errorf("nginx domain %q belongs to multiple resources", domain)
 			}
 			seenDomain[domain] = entry.ResourceID
 		}
@@ -314,7 +318,7 @@ func ValidateManifest(manifest Manifest) error {
 				continue
 			}
 			if owner := seenListener[listener]; owner != "" && owner != entry.ResourceID {
-				return fmt.Errorf("Nginx listener %q belongs to multiple resources", listener)
+				return fmt.Errorf("nginx listener %q belongs to multiple resources", listener)
 			}
 			seenListener[listener] = entry.ResourceID
 		}
@@ -348,11 +352,11 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	}
 	main, err := readRegular(paths.MainPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil || digest(main) != manifest.MainDigest || string(main) != renderMain(paths) {
-		return Manifest{}, fmt.Errorf("Nginx main config differs from the closed graph")
+		return Manifest{}, fmt.Errorf("nginx main config differs from the closed graph")
 	}
 	sanitizer, err := readRegular(paths.SanitizerPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil || digest(sanitizer) != manifest.SanitizerDigest || string(sanitizer) != renderSanitizer() {
-		return Manifest{}, fmt.Errorf("Nginx sanitizer differs from the closed graph")
+		return Manifest{}, fmt.Errorf("nginx sanitizer differs from the closed graph")
 	}
 	certificatePEM, err := readRegular(paths.CertificatePath, owner, 0o644, MaximumGraphFileSize)
 	if err != nil {
@@ -365,7 +369,7 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	certificate, err := ParseDefaultCertificate(certificatePEM, privateKeyPEM)
 	expectedDNS, dnsErr := ExpectedDefaultDNSName(manifest.InstallationID)
 	if err != nil || dnsErr != nil || certificate.Fingerprint != manifest.DefaultCertFingerprint || certificate.DNSName != expectedDNS {
-		return Manifest{}, fmt.Errorf("Nginx default rejection certificate fingerprint differs")
+		return Manifest{}, fmt.Errorf("nginx default rejection certificate fingerprint differs")
 	}
 	if err := validateAuditSink(paths.AuditPath, owner); err != nil {
 		return Manifest{}, err
@@ -385,7 +389,7 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 		want[entry.Relative] = entry
 		data, err := readRegular(filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative)), owner, 0o600, MaximumGraphFileSize)
 		if err != nil || digest(data) != entry.Digest || validateEntryConfig(entry, data) != nil {
-			return Manifest{}, fmt.Errorf("Nginx graph entry %q differs from its manifest", entry.Relative)
+			return Manifest{}, fmt.Errorf("nginx graph entry %q differs from its manifest", entry.Relative)
 		}
 	}
 	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
@@ -402,7 +406,7 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	}
 	staging, err := os.ReadDir(paths.StagingPath())
 	if err != nil || len(staging) != 0 {
-		return Manifest{}, fmt.Errorf("Nginx graph staging is not empty")
+		return Manifest{}, fmt.Errorf("nginx graph staging is not empty")
 	}
 	return manifest, nil
 }
@@ -418,7 +422,7 @@ func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry E
 	for index, current := range manifest.Entries {
 		if current.Relative == entry.Relative || current.ResourceID == entry.ResourceID && current.Kind == entry.Kind {
 			if current.Relative != entry.Relative || current.ResourceID != entry.ResourceID || current.Kind != entry.Kind {
-				return Manifest{}, nil, fmt.Errorf("Nginx active entry identity conflicts")
+				return Manifest{}, nil, fmt.Errorf("nginx active entry identity conflicts")
 			}
 			replaceIndex = index
 		}
@@ -436,7 +440,7 @@ func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry E
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
 	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative))
 	var existing *filetxn.Metadata
@@ -470,7 +474,7 @@ func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected
 	for currentIndex, current := range manifest.Entries {
 		if current.Relative == expected.Relative {
 			if current.ResourceID != expected.ResourceID || current.Kind != expected.Kind || current.Generation != expected.Generation || current.Digest != expected.Digest {
-				return Manifest{}, nil, fmt.Errorf("Nginx exact entry identity changed")
+				return Manifest{}, nil, fmt.Errorf("nginx exact entry identity changed")
 			}
 			index = currentIndex
 		}
@@ -482,7 +486,7 @@ func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
 	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(expected.Relative))
 	result, err := txn.Remove(ctx, filetxn.Request{Path: entryPath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize})
@@ -501,6 +505,7 @@ func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected
 	audited, err := Audit(paths, owner)
 	return audited, []string{entryPath, paths.ManifestPath()}, err
 }
+
 func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs []string) (Manifest, []string, error) {
 	manifest, err := Audit(paths, owner)
 	if err != nil {
@@ -509,7 +514,7 @@ func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs
 	selected := map[string]bool{}
 	for _, id := range resourceIDs {
 		if !resourcePattern.MatchString(id) || selected[id] {
-			return Manifest{}, nil, fmt.Errorf("Nginx contraction resource inventory is invalid")
+			return Manifest{}, nil, fmt.Errorf("nginx contraction resource inventory is invalid")
 		}
 		selected[id] = true
 	}
@@ -520,7 +525,7 @@ func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	defer txn.Close()
+	defer func(ignore func() error) { _ = ignore() }(txn.Close)
 	kept := make([]Entry, 0, len(manifest.Entries))
 	removed := []string{}
 	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
@@ -637,7 +642,7 @@ func validEntry(entry Entry) bool {
 			return false
 		}
 	case EntryControl:
-		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}) || entry.Domain == nil || !validDomainSite(*entry.Domain, entry.Domains) || entry.Domain.AuthMode != "application_managed" || entry.Domain.UpstreamNetwork != "unix" || !entry.Domain.WebSocket || len(entry.Domain.Static) != 0 || entry.Domain.GoAccess != nil {
+		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}) || entry.Domain == nil || !validDomainSite(*entry.Domain, entry.Domains) || entry.Domain.AuthMode != "application_managed" || entry.Domain.UpstreamNetwork != "unix" || !entry.Domain.WebSocket || len(entry.Domain.Static) != 0 || entry.Domain.GoAccess != nil || entry.Challenge != nil && !validChallengeSite(*entry.Challenge, entry.Domains) {
 			return false
 		}
 	case EntryTemporary:
@@ -663,6 +668,7 @@ func validEntry(entry Entry) bool {
 func sharedHTTPSListener(value string) bool {
 	return value == "tcp:0.0.0.0:80" || value == "tcp:[::]:80" || value == "tcp:0.0.0.0:443" || value == "tcp:[::]:443"
 }
+
 func entriesEqual(left, right []Entry) bool {
 	if len(left) != len(right) {
 		return false
@@ -693,7 +699,7 @@ func canonicalEntries(entries []Entry) []Entry {
 func validatePaths(paths Paths) error {
 	for name, path := range map[string]string{"config": paths.ConfigRoot, "state": paths.StateRoot, "audit": paths.AuditPath, "certificate": paths.CertificatePath, "private_key": paths.PrivateKeyPath, "pid": paths.PIDPath} {
 		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
-			return fmt.Errorf("Nginx %s path is invalid", name)
+			return fmt.Errorf("nginx %s path is invalid", name)
 		}
 	}
 	return nil
@@ -704,7 +710,7 @@ func validateParentChain(path string) error {
 	for {
 		var stat unix.Stat_t
 		if err := unix.Lstat(current, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
-			return fmt.Errorf("Nginx graph parent %q is unsafe", current)
+			return fmt.Errorf("nginx graph parent %q is unsafe", current)
 		}
 		if current == "/" {
 			return nil
@@ -723,6 +729,7 @@ func validChallengeSite(site ChallengeSite, domains []string) bool {
 	}
 	return true
 }
+
 func renderChallenge(entry Entry) ([]byte, error) {
 	site := entry.Challenge
 	hosts := strings.Join(site.Hosts, " ")
@@ -733,6 +740,7 @@ func renderChallenge(entry Entry) ([]byte, error) {
 	text := fmt.Sprintf("server {\n  listen 0.0.0.0:80;\n  listen [::]:80;\n  server_name %s;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  location ~ ^/\\.well-known/acme-challenge/([A-Za-z0-9_-]{20,256})$ {\n    default_type application/octet-stream;\n    disable_symlinks on;\n    alias %s/.well-known/acme-challenge/$1;\n    limit_except GET HEAD { deny all; }\n  }\n  location /.well-known/acme-challenge/ { return 404; }\n  location / { return 421; }\n}\n", hosts, strings.Join(escaped, "|"), site.Webroot)
 	return []byte(text), nil
 }
+
 func validTemporarySite(site TemporarySite, listener string) bool {
 	if domain.ValidateTemporaryPublicIPv4(site.PublicIPv4) != nil || site.Port < 1024 || site.Port == 80 || site.Port == 443 || site.HostAuthority != fmt.Sprintf("%s:%d", site.PublicIPv4, site.Port) || listener != fmt.Sprintf("tcp:0.0.0.0:%d", site.Port) || site.ReadinessPath == "" || !strings.HasPrefix(site.ReadinessPath, "/") {
 		return false
@@ -743,10 +751,15 @@ func validTemporarySite(site TemporarySite, listener string) bool {
 	case "tcp":
 		host, port, err := net.SplitHostPort(site.UpstreamAddress)
 		parsed, parseErr := netip.ParseAddr(host)
-		return err == nil && parseErr == nil && parsed.IsLoopback() && port != ""
+		return err == nil && parseErr == nil && port != "" && (site.Tailnet && parsed.IsGlobalUnicast() && !parsed.IsLoopback() && validTailnetSource(site.UpstreamSource, parsed.BitLen()) || !site.Tailnet && parsed.IsLoopback() && site.UpstreamSource == "")
 	default:
 		return false
 	}
+}
+
+func validTailnetSource(value string, bits int) bool {
+	address, err := netip.ParseAddr(value)
+	return err == nil && address.IsGlobalUnicast() && !address.IsLoopback() && address.BitLen() == bits
 }
 
 func validDomainSite(site DomainSite, domains []string) bool {
@@ -763,7 +776,7 @@ func validDomainSite(site DomainSite, domains []string) bool {
 		host, port, err := net.SplitHostPort(site.UpstreamAddress)
 		address, addressErr := netip.ParseAddr(host)
 		value, valueErr := strconv.ParseUint(port, 10, 16)
-		if err != nil || addressErr != nil || valueErr != nil || value == 0 || !address.IsLoopback() {
+		if err != nil || addressErr != nil || valueErr != nil || value == 0 || site.Tailnet && (!address.IsGlobalUnicast() || address.IsLoopback() || !validTailnetSource(site.UpstreamSource, address.BitLen())) || !site.Tailnet && (!address.IsLoopback() || site.UpstreamSource != "") {
 			return false
 		}
 	}
@@ -790,6 +803,7 @@ func validDomainSite(site DomainSite, domains []string) bool {
 	}
 	return true
 }
+
 func validGoAccessSite(value GoAccessSite) bool {
 	if strings.ContainsAny(value.CredentialPath+value.Endpoint+value.ReportPath+value.AccessLog, "\x00\r\n") || !filepath.IsAbs(value.CredentialPath) || filepath.Clean(value.CredentialPath) != value.CredentialPath || !validDomain(value.CanonicalHost) || !strings.HasPrefix(value.Endpoint, "/run/lanpanel-goaccess/") || filepath.Clean(value.Endpoint) != value.Endpoint || !strings.HasPrefix(value.ReportPath, "/var/lib/lanpanel/goaccess/") || filepath.Clean(value.ReportPath) != value.ReportPath || !strings.HasPrefix(value.AccessLog, "/var/log/lanpanel/goaccess/") || filepath.Clean(value.AccessLog) != value.AccessLog || !strings.HasPrefix(value.DashboardPath, "/") || !strings.HasSuffix(value.DashboardPath, "/") || filepath.Clean(value.DashboardPath) != strings.TrimSuffix(value.DashboardPath, "/") || !strings.HasPrefix(value.WebSocketPath, "/") || strings.HasSuffix(value.WebSocketPath, "/") || filepath.Clean(value.WebSocketPath) != value.WebSocketPath || strings.HasPrefix(value.WebSocketPath, value.DashboardPath) || !validDigest(value.Identity) {
 		return false
@@ -804,6 +818,7 @@ func validGoAccessSite(value GoAccessSite) bool {
 	}
 	return true
 }
+
 func renderLocationAccess(output *strings.Builder, path string, cidrs []string) {
 	output.WriteString("    auth_basic \"Restricted\";\n    auth_basic_user_file " + quoteNginxArgument(path) + ";\n")
 	for _, cidr := range cidrs {
@@ -813,10 +828,12 @@ func renderLocationAccess(output *strings.Builder, path string, cidrs []string) 
 		output.WriteString("    deny all;\n")
 	}
 }
+
 func quoteNginxArgument(value string) string {
 	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "$", "\\$")
 	return "\"" + replacer.Replace(value) + "\""
 }
+
 func renderDomain(entry Entry) ([]byte, error) {
 	site := entry.Domain
 	hosts := strings.Join(site.Hosts, " ")
@@ -869,9 +886,13 @@ func renderDomain(entry Entry) ([]byte, error) {
 	} else {
 		output.WriteString("    proxy_set_header Upgrade \"\";\n    proxy_set_header Connection \"\";\n")
 	}
+	if site.Tailnet {
+		output.WriteString("    proxy_bind " + site.UpstreamSource + ";\n")
+	}
 	output.WriteString("    proxy_pass " + upstream + ";\n  }\n}\n")
 	return []byte(output.String()), nil
 }
+
 func DigestEntry(entry Entry) (string, error) {
 	copy := entry
 	copy.Digest = "sha256:" + strings.Repeat("0", 64)
@@ -881,9 +902,10 @@ func DigestEntry(entry Entry) (string, error) {
 	}
 	return digest(data), nil
 }
+
 func RenderEntry(entry Entry) ([]byte, error) {
 	if !validEntry(entry) {
-		return nil, fmt.Errorf("Nginx graph entry authority is invalid")
+		return nil, fmt.Errorf("nginx graph entry authority is invalid")
 	}
 	if entry.Kind == EntryChallenge {
 		return renderChallenge(entry)
@@ -895,10 +917,19 @@ func RenderEntry(entry Entry) ([]byte, error) {
 		}
 		authorization := []byte("    proxy_set_header Authorization $http_authorization;\n")
 		if bytes.Count(data, authorization) != 1 {
-			return nil, fmt.Errorf("Headscale control sanitizer rendering changed")
+			return nil, fmt.Errorf("headscale control sanitizer rendering changed")
 		}
 		explicit := append(append([]byte(nil), authorization...), []byte("    proxy_set_header Cookie \"\";\n")...)
-		return bytes.Replace(data, authorization, explicit, 1), nil
+		data = bytes.Replace(data, authorization, explicit, 1)
+		if entry.Challenge != nil {
+			needle := []byte("  return 308 https://$http_host$request_uri;\n")
+			if bytes.Count(data, needle) != 1 {
+				return nil, fmt.Errorf("headscale challenge insertion changed")
+			}
+			route := []byte(fmt.Sprintf("  location ~ ^/\\.well-known/acme-challenge/([A-Za-z0-9_-]{20,256})$ {\n    default_type application/octet-stream;\n    disable_symlinks on;\n    alias %s/.well-known/acme-challenge/$1;\n    limit_except GET HEAD { deny all; }\n  }\n  location /.well-known/acme-challenge/ { return 404; }\n", entry.Challenge.Webroot))
+			data = bytes.Replace(data, needle, append(route, needle...), 1)
+		}
+		return data, nil
 	}
 	if entry.Kind == EntryApp && entry.Domain != nil {
 		return renderDomain(entry)
@@ -911,13 +942,17 @@ func RenderEntry(entry Entry) ([]byte, error) {
 	if site.UpstreamNetwork == "unix" {
 		upstream = "http://unix:" + site.UpstreamAddress + ":"
 	}
-	text := fmt.Sprintf("server {\n  listen 0.0.0.0:%d default_server;\n  server_name _;\n  add_header X-LanPanel-Rejection temporary_default always;\n  return 421;\n}\nserver {\n  listen 0.0.0.0:%d;\n  server_name %s;\n  if ($http_host != %s) { return 421; }\n  if ($server_protocol != HTTP/1.1) { return 505; }\n  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization \"\";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Cookie \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto http;\n    proxy_set_header Upgrade \"\";\n    proxy_set_header Connection \"\";\n    add_header Warning '299 lanpanel \"Public plaintext HTTP; never transmit credentials or sensitive data\"' always;\n    add_header X-LanPanel-Plaintext-Warning public_http_anyone_no_credentials always;\n    proxy_pass %s;\n  }\n}\n", site.Port, site.Port, site.PublicIPv4, site.HostAuthority, upstream)
+	proxyBind := ""
+	if site.Tailnet {
+		proxyBind = "    proxy_bind " + site.UpstreamSource + ";\n"
+	}
+	text := fmt.Sprintf("server {\n  listen 0.0.0.0:%d default_server;\n  server_name _;\n  add_header X-LanPanel-Rejection temporary_default always;\n  return 421;\n}\nserver {\n  listen 0.0.0.0:%d;\n  server_name %s;\n  if ($http_host != %s) { return 421; }\n  if ($server_protocol != HTTP/1.1) { return 505; }\n  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Authorization \"\";\n    proxy_set_header Proxy-Authorization \"\";\n    proxy_set_header Cookie \"\";\n    proxy_set_header X-Forwarded-User \"\";\n    proxy_set_header X-Authenticated-User \"\";\n    proxy_set_header Remote-User \"\";\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header X-Original-Forwarded-For \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header EO-Client-IP \"\";\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto http;\n    proxy_set_header Upgrade \"\";\n    proxy_set_header Connection \"\";\n    add_header Warning '299 lanpanel \"Public plaintext HTTP; never transmit credentials or sensitive data\"' always;\n    add_header X-LanPanel-Plaintext-Warning public_http_anyone_no_credentials always;\n%s    proxy_pass %s;\n  }\n}\n", site.Port, site.Port, site.PublicIPv4, site.HostAuthority, proxyBind, upstream)
 	return []byte(text), nil
 }
 
 func RenderClosedEntry(entry Entry) ([]byte, error) {
 	if !validEntry(entry) {
-		return nil, fmt.Errorf("Nginx graph entry authority is invalid")
+		return nil, fmt.Errorf("nginx graph entry authority is invalid")
 	}
 	binding := struct {
 		Kind       EntryKind `json:"kind"`
@@ -940,7 +975,7 @@ func RenderClosedEntry(entry Entry) ([]byte, error) {
 func validateEntryConfig(entry Entry, data []byte) error {
 	expected, err := RenderEntry(entry)
 	if err != nil || !bytes.Equal(data, expected) {
-		return fmt.Errorf("Nginx graph entry is not its exact closed rendering")
+		return fmt.Errorf("nginx graph entry is not its exact closed rendering")
 	}
 	return nil
 }
@@ -948,7 +983,7 @@ func validateEntryConfig(entry Entry, data []byte) error {
 func validateDirectory(path string, owner filetxn.Owner) error {
 	var stat unix.Stat_t
 	if err := unix.Lstat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != owner.UID || stat.Gid != owner.GID {
-		return fmt.Errorf("Nginx graph directory %q is unsafe", path)
+		return fmt.Errorf("nginx graph directory %q is unsafe", path)
 	}
 	return nil
 }
@@ -963,14 +998,14 @@ func readRegular(path string, owner filetxn.Owner, mode fs.FileMode, maximum int
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("wrap Nginx graph descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var before, after unix.Stat_t
 	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Mode&0o7777 != uint32(mode.Perm()) || before.Uid != owner.UID || before.Gid != owner.GID || before.Nlink != 1 || before.Size <= 0 || before.Size > maximum {
-		return nil, fmt.Errorf("Nginx graph file %q has unsafe metadata", path)
+		return nil, fmt.Errorf("nginx graph file %q has unsafe metadata", path)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
 	if err != nil || int64(len(data)) != before.Size || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim {
-		return nil, fmt.Errorf("Nginx graph file %q changed while read", path)
+		return nil, fmt.Errorf("nginx graph file %q changed while read", path)
 	}
 	return data, nil
 }
@@ -980,10 +1015,10 @@ func validateAuditSink(path string, owner filetxn.Owner) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Nlink != 1 {
-		return fmt.Errorf("Nginx rejection audit sink is unsafe")
+		return fmt.Errorf("nginx rejection audit sink is unsafe")
 	}
 	return nil
 }
@@ -992,6 +1027,7 @@ func digest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func validDigest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
 		return false
@@ -999,9 +1035,11 @@ func validDigest(value string) bool {
 	_, err := hex.DecodeString(value[7:])
 	return err == nil
 }
+
 func validRef(value string) bool {
 	return value != "" && value == strings.TrimSpace(value) && len(value) <= 256 && !strings.ContainsAny(value, "\x00\r\n")
 }
+
 func validDefaultDNSName(value string) bool {
 	if !strings.HasSuffix(value, ".lanpanel.invalid") || strings.Count(value, ".") != 2 {
 		return false

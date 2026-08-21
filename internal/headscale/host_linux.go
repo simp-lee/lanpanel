@@ -58,10 +58,10 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parentFD)
+	defer func() { _ = unix.Close(parentFD) }()
 	var parent unix.Stat_t
 	if unix.Fstat(parentFD, &parent) != nil || parent.Mode&unix.S_IFMT != unix.S_IFDIR || parent.Uid != owner.UID || parent.Gid != owner.GID || parent.Mode&0o022 != 0 {
-		return fmt.Errorf("Headscale directory parent is unsafe")
+		return fmt.Errorf("headscale directory parent is unsafe")
 	}
 	if err := unix.Mkdirat(parentFD, filepath.Base(path), mode); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
@@ -70,10 +70,10 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != mode {
-		return fmt.Errorf("Headscale managed directory is foreign")
+		return fmt.Errorf("headscale managed directory is foreign")
 	}
 	return unix.Fsync(parentFD)
 }
@@ -114,9 +114,9 @@ func ValidateInitializationEvidence(installationID string, candidate domain.Head
 	file := os.NewFile(uintptr(fd), filepath.Base(paths.IdentityParent))
 	if file == nil {
 		_ = unix.Close(fd)
-		return fmt.Errorf("Headscale identity directory descriptor unavailable")
+		return fmt.Errorf("headscale identity directory descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != 0o700 {
 		return fmt.Errorf("%w: identity directory metadata changed", ErrForeignEvidence)
@@ -195,7 +195,7 @@ func Install(ctx context.Context, request InstallRequest) error {
 
 func validateInstallRequest(request InstallRequest) error {
 	if request.Paths.Root == "" || !filepath.IsAbs(request.Paths.Root) || request.Paths.Staging == "" || request.Paths.Executable == "" || request.Paths.IdentityParent == "" || request.Paths.IdentityName != "identity" || request.Paths.SQLite == "" || request.Candidate.Database.SQLitePath != "/var/lib/lanpanel/headscale-runtime/db.sqlite" {
-		return fmt.Errorf("Headscale host paths are invalid")
+		return fmt.Errorf("headscale host paths are invalid")
 	}
 	if err := release.ValidateInstallIdentity(request.Release); err != nil {
 		return err
@@ -204,11 +204,11 @@ func validateInstallRequest(request InstallRequest) error {
 		return err
 	}
 	if request.Candidate.Artifact.BaselineDigest != "sha256:"+request.Release.DependencyBaseline.Digest || request.Candidate.Artifact.ArchiveDigest != "sha256:"+request.Release.Headscale.Archive.Digest || request.Candidate.Artifact.ConfigContractDigest != "sha256:"+request.Release.Headscale.ConfigContractDigest || request.Candidate.Artifact.Version != request.Release.Headscale.Version || request.Candidate.Artifact.ConfigContract != request.Release.Headscale.ConfigContract || request.Paths.Executable != rooted(request.Paths.Root, request.Release.Headscale.InstallPath) || request.Paths.SQLite != rooted(request.Paths.Root, "/var/lib/lanpanel/headscale-runtime/db.sqlite") {
-		return fmt.Errorf("Headscale candidate differs from installed release authority")
+		return fmt.Errorf("headscale candidate differs from installed release authority")
 	}
 	sum := sha256.Sum256(request.ArchiveBytes)
 	if uint64(len(request.ArchiveBytes)) != request.Release.Headscale.Archive.Bytes || hex.EncodeToString(sum[:]) != request.Release.Headscale.Archive.Digest {
-		return fmt.Errorf("Headscale archive bytes differ from installed release authority")
+		return fmt.Errorf("headscale archive bytes differ from installed release authority")
 	}
 	return nil
 }
@@ -232,7 +232,7 @@ func verifyOrInstallExecutable(ctx context.Context, request InstallRequest) erro
 		}
 	}
 	if len(executable) == 0 || uint64(len(executable)) != executableIdentity.Bytes {
-		return fmt.Errorf("Headscale executable member is missing")
+		return fmt.Errorf("headscale executable member is missing")
 	}
 	if err := verifyRegular(request.Paths.Executable, request.Owner, 0o755, executableIdentity.Digest, int64(executableIdentity.Bytes)); err == nil {
 		return nil
@@ -247,7 +247,7 @@ func verifyOrInstallExecutable(ctx context.Context, request InstallRequest) erro
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	metadata := filetxn.Metadata{Owner: request.Owner, Mode: 0o755}
 	_, err = store.Put(ctx, filetxn.Request{Path: request.Paths.Executable, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{request.Owner}, AllowedMode: 0o755}, New: metadata, MaxBytes: int64(executableIdentity.Bytes)}, executable, filetxn.CreateOnly)
 	return err
@@ -260,7 +260,7 @@ func verifyOrCommitIdentity(ctx context.Context, request InstallRequest) error {
 		_, err = filetxn.VerifyDirectory(directoryRequest)
 	}
 	if err != nil {
-		return fmt.Errorf("Headscale initialized identity is foreign or incomplete: %w", err)
+		return fmt.Errorf("headscale initialized identity is foreign or incomplete: %w", err)
 	}
 	return nil
 }
@@ -274,7 +274,7 @@ func rejectDatabaseEvidence(paths Paths, owner filetxn.Owner) error {
 	identity := filepath.Join(paths.IdentityParent, paths.IdentityName)
 	var stat unix.Stat_t
 	if err := unix.Lstat(identity, &stat); err == nil && (stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != 0o700) {
-		return fmt.Errorf("Headscale initialized identity path is unsafe")
+		return fmt.Errorf("headscale initialized identity path is unsafe")
 	} else if err != nil && !errors.Is(err, unix.ENOENT) {
 		return err
 	}
@@ -304,7 +304,7 @@ func verifyRegular(path string, owner filetxn.Owner, mode uint32, digest string,
 		_ = unix.Close(fd)
 		return fmt.Errorf("descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != mode || stat.Size != bytes {
 		return fmt.Errorf("type or metadata mismatch")
@@ -323,7 +323,7 @@ func verifyRegular(path string, owner filetxn.Owner, mode uint32, digest string,
 func directoryMode(path string, owner filetxn.Owner) (os.FileMode, error) {
 	var stat unix.Stat_t
 	if err := unix.Stat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o022 != 0 {
-		return 0, fmt.Errorf("Headscale transaction root is unsafe (uid=%d gid=%d mode=%#o)", stat.Uid, stat.Gid, stat.Mode&0o7777)
+		return 0, fmt.Errorf("headscale transaction root is unsafe (uid=%d gid=%d mode=%#o)", stat.Uid, stat.Gid, stat.Mode&0o7777)
 	}
 	return os.FileMode(stat.Mode & 0o7777), nil
 }

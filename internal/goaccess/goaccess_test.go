@@ -43,6 +43,7 @@ func TestRenderUsesPrivateNetworkAndProtectedRelay(t *testing.T) {
 		t.Fatal("protected endpoint identity missing")
 	}
 }
+
 func TestServiceIdentityIsLengthDelimited(t *testing.T) {
 	if managedServiceIdentity([]byte("a"), []byte("bc")) == managedServiceIdentity([]byte("ab"), []byte("c")) {
 		t.Fatal("service identity lost file boundaries")
@@ -211,6 +212,7 @@ func (f *fakeLauncher) RunInvocation(_ context.Context, id child.ProfileID, _ ch
 	}
 	return f.results[id], nil
 }
+
 func stoppedUnits(active string) []byte {
 	unitID := "res_00000000000000000000000000000001-7"
 	names := []string{"lanpanel-goaccess-" + unitID + ".service", "lanpanel-goaccess-relay-" + unitID + ".service", "lanpanel-goaccess-" + unitID + ".socket", "lanpanel-goaccess-retention-" + unitID + ".timer", "lanpanel-goaccess-retention-" + unitID + ".service"}
@@ -228,6 +230,7 @@ func stoppedUnits(active string) []byte {
 	}
 	return []byte(strings.Join(blocks, "\n\n"))
 }
+
 func TestCandidateStagingRecoveryRemovesOnlyExactOwnedPrefix(t *testing.T) {
 	directory := t.TempDir()
 	staging := filepath.Join(directory, ".unit.service.lanpanel")
@@ -300,12 +303,12 @@ func TestAccountLockAcquisitionIsBoundedAndContextAware(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Close()
+	defer func(ignore func() error) { _ = ignore() }(first.Close)
 	second, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer second.Close()
+	defer func(ignore func() error) { _ = ignore() }(second.Close)
 	if err := unix.Flock(int(first.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}

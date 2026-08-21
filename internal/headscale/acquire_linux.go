@@ -27,7 +27,7 @@ func AcquireArchive(ctx context.Context, installed release.InstallIdentity, choi
 		return nil, err
 	}
 	if !attemptPattern.MatchString(attempt) || !filepath.IsAbs(stagingDirectory) {
-		return nil, fmt.Errorf("Headscale acquisition staging authority is invalid")
+		return nil, fmt.Errorf("headscale acquisition staging authority is invalid")
 	}
 	expected := installed.Headscale.Archive
 	if source.Kind == sources.Offline {
@@ -35,7 +35,7 @@ func AcquireArchive(ctx context.Context, installed release.InstallIdentity, choi
 		if err != nil {
 			return nil, err
 		}
-		defer file.Close()
+		defer func(ignore func() error) { _ = ignore() }(file.Close)
 		data, err := io.ReadAll(io.LimitReader(file, int64(expected.Bytes)+1))
 		if err != nil || uint64(len(data)) != expected.Bytes || identity.Bytes != int64(expected.Bytes) {
 			return nil, fmt.Errorf("verified offline Headscale artifact changed while copying")
@@ -71,7 +71,7 @@ func AcquireArchive(ctx context.Context, installed release.InstallIdentity, choi
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	data, err := io.ReadAll(io.LimitReader(file, int64(expected.Bytes)+1))
 	if err != nil || uint64(len(data)) != expected.Bytes || identity.Bytes != int64(expected.Bytes) {
 		return nil, fmt.Errorf("verified network Headscale artifact changed while copying")
@@ -84,7 +84,7 @@ func reconcileAcquisitionStaging(directory, name string, owner filetxn.Owner, ma
 	if err != nil {
 		return err
 	}
-	defer unix.Close(parent)
+	defer func() { _ = unix.Close(parent) }()
 	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return nil
@@ -96,7 +96,7 @@ func reconcileAcquisitionStaging(directory, name string, owner filetxn.Owner, ma
 	statErr := unix.Fstat(fd, &stat)
 	closeErr := unix.Close(fd)
 	if statErr != nil || closeErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != 0o600 || stat.Size < 0 || stat.Size > maximum {
-		return fmt.Errorf("Headscale acquisition staging evidence is foreign")
+		return fmt.Errorf("headscale acquisition staging evidence is foreign")
 	}
 	if err := unix.Unlinkat(parent, name, 0); err != nil {
 		return err

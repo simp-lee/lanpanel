@@ -9,13 +9,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"lanpanel/internal/filetxn"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf8"
-
-	"lanpanel/internal/filetxn"
 )
 
 type Format string
@@ -123,7 +122,7 @@ func extractTar(reader io.Reader, expected map[string]Member, maximumTotal int64
 		}
 		member, known := expected[header.Name]
 		physical := ((header.Size + 511) / 512) * 512
-		if !known || !validMemberPath(header.Name) || header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA || header.Size < 0 || header.Size > member.MaximumBytes || physical > member.MaximumPhysicalBytes || len(header.PAXRecords) != 0 || len(header.Xattrs) != 0 || header.Format == tar.FormatPAX || !header.AccessTime.IsZero() || !header.ChangeTime.IsZero() || header.Devmajor != 0 || header.Devminor != 0 || header.Mode&0o7000 != 0 {
+		if !known || !validMemberPath(header.Name) || header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > member.MaximumBytes || physical > member.MaximumPhysicalBytes || len(header.PAXRecords) != 0 || header.Format == tar.FormatPAX || !header.AccessTime.IsZero() || !header.ChangeTime.IsZero() || header.Devmajor != 0 || header.Devminor != 0 || header.Mode&0o7000 != 0 {
 			return nil, fmt.Errorf("tar archive contains unexpected type, metadata, member, or size")
 		}
 		if _, duplicate := result[header.Name]; duplicate {

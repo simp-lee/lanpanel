@@ -21,6 +21,7 @@ import (
 	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
@@ -63,7 +64,7 @@ type HeadscaleDeployExecution struct {
 // helper/UI route only after expiry/startup contraction owners are available.
 func BeginHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleDeployPayload) (*HeadscaleDeployExecution, error) {
 	if payload.PlanID == "" || payload.Confirmation != "deploy" {
-		return nil, fmt.Errorf("Headscale deploy confirmation is invalid")
+		return nil, fmt.Errorf("headscale deploy confirmation is invalid")
 	}
 	service, err := OpenFixed()
 	if err != nil {
@@ -75,8 +76,8 @@ func BeginHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleDep
 		return fail(err)
 	}
 	plan, err := service.ReadPlan(payload.PlanID)
-	if err != nil || plan.Operation != string(domain.OperationDeploy) || plan.Target.Kind != plans.TargetHeadscale || plan.Target.ID == "" || plan.ActorIdentity != authority {
-		return fail(fmt.Errorf("Headscale deploy Plan authority is invalid"))
+	if err != nil || plan.Operation != string(domain.OperationHeadscaleControlDeploy) || plan.Target.Kind != plans.TargetHeadscale || plan.Target.ID == "" || plan.ActorIdentity != authority {
+		return fail(fmt.Errorf("headscale deploy Plan authority is invalid"))
 	}
 	document, err := service.normal.Read()
 	if err != nil {
@@ -112,7 +113,7 @@ func BeginHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleDep
 	}
 	candidateDigest, err := control.Digest(candidateAuthority.Rendered.Candidate)
 	if err != nil || candidateDigest != plannedDigest || !headscaleDeployPlanMatches(plan, candidateAuthority) {
-		return fail(fmt.Errorf("Headscale deploy candidate changed after Plan"))
+		return fail(fmt.Errorf("headscale deploy candidate changed after Plan"))
 	}
 	admitter, err := service.Admitter(plan)
 	if err != nil {
@@ -165,22 +166,22 @@ func BeginHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleDep
 	}
 	fresh, err := service.normal.Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
-		return cleanup(fmt.Errorf("Headscale deploy authority changed after admission"))
+		return cleanup(fmt.Errorf("headscale deploy authority changed after admission"))
 	}
 	freshInstallation, err := loadHeadscaleInstallation(fresh)
 	if err != nil || !reflect.DeepEqual(freshInstallation.Headscale, installation.Headscale) {
-		return cleanup(fmt.Errorf("Headscale identity changed after admission"))
+		return cleanup(fmt.Errorf("headscale identity changed after admission"))
 	}
 	freshRequest, freshResult, err := evaluateHeadscaleDeployPreflight(ctx, installed, freshInstallation.InstallationID, freshInstallation.Headscale.ID, freshInstallation.Headscale.ControlDomain, freshInstallation.Headscale.Database.Generation)
 	if err != nil || !reflect.DeepEqual(freshRequest, preflightRequest) {
-		return cleanup(fmt.Errorf("Headscale deploy preflight policy changed"))
+		return cleanup(fmt.Errorf("headscale deploy preflight policy changed"))
 	}
 	if err := preflight.RequireExpansionResultForRequest(freshResult, freshRequest, freshResult.ObservedAt); err != nil {
 		return cleanup(err)
 	}
 	freshBinding, err := loadHeadscaleCertificateBinding(payload.Certificate)
 	if err != nil || !reflect.DeepEqual(freshBinding, binding) {
-		return cleanup(fmt.Errorf("Headscale ACME authority changed after Plan"))
+		return cleanup(fmt.Errorf("headscale ACME authority changed after Plan"))
 	}
 	binding = freshBinding
 	freshSafety, err := service.safety.ReadForRecovery(exposure)
@@ -189,7 +190,7 @@ func BeginHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleDep
 	}
 	freshAuthority, err := buildHeadscaleDeployAuthority(freshInstallation, binding, certificateID, authority, freshRequest, freshResult, freshSafety, freshResult.ObservedAt)
 	if err != nil || !headscaleDeployPlanMatches(plan, freshAuthority) {
-		return cleanup(fmt.Errorf("Headscale deploy prerequisites changed after Plan"))
+		return cleanup(fmt.Errorf("headscale deploy prerequisites changed after Plan"))
 	}
 	candidateAuthority = freshAuthority
 	if err := managedheadscale.ValidateCommittedInitialization(freshInstallation.InstallationID, *freshInstallation.Headscale, installed, managedheadscale.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}); err != nil {
@@ -243,7 +244,7 @@ func freshInstallationID(installation domain.Installation) string {
 
 func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Context, host control.CandidateHost) (issued control.IssueRequest, returnErr error) {
 	if execution == nil || execution.Mutation == nil || execution.Exposure == nil {
-		return control.IssueRequest{}, fmt.Errorf("Headscale deploy local authority is unavailable")
+		return control.IssueRequest{}, fmt.Errorf("headscale deploy local authority is unavailable")
 	}
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	local, err := control.Prepare(ctx, store, host, control.StageRequest{InstallationID: execution.Installation.InstallationID, JobID: execution.JobID, PlanID: execution.Plan.ID, IntentGeneration: execution.Revision - 1, Rendered: execution.Authority.Rendered, Preflight: execution.Authority.Preflight, PreflightResult: execution.Authority.Result})
@@ -260,7 +261,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	}()
 	journal := local.Journal()
 	if journal.Database == nil || journal.Phase != control.PhaseCertificatePending {
-		return control.IssueRequest{}, fmt.Errorf("Headscale local candidate did not reach certificate wait")
+		return control.IssueRequest{}, fmt.Errorf("headscale local candidate did not reach certificate wait")
 	}
 	if err := execution.Admitter.CommitHeadscaleDeployStaged(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.HeadscaleDeployStagedCommit{HeadscaleID: execution.Installation.Headscale.ID, InitializedDigest: journal.Database.InitializedDigest}); err != nil {
 		return control.IssueRequest{}, err
@@ -268,11 +269,11 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	execution.Revision++
 	bindingDigest, err := acme.BindingDigest(execution.Authority.Binding)
 	if err != nil || bindingDigest != execution.Authority.Rendered.Candidate.CertificateBinding {
-		return control.IssueRequest{}, fmt.Errorf("Headscale ACME binding changed before challenge")
+		return control.IssueRequest{}, fmt.Errorf("headscale ACME binding changed before challenge")
 	}
 	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
 	if err != nil || state.Headscale.GenerationSequence+1 != execution.Authority.Rendered.Candidate.Generation || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil {
-		return control.IssueRequest{}, fmt.Errorf("Headscale challenge safety generation changed")
+		return control.IssueRequest{}, fmt.Errorf("headscale challenge safety generation changed")
 	}
 	prepared, err := challenge.Prepare(challenge.Request{ResourceID: execution.Installation.Headscale.ID, PlanID: execution.Plan.ID, Generation: execution.Authority.Rendered.Candidate.Generation, ConfigDigest: execution.Authority.Rendered.Candidate.ConfigDigest, Domains: []string{execution.Installation.Headscale.ControlDomain}, Binding: execution.Authority.Binding, CertificateIdentity: execution.Authority.Rendered.Candidate.CertificateID, Webroot: "/var/lib/lanpanel/certificates/webroot/" + execution.Authority.Rendered.Candidate.CertificateID, BaseMarkers: headscaleBaseSnapshot(state.Headscale)})
 	if err != nil {
@@ -286,7 +287,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	execution.StageUID, execution.StageGID = stageIdentity.UID, stageIdentity.GID
 	identityDocument, err := execution.Service.normal.Read()
 	if err != nil || identityDocument.Revision != execution.Revision || validateCertificateStageIdentity(identityDocument, stageIdentity) != nil {
-		return control.IssueRequest{}, fmt.Errorf("Headscale certificate stage identity is unavailable")
+		return control.IssueRequest{}, fmt.Errorf("headscale certificate stage identity is unavailable")
 	}
 	if err := execution.Admitter.BindOperationIdentity(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, bindingDigest); err != nil {
 		return control.IssueRequest{}, err
@@ -326,7 +327,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	execution.Mutation, execution.Exposure = mutation, exposure
 	freshState, err := execution.Service.safety.ReadForRecovery(exposure)
 	if err != nil || freshState.Headscale.GenerationSequence+1 != prepared.Safety.Generation || freshState.Headscale.ChallengePending != nil || freshState.Headscale.Reactivating != nil {
-		return control.IssueRequest{}, fmt.Errorf("Headscale challenge safety authority changed")
+		return control.IssueRequest{}, fmt.Errorf("headscale challenge safety authority changed")
 	}
 	next := freshState
 	next.Revision++
@@ -378,7 +379,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 // authenticated request. Startup recovery has no path to this method.
 func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Context, host control.CandidateHost) (issuedIdentity certificates.Identity, returnErr error) {
 	if execution == nil || execution.Local == nil || execution.Mutation != nil || execution.Exposure != nil || execution.Child.ID == "" {
-		return certificates.Identity{}, fmt.Errorf("Headscale first certificate remote authority is unavailable")
+		return certificates.Identity{}, fmt.Errorf("headscale first certificate remote authority is unavailable")
 	}
 	cleanup := true
 	defer func() {
@@ -401,6 +402,7 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 	remoteCtx, cancel := context.WithDeadline(ctx, execution.Plan.ExpiresAt)
 	result, runErr := acme.RunLego(remoteCtx, launcher, acme.IssueRequest{CertificateID: issueRequest.CertificateID, Domains: []string{issueRequest.Domain}, Binding: execution.Authority.Binding, UID: execution.StageUID, GID: execution.StageGID, Chroot: stage.Root, ExecutableDigest: execution.LegoDigest})
 	cancel()
+	runErr = errors.Join(runErr, verifyManagedACMEBinding(execution.Authority.Binding))
 	if child.CgroupClosureUnproved(runErr) {
 		execution.ClosureUncertain = true
 		cleanup = false
@@ -441,7 +443,10 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 // not load the control site, activate the certificate pointer, or expose STUN.
 func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Context, request control.IssueRequest, identity certificates.Identity, host control.CandidateHost, remote ...acme.IssueResult) (returnErr error) {
 	if execution == nil || execution.Mutation != nil || execution.Exposure != nil {
-		return fmt.Errorf("Headscale remote result phase is invalid")
+		return fmt.Errorf("headscale remote result phase is invalid")
+	}
+	if err := verifyManagedACMEBinding(execution.Authority.Binding); err != nil {
+		return err
 	}
 	cleanup := true
 	defer func() {
@@ -460,7 +465,7 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 	execution.Mutation, execution.Exposure = mutation, exposure
 	execution.Revision = document.Revision + 1
 	if execution.Child.ID == "" {
-		return fmt.Errorf("Headscale issuer child authority is missing")
+		return fmt.Errorf("headscale issuer child authority is missing")
 	}
 	terminalChild := execution.Child
 	now := time.Now().UTC()
@@ -471,7 +476,7 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 	if len(remote) == 1 {
 		resultIdentity = remote[0].StdoutDigest + "\x00" + remote[0].StderrDigest
 	} else if len(remote) != 0 {
-		return fmt.Errorf("Headscale issuer result is ambiguous")
+		return fmt.Errorf("headscale issuer result is ambiguous")
 	}
 	resultSum := sha256.Sum256([]byte(resultIdentity))
 	terminalChild.ResultDigest = "sha256:" + hex.EncodeToString(resultSum[:])
@@ -512,8 +517,8 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 		return err
 	}
 	freshSafety, err := execution.Service.safety.ReadForRecovery(exposure)
-	if err != nil || freshSafety.Headscale.ChallengePending == nil || !challenge.Matches(*freshSafety.Headscale.ChallengePending, execution.Challenge) || freshSafety.Headscale.Reactivating != nil || freshSafety.StopFence != nil || freshSafety.MaintenancePending != nil || freshSafety.DependencyTransitionPending != nil || freshSafety.UpgradePending != nil || freshSafety.BackupQuiescence != nil || freshSafety.BackupTransition != nil {
-		return fmt.Errorf("Headscale challenge authority changed before certificate handoff")
+	if err != nil || freshSafety.Headscale.ChallengePending == nil || !challenge.Matches(*freshSafety.Headscale.ChallengePending, execution.Challenge) || freshSafety.Headscale.Reactivating != nil || freshSafety.StopFence != nil {
+		return fmt.Errorf("headscale challenge authority changed before certificate handoff")
 	}
 	candidateDigest, err := control.Digest(execution.Authority.Rendered.Candidate)
 	if err != nil {
@@ -522,7 +527,7 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 	next := freshSafety
 	next.Revision++
 	next.Headscale.ChallengePending = nil
-	next.Headscale.Reactivating = &safety.HeadscaleReactivating{Generation: execution.Challenge.Safety.Generation, PriorGeneration: execution.Challenge.Safety.Generation - 1, PlanID: execution.Plan.ID, ControlGeneration: execution.Authority.Rendered.Candidate.Generation, CertificateGeneration: identity.Generation, CertificateFingerprint: identity.Fingerprint, CandidateDigest: execution.Authority.Rendered.Candidate.ConfigDigest, CandidateBundle: candidateDigest, BaseMarkers: append([]safety.MarkerSnapshot(nil), execution.Challenge.Safety.BaseMarkers...), CertificateUntil: identity.NotAfter}
+	next.Headscale.Reactivating = &safety.HeadscaleReactivating{Generation: execution.Challenge.Safety.Generation, PriorGeneration: execution.Challenge.Safety.Generation - 1, PlanID: execution.Plan.ID, ControlGeneration: execution.Authority.Rendered.Candidate.Generation, CertificateGeneration: identity.Generation, CertificateFingerprint: identity.Fingerprint, CandidateDigest: execution.Authority.Rendered.Candidate.ConfigDigest, CandidateBundle: candidateDigest, BaseMarkers: append([]safety.MarkerSnapshot(nil), execution.Challenge.Safety.BaseMarkers...), CertificateUntil: identity.NotAfter, CertificateLastTrustedWall: identity.LastTrustedWall}
 	if _, err := execution.Service.safety.Commit(ctx, exposure, safety.RoleCertificateHandoff, freshSafety.Revision, next, safety.TransitionProof{}); err != nil {
 		return err
 	}
@@ -566,12 +571,12 @@ func readHeadscaleStageFile(path string, uid, gid uint32, maximumMode uint32) ([
 	file := os.NewFile(uintptr(fd), filepath.Base(path))
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("Headscale certificate stage descriptor unavailable")
+		return nil, fmt.Errorf("headscale certificate stage descriptor unavailable")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777&^maximumMode != 0 || stat.Size <= 0 || stat.Size > 1<<20 {
-		return nil, fmt.Errorf("Headscale certificate stage metadata is unsafe")
+		return nil, fmt.Errorf("headscale certificate stage metadata is unsafe")
 	}
 	data := make([]byte, stat.Size)
 	if _, err := file.ReadAt(data, 0); err != nil {
@@ -579,14 +584,14 @@ func readHeadscaleStageFile(path string, uid, gid uint32, maximumMode uint32) ([
 	}
 	var after unix.Stat_t
 	if unix.Fstat(fd, &after) != nil || stat.Dev != after.Dev || stat.Ino != after.Ino || stat.Size != after.Size || stat.Mtim != after.Mtim {
-		return nil, fmt.Errorf("Headscale certificate stage changed during read")
+		return nil, fmt.Errorf("headscale certificate stage changed during read")
 	}
 	return data, nil
 }
 
 func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Context, host control.CandidateHost) error {
 	if execution == nil {
-		return fmt.Errorf("Headscale failed challenge authority unavailable")
+		return fmt.Errorf("headscale failed challenge authority unavailable")
 	}
 	var errs []error
 	if execution.DNSPreflight != nil {
@@ -658,14 +663,14 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 		changed := false
 		if err == nil && state.Headscale.ChallengePending != nil {
 			if !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
-				err = fmt.Errorf("Headscale challenge owner changed during cleanup")
+				err = fmt.Errorf("headscale challenge owner changed during cleanup")
 			} else {
 				changed = true
 			}
 		}
 		if err == nil && state.Headscale.Reactivating != nil {
 			if state.Headscale.Reactivating.PlanID != execution.Plan.ID || state.Headscale.Reactivating.Generation != execution.Challenge.Safety.Generation {
-				err = fmt.Errorf("Headscale reactivation owner changed during cleanup")
+				err = fmt.Errorf("headscale reactivation owner changed during cleanup")
 			} else {
 				changed = true
 			}
@@ -716,7 +721,7 @@ func headscaleBaseSnapshot(value safety.HeadscaleSafety) []safety.MarkerSnapshot
 	if value.CertificateExpiry != nil {
 		certificate = safety.MarkerSnapshot{Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotPresent, Generation: value.CertificateExpiry.Generation}
 	}
-	return []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, certificate, {Kind: safety.MarkerEdgeOneExpiry, State: safety.SnapshotAbsent}}
+	return []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, certificate}
 }
 
 func reconcileInterruptedHeadscaleLocalCandidate(ctx context.Context, service *FixedService) error {
@@ -734,6 +739,34 @@ func reconcileInterruptedHeadscaleLocalCandidate(ctx context.Context, service *F
 	}
 	if state.Headscale.ChallengePending != nil {
 		return nil
+	}
+	if journal.Phase == control.PhaseExpired {
+		if state.Headscale.CertificateExpiry == nil {
+			return fmt.Errorf("expired Headscale journal lacks marker")
+		}
+		manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if auditErr != nil {
+			return auditErr
+		}
+		for _, entry := range manifest.Entries {
+			if entry.Kind == nginx.EntryControl {
+				return fmt.Errorf("expired Headscale control graph remained")
+			}
+		}
+		return nil
+	}
+	if journal.Phase == control.PhaseCommitted {
+		if err := verifyCommittedHeadscaleLifecycle(service, journal, state); err != nil {
+			return err
+		}
+		return finalizeInterruptedHeadscaleLifecycle(ctx, service, journal, state)
+	}
+	if journal.Phase == control.PhaseActivated {
+		if committed, checkErr := headscaleLifecycleNormalCommitted(service, journal); checkErr != nil {
+			return checkErr
+		} else if committed {
+			return finalizeInterruptedHeadscaleLifecycle(ctx, service, journal, state)
+		}
 	}
 	if journal.Phase == control.PhaseContracted {
 		document, readErr := service.normal.Read()
@@ -793,6 +826,136 @@ func reconcileInterruptedHeadscaleLocalCandidate(ctx context.Context, service *F
 	return errors.Join(stageErr, stopErr, cleanupErr)
 }
 
+func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedService, document persist.Document, intent operations.Reservation, pending safety.ChallengePending, childClosure string) (returnErr error) {
+	raw, present := document.Entries["journals/certificate-"+intent.JobID]
+	var journal operations.JournalRecord
+	if !present || json.Unmarshal(raw, &journal) != nil || journal.JobID != intent.JobID || journal.Operation != operations.CertificateRenew || !strings.HasPrefix(journal.Target, "headscale/") || journal.Certificate == nil || len(journal.ChildIDs) != 1 {
+		return fmt.Errorf("interrupted Headscale renewal journal invalid")
+	}
+	var childRecord operations.ChildRecord
+	childRaw, present := document.Entries["children/"+journal.ChildIDs[0]]
+	if !present || json.Unmarshal(childRaw, &childRecord) != nil || childRecord.JobID != intent.JobID {
+		return fmt.Errorf("interrupted Headscale renewal child invalid")
+	}
+	if pending.Method == "dns-01" {
+		ownerLocks, err := acme.AcquireOwnerLocks(ctx, fixedRoot+"/locks", acme.DNSProvider(pending.Provider), pending.Zone, pending.Owners, pending.OwnerLock)
+		if err != nil {
+			return err
+		}
+		_, preflightErr := acme.PreflightDNS01(ctx, acme.NetDNSObserver{}, pending.Zone, pending.Owners)
+		if err := errors.Join(preflightErr, ownerLocks.Close()); err != nil {
+			return fmt.Errorf("interrupted Headscale renewal DNS cleanup unproved: %w", err)
+		}
+	}
+	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	controlJournal, err := store.Read()
+	if err != nil || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || controlJournal.Certificate == nil {
+		return fmt.Errorf("interrupted Headscale renewal control authority changed: %w", err)
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return err
+	}
+	_, _, mutation, exposure, err := admitter.ReenterHeadscaleChallengeContraction(ctx, mutationSet, service.manager, document.Revision, intent.JobID, childRecord.ID, childClosure)
+	if err != nil {
+		_ = mutationSet.Close()
+		return err
+	}
+	defer func() {
+		returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure), mutationSet.Close())
+	}()
+	if pending.Method == "http-01" {
+		prepared, prepareErr := challenge.PreparedHTTP("headscale", pending)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		if controlJournal.Phase == control.PhaseExpired {
+			host, hostErr := activation.NewFixedHost()
+			if hostErr != nil {
+				return hostErr
+			}
+			if _, removeErr := host.RemoveChallenge(ctx, prepared); removeErr != nil {
+				return removeErr
+			}
+		} else {
+			bundle, bundleErr := control.BuildActivation(controlJournal.InstallationID, controlJournal.Candidate, *controlJournal.Certificate)
+			if bundleErr != nil {
+				return bundleErr
+			}
+			host, hostErr := control.NewActivationHost()
+			if hostErr != nil {
+				return hostErr
+			}
+			if removeErr := host.RemoveCertificateChallenge(ctx, bundle, prepared); removeErr != nil {
+				return removeErr
+			}
+		}
+	}
+	certificate := journal.Certificate
+	if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
+		return err
+	}
+	if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
+		return err
+	}
+	freshDocument, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	freshInstallation, loadErr := loadHeadscaleInstallation(freshDocument)
+	if loadErr != nil {
+		return loadErr
+	}
+	if freshInstallation.Headscale.DeployIntent != nil {
+		if err := admitter.ContractHeadscaleReissueActivation(ctx, mutation, exposure, freshDocument.Revision, intent.JobID); err != nil {
+			return err
+		}
+		freshDocument, err = service.normal.Read()
+		if err != nil {
+			return err
+		}
+	}
+	closureRaw, _ := json.Marshal(struct {
+		Job        string `json:"job"`
+		Generation uint64 `json:"generation"`
+		Binding    string `json:"binding"`
+	}{intent.JobID, pending.Generation, pending.ACMEBinding})
+	closure := shaDigest(append(closureRaw, []byte("\x00"+childClosure)...))
+	if _, err := admitter.TerminalizeContractedCertificate(ctx, mutation, exposure, freshDocument.Revision, intent.JobID, pending, closure); err != nil {
+		return err
+	}
+	fresh, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if fresh.Headscale.ChallengePending == nil || !reflect.DeepEqual(*fresh.Headscale.ChallengePending, pending) {
+		return fmt.Errorf("interrupted Headscale renewal safety changed")
+	}
+	next := fresh
+	next.Revision++
+	next.Headscale.ChallengePending = nil
+	_, err = service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{})
+	return err
+}
+
+func interruptedHeadscaleChallengeIntentMatches(candidate operations.Reservation, pending safety.ChallengePending, headscale domain.HeadscaleDomain) bool {
+	if candidate.SafetyBinding.PlanID != pending.PlanID || candidate.SafetyBinding.IntentGeneration != pending.Generation || candidate.SafetyBinding.CertificateIdentity != pending.CertificateIdentity || candidate.SafetyBinding.ChallengeMethod != pending.Method || candidate.Target != "headscale/"+headscale.ID {
+		return false
+	}
+	switch candidate.Operation {
+	case operations.HeadscaleDeploy:
+		return candidate.HeadscaleDeploy != nil && candidate.HeadscaleDeploy.Candidate.HeadscaleID == headscale.ID && candidate.SafetyBinding.CandidateDigest == pending.ConfigDigest && candidate.SafetyBinding.ACMEBinding == pending.ACMEBinding
+	case operations.CertificateRenew:
+		return headscale.Applied != nil && headscale.Applied.ConfigDigest == pending.ConfigDigest && candidate.SafetyBinding.CandidateDigest == pending.SANIdentity && candidate.SafetyBinding.CandidateBundle == pending.ACMEBinding
+	default:
+		return false
+	}
+}
+
 func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedService, childClosure string) error {
 	state, err := service.safety.Read()
 	if err != nil || state.Headscale.ChallengePending == nil {
@@ -803,22 +966,29 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 	if err != nil {
 		return err
 	}
+	installation, err := loadHeadscaleInstallation(document)
+	if err != nil || installation.Headscale == nil {
+		return errors.Join(err, fmt.Errorf("interrupted Headscale challenge installation authority missing"))
+	}
 	var intent operations.Reservation
 	for key, raw := range document.Entries {
 		if !strings.HasPrefix(key, "intents/") {
 			continue
 		}
 		var candidate operations.Reservation
-		if json.Unmarshal(raw, &candidate) != nil || candidate.Operation != operations.HeadscaleDeploy || candidate.HeadscaleDeploy == nil || candidate.Target != "headscale/"+candidate.HeadscaleDeploy.Candidate.HeadscaleID || candidate.SafetyBinding.PlanID != pending.PlanID || candidate.SafetyBinding.IntentGeneration != pending.Generation || candidate.SafetyBinding.CandidateDigest != pending.ConfigDigest || candidate.SafetyBinding.ACMEBinding != pending.ACMEBinding || candidate.SafetyBinding.CertificateIdentity != pending.CertificateIdentity {
+		if json.Unmarshal(raw, &candidate) != nil || !interruptedHeadscaleChallengeIntentMatches(candidate, pending, *installation.Headscale) {
 			continue
 		}
 		if intent.JobID != "" {
-			return fmt.Errorf("multiple Headscale deploy intents match interrupted challenge")
+			return fmt.Errorf("multiple Headscale operation intents match interrupted challenge")
 		}
 		intent = candidate
 	}
 	if intent.JobID == "" {
 		return fmt.Errorf("interrupted Headscale challenge lacks exact operation authority")
+	}
+	if intent.Operation == operations.CertificateRenew {
+		return contractInterruptedHeadscaleRenewal(ctx, service, document, intent, pending, childClosure)
 	}
 	var operationJournal operations.JournalRecord
 	rawOperationJournal, present := document.Entries["journals/certificate-"+intent.JobID]
@@ -867,7 +1037,7 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 	}
 	_, childRecord, mutation, exposure, err := admitter.ReenterHeadscaleChallengeContraction(ctx, mutationSet, service.manager, document.Revision, intent.JobID, childRecord.ID, childClosure)
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return err
 	}
 	var closureErr error

@@ -19,7 +19,21 @@ const (
 	maximumArgumentBytes = 4096
 )
 
+type TailnetSpec struct {
+	TargetKind          domain.AppTargetKind      `json:"target_kind"`
+	Name                string                    `json:"name"`
+	PeerIP              string                    `json:"peer_ip"`
+	SourceIP            string                    `json:"source_ip"`
+	Port                uint16                    `json:"port"`
+	ReadinessPath       string                    `json:"readiness_path"`
+	WebSocket           domain.WebSocketReadiness `json:"websocket"`
+	AllowedHTTPStatuses []uint16                  `json:"allowed_http_statuses"`
+	Publication         domain.AppPublication     `json:"publication"`
+	CredentialIDs       []string                  `json:"credential_ids,omitempty"`
+}
+
 type LocalSpec struct {
+	TargetKind          domain.AppTargetKind `json:"target_kind,omitempty"`
 	Name                string
 	EndpointKind        domain.LocalEndpointKind
 	TCPAddress          string
@@ -33,6 +47,9 @@ type LocalSpec struct {
 }
 
 func NewLocal(spec LocalSpec, random io.Reader) (domain.AppResource, error) {
+	if spec.TargetKind != "" && spec.TargetKind != domain.AppTargetLocalHTTP {
+		return domain.AppResource{}, fmt.Errorf("local resource target kind is invalid")
+	}
 	if random == nil {
 		random = rand.Reader
 	}
@@ -67,6 +84,29 @@ func NewLocal(spec LocalSpec, random io.Reader) (domain.AppResource, error) {
 	return resource, nil
 }
 
+func NewTailnet(spec TailnetSpec, random io.Reader) (domain.AppResource, error) {
+	if random == nil {
+		random = rand.Reader
+	}
+	if spec.TargetKind != domain.AppTargetTailnetHTTP {
+		return domain.AppResource{}, fmt.Errorf("tailnet resource target kind is invalid")
+	}
+	resourceID, err := newID(random, "res_")
+	if err != nil {
+		return domain.AppResource{}, err
+	}
+	statuses := append([]uint16(nil), spec.AllowedHTTPStatuses...)
+	if len(statuses) == 0 {
+		statuses = []uint16{200, 204}
+	}
+	resource := domain.AppResource{ID: resourceID, Name: spec.Name, Lifecycle: domain.LifecycleActive, Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: spec.ReadinessPath, AllowedHTTPStatuses: statuses, WebSocket: spec.WebSocket, TailnetHTTP: &domain.TailnetHTTPTarget{IP: spec.PeerIP, SourceIP: spec.SourceIP, Port: spec.Port}}, Publication: spec.Publication, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, CredentialIDs: append([]string(nil), spec.CredentialIDs...), ManagedPaths: []string{}}
+	resource.CurrentConfigDigest, err = ConfigDigest(resource)
+	if err != nil {
+		return domain.AppResource{}, err
+	}
+	return resource, nil
+}
+
 func ConfigDigest(resource domain.AppResource) (string, error) {
 	candidate := resource
 	candidate.CurrentConfigDigest = ""
@@ -90,7 +130,7 @@ func ConfigDigest(resource domain.AppResource) (string, error) {
 }
 
 func ValidateCreate(current domain.Installation, candidate domain.AppResource) error {
-	if candidate.Lifecycle != domain.LifecycleActive || candidate.PublicationRecord.State != domain.PublicationUnpublished || candidate.PublicationRecord.UnpublishedGeneration != 1 || candidate.PublicationRecord.LastAppliedDigest != nil || candidate.PublicationRecord.LastAppliedBundle != nil || candidate.PublicationRecord.ActivationIntent != nil || candidate.PublicationRecord.ContractionIntent != nil || candidate.PublicationRecord.RuntimeObservation != nil || candidate.ManagedProcess == nil || candidate.ManagedProcess.Requested != domain.ProcessRequestedStopped || candidate.ManagedProcess.RuntimeObservation != nil || candidate.ManagedProcess.Applied != nil || candidate.ManagedProcess.LastJobID != "" {
+	if candidate.Lifecycle != domain.LifecycleActive || candidate.PublicationRecord.State != domain.PublicationUnpublished || candidate.PublicationRecord.UnpublishedGeneration != 1 || candidate.PublicationRecord.LastAppliedDigest != nil || candidate.PublicationRecord.LastAppliedBundle != nil || candidate.PublicationRecord.ActivationIntent != nil || candidate.PublicationRecord.ContractionIntent != nil || candidate.PublicationRecord.RuntimeObservation != nil || candidate.Target.Kind == domain.AppTargetLocalHTTP && (candidate.ManagedProcess == nil || candidate.ManagedProcess.Requested != domain.ProcessRequestedStopped || candidate.ManagedProcess.RuntimeObservation != nil || candidate.ManagedProcess.Applied != nil || candidate.ManagedProcess.LastJobID != "") || candidate.Target.Kind == domain.AppTargetTailnetHTTP && candidate.ManagedProcess != nil {
 		return fmt.Errorf("fresh resource must be active, sticky-unpublished, unapplied, and stopped")
 	}
 	for _, existing := range current.Resources {
@@ -120,23 +160,29 @@ func PrepareUpdate(current domain.Installation, candidate domain.AppResource) (d
 			break
 		}
 	}
-	if prior == nil || prior.Lifecycle != domain.LifecycleActive || prior.ManagedProcess == nil || candidate.ManagedProcess == nil || candidate.ManagedProcess.ID != prior.ManagedProcess.ID || candidate.Target.Kind != domain.AppTargetLocalHTTP {
+	if prior == nil || prior.Lifecycle != domain.LifecycleActive || candidate.Target.Kind != prior.Target.Kind || prior.Target.Kind == domain.AppTargetLocalHTTP && (prior.ManagedProcess == nil || candidate.ManagedProcess == nil || candidate.ManagedProcess.ID != prior.ManagedProcess.ID) || prior.Target.Kind == domain.AppTargetTailnetHTTP && candidate.ManagedProcess != nil {
 		return domain.AppResource{}, fmt.Errorf("resource update immutable identity is absent or changed")
 	}
 	paths, err := DerivePaths(candidate.ID)
 	if err != nil {
 		return domain.AppResource{}, err
 	}
-	candidate.ManagedPaths = paths.ManagedPaths()
+	if candidate.Target.Kind == domain.AppTargetLocalHTTP {
+		candidate.ManagedPaths = paths.ManagedPaths()
+	} else {
+		candidate.ManagedPaths = []string{}
+	}
 	candidate.Lifecycle = prior.Lifecycle
 	candidate.PublicationRecord = prior.PublicationRecord
-	candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
-	candidate.ManagedProcess.ReferenceBinding = nil
-	candidate.ManagedProcess.Applied = prior.ManagedProcess.Applied
-	candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
-	candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
-	candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
-	candidate.ManagedProcess.LastJobID = prior.ManagedProcess.LastJobID
+	if candidate.ManagedProcess != nil {
+		candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
+		candidate.ManagedProcess.ReferenceBinding = nil
+		candidate.ManagedProcess.Applied = prior.ManagedProcess.Applied
+		candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
+		candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
+		candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
+		candidate.ManagedProcess.LastJobID = prior.ManagedProcess.LastJobID
+	}
 	candidate.CurrentConfigDigest = ""
 	digest, err := ConfigDigest(candidate)
 	if err != nil {
@@ -237,6 +283,7 @@ func ValidateArguments(arguments []string, knownSecretDigests map[string]struct{
 	}
 	return nil
 }
+
 func hasControl(value string) bool {
 	for _, character := range value {
 		if character < 0x20 || character == 0x7f {

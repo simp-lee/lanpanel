@@ -193,6 +193,7 @@ func (manager *Manager) Authority() Authority {
 	}
 	return Authority{device: uint64(manager.rootStat.Dev), inode: manager.rootStat.Ino, owner: manager.owner, group: manager.group}
 }
+
 func (manager *Manager) Held(kind Kind) bool {
 	if manager == nil {
 		return false
@@ -201,6 +202,7 @@ func (manager *Manager) Held(kind Kind) bool {
 	defer manager.mu.Unlock()
 	return manager.held[kind] != nil || manager.acquiring[kind]
 }
+
 func (lease *Lease) Authority() Authority {
 	if lease == nil || lease.manager == nil {
 		return Authority{}
@@ -318,7 +320,7 @@ func (manager *Manager) revalidate(kind Kind) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(freshRootFD)
+	defer func() { _ = unix.Close(freshRootFD) }()
 	if err := validateDirectory(freshRoot, manager.owner, manager.group, manager.mode); err != nil || !sameDirectory(freshRoot, manager.rootStat) {
 		return fmt.Errorf("configured independent lock root changed: %w", err)
 	}
@@ -337,7 +339,7 @@ func (manager *Manager) revalidate(kind Kind) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(freshFD)
+	defer func() { _ = unix.Close(freshFD) }()
 	var freshStat unix.Stat_t
 	if err := unix.Fstat(freshFD, &freshStat); err != nil {
 		return err

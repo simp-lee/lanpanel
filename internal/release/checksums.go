@@ -1,13 +1,22 @@
 package release
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha1" // #nosec G505 -- Git index object identity is SHA-1; release authority remains SHA-256.
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"io"
+	"os"
 	"path"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -218,6 +227,290 @@ func SourceTreeDigest(inventory TrackedInventory, entries []TreeEntry) (string, 
 		previous = entry.Path
 	}
 	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// CleanTrackedSourceTree reads the stage-0 Git index directly and requires
+// every indexed blob to match the worktree. Release gates separately require
+// the index to equal HEAD so no process execution enters this verifier.
+func CleanTrackedSourceTree(root string) (TrackedInventory, []TreeEntry, string, error) {
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return TrackedInventory{}, nil, "", err
+	}
+	indexPath, err := gitIndexPath(absolute)
+	if err != nil {
+		return TrackedInventory{}, nil, "", err
+	}
+	index, err := os.ReadFile(indexPath)
+	if err != nil {
+		return TrackedInventory{}, nil, "", err
+	}
+	if len(index) < 32 || len(index) > 64<<20 || string(index[:4]) != "DIRC" || binary.BigEndian.Uint32(index[4:8]) < 2 || binary.BigEndian.Uint32(index[4:8]) > 3 {
+		return TrackedInventory{}, nil, "", fmt.Errorf("git index format is unsupported")
+	}
+	payload, checksum := index[:len(index)-sha1.Size], index[len(index)-sha1.Size:]
+	actual := sha1.Sum(payload)
+	if !bytes.Equal(actual[:], checksum) {
+		return TrackedInventory{}, nil, "", fmt.Errorf("git index checksum changed")
+	}
+	count := int(binary.BigEndian.Uint32(index[8:12]))
+	offset := 12
+	paths := make([]string, 0, count)
+	entries := make([]TreeEntry, 0, count)
+	for item := 0; item < count; item++ {
+		start := offset
+		if offset+62 > len(payload) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index entry is truncated")
+		}
+		mode := binary.BigEndian.Uint32(index[offset+24 : offset+28])
+		objectID := index[offset+40 : offset+60]
+		flags := binary.BigEndian.Uint16(index[offset+60 : offset+62])
+		if flags&0x3000 != 0 || flags&0x4000 != 0 {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index contains a non-stage-zero or extended entry")
+		}
+		pathStart := offset + 62
+		pathEnd := bytes.IndexByte(index[pathStart:len(payload)], 0)
+		if pathEnd < 0 {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index path is unterminated")
+		}
+		pathEnd += pathStart
+		trackedPath := string(index[pathStart:pathEnd])
+		if !ValidRelativePath(trackedPath) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index path is invalid")
+		}
+		length := pathEnd - start + 1
+		offset = start + (length+7)&^7
+		if offset > len(payload) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index padding is invalid")
+		}
+		fullPath := filepath.Join(absolute, filepath.FromSlash(trackedPath))
+		entry := TreeEntry{Path: trackedPath}
+		switch mode {
+		case 0o100644, 0o100755:
+			info, statErr := os.Lstat(fullPath)
+			if statErr != nil || !info.Mode().IsRegular() || info.Size() > 64<<20 {
+				return TrackedInventory{}, nil, "", fmt.Errorf("tracked source file %q changed type or size", trackedPath)
+			}
+			content, readErr := os.ReadFile(fullPath)
+			if readErr != nil {
+				return TrackedInventory{}, nil, "", readErr
+			}
+			entry.Type, entry.Mode, entry.Content = TreeEntryRegular, TreeModeRegular, content
+			if mode == 0o100755 {
+				entry.Mode = TreeModeExec
+			}
+		case 0o120000:
+			target, readErr := os.Readlink(fullPath)
+			if readErr != nil {
+				return TrackedInventory{}, nil, "", fmt.Errorf("read tracked source symlink %q: %w", trackedPath, readErr)
+			}
+			entry.Type, entry.Mode, entry.Content = TreeEntrySymlink, TreeModeSymlink, []byte(target)
+		default:
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index mode is unsupported")
+		}
+		blob := sha1.New()
+		_, _ = fmt.Fprintf(blob, "blob %d%c", len(entry.Content), byte(0))
+		_, _ = blob.Write(entry.Content)
+		if !bytes.Equal(blob.Sum(nil), objectID) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("tracked source entry %q differs from Git index", trackedPath)
+		}
+		paths = append(paths, trackedPath)
+		entries = append(entries, entry)
+	}
+	for offset < len(payload) {
+		if offset+8 > len(payload) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index extension is truncated")
+		}
+		extensionKind := string(payload[offset : offset+4])
+		size := int(binary.BigEndian.Uint32(payload[offset+4 : offset+8]))
+		offset += 8
+		if size < 0 || offset+size > len(payload) {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index extension size is invalid")
+		}
+		if extensionKind != "TREE" {
+			return TrackedInventory{}, nil, "", fmt.Errorf("git index extension %q is unsupported for release inventory", extensionKind)
+		}
+		offset += size
+	}
+	inventory, err := NewTrackedInventory(paths)
+	if err != nil {
+		return TrackedInventory{}, nil, "", err
+	}
+	digest, err := SourceTreeDigest(inventory, entries)
+	if err != nil {
+		return TrackedInventory{}, nil, "", err
+	}
+	return inventory, entries, digest, nil
+}
+
+func gitIndexPath(root string) (string, error) {
+	dotGit := filepath.Join(root, ".git")
+	info, err := os.Lstat(dotGit)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return filepath.Join(dotGit, "index"), nil
+	}
+	if !info.Mode().IsRegular() || info.Size() > 4096 {
+		return "", fmt.Errorf("git metadata reference is invalid")
+	}
+	raw, err := os.ReadFile(dotGit)
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(raw))
+	if !strings.HasPrefix(line, "gitdir: ") {
+		return "", fmt.Errorf("git metadata reference is invalid")
+	}
+	directory := strings.TrimPrefix(line, "gitdir: ")
+	if !filepath.IsAbs(directory) {
+		directory = filepath.Join(root, directory)
+	}
+	directory = filepath.Clean(directory)
+	return filepath.Join(directory, "index"), nil
+}
+
+func VerifySourceArchiveAgainstCleanTree(root string, archive []byte) (string, error) {
+	_, _, trackedDigest, err := CleanTrackedSourceTree(root)
+	if err != nil {
+		return "", err
+	}
+	archiveDigest, err := SourceArchiveTreeDigest(archive)
+	if err != nil {
+		return "", err
+	}
+	if archiveDigest != trackedDigest {
+		return "", fmt.Errorf("source archive does not match the clean tracked source tree")
+	}
+	return trackedDigest, nil
+}
+
+func SourceArchiveTreeDigest(data []byte) (string, error) { return sourceArchiveTreeDigest(data, "") }
+func sourceArchiveTreeDigest(data []byte, expectedRoot string) (string, error) {
+	if len(data) == 0 || len(data) > 512<<20 {
+		return "", fmt.Errorf("source archive is empty or unbounded")
+	}
+	compressed := bytes.NewReader(data)
+	gzipReader, err := gzip.NewReader(compressed)
+	if err != nil {
+		return "", err
+	}
+	gzipReader.Multistream(false)
+	if !gzipReader.ModTime.IsZero() || gzipReader.Name != "" || gzipReader.Comment != "" || len(gzipReader.Extra) != 0 || gzipReader.OS != 255 {
+		return "", fmt.Errorf("source archive gzip metadata is noncanonical")
+	}
+	defer func(ignore func() error) { _ = ignore() }(gzipReader.Close)
+	reader := tar.NewReader(gzipReader)
+	entries := []TreeEntry{}
+	paths := []string{}
+	prefix := ""
+	previousHeader := ""
+	seenHeaders := map[string]bool{}
+	directories := map[string]bool{}
+	total := int64(0)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if header.Format != tar.FormatUSTAR || header.Uid != 0 || header.Gid != 0 || header.Uname != "" || header.Gname != "" || !header.ModTime.Equal(time.Unix(0, 0).UTC()) || !header.AccessTime.IsZero() || !header.ChangeTime.IsZero() || len(header.PAXRecords) != 0 {
+			return "", fmt.Errorf("source archive tar metadata is noncanonical")
+		}
+		rawName := header.Name
+		name := path.Clean(strings.TrimSuffix(rawName, "/"))
+		canonicalRaw := name
+		if header.Typeflag == tar.TypeDir {
+			canonicalRaw += "/"
+		}
+		if rawName != canonicalRaw || name == "." || strings.HasPrefix(name, "../") || path.IsAbs(name) || strings.Contains(name, "\\") || seenHeaders[rawName] || previousHeader != "" && previousHeader >= rawName {
+			return "", fmt.Errorf("source archive path, order, or uniqueness is noncanonical")
+		}
+		seenHeaders[rawName] = true
+		previousHeader = rawName
+		parts := strings.Split(name, "/")
+		if prefix == "" {
+			prefix = parts[0]
+		} else if parts[0] != prefix {
+			return "", fmt.Errorf("source archive lacks one canonical root")
+		}
+		if len(parts) == 1 {
+			if header.Typeflag != tar.TypeDir || len(entries) != 0 || len(paths) != 0 || header.Mode != 0o755 {
+				return "", fmt.Errorf("source archive root is not one canonical directory")
+			}
+			continue
+		}
+		relative := strings.Join(parts[1:], "/")
+		if header.Typeflag == tar.TypeDir {
+			if header.Mode != 0o755 {
+				return "", fmt.Errorf("source archive directory mode is noncanonical")
+			}
+			directories[relative] = true
+			continue
+		}
+		entry := TreeEntry{Path: relative}
+		switch header.Typeflag {
+		case tar.TypeReg:
+			if header.Mode != 0o644 && header.Mode != 0o755 {
+				return "", fmt.Errorf("source archive regular mode is noncanonical")
+			}
+			if header.Size < 0 || header.Size > 64<<20 {
+				return "", fmt.Errorf("source archive member is unbounded")
+			}
+			content, err := io.ReadAll(io.LimitReader(reader, header.Size+1))
+			if err != nil || int64(len(content)) != header.Size {
+				return "", fmt.Errorf("source archive member changed")
+			}
+			total += header.Size
+			if total > 512<<20 {
+				return "", fmt.Errorf("source archive expands beyond bound")
+			}
+			entry.Type = TreeEntryRegular
+			entry.Mode = TreeModeRegular
+			if header.Mode&0o111 != 0 {
+				entry.Mode = TreeModeExec
+			}
+			entry.Content = content
+		case tar.TypeSymlink:
+			if header.Mode != 0o777 || header.Linkname == "" || strings.ContainsRune(header.Linkname, '\x00') {
+				return "", fmt.Errorf("source archive symlink is noncanonical")
+			}
+			entry.Type = TreeEntrySymlink
+			entry.Mode = TreeModeSymlink
+			entry.Content = []byte(header.Linkname)
+		default:
+			return "", fmt.Errorf("source archive member type is unsupported")
+		}
+		paths = append(paths, relative)
+		entries = append(entries, entry)
+	}
+	if prefix == "" {
+		return "", fmt.Errorf("source archive root is missing")
+	}
+	if expectedRoot != "" && prefix != expectedRoot {
+		return "", fmt.Errorf("source archive root does not match release tag")
+	}
+	expectedDirectories := map[string]bool{}
+	for _, filePath := range paths {
+		for parent := path.Dir(filePath); parent != "."; parent = path.Dir(parent) {
+			expectedDirectories[parent] = true
+		}
+	}
+	if !reflect.DeepEqual(directories, expectedDirectories) {
+		return "", fmt.Errorf("source archive directory inventory differs from tracked tree")
+	}
+	trailing, tailErr := io.ReadAll(io.LimitReader(gzipReader, 1))
+	if tailErr != nil || len(trailing) != 0 || gzipReader.Close() != nil || compressed.Len() != 0 {
+		return "", fmt.Errorf("source archive contains trailing payload")
+	}
+	inventory, err := NewTrackedInventory(paths)
+	if err != nil {
+		return "", err
+	}
+	return SourceTreeDigest(inventory, entries)
 }
 
 func writeLengthPrefixed(writer hash.Hash, value []byte) {

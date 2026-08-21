@@ -102,6 +102,7 @@ func VerifyRunning(observation RuntimeObservation) error {
 	}
 	return nil
 }
+
 func ObserveStopped(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle) (RuntimeObservation, error) {
 	if err := ctx.Err(); err != nil {
 		return RuntimeObservation{}, err
@@ -231,6 +232,7 @@ func procTCPListenerPresent(data []byte, want netip.Addr, port uint16) (bool, er
 	}
 	return false, scanner.Err()
 }
+
 func parseProcTCPAddress(value string, ipv6 bool) (netip.Addr, error) {
 	size := 4
 	if ipv6 {
@@ -271,7 +273,7 @@ func readListeners(path string) ([]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	result := []uint64{}
 	scanner := bufio.NewScanner(io.LimitReader(file, 32<<20))
 	first := true

@@ -6,12 +6,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"lanpanel/internal/child"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"lanpanel/internal/child"
 )
 
 func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testing.T) {

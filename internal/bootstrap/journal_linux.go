@@ -14,8 +14,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const journalSlotBytes = MaximumJournalBytes + 32
-const journalFileBytes = journalSlotBytes * 2
+const (
+	journalSlotBytes = MaximumJournalBytes + 32
+	journalFileBytes = journalSlotBytes * 2
+)
 
 type journalStore struct {
 	fd       int
@@ -37,21 +39,21 @@ func createJournal(path string, owner, group uint32, value Journal) (*journalSto
 	}
 	data, err := encodeJournalSlot(value)
 	if err != nil {
-		store.close()
+		_ = store.close()
 		return nil, err
 	}
 	if err := unix.Ftruncate(store.fd, journalFileBytes); err != nil {
-		store.close()
+		_ = store.close()
 		return nil, err
 	}
 	for index := range 2 {
 		if written, err := unix.Pwrite(store.fd, data, int64(index*journalSlotBytes)); err != nil || written != len(data) {
-			store.close()
+			_ = store.close()
 			return nil, fmt.Errorf("initialize bootstrap journal slot")
 		}
 	}
 	if err := unix.Fsync(store.fd); err != nil || unix.Fsync(store.dirFD) != nil {
-		store.close()
+		_ = store.close()
 		return nil, fmt.Errorf("sync first bootstrap journal")
 	}
 	store.sequence, store.slot = 1, 1
@@ -65,7 +67,7 @@ func openJournal(path string, owner, group uint32) (*journalStore, Journal, erro
 	}
 	value, slot, err := store.load()
 	if err != nil {
-		store.close()
+		_ = store.close()
 		return nil, Journal{}, err
 	}
 	store.sequence, store.slot = value.Sequence, slot

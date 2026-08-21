@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"net"
 	"os"
@@ -32,15 +33,20 @@ type IdentitySet struct {
 	Recovery PeerIdentity `json:"recovery"`
 }
 
-type Revalidator func(context.Context, helperproto.Caller, helperproto.Request) error
-type ExecutionResult struct {
-	ResultDigest string
-	Secret       *helperproto.Secret
-	Action       *helperproto.ActionResult
-	Resource     *helperproto.ResourceResult
-	ErrorCode    string
-	ErrorJobID   string
-}
+type (
+	Revalidator     func(context.Context, helperproto.Caller, helperproto.Request) error
+	ExecutionResult struct {
+		ResultDigest string
+		Secret       *helperproto.Secret
+		Action       *helperproto.ActionResult
+		Resource     *helperproto.ResourceResult
+		Headscale    *helperproto.HeadscaleResult
+		Connector    *helperproto.ConnectorResult
+		Read         *helperproto.ReadResult
+		ErrorCode    string
+		ErrorJobID   string
+	}
+)
 
 type Executor func(context.Context, helperproto.Caller, helperproto.Request, *helperproto.Secret) (ExecutionResult, error)
 
@@ -61,116 +67,135 @@ func newRegistration(operation helperproto.Operation, revalidate Revalidator, ex
 func ApplicationPlanHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationApplicationPlan, r, e)
 }
-func ManagedFileCommitHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationManagedFileCommit, r, e)
-}
-func AccountCreateHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationAccountCreate, r, e)
-}
+
 func AdminTokenVerifyHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenVerify, r, e)
 }
+
 func AdminTokenSourceHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenSource, r, e)
 }
+
 func ManagementProfileHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagementProfile, r, e)
 }
+
 func AdminTokenRotateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenRotate, r, e)
 }
+
 func AdminTokenReconcileHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenReconcile, r, e)
 }
-func PackageTransactionHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationPackageTransaction, r, e)
-}
-func SystemdTransitionHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationSystemdTransition, r, e)
-}
-func NginxTestHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationNginxTest, r, e)
-}
-func NginxReloadHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationNginxReload, r, e)
-}
-func CredentialImportHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationCredentialImport, r, e)
-}
-func CredentialAdoptHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationCredentialAdopt, r, e)
-}
-func CertificateIssueHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationCertificateIssue, r, e)
-}
+
 func CertificateRenewHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationCertificateRenew, r, e)
 }
-func EdgeOneRefreshHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationEdgeOneRefresh, r, e)
-}
-func HeadscaleAdminHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationHeadscaleAdmin, r, e)
-}
-func PreauthKeyCreateHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationPreauthKeyCreate, r, e)
-}
-func TailscaleAuthImportHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationTailscaleAuthImport, r, e)
-}
-func TailscaleAuthAdoptHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationTailscaleAuthAdopt, r, e)
-}
-func TailscaleAdminHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationTailscaleAdmin, r, e)
-}
-func GoAccessProbeHandler(r Revalidator, e Executor) Registration {
-	return newRegistration(helperproto.OperationGoAccessProbe, r, e)
-}
+
 func ManagedBasicGenerateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagedBasicGenerate, r, e)
 }
+
 func ManagedBasicDeleteHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagedBasicDelete, r, e)
 }
+
 func StaticRootRegisterHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationStaticRootRegister, r, e)
 }
+
 func ExternalHTPasswdRegisterHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationExternalHTPasswdRegister, r, e)
 }
+
 func DomainStatusHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationDomainStatus, r, e)
 }
+
 func ContractionCloseHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationContractionClose, r, e)
 }
+
 func StartupContractionHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationStartupContraction, r, e)
 }
+
 func HeadscaleInitializeHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationHeadscaleInitialize, r, e)
 }
+
+func HeadscaleDeployHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationHeadscaleDeploy, r, e)
+}
+
+func HeadscaleReissueHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationHeadscaleReissue, r, e)
+}
+
+func HeadscaleReadHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationHeadscaleRead, r, e)
+}
+
+func HeadscaleMutationHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationHeadscaleMutation, r, e)
+}
+
+func PreauthKeyPlanHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationPreauthKeyPlan, r, e)
+}
+
+func PreauthKeyCreateHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationPreauthKeyCreate, r, e)
+}
+
+func ConnectorMutationHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationConnectorMutation, r, e)
+}
+
+func ConnectorReadHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationConnectorRead, r, e)
+}
+
+func ConnectorLoginPlanHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationConnectorLoginPlan, r, e)
+}
+
+func ConnectorLoginHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationConnectorLogin, r, e)
+}
+
+func ResourceDeleteHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationResourceDelete, r, e)
+}
+
+func ProductReadHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationProductRead, r, e)
+}
+
 func ResourceMutationHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationResourceMutation, r, e)
 }
+
 func ProcessLifecycleHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationProcessLifecycle, r, e)
 }
+
 func PublicationActivateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationPublicationActivate, r, e)
 }
 
 type Server struct {
-	identities IdentitySet
-	handlers   map[helperproto.Operation]handler
-	now        func() time.Time
-	ioTimeout  time.Duration
+	identities   IdentitySet
+	handlers     map[helperproto.Operation]handler
+	now          func() time.Time
+	ioTimeout    time.Duration
+	mutationGate func(helperproto.Request) error
 }
 
 type Options struct {
-	Now       func() time.Time
-	IOTimeout time.Duration
+	Now          func() time.Time
+	IOTimeout    time.Duration
+	MutationGate func(helperproto.Request) error
 }
 
 func NewServer(identities IdentitySet, registrations []Registration, options Options) (*Server, error) {
@@ -188,7 +213,7 @@ func NewServer(identities IdentitySet, registrations []Registration, options Opt
 	if timeout < time.Second || timeout > 30*time.Second {
 		return nil, fmt.Errorf("helper protocol timeout is outside the fixed bound")
 	}
-	server := &Server{identities: identities, handlers: map[helperproto.Operation]handler{}, now: now, ioTimeout: timeout}
+	server := &Server{identities: identities, handlers: map[helperproto.Operation]handler{}, now: now, ioTimeout: timeout, mutationGate: options.MutationGate}
 	for _, registration := range registrations {
 		if _, known := helperproto.PolicyFor(registration.operation); !known || registration.handler.revalidate == nil || registration.handler.execute == nil {
 			return nil, fmt.Errorf("helper handler registration is unknown or incomplete")
@@ -240,7 +265,7 @@ func (server *Server) serveUnix(ctx context.Context, listener *net.UnixListener,
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			defer connection.Close()
+			defer func(ignore func() error) { _ = ignore() }(connection.Close)
 			_ = server.serveConnection(ctx, connection, requireRoot)
 		}()
 	}
@@ -255,7 +280,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 	if !ok {
 		return fmt.Errorf("helper peer is unauthorized")
 	}
-	for {
+	{
 		deadline := time.Now().Add(server.ioTimeout)
 		if err := connection.SetDeadline(deadline); err != nil {
 			return err
@@ -297,6 +322,13 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			destroySecret()
 			return server.writeFailure(connection, request.Operation, request.RequestID, "authority_rejected")
 		}
+		if server.mutationGate != nil {
+			if gateErr := server.mutationGate(request); gateErr != nil {
+				cancel()
+				destroySecret()
+				return server.writeFailure(connection, request.Operation, request.RequestID, "recovery_incomplete")
+			}
+		}
 		if requireRoot && (os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0) {
 			cancel()
 			destroySecret()
@@ -310,6 +342,14 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			if result.Secret != nil {
 				result.Secret.Destroy()
 			}
+			var prerequisite domain.PrerequisiteError
+			if errors.As(err, &prerequisite) {
+				switch prerequisite.Code {
+				case domain.PrerequisiteHeadscaleNotConfigured, domain.PrerequisiteConnectorRequired, domain.PrerequisiteOSProfileLiveUnqualified, domain.PrerequisitePackageIdentityDrift:
+					response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseRejected, ErrorCode: string(prerequisite.Code)}
+					return helperproto.WriteResponse(connection, request.Operation, response, nil)
+				}
+			}
 			if request.Operation == helperproto.OperationHeadscaleInitialize && result.ErrorCode == "foreign_database_evidence" {
 				response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseRejected, ErrorCode: result.ErrorCode, ErrorJobID: result.ErrorJobID}
 				return helperproto.WriteResponse(connection, request.Operation, response, nil)
@@ -319,7 +359,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 		if result.ErrorCode != "" || result.ErrorJobID != "" {
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
-		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource}
+		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource, Headscale: result.Headscale, Connector: result.Connector, Read: result.Read}
 		return helperproto.WriteResponse(connection, request.Operation, response, result.Secret)
 	}
 }

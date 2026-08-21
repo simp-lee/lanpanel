@@ -21,8 +21,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const emergencySlotSize = 4096
-const emergencyFileSize = emergencySlotSize * 2
+const (
+	emergencySlotSize = 4096
+	emergencyFileSize = emergencySlotSize * 2
+)
 
 var (
 	ErrEmergencySequence  = errors.New("emergency backing sequence mismatch")
@@ -31,23 +33,25 @@ var (
 )
 
 type EmergencyStopFence struct {
-	Kind                  StopFenceKind
-	OriginOperation       string
-	ScopeKind             string
-	ResourceID            string
-	Generation            uint64
-	GlobalGeneration      uint64
-	ClosingGeneration     uint64
-	CertificateGeneration uint64
-	EdgeOneGeneration     uint64
-	OwnershipDigest       string
-	OwnedGraphDigest      string
-	InventoryDigest       string
-	MasterStopped         bool
-	WorkersStopped        bool
-	ListenersStopped      bool
-	ObservedUnix          int64
-	AccessMayRemain       bool
+	Kind                   StopFenceKind
+	OriginOperation        string
+	ScopeKind              string
+	ResourceID             string
+	Generation             uint64
+	GlobalGeneration       uint64
+	ClosingGeneration      uint64
+	CertificateGeneration  uint64
+	SafetyIntentGeneration uint64
+	OperationRef           string
+	SafetyIntentID         string
+	OwnershipDigest        string
+	OwnedGraphDigest       string
+	InventoryDigest        string
+	MasterStopped          bool
+	WorkersStopped         bool
+	ListenersStopped       bool
+	ObservedUnix           int64
+	AccessMayRemain        bool
 }
 
 type EmergencyClearProof struct {
@@ -213,6 +217,7 @@ func (store *EmergencyStore) LockAuthority() locks.Authority {
 	}
 	return store.lockAuthority
 }
+
 func (store *EmergencyStore) Authority() (EmergencyState, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -444,9 +449,6 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 			return false
 		}
 		expectedRole := RoleJournalConvergence
-		if current.StopFence.Kind == StopFenceGenerationUpgrade {
-			expectedRole = RoleUpgradeRecovery
-		}
 		if role != expectedRole || !validEmergencyClearProof(next.ClearProof, current) {
 			return false
 		}
@@ -469,6 +471,7 @@ func validEmergencyClearProof(proof *EmergencyClearProof, current EmergencyState
 	}
 	return true
 }
+
 func sameEmergencyClearProof(left, right *EmergencyClearProof) bool {
 	if left == nil || right == nil {
 		return left == right
@@ -486,7 +489,12 @@ func validEmergencyFence(fence EmergencyStopFence, global GlobalClose) bool {
 	if fence.ScopeKind == "app" && (!validRef(fence.ResourceID) || len(fence.ResourceID) > 128) {
 		return false
 	}
-	if fence.GlobalGeneration+fence.ClosingGeneration+fence.CertificateGeneration+fence.EdgeOneGeneration == 0 {
+	if fence.GlobalGeneration+fence.ClosingGeneration+fence.CertificateGeneration == 0 {
+		return false
+	}
+	normalOperation := validRef(fence.OperationRef) && fence.SafetyIntentID == "" && fence.SafetyIntentGeneration == 0
+	stateIndependent := fence.OperationRef == "" && validRef(fence.SafetyIntentID) && fence.SafetyIntentGeneration != 0
+	if !normalOperation && !stateIndependent {
 		return false
 	}
 	if fence.GlobalGeneration != 0 && fence.GlobalGeneration != global.Generation {
@@ -509,12 +517,12 @@ func EmergencyFenceDigest(fence EmergencyStopFence) string {
 }
 
 func sameEmergencyFenceBinding(left, right EmergencyStopFence) bool {
-	return left.Kind == right.Kind && left.OriginOperation == right.OriginOperation && left.ScopeKind == right.ScopeKind && left.ResourceID == right.ResourceID && left.Generation == right.Generation && left.GlobalGeneration == right.GlobalGeneration && left.ClosingGeneration == right.ClosingGeneration && left.CertificateGeneration == right.CertificateGeneration && left.EdgeOneGeneration == right.EdgeOneGeneration && left.OwnershipDigest == right.OwnershipDigest && left.OwnedGraphDigest == right.OwnedGraphDigest && left.InventoryDigest == right.InventoryDigest
+	return left.Kind == right.Kind && left.OriginOperation == right.OriginOperation && left.ScopeKind == right.ScopeKind && left.ResourceID == right.ResourceID && left.Generation == right.Generation && left.GlobalGeneration == right.GlobalGeneration && left.ClosingGeneration == right.ClosingGeneration && left.CertificateGeneration == right.CertificateGeneration && left.OperationRef == right.OperationRef && left.SafetyIntentID == right.SafetyIntentID && left.SafetyIntentGeneration == right.SafetyIntentGeneration && left.OwnershipDigest == right.OwnershipDigest && left.OwnedGraphDigest == right.OwnedGraphDigest && left.InventoryDigest == right.InventoryDigest
 }
 
 func validStopFenceKind(kind StopFenceKind) bool {
 	switch kind {
-	case StopFenceContraction, StopFenceIngressActivation, StopFenceCertificateActivation, StopFenceEdgeOneRefresh, StopFenceMaintenanceTransition, StopFenceGenerationUpgrade:
+	case StopFenceContraction, StopFenceIngressActivation, StopFenceCertificateActivation:
 		return true
 	default:
 		return false
@@ -522,7 +530,7 @@ func validStopFenceKind(kind StopFenceKind) bool {
 }
 
 func encodeEmergency(slot []byte, state EmergencyState) {
-	copy(slot[0:8], "LPSAFE03")
+	copy(slot[0:8], "LPSAFE04")
 	binary.LittleEndian.PutUint64(slot[8:16], state.Sequence)
 	binary.LittleEndian.PutUint64(slot[16:24], state.GlobalClose.Generation)
 	slot[24] = phaseCode(state.GlobalClose.Phase)
@@ -568,20 +576,22 @@ func encodeEmergency(slot []byte, state EmergencyState) {
 		binary.LittleEndian.PutUint64(slot[40:48], fence.GlobalGeneration)
 		binary.LittleEndian.PutUint64(slot[48:56], fence.ClosingGeneration)
 		binary.LittleEndian.PutUint64(slot[56:64], fence.CertificateGeneration)
-		binary.LittleEndian.PutUint64(slot[64:72], fence.EdgeOneGeneration)
+		binary.LittleEndian.PutUint64(slot[64:72], fence.SafetyIntentGeneration)
 		binary.LittleEndian.PutUint64(slot[72:80], uint64(fence.ObservedUnix))
 		putFixedString(slot[80:145], fence.OriginOperation)
 		putFixedString(slot[145:274], fence.ResourceID)
 		putDigest(slot[274:306], fence.OwnershipDigest)
 		putDigest(slot[306:338], fence.OwnedGraphDigest)
 		putDigest(slot[338:370], fence.InventoryDigest)
+		putFixedString(slot[576:834], fence.OperationRef)
+		putFixedString(slot[834:1092], fence.SafetyIntentID)
 	}
 	checksum := crc32.ChecksumIEEE(slot[:emergencySlotSize-4])
 	binary.LittleEndian.PutUint32(slot[emergencySlotSize-4:], checksum)
 }
 
 func decodeEmergency(slot []byte) (EmergencyState, bool) {
-	if string(slot[0:8]) != "LPSAFE03" {
+	if string(slot[0:8]) != "LPSAFE04" {
 		return EmergencyState{}, false
 	}
 	want := binary.LittleEndian.Uint32(slot[emergencySlotSize-4:])
@@ -603,7 +613,7 @@ func decodeEmergency(slot []byte) (EmergencyState, bool) {
 		state.ClearProof = &proof
 	}
 	if slot[25] != 0 {
-		fence := EmergencyStopFence{Kind: StopFenceContraction, ScopeKind: scopeFromCode(slot[27]), Generation: binary.LittleEndian.Uint64(slot[32:40]), GlobalGeneration: binary.LittleEndian.Uint64(slot[40:48]), ClosingGeneration: binary.LittleEndian.Uint64(slot[48:56]), CertificateGeneration: binary.LittleEndian.Uint64(slot[56:64]), EdgeOneGeneration: binary.LittleEndian.Uint64(slot[64:72]), ObservedUnix: int64(binary.LittleEndian.Uint64(slot[72:80])), OriginOperation: getFixedString(slot[80:145]), ResourceID: getFixedString(slot[145:274]), OwnershipDigest: getDigest(slot[274:306]), OwnedGraphDigest: getDigest(slot[306:338]), InventoryDigest: getDigest(slot[338:370]), AccessMayRemain: slot[26]&1 != 0, MasterStopped: slot[26]&2 != 0, WorkersStopped: slot[26]&4 != 0, ListenersStopped: slot[26]&8 != 0}
+		fence := EmergencyStopFence{Kind: StopFenceContraction, ScopeKind: scopeFromCode(slot[27]), Generation: binary.LittleEndian.Uint64(slot[32:40]), GlobalGeneration: binary.LittleEndian.Uint64(slot[40:48]), ClosingGeneration: binary.LittleEndian.Uint64(slot[48:56]), CertificateGeneration: binary.LittleEndian.Uint64(slot[56:64]), SafetyIntentGeneration: binary.LittleEndian.Uint64(slot[64:72]), ObservedUnix: int64(binary.LittleEndian.Uint64(slot[72:80])), OriginOperation: getFixedString(slot[80:145]), ResourceID: getFixedString(slot[145:274]), OwnershipDigest: getDigest(slot[274:306]), OwnedGraphDigest: getDigest(slot[306:338]), InventoryDigest: getDigest(slot[338:370]), OperationRef: getFixedString(slot[576:834]), SafetyIntentID: getFixedString(slot[834:1092]), AccessMayRemain: slot[26]&1 != 0, MasterStopped: slot[26]&2 != 0, WorkersStopped: slot[26]&4 != 0, ListenersStopped: slot[26]&8 != 0}
 		if !validEmergencyFence(fence, state.GlobalClose) || fence.Generation != state.StopFenceSequence {
 			return EmergencyState{}, false
 		}
@@ -689,6 +699,7 @@ func scopeCode(scope string) byte {
 	}
 	return 0
 }
+
 func scopeFromCode(code byte) string {
 	switch code {
 	case 1:
@@ -714,7 +725,7 @@ func (store *EmergencyStore) scanLatestSequence() (uint64, int, bool, error) {
 		if n != len(slot) {
 			return 0, 0, false, errors.New("short emergency slot read")
 		}
-		if string(slot[0:8]) != "LPSAFE03" || crc32.ChecksumIEEE(slot[:emergencySlotSize-4]) != binary.LittleEndian.Uint32(slot[emergencySlotSize-4:]) {
+		if string(slot[0:8]) != "LPSAFE04" || crc32.ChecksumIEEE(slot[:emergencySlotSize-4]) != binary.LittleEndian.Uint32(slot[emergencySlotSize-4:]) {
 			continue
 		}
 		sequence := binary.LittleEndian.Uint64(slot[8:16])
@@ -741,6 +752,7 @@ func phaseCode(phase GlobalClosePhase) byte {
 	}
 	return 0
 }
+
 func phaseFromCode(code byte) GlobalClosePhase {
 	switch code {
 	case 1:
@@ -752,6 +764,7 @@ func phaseFromCode(code byte) GlobalClosePhase {
 	}
 	return ""
 }
+
 func fenceCode(kind StopFenceKind) byte {
 	switch kind {
 	case StopFenceContraction:
@@ -760,15 +773,10 @@ func fenceCode(kind StopFenceKind) byte {
 		return 2
 	case StopFenceCertificateActivation:
 		return 3
-	case StopFenceEdgeOneRefresh:
-		return 4
-	case StopFenceMaintenanceTransition:
-		return 5
-	case StopFenceGenerationUpgrade:
-		return 6
 	}
 	return 0
 }
+
 func fenceFromCode(code byte) StopFenceKind {
 	switch code {
 	case 1:
@@ -777,12 +785,6 @@ func fenceFromCode(code byte) StopFenceKind {
 		return StopFenceIngressActivation
 	case 3:
 		return StopFenceCertificateActivation
-	case 4:
-		return StopFenceEdgeOneRefresh
-	case 5:
-		return StopFenceMaintenanceTransition
-	case 6:
-		return StopFenceGenerationUpgrade
 	}
 	return ""
 }

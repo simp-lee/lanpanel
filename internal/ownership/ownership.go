@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -82,6 +83,7 @@ const (
 	ActivationWriter                WriterRole = "activation_writer"
 	GoAccessRetirementWriter        WriterRole = "goaccess_retirement_writer"
 	GoAccessCandidateRollbackWriter WriterRole = "goaccess_candidate_rollback_writer"
+	DeleteWriter                    WriterRole = "delete_writer"
 )
 
 type Config struct {
@@ -207,6 +209,19 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 		Parents:  filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700},
 		Existing: &metadata, New: metadata, MaxBytes: maxRecordBytes,
 	}, data, disposition)
+}
+
+func (store *Store) Delete(ctx context.Context, lease *locks.Lease, expected Record) error {
+	if store == nil || lease == nil || lease.Authority() != store.config.LockAuthority || !lease.Holds(locks.Exposure) || expected.State != Owned || Validate(expected, store.config.Policy) != nil {
+		return fmt.Errorf("ownership delete authority invalid")
+	}
+	current, err := store.Read(expected.ResourceID)
+	if err != nil || !reflect.DeepEqual(current, expected) {
+		return fmt.Errorf("ownership delete record changed: %w", err)
+	}
+	metadata := filetxn.Metadata{Owner: store.config.Owner, Mode: 0o600}
+	_, err = store.txn.Remove(ctx, filetxn.Request{Path: filepath.Join(store.config.RecordsPath, expected.ResourceID+".json"), Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{store.config.Owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: maxRecordBytes})
+	return err
 }
 
 func (store *Store) Read(resourceID string) (Record, error) {
@@ -391,7 +406,7 @@ func (store *Store) readFile(name string) (Record, error) {
 		_ = unix.Close(fd)
 		return Record{}, fmt.Errorf("wrap ownership record descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	decoder := json.NewDecoder(io.LimitReader(file, maxRecordBytes+1))
 	decoder.DisallowUnknownFields()
 	var record Record
@@ -670,14 +685,6 @@ func recordChecksum(record Record) (string, error) {
 	}
 	digest := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
-}
-
-func isDigest(value string) bool {
-	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
-		return false
-	}
-	_, err := hex.DecodeString(value[7:])
-	return err == nil && strings.ToLower(value) == value
 }
 
 func cloneConfig(config Config) Config {

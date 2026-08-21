@@ -19,6 +19,7 @@ func TestCertificatePointerHandoffAcceptsExactCandidate(t *testing.T) {
 		t.Fatalf("handoff=%#v restored=%t err=%v", result, restored, err)
 	}
 }
+
 func TestCertificatePointerHandoffPropagatesActivationFaultWithoutRestore(t *testing.T) {
 	fault := errors.New("activate fault")
 	restored := false
@@ -29,6 +30,7 @@ func TestCertificatePointerHandoffPropagatesActivationFaultWithoutRestore(t *tes
 		t.Fatalf("err=%v restored=%t", err, restored)
 	}
 }
+
 func TestCertificatePointerPostRenameFaultRestoresPriorPointer(t *testing.T) {
 	fault := errors.New("fsync fault")
 	restored := false
@@ -40,6 +42,7 @@ func TestCertificatePointerPostRenameFaultRestoresPriorPointer(t *testing.T) {
 		t.Fatalf("err=%v restored=%t", err, restored)
 	}
 }
+
 func TestCertificatePointerPostRenameRestoreFailureIsReported(t *testing.T) {
 	fault := errors.New("verify fault")
 	restoreFault := errors.New("restore fault")
@@ -51,6 +54,7 @@ func TestCertificatePointerPostRenameRestoreFailureIsReported(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
 func TestCertificatePointerTargetMismatchRestoresBeforeFailure(t *testing.T) {
 	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
 	restoredTarget := ""

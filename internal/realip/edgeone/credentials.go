@@ -149,9 +149,7 @@ func secretFileToken(data []byte) (string, error) {
 	value := string(data)
 	if strings.HasSuffix(value, "\n") {
 		value = strings.TrimSuffix(value, "\n")
-		if strings.HasSuffix(value, "\r") {
-			value = strings.TrimSuffix(value, "\r")
-		}
+		value = strings.TrimSuffix(value, "\r")
 	}
 	if value == "" {
 		return "", nil

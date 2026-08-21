@@ -14,9 +14,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const FixedRoot = "/var/lib/lanpanel/certificates"
-const FixedBundlesRoot = FixedRoot + "/bundles"
-const FixedActiveRoot = FixedRoot + "/active"
+const (
+	FixedRoot        = "/var/lib/lanpanel/certificates"
+	FixedBundlesRoot = FixedRoot + "/bundles"
+	FixedActiveRoot  = FixedRoot + "/active"
+)
 
 type Pointer struct {
 	CertificateID           string
@@ -79,7 +81,7 @@ func RemoveInactiveBundle(certificateIdentity string, generation uint64, uid, gi
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
+	defer func(ignore func() error) { _ = ignore() }(parent.Close)
 	return parent.Sync()
 }
 
@@ -89,12 +91,14 @@ func BundlePath(certificateIdentity string, generation uint64) (string, error) {
 	}
 	return filepath.Join(FixedBundlesRoot, bundleName(certificateIdentity, generation)), nil
 }
+
 func ActivePointerPath(certificateIdentity string) (string, error) {
 	if !certificateID(certificateIdentity) {
 		return "", fmt.Errorf("certificate identity invalid")
 	}
 	return filepath.Join(FixedActiveRoot, certificateIdentity+".current"), nil
 }
+
 func ActiveCertificatePath(certificateIdentity string) (string, error) {
 	pointer, err := ActivePointerPath(certificateIdentity)
 	if err != nil {
@@ -102,6 +106,7 @@ func ActiveCertificatePath(certificateIdentity string) (string, error) {
 	}
 	return filepath.Join(pointer, "certificate.pem"), nil
 }
+
 func ActivePrivateKeyPath(certificateIdentity string) (string, error) {
 	pointer, err := ActivePointerPath(certificateIdentity)
 	if err != nil {
@@ -109,6 +114,7 @@ func ActivePrivateKeyPath(certificateIdentity string) (string, error) {
 	}
 	return filepath.Join(pointer, "private-key.pem"), nil
 }
+
 func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error) {
 	if err := ctx.Err(); err != nil {
 		return PointerResult{}, err
@@ -122,7 +128,7 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 	if err != nil {
 		return PointerResult{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	observed, err := readPointer(fd, filepath.Base(path))
 	if errors.Is(err, os.ErrNotExist) {
 		observed = ""
@@ -155,6 +161,7 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 	result.Durable = true
 	return result, nil
 }
+
 func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate string) error {
 	path, candidate, prior, err := pointerPaths(pointer)
 	if err != nil {
@@ -173,7 +180,7 @@ func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate stri
 		if err != nil {
 			return err
 		}
-		defer unix.Close(fd)
+		defer func() { _ = unix.Close(fd) }()
 		if err := unix.Unlinkat(fd, filepath.Base(path), 0); err != nil {
 			return err
 		}
@@ -186,6 +193,7 @@ func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate stri
 	_, err = ActivatePointer(ctx, reverse)
 	return err
 }
+
 func pointerPaths(pointer Pointer) (string, string, string, error) {
 	if !certificateID(pointer.CertificateID) || pointer.CandidateGeneration == 0 || pointer.CandidateGeneration == pointer.ExpectedPriorGeneration {
 		return "", "", "", fmt.Errorf("certificate pointer authority invalid")
@@ -207,6 +215,7 @@ func pointerPaths(pointer Pointer) (string, string, string, error) {
 	}
 	return path, candidate, prior, nil
 }
+
 func verifyBundleTarget(path string) error {
 	if !strings.HasPrefix(path, FixedBundlesRoot+string(filepath.Separator)) || filepath.Clean(path) != path {
 		return fmt.Errorf("certificate target outside fixed root")
@@ -242,6 +251,7 @@ func certificateID(value string) bool {
 	}
 	return true
 }
+
 func ObservePointer(certificateIdentity string) (string, error) {
 	path, err := ActivePointerPath(certificateIdentity)
 	if err != nil {
@@ -253,15 +263,17 @@ func ObservePointer(certificateIdentity string) (string, error) {
 	}
 	return value, err
 }
+
 func readLink(path string) (string, error) {
 	parent := filepath.Dir(path)
 	fd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return "", err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	return readPointer(fd, filepath.Base(path))
 }
+
 func readPointer(parentFD int, name string) (string, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {

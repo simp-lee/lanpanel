@@ -20,8 +20,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const managedExecSchema = "lanpanel.managed.exec.v1"
-const maximumManagedExecBytes = 32 << 10
+const (
+	managedExecSchema       = "lanpanel.managed.exec.v1"
+	maximumManagedExecBytes = 32 << 10
+)
 
 type ExecAuthority struct {
 	SchemaVersion string                     `json:"schema_version"`
@@ -40,7 +42,7 @@ func LoadExecAuthority(resourceID string) (ExecAuthority, error) {
 	if err != nil {
 		return ExecAuthority{}, err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumManagedExecBytes {
 		return ExecAuthority{}, fmt.Errorf("managed execution authority file unsafe")
@@ -75,7 +77,7 @@ func Execute(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumManagedExecBytes {
 		return fmt.Errorf("managed execution authority file unsafe")
@@ -188,7 +190,7 @@ func verifyBindListenDenied(policy confinement.UnitPolicy) error {
 			return err
 		}
 		listenErr := unix.Listen(fd, 1)
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		if !errors.Is(listenErr, unix.EACCES) {
 			return fmt.Errorf("BPF LSM unbound INET listen probe was not denied: %w", listenErr)
 		}
@@ -202,7 +204,7 @@ func verifyBindListenDenied(policy confinement.UnitPolicy) error {
 		} else {
 			bindErr = unix.Bind(fd, &unix.SockaddrInet6{Port: 0, Addr: [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}})
 		}
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		if !errors.Is(bindErr, unix.EACCES) {
 			return fmt.Errorf("systemd explicit INET bind probe was not denied: %w", bindErr)
 		}

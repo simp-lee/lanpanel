@@ -11,21 +11,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
 )
 
 const (
-	JournalSchemaVersion = "lanpanel.bootstrap.journal.v1"
-	BundleSchemaVersion  = "lanpanel.installation.bundle.v1"
+	JournalSchemaVersion = "lanpanel.bootstrap.journal.v2"
+	BundleSchemaVersion  = "lanpanel.installation.bundle.v2"
 	CommitSchemaVersion  = "lanpanel.bootstrap.commit.v1"
 	MaximumJournalBytes  = 4 << 20
 )
@@ -34,6 +35,8 @@ type Phase string
 
 const (
 	PhasePrepared          Phase = "prepared"
+	PhaseNginxMasked       Phase = "nginx_masked"
+	PhasePackagesCommitted Phase = "packages_committed"
 	PhaseBundleCommitted   Phase = "bundle_committed"
 	PhaseAccountsSubmitted Phase = "accounts_submitted"
 	PhaseAccountsVerified  Phase = "accounts_verified"
@@ -49,6 +52,7 @@ type Paths struct {
 	CommitPath       string `json:"commit_path"`
 	PersistentRoot   string `json:"persistent_root"`
 	InstallationRoot string `json:"installation_root"`
+	ACMEAccountKey   string `json:"acme_account_key"`
 	StateRoot        string `json:"state_root"`
 	SafetyRoot       string `json:"safety_root"`
 	OwnershipRoot    string `json:"ownership_root"`
@@ -62,7 +66,7 @@ type Paths struct {
 
 func FixedPaths() Paths {
 	return Paths{
-		Journal: "/var/lib/lanpanel.bootstrap-journal", StartupAuthority: "/etc/lanpanel/startup-authority.json", CommitPath: "/var/lib/lanpanel/bootstrap-commit.json", PersistentRoot: "/var/lib/lanpanel", InstallationRoot: "/var/lib/lanpanel/installation",
+		Journal: "/var/lib/lanpanel.bootstrap-journal", StartupAuthority: "/etc/lanpanel/startup-authority.json", CommitPath: "/var/lib/lanpanel/bootstrap-commit.json", PersistentRoot: "/var/lib/lanpanel", InstallationRoot: "/var/lib/lanpanel/installation", ACMEAccountKey: acmeaccount.ManagedKeyPath,
 		StateRoot: "/var/lib/lanpanel/state", SafetyRoot: "/var/lib/lanpanel/safety", OwnershipRoot: "/var/lib/lanpanel/ownership",
 		LockRoot: "/var/lib/lanpanel/locks", PackageRoot: "/var/lib/lanpanel/packages", RuntimeRoot: "/run/lanpanel",
 		SystemdRoot: "/etc/systemd/system", SysusersPath: "/etc/lanpanel-sysusers.conf", BinaryPath: "/usr/lib/lanpanel/lanpanel",
@@ -81,6 +85,10 @@ type Journal struct {
 	Authority              identity.ManagementAuthority `json:"management_authority"`
 	PreflightRequest       preflight.ExpansionRequest   `json:"preflight_request"`
 	PreflightDigest        string                       `json:"preflight_digest"`
+	ACMEAccountContact     string                       `json:"acme_account_contact"`
+	PackageTransactionID   string                       `json:"package_transaction_id"`
+	PackagePlanDigest      string                       `json:"package_plan_digest"`
+	PackageJournalDigest   string                       `json:"package_journal_digest,omitempty"`
 	Accounts               identity.AccountSet          `json:"accounts"`
 	Paths                  Paths                        `json:"paths"`
 	ArtifactDigests        map[string]string            `json:"artifact_digests"`
@@ -90,15 +98,17 @@ type Journal struct {
 }
 
 type Bundle struct {
-	SchemaVersion    string                       `json:"schema_version"`
-	AttemptID        string                       `json:"attempt_id"`
-	InstallationID   string                       `json:"installation_id"`
-	GenerationID     string                       `json:"generation_id"`
-	SafetyGeneration uint64                       `json:"safety_generation"`
-	Fingerprint      string                       `json:"fingerprint"`
-	Management       identity.ManagementAuthority `json:"management_authority"`
-	Release          release.InstallIdentity      `json:"release"`
-	PreflightDigest  string                       `json:"preflight_digest"`
+	SchemaVersion             string                       `json:"schema_version"`
+	AttemptID                 string                       `json:"attempt_id"`
+	InstallationID            string                       `json:"installation_id"`
+	GenerationID              string                       `json:"generation_id"`
+	SafetyGeneration          uint64                       `json:"safety_generation"`
+	Fingerprint               string                       `json:"fingerprint"`
+	Management                identity.ManagementAuthority `json:"management_authority"`
+	Release                   release.InstallIdentity      `json:"release"`
+	PreflightDigest           string                       `json:"preflight_digest"`
+	ACMEAccountContact        string                       `json:"acme_account_contact"`
+	ACMEAccountKeyFingerprint string                       `json:"acme_account_key_fingerprint"`
 }
 
 type Commit struct {
@@ -132,16 +142,23 @@ func FixedDiskRequirements(paths Paths) []preflight.DiskRequirement {
 
 type PreflightEvaluator func(context.Context, identity.ManagementAuthority, uint64) (preflight.ExpansionRequest, preflight.Result, error)
 
+type PackageTransaction func(context.Context, packages.Plan, preflight.Result) (packages.Journal, error)
+
 type Request struct {
-	ReleaseAuthority *release.InstallAuthority
-	Preflight        PreflightEvaluator
-	SourceBinaryPath string
-	LegoBytes        []byte
-	Random           io.Reader
-	Now              func() time.Time
-	Paths            Paths
-	Output           io.Writer
-	TTY              TTY
+	ReleaseAuthority   *release.InstallAuthority
+	Preflight          PreflightEvaluator
+	PackagePlan        packages.Plan
+	PackagePreflight   preflight.Result
+	PackageTransaction PackageTransaction
+	SourceBinary       []byte
+	ACMEAccountContact string
+	LegoBytes          []byte
+	TailscaleBytes     []byte
+	Random             io.Reader
+	Now                func() time.Time
+	Paths              Paths
+	Output             io.Writer
+	TTY                TTY
 }
 
 type TTY interface {
@@ -150,8 +167,12 @@ type TTY interface {
 }
 
 func validateJournal(value Journal) error {
-	if value.SchemaVersion != JournalSchemaVersion || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
+	if value.SchemaVersion != JournalSchemaVersion || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
 		return fmt.Errorf("bootstrap journal is incomplete or invalid")
+	}
+	beforePackages := value.Phase == PhasePrepared || value.Phase == PhaseNginxMasked
+	if !beforePackages && !release.ValidDigest(value.PackageJournalDigest) || beforePackages && value.PackageJournalDigest != "" {
+		return fmt.Errorf("bootstrap package transaction binding is invalid")
 	}
 	if (value.Phase == PhaseCommitted || value.Phase == PhaseActivated) && !release.ValidDigest(value.FinalCommitDigest) || value.Phase != PhaseCommitted && value.Phase != PhaseActivated && value.FinalCommitDigest != "" {
 		return fmt.Errorf("bootstrap final commit binding is invalid")
@@ -176,7 +197,7 @@ func validateJournal(value Journal) error {
 }
 
 func validateBundle(value Bundle) error {
-	if value.SchemaVersion != BundleSchemaVersion || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || len(value.Fingerprint) != 16 || identity.ValidateManagementAuthority(value.Management) != nil || release.ValidateInstallIdentity(value.Release) != nil || value.PreflightDigest == "" {
+	if value.SchemaVersion != BundleSchemaVersion || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || len(value.Fingerprint) != 16 || identity.ValidateManagementAuthority(value.Management) != nil || release.ValidateInstallIdentity(value.Release) != nil || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || !strings.HasPrefix(value.ACMEAccountKeyFingerprint, "sha256:") || !release.ValidDigest(strings.TrimPrefix(value.ACMEAccountKeyFingerprint, "sha256:")) {
 		return fmt.Errorf("installation bundle is invalid")
 	}
 	fingerprint, _ := identity.Fingerprint(value.InstallationID)
@@ -188,7 +209,7 @@ func validateBundle(value Bundle) error {
 
 func validPhase(value Phase) bool {
 	switch value {
-	case PhasePrepared, PhaseBundleCommitted, PhaseAccountsSubmitted, PhaseAccountsVerified, PhaseStoresInitialized, PhaseAssetsInstalled, PhaseCommitted, PhaseActivated:
+	case PhasePrepared, PhaseNginxMasked, PhasePackagesCommitted, PhaseBundleCommitted, PhaseAccountsSubmitted, PhaseAccountsVerified, PhaseStoresInitialized, PhaseAssetsInstalled, PhaseCommitted, PhaseActivated:
 		return true
 	}
 	return false
@@ -221,16 +242,10 @@ func decodeCanonical(data []byte, destination any) error {
 
 func digestBytes(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 
-var cleanRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
-
-func validRef(value string) bool {
-	return cleanRef.MatchString(value) && !strings.Contains(value, "..")
-}
-
 func authorityInUse(authority identity.ManagementAuthority) error {
 	listener, err := net.Listen("tcp4", net.JoinHostPort(authority.Address, fmt.Sprintf("%d", authority.Port)))
 	if err != nil {
-		return fmt.Errorf("Management authority conflicts with an existing listener")
+		return fmt.Errorf("management authority conflicts with an existing listener")
 	}
 	return listener.Close()
 }

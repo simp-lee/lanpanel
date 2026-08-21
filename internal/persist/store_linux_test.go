@@ -170,17 +170,17 @@ func TestVersionedNormalTransaction(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer manager.Close()
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
 		admission, err := manager.Acquire(context.Background(), locks.MutationAdmission)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer admission.Release()
+		defer func(ignore func() error) { _ = ignore() }(admission.Release)
 		store, err := Open(Config{RootPath: root, StagingPath: staging, StatePath: filepath.Join(root, "normal.json"), Owner: owner, Fault: fault, LockAuthority: manager.Authority()})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer store.Close()
+		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		validator := func(string, json.RawMessage) error { return nil }
 		for namespace, owner := range map[string]string{"plans": "plans.v1", "jobs": "jobs.v1", "intents": "operations.intents.v1", "children": "operations.children.v1", "journals": "operations.journals.v1"} {
 			if err := store.RegisterCanonicalNamespace(namespace, owner, validator, nil); err != nil {

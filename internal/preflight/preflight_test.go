@@ -1,11 +1,10 @@
 package preflight
 
 import (
+	"lanpanel/internal/plans"
 	"strings"
 	"testing"
 	"time"
-
-	"lanpanel/internal/plans"
 )
 
 func TestExpansionPreflightUsesExactScopeAndResponsibilities(t *testing.T) {
@@ -45,6 +44,7 @@ func TestBootstrapRequiresManagementAndClosedNginxListeners(t *testing.T) {
 	request.Domains = nil
 	request.BootstrapListeners = []ListenerRequirement{{Protocol: "tcp", Address: "127.23.45.67", Port: 52345, Purpose: "management"}}
 	observed := passingExpansionObservations(request, now)
+	observed.Packages.NginxVersion = ""
 	result, err := EvaluateExpansion(request, observed)
 	if err != nil || !result.Allowed {
 		t.Fatalf("bootstrap result=%#v error=%v", result, err)
@@ -221,17 +221,17 @@ func TestExpansionResultBindsExactTypedRequest(t *testing.T) {
 	}
 }
 
-func TestQualificationCandidateUsesManifestHostProfileCaseBinding(t *testing.T) {
+func TestQualificationTargetUsesInstallPlanHostAndRunBinding(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	request := expansionRequest(ExpansionHeadscale)
-	request.Profile.Authority = ProfileAuthority{Kind: QualificationCandidate, Digest: "sha256:" + strings.Repeat("a", 64), CandidateDigest: "sha256:" + strings.Repeat("b", 64), ManifestDigest: "sha256:" + strings.Repeat("c", 64), HostFingerprint: "host/fingerprint", CaseID: "headscale-install"}
+	request.Profile.Authority = ProfileAuthority{Kind: QualificationTarget, Digest: "sha256:" + strings.Repeat("a", 64), CandidateDigest: "sha256:" + strings.Repeat("b", 64), InstallManifestDigest: "sha256:" + strings.Repeat("c", 64), SideEffectPlanDigest: "sha256:" + strings.Repeat("d", 64), HostFingerprint: "host/fingerprint", RunID: "run-one"}
 	result, err := EvaluateExpansion(request, passingExpansionObservations(request, now))
 	if err != nil || !result.Allowed {
 		t.Fatalf("candidate result=%#v err=%v", result, err)
 	}
-	request.Profile.Authority.CaseID = ""
+	request.Profile.Authority.RunID = ""
 	if _, err := EvaluateExpansion(request, passingExpansionObservations(request, now)); err == nil {
-		t.Fatal("candidate without case binding was accepted")
+		t.Fatal("qualification target without run binding was accepted")
 	}
 }
 

@@ -12,8 +12,10 @@ import (
 	"time"
 )
 
-type verifier struct{ fp string }
-type normalProfile struct{}
+type (
+	verifier      struct{ fp string }
+	normalProfile struct{}
+)
 
 func (normalProfile) Current(context.Context) (Profile, error) { return ProfileNormal, nil }
 
@@ -37,6 +39,7 @@ func testServer(t *testing.T) *Server {
 	}
 	return server
 }
+
 func TestActionLeaseCancelsOnSessionInvalidation(t *testing.T) {
 	server := testServer(t)
 	principal := session.Principal{Selector: "selector", Generation: 1}
@@ -59,17 +62,23 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if response.Code != http.StatusOK {
 		t.Fatal(response.Code)
 	}
-	for _, id := range []string{"headscale-initialize", "domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
+	for _, id := range []string{"headscale-initialize", "headscale-control", "headscale-reissue", "resource-create", "resource-update-json", "process-control", "resource-delete", "headscale-user-create", "headscale-key-create", "headscale-key-revoke", "headscale-device-expire", "headscale-reads", "connector-binding", "connector-login", "connector-verify", "product-reads", "job-detail", "domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
 		if !strings.Contains(response.Body.String(), `id="`+id+`"`) {
 			t.Fatalf("management control %s missing", id)
 		}
+	}
+	if strings.Count(appJS, `JSON.stringify({plan_id:"",confirmation:"",certificate})`) != 2 {
+		t.Fatal("Headscale Plan requests are not canonical")
+	}
+	if strings.Contains(response.Body.String(), `name="account_key_path"`) || strings.Contains(appJS, "account_key_path") || strings.Contains(response.Body.String(), `name="account_email"`) || strings.Contains(appJS, "account_email") || strings.Count(response.Body.String(), "installation-managed ACME account key") != 2 {
+		t.Fatal("ACME account key is still caller-selected or its managed authority is not disclosed")
 	}
 	for _, field := range []string{"control_domain", "magicdns_namespace", "source_kind", "mirror_url", "offline_path", "proxy_url"} {
 		if !strings.Contains(response.Body.String(), `name="`+field+`"`) {
 			t.Fatalf("Headscale UI field %s missing", field)
 		}
 	}
-	for _, required := range []string{"trusted_mesh", "/api/actions/deploy", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence"} {
+	for _, required := range []string{"trusted_mesh", "/api/actions/headscale_initialize", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence"} {
 		if !strings.Contains(response.Body.String(), required) && !strings.Contains(appJS, required) {
 			t.Fatalf("Headscale initialization warning/action missing %q", required)
 		}
@@ -107,6 +116,7 @@ func TestLoginRequiresExactHostOriginAndBoundedBody(t *testing.T) {
 		t.Fatal("selector cookie not protected")
 	}
 }
+
 func TestHostOriginAndDuplicateCookieFailClosed(t *testing.T) {
 	server := testServer(t)
 	request := httptest.NewRequest(http.MethodGet, "http://example.invalid/", nil)

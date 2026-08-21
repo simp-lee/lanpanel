@@ -16,27 +16,29 @@ import (
 
 const Backend = "127.0.0.1:7890"
 
-type Paths struct{ ResourceRoot, StateRoot, Database, Report, AccessLog, Endpoint, ServiceUnit, ServiceEnablement, RelayUnit, RelayEnablement, SocketUnit, SocketEnablement, Sysusers, RetentionUnit, RetentionTimer, RetentionEnablement, RetentionLock string }
-type Candidate struct {
-	InstallationID                                                     string
-	ResourceID                                                         string
-	Generation                                                         uint64
-	Paths                                                              Paths
-	Service, Relay, Socket, Sysusers, RetentionService, RetentionTimer []byte
-	ServiceIdentity                                                    string
-	UID, GID, RelayUID, RelayGID, NginxGID                             uint32
-	WebSocketPath                                                      string
-	User, Group, RelayUser, RelayGroup                                 string
-	Accounts                                                           identity.ResourceAccountSet
-	RetainShared                                                       bool
-	RetainState                                                        bool
-	ReuseApplied                                                       bool
-	StateGeneration                                                    uint64
-	RetainedServiceGeneration                                          uint64
-	RetainedServiceIdentity                                            string
-	RetainedUnitIdentities                                             []string
-	UnitIdentities                                                     []string
-}
+type (
+	Paths     struct{ ResourceRoot, StateRoot, Database, Report, AccessLog, Endpoint, ServiceUnit, ServiceEnablement, RelayUnit, RelayEnablement, SocketUnit, SocketEnablement, Sysusers, RetentionUnit, RetentionTimer, RetentionEnablement, RetentionLock string }
+	Candidate struct {
+		InstallationID                                                     string
+		ResourceID                                                         string
+		Generation                                                         uint64
+		Paths                                                              Paths
+		Service, Relay, Socket, Sysusers, RetentionService, RetentionTimer []byte
+		ServiceIdentity                                                    string
+		UID, GID, RelayUID, RelayGID, NginxGID                             uint32
+		WebSocketPath                                                      string
+		User, Group, RelayUser, RelayGroup                                 string
+		Accounts                                                           identity.ResourceAccountSet
+		RetainShared                                                       bool
+		RetainState                                                        bool
+		ReuseApplied                                                       bool
+		StateGeneration                                                    uint64
+		RetainedServiceGeneration                                          uint64
+		RetainedServiceIdentity                                            string
+		RetainedUnitIdentities                                             []string
+		UnitIdentities                                                     []string
+	}
+)
 
 func DerivePaths(resourceID string, generation uint64) (Paths, error) {
 	if !validResourceID(resourceID) || generation == 0 {
@@ -66,6 +68,7 @@ func deriveAccountAuthority(installationID, resourceID string) (accountAuthority
 	sysusers := []byte("g " + group + " " + fmt.Sprint(gid) + " -\nu " + user + " " + fmt.Sprint(uid) + ":" + fmt.Sprint(gid) + " " + strconv.Quote(accounts.Application.Comment) + " /nonexistent /usr/sbin/nologin\ng " + relayGroup + " " + fmt.Sprint(relayGID) + " -\nu " + relayUser + " " + fmt.Sprint(relayUID) + ":" + fmt.Sprint(relayGID) + " " + strconv.Quote(accounts.Relay.Comment) + " /nonexistent /usr/sbin/nologin\n")
 	return accountAuthority{accounts: accounts, uid: uid, gid: gid, relayUID: relayUID, relayGID: relayGID, user: user, group: group, relayUser: relayUser, relayGroup: relayGroup, sysusers: sysusers}, nil
 }
+
 func ObserveCandidate(installationID, resourceID string, nginxGID uint32, applied domain.GoAccessBundleIdentity) (Candidate, error) {
 	if !applied.Enabled || applied.Generation == 0 || applied.StateGeneration == 0 || applied.ServiceIdentity == "" || len(applied.UnitIdentities) != 5 || applied.WebSocketPath == "" {
 		return Candidate{}, fmt.Errorf("applied GoAccess observation authority incomplete")
@@ -93,6 +96,7 @@ func deriveRuntimePaths(resourceID string, generation, stateGeneration uint64) (
 	paths.StateRoot, paths.Database, paths.Report = state.StateRoot, state.Database, state.Report
 	return paths, nil
 }
+
 func Render(installationID string, resource domain.AppResource, nginxGID uint32, generation uint64) (Candidate, error) {
 	publication := resource.Publication.DomainHTTPS
 	if publication == nil || !publication.GoAccess.Enabled || nginxGID == 0 || !validInstallationID(installationID) {
@@ -152,6 +156,7 @@ func Render(installationID string, resource domain.AppResource, nginxGID uint32,
 	unitIdentities := []string{digest(service), digest(relay), digest(socket), digest(retentionService), digest(retentionTimer)}
 	return Candidate{InstallationID: installationID, ResourceID: resource.ID, Generation: generation, RetainShared: retainShared, RetainState: retainState, StateGeneration: stateGeneration, RetainedServiceGeneration: retainedServiceGeneration, RetainedServiceIdentity: retainedServiceIdentity, RetainedUnitIdentities: retainedUnitIdentities, Paths: paths, Service: service, Relay: relay, Socket: socket, Sysusers: sysusers, RetentionService: retentionService, RetentionTimer: retentionTimer, ServiceIdentity: identity, UID: uid, GID: gid, RelayUID: relayUID, RelayGID: relayGID, NginxGID: nginxGID, WebSocketPath: publication.GoAccess.WebSocketPath, User: user, Group: group, RelayUser: relayUser, RelayGroup: relayGroup, Accounts: accounts, UnitIdentities: unitIdentities}, nil
 }
+
 func numeric(installationID, resourceID string) (uint32, uint32, uint32, uint32) {
 	sum := sha256.Sum256([]byte(installationID + "\x00" + resourceID))
 	raw := sum[:6]
@@ -162,6 +167,7 @@ func numeric(installationID, resourceID string) (uint32, uint32, uint32, uint32)
 	relay := value(60_000_000, 3)
 	return uid, uid, relay, relay
 }
+
 func validInstallationID(value string) bool {
 	if len(value) != 36 || !strings.HasPrefix(value, "ins_") {
 		return false
@@ -169,6 +175,7 @@ func validInstallationID(value string) bool {
 	_, err := hex.DecodeString(value[4:])
 	return err == nil
 }
+
 func validResourceID(value string) bool {
 	if len(value) != 36 || !strings.HasPrefix(value, "res_") {
 		return false
@@ -185,6 +192,7 @@ func managedServiceIdentity(values ...[]byte) string {
 	}
 	return digest(authority)
 }
+
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])

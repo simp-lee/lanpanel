@@ -13,12 +13,16 @@ import (
 	"slices"
 )
 
+func installedProfileAuthority(installed release.InstallIdentity) preflight.ProfileAuthority {
+	if installed.Kind == release.InstallQualification {
+		return preflight.ProfileAuthority{Kind: preflight.QualificationTarget, Digest: "sha256:" + installed.ProfileDigest, CandidateDigest: "sha256:" + installed.CandidateDigest, InstallManifestDigest: "sha256:" + installed.QualificationInstallManifestDigest, SideEffectPlanDigest: "sha256:" + installed.SideEffectPlanDigest, HostFingerprint: installed.HostFingerprint, RunID: installed.RunID}
+	}
+	return preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + installed.ProfileDigest, LiveQualified: true}
+}
+
 func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallIdentity, controlDomain string, generation uint64, additionalPaths ...preflight.ManagedPathRequirement) (preflight.ExpansionRequest, preflight.Result, error) {
 	profile := installed.Profile
-	authority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + installed.ProfileDigest, LiveQualified: true}
-	if installed.Kind == release.EnvelopeQualificationCandidate {
-		authority = preflight.ProfileAuthority{Kind: preflight.QualificationCandidate, Digest: "sha256:" + installed.ProfileDigest, CandidateDigest: "sha256:" + installed.CandidateDigest, ManifestDigest: "sha256:" + installed.QualificationManifest, HostFingerprint: installed.HostFingerprint, CaseID: installed.CaseID}
-	}
+	authority := installedProfileAuthority(installed)
 	confinement := profile.ManagedConfinement
 	host, err := activation.NewFixedHost()
 	if err != nil {

@@ -132,6 +132,58 @@ func TestCertificateResultMustMatchSameDeployAuthority(t *testing.T) {
 	}
 }
 
+func TestCommittedRenewalAdvancesCertificateBindingOnly(t *testing.T) {
+	rendered := testRendered(t)
+	request, result := testPreflight(t, rendered.Candidate)
+	store := testStore(t)
+	execution, err := Prepare(context.Background(), store, &fakeCandidateHost{}, StageRequest{InstallationID: "ins_00000000000000000000000000000001", JobID: "job_renew_binding", PlanID: "plan_renew_binding", IntentGeneration: 12, Rendered: rendered, Preflight: request, PreflightResult: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue, _ := execution.IssueRequest()
+	first := testCertificateIdentity(issue)
+	if err := execution.StageCertificate(context.Background(), issue, first); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationIntent := execution.Journal()
+	activationIntent.Phase = PhaseActivationIntent
+	activationIntent.ActivationDigest = bundle.Digest
+	if err := store.Replace(context.Background(), execution.Journal(), activationIntent); err != nil {
+		t.Fatal(err)
+	}
+	activated := activationIntent
+	activated.Phase = PhaseActivated
+	activated.RuntimeDigest = testDigest("runtime-one")
+	if err := store.Replace(context.Background(), activationIntent, activated); err != nil {
+		t.Fatal(err)
+	}
+	committed := activated
+	committed.Phase = PhaseCommitted
+	if err := store.Replace(context.Background(), activated, committed); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.Generation = 2
+	second.BindingIdentity = testDigest("new-provider-binding")
+	second.Fingerprint = testDigest("second-fingerprint")
+	second.CertificatePath = "/var/lib/lanpanel/certificates/headscale-2/certificate.pem"
+	second.PrivateKeyPath = "/var/lib/lanpanel/certificates/headscale-2/private-key.pem"
+	second.DirectoryIdentity = ""
+	raw, _ := json.Marshal(second)
+	second.DirectoryIdentity = testDigest(string(raw))
+	renewed, err := store.CommitRenewal(context.Background(), committed, second, testDigest("runtime-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Certificate.BindingIdentity != second.BindingIdentity || renewed.Candidate.CertificateBinding != committed.Candidate.CertificateBinding || renewed.CandidateDigest != committed.CandidateDigest || renewed.Phase != PhaseCommitted {
+		t.Fatal("renewal did not atomically advance exact certificate binding")
+	}
+}
+
 type fakeCandidateHost struct {
 	databaseCalls int
 	serviceCalls  int
@@ -145,10 +197,12 @@ func (host *fakeCandidateHost) InitializeDatabase(_ context.Context, rendered Re
 	host.databaseCalls++
 	return DatabaseEvidence{UUID: rendered.Candidate.DatabaseUUID, Generation: rendered.Candidate.DatabaseGeneration, MainDigest: testDigest("database-main"), InitializedDigest: testDigest("database")}, nil
 }
+
 func (host *fakeCandidateHost) StagePrivateService(_ context.Context, rendered Rendered, _ DatabaseEvidence) (ServiceEvidence, error) {
 	host.serviceCalls++
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: testDigest("private-probe"), PublicSTUNOpen: host.public}, nil
 }
+
 func (host *fakeCandidateHost) VerifyActiveCandidate(_ context.Context, rendered Rendered, _ DatabaseEvidence, expected ServiceEvidence) error {
 	host.serviceCalls++
 	actual := ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: testDigest("private-probe"), PublicSTUNOpen: host.public}
@@ -157,6 +211,7 @@ func (host *fakeCandidateHost) VerifyActiveCandidate(_ context.Context, rendered
 	}
 	return nil
 }
+
 func (host *fakeCandidateHost) StopPrivateService(context.Context, Candidate) error {
 	host.stopCalls++
 	return nil
@@ -170,16 +225,20 @@ func testRendered(t *testing.T) Rendered {
 	}
 	return value
 }
+
 func testHeadscale() domain.HeadscaleDomain {
 	return domain.HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.test", MagicDNSNamespace: "mesh.example.test", Policy: "trusted_mesh", Artifact: domain.HeadscaleArtifactIdentity{BaselineDigest: testDigest("baseline"), Version: "0.25.1", ArchiveDigest: testDigest("archive"), ExecutableDigest: testDigest("executable"), ConfigContract: ConfigContract, ConfigContractDigest: testDigest("contract")}, Database: domain.HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: FixedPaths().Database, IdentityBundleDigest: testDigest("bundle"), Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: testDigest("desired"), ManagedPaths: domain.HeadscaleManagedPaths()}
 }
+
 func testBinding() acme.Binding {
 	return acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/var/lib/lanpanel/credentials/acme-account.key", AccountKeyFingerprint: testDigest("account"), Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}, AccountEmail: "admin@example.test", TermsAccepted: true}
 }
+
 func testDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
+
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	root := t.TempDir()
@@ -194,6 +253,7 @@ func testStore(t *testing.T) *Store {
 	paths.JournalStaging = filepath.Join(root, ".filetxn")
 	return NewStore(paths, filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())})
 }
+
 func testPreflight(t *testing.T, candidate Candidate) (preflight.ExpansionRequest, preflight.Result) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -205,6 +265,7 @@ func testPreflight(t *testing.T, candidate Candidate) (preflight.ExpansionReques
 	}
 	return request, result
 }
+
 func testCertificateIdentity(request IssueRequest) certificates.Identity {
 	now := time.Now().UTC().Truncate(time.Second)
 	value := certificates.Identity{SchemaVersion: certificates.SchemaVersion, ID: request.CertificateID, Generation: 1, Domains: []string{request.Domain}, SANIdentity: testDigest("san"), Fingerprint: testDigest("fingerprint"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), BindingIdentity: request.BindingDigest, LastTrustedWall: now, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour), CertificatePath: "/var/lib/lanpanel/certificates/headscale/certificate.pem", PrivateKeyPath: "/var/lib/lanpanel/certificates/headscale/private-key.pem"}

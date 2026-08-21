@@ -25,7 +25,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	state, err := service.safety.Read()
 	if err != nil {
 		return err
@@ -103,19 +103,19 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		fresh, err := service.safety.ReadForRecovery(exposure)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		owned, ownerErr := service.ownership.Read(resource.ID)
 		if ownerErr != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return ownerErr
 		}
 		for _, item := range fresh.Resources {
@@ -129,16 +129,16 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 						ownershipNext.Resources[index].OwnershipDigest = owned.Checksum
 						proof := &safety.OwnershipConvergenceProof{ResourceID: resource.ID, IntentRef: item.Reactivating.PlanID, Generation: item.Reactivating.Generation, BeforeDigest: before, AfterDigest: owned.Checksum}
 						if _, err := service.safety.Commit(ctx, exposure, safety.RoleOwnershipActivation, fresh.Revision, ownershipNext, safety.TransitionProof{Ownership: proof}); err != nil {
-							operations.ReleaseExposure(mutation, exposure)
-							mutationSet.Close()
+							_ = operations.ReleaseExposure(mutation, exposure)
+							_ = mutationSet.Close()
 							return err
 						}
 					}
 				}
 				fresh, err = service.safety.ReadForRecovery(exposure)
 				if err != nil {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return err
 				}
 				break
@@ -155,8 +155,8 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			}
 			updated, currentGeneration, changed, transitionErr := interruptDomainSafety(next.Resources[index], *activationIntent)
 			if transitionErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return transitionErr
 			}
 			next.Resources[index] = updated
@@ -164,21 +164,21 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			safetyChanged = changed
 		}
 		if generation == 0 {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("reactivating publication safety resource missing")
 		}
 		if safetyChanged {
 			if _, err := service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{}); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 		}
 		host, err := activation.NewFixedHost()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		result, contractErr := host.ContractResource(ctx, resource.ID)
@@ -192,8 +192,8 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
 			fenceErr := service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
 			cancelFence()
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)
 		}
 		pointerErr := restoreInterruptedDomainPointer(ctx, *activationIntent)
@@ -219,6 +219,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	}
 	return reconcilePendingContractionGoAccess(ctx, service)
 }
+
 func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedService) error {
 	document, err := service.normal.Read()
 	if err != nil {
@@ -295,7 +296,7 @@ func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedServ
 		mutation, exposure, err := mutationSet.AcquireExposure(cleanupCtx, "resource/"+resource.ID, service.manager)
 		if err != nil {
 			cancelCleanup()
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		if needsBegin {
@@ -425,7 +426,7 @@ func reconcileRetiredGoAccess(ctx context.Context, service *FixedService) error 
 			}
 			mutation, exposure, acquireErr := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 			if acquireErr != nil {
-				mutationSet.Close()
+				_ = mutationSet.Close()
 				return acquireErr
 			}
 			interruptCtx, cancelInterrupt := context.WithTimeout(context.Background(), 15*time.Second)
@@ -499,22 +500,22 @@ func reconcileRetiredGoAccess(ctx context.Context, service *FixedService) error 
 		mutation, exposure, acquireErr := mutationSet.AcquireExposure(cleanupCtx, "resource/"+resource.ID, service.manager)
 		if acquireErr != nil {
 			cancelCleanup()
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return acquireErr
 		}
 		if reconciliation && needsBegin {
 			_, beginErr := admitter.BeginPlanless(cleanupCtx, mutation, exposure, operations.ConsumeRequest{JobID: jobID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
 			if beginErr != nil {
 				cancelCleanup()
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return beginErr
 			}
 			document, err = service.normal.Read()
 			if err != nil {
 				cancelCleanup()
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 		}
@@ -716,7 +717,7 @@ func convergeCommittedDomainPublication(ctx context.Context, service *FixedServi
 			}
 			mutation, exposure, acquireErr := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 			if acquireErr != nil {
-				mutationSet.Close()
+				_ = mutationSet.Close()
 				return acquireErr
 			}
 			interruptCtx, cancelInterrupt := context.WithTimeout(context.Background(), 15*time.Second)
@@ -777,12 +778,12 @@ func convergeCommittedDomainPublication(ctx context.Context, service *FixedServi
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
@@ -801,7 +802,6 @@ func convergeCommittedDomainPublication(ctx context.Context, service *FixedServi
 			item.StickyUnpublished = nil
 			item.Contraction = nil
 			item.CertificateExpiry = nil
-			item.EdgeOne.Expiry = nil
 			authority, authorityErr := activeCertificateAuthority(candidate.Bundle.DomainHTTPS.Certificate)
 			if authorityErr != nil {
 				return authorityErr
@@ -823,12 +823,12 @@ func contractCommittedDomainPublication(ctx context.Context, service *FixedServi
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
@@ -891,12 +891,12 @@ func resumeCommittedDomainContraction(ctx context.Context, service *FixedService
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err

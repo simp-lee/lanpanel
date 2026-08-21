@@ -12,12 +12,12 @@ import (
 )
 
 func TestCommittedBootstrapWireKeepsStructCanonicalOrderAndOriginalDigest(t *testing.T) {
-	bundle := installationBundleWire{SchemaVersion: "lanpanel.installation.bundle.v1", AttemptID: "bst_" + strings.Repeat("a", 64), InstallationID: "ins_00000000000000000000000000000001", GenerationID: "gen_00000000000000000000000000000001", SafetyGeneration: 1, Fingerprint: "0123456789abcdef", Management: identity.ManagementAuthority{Address: "127.1.2.3", Port: 50000}, PreflightDigest: "sha256:" + strings.Repeat("b", 64)}
+	bundle := installationBundleWire{SchemaVersion: "lanpanel.installation.bundle.v2", AttemptID: "bst_" + strings.Repeat("a", 64), InstallationID: "ins_00000000000000000000000000000001", GenerationID: "gen_00000000000000000000000000000001", SafetyGeneration: 1, Fingerprint: "0123456789abcdef", Management: identity.ManagementAuthority{Address: "127.1.2.3", Port: 50000}, PreflightDigest: "sha256:" + strings.Repeat("b", 64), ACMEAccountContact: "admin@example.test", ACMEAccountKeyFingerprint: "sha256:" + strings.Repeat("d", 64)}
 	bundleBytes, err := json.Marshal(bundle)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(bundleBytes), `{"schema_version":"lanpanel.installation.bundle.v1","attempt_id":`) {
+	if !strings.HasPrefix(string(bundleBytes), `{"schema_version":"lanpanel.installation.bundle.v2","attempt_id":`) {
 		t.Fatalf("wire field order changed: %s", bundleBytes)
 	}
 	var decoded installationBundleWire

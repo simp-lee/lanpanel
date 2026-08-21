@@ -20,6 +20,8 @@ type NormalAuthority struct {
 	Mutation        *operations.MutationLease
 	Exposure        *locks.Lease
 	JobID           string
+	PlanID          string
+	Operation       operations.Type
 	Revision        uint64
 	SafetyState     safety.State
 	Generations     map[string]uint64
@@ -102,7 +104,7 @@ func (authority *NormalAuthority) CommitUnpublished(ctx context.Context, invento
 }
 
 func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventory closure.Inventory) error {
-	if inventory.Digest != authority.InventoryDigest || authority.SafetyState.StopFence != nil {
+	if inventory.Digest != authority.InventoryDigest || authority.SafetyState.StopFence != nil || authority.Operation == "" {
 		return fmt.Errorf("normal stop-fence authority changed")
 	}
 	emergency, err := authority.Emergency.Authority()
@@ -129,10 +131,15 @@ func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventor
 	if scopeKind == "app" {
 		ownershipDigest = inventory.ResourceOwnership[resourceID]
 		if ownershipDigest == "" {
-			return fmt.Errorf("App stop fence ownership digest is unavailable")
+			return fmt.Errorf("app stop fence ownership digest is unavailable")
 		}
 	}
-	emergencyFence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: "contraction", ScopeKind: scopeKind, ResourceID: resourceID, Generation: emergency.StopFenceSequence + 1, GlobalGeneration: globalGeneration, ClosingGeneration: closingGeneration, OwnershipDigest: ownershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: observed.Unix(), AccessMayRemain: true}
+	emergencyFence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), ScopeKind: scopeKind, ResourceID: resourceID, Generation: emergency.StopFenceSequence + 1, GlobalGeneration: globalGeneration, ClosingGeneration: closingGeneration, OwnershipDigest: ownershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: observed.Unix(), OperationRef: func() string {
+		if authority.PlanID != "" {
+			return authority.PlanID
+		}
+		return "intent/" + authority.JobID
+	}(), AccessMayRemain: true}
 	emergencyNext := emergency
 	emergencyNext.Sequence++
 	emergencyNext.StopFenceSequence++
@@ -141,7 +148,7 @@ func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventor
 	if err := authority.Emergency.Commit(authority.Exposure, safety.RoleContraction, emergency.Sequence, emergencyNext); err != nil {
 		return err
 	}
-	normalFence := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: "contraction", Scope: safety.FenceScope{Kind: scopeKind, ResourceID: resourceID}, FenceGeneration: emergencyNext.StopFenceSequence, CreatedAt: observed, SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, Observation: safety.StopObservation{ObservedAt: observed}, AccessMayRemain: true, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: ownershipDigest}}
+	normalFence := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), Scope: safety.FenceScope{Kind: scopeKind, ResourceID: resourceID}, FenceGeneration: emergencyNext.StopFenceSequence, CreatedAt: observed, SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, Observation: safety.StopObservation{ObservedAt: observed}, AccessMayRemain: true, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: ownershipDigest, OperationRef: emergencyFence.OperationRef}}
 	next := authority.SafetyState
 	next.Revision++
 	next.AuthoritySequence = emergencyNext.Sequence

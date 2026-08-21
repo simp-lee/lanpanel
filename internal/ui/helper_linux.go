@@ -7,12 +7,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"lanpanel/internal/application"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/helperproto"
 	"net"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type HelperVerifier struct{}
@@ -22,27 +23,36 @@ func (HelperVerifier) Verify(ctx context.Context, token []byte) (string, error) 
 	clear(reply.Secret)
 	return reply.Digest, err
 }
+
 func (HelperVerifier) Source(ctx context.Context) (string, error) {
 	reply, err := helperExchange(ctx, helperproto.OperationAdminTokenSource, nil, nil, nil)
 	clear(reply.Secret)
 	return reply.Digest, err
 }
+
 func HelperApplicationRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ActionPayload) (application.HelperReply, error) {
 	return helperExchange(ctx, operation, &payload, nil, nil)
 }
+
 func HelperResourceRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ResourcePayload, target string) (application.HelperReply, error) {
 	return helperExchange(ctx, operation, nil, &payload, nil, target)
 }
+
+func HelperSecretResourceRequest(ctx context.Context, operation helperproto.Operation, payload helperproto.ResourcePayload, target string, secret []byte) (application.HelperReply, error) {
+	return helperExchange(ctx, operation, nil, &payload, secret, target)
+}
+
 func HelperAdminTokenReconcile(ctx context.Context) (application.HelperReply, error) {
 	return helperExchange(ctx, helperproto.OperationAdminTokenReconcile, nil, nil, nil)
 }
+
 func helperExchange(ctx context.Context, operation helperproto.Operation, action *helperproto.ActionPayload, resource *helperproto.ResourcePayload, secret []byte, explicitTarget ...string) (application.HelperReply, error) {
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "unix", helper.FixedSocketPath)
 	if err != nil {
 		return application.HelperReply{}, err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	finished := make(chan struct{})
 	defer close(finished)
 	go func() {
@@ -105,8 +115,11 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		if responseSecret != nil {
 			responseSecret.Destroy()
 		}
-		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected && response.ErrorCode == "foreign_database_evidence" {
-			return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
+		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected {
+			switch response.ErrorCode {
+			case "foreign_database_evidence", "headscale_not_configured", "connector_required", "os_profile_live_unqualified", "package_identity_drift":
+				return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
+			}
 		}
 		return application.HelperReply{}, fmt.Errorf("helper request rejected")
 	}
@@ -118,5 +131,5 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 			return application.HelperReply{}, err
 		}
 	}
-	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Resource: response.Resource, Secret: output}, nil
+	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Resource: response.Resource, Headscale: response.Headscale, Connector: response.Connector, Read: response.Read, Secret: output}, nil
 }

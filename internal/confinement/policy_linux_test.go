@@ -36,6 +36,7 @@ func TestManagedPolicyCoversDescendantsAndProtectedDestinations(t *testing.T) {
 		}
 	}
 }
+
 func digestForTest() string {
 	return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }

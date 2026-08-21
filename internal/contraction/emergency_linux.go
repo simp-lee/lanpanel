@@ -4,6 +4,9 @@ package contraction
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"lanpanel/internal/child"
@@ -16,6 +19,7 @@ import (
 	"lanpanel/internal/operations"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
+	"lanpanel/internal/plans"
 	"lanpanel/internal/safety"
 	"os"
 	"strconv"
@@ -140,6 +144,11 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		return fmt.Errorf("verified stopped emergency fence is unavailable: %w", err)
 	}
 	state := *service.safetyState
+	if state.StopFence != nil {
+		if err := service.validateStopFenceOrigin(*state.StopFence); err != nil {
+			return err
+		}
+	}
 	if !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
 		emergencyFence := authority.StopFence
 		authorities := []safety.MarkerGeneration{}
@@ -149,7 +158,7 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		if emergencyFence.ClosingGeneration != 0 {
 			authorities = append(authorities, safety.MarkerGeneration{Kind: "closing", Generation: emergencyFence.ClosingGeneration})
 		}
-		projected := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}, FenceGeneration: emergencyFence.Generation, CreatedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC(), SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: emergencyFence.OwnershipDigest}}
+		projected := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}, FenceGeneration: emergencyFence.Generation, CreatedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC(), SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: emergencyFence.OwnershipDigest, OperationRef: emergencyFence.OperationRef, SafetyIntentID: emergencyFence.SafetyIntentID, SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration}}
 		projectedState := state
 		projectedState.Revision++
 		projectedState.AuthoritySequence = authority.Sequence
@@ -221,6 +230,9 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	if state.StopFence == nil {
 		return fmt.Errorf("normal stop fence is unavailable for exact recovery")
 	}
+	if err := service.validateStopFenceOrigin(*state.StopFence); err != nil {
+		return err
+	}
 	clearProof := &safety.EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFence.Generation, StopFenceDigest: safety.EmergencyFenceDigest(*authority.StopFence), InventoryDigest: snapshot.Inventory.FullOwnershipDigest, OwnedGraphDigest: snapshot.Inventory.Digest, RuntimeClosureDigest: closureDigest, NginxTestPassed: true, RuntimeClosed: true}
 	withoutFence := authority
 	withoutFence.Sequence++
@@ -234,6 +246,15 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	normalWithoutFence.AuthoritySequence = withoutFence.Sequence
 	normalWithoutFence.StopFence = nil
 	stopProof := &safety.StopFenceConvergenceProof{Kind: state.StopFence.Kind, FenceGeneration: state.StopFence.FenceGeneration, FenceDigest: safety.StopFenceDigest(*state.StopFence), InventoryDigest: state.StopFence.InventoryDigest, OwnedGraphDigest: state.StopFence.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}
+	if state.StopFence.Contraction != nil {
+		stopProof.JournalRef = state.StopFence.Contraction.OperationRef
+		stopProof.SafetyIntentID = state.StopFence.Contraction.SafetyIntentID
+		stopProof.SafetyIntentGeneration = state.StopFence.Contraction.SafetyIntentGeneration
+	} else if state.StopFence.IngressActivation != nil {
+		stopProof.JournalRef = state.StopFence.IngressActivation.IntentRef
+	} else if state.StopFence.CertificateActivation != nil {
+		stopProof.JournalRef = state.StopFence.CertificateActivation.JournalRef
+	}
 	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleJournalConvergence, state.Revision, normalWithoutFence, safety.TransitionProof{StopFence: stopProof}); err != nil {
 		return err
 	}
@@ -323,11 +344,104 @@ func (service *EmergencyService) PersistClosing(_ context.Context, inventory clo
 	service.safetyState = &normalNext
 	return nil
 }
+
+func (service *EmergencyService) validateStopFenceOrigin(fence safety.StopFence) error {
+	if fence.IngressActivation != nil {
+		expected := operations.Publish
+		if fence.OriginOperation == "headscale_deploy" && fence.Scope.Kind == "headscale" {
+			expected = operations.HeadscaleDeploy
+		} else if fence.OriginOperation != "publish" || fence.Scope.Kind != "app" {
+			return fmt.Errorf("ingress activation fence operation is unsupported")
+		}
+		return service.validateIntentFenceOrigin(fence.IngressActivation.IntentRef, fence.Scope, "ingress activation", expected)
+	}
+	if fence.CertificateActivation != nil {
+		if service.normal == nil {
+			return fmt.Errorf("certificate activation journal authority is unavailable")
+		}
+		document, err := service.normal.Read()
+		if err != nil {
+			return err
+		}
+		journalKey := fence.CertificateActivation.JournalRef
+		if !strings.HasPrefix(journalKey, "journals/") {
+			journalKey = "journals/" + journalKey
+		}
+		raw, present := document.Entries[journalKey]
+		var journal operations.JournalRecord
+		pointerDigest := func(value string) string {
+			sum := sha256.Sum256([]byte(value))
+			return "sha256:" + hex.EncodeToString(sum[:])
+		}
+		if !present || json.Unmarshal(raw, &journal) != nil || journal.ID == "" || "journals/"+journal.ID != journalKey || journal.Certificate == nil || journal.Kind != operations.JournalCertificateActivation || journal.Phase != operations.JournalActive && journal.Phase != operations.JournalTerminal || journal.Certificate.PriorGeneration != 0 && pointerDigest(journal.Certificate.PriorPointer) != fence.CertificateActivation.PriorPointer || pointerDigest(journal.Certificate.CandidatePointer) != fence.CertificateActivation.CandidatePointer {
+			return fmt.Errorf("certificate activation fence journal reference is stale or invalid")
+		}
+		if fence.Scope.Kind == "app" && (journal.Target != "resource/"+fence.Scope.ResourceID || journal.Operation != operations.Publish && journal.Operation != operations.CertificateRenew) || fence.Scope.Kind == "headscale" && (!strings.HasPrefix(journal.Target, "headscale/") || journal.Operation != operations.CertificateRenew) {
+			return fmt.Errorf("certificate activation fence journal target changed")
+		}
+		return nil
+	}
+	if fence.Contraction == nil {
+		return fmt.Errorf("stop fence origin payload is missing")
+	}
+	origin := fence.Contraction
+	if origin.OperationRef != "" {
+		expected := operations.Type(fence.OriginOperation)
+		if expected != operations.CloseAll && expected != operations.Unpublish && expected != operations.CertificateExpiry {
+			return fmt.Errorf("contraction fence operation is unsupported")
+		}
+		return service.validateIntentFenceOrigin(origin.OperationRef, fence.Scope, "contraction", expected)
+	}
+	if origin.SafetyIntentID == "emergency_close_all" && origin.SafetyIntentGeneration == service.safetyState.GlobalClose.Generation {
+		return nil
+	}
+	if origin.SafetyIntentID == "headscale_certificate_expiry" && service.safetyState.Headscale.CertificateExpiry != nil && origin.SafetyIntentGeneration == service.safetyState.Headscale.CertificateExpiry.Generation {
+		return nil
+	}
+	return fmt.Errorf("contraction fence safety-intent reference is stale or invalid")
+}
+
+func (service *EmergencyService) validateIntentFenceOrigin(reference string, scope safety.FenceScope, kind string, expected ...operations.Type) error {
+	if service.normal == nil {
+		return fmt.Errorf("%s operation reference is unavailable", kind)
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	jobID, ok := strings.CutPrefix(reference, "intent/")
+	if !ok {
+		planID, planRef := strings.CutPrefix(reference, "plan_")
+		if !planRef || planID == "" {
+			return fmt.Errorf("%s fence operation reference is invalid", kind)
+		}
+		rawPlan, present := document.Entries["plans/"+reference]
+		var plan plans.Plan
+		if !present || json.Unmarshal(rawPlan, &plan) != nil || plan.ID != reference || plan.ConsumedByJob == "" {
+			return fmt.Errorf("%s fence Plan reference is stale or invalid", kind)
+		}
+		jobID = plan.ConsumedByJob
+	}
+	raw, present := document.Entries["intents/"+jobID]
+	var intent operations.Reservation
+	if !present || json.Unmarshal(raw, &intent) != nil || intent.JobID != jobID || intent.Phase == operations.PhaseReserved {
+		return fmt.Errorf("%s fence operation reference is stale or invalid", kind)
+	}
+	if len(expected) != 0 && intent.Operation != expected[0] {
+		return fmt.Errorf("%s fence operation changed", kind)
+	}
+	if scope.Kind == "app" && intent.Target != "resource/"+scope.ResourceID || scope.Kind == "headscale" && !strings.HasPrefix(intent.Target, "headscale/") {
+		return fmt.Errorf("%s fence operation target changed", kind)
+	}
+	return nil
+}
+
 func (service *EmergencyService) CommitUnpublished(context.Context, closure.Inventory) error {
 	// State-independent emergency contraction must not fabricate normal jobs or
 	// state. Exact recovery later projects the emergency generation.
 	return nil
 }
+
 func (service *EmergencyService) PersistStopFence(_ context.Context, inventory closure.Inventory) error {
 	current, err := service.emergency.Authority()
 	if err != nil {
@@ -339,7 +453,7 @@ func (service *EmergencyService) PersistStopFence(_ context.Context, inventory c
 	if current.GlobalClose.Phase == safety.GlobalCloseNone {
 		return fmt.Errorf("stop fence requires prior global close authority")
 	}
-	fence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: "emergency_close_all", ScopeKind: "installation", Generation: current.StopFenceSequence + 1, GlobalGeneration: current.GlobalClose.Generation, OwnershipDigest: inventory.FullOwnershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: time.Now().Unix(), AccessMayRemain: true}
+	fence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: "emergency_close_all", ScopeKind: "installation", Generation: current.StopFenceSequence + 1, GlobalGeneration: current.GlobalClose.Generation, OwnershipDigest: inventory.FullOwnershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: time.Now().Unix(), SafetyIntentID: "emergency_close_all", SafetyIntentGeneration: current.GlobalClose.Generation, AccessMayRemain: true}
 	next := current
 	next.Sequence++
 	next.StopFenceSequence++
@@ -348,6 +462,7 @@ func (service *EmergencyService) PersistStopFence(_ context.Context, inventory c
 	next.StopFence = &fence
 	return service.emergency.Commit(service.exposure, safety.RoleContraction, current.Sequence, next)
 }
+
 func (service *EmergencyService) stopGoAccess(ctx context.Context, inventory closure.Inventory) error {
 	host, err := goaccessruntime.NewFixedHost()
 	if err != nil {
@@ -394,8 +509,14 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 		return err
 	}
 	current, err := service.emergency.Authority()
-	if err != nil || current.GlobalClose.Phase == safety.GlobalCloseNone || current.StopFence != nil || service.normal == nil || service.safetyStore == nil || service.safetyState == nil || !inventory.Complete {
-		return nil
+	if err != nil {
+		return err
+	}
+	if current.StopFence != nil {
+		return fmt.Errorf("durable emergency stop fence still requires exact recovery")
+	}
+	if current.GlobalClose.Phase == safety.GlobalCloseNone || service.normal == nil || service.safetyStore == nil || service.safetyState == nil || !inventory.Complete {
+		return fmt.Errorf("emergency closure cannot finalize incomplete normal projection")
 	}
 	state := *service.safetyState
 	generations := make(map[string]uint64, len(state.Resources))
@@ -445,6 +566,7 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 	service.safetyState = &normalNext
 	return nil
 }
+
 func (service *EmergencyService) UpdateStopObservation(_ context.Context, snapshot closure.RuntimeSnapshot, verified bool) error {
 	current, err := service.emergency.Authority()
 	if err != nil || current.StopFence == nil {
@@ -461,6 +583,7 @@ func (service *EmergencyService) UpdateStopObservation(_ context.Context, snapsh
 	next.StopFence = &fence
 	return service.emergency.Commit(service.exposure, safety.RoleContraction, current.Sequence, next)
 }
+
 func (service *EmergencyService) Close() error {
 	if service == nil || service.closed {
 		return nil
@@ -487,6 +610,7 @@ func (service *EmergencyService) Close() error {
 	}
 	return errors.Join(errs...)
 }
+
 func inventoryListeners(inventory closure.Inventory) []string {
 	result := append([]string(nil), inventory.FallbackListeners...)
 	for _, identity := range inventory.Identities {

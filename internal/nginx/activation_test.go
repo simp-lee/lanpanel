@@ -49,12 +49,14 @@ func TestActivationSnapshotRestoresExactPriorGraph(t *testing.T) {
 		t.Fatal("prior entry bytes changed")
 	}
 }
+
 func testOwner() filetxn.Owner {
 	current, _ := user.Current()
 	uid, _ := strconv.ParseUint(current.Uid, 10, 32)
 	gid, _ := strconv.ParseUint(current.Gid, 10, 32)
 	return filetxn.Owner{UID: uint32(uid), GID: uint32(gid)}
 }
+
 func repeatHex(value byte) string {
 	data := make([]byte, 64)
 	for i := range data {

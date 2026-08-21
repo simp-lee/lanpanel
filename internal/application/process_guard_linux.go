@@ -12,7 +12,7 @@ func RunningProcessBundles() ([]domain.ProcessBundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return nil, err

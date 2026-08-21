@@ -81,6 +81,7 @@ func Prepare(request Request) (Prepared, error) {
 		return Prepared{}, fmt.Errorf("unsupported challenge method")
 	}
 }
+
 func PreparedHTTP(resourceID string, pending safety.ChallengePending) (Prepared, error) {
 	if pending.Method != "http-01" || resourceID == "" {
 		return Prepared{}, fmt.Errorf("HTTP challenge recovery identity invalid")
@@ -93,9 +94,11 @@ func PreparedHTTP(resourceID string, pending safety.ChallengePending) (Prepared,
 	entry.Digest = digest
 	return Prepared{Safety: pending, Entry: &entry}, nil
 }
+
 func Matches(pending safety.ChallengePending, prepared Prepared) bool {
 	return pending.Generation == prepared.Safety.Generation && pending.PlanID == prepared.Safety.PlanID && pending.Method == prepared.Safety.Method && pending.ConfigDigest == prepared.Safety.ConfigDigest && pending.SANIdentity == prepared.Safety.SANIdentity && pending.ACMEBinding == prepared.Safety.ACMEBinding && pending.CertificateIdentity == prepared.Safety.CertificateIdentity && pending.OwnerLock == prepared.Safety.OwnerLock && pending.Provider == prepared.Safety.Provider && pending.Zone == prepared.Safety.Zone && slices.Equal(pending.Owners, prepared.Safety.Owners) && pending.Host == prepared.Safety.Host && slices.Equal(pending.Hosts, prepared.Safety.Hosts) && pending.TokenPath == prepared.Safety.TokenPath && pending.Webroot == prepared.Safety.Webroot && pending.BootstrapIdentity == prepared.Safety.BootstrapIdentity && slices.Equal(pending.BaseMarkers, prepared.Safety.BaseMarkers)
 }
+
 func sum(data []byte) string {
 	value := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(value[:])

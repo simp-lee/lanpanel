@@ -36,7 +36,7 @@ func rotateAccessLog(path, lockPath string, expectedUID, expectedGID uint32) err
 	if err != nil {
 		return err
 	}
-	defer unix.Close(lock)
+	defer func() { _ = unix.Close(lock) }()
 	var lockStat unix.Stat_t
 	if err = unix.Fstat(lock, &lockStat); err != nil || lockStat.Mode&unix.S_IFMT != unix.S_IFREG || lockStat.Uid != expectedUID || lockStat.Gid != expectedGID || lockStat.Mode&0o7777 != 0o600 {
 		return fmt.Errorf("GoAccess retention lock identity unsafe")
@@ -44,7 +44,7 @@ func rotateAccessLog(path, lockPath string, expectedUID, expectedGID uint32) err
 	if err = unix.Flock(lock, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return fmt.Errorf("GoAccess retention already running: %w", err)
 	}
-	defer unix.Flock(lock, unix.LOCK_UN)
+	defer func() { _ = unix.Flock(lock, unix.LOCK_UN) }()
 
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -61,7 +61,7 @@ func rotateAccessLog(path, lockPath string, expectedUID, expectedGID uint32) err
 	if err != nil {
 		return err
 	}
-	defer source.Close()
+	defer func(ignore func() error) { _ = ignore() }(source.Close)
 	opened, err := source.Stat()
 	if err != nil {
 		return err
@@ -137,6 +137,6 @@ func rotateAccessLog(path, lockPath string, expectedUID, expectedGID uint32) err
 	if err != nil {
 		return err
 	}
-	defer parent.Close()
+	defer func(ignore func() error) { _ = ignore() }(parent.Close)
 	return parent.Sync()
 }

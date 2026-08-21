@@ -21,13 +21,12 @@ const (
 	fixedLockRoot           = "/var/lib/lanpanel/locks"
 )
 
-func managementProfile() string { return managementProfileWithRecovery(nil) }
 func managementProfileWithRecovery(recoveryErr error) string {
 	manager, err := locks.Open(locks.Config{RootPath: fixedLockRoot, Owner: 0, Group: 0, Mode: 0o700})
 	if err != nil {
 		return "unavailable"
 	}
-	defer manager.Close()
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
 	if validateIndependentAuthority(manager) != nil {
 		return "emergency"
 	}
@@ -36,7 +35,7 @@ func managementProfileWithRecovery(recoveryErr error) string {
 	if err != nil {
 		return "emergency"
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	if err := operations.Register(store); err != nil {
 		return "emergency"
 	}
@@ -45,13 +44,14 @@ func managementProfileWithRecovery(recoveryErr error) string {
 	}
 	return "normal"
 }
+
 func validateIndependentAuthority(manager *locks.Manager) error {
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	ownershipStore, err := ownership.Open(ownership.Config{RootPath: "/var/lib/lanpanel/ownership", StagingPath: "/var/lib/lanpanel/ownership/.filetxn", RecordsPath: "/var/lib/lanpanel/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
 		return err
 	}
-	defer ownershipStore.Close()
+	defer func(ignore func() error) { _ = ignore() }(ownershipStore.Close)
 	if _, complete, err := ownershipStore.InventoryAuthority(); err != nil || !complete {
 		return fmt.Errorf("ownership authority unavailable")
 	}
@@ -59,15 +59,16 @@ func validateIndependentAuthority(manager *locks.Manager) error {
 	if err != nil {
 		return err
 	}
-	defer emergency.Close()
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
 	store, err := safety.OpenStore(safety.StoreConfig{RootPath: "/var/lib/lanpanel/safety", StagingPath: "/var/lib/lanpanel/safety/.filetxn", StatePath: "/var/lib/lanpanel/safety/state.json", Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: ownershipStore})
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
 	_, err = store.Read()
 	return err
 }
+
 func profileDigest(profile string) string {
 	digest := sha256.Sum256([]byte("lanpanel.management.profile/" + profile))
 	return "sha256:" + hex.EncodeToString(digest[:])

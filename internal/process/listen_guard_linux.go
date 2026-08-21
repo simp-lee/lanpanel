@@ -210,7 +210,7 @@ func ensureListenGuard(resourceID string, uid uint32, policy confinement.UnitPol
 	if err != nil {
 		return err
 	}
-	defer unix.Close(mapFD)
+	defer func() { _ = unix.Close(mapFD) }()
 	if err := ensureListenGuardLink(linkPath, mapFD, layout); err != nil {
 		return err
 	}
@@ -235,7 +235,7 @@ func InitializeListenGuards(running []domain.ProcessBundle) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(mapFD)
+	defer func() { _ = unix.Close(mapFD) }()
 	if err := ensureListenGuardLink(linkPath, mapFD, layout); err != nil {
 		return err
 	}
@@ -268,7 +268,7 @@ func releaseListenGuardUID(uid uint32) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(mapFD)
+	defer func() { _ = unix.Close(mapFD) }()
 	if err := verifyListenGuardMap(mapFD); err != nil {
 		return err
 	}
@@ -278,6 +278,7 @@ func releaseListenGuardUID(uid uint32) error {
 func listenGuardPaths(version string) (string, string) {
 	return filepath.Join("/sys/fs/bpf/lanpanel", "listen-map-"+version[:24]), filepath.Join("/sys/fs/bpf/lanpanel", "listen-link-"+version[:24])
 }
+
 func rejectStaleListenGuardPins(mapPath, linkPath string) error {
 	entries, err := os.ReadDir("/sys/fs/bpf/lanpanel")
 	if err != nil {
@@ -286,15 +287,16 @@ func rejectStaleListenGuardPins(mapPath, linkPath string) error {
 	for _, entry := range entries {
 		name := entry.Name()
 		if strings.HasPrefix(name, "listen-") && name != filepath.Base(mapPath) && name != filepath.Base(linkPath) {
-			return fmt.Errorf("stale managed listen guard pin requires exact reinstall")
+			return fmt.Errorf("stale managed listen guard pin requires diagnostics, export, and clean-host rebuild")
 		}
 	}
 	return nil
 }
+
 func openOrCreateListenGuardMap(path string) (int, error) {
 	if fd, err := getPinnedBPF(path); err == nil {
 		if err := verifyListenGuardMap(fd); err != nil {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 			return -1, err
 		}
 		return fd, nil
@@ -308,15 +310,16 @@ func openOrCreateListenGuardMap(path string) (int, error) {
 		return -1, fmt.Errorf("create managed listen UID map: %w", errno)
 	}
 	if err := pinBPF(path, int(fd)); err != nil {
-		unix.Close(int(fd))
+		_ = unix.Close(int(fd))
 		return -1, err
 	}
 	if err := verifyListenGuardMap(int(fd)); err != nil {
-		unix.Close(int(fd))
+		_ = unix.Close(int(fd))
 		return -1, err
 	}
 	return int(fd), nil
 }
+
 func verifyListenGuardMap(fd int) error {
 	var info bpfMapInfo
 	attribute := bpfObjectInfo{BpfFD: uint32(fd), InfoLength: uint32(unsafe.Sizeof(info)), Info: uint64(uintptr(unsafe.Pointer(&info)))}
@@ -329,6 +332,7 @@ func verifyListenGuardMap(fd int) error {
 	}
 	return nil
 }
+
 func ensureListenGuardLink(path string, mapFD int, layout kernelBTFLayout) error {
 	if fd, err := getPinnedBPF(path); err == nil {
 		verifyErr := verifyListenGuardLink(fd, mapFD, layout)
@@ -346,13 +350,13 @@ func ensureListenGuardLink(path string, mapFD int, layout kernelBTFLayout) error
 	if errno != 0 {
 		return fmt.Errorf("load managed listen BPF LSM: %w: %s", errno, strings.TrimRight(string(log), "\x00"))
 	}
-	defer unix.Close(int(programFD))
+	defer func() { _ = unix.Close(int(programFD)) }()
 	linkAttribute := bpfLinkCreate{ProgramFD: uint32(programFD), AttachType: bpfAttachLSMMAC}
 	linkFD, _, errno := unix.Syscall(unix.SYS_BPF, bpfCommandLinkCreate, uintptr(unsafe.Pointer(&linkAttribute)), unsafe.Sizeof(linkAttribute))
 	if errno != 0 {
 		return fmt.Errorf("attach managed listen BPF LSM: %w", errno)
 	}
-	defer unix.Close(int(linkFD))
+	defer func() { _ = unix.Close(int(linkFD)) }()
 	if err := pinBPF(path, int(linkFD)); err != nil {
 		return err
 	}
@@ -362,6 +366,7 @@ func ensureListenGuardLink(path string, mapFD int, layout kernelBTFLayout) error
 	}
 	return unix.Close(fd)
 }
+
 func verifyListenGuardLink(linkFD, mapFD int, layout kernelBTFLayout) error {
 	var link bpfLinkInfo
 	attribute := bpfObjectInfo{BpfFD: uint32(linkFD), InfoLength: uint32(unsafe.Sizeof(link)), Info: uint64(uintptr(unsafe.Pointer(&link)))}
@@ -376,7 +381,7 @@ func verifyListenGuardLink(linkFD, mapFD int, layout kernelBTFLayout) error {
 	if errno != 0 {
 		return fmt.Errorf("open managed listen BPF program: %w", errno)
 	}
-	defer unix.Close(int(programFD))
+	defer func() { _ = unix.Close(int(programFD)) }()
 	var program bpfProgramInfo
 	mapIDs := make([]uint32, 1)
 	program.MapCount = 1
@@ -441,6 +446,7 @@ func ensureBPFDirectory() error {
 	}
 	return nil
 }
+
 func pinBPF(path string, fd int) error {
 	bytes := append([]byte(path), 0)
 	attribute := bpfObjectPath{Pathname: uint64(uintptr(unsafe.Pointer(&bytes[0]))), BpfFD: uint32(fd)}
@@ -450,6 +456,7 @@ func pinBPF(path string, fd int) error {
 	}
 	return nil
 }
+
 func getPinnedBPF(path string) (int, error) {
 	bytes := append([]byte(path), 0)
 	attribute := bpfObjectPath{Pathname: uint64(uintptr(unsafe.Pointer(&bytes[0])))}
@@ -462,10 +469,28 @@ func getPinnedBPF(path string) (int, error) {
 
 func listenGuardInstructions(mapFD int, layout kernelBTFLayout) []bpfInstruction {
 	return []bpfInstruction{
-		{Code: 0x61, Registers: 7 | (1 << 4), Offset: layout.ListenReturnOffset}, {Code: 0x15, Registers: 7, Offset: 2}, {Code: 0xbc, Registers: 0 | (7 << 4)}, {Code: 0x95},
-		{Code: 0x79, Registers: 6 | (1 << 4)}, {Code: 0x85, Immediate: bpfHelperCurrentUIDGID}, {Code: 0xbc, Registers: 0}, {Code: 0x63, Registers: 10, Offset: -4},
-		{Code: 0x18, Registers: 1 | (bpfPseudoMapFD << 4), Immediate: int32(mapFD)}, {}, {Code: 0xbf, Registers: 2 | (10 << 4)}, {Code: 0x07, Registers: 2, Immediate: -4}, {Code: 0x85, Immediate: bpfHelperMapLookup}, {Code: 0x15, Registers: 0, Offset: 5},
-		{Code: 0x79, Registers: 2 | (6 << 4), Offset: layout.SocketSK}, {Code: 0x69, Registers: 2 | (2 << 4), Offset: layout.SockFamily}, {Code: 0x15, Registers: 2, Offset: 3, Immediate: unix.AF_INET}, {Code: 0x15, Registers: 2, Offset: 2, Immediate: unix.AF_INET6}, {Code: 0xb7, Registers: 0}, {Code: 0x95}, {Code: 0xb7, Registers: 0, Immediate: -int32(unix.EACCES)}, {Code: 0x95},
+		{Code: 0x61, Registers: 7 | (1 << 4), Offset: layout.ListenReturnOffset},
+		{Code: 0x15, Registers: 7, Offset: 2},
+		{Code: 0xbc, Registers: 0 | (7 << 4)},
+		{Code: 0x95},
+		{Code: 0x79, Registers: 6 | (1 << 4)},
+		{Code: 0x85, Immediate: bpfHelperCurrentUIDGID},
+		{Code: 0xbc, Registers: 0},
+		{Code: 0x63, Registers: 10, Offset: -4},
+		{Code: 0x18, Registers: 1 | (bpfPseudoMapFD << 4), Immediate: int32(mapFD)},
+		{},
+		{Code: 0xbf, Registers: 2 | (10 << 4)},
+		{Code: 0x07, Registers: 2, Immediate: -4},
+		{Code: 0x85, Immediate: bpfHelperMapLookup},
+		{Code: 0x15, Registers: 0, Offset: 5},
+		{Code: 0x79, Registers: 2 | (6 << 4), Offset: layout.SocketSK},
+		{Code: 0x69, Registers: 2 | (2 << 4), Offset: layout.SockFamily},
+		{Code: 0x15, Registers: 2, Offset: 3, Immediate: unix.AF_INET},
+		{Code: 0x15, Registers: 2, Offset: 2, Immediate: unix.AF_INET6},
+		{Code: 0xb7, Registers: 0},
+		{Code: 0x95},
+		{Code: 0xb7, Registers: 0, Immediate: -int32(unix.EACCES)},
+		{Code: 0x95},
 	}
 }
 

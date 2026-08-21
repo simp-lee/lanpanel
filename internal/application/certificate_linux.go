@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/challenge"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
 	"lanpanel/internal/contraction"
+	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/identity"
@@ -65,6 +67,11 @@ type CertificateExecution struct {
 	StageGID         uint32
 	LegoDigest       string
 	RemoteStarted    bool
+	Headscale        bool
+	HeadscaleID      string
+	HeadscalePrior   *domain.CertificateBundleIdentity
+	ClosureUncertain bool
+	RecoveryPending  bool
 }
 
 func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget string, payload ConfirmationPayload) (*CertificateExecution, error) {
@@ -121,18 +128,25 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	domains := append([]string{publication.CanonicalDomain}, publication.Aliases...)
 	sort.Strings(domains)
 	request := publication.Certificate
+	accountContact, accountKeyFingerprint, contactErr := readManagedACMEAccountAuthority()
+	if contactErr != nil {
+		return fail(contactErr)
+	}
 	var binding acme.Binding
 	if request.ChallengeMethod == "http-01" {
-		binding, err = acme.LoadHTTPBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted)
+		binding, err = acme.LoadHTTPBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted)
 	} else {
 		provider, parseErr := acme.ParseDNSProvider(request.DNSProvider)
 		if parseErr != nil {
 			return fail(parseErr)
 		}
-		binding, err = acme.LoadDNSBinding(request.DirectoryURL, request.AccountKeyPath, request.AccountEmail, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
+		binding, err = acme.LoadDNSBinding(request.DirectoryURL, acmeaccount.ManagedKeyPath, accountContact, request.TermsAccepted, provider, request.ProviderProfilePath, request.AuthoritativeZone)
 	}
 	if err != nil {
 		return fail(err)
+	}
+	if binding.AccountKeyFingerprint != accountKeyFingerprint {
+		return fail(fmt.Errorf("managed ACME account key changed after installation verification"))
 	}
 	bindingDigest, err := acme.BindingDigest(binding)
 	evidenceMatched := false
@@ -209,7 +223,7 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	}
 	mutation, exposure, err = mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	if err != nil {
-		mutationSet.Close()
+		_ = mutationSet.Close()
 		return fail(err)
 	}
 	fresh, err := service.normal.Read()
@@ -263,7 +277,7 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 		return fail(err)
 	}
 	if err := admitter.ReserveChild(ctx, admission, intent.IntentGeneration+2, childRecord); err != nil {
-		admission.Release()
+		_ = admission.Release()
 		return fail(err)
 	}
 	if err := admission.Release(); err != nil {
@@ -300,9 +314,14 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	cleanup = nil
 	return &CertificateExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.Publish, Revision: intent.IntentGeneration + 3, Resource: resource, Binding: binding, Challenge: prepared, InstallationID: installation.InstallationID, Plan: plan, Deadline: plan.ExpiresAt, BundleGeneration: 1, StageUID: stageUID, StageGID: stageGID, Child: childRecord, LegoDigest: legoDigest}, nil
 }
+
 func bindingFromCertificateAuthority(authority *domain.CertificateAuthorityIdentity) (acme.Binding, error) {
 	if authority == nil || !authority.TermsAccepted {
 		return acme.Binding{}, fmt.Errorf("applied certificate authority missing")
+	}
+	accountContact, accountKeyFingerprint, err := readManagedACMEAccountAuthority()
+	if err != nil || authority.AccountEmail != accountContact || authority.AccountKeyPath != acmeaccount.ManagedKeyPath || authority.AccountKeyFingerprint != accountKeyFingerprint {
+		return acme.Binding{}, fmt.Errorf("applied certificate ACME account authority changed")
 	}
 	if authority.Method == string(acme.ChallengeHTTP01) {
 		binding, err := acme.LoadHTTPBinding(authority.DirectoryURL, authority.AccountKeyPath, authority.AccountEmail, authority.TermsAccepted)
@@ -321,6 +340,7 @@ func bindingFromCertificateAuthority(authority *domain.CertificateAuthorityIdent
 	}
 	return binding, nil
 }
+
 func BeginCertificateRenew(ctx context.Context, resourceID string) (*CertificateExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -525,12 +545,13 @@ func BeginCertificateRenew(ctx context.Context, resourceID string) (*Certificate
 	priorCopy := prior
 	return &CertificateExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.CertificateRenew, Revision: intent.IntentGeneration + 3, Resource: resource, Binding: binding, Challenge: prepared, InstallationID: installation.InstallationID, Deadline: operationDeadline, BundleGeneration: prior.Generation + 1, PriorCertificate: &priorCopy, StageUID: stageUID, StageGID: stageGID, Child: childRecord, LegoDigest: legoDigest}, nil
 }
+
 func ContractExpiredCertificate(ctx context.Context, resourceID string, now time.Time) error {
 	service, err := OpenFixed()
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -589,7 +610,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 	if err != nil {
 		return err
 	}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.CertificateExpiry, Target: "resource/" + resourceID, ActorIdentity: "timer/certificate-expiry", Source: operations.AdmissionTimer, SafetyBinding: operations.SafetyBinding{ResourceID: resourceID, ExpiryKind: "certificate_expiry", ExpiryGeneration: expiryGeneration, Deadline: effectiveDeadline, CandidateBundle: certificate.BindingIdentity}, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.CertificateExpiry, Target: "resource/" + resourceID, ActorIdentity: "timer/certificate-expiry", Source: operations.AdmissionTimer, SafetyBinding: operations.SafetyBinding{ResourceID: resourceID, ExpiryGeneration: expiryGeneration, Deadline: effectiveDeadline, CandidateBundle: certificate.BindingIdentity}, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return errors.Join(err, releaseErr)
@@ -598,12 +619,12 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resourceID, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	freshState, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
@@ -674,7 +695,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 	if generationErr != nil {
 		inventory = closure.BuildFallbackInventory(closure.Inputs{Installation: installation, Safety: &committedState, Ownership: owned, Graph: graph, ResourceIDs: []string{resourceID}}, generationErr)
 	}
-	authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, SafetyState: committedState, Generations: generations}
+	authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.CertificateExpiry, Revision: intent.IntentGeneration, SafetyState: committedState, Generations: generations}
 	runtime, err := contraction.FixedHost(inventory)
 	if err != nil {
 		runtime, err = contraction.FixedFallbackHost(inventory)
@@ -707,6 +728,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 	}
 	return runErr
 }
+
 func cleanupCertificateSetup(ctx context.Context, service *FixedService, admitter *operations.Admitter, jobID, resourceID string, prepared challenge.Prepared, childRecords []operations.ChildRecord) error {
 	intent, err := admitter.OperationIntent(jobID)
 	if err != nil {
@@ -767,12 +789,12 @@ func cleanupCertificateSetup(ctx context.Context, service *FixedService, admitte
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resourceID, service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	for _, record := range childRecords {
 		if record.ID == "" {
 			continue
@@ -837,6 +859,7 @@ func cleanupCertificateSetup(ctx context.Context, service *FixedService, admitte
 	_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, jobID, "no_effect", nil, []jobs.Postcondition{{Kind: "certificate_not_activated", Status: jobs.PostconditionVerified, Identity: resourceID}}, "certificate_setup_failed")
 	return err
 }
+
 func (execution *CertificateExecution) Reenter(ctx context.Context) (operations.Reservation, error) {
 	document, err := execution.Service.normal.Read()
 	if err != nil {
@@ -851,6 +874,7 @@ func (execution *CertificateExecution) Reenter(ctx context.Context) (operations.
 	execution.Revision = document.Revision + 1
 	return intent, nil
 }
+
 func (execution *CertificateExecution) RunRemote(ctx context.Context, uid, gid uint32) (acme.IssueResult, error) {
 	if uid != execution.StageUID || gid != execution.StageGID || uid == 0 || gid == 0 {
 		return acme.IssueResult{}, fmt.Errorf("certificate stage identity changed")
@@ -899,12 +923,14 @@ func (execution *CertificateExecution) RunRemote(ctx context.Context, uid, gid u
 	if execution.DNSPreflight != nil {
 		runErr = errors.Join(runErr, acme.VerifyDNS01Cleanup(ctx, acme.NetDNSObserver{}, *execution.DNSPreflight))
 	}
+	runErr = errors.Join(runErr, verifyManagedACMEBinding(execution.Binding))
 	if execution.DNSLocks != nil {
 		runErr = errors.Join(runErr, execution.DNSLocks.Close())
 		execution.DNSLocks = nil
 	}
 	return result, runErr
 }
+
 func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, result acme.IssueResult, runErr error) error {
 	if child.CgroupClosureUnproved(runErr) {
 		return runErr
@@ -915,7 +941,7 @@ func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, res
 	if _, err := execution.Reenter(ctx); err != nil {
 		return err
 	}
-	if _, err := acme.BuildEnvironment(execution.Binding); err != nil {
+	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
 		return fmt.Errorf("ACME binding changed after remote wait: %w", err)
 	}
 	bindingDigest, err := acme.BindingDigest(execution.Binding)
@@ -926,11 +952,21 @@ func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, res
 	if err != nil {
 		return err
 	}
-	_, current, err := loadCertificateResource(document.Entries, execution.Resource.ID)
-	if err != nil {
-		return err
+	var current domain.AppResource
+	if execution.Headscale {
+		installation, loadErr := loadHeadscaleInstallation(document)
+		if loadErr != nil || installation.Headscale.Certificate == nil || execution.HeadscalePrior == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, *execution.HeadscalePrior) {
+			return fmt.Errorf("headscale renewal authority changed during remote wait: %w", loadErr)
+		}
+	} else {
+		_, current, err = loadCertificateResource(document.Entries, execution.Resource.ID)
+		if err != nil {
+			return err
+		}
 	}
-	if execution.Operation == operations.Publish {
+	if execution.Headscale {
+		// Exact committed Headscale authority was checked above.
+	} else if execution.Operation == operations.Publish {
 		if current.Publication.DomainHTTPS == nil {
 			return fmt.Errorf("certificate publication config disappeared")
 		}
@@ -958,6 +994,7 @@ func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, res
 	execution.Revision++
 	return nil
 }
+
 func (execution *CertificateExecution) Abort(ctx context.Context, cause error) error {
 	if execution == nil {
 		return cause
@@ -985,10 +1022,8 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 	if err != nil {
 		return errors.Join(cause, err)
 	}
-	if execution.Challenge.Entry != nil {
-		if _, err := host.RemoveChallenge(ctx, execution.Challenge); err != nil {
-			return errors.Join(cause, err)
-		}
+	if err := execution.removeActiveChallenge(ctx, host); err != nil {
+		return errors.Join(cause, err)
 	}
 	if execution.StageUID != 0 {
 		if err := errors.Join(acme.RemoveStage(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID), acme.RemoveWebroot(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID)); err != nil {
@@ -1054,10 +1089,17 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 	next := state
 	changed := false
 	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
-	for index := range next.Resources {
-		if next.Resources[index].ResourceID == execution.Resource.ID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
-			next.Resources[index].ChallengePending = nil
+	if execution.Headscale {
+		if next.Headscale.ChallengePending != nil && challenge.Matches(*next.Headscale.ChallengePending, execution.Challenge) {
+			next.Headscale.ChallengePending = nil
 			changed = true
+		}
+	} else {
+		for index := range next.Resources {
+			if next.Resources[index].ResourceID == execution.Resource.ID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
+				next.Resources[index].ChallengePending = nil
+				changed = true
+			}
 		}
 	}
 	if changed {
@@ -1069,6 +1111,18 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 	document, err = execution.Service.normal.Read()
 	if err != nil {
 		return errors.Join(cause, err)
+	}
+	if execution.Headscale {
+		installation, loadErr := loadHeadscaleInstallation(document)
+		if loadErr == nil && installation.Headscale.DeployIntent != nil && installation.Headscale.DeployIntent.JobID == execution.JobID {
+			if contractErr := execution.Admitter.ContractHeadscaleReissueActivation(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID); contractErr != nil {
+				return errors.Join(cause, contractErr)
+			}
+			document, err = execution.Service.normal.Read()
+			if err != nil {
+				return errors.Join(cause, err)
+			}
+		}
 	}
 	branch := "source_unknown"
 	status := jobs.PostconditionUnobserved
@@ -1087,9 +1141,50 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 		kind = "certificate_prior_restored"
 		errorCode = "activation_contracted"
 	}
-	_, err = execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID, branch, nil, []jobs.Postcondition{{Kind: kind, Status: status, Identity: execution.Resource.ID}}, errorCode)
+	_, err = execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID, branch, nil, []jobs.Postcondition{{Kind: kind, Status: status, Identity: certificateExecutionTarget(execution)}}, errorCode)
 	return errors.Join(cause, err)
 }
+
+func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context, host activation.Host) error {
+	if execution == nil || execution.Challenge.Entry == nil {
+		return nil
+	}
+	if execution.Headscale {
+		state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
+		if stateErr != nil {
+			return stateErr
+		}
+		if state.Headscale.CertificateExpiry != nil {
+			if state.Headscale.ChallengePending == nil {
+				return nil
+			}
+			_, err := host.RemoveChallenge(ctx, execution.Challenge)
+			return err
+		}
+		bundle, err := execution.headscaleActivationBundle()
+		if err != nil {
+			return err
+		}
+		controlHost, err := control.NewActivationHost()
+		if err != nil {
+			return err
+		}
+		return controlHost.RemoveCertificateChallenge(ctx, bundle, execution.Challenge)
+	}
+	_, err := host.RemoveChallenge(ctx, execution.Challenge)
+	return err
+}
+
+func certificateExecutionTarget(execution *CertificateExecution) string {
+	if execution != nil && execution.Headscale {
+		return "headscale"
+	}
+	if execution == nil {
+		return ""
+	}
+	return execution.Resource.ID
+}
+
 func (execution *CertificateExecution) LoadIssued(now time.Time) (certificates.IssuedMaterial, error) {
 	certificatePath := filepath.Join("/var/lib/lanpanel/certificates/chroot", execution.Challenge.Safety.CertificateIdentity, "work", "certificates", execution.Challenge.Safety.Hosts[0]+".crt")
 	keyPath := filepath.Join("/var/lib/lanpanel/certificates/chroot", execution.Challenge.Safety.CertificateIdentity, "work", "certificates", execution.Challenge.Safety.Hosts[0]+".key")
@@ -1112,7 +1207,11 @@ func (execution *CertificateExecution) LoadIssued(now time.Time) (certificates.I
 	}
 	return certificates.ValidateIssued(chain, keyPEM, execution.Challenge.Safety.Hosts, now, execution.Binding.DirectoryURL)
 }
+
 func (execution *CertificateExecution) PreparePublicationCertificate(ctx context.Context, identity certificates.Identity) (domain.CertificateBundleIdentity, error) {
+	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
+		return domain.CertificateBundleIdentity{}, err
+	}
 	if execution.Operation != operations.Publish {
 		return domain.CertificateBundleIdentity{}, fmt.Errorf("publication certificate operation mismatched")
 	}
@@ -1154,7 +1253,11 @@ func (execution *CertificateExecution) PreparePublicationCertificate(ctx context
 	execution.Revision++
 	return certificate, nil
 }
-func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Context, bundle domain.PublicationBundle, aclUntil time.Time) (domain.ActivationIntent, error) {
+
+func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Context, bundle domain.PublicationBundle) (domain.ActivationIntent, error) {
+	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
+		return domain.ActivationIntent{}, err
+	}
 	if execution.Operation != operations.Publish || execution.Mutation == nil || execution.Exposure == nil {
 		return domain.ActivationIntent{}, fmt.Errorf("certificate publication handoff authority missing")
 	}
@@ -1164,13 +1267,6 @@ func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Conte
 	certificateUntil, err := time.Parse(time.RFC3339, bundle.DomainHTTPS.Certificate.NotAfter)
 	if err != nil || !certificateUntil.After(time.Now().UTC()) || !certificateUntil.Before(execution.Deadline.Add(366*24*time.Hour)) {
 		return domain.ActivationIntent{}, fmt.Errorf("certificate publication deadline invalid")
-	}
-	if bundle.DomainHTTPS.EdgeOne.Enabled {
-		if aclUntil.IsZero() || !aclUntil.After(time.Now().UTC()) {
-			return domain.ActivationIntent{}, fmt.Errorf("certificate publication ACL deadline invalid")
-		}
-	} else {
-		aclUntil = certificateUntil
 	}
 	bundleDigest, err := publication.BundleDigest(bundle)
 	if err != nil {
@@ -1207,7 +1303,7 @@ func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Conte
 		}
 		pending := resource.ChallengePending
 		resource.ChallengePending = nil
-		resource.Reactivating = &safety.Reactivating{Generation: pending.Generation, PriorGeneration: pending.Generation - 1, PlanID: pending.PlanID, CandidateDigest: bundle.ConfigDigest, CandidateBundle: bundleDigest, CertificateUntil: certificateUntil, ACLUntil: aclUntil, BaseMarkers: append([]safety.MarkerSnapshot(nil), pending.BaseMarkers...)}
+		resource.Reactivating = &safety.Reactivating{Generation: pending.Generation, PriorGeneration: pending.Generation - 1, PlanID: pending.PlanID, CandidateDigest: bundle.ConfigDigest, CandidateBundle: bundleDigest, CertificateUntil: certificateUntil, BaseMarkers: append([]safety.MarkerSnapshot(nil), pending.BaseMarkers...)}
 		matched = true
 	}
 	if !matched {
@@ -1219,12 +1315,12 @@ func (execution *CertificateExecution) BeginPublicationHandoff(ctx context.Conte
 	return intent, nil
 }
 
-func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Context, candidate publication.Candidate, aclUntil time.Time) (*PublicationExecution, error) {
+func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Context, candidate publication.Candidate) (*PublicationExecution, error) {
 	activationDeadline := time.Now().UTC().Add(time.Minute)
 	if candidate.ResourceID != execution.Resource.ID || candidate.Generation != execution.Challenge.Safety.Generation {
 		return nil, fmt.Errorf("domain publication candidate identity changed")
 	}
-	if _, err := execution.BeginPublicationHandoff(ctx, candidate.Bundle, aclUntil); err != nil {
+	if _, err := execution.BeginPublicationHandoff(ctx, candidate.Bundle); err != nil {
 		return nil, err
 	}
 	owned, err := execution.Service.ownership.Read(execution.Resource.ID)
@@ -1286,6 +1382,9 @@ func publicationExecutionFromCertificate(execution *CertificateExecution, candid
 }
 
 func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, identity certificates.Identity) (jobs.Record, error) {
+	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
+		return jobs.Record{}, err
+	}
 	activationCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	ctx = activationCtx
@@ -1299,10 +1398,8 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	if execution.Challenge.Entry != nil {
-		if _, err := host.RemoveChallenge(ctx, execution.Challenge); err != nil {
-			return jobs.Record{}, err
-		}
+	if err := execution.removeActiveChallenge(ctx, host); err != nil {
+		return jobs.Record{}, err
 	}
 	if execution.Binding.Method == acme.ChallengeHTTP01 {
 		if err := acme.VerifyWebrootEmpty(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID); err != nil {
@@ -1319,6 +1416,12 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		return jobs.Record{}, err
 	}
 	candidate := domain.CertificateBundleIdentity{PointerIdentity: pointerIdentity, BindingIdentity: identity.BindingIdentity, Generation: identity.Generation, Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, Authority: &authority}
+	if execution.Headscale {
+		candidate, err = headscaleCertificateBundle(identity, execution.Binding)
+		if err != nil {
+			return jobs.Record{}, err
+		}
+	}
 	priorPath, err := certificates.BundlePath(identity.ID, prior.Generation)
 	if err != nil {
 		return jobs.Record{}, err
@@ -1327,11 +1430,19 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: "resource/" + execution.Resource.ID, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: []string{execution.Resource.ID}, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
+	target := "resource/" + execution.Resource.ID
+	resourceIDs := []string{execution.Resource.ID}
+	if execution.Headscale {
+		target, resourceIDs = "headscale/"+execution.HeadscaleID, nil
+	}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: target, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: resourceIDs, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
 		return jobs.Record{}, err
 	}
 	execution.Revision++
+	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
+		return jobs.Record{}, err
+	}
 	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, ExpectedPriorGeneration: prior.Generation}
 	activationResult, err := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint)
 	if err != nil {
@@ -1341,22 +1452,38 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		}
 		return jobs.Record{}, err
 	}
-	if err := execution.Admitter.CommitCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID, prior, candidate); err != nil {
+	var commitErr error
+	if execution.Headscale {
+		journal.RuntimeDigest = headscaleFailureDigest(activationResult.Runtime.Generation + "\x00" + identity.Fingerprint)
+		journal.Phase = operations.JournalTerminal
+		if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
+			return jobs.Record{}, err
+		}
+		execution.Revision++
+		commitErr = execution.Admitter.CommitHeadscaleCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, prior, candidate)
+	} else {
+		commitErr = execution.Admitter.CommitCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID, prior, candidate)
+	}
+	if commitErr != nil {
 		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, activationResult.Pointer.CandidateTarget, execution.Challenge.Safety.Hosts[0], prior.Fingerprint)
 		if restoreErr != nil {
-			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, errors.Join(err, restoreErr))
+			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, errors.Join(commitErr, restoreErr))
 		}
-		return jobs.Record{}, &activation.Failure{Cause: err, PriorRestored: true}
+		return jobs.Record{}, &activation.Failure{Cause: commitErr, PriorRestored: true}
 	}
 	execution.Revision++
-	if err := execution.Service.CommitRenewedCertificateAuthority(ctx, execution.Exposure, execution.Resource.ID, candidate); err != nil {
-		return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, err)
+	if !execution.Headscale {
+		if err := execution.Service.CommitRenewedCertificateAuthority(ctx, execution.Exposure, execution.Resource.ID, candidate); err != nil {
+			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, err)
+		}
 	}
-	journal.Phase = operations.JournalTerminal
-	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
-		return jobs.Record{}, err
+	if !execution.Headscale {
+		journal.Phase = operations.JournalTerminal
+		if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
+			return jobs.Record{}, err
+		}
+		execution.Revision++
 	}
-	execution.Revision++
 	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
 	if err != nil {
 		return jobs.Record{}, err
@@ -1365,8 +1492,17 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	next.Revision++
 	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 	matched := false
+	if execution.Headscale {
+		pending := next.Headscale.ChallengePending
+		if pending == nil || !challenge.Matches(*pending, execution.Challenge) {
+			return jobs.Record{}, fmt.Errorf("headscale renewal challenge authority changed")
+		}
+		next.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: candidate.Generation, Fingerprint: candidate.Fingerprint, Binding: candidate.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
+		next.Headscale.ChallengePending = nil
+		matched = true
+	}
 	for index := range next.Resources {
-		if next.Resources[index].ResourceID == execution.Resource.ID {
+		if !execution.Headscale && next.Resources[index].ResourceID == execution.Resource.ID {
 			pending := next.Resources[index].ChallengePending
 			if pending == nil || !challenge.Matches(*pending, execution.Challenge) {
 				return jobs.Record{}, fmt.Errorf("renewal challenge authority changed")
@@ -1378,13 +1514,47 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if !matched {
 		return jobs.Record{}, fmt.Errorf("renewal safety resource missing")
 	}
-	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+	role := safety.RoleChallenge
+	if execution.Headscale {
+		role = safety.RoleCertificateActivation
+	}
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, role, state.Revision, next, safety.TransitionProof{}); err != nil {
 		return jobs.Record{}, err
+	}
+	if execution.Headscale {
+		store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		priorJournal, readErr := store.Read()
+		if readErr != nil {
+			return jobs.Record{}, readErr
+		}
+		runtimeDigest := headscaleFailureDigest(activationResult.Runtime.Generation + "\x00" + identity.Fingerprint)
+		if _, commitJournalErr := store.CommitRenewal(ctx, priorJournal, identity, runtimeDigest); commitJournalErr != nil {
+			return jobs.Record{}, commitJournalErr
+		}
 	}
 	return execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", []string{identity.CertificatePath, identity.PrivateKeyPath, pointerIdentity}, []jobs.Postcondition{{Kind: "certificate_renewed_and_served", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}}, "")
 }
+
 func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Context, host activation.Host, pointerResult certificates.PointerResult, candidate domain.CertificateBundleIdentity, cause error) error {
 	now := time.Now().UTC()
+	if execution.Headscale {
+		if execution.PriorCertificate == nil {
+			return errors.Join(cause, fmt.Errorf("headscale prior certificate missing"))
+		}
+		if err := execution.Service.MarkHeadscaleCertificateActivationUncertain(ctx, execution.Exposure, execution.PriorCertificate.BindingIdentity, now); err != nil {
+			return errors.Join(cause, err)
+		}
+		priorDigest := sha256.Sum256([]byte(pointerResult.PriorTarget))
+		candidateDigest := sha256.Sum256([]byte(pointerResult.CandidateTarget))
+		observation := safety.StopObservation{ObservedAt: now}
+		if err := execution.Service.WriteHeadscaleCertificateActivationFence(ctx, execution.Exposure, "certificate-"+execution.JobID, "sha256:"+hex.EncodeToString(priorDigest[:]), "sha256:"+hex.EncodeToString(candidateDigest[:]), observation, true); err != nil {
+			return errors.Join(cause, err)
+		}
+		snapshot, stopErr := host.StopAndVerify(ctx)
+		observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
+		updateErr := execution.Service.UpdateCertificateActivationFence(ctx, execution.Exposure, observed, stopErr != nil)
+		return errors.Join(cause, stopErr, updateErr)
+	}
 	if err := execution.Service.MarkCertificateActivationUncertain(ctx, execution.Exposure, execution.Resource.ID, candidate.BindingIdentity, now); err != nil {
 		return errors.Join(cause, err)
 	}
@@ -1399,21 +1569,60 @@ func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Co
 	updateErr := execution.Service.UpdateCertificateActivationFence(ctx, execution.Exposure, observed, stopErr != nil)
 	return errors.Join(cause, stopErr, updateErr)
 }
+
 func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) error {
 	host, err := activation.NewFixedHost()
 	if err != nil {
 		return err
 	}
 	if execution.Binding.Method == acme.ChallengeHTTP01 {
-		if _, err := host.ActivateChallenge(ctx, execution.Challenge); err != nil {
+		if execution.Headscale {
+			state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
+			if stateErr != nil {
+				return stateErr
+			}
+			if state.Headscale.CertificateExpiry != nil {
+				if _, err := host.ActivateChallenge(ctx, execution.Challenge); err != nil {
+					return err
+				}
+			} else {
+				bundle, bundleErr := execution.headscaleActivationBundle()
+				if bundleErr != nil {
+					return bundleErr
+				}
+				controlHost, hostErr := control.NewActivationHost()
+				if hostErr != nil {
+					return hostErr
+				}
+				state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
+				if stateErr != nil {
+					return stateErr
+				}
+				document, readErr := execution.Service.normal.Read()
+				if readErr != nil {
+					return readErr
+				}
+				installation, loadErr := loadHeadscaleInstallation(document)
+				if loadErr != nil {
+					return loadErr
+				}
+				ownershipAuthority, ownershipErr := fixedOwnershipAuthority(execution.Service.ownership)
+				if ownershipErr != nil {
+					return ownershipErr
+				}
+				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, state, installation, ownershipAuthority); err != nil {
+					return err
+				}
+			}
+		} else if _, err := host.ActivateChallenge(ctx, execution.Challenge); err != nil {
 			return err
 		}
 	} else {
-		if _, err := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID); err != nil {
-			return err
+		_, remoteErr := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+		execution.Mutation, execution.Exposure = nil, nil
+		if remoteErr != nil {
+			return remoteErr
 		}
-		execution.Mutation = nil
-		execution.Exposure = nil
 		execution.Revision++
 		ownerLocks, err := acme.AcquireOwnerLocks(ctx, fixedRoot+"/locks", execution.Binding.Provider, execution.Binding.Zone, execution.Challenge.Owners, execution.Challenge.Safety.OwnerLock)
 		if err != nil {
@@ -1421,21 +1630,22 @@ func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) er
 		}
 		preflight, err := acme.PreflightDNS01(ctx, acme.NetDNSObserver{}, execution.Binding.Zone, execution.Challenge.Owners)
 		if err != nil {
-			ownerLocks.Close()
+			_ = ownerLocks.Close()
 			return err
 		}
 		execution.DNSLocks = ownerLocks
 		execution.DNSPreflight = &preflight
 		return nil
 	}
-	if _, err := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID); err != nil {
-		return err
+	_, remoteErr := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+	execution.Mutation, execution.Exposure = nil, nil
+	if remoteErr != nil {
+		return remoteErr
 	}
-	execution.Mutation = nil
-	execution.Exposure = nil
 	execution.Revision++
 	return nil
 }
+
 func (execution *CertificateExecution) Close() error {
 	if execution == nil {
 		return nil
@@ -1459,36 +1669,46 @@ type certificateSafetyOnly struct {
 	store     *safety.Store
 }
 
+func (service *certificateSafetyOnly) fenceHeadscaleExpiry(ctx context.Context, lease *locks.Lease, graph string) error {
+	return commitHeadscaleCertificateContractionFence(ctx, lease, service.emergency, service.store, graph, safety.StopObservation{ObservedAt: time.Now().UTC()}, true)
+}
+
+func (service *certificateSafetyOnly) updateHeadscaleExpiryFence(ctx context.Context, lease *locks.Lease, observed safety.StopObservation, access bool) error {
+	return updateHeadscaleCertificateContractionFence(ctx, lease, service.emergency, service.store, observed, access)
+}
+
 func openCertificateSafetyOnly() (*certificateSafetyOnly, error) {
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	manager, err := locks.Open(locks.Config{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700})
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*certificateSafetyOnly, error) { manager.Close(); return nil, err }
+	fail := func(err error) (*certificateSafetyOnly, error) { _ = manager.Close(); return nil, err }
 	ownershipStore, err := ownership.Open(ownership.Config{RootPath: fixedRoot + "/ownership", StagingPath: fixedRoot + "/ownership/.filetxn", RecordsPath: fixedRoot + "/ownership/records", Owner: owner, Policy: ownership.FixedPolicy(), LockAuthority: manager.Authority()})
 	if err != nil {
 		return fail(err)
 	}
 	emergency, err := safety.OpenEmergency(fixedRoot+"/safety/emergency", owner, safety.EmergencyOptions{LockAuthority: manager.Authority()})
 	if err != nil {
-		ownershipStore.Close()
+		_ = ownershipStore.Close()
 		return fail(err)
 	}
 	store, err := safety.OpenStore(safety.StoreConfig{RootPath: fixedRoot + "/safety", StagingPath: fixedRoot + "/safety/.filetxn", StatePath: fixedRoot + "/safety/state.json", Owner: owner, Emergency: emergency, LockAuthority: manager.Authority(), Ownership: ownershipStore})
 	if err != nil {
-		emergency.Close()
-		ownershipStore.Close()
+		_ = emergency.Close()
+		_ = ownershipStore.Close()
 		return fail(err)
 	}
 	return &certificateSafetyOnly{manager: manager, ownership: ownershipStore, emergency: emergency, store: store}, nil
 }
+
 func (service *certificateSafetyOnly) Close() error {
 	if service == nil {
 		return nil
 	}
 	return errors.Join(service.store.Close(), service.emergency.Close(), service.ownership.Close(), service.manager.Close())
 }
+
 func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) error {
 	service, err := openCertificateSafetyOnly()
 	if err != nil {
@@ -1496,17 +1716,32 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	}
 	state, err := service.store.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
 	due := false
+	appDue := false
 	next := state
 	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	if active := next.Headscale.ActiveCertificate; next.Headscale.CertificateExpiry != nil {
+		due = true
+	} else if active != nil {
+		deadline := active.NotAfter
+		if now.Before(active.LastTrustedWall) {
+			deadline = now
+		}
+		if !deadline.After(now) {
+			next.Headscale.GenerationSequence++
+			next.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: next.Headscale.GenerationSequence, Deadline: deadline, Binding: active.Binding}
+			due = true
+		}
+	}
 	for index := range next.Resources {
 		resource := &next.Resources[index]
 		active := resource.ActiveCertificate
 		if resource.CertificateExpiry != nil {
 			due = true
+			appDue = true
 			continue
 		}
 		if active == nil {
@@ -1520,6 +1755,7 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 			resource.GenerationSequence++
 			resource.CertificateExpiry = &safety.DeadlineMarker{Generation: resource.GenerationSequence, Deadline: deadline, Binding: active.Binding}
 			due = true
+			appDue = true
 		}
 	}
 	if !due {
@@ -1527,23 +1763,88 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	}
 	exposure, err := service.manager.Acquire(ctx, locks.Exposure)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return err
 	}
-	if !reflect.DeepEqual(state.Resources, next.Resources) {
+	if !reflect.DeepEqual(state.Resources, next.Resources) || !reflect.DeepEqual(state.Headscale, next.Headscale) {
 		next.Revision++
 		_, err = service.store.Commit(ctx, exposure, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	}
+	if err != nil {
+		return err
+	}
+	if next.Headscale.CertificateExpiry != nil {
+		controlStore := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		journal, journalErr := controlStore.Read()
+		var closureErr error
+		if journalErr == nil && journal.Certificate != nil {
+			if journal.Phase != control.PhaseExpired {
+				if journal.Phase != control.PhaseCommitted {
+					closureErr = fmt.Errorf("headscale independent expiry journal phase invalid")
+				} else {
+					bundle, bundleErr := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
+					if bundleErr == nil {
+						controlHost, hostErr := control.NewActivationHost()
+						if hostErr == nil {
+							closureErr = controlHost.CloseControl(ctx, bundle)
+							if closureErr == nil {
+								expired := journal
+								expired.Phase = control.PhaseExpired
+								closureErr = controlStore.Replace(ctx, journal, expired)
+							} else {
+								if fenceErr := service.fenceHeadscaleExpiry(context.WithoutCancel(ctx), exposure, bundle.Digest); fenceErr != nil {
+									return errors.Join(closureErr, fenceErr)
+								}
+								observed, fallbackErr := controlHost.FallbackStop(context.WithoutCancel(ctx), bundle)
+								updateErr := service.updateHeadscaleExpiryFence(context.WithoutCancel(ctx), exposure, observed, fallbackErr != nil)
+								closureErr = errors.Join(closureErr, fallbackErr, updateErr)
+							}
+						} else {
+							closureErr = hostErr
+						}
+					} else {
+						closureErr = bundleErr
+					}
+				}
+			}
+		} else {
+			closureErr = journalErr
+		}
+		if closureErr != nil {
+			state, readErr := service.store.ReadForRecovery(exposure)
+			if readErr != nil {
+				return errors.Join(closureErr, readErr)
+			}
+			if state.StopFence == nil {
+				graph := state.Headscale.ControlEntryDigest
+				if fenceErr := service.fenceHeadscaleExpiry(context.WithoutCancel(ctx), exposure, graph); fenceErr != nil {
+					return errors.Join(closureErr, fenceErr)
+				}
+				host, hostErr := activation.NewFixedHost()
+				if hostErr != nil {
+					return errors.Join(closureErr, hostErr)
+				}
+				snapshot, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+				observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
+				updateErr := service.updateHeadscaleExpiryFence(context.WithoutCancel(ctx), exposure, observed, stopErr != nil)
+				return errors.Join(closureErr, stopErr, updateErr)
+			}
+			return closureErr
+		}
+	}
 	releaseErr := exposure.Release()
 	closeErr := service.Close()
-	if err != nil || releaseErr != nil || closeErr != nil {
-		return errors.Join(err, releaseErr, closeErr)
+	if releaseErr != nil || closeErr != nil {
+		return errors.Join(releaseErr, closeErr)
+	}
+	if !appDue {
+		return nil
 	}
 	emergency, err := contraction.OpenEmergency(ctx)
 	if err != nil {
 		return err
 	}
-	defer emergency.Close()
+	defer func(ignore func() error) { _ = ignore() }(emergency.Close)
 	snapshot, err := emergency.Snapshot()
 	if err != nil {
 		return err
@@ -1554,6 +1855,7 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	}
 	return runErr
 }
+
 func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, now time.Time) error {
 	if service == nil || now.IsZero() {
 		return fmt.Errorf("certificate wall observation invalid")
@@ -1562,12 +1864,12 @@ func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	defer mutationSet.Close()
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "installation", service.manager)
 	if err != nil {
 		return err
 	}
-	defer operations.ReleaseExposure(mutation, exposure)
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
@@ -1583,6 +1885,12 @@ func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, 
 		copy := *active
 		copy.LastTrustedWall = now.UTC()
 		next.Resources[index].ActiveCertificate = &copy
+		changed = true
+	}
+	if active := next.Headscale.ActiveCertificate; active != nil && now.After(active.LastTrustedWall) && active.NotAfter.After(now) {
+		copy := *active
+		copy.LastTrustedWall = now.UTC()
+		next.Headscale.ActiveCertificate = &copy
 		changed = true
 	}
 	if !changed {
@@ -1602,34 +1910,42 @@ func ReconcileCertificateExpiries(ctx context.Context, now time.Time) error {
 		return ContractIndependentCertificateExpiries(ctx, now)
 	}
 	if err := service.ObserveCertificateTrustedWall(ctx, now); err != nil {
-		service.Close()
+		_ = service.Close()
 		return fallback(err)
 	}
 	state, err := service.safety.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return fallback(err)
 	}
 	document, err := service.normal.Read()
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return fallback(err)
 	}
 	raw, present := document.Entries["installations/current"]
 	if !present {
-		service.Close()
+		_ = service.Close()
 		return fallback(fmt.Errorf("installation authority missing"))
 	}
 	installation, err := domain.DecodeInstallation(raw)
 	if err != nil {
-		service.Close()
+		_ = service.Close()
 		return fallback(err)
+	}
+	headscaleDecision, decisionErr := renewal.EvaluateHeadscale(now, 30*24*time.Hour, installation.Headscale, state)
+	if decisionErr != nil {
+		_ = service.Close()
+		return fallback(decisionErr)
+	}
+	if state.Headscale.CertificateExpiry != nil {
+		headscaleDecision = renewal.DecisionContract
 	}
 	ids := []string{}
 	for _, resource := range installation.Resources {
 		decision, decisionErr := renewal.Evaluate(renewal.Input{Now: now, RenewBefore: 30 * 24 * time.Hour, Publication: resource.PublicationRecord, Safety: state, ResourceID: resource.ID})
 		if decisionErr != nil {
-			service.Close()
+			_ = service.Close()
 			return fallback(decisionErr)
 		}
 		for _, safetyResource := range state.Resources {
@@ -1644,6 +1960,11 @@ func ReconcileCertificateExpiries(ctx context.Context, now time.Time) error {
 	if err := service.Close(); err != nil {
 		return fallback(err)
 	}
+	if headscaleDecision == renewal.DecisionContract {
+		if err := ContractExpiredHeadscaleCertificate(ctx, now); err != nil {
+			return fallback(err)
+		}
+	}
 	for _, id := range ids {
 		if err := ContractExpiredCertificate(ctx, id, now); err != nil {
 			return fallback(err)
@@ -1651,6 +1972,7 @@ func ReconcileCertificateExpiries(ctx context.Context, now time.Time) error {
 	}
 	return nil
 }
+
 func fenceInterruptedCertificate(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID, binding, journalRef, priorPointer, candidatePointer string, cause error) error {
 	now := time.Now().UTC()
 	if err := service.MarkCertificateActivationUncertain(ctx, exposure, resourceID, binding, now); err != nil {
@@ -1670,6 +1992,7 @@ func fenceInterruptedCertificate(ctx context.Context, service *FixedService, exp
 	updateErr := service.UpdateCertificateActivationFence(ctx, exposure, observed, stopErr != nil)
 	return errors.Join(cause, stopErr, updateErr)
 }
+
 func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure string) error {
 	if !strings.HasPrefix(childClosure, "sha256:") {
 		return fmt.Errorf("certificate child closure identity invalid")
@@ -1678,7 +2001,7 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -1757,28 +2080,33 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		document, err = service.normal.Read()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		freshState, err := service.safety.ReadForRecovery(exposure)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		for _, resource := range freshState.Resources {
 			pending := resource.ChallengePending
 			if pending != nil && resource.ResourceID == intent.SafetyBinding.ResourceID && pending.PlanID == intent.SafetyBinding.PlanID && pending.Generation == intent.SafetyBinding.IntentGeneration {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("journal-less certificate acquired challenge authority")
 			}
+		}
+		if intent.SafetyBinding.ResourceID == "headscale" && freshState.Headscale.ChallengePending != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("journal-less Headscale certificate acquired challenge authority")
 		}
 		_, completeErr := admitter.TerminalizeJournalLessCertificate(ctx, mutation, exposure, document.Revision, jobID, childClosure)
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
@@ -1798,7 +2126,7 @@ func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure str
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -1827,6 +2155,9 @@ func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure str
 			if pending != nil && resource.ResourceID == intent.SafetyBinding.ResourceID && pending.PlanID == intent.SafetyBinding.PlanID && pending.Generation == intent.SafetyBinding.IntentGeneration {
 				hasChallenge = true
 			}
+		}
+		if intent.SafetyBinding.ResourceID == "headscale" && state.Headscale.ChallengePending != nil && state.Headscale.ChallengePending.PlanID == intent.SafetyBinding.PlanID && state.Headscale.ChallengePending.Generation == intent.SafetyBinding.IntentGeneration {
+			hasChallenge = true
 		}
 		if !hasChallenge {
 			jobsToClose = append(jobsToClose, journal.JobID)
@@ -1857,49 +2188,54 @@ func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure str
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		document, err = service.normal.Read()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		freshState, err := service.safety.ReadForRecovery(exposure)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		currentIntentRaw, present := document.Entries["intents/"+jobID]
 		if !present || json.Unmarshal(currentIntentRaw, &intent) != nil || intent.Phase != operations.PhaseLocalIntent {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("unstarted certificate intent changed under lock")
 		}
 		currentJournalRaw, present := document.Entries["journals/certificate-"+jobID]
 		if !present || json.Unmarshal(currentJournalRaw, &journal) != nil || journal.Certificate == nil || journal.Phase != operations.JournalPrepared {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("unstarted certificate journal changed under lock")
 		}
 		for _, resource := range freshState.Resources {
 			if resource.ResourceID == intent.SafetyBinding.ResourceID && resource.ChallengePending != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("unstarted certificate acquired challenge authority")
 			}
 		}
+		if intent.SafetyBinding.ResourceID == "headscale" && freshState.Headscale.ChallengePending != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("unstarted Headscale certificate acquired challenge authority")
+		}
 		if err := errors.Join(acme.RemoveStage(journal.Certificate.CertificateID, journal.Certificate.StageUID, journal.Certificate.StageGID), acme.RemoveWebroot(journal.Certificate.CertificateID, journal.Certificate.StageUID, journal.Certificate.StageGID)); err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		admitter, err := service.TimerAdmitter()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		pending := safety.ChallengePending{PlanID: intent.SafetyBinding.PlanID, Generation: intent.SafetyBinding.IntentGeneration, SANIdentity: intent.SafetyBinding.CandidateDigest, ACMEBinding: intent.SafetyBinding.CandidateBundle}
@@ -1919,7 +2255,7 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -1948,7 +2284,12 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 		if !present || json.Unmarshal(raw, &journal) != nil || journal.Certificate == nil {
 			return fmt.Errorf("completed renewal journal changed")
 		}
-		certificate := journal.Certificate
+		if strings.HasPrefix(journal.Target, "headscale/") {
+			if err := reconcileCompletedHeadscaleRenewal(ctx, journalID); err != nil {
+				return err
+			}
+			continue
+		}
 		resourceID := strings.TrimPrefix(journal.Target, "resource/")
 		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 		if err != nil {
@@ -1956,46 +2297,46 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, journal.Target, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		admitter, err := service.TimerAdmitter()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		document, err = service.normal.Read()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		raw, present = document.Entries["journals/"+journalID]
 		if !present || json.Unmarshal(raw, &journal) != nil || journal.Certificate == nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal journal disappeared")
 		}
-		certificate = journal.Certificate
+		certificate := journal.Certificate
 		intent, err := admitter.OperationIntent(journal.JobID)
 		if err != nil || intent.Operation != operations.CertificateRenew || (intent.Phase != operations.PhaseLocalIntent && intent.Phase != operations.PhaseRemoteWait && intent.Phase != operations.PhaseReentered) {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal intent changed")
 		}
 		installation, resource, err := loadCertificateResource(document.Entries, resourceID)
 		_ = installation
 		if err != nil || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal normal authority missing")
 		}
 		applied := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate
 		state, err := service.safety.ReadForRecovery(exposure)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		var safetyResource *safety.ResourceSafety
@@ -2005,39 +2346,39 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 			}
 		}
 		if safetyResource == nil || safetyResource.ChallengePending != nil || safetyResource.ActiveCertificate == nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal safety authority changed")
 		}
 		if !slices.Equal(journal.ChildIDs, []string{"lego-" + journal.JobID}) {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal child inventory changed")
 		}
 		var childRecord operations.ChildRecord
 		childRaw, present := document.Entries["children/"+journal.ChildIDs[0]]
 		if !present || json.Unmarshal(childRaw, &childRecord) != nil || childRecord.State != operations.ChildTerminal {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal child result changed")
 		}
 		pointer, err := certificates.ObservePointer(certificate.CertificateID)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		candidateCommitted := applied.Generation == certificate.CandidateGeneration && applied.Fingerprint == certificate.CandidateFingerprint && applied.Authority != nil && applied.Authority.CertificateID == certificate.CertificateID && safetyResource.ActiveCertificate.Generation == certificate.CandidateGeneration && safetyResource.ActiveCertificate.Fingerprint == certificate.CandidateFingerprint && pointer == certificate.CandidatePointer && childRecord.Outcome == operations.ChildSucceeded
 		priorRetained := journal.Phase == operations.JournalTerminal && certificate.PriorGeneration > 0 && applied.Generation == certificate.PriorGeneration && applied.Fingerprint == certificate.PriorFingerprint && safetyResource.ActiveCertificate.Generation == certificate.PriorGeneration && safetyResource.ActiveCertificate.Fingerprint == certificate.PriorFingerprint && pointer == certificate.PriorPointer
 		if priorRetained {
 			if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 			if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 			pending := safety.ChallengePending{PlanID: intent.SafetyBinding.PlanID, Generation: intent.SafetyBinding.IntentGeneration, SANIdentity: intent.SafetyBinding.CandidateDigest, ACMEBinding: intent.SafetyBinding.CandidateBundle}
@@ -2051,33 +2392,33 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 			continue
 		}
 		if !candidateCommitted {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal candidate changed")
 		}
 		host, err := activation.NewFixedHost()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		serverName := resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.ExactDomains[0]
 		if err := host.VerifyServedCertificate(ctx, serverName, certificate.CandidateFingerprint); err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		revision := document.Revision
 		if journal.Phase == operations.JournalActive {
 			journal.Phase = operations.JournalTerminal
 			if err := admitter.PutJournal(ctx, mutation, exposure, revision, journal, false); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 			revision++
@@ -2100,7 +2441,7 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 	if err != nil {
 		return err
 	}
-	defer service.Close()
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
 	if err := reconcileInterruptedHeadscaleLocalCandidate(ctx, service); err != nil {
 		return err
 	}
@@ -2139,46 +2480,46 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		}
 		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ResourceID, service.manager)
 		if err != nil {
-			mutationSet.Close()
+			_ = mutationSet.Close()
 			return err
 		}
 		if pending.Method == "http-01" {
 			host, hostErr := activation.NewFixedHost()
 			if hostErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return hostErr
 			}
 			manifest, auditErr := nginx.Audit(host.Paths, host.Owner)
 			if auditErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return auditErr
 			}
 			expected, prepareErr := challenge.PreparedHTTP(resource.ResourceID, *pending)
 			if prepareErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return prepareErr
 			}
 			for index := range manifest.Entries {
 				current := &manifest.Entries[index]
 				if current.Kind == nginx.EntryChallenge && current.ResourceID == resource.ResourceID && !reflect.DeepEqual(*current, *expected.Entry) {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return fmt.Errorf("interrupted HTTP challenge graph identity changed")
 				}
 			}
 			if _, err := host.RemoveChallenge(ctx, expected); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 		}
 		document, err := service.normal.Read()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		jobID := ""
@@ -2197,8 +2538,8 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			matchesHandoff := handoff != nil && handoff.PlanID == pending.PlanID && handoff.Generation == pending.Generation && handoff.SANIdentity == pending.SANIdentity && handoff.ACMEBinding == pending.ACMEBinding && handoff.CertificateID == pending.CertificateIdentity
 			if matchesChallenge || matchesHandoff {
 				if jobID != "" {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return fmt.Errorf("multiple certificate intents match challenge")
 				}
 				jobID = intent.JobID
@@ -2208,20 +2549,20 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			}
 		}
 		if jobID == "" {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate challenge lacks exact operation intent")
 		}
 		rawJournal, present := document.Entries["journals/certificate-"+jobID]
 		if !present {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate challenge journal missing")
 		}
 		var journal operations.JournalRecord
 		if err := json.Unmarshal(rawJournal, &journal); err != nil || journal.Certificate == nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate challenge journal invalid")
 		}
 		certificateIdentity := journal.Certificate
@@ -2250,8 +2591,8 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			}
 			installation, _, loadErr := loadCertificateResource(document.Entries, resource.ResourceID)
 			if loadErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return loadErr
 			}
 			var normalResource *domain.AppResource
@@ -2267,8 +2608,8 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			}
 			host, hostErr := activation.NewFixedHost()
 			if hostErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return hostErr
 			}
 			switch {
@@ -2305,69 +2646,69 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		}
 		if !committedCertificate {
 			if err := certificates.RemoveInactiveBundle(certificateIdentity.CertificateID, certificateIdentity.CandidateGeneration, certificateIdentity.StageUID, certificateIdentity.StageGID); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 		}
 		if err := errors.Join(acme.RemoveStage(certificateIdentity.CertificateID, certificateIdentity.StageUID, certificateIdentity.StageGID), acme.RemoveWebroot(certificateIdentity.CertificateID, certificateIdentity.StageUID, certificateIdentity.StageGID)); err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		admitter, err := service.TimerAdmitter()
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		stageIdentity, stageErr := identity.CertificateStageIdentityFor(certificateIdentity.CertificateID)
 		if stageErr != nil || stageIdentity.UID != certificateIdentity.StageUID || stageIdentity.GID != certificateIdentity.StageGID {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate recovery stage identity changed")
 		}
 		if stageErr := validateCertificateStageIdentity(document, stageIdentity); stageErr != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return stageErr
 		}
 		if !slices.Equal(journal.ChildIDs, []string{"lego-" + jobID}) {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate recovery child inventory changed")
 		}
 		if publicationHandoff != nil {
 			appRaw, present := document.Entries["journals/activation-"+jobID]
 			var appJournal operations.JournalRecord
 			if !present || json.Unmarshal(appRaw, &appJournal) != nil || journal.Phase != operations.JournalTerminal || appJournal.Kind != operations.JournalAppActivation || (appJournal.Phase != operations.JournalPrepared && appJournal.Phase != operations.JournalTerminal) || appJournal.JobID != jobID || appJournal.SafetyMarkerDigest == publicationHandoff.ChallengeSafetyDigest || publicationIntent == nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("certificate publication handoff recovery identity changed")
 			}
 			if appJournal.Phase == operations.JournalPrepared {
 				if publicationIntent.Phase != operations.PhaseLocalIntent {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return fmt.Errorf("certificate publication handoff phase changed")
 				}
 				if err := admitter.RejectPublication(ctx, mutation, exposure, document.Revision, jobID, "certificate_handoff_interrupted"); err != nil {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return err
 				}
 			} else {
 				record, recordErr := jobs.LoadEntries(document.Entries, jobID)
 				if publicationIntent.Phase != operations.PhaseTerminal || recordErr != nil || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultFailed {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return fmt.Errorf("certificate publication rejection is incomplete")
 				}
 			}
 			fresh, err := service.safety.ReadForRecovery(exposure)
 			if err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 			next := fresh
@@ -2381,8 +2722,8 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				}
 			}
 			if !matched {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("certificate publication handoff safety changed")
 			}
 			_, commitErr := service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{})
@@ -2395,8 +2736,8 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		}
 		if committedCertificate {
 			if journal.Operation != operations.CertificateRenew {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("unexpected committed publication certificate journal")
 			}
 			completionRevision := document.Revision
@@ -2404,16 +2745,16 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				terminalJournal := journal
 				terminalJournal.Phase = operations.JournalTerminal
 				if putErr := admitter.PutJournal(ctx, mutation, exposure, completionRevision, terminalJournal, false); putErr != nil {
-					operations.ReleaseExposure(mutation, exposure)
-					mutationSet.Close()
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
 					return putErr
 				}
 				completionRevision++
 			}
 			fresh, readErr := service.safety.ReadForRecovery(exposure)
 			if readErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return readErr
 			}
 			next := fresh
@@ -2427,13 +2768,13 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				}
 			}
 			if !matched {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("terminal certificate challenge authority changed")
 			}
 			if _, commitErr := service.safety.Commit(ctx, exposure, safety.RoleChallenge, fresh.Revision, next, safety.TransitionProof{}); commitErr != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return commitErr
 			}
 			_, completeErr := admitter.Complete(ctx, mutation, exposure, completionRevision, jobID, "complete", []string{certificateIdentity.CandidatePointer}, []jobs.Postcondition{{Kind: "certificate_renewed_and_served", Status: jobs.PostconditionVerified, Identity: certificateIdentity.CandidateFingerprint}}, "")
@@ -2453,28 +2794,28 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		closureRaw = append(closureRaw, []byte("\x00"+childClosure)...)
 		closureDigest := shaDigest(closureRaw)
 		if publicationIntent == nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return fmt.Errorf("certificate recovery intent missing")
 		}
 		if publicationIntent.Phase != operations.PhaseTerminal {
 			if _, err := admitter.TerminalizeContractedCertificate(ctx, mutation, exposure, document.Revision, jobID, *pending, closureDigest); err != nil {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return err
 			}
 		} else {
 			record, recordErr := jobs.LoadEntries(document.Entries, jobID)
 			if recordErr != nil || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultInterrupted || journal.Phase != operations.JournalTerminal {
-				operations.ReleaseExposure(mutation, exposure)
-				mutationSet.Close()
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
 				return fmt.Errorf("certificate recovery terminal authority changed")
 			}
 		}
 		fresh, err := service.safety.ReadForRecovery(exposure)
 		if err != nil {
-			operations.ReleaseExposure(mutation, exposure)
-			mutationSet.Close()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
 			return err
 		}
 		next := fresh
@@ -2494,6 +2835,7 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 	}
 	return nil
 }
+
 func loadCertificateLegoDigest() (string, error) {
 	identity, err := loadInstalledReleaseIdentity()
 	if err != nil {
@@ -2504,6 +2846,7 @@ func loadCertificateLegoDigest() (string, error) {
 	}
 	return identity.Lego.Digest, nil
 }
+
 func validateCertificateStageIdentity(document persist.Document, stage identity.CertificateStageIdentity) error {
 	if err := identity.VerifyCertificateStageIdentityAvailable(stage, "/etc/passwd", "/etc/group"); err != nil {
 		return err
@@ -2551,6 +2894,7 @@ func validateCertificateStageIdentity(document persist.Document, stage identity.
 	}
 	return nil
 }
+
 func loadCertificateResource(entries map[string]json.RawMessage, id string) (domain.Installation, domain.AppResource, error) {
 	raw, present := entries["installations/current"]
 	if !present {

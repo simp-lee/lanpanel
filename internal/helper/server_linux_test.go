@@ -25,9 +25,9 @@ func TestServerAuthenticatesPeerAndRevalidatesEveryRequest(t *testing.T) {
 	identities := IdentitySet{UI: PeerIdentity{UID: uid, GID: gid}, Timer: PeerIdentity{UID: uid + 1, GID: gid}, Recovery: PeerIdentity{UID: uid + 2, GID: gid}}
 	var revalidated atomic.Int32
 	var executed atomic.Int32
-	server, err := NewServer(identities, []Registration{CredentialImportHandler(
+	server, err := NewServer(identities, []Registration{AdminTokenVerifyHandler(
 		func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
-			if caller != helperproto.CallerUI || request.Target != "credential/basic-one" {
+			if caller != helperproto.CallerUI || request.Target != "installation" {
 				return errors.New("wrong authority")
 			}
 			revalidated.Add(1)
@@ -54,7 +54,7 @@ func TestServerAuthenticatesPeerAndRevalidatesEveryRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- server.serveUnix(ctx, listener, false) }()
@@ -62,7 +62,7 @@ func TestServerAuthenticatesPeerAndRevalidatesEveryRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-one", Operation: helperproto.OperationCredentialImport, Target: "credential/basic-one", IntentGeneration: 2, Deadline: time.Unix(1_700_000_000, 0).UTC().Add(time.Minute), InputDigest: digest("input")}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-one", Operation: helperproto.OperationAdminTokenVerify, Target: "installation", IntentGeneration: 2, Deadline: time.Unix(1_700_000_000, 0).UTC().Add(time.Minute), InputDigest: digest("input")}
 	if err := helperproto.WriteRequest(client, request, []byte("sentinel-secret")); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestServerReturnsDurablePartialPublicationDespiteExecutorCleanupError(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- server.serveUnix(ctx, listener, false) }()
@@ -134,7 +134,7 @@ func TestServerRejectsUnauthorizedLocalPeerAndIncompleteHandlers(t *testing.T) {
 		t.Skip("test requires a dedicated non-root peer")
 	}
 	identities := IdentitySet{UI: PeerIdentity{UID: uid + 3, GID: gid}, Timer: PeerIdentity{UID: uid + 4, GID: gid}, Recovery: PeerIdentity{UID: uid + 5, GID: gid}}
-	if _, err := NewServer(identities, []Registration{NginxTestHandler(nil, nil)}, Options{}); err == nil {
+	if _, err := NewServer(identities, []Registration{ManagementProfileHandler(nil, nil)}, Options{}); err == nil {
 		t.Fatal("incomplete helper handler registered")
 	}
 	server, err := NewServer(identities, nil, Options{})
@@ -153,7 +153,7 @@ func TestServerRejectsUnauthorizedLocalPeerAndIncompleteHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-one", Operation: helperproto.OperationNginxTest, Target: "installation", IntentGeneration: 2, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}
+	request := helperproto.Request{SchemaVersion: helperproto.SchemaVersion, RequestID: "request-one", Operation: helperproto.OperationManagementProfile, Target: "installation", IntentGeneration: 2, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}
 	_ = helperproto.WriteRequest(client, request, nil)
 	if _, _, err := helperproto.ReadResponse(client, request.Operation); err == nil {
 		t.Fatal("unauthorized local peer received a helper response")

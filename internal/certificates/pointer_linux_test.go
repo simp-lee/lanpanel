@@ -11,6 +11,7 @@ func TestCertificatePointerRejectsUnfixedOrRegressingIdentity(t *testing.T) {
 		}
 	}
 }
+
 func TestCertificatePointerPathsStayInFixedRoots(t *testing.T) {
 	value := Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
 	path, candidate, prior, err := pointerPaths(value)

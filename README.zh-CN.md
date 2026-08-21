@@ -1,9 +1,90 @@
-# LanPanel
+# LanPanel 社区版
 
-LanPanel 是一个采用 MIT License 的社区版本机管理应用，用于 Headscale 与已发布应用。
+LanPanel 是面向个人和相互信任小团队的 MIT License、自托管 Linux 主机管理产品。一个 Linux amd64 executable 以固定 installer、Management UI、helper、guard、timer、relay 和数据面 role 运行。
 
-发行架构只使用一个 binary，并以闭集、独立监督的进程角色运行。Management UI 是唯一受支持的管理接口。数据面服务和 timer 角色独立受监督，因此关闭或重启 UI 不会停止既有 ingress、Headscale、connector、managed process、分析或证书续期。
+## 管理边界
 
-项目正在按 GA 安全与 qualification contract 重建。每个 operational role 只有在完整 typed handler 与发行 qualification 就绪后才会开放。产品不提供受支持的命令行、JSON 或 YAML 管理接口。
+仅 loopback 监听的 Management UI 是唯一受支持的日常管理入口。LanPanel 不提供管理 CLI、JSON CLI、YAML workflow、shell、terminal 或文件管理器。远程管理时，使用 SSH tunnel 连接 installer 显示的 installation-specific exact `127/8` IPv4 与 high port；不得用 `localhost` 替代。
 
-许可证见 [LICENSE](LICENSE)。
+安装生成 CSPRNG admin token。连接 TTY 时可以显示一次；无 TTY 时只报告 root-protected source path。登录使用带 CSRF、exact Origin/Host 的短期 selector/proof session。token rotation 会使现有 session 失效。secret 不进入 URL、argv、unit、Plan、job、audit、diagnostics、WebSocket 或 release asset。
+
+UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix-socket helper。关闭或重启 UI 不会停止已提交的 Headscale、managed process、GoAccess、certificate timer 或 App ingress。
+
+## 平台与安装
+
+代码目标是使用 systemd、apt/dpkg 和 release-qualified Nginx profile 的 Debian/Ubuntu Linux amd64。只有同一个 exact release binary 在真实主机完成 live qualification 后，一个 profile 才能成为 **supported OS profile**。其他 Debian/Ubuntu profile 只能称 code target 或“not live tested”。
+
+首版只支持 clean install。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、exact repository/key/metadata snapshot、package closure/tuple，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
+
+Dependency source 仅为：
+
+- `official/canonical_artifact`：release 固定 HTTPS URL、version、archive digest、member 和 executable digest；
+- `official/distro_repository`：只用于 clean install 的 exact apt repository 与 package closure；
+- `mirror`：管理员选择的 HTTP(S) URL，仍校验相同固定 digest；
+- `offline`：管理员选择的安全 regular file，校验 name/version/OS/arch/digest。
+
+只能配置一个显式、无认证 canonical HTTP(S) download proxy。LanPanel 不读取 ambient proxy，source 失败时不会静默 bypass 或切换。
+
+## Headscale 与 connector
+
+Headscale 是可选能力。没有任何 Headscale evidence 时，本机 App-only publication 仍可工作。启用后，LanPanel 管理一个 trusted-mesh Headscale trust domain：SQLite、MagicDNS、embedded DERP/STUN、private admin endpoint，以及独立 exact-host HTTPS control ingress。
+
+Headscale lifecycle 刻意保持精简：
+
+- user：仅 create/list；
+- pre-auth key：仅 create/list/revoke；新 key 为 one-use、untagged，默认一小时、最长 24 小时，并且只显示一次；
+- device：仅 list/expire。
+
+Key revoke 不会 expire 已注册 device。Device expire 不保证终止既有 TCP/UDP flow。
+
+LanPanel 管理一个本机 Tailscale connector，ControlURL set-once。verify 检查 pinned client、running/logged-in 状态、exact ControlURL、本机 tailnet IP、peer，以及经过 `tailscale0` 的 kernel route。assisted login 直接接收当前 authenticated request 的一次性 auth key，写 owner-only job file，只调用 `--auth-key=file:<exact-path>`，并在 terminal/cancel/startup 删除。没有 key inventory、external key adoption、discard、disconnect、自动 logout/reset/rejoin、rebind 或 multi-connector action。mismatch 必须在 LanPanel 外处理后再次 verify。
+
+## App 与 managed process
+
+每个 App 有 immutable resource ID，target 仅为：
+
+- `local_http`：per-resource non-root confined managed process，通过 protected Unix socket、release-owned relay 或 PID1-owned socket activation 访问；
+- `tailnet_http`：一个固定非本机 peer IP:port，并 fresh 证明 route 经 Tailscale。
+
+LanPanel 不上传、构建、安装或编辑 application code/runtime/config。executable、arguments、working directory、environment-file reference 与 write path 都是 typed 的；禁止 shell parsing 和 opaque `ExecStart`。已 publish 的本机 App 必须先显式 unpublish 才能 stop process。Unpublish 不保证终止既有 flow。
+
+## Publication
+
+`publish` 是唯一正常开放或替换 App ingress 的动作。save、process start、connector login、Headscale deploy、restart、timer 和 reconciliation 都不会隐式 publish。每个 resource 初始为 sticky-unpublished。
+
+Publication mode：
+
+- `domain_https`：80/443、exact TLS SNI/HTTP Host、TLS 1.2/1.3、HTTP/1.1、HTTP/2，以及可选 WebSocket；
+- test-only `temporary_ip_http`：一个 publicly routable IPv4 与 high port、exact Host、仅 public HTTP/1.1。
+
+Temporary HTTP 是公网明文，并且不会自动过期。
+
+Access mode 为 `public|application_managed|basic`。Basic 可使用一次性 Managed Basic password 或 verified external htpasswd，并可配置 CIDR allowlist。static root 是 external、root-owned、read-only、no-follow tree，只开放显式 route。可选 GoAccess 使用 isolated identity、protected endpoint 与独立 external Basic credential，不提供 raw access-log browser。
+
+每个入口先移除 untrusted identity header，再只根据实际 socket peer 重建 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Host` 和 `X-Forwarded-Proto`。首版不信任 CDN identity header。
+
+clean installer 会原子生成唯一的 installation-managed P-256 ACME account key；操作员只提供 account email 并明确接受条款，不能选择私钥路径。ACME 支持 HTTP-01 和 DNS-01；DNS provider exact 闭集为 `cloudflare|route53|digitalocean|gcloud|tencentcloud`。DNS credential 保持在 protected file/profile。禁止 provider、CA 和 source fallback。release notes 会区分真实 live-tested provider 与 deterministic fixture coverage。
+
+## 关闭、恢复、删除与导出
+
+`unpublish` 持久关闭一个 App；`close-all` 持久关闭全部 LanPanel-owned App ingress，正常情况下保留健康 Headscale control ingress。sticky closure 跨 restart/reboot 保留。certificate expiry 或 uncertain activation 会收缩 ingress，而不是重试 remote work。
+
+关闭会验证 owned disk graph、Nginx reload、prior-worker drain 和 release-owned runtime rejection。无法证明 selective closure 时，LanPanel 持久化 stop fence 并 stop Nginx。Fail-closed stop Nginx 可能同时中断 Headscale control ingress。
+
+Startup reconciliation 只可完成 exact existing local journal 或收缩 ingress；不会重试 ACME/provider、登录 connector、adopt orphan、启动 explicitly stopped process 或恢复 App ingress。未解决的 orphan/unknown state 保持 closed。受支持的后续动作是 diagnostics、无 secret configuration export 和 clean-host rebuild，而不是 Repair。
+
+Plan-bound resource delete 要求 fresh unpublished closure；本机 App 还要求 cgroup/listener 已停止。只删除 exact LanPanel-managed inventory。external executable、working directory、static root、environment file、htpasswd 和 log source 永不删除。
+
+## 首版明确限制
+
+- 不支持原地 upgrade、same-version reinstall、dependency maintenance、updater、rollback engine 或 state/schema migration。
+- 不支持产品级 backup/restore、restore cutover 或跨主机 migration。手工 host copy 或 VM snapshot 不自动构成受支持、可恢复的 backup。
+- 不提供 Repair、fix-host、orphan adoption 或 normalization action。
+- 首版无 EdgeOne integration；保留的 `internal/realip*` 算法是不可达二期资产。
+- 不声明 ARM64 GA；不提供公网 TCP/UDP、SSH/RDP/VNC、容器、Kubernetes、数据库、application template、remote API、OIDC 或 RBAC。
+
+主机管理员可以在产品外读取自己的配置、SQLite 和数据。Configuration export 是产品支持的数据迁出能力。
+
+## 安全与发行
+
+参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、SBOM、dependency manifest、`SHA256SUMS`、一个 canonical `release.json`、恰好一个 live-qualified supported profile、provider live-test 说明和 known limitations。最终发布复用通过 deterministic/live gate 的 exact binary bytes。发行操作员应遵循[受保护 qualification tooling 指南](docs/qualification.md)。

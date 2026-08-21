@@ -28,9 +28,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const bootstrapSchema = "lanpanel.child.bootstrap.v1"
-const maximumBootstrapBytes = 32 << 10
-const FixedLanPanelExecutable = "/usr/lib/lanpanel/lanpanel"
+const (
+	bootstrapSchema         = "lanpanel.child.bootstrap.v1"
+	maximumBootstrapBytes   = 32 << 10
+	FixedLanPanelExecutable = "/usr/lib/lanpanel/lanpanel"
+)
 
 var errOutputLimit = errors.New("external child output limit reached")
 
@@ -108,19 +110,19 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if err != nil {
 		return Result{}, err
 	}
-	defer instructionRead.Close()
-	defer instructionWrite.Close()
+	defer func(ignore func() error) { _ = ignore() }(instructionRead.Close)
+	defer func(ignore func() error) { _ = ignore() }(instructionWrite.Close)
 	inputRead, inputWrite, err := os.Pipe()
 	if err != nil {
 		return Result{}, err
 	}
-	defer inputRead.Close()
-	defer inputWrite.Close()
+	defer func(ignore func() error) { _ = ignore() }(inputRead.Close)
+	defer func(ignore func() error) { _ = ignore() }(inputWrite.Close)
 	command := exec.Command(launcher.self, "child-executor")
 	command.Env = []string{}
 	command.ExtraFiles = []*os.File{instructionRead, inputRead}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileGoAccessShow || profileID == ProfileHTPasswd)
+	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileGoAccessShow || profileID == ProfileHeadscaleAdmin || profileID == ProfileTailscaleAdmin || profileID == ProfileHTPasswd)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
 	if err := ctx.Err(); err != nil {
@@ -681,13 +683,14 @@ func executableDigest(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
+
 func verifyRootExecutable(path string) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("executable path is not absolute and clean")
@@ -753,22 +756,26 @@ func (writer *digestWriter) Write(value []byte) (int, error) {
 	writer.written += len(value)
 	return len(value), nil
 }
+
 func (writer *digestWriter) Digest() string {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return "sha256:" + hex.EncodeToString(writer.hash.Sum(nil))
 }
+
 func (writer *digestWriter) Destroy() {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	clear(writer.bytes)
 	writer.bytes = nil
 }
+
 func (writer *digestWriter) Bytes() []byte {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return append([]byte(nil), writer.bytes...)
 }
+
 func (writer *digestWriter) CutOff() bool {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()

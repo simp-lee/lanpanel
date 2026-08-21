@@ -17,7 +17,10 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -65,10 +68,7 @@ func Probe(ctx context.Context, request ProbeRequest, transport Transport) (Evid
 	if transport == nil || request.ResourceID == "" || !validDigest(request.ConfigDigest) || !validDigest(request.EndpointIdentity) || transport.Identity() == "" {
 		return Evidence{}, fmt.Errorf("target readiness authority is incomplete")
 	}
-	if request.Target.Kind == domain.AppTargetTailnetHTTP {
-		return Evidence{}, fmt.Errorf("tailnet readiness transport is unavailable until connector qualification")
-	}
-	if request.Target.Kind != domain.AppTargetLocalHTTP || request.Target.LocalHTTP == nil {
+	if request.Target.Kind != domain.AppTargetLocalHTTP && request.Target.Kind != domain.AppTargetTailnetHTTP || request.Target.Kind == domain.AppTargetLocalHTTP && request.Target.LocalHTTP == nil || request.Target.Kind == domain.AppTargetTailnetHTTP && request.Target.TailnetHTTP == nil {
 		return Evidence{}, fmt.Errorf("target readiness kind is unsupported")
 	}
 	if expected := targetTransportIdentity(request.Target); expected == "" || transport.Identity() != request.EndpointIdentity+"/"+expected {
@@ -114,7 +114,7 @@ func probeHTTP(ctx context.Context, request ProbeRequest, transport Transport) (
 	if err != nil {
 		return 0, err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, MaximumBody))
 	if !allowedHTTPStatus(response.StatusCode, request.Target.AllowedHTTPStatuses, request.AccessMode) {
 		return response.StatusCode, fmt.Errorf("target HTTP readiness returned disallowed status %d", response.StatusCode)
@@ -127,7 +127,7 @@ func probeWebSocket(ctx context.Context, request ProbeRequest, transport Transpo
 	if err != nil {
 		return 0, err
 	}
-	defer connection.Close()
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
 	deadline := time.Now().Add(ReadTimeout)
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
 		deadline = value
@@ -149,7 +149,7 @@ func probeWebSocket(ctx context.Context, request ProbeRequest, transport Transpo
 	if err != nil {
 		return 0, err
 	}
-	defer response.Body.Close()
+	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	if response.StatusCode == http.StatusSwitchingProtocols {
 		if !headerToken(response.Header.Values("Connection"), "upgrade") || !headerToken(response.Header.Values("Upgrade"), "websocket") || response.Header.Get("Sec-WebSocket-Accept") != websocketAccept(key) {
 			return response.StatusCode, fmt.Errorf("target WebSocket upgrade identity is invalid")
@@ -200,6 +200,9 @@ func validDigest(value string) bool {
 }
 
 func targetTransportIdentity(target domain.AppTarget) string {
+	if target.Kind == domain.AppTargetTailnetHTTP && target.TailnetHTTP != nil {
+		return "tailnet/" + net.JoinHostPort(target.TailnetHTTP.IP, fmt.Sprint(target.TailnetHTTP.Port))
+	}
 	local := target.LocalHTTP
 	if local == nil {
 		return ""
@@ -228,7 +231,38 @@ func NewTCPTransport(address string, port uint16, identity string) (TCPTransport
 	authority := net.JoinHostPort(address, fmt.Sprint(port))
 	return TCPTransport{Address: authority, identity: identity + "/tcp/" + authority}, nil
 }
+
 func (transport TCPTransport) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
 	return (&net.Dialer{Timeout: ConnectTimeout}).DialContext(ctx, "tcp", transport.Address)
 }
 func (transport TCPTransport) Identity() string { return transport.identity }
+
+type TailnetTransport struct {
+	Address  string
+	SourceIP string
+	identity string
+}
+
+func NewTailnetTransport(address, sourceIP string, port uint16, identity string) (TailnetTransport, error) {
+	parsed, err := netip.ParseAddr(address)
+	source, sourceErr := netip.ParseAddr(sourceIP)
+	if err != nil || sourceErr != nil || parsed.IsLoopback() || parsed.IsUnspecified() || !parsed.IsGlobalUnicast() || !source.IsGlobalUnicast() || source.IsLoopback() || source.BitLen() != parsed.BitLen() || port == 0 || identity == "" {
+		return TailnetTransport{}, fmt.Errorf("tailnet readiness endpoint authority invalid")
+	}
+	authority := net.JoinHostPort(address, fmt.Sprint(port))
+	return TailnetTransport{Address: authority, SourceIP: source.String(), identity: identity + "/tailnet/" + source.String() + "/" + authority}, nil
+}
+
+func (transport TailnetTransport) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: ConnectTimeout, LocalAddr: &net.TCPAddr{IP: net.ParseIP(transport.SourceIP)}, Control: func(_, _ string, raw syscall.RawConn) error {
+		var controlErr error
+		if err := raw.Control(func(fd uintptr) {
+			controlErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, "tailscale0")
+		}); err != nil {
+			return err
+		}
+		return controlErr
+	}}
+	return dialer.DialContext(ctx, "tcp", transport.Address)
+}
+func (transport TailnetTransport) Identity() string { return transport.identity }

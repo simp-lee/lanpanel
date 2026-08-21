@@ -26,8 +26,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const SchemaVersion = "lanpanel.normal.v1"
-const maxDocumentBytes = 8 << 20
+const (
+	SchemaVersion    = "lanpanel.normal.v1"
+	maxDocumentBytes = 8 << 20
+)
 
 var (
 	canonicalNamespaceOwners = map[string]string{
@@ -81,6 +83,7 @@ func (store *Store) ValidateUnavailable(proof UnavailableProof) bool {
 	store.proofEpoch++
 	return true
 }
+
 func (store *Store) SealSchema() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -99,6 +102,7 @@ func (store *Store) SealSchema() error {
 	store.schemaSealed = true
 	return nil
 }
+
 func (store *Store) ProveUnavailable() (UnavailableProof, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -127,6 +131,7 @@ func (transaction *Transaction) Get(key string) (json.RawMessage, bool) {
 	value, ok := transaction.entries[key]
 	return append(json.RawMessage(nil), value...), ok
 }
+
 func (transaction *Transaction) Create(key string, value json.RawMessage) error {
 	if _, exists := transaction.entries[key]; exists {
 		return fmt.Errorf("normal entry %q already exists", key)
@@ -134,6 +139,7 @@ func (transaction *Transaction) Create(key string, value json.RawMessage) error 
 	transaction.entries[key] = append(json.RawMessage(nil), value...)
 	return nil
 }
+
 func (transaction *Transaction) Replace(key string, value json.RawMessage) error {
 	if _, exists := transaction.entries[key]; !exists {
 		return fmt.Errorf("normal entry %q is missing", key)
@@ -141,6 +147,7 @@ func (transaction *Transaction) Replace(key string, value json.RawMessage) error
 	transaction.entries[key] = append(json.RawMessage(nil), value...)
 	return nil
 }
+
 func (transaction *Transaction) Delete(key string) error {
 	if _, exists := transaction.entries[key]; !exists {
 		return fmt.Errorf("normal entry %q is missing", key)
@@ -148,6 +155,7 @@ func (transaction *Transaction) Delete(key string) error {
 	delete(transaction.entries, key)
 	return nil
 }
+
 func (transaction *Transaction) Keys(namespace string) []string {
 	prefix := namespace + "/"
 	result := []string{}
@@ -160,10 +168,12 @@ func (transaction *Transaction) Keys(namespace string) []string {
 	return result
 }
 
-type NamespaceValidator func(key string, value json.RawMessage) error
-type TransitionValidator func(key string, before, after json.RawMessage) error
-type DocumentValidator func(Document) error
-type DocumentTransitionValidator func(before, after Document) error
+type (
+	NamespaceValidator          func(key string, value json.RawMessage) error
+	TransitionValidator         func(key string, before, after json.RawMessage) error
+	DocumentValidator           func(Document) error
+	DocumentTransitionValidator func(before, after Document) error
+)
 
 type Store struct {
 	mu                                sync.Mutex
@@ -230,11 +240,13 @@ func (store *Store) registerNamespace(namespace, owner string, validator Namespa
 	}
 	return nil
 }
+
 func (store *Store) NamespaceRegistered(namespace string) bool {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return store.validators[namespace] != nil
 }
+
 func (store *Store) RegisterDocumentValidator(validator DocumentValidator) error {
 	return store.registerDocumentValidator("", validator)
 }
@@ -306,6 +318,7 @@ func (store *Store) SchemaSealed() bool {
 	defer store.mu.Unlock()
 	return store.schemaSealed
 }
+
 func (store *Store) LockAuthority() locks.Authority {
 	if store == nil {
 		return locks.Authority{}
@@ -460,7 +473,7 @@ func (store *Store) readLocked() (Document, error) {
 	if file == nil {
 		return Document{}, fmt.Errorf("wrap normal state descriptor")
 	}
-	defer file.Close()
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	decoder := json.NewDecoder(io.LimitReader(file, maxDocumentBytes+1))
 	decoder.DisallowUnknownFields()
 	var document Document
@@ -597,6 +610,7 @@ func (store *Store) validateTypedEntries(entries map[string]json.RawMessage) err
 	}
 	return nil
 }
+
 func (store *Store) validateEntryTransitions(before, after map[string]json.RawMessage) error {
 	for key, newValue := range after {
 		if _, exists := before[key]; exists {
@@ -641,6 +655,7 @@ func (store *Store) validateEntryTransitions(before, after map[string]json.RawMe
 	}
 	return nil
 }
+
 func validateInstallationEntry(key string, value json.RawMessage) error {
 	if key != "installations/current" {
 		return fmt.Errorf("installation entry key is invalid")
@@ -648,6 +663,7 @@ func validateInstallationEntry(key string, value json.RawMessage) error {
 	_, err := decodeInstallation(value)
 	return err
 }
+
 func validateInstallationTransition(_ string, before, after json.RawMessage) error {
 	if len(before) == 0 {
 		installation, err := decodeInstallation(after)
@@ -655,7 +671,7 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 			return err
 		}
 		for _, resource := range installation.Resources {
-			if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration == 0 || resource.PublicationRecord.LastAppliedDigest != nil || resource.PublicationRecord.LastAppliedBundle != nil || resource.PublicationRecord.EffectiveSecurity != nil || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.RuntimeObservation != nil || resource.PublicationRecord.LastOperation != "" || resource.PublicationRecord.LastOperationResult != "" || resource.PublicationRecord.LastJobID != "" || resource.ManagedProcess != nil && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.RuntimeObservation != nil) {
+			if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration == 0 || resource.PublicationRecord.LastAppliedDigest != nil || resource.PublicationRecord.LastAppliedBundle != nil || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.RuntimeObservation != nil || resource.PublicationRecord.LastOperation != "" || resource.PublicationRecord.LastOperationResult != "" || resource.PublicationRecord.LastJobID != "" || resource.ManagedProcess != nil && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.RuntimeObservation != nil) {
 				return fmt.Errorf("initial resource must start active, unpublished, unapplied, and stopped with a generation")
 			}
 		}
@@ -682,7 +698,7 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 			// authorized by the canonical document-transition validator, which
 			// can inspect the matching immutable job and intent atomically.
 			delete(oldResources, resource.ID)
-		} else if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration == 0 || resource.PublicationRecord.LastAppliedDigest != nil || resource.PublicationRecord.LastAppliedBundle != nil || resource.PublicationRecord.EffectiveSecurity != nil || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.RuntimeObservation != nil || resource.PublicationRecord.LastOperation != "" || resource.PublicationRecord.LastOperationResult != "" || resource.PublicationRecord.LastJobID != "" || resource.ManagedProcess != nil && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.RuntimeObservation != nil) {
+		} else if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration == 0 || resource.PublicationRecord.LastAppliedDigest != nil || resource.PublicationRecord.LastAppliedBundle != nil || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.RuntimeObservation != nil || resource.PublicationRecord.LastOperation != "" || resource.PublicationRecord.LastOperationResult != "" || resource.PublicationRecord.LastJobID != "" || resource.ManagedProcess != nil && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.RuntimeObservation != nil) {
 			return fmt.Errorf("new resource must start active, unpublished, unapplied, and stopped with a generation")
 		}
 	}
@@ -691,6 +707,7 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 	}
 	return nil
 }
+
 func rejectUnownedInstallationStateChange(before, after json.RawMessage) error {
 	oldValue, err := decodeInstallation(before)
 	if err != nil {
@@ -819,6 +836,7 @@ func validateRootStat(stat unix.Stat_t, owner filetxn.Owner) error {
 	}
 	return nil
 }
+
 func sameRoot(left, right unix.Stat_t) bool {
 	return left.Dev == right.Dev && left.Ino == right.Ino && left.Mode == right.Mode && left.Uid == right.Uid && left.Gid == right.Gid
 }
