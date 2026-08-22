@@ -371,6 +371,121 @@ func gitIndexPath(root string) (string, error) {
 	return filepath.Join(directory, "index"), nil
 }
 
+// GenerateSourceArchive builds the one canonical USTAR+gzip source archive
+// directly from the already verified stage-0 index/worktree inventory.
+func GenerateSourceArchive(root, releaseTag string) ([]byte, string, error) {
+	if !releaseTagPattern.MatchString(releaseTag) {
+		return nil, "", fmt.Errorf("source archive release tag is invalid")
+	}
+	inventory, entries, digest, err := CleanTrackedSourceTree(root)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(entries) != len(inventory.Paths()) {
+		return nil, "", fmt.Errorf("source archive inventory changed")
+	}
+	rootName := "lanpanel-" + releaseTag
+	type archiveEntry struct {
+		name  string
+		entry *TreeEntry
+	}
+	values := []archiveEntry{{name: rootName + "/"}}
+	directories := map[string]bool{}
+	for index := range entries {
+		entry := entries[index]
+		for parent := path.Dir(entry.Path); parent != "."; parent = path.Dir(parent) {
+			directories[parent] = true
+		}
+		copyEntry := entry
+		values = append(values, archiveEntry{name: rootName + "/" + entry.Path, entry: &copyEntry})
+	}
+	for directory := range directories {
+		values = append(values, archiveEntry{name: rootName + "/" + directory + "/"})
+	}
+	slices.SortFunc(values, func(left, right archiveEntry) int { return strings.Compare(left.name, right.name) })
+	var output bytes.Buffer
+	compressed := gzip.NewWriter(&output)
+	compressed.ModTime = time.Time{}
+	compressed.OS = 255
+	archive := tar.NewWriter(compressed)
+	for _, value := range values {
+		header := &tar.Header{Name: value.name, Uid: 0, Gid: 0, ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR}
+		if value.entry == nil {
+			header.Typeflag = tar.TypeDir
+			header.Mode = 0o755
+		} else if value.entry.Type == TreeEntrySymlink {
+			header.Typeflag = tar.TypeSymlink
+			header.Mode = 0o777
+			header.Linkname = string(value.entry.Content)
+		} else {
+			header.Typeflag = tar.TypeReg
+			header.Mode = 0o644
+			if value.entry.Mode == TreeModeExec {
+				header.Mode = 0o755
+			}
+			header.Size = int64(len(value.entry.Content))
+		}
+		if err := archive.WriteHeader(header); err != nil {
+			return nil, "", err
+		}
+		if value.entry != nil && value.entry.Type == TreeEntryRegular {
+			if _, err := archive.Write(value.entry.Content); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	if err := archive.Close(); err != nil {
+		return nil, "", err
+	}
+	if err := compressed.Close(); err != nil {
+		return nil, "", err
+	}
+	data := output.Bytes()
+	verified, err := sourceArchiveTreeDigest(data, rootName)
+	if err != nil || verified != digest {
+		return nil, "", fmt.Errorf("generated source archive failed exact self-verification: %w", err)
+	}
+	return append([]byte(nil), data...), digest, nil
+}
+
+func ReadSourceArchiveFile(data []byte, releaseTag, relative string, maximum int64) ([]byte, error) {
+	if !releaseTagPattern.MatchString(releaseTag) || !ValidRelativePath(relative) || maximum <= 0 {
+		return nil, fmt.Errorf("source archive file authority is invalid")
+	}
+	root := "lanpanel-" + releaseTag
+	if _, err := sourceArchiveTreeDigest(data, root); err != nil {
+		return nil, err
+	}
+	compressed, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = compressed.Close() }()
+	reader := tar.NewReader(compressed)
+	expected := root + "/" + relative
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if header.Name != expected {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg || header.Size <= 0 || header.Size > maximum {
+			return nil, fmt.Errorf("source archive file type or size is invalid")
+		}
+		content, err := io.ReadAll(io.LimitReader(reader, maximum+1))
+		if err != nil || int64(len(content)) != header.Size {
+			return nil, fmt.Errorf("source archive file changed: %w", err)
+		}
+		return content, nil
+	}
+	return nil, fmt.Errorf("source archive file %q is missing", relative)
+}
+
 func VerifySourceArchiveAgainstCleanTree(root string, archive []byte) (string, error) {
 	_, _, trackedDigest, err := CleanTrackedSourceTree(root)
 	if err != nil {

@@ -3494,11 +3494,23 @@ func (admitter *Admitter) CommitResourceDeleteRemoval(ctx context.Context, mutat
 			return err
 		}
 		kept := installation.Resources[:0]
+		deletedStaticRoots := map[string]bool{}
+		for _, root := range installation.StaticRoots {
+			if root.OwnerResourceID == resourceID {
+				deletedStaticRoots[root.ID] = true
+			}
+		}
 		found := false
 		for _, resource := range installation.Resources {
 			if resource.ID == resourceID {
 				if resource.Lifecycle != domain.LifecycleDeleting || resource.PublicationRecord.LastJobID != jobID {
 					return fmt.Errorf("resource deleting tombstone changed")
+				}
+				if publication := resource.Publication.DomainHTTPS; publication != nil && publication.StaticRootID != "" {
+					deletedStaticRoots[publication.StaticRootID] = true
+				}
+				if applied := resource.PublicationRecord.LastAppliedBundle; applied != nil && applied.DomainHTTPS != nil && applied.DomainHTTPS.Static.RootID != "" {
+					deletedStaticRoots[applied.DomainHTTPS.Static.RootID] = true
 				}
 				found = true
 				continue
@@ -3516,6 +3528,21 @@ func (admitter *Admitter) CommitResourceDeleteRemoval(ctx context.Context, mutat
 			}
 		}
 		installation.Credentials = credentials
+		for _, resource := range kept {
+			if publication := resource.Publication.DomainHTTPS; publication != nil {
+				delete(deletedStaticRoots, publication.StaticRootID)
+			}
+			if applied := resource.PublicationRecord.LastAppliedBundle; applied != nil && applied.DomainHTTPS != nil {
+				delete(deletedStaticRoots, applied.DomainHTTPS.Static.RootID)
+			}
+		}
+		staticRoots := installation.StaticRoots[:0]
+		for _, root := range installation.StaticRoots {
+			if !deletedStaticRoots[root.ID] {
+				staticRoots = append(staticRoots, root)
+			}
+		}
+		installation.StaticRoots = staticRoots
 		raw, err := persist.EncodeEntry(installation)
 		if err != nil {
 			return err

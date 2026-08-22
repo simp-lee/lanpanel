@@ -94,11 +94,31 @@ func (store ProtectedReportStore) Write(report release.LiveCleanupReport) error 
 }
 
 func validateReportAdvance(prior, next release.LiveCleanupReport) error {
-	if prior.RunID != next.RunID || prior.SideEffectPlanDigest != next.SideEffectPlanDigest || prior.QualificationInstallManifestDigest != next.QualificationInstallManifestDigest || prior.ProtectedInputDigest != next.ProtectedInputDigest || prior.JourneySucceeded && !next.JourneySucceeded || next.UpdatedAt.Before(prior.UpdatedAt) || len(next.Items) < len(prior.Items) {
+	if prior.RunID != next.RunID || prior.SideEffectPlanDigest != next.SideEffectPlanDigest || prior.QualificationInstallManifestDigest != next.QualificationInstallManifestDigest || prior.ProtectedInputDigest != next.ProtectedInputDigest || prior.ExecutionFailed && !next.ExecutionFailed || prior.JourneySucceeded && !next.JourneySucceeded || next.UpdatedAt.Before(prior.UpdatedAt) || len(next.Steps) < len(prior.Steps) || len(next.Items) < len(prior.Items) {
 		return fmt.Errorf("cleanup report authority regressed")
 	}
-	if next.JourneySucceeded && len(next.Items) == 0 {
-		return fmt.Errorf("cleanup report success attestation is empty")
+	if next.JourneySucceeded && (next.ExecutionFailed || !release.ValidDigest(next.ExecutorAttestationDigest)) {
+		return fmt.Errorf("cleanup report success attestation is incomplete")
+	}
+	steps := make(map[string]release.JourneyStepResult, len(next.Steps))
+	for _, step := range next.Steps {
+		steps[step.MutationID] = step
+		if (step.Outcome == release.StepFailed || step.Outcome == release.StepUnknown) && !next.ExecutionFailed {
+			return fmt.Errorf("cleanup report hides a failed execution")
+		}
+	}
+	for _, step := range prior.Steps {
+		nextStep, present := steps[step.MutationID]
+		if !present {
+			return fmt.Errorf("cleanup report removed a step")
+		}
+		valid := nextStep == step
+		if step.Outcome == release.StepSubmitted {
+			valid = valid || nextStep.MutationID == step.MutationID && nextStep.AttemptID == step.AttemptID && (nextStep.Outcome == release.StepPassed || nextStep.Outcome == release.StepFailed || nextStep.Outcome == release.StepUnknown)
+		}
+		if !valid {
+			return fmt.Errorf("cleanup report step transition is invalid")
+		}
 	}
 	byID := make(map[string]release.CleanupItem, len(next.Items))
 	for _, item := range next.Items {
@@ -112,9 +132,9 @@ func validateReportAdvance(prior, next release.LiveCleanupReport) error {
 		valid := nextItem == item
 		switch item.Result {
 		case release.CleanupSubmitted:
-			valid = nextItem.MutationID == item.MutationID && nextItem.Result == release.CleanupExecuted && nextItem.ObservedIdentity != ""
+			valid = valid || nextItem.MutationID == item.MutationID && nextItem.Result == release.CleanupExecuted && nextItem.ObservedIdentity != ""
 		case release.CleanupExecuted:
-			valid = nextItem.MutationID == item.MutationID && nextItem.ObservedIdentity == item.ObservedIdentity && (nextItem.Result == release.CleanupCleaned || nextItem.Result == release.CleanupRetained)
+			valid = valid || nextItem.MutationID == item.MutationID && nextItem.ObservedIdentity == item.ObservedIdentity && (nextItem.Result == release.CleanupCleaned || nextItem.Result == release.CleanupRetained)
 		}
 		if !valid {
 			return fmt.Errorf("cleanup report item transition is invalid")

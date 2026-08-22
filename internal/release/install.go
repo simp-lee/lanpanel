@@ -1,6 +1,7 @@
 package release
 
 import (
+	"bytes"
 	"fmt"
 	"lanpanel/internal/acmeaccount"
 	"reflect"
@@ -142,7 +143,22 @@ func VerifyQualificationInstallAuthority(expectedInstallManifestDigest string, i
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyDependencyAuthority(dependencies, target.Profile, assets); err != nil {
+	dependencyPaths, err := QualificationDependencyAssetPaths(dependencies)
+	if err != nil {
+		return nil, err
+	}
+	if len(assets) != len(dependencyPaths) && (len(assets) != len(dependencyPaths)+1 || !bytes.Equal(assets["lanpanel"], candidateBinaryBytes)) {
+		return nil, fmt.Errorf("qualification installer asset inventory contains extras")
+	}
+	dependencyAssets := make(map[string][]byte, len(dependencyPaths))
+	for _, path := range dependencyPaths {
+		value, present := assets[path]
+		if !present {
+			return nil, fmt.Errorf("qualification dependency asset %q is missing", path)
+		}
+		dependencyAssets[path] = value
+	}
+	if err := verifyDependencyAuthority(dependencies, target.Profile, dependencyAssets); err != nil {
 		return nil, err
 	}
 	profileDigest, _ := ProfileDigest(target.Profile)

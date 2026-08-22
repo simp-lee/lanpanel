@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	InstallationSchemaVersion = "lanpanel.installation.ga.v1"
+	InstallationSchemaVersion = "lanpanel.installation.ga.v2"
 	MaximumResources          = 256
 )
 
@@ -265,10 +265,11 @@ type Credential struct {
 	Fingerprint     string `json:"fingerprint,omitempty"`
 }
 type StaticContentRoot struct {
-	ID          string `json:"id"`
-	Path        string `json:"path"`
-	Fingerprint string `json:"fingerprint"`
-	Device      uint64 `json:"device"`
+	ID              string `json:"id"`
+	OwnerResourceID string `json:"owner_resource_id"`
+	Path            string `json:"path"`
+	Fingerprint     string `json:"fingerprint"`
+	Device          uint64 `json:"device"`
 }
 type StaticMapping struct {
 	URLPath      string `json:"url_path"`
@@ -613,7 +614,9 @@ func ValidateOperationTarget(operation OperationCode, target OperationTarget) er
 	}
 	allowed := false
 	switch operation {
-	case OperationPlan, OperationStatus:
+	case OperationPlan:
+		allowed = target.Kind == OperationTargetInstallation || target.Kind == OperationTargetResource || target.Kind == OperationTargetCredential
+	case OperationStatus:
 		allowed = target.Kind == OperationTargetInstallation || target.Kind == OperationTargetResource
 	case OperationConnectorBindingSet, OperationConnectorVerify, OperationConnectorLogin:
 		allowed = target.Kind == OperationTargetConnector
@@ -919,14 +922,16 @@ func ValidateInstallation(installation Installation) error {
 		}
 	}
 	staticRootIDs := map[string]struct{}{}
+	staticRootOwners := map[string]string{}
 	for index, root := range installation.StaticRoots {
-		if !strings.HasPrefix(root.ID, "static_") || len(root.ID) != 39 || !cleanAbsolutePath(root.Path) || !validSHA256Digest(root.Fingerprint) || root.Device == 0 {
+		if !strings.HasPrefix(root.ID, "static_") || len(root.ID) != 39 || !idPattern.MatchString(root.OwnerResourceID) || !cleanAbsolutePath(root.Path) || !validSHA256Digest(root.Fingerprint) || root.Device == 0 {
 			return fmt.Errorf("static_roots[%d] identity invalid", index)
 		}
 		if _, duplicate := staticRootIDs[root.ID]; duplicate {
 			return fmt.Errorf("static root duplicated")
 		}
 		staticRootIDs[root.ID] = struct{}{}
+		staticRootOwners[root.ID] = root.OwnerResourceID
 	}
 	if len(installation.Resources) > MaximumResources {
 		return fmt.Errorf("installation resource limit exceeds %d", MaximumResources)
@@ -940,6 +945,11 @@ func ValidateInstallation(installation Installation) error {
 		resourceIDs[resource.ID] = struct{}{}
 		if err := validateResource(*resource, credentialIDs, credentialOwners, staticRootIDs); err != nil {
 			return fmt.Errorf("resources[%d]: %w", index, err)
+		}
+		for _, rootID := range resourceStaticRootIDs(*resource) {
+			if rootID != "" && staticRootOwners[rootID] != resource.ID {
+				return fmt.Errorf("resources[%d]: static root belongs to another resource", index)
+			}
 		}
 		if resource.Target.Kind == AppTargetTailnetHTTP && installation.Connector == nil {
 			return fmt.Errorf("resources[%d]: tailnet_http requires connector binding", index)
@@ -970,12 +980,28 @@ func ValidateInstallation(installation Installation) error {
 			}
 		}
 	}
+	for _, owner := range staticRootOwners {
+		if _, present := resourceIDs[owner]; !present {
+			return fmt.Errorf("static root owner resource is missing")
+		}
+	}
 	for id, owner := range credentialOwners {
 		if _, present := resourceIDs[owner]; !present {
 			return fmt.Errorf("credential %q owner resource is missing", id)
 		}
 	}
 	return nil
+}
+
+func resourceStaticRootIDs(resource AppResource) []string {
+	ids := []string{}
+	if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.StaticRootID != "" {
+		ids = append(ids, resource.Publication.DomainHTTPS.StaticRootID)
+	}
+	if resource.PublicationRecord.LastAppliedBundle != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil && resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Static.RootID != "" {
+		ids = append(ids, resource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Static.RootID)
+	}
+	return ids
 }
 
 func validateManagement(authority ManagementAuthority) error {

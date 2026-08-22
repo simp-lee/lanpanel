@@ -30,6 +30,9 @@ const (
 	ProfileSystemctlNginxStart    ProfileID = "systemctl_nginx_start"
 	ProfileSystemctlNginxReload   ProfileID = "systemctl_nginx_reload"
 	ProfileSystemctlNginxStop     ProfileID = "systemctl_nginx_stop"
+	ProfileQualificationUIRestart ProfileID = "qualification_ui_restart"
+	ProfileQualificationReboot    ProfileID = "qualification_reboot"
+	ProfileQualificationServices  ProfileID = "qualification_services"
 	ProfileNginxStart             ProfileID = "nginx_start"
 	ProfileNginxTest              ProfileID = "nginx_test"
 	ProfileNginxDump              ProfileID = "nginx_dump"
@@ -229,6 +232,9 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxStart:    {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxReload:   {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxStop:     {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileQualificationUIRestart: {ID: ProfileQualificationUIRestart, Executable: "/usr/bin/systemctl", Arguments: []string{"restart", "lanpanel-ui.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileQualificationReboot:    {ID: ProfileQualificationReboot, Executable: "/usr/bin/systemctl", Arguments: []string{"reboot"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileQualificationServices:  {ID: ProfileQualificationServices, Executable: "/usr/bin/systemctl", Arguments: []string{"show", "--property=ActiveState", "--value", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-nginx.service", "lanpanel-headscale.service", "tailscaled.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAccounts:      {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleStart:         {ID: ProfileHeadscaleStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleStop:          {ID: ProfileHeadscaleStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},

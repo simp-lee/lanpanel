@@ -25,6 +25,43 @@ const (
 	maximumInstallerInputBytes = 32 << 20
 )
 
+type QualificationInstallerAuthority struct {
+	ACMEAccountContact            string
+	InstallManifest               []byte
+	TargetProfile                 []byte
+	SideEffectPlan                []byte
+	DependencyAuthority           []byte
+	ExpectedInstallManifestDigest string
+	RemoteAssetPaths              map[string]string
+	PackagePlan                   packages.Plan
+	PackagePreflight              preflight.Result
+}
+
+func BuildQualificationInstallerAuthority(authority QualificationInstallerAuthority) ([]byte, error) {
+	input := installerInput{
+		SchemaVersion: installerInputSchema, Kind: release.InstallQualification, ACMEAccountContact: authority.ACMEAccountContact,
+		ExpectedQualificationInstallManifestDigest: authority.ExpectedInstallManifestDigest,
+		QualificationInstallManifest:               authority.InstallManifest, QualificationTargetProfile: authority.TargetProfile,
+		LiveSideEffectPlan: authority.SideEffectPlan, QualificationDependencyAuthority: authority.DependencyAuthority,
+		AssetPaths: authority.RemoteAssetPaths, PackagePlan: authority.PackagePlan, PackagePreflight: authority.PackagePreflight,
+	}
+	data, err := json.Marshal(input)
+	if err != nil || len(data) == 0 || len(data) > maximumInstallerInputBytes {
+		return nil, fmt.Errorf("qualification installer authority is invalid or unbounded")
+	}
+	return data, nil
+}
+
+// RunQualificationInstallerAuthority is available only to the fixed
+// qualification-agent role; it preserves the same root and canonical input
+// checks as the inherited-fd installer entrypoint.
+func RunQualificationInstallerAuthority(data []byte, stdout io.Writer) error {
+	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
+		return fmt.Errorf("qualification installer requires root")
+	}
+	return runInstallerAuthority(data, stdout)
+}
+
 type installerInput struct {
 	SchemaVersion                              string              `json:"schema_version"`
 	Kind                                       release.InstallKind `json:"kind"`
@@ -57,6 +94,10 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 	if err != nil || len(data) == 0 || len(data) > maximumInstallerInputBytes {
 		return fmt.Errorf("installer release authority is missing or unbounded")
 	}
+	return runInstallerAuthority(data, stdout)
+}
+
+func runInstallerAuthority(data []byte, stdout io.Writer) error {
 	var input installerInput
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -132,7 +173,8 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 		}
 		bound := false
 		for _, mutation := range plan.Mutations {
-			if mutation.ID == "clean_install" && mutation.PriorStateDigest == beforeInventory {
+			expectedPrior := "bootstrap-inventory/" + beforeInventory
+			if mutation.ID == "clean_install" && mutation.PriorState == expectedPrior && mutation.PriorStateDigest == release.DigestBytes([]byte(expectedPrior)) {
 				bound = true
 			}
 		}

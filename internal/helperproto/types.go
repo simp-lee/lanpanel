@@ -453,7 +453,7 @@ func validStatusCredential(id, fingerprint string, changed bool) bool {
 }
 
 func validDomainStatus(value ResourceResult) bool {
-	if value.Status != "healthy" && value.Status != "degraded" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || !validStatusCredential(value.CredentialID, value.CredentialFingerprint, value.CredentialChanged) || !validStatusCredential(value.GoAccessCredentialID, value.GoAccessCredentialFingerprint, value.GoAccessCredentialChanged) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.StaticChanged && value.StaticFingerprint == "" {
+	if value.Status != "healthy" && value.Status != "degraded" && value.Status != "unknown" && value.Status != "source_verified_runtime_unknown" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || !validStatusCredential(value.CredentialID, value.CredentialFingerprint, value.CredentialChanged) || !validStatusCredential(value.GoAccessCredentialID, value.GoAccessCredentialFingerprint, value.GoAccessCredentialChanged) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.StaticChanged && value.StaticFingerprint == "" {
 		return false
 	}
 	retirement := value.GoAccessRetirementJobID != "" || len(value.GoAccessRetirementGenerations) != 0
@@ -470,7 +470,7 @@ func validDomainStatus(value ResourceResult) bool {
 		}
 	}
 	degradedActions := len(value.AllowedActions) == 2 && value.AllowedActions[0] == "unpublish" && value.AllowedActions[1] == "close_all"
-	return value.Status == "degraded" && value.AccessMayRemain && degradedActions && (!retirement || value.Reason == "GoAccess retirement pending") || value.Status == "healthy" && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0 && !retirement
+	return value.Status == "degraded" && value.AccessMayRemain && degradedActions && (!retirement || value.Reason == "GoAccess retirement pending") || (value.Status == "healthy" || value.Status == "unknown" || value.Status == "source_verified_runtime_unknown") && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0 && !retirement
 }
 
 func validDisplay(value string) bool {

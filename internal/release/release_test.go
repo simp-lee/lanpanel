@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"lanpanel/internal/dependencies"
+	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -12,32 +14,42 @@ import (
 
 func TestLiveCleanupMustCoverImmutablePlanExactly(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	plan := LiveSideEffectPlan{SchemaVersion: LiveSideEffectPlanSchemaVersion, RunID: "run-one", AuthorizedHostFingerprint: "host-one", CreatedAt: now, Mutations: []PlannedMutation{{ID: "delete", ScopeDigest: digest("scope"), PriorStateDigest: digest("prior"), PlannedMutationDigest: digest("mutation"), SelectorDigest: digest("selector"), CleanupPolicy: "delete_exact"}, {ID: "retained", ScopeDigest: digest("scope-2"), PriorStateDigest: digest("prior-2"), PlannedMutationDigest: digest("mutation-2"), SelectorDigest: digest("selector-2"), CleanupPolicy: "retain_authorized"}}}
+	plan := LiveSideEffectPlan{SchemaVersion: LiveSideEffectPlanSchemaVersion, RunID: "run-one", AuthorizedHostFingerprint: "host-one", CreatedAt: now, Mutations: []PlannedMutation{plannedMutation("delete", "scope", "prior", "mutation", "selector", "delete_exact"), plannedMutation("retained", "scope-2", "prior-2", "mutation-2", "selector-2", "retain_authorized")}}
 	planBytes, err := MarshalCanonical(plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifestDigest := digest("install-manifest")
-	report := LiveCleanupReport{SchemaVersion: LiveCleanupReportSchemaVersion, RunID: plan.RunID, SideEffectPlanDigest: DigestBytes(planBytes), QualificationInstallManifestDigest: manifestDigest, ProtectedInputDigest: DigestBytes([]byte("input")), JourneySucceeded: true, UpdatedAt: now.Add(time.Second), Items: []CleanupItem{{MutationID: "delete", ObservedIdentity: "dns/example", Result: CleanupCleaned}, {MutationID: "retained", ObservedIdentity: "host/package", Result: CleanupRetained}}}
+	inputDigest := DigestBytes([]byte("input"))
+	steps := []JourneyStepResult{{MutationID: "delete", AttemptID: "attempt-delete", Outcome: StepPassed, EvidenceDigest: digest("delete-evidence")}, {MutationID: "retained", AttemptID: "attempt-retained", Outcome: StepPassed, EvidenceDigest: digest("retained-evidence")}}
+	cleanup := []CleanupItem{{MutationID: "delete", ObservedIdentity: "dns/example", Result: CleanupCleaned}, {MutationID: "retained", ObservedIdentity: "host/package", Result: CleanupRetained}}
+	attestation := LiveExecutorAttestation{SchemaVersion: LiveExecutorAttestationSchemaVersion, ExecutorIdentity: "lanpanel-trusted-live-executor-v1", RunID: plan.RunID, CandidateDigest: digest("candidate"), TargetProfileDigest: digest("profile"), SideEffectPlanDigest: DigestBytes(planBytes), QualificationInstallManifestDigest: manifestDigest, ProtectedInputDigest: inputDigest, TargetHostFingerprint: "host-one", ExternalVantageDigest: digest("vantage"), DNSProvider: "cloudflare", DNSLiveTested: true, TailnetLiveStatus: "not_live_tested", Steps: []AttestedJourneyStep{{MutationID: "delete", EvidenceDigest: steps[0].EvidenceDigest}, {MutationID: "retained", EvidenceDigest: steps[1].EvidenceDigest}}, Cleanup: cleanup, CompletedAt: now.Add(time.Second)}
+	attestationBytes, err := MarshalCanonical(attestation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := LiveCleanupReport{SchemaVersion: LiveCleanupReportSchemaVersion, RunID: plan.RunID, SideEffectPlanDigest: DigestBytes(planBytes), QualificationInstallManifestDigest: manifestDigest, ProtectedInputDigest: inputDigest, JourneySucceeded: true, ExecutorAttestationDigest: DigestBytes(attestationBytes), UpdatedAt: now.Add(2 * time.Second), Steps: steps, Items: cleanup}
 	reportBytes, err := MarshalCanonical(report)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyLiveCleanup(planBytes, reportBytes, manifestDigest, DigestBytes([]byte("input"))); err != nil {
+	if _, _, err := VerifyLiveCleanup(planBytes, reportBytes, attestationBytes, manifestDigest, inputDigest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyLiveCleanup(planBytes, reportBytes, manifestDigest, DigestBytes([]byte("changed-input"))); err == nil {
+	if _, _, err := VerifyLiveCleanup(planBytes, reportBytes, attestationBytes, manifestDigest, DigestBytes([]byte("changed-input"))); err == nil {
 		t.Fatal("cleanup report accepted different protected input")
 	}
 	report.JourneySucceeded = false
+	report.ExecutorAttestationDigest = ""
 	reportBytes, _ = MarshalCanonical(report)
-	if _, err := VerifyLiveCleanup(planBytes, reportBytes, manifestDigest, DigestBytes([]byte("input"))); err == nil {
+	if _, _, err := VerifyLiveCleanup(planBytes, reportBytes, attestationBytes, manifestDigest, inputDigest); err == nil {
 		t.Fatal("cleanup-only report was accepted as successful journey")
 	}
 	report.JourneySucceeded = true
+	report.ExecutorAttestationDigest = DigestBytes(attestationBytes)
 	report.Items[0].Result = CleanupRetained
 	reportBytes, _ = MarshalCanonical(report)
-	if _, err := VerifyLiveCleanup(planBytes, reportBytes, manifestDigest, DigestBytes([]byte("input"))); err == nil {
+	if _, _, err := VerifyLiveCleanup(planBytes, reportBytes, attestationBytes, manifestDigest, inputDigest); err == nil {
 		t.Fatal("delete_exact residue was accepted")
 	}
 }
@@ -99,16 +111,25 @@ func TestQualificationInstallBindsCandidateTargetHostAndImmutablePlan(t *testing
 	target := QualificationTargetProfile{SchemaVersion: QualificationTargetProfileSchemaVersion, Profile: profile, CapturedAt: now}
 	targetBytes, _ := MarshalCanonical(target)
 	profileDigest, _ := ProfileDigest(profile)
-	plan := LiveSideEffectPlan{SchemaVersion: LiveSideEffectPlanSchemaVersion, RunID: "run-one", AuthorizedHostFingerprint: "host-one", CreatedAt: now, Mutations: []PlannedMutation{{ID: "clean_install", ScopeDigest: digest("scope"), PriorStateDigest: digest("prior"), PlannedMutationDigest: digest("mutation"), SelectorDigest: digest("selector"), CleanupPolicy: "retain_authorized"}}}
+	plan := LiveSideEffectPlan{SchemaVersion: LiveSideEffectPlanSchemaVersion, RunID: "run-one", AuthorizedHostFingerprint: "host-one", CreatedAt: now, Mutations: []PlannedMutation{plannedMutation("clean_install", "scope", "prior", "mutation", "selector", "retain_authorized")}}
 	planBytes, _ := MarshalCanonical(plan)
 	dependencyBytes, _, dependencyAssets, baseline := dependencyAuthorityFixture(t, profile)
 	dependencyAssets["dependency-baseline.json"] = baseline
 	binary := []byte("candidate-binary")
-	manifest := QualificationInstallManifest{SchemaVersion: QualificationInstallManifestSchemaVersion, RunID: plan.RunID, ReleaseTag: "v1.0.0", CandidateBinary: identity("lanpanel", binary), SourceTreeDigest: digest("source"), DependencyManifestDigest: DigestBytes(dependencyBytes), TargetProfileDigest: profileDigest, AuthorizedHostFingerprint: plan.AuthorizedHostFingerprint, SideEffectPlanDigest: DigestBytes(planBytes), ProtectedAuthorityDigest: digest("protected-authority"), ACMEAccountContact: "admin@example.test", CreatedAt: now.Add(time.Second)}
+	manifest := QualificationInstallManifest{SchemaVersion: QualificationInstallManifestSchemaVersion, RunID: plan.RunID, ReleaseTag: "v1.0.0", CandidateBinary: identity("lanpanel", binary), SourceArchive: identity("lanpanel-v1.0.0.tar.gz", []byte("source-archive")), SBOM: identity("lanpanel.spdx.json", []byte("sbom")), SourceTreeDigest: digest("source"), DependencyManifestDigest: DigestBytes(dependencyBytes), TargetProfileDigest: profileDigest, AuthorizedHostFingerprint: plan.AuthorizedHostFingerprint, SideEffectPlanDigest: DigestBytes(planBytes), JourneySpecDigest: digest("journey-spec"), PackageTemplateDigest: digest("package-template"), ExternalVantageDigest: digest("vantage"), ProtectedAuthorityDigest: digest("protected-authority"), ACMEAccountContact: "admin@example.test", CreatedAt: now.Add(time.Second)}
 	manifestBytes, _ := MarshalCanonical(manifest)
 	authority, err := VerifyQualificationInstallAuthority(DigestBytes(manifestBytes), manifestBytes, targetBytes, planBytes, dependencyBytes, binary, dependencyAssets, QualificationInstallObservation{HostFingerprint: "host-one", ObservedAt: now.Add(2 * time.Second)})
 	if err != nil {
 		t.Fatal(err)
+	}
+	installerAssets := cloneBytesMap(dependencyAssets)
+	installerAssets["lanpanel"] = binary
+	if _, err := VerifyQualificationInstallAuthority(DigestBytes(manifestBytes), manifestBytes, targetBytes, planBytes, dependencyBytes, binary, installerAssets, QualificationInstallObservation{HostFingerprint: "host-one", ObservedAt: now.Add(2 * time.Second)}); err != nil {
+		t.Fatalf("installer candidate plus exact dependency assets rejected: %v", err)
+	}
+	installerAssets["unexpected-secret"] = []byte("must-not-pass")
+	if _, err := VerifyQualificationInstallAuthority(DigestBytes(manifestBytes), manifestBytes, targetBytes, planBytes, dependencyBytes, binary, installerAssets, QualificationInstallObservation{HostFingerprint: "host-one", ObservedAt: now.Add(2 * time.Second)}); err == nil {
+		t.Fatal("qualification installer accepted an extra asset")
 	}
 	installed := authority.Identity()
 	if installed.Kind != InstallQualification || installed.ReleaseManifestDigest != "" || installed.QualificationInstallManifestDigest != DigestBytes(manifestBytes) || installed.SideEffectPlanDigest != DigestBytes(planBytes) {
@@ -162,7 +183,14 @@ func TestSecurityGateRejectsUnresolvedMaterialFinding(t *testing.T) {
 func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest, []byte, []byte, map[string][]byte) {
 	t.Helper()
 	profile := testProfile()
-	binary := []byte("binary")
+	binaryPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(binaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dependencyBytes, dependency, dependencyAssets, baseline := dependencyAuthorityFixture(t, profile)
 	sourceArchive := sourceArchiveFixture(t)
 	sourceTreeDigest, sourceErr := SourceArchiveTreeDigest(sourceArchive)
@@ -171,11 +199,12 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 	}
 	profileDigest, _ := ProfileDigest(profile)
 	providers := []ProviderLiveTest{{Provider: "cloudflare", Status: "live_tested"}, {Provider: "digitalocean", Status: "not_live_tested"}, {Provider: "gcloud", Status: "not_live_tested"}, {Provider: "route53", Status: "not_live_tested"}, {Provider: "tencentcloud", Status: "not_live_tested"}}
-	sbomBytes, sbomErr := MarshalCanonical(SPDXDocument{SPDXVersion: "SPDX-2.3", DataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", Name: "lanpanel-test", DocumentNamespace: "https://lanpanel.invalid/spdx/test", CreationInfo: SPDXCreation{Created: time.Unix(1_700_000_000, 0).UTC().Format(time.RFC3339), Creators: []string{"Tool: test"}}, Packages: []SPDXPackage{{Name: "lanpanel", SPDXID: "SPDXRef-Package-lanpanel", VersionInfo: "v1.0.0", DownloadLocation: "NOASSERTION", FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION", Checksums: []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: DigestBytes(binary)}}}}, Relationships: []SPDXRelationship{{SPDXElementID: "SPDXRef-DOCUMENT", RelationshipType: "DESCRIBES", RelatedSPDXElement: "SPDXRef-Package-lanpanel"}}})
+	sbomBytes, sbomErr := GenerateSPDX(binaryPath, time.Unix(1_700_000_000, 0).UTC())
 	if sbomErr != nil {
 		t.Fatal(sbomErr)
 	}
-	summaryBytes, summaryErr := MarshalCanonical(QualificationSummary{SchemaVersion: QualificationSummarySchemaVersion, RunID: "run-one", CandidateDigest: DigestBytes(binary), SourceTreeDigest: sourceTreeDigest, TargetProfileDigest: profileDigest, InstallManifestDigest: digest("install"), SideEffectPlanDigest: digest("plan"), ProtectedInputDigest: digest("input"), CleanupReportDigest: digest("cleanup"), JourneySucceeded: true, ProviderLiveTests: providers, CompletedAt: time.Unix(1_700_000_000, 0).UTC()})
+	sbomBytes = releaseSPDXFixture(t, sbomBytes, dependency, profile)
+	summaryBytes, summaryErr := MarshalCanonical(QualificationSummary{SchemaVersion: QualificationSummarySchemaVersion, RunID: "run-one", CandidateDigest: DigestBytes(binary), SourceTreeDigest: sourceTreeDigest, TargetProfileDigest: profileDigest, InstallManifestDigest: digest("install"), SideEffectPlanDigest: digest("plan"), ProtectedInputDigest: digest("input"), CleanupReportDigest: digest("cleanup"), ExecutorAttestationDigest: digest("attestation"), JourneySucceeded: true, TailnetLiveStatus: "not_live_tested", ProviderLiveTests: providers, CompletedAt: time.Unix(1_700_000_000, 0).UTC()})
 	if summaryErr != nil {
 		t.Fatal(summaryErr)
 	}
@@ -194,9 +223,9 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 		"tailscale.tar.gz":           dependencyAssets["tailscale.tar.gz"],
 		"tailscale":                  dependencyAssets["tailscale"],
 		"qualification-summary.json": summaryBytes,
-		"known-limitations.md":       []byte("limitations"),
+		"known-limitations.md":       []byte("Clean installation only.\nNo supported product backup/restore.\nNo generic Repair.\nNo EdgeOne integration.\nNo connector disconnect, logout, reset, rejoin, or rebind automation.\nConnector mismatches must be resolved outside LanPanel.\nTailnet is not live tested.\nTemporary public HTTP is plaintext and does not expire automatically.\nFail-closed Nginx stop can interrupt Headscale control ingress.\n"),
 	}
-	reportBytes, err := MarshalCanonical(testSecurityReport(DigestBytes(binary), resolution))
+	reportBytes, err := MarshalCanonical(testSecurityReport(DigestBytes(binary), DigestBytes(sbomBytes), DigestBytes(dependencyBytes), profileDigest, resolution))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,12 +361,43 @@ func tarGzipFixture(t *testing.T, members map[string][]byte) []byte {
 	return output.Bytes()
 }
 
-func testSecurityReport(candidate string, resolution FindingResolution) SecurityReport {
+func releaseSPDXFixture(t *testing.T, data []byte, dependency QualificationDependencyAuthority, profile OSProfile) []byte {
+	t.Helper()
+	var document SPDXDocument
+	if err := DecodeCanonical(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	for index := range document.Packages {
+		if document.Packages[index].SPDXID == "SPDXRef-Package-lanpanel" {
+			document.Packages[index].VersionInfo = "v1.0.0"
+		}
+	}
+	document.Packages = append(document.Packages,
+		spdxNativePackage("headscale", dependency.Headscale.Version, dependency.Headscale.ArtifactIdentity, dependency.Headscale.Archive.Digest),
+		spdxNativePackage("lego", dependency.LegoVersion, dependency.LegoArtifactIdentity, dependency.LegoArchive.Digest),
+		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
+	)
+	for _, tuple := range profile.Packages {
+		document.Packages = append(document.Packages, SPDXPackage{Name: tuple.Name, SPDXID: spdxID("os-" + tuple.Name + "-" + tuple.Architecture), VersionInfo: tuple.Version, DownloadLocation: profile.RepositorySource, FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"})
+	}
+	sort.Slice(document.Packages, func(i, j int) bool { return document.Packages[i].SPDXID < document.Packages[j].SPDXID })
+	document.Relationships = make([]SPDXRelationship, len(document.Packages))
+	for index, pkg := range document.Packages {
+		document.Relationships[index] = SPDXRelationship{SPDXElementID: "SPDXRef-DOCUMENT", RelationshipType: "DESCRIBES", RelatedSPDXElement: pkg.SPDXID}
+	}
+	encoded, err := MarshalCanonical(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func testSecurityReport(candidate, sbom, dependency, profile string, resolution FindingResolution) SecurityReport {
 	finding := SecurityFinding{ID: "GO-TEST-1", Component: "module-one", Severity: SeverityHigh, InShippedClosure: true, RuntimeReachable: true, Resolution: resolution}
 	if resolution != ResolutionUnresolved {
 		finding.EvidenceDigest = digest("resolution")
 	}
-	return SecurityReport{SchemaVersion: SecurityReportSchemaVersion, CandidateDigest: candidate, ScannedAt: time.Unix(1_700_000_000, 0).UTC(), Scanners: []ScannerIdentity{{Kind: "distro_security", Name: "debian-security-tracker", Version: "2026.08", DatabaseDigest: digest("distro-db"), Coverage: "runtime_os_packages"}, {Kind: "go_vulnerability", Name: "govulncheck", Version: "1.1.4", DatabaseDigest: digest("go-db"), Coverage: "go_binary"}, {Kind: "sbom_osv", Name: "osv-scanner", Version: "2.0.3", DatabaseDigest: digest("osv-db"), Coverage: "sbom"}}, Findings: []SecurityFinding{finding}}
+	return SecurityReport{SchemaVersion: SecurityReportSchemaVersion, CandidateDigest: candidate, SBOMDigest: sbom, DependencyManifestDigest: dependency, TargetProfileDigest: profile, ScannedAt: time.Unix(1_700_000_000, 0).UTC(), Scanners: []ScannerIdentity{{Kind: "distro_security", Name: "debian-security-tracker", Version: "2026.08", DatabaseDigest: digest("distro-db"), Coverage: "runtime_os_packages"}, {Kind: "go_vulnerability", Name: "govulncheck", Version: "1.1.4", DatabaseDigest: digest("go-db"), Coverage: "go_binary"}, {Kind: "sbom_osv", Name: "osv-scanner", Version: "2.0.3", DatabaseDigest: digest("osv-db"), Coverage: "sbom"}}, Findings: []SecurityFinding{finding}}
 }
 
 func checksumsFor(t *testing.T, assets map[string][]byte) []byte {
@@ -355,6 +415,10 @@ func checksumsFor(t *testing.T, assets map[string][]byte) []byte {
 
 func identity(path string, data []byte) AssetIdentity {
 	return AssetIdentity{Path: path, Digest: DigestBytes(data), Bytes: uint64(len(data))}
+}
+
+func plannedMutation(id, scope, prior, mutation, selector, policy string) PlannedMutation {
+	return PlannedMutation{ID: id, Scope: scope, ScopeDigest: DigestBytes([]byte(scope)), PriorState: prior, PriorStateDigest: DigestBytes([]byte(prior)), PlannedMutation: mutation, PlannedMutationDigest: DigestBytes([]byte(mutation)), Selector: selector, SelectorDigest: DigestBytes([]byte(selector)), CleanupPolicy: policy}
 }
 
 func digest(seed string) string {

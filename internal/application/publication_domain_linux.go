@@ -229,7 +229,7 @@ func requireAppliedDomainSourcesHealthy(resource domain.AppResource) error {
 	if err != nil {
 		return err
 	}
-	if status.Status != "healthy" || status.AccessMayRemain {
+	if status.Status == "degraded" || status.AccessMayRemain {
 		return fmt.Errorf("applied domain source degraded; unpublish required")
 	}
 	return nil

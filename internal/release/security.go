@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const SecurityReportSchemaVersion = "lanpanel.release.security-report.v1"
+const SecurityReportSchemaVersion = "lanpanel.release.security-report.v2"
 
 type Severity string
 
@@ -46,11 +46,14 @@ type SecurityFinding struct {
 }
 
 type SecurityReport struct {
-	SchemaVersion   string            `json:"schema_version"`
-	CandidateDigest string            `json:"candidate_digest"`
-	ScannedAt       time.Time         `json:"scanned_at"`
-	Scanners        []ScannerIdentity `json:"scanners"`
-	Findings        []SecurityFinding `json:"findings"`
+	SchemaVersion            string            `json:"schema_version"`
+	CandidateDigest          string            `json:"candidate_digest"`
+	SBOMDigest               string            `json:"sbom_digest"`
+	DependencyManifestDigest string            `json:"dependency_manifest_digest"`
+	TargetProfileDigest      string            `json:"target_profile_digest"`
+	ScannedAt                time.Time         `json:"scanned_at"`
+	Scanners                 []ScannerIdentity `json:"scanners"`
+	Findings                 []SecurityFinding `json:"findings"`
 }
 
 var requiredScannerCoverage = map[string]string{
@@ -71,7 +74,7 @@ func DecodeSecurityReport(data []byte) (SecurityReport, error) {
 }
 
 func ValidateSecurityReport(report SecurityReport) error {
-	if report.SchemaVersion != SecurityReportSchemaVersion || !ValidDigest(report.CandidateDigest) || !sameUTCSecond(report.ScannedAt) || len(report.Scanners) != len(requiredScannerCoverage) {
+	if report.SchemaVersion != SecurityReportSchemaVersion || !ValidDigest(report.CandidateDigest) || !ValidDigest(report.SBOMDigest) || !ValidDigest(report.DependencyManifestDigest) || !ValidDigest(report.TargetProfileDigest) || !sameUTCSecond(report.ScannedAt) || len(report.Scanners) != len(requiredScannerCoverage) {
 		return fmt.Errorf("security report identity, time, or scanner inventory is invalid")
 	}
 	previous := ""

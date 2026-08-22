@@ -22,7 +22,11 @@ func BuildSummary(prepared Prepared, report release.LiveCleanupReport, completed
 	if err != nil {
 		return nil, err
 	}
-	verified, err := release.VerifyLiveCleanup(prepared.PlanBytes, reportBytes, prepared.InstallManifestDigest, prepared.InputDigest)
+	attestationBytes, _, err := readProtectedFile(prepared.Input.Artifacts.ExecutorAttestation, 4<<20, true)
+	if err != nil {
+		return nil, err
+	}
+	verified, attestation, err := release.VerifyLiveCleanup(prepared.PlanBytes, reportBytes, attestationBytes, prepared.InstallManifestDigest, prepared.InputDigest)
 	if err != nil || !reflect.DeepEqual(verified, report) {
 		return nil, fmt.Errorf("qualification summary requires verified final readiness: %w", err)
 	}
@@ -38,7 +42,7 @@ func BuildSummary(prepared Prepared, report release.LiveCleanupReport, completed
 		providers = append(providers, release.ProviderLiveTest{Provider: name, Status: status})
 	}
 	installIdentity := prepared.Install.Identity()
-	summary := release.QualificationSummary{SchemaVersion: release.QualificationSummarySchemaVersion, RunID: prepared.Input.RunID, CandidateDigest: installIdentity.CandidateDigest, SourceTreeDigest: prepared.SourceDigest, TargetProfileDigest: installIdentity.ProfileDigest, InstallManifestDigest: prepared.InstallManifestDigest, SideEffectPlanDigest: prepared.PlanDigest, ProtectedInputDigest: prepared.InputDigest, CleanupReportDigest: release.DigestBytes(reportBytes), JourneySucceeded: true, ProviderLiveTests: append([]release.ProviderLiveTest(nil), providers...), CompletedAt: completedAt}
+	summary := release.QualificationSummary{SchemaVersion: release.QualificationSummarySchemaVersion, RunID: prepared.Input.RunID, CandidateDigest: installIdentity.CandidateDigest, SourceTreeDigest: prepared.SourceDigest, TargetProfileDigest: installIdentity.ProfileDigest, InstallManifestDigest: prepared.InstallManifestDigest, SideEffectPlanDigest: prepared.PlanDigest, ProtectedInputDigest: prepared.InputDigest, CleanupReportDigest: release.DigestBytes(reportBytes), ExecutorAttestationDigest: release.DigestBytes(attestationBytes), JourneySucceeded: true, TailnetLiveStatus: attestation.TailnetLiveStatus, ProviderLiveTests: append([]release.ProviderLiveTest(nil), providers...), CompletedAt: completedAt}
 	encoded, err := release.MarshalCanonical(summary)
 	if err != nil {
 		return nil, err
@@ -47,6 +51,28 @@ func BuildSummary(prepared Prepared, report release.LiveCleanupReport, completed
 		return nil, err
 	}
 	return encoded, nil
+}
+
+func WriteQualificationSummary(path string, data []byte) error {
+	if err := WriteSummary(path, data); err != nil {
+		return err
+	}
+	return sealProtectedFile(path)
+}
+
+func sealProtectedFile(path string) error {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("protected artifact descriptor is invalid")
+	}
+	chmodErr := file.Chmod(0o400)
+	closeErr := file.Close()
+	return errors.Join(chmodErr, closeErr)
 }
 
 func WriteSummary(path string, data []byte) error {

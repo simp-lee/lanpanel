@@ -996,6 +996,24 @@ func verifyCommittedBundle(paths Paths, journal Journal, commit Commit) error {
 	return nil
 }
 
+func ReadCommittedInstallIdentity(paths Paths) (release.InstallIdentity, error) {
+	if err := RequireCommitted(paths); err != nil {
+		return release.InstallIdentity{}, err
+	}
+	if paths.PersistentRoot == "" {
+		paths = FixedPaths()
+	}
+	store, journal, err := openJournal(paths.Journal, 0, 0)
+	if err != nil {
+		return release.InstallIdentity{}, err
+	}
+	defer func() { _ = store.close() }()
+	if err := release.ValidateInstallIdentity(journal.Release); err != nil {
+		return release.InstallIdentity{}, err
+	}
+	return journal.Release, nil
+}
+
 func RequireCommitted(paths Paths) error {
 	if os.Geteuid() != 0 {
 		return requirePublicStartupAuthority(paths)

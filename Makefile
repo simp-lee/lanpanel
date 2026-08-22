@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := check
 
-.PHONY: build test vet lint check tidy ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-live-qualification-preflight ga-final-release-readiness-check
+.PHONY: build test vet lint check tidy ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
@@ -66,7 +66,7 @@ ga-helper-boundary-audit:
 	@grep -Fq 'runtime.LockOSThread' internal/child/executor_linux.go
 	@grep -Fq 'setExactCapabilities' internal/child/executor_linux.go
 	@grep -Fq 'validOperationTarget' internal/helperproto/types.go
-	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); expected=$$(printf '%s\n' internal/child/executor_linux.go internal/process/managed_exec_linux.go); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = "$$expected" || { printf 'external process call escaped fixed executor boundary:\n%s\n' "$$found" >&2; exit 1; }
+	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); expected=$$(printf '%s\n' internal/child/executor_linux.go internal/process/managed_exec_linux.go internal/qualification/generator_linux.go); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = "$$expected" || { printf 'external process call escaped fixed executor boundary:\n%s\n' "$$found" >&2; exit 1; }
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"([^" ]*/)?(sh|bash|dash)"|"([^" ]*/)?(sudo|doas|pkexec|su)"' internal cmd; then echo 'shell or sudo-like executable remains in production' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -n -E 'Command|Arguments|Argv|Unit|Path' internal/helperproto/types.go; then echo 'generic command, unit, argv, or path entered helper request schema' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
@@ -87,18 +87,34 @@ ga-final-asset-selftest:
 
 ga-qualification-tooling-selftest:
 	$(GO) test -count=1 ./internal/qualification ./cmd/lanpanel-qualification
-	@grep -Fq 'Observe(ctx, step)' internal/qualification/journey.go
+	@grep -Fq 'Executor.Observe(observeCtx, step)' internal/qualification/journey.go
 	@grep -Fq 'context.WithoutCancel(ctx)' internal/qualification/journey.go
+	@grep -Fq 'lanpanel-trusted-live-executor-v1' internal/qualification/live_executor_linux.go
+
+ga-generate-qualification-artifacts:
+	@test -n "$(QUALIFICATION_GENERATION_INPUT)" || { echo 'QUALIFICATION_GENERATION_INPUT protected file is required' >&2; exit 2; }
+	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'qualification source worktree must be clean' >&2; exit 1; }
+	$(GO) run ./cmd/lanpanel-qualification generate "$(QUALIFICATION_GENERATION_INPUT)"
 
 ga-live-qualification-preflight:
 	@test -n "$(QUALIFICATION_INPUT)" || { echo 'QUALIFICATION_INPUT protected reference is required' >&2; exit 2; }
 	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'qualification source worktree must be clean' >&2; exit 1; }
 	$(GO) run ./cmd/lanpanel-qualification preflight "$(QUALIFICATION_INPUT)"
 
+ga-run-live-journey:
+	@test -n "$(QUALIFICATION_INPUT)" || { echo 'QUALIFICATION_INPUT protected reference is required' >&2; exit 2; }
+	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'qualification source worktree must be clean' >&2; exit 1; }
+	$(GO) run ./cmd/lanpanel-qualification run "$(QUALIFICATION_INPUT)"
+
 ga-final-release-readiness-check:
 	@test -n "$(QUALIFICATION_INPUT)" || { echo 'QUALIFICATION_INPUT protected reference is required' >&2; exit 2; }
 	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'final release source worktree must be clean' >&2; exit 1; }
 	$(GO) run ./cmd/lanpanel-qualification final "$(QUALIFICATION_INPUT)"
+
+ga-finalize-release:
+	@test -n "$(RELEASE_FINALIZE_INPUT)" || { echo 'RELEASE_FINALIZE_INPUT protected file is required' >&2; exit 2; }
+	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'final release source worktree must be clean' >&2; exit 1; }
+	$(GO) run ./cmd/lanpanel-qualification release "$(RELEASE_FINALIZE_INPUT)"
 
 ga-local-gate: check lint ga-vulnerability-scan ga-release-tooling-selftest ga-final-asset-selftest
 	$(GO) test -race -count=1 ./...

@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/nginxguard"
 	"lanpanel/internal/packages"
 	managedprocess "lanpanel/internal/process"
+	"lanpanel/internal/qualification"
 	"lanpanel/internal/relay"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/roles"
@@ -64,6 +65,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return managedprocess.RunGuard(args, application.RunningProcessBundles)
 		}},
 		{Name: roles.ManagedExecutor, Handler: func(args []string, _, _ io.Writer) error { return managedprocess.Execute(args) }},
+		{Name: roles.QualificationAgent, Handler: func(args []string, stdout, _ io.Writer) error {
+			return qualification.RunAgentRole(args, os.Stdin, stdout)
+		}},
+		{Name: roles.QualificationFixture, Handler: func(args []string, _, _ io.Writer) error { return qualification.RunFixtureRole(args) }},
 		{Name: roles.HeadscalePrivateProbe, Handler: func(args []string, _, _ io.Writer) error { return control.RunPrivateProbe(args) }},
 		{Name: roles.HeadscaleControlRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunControlRelay(args) }},
 		{Name: roles.HeadscaleSTUNRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunSTUNRelay(args) }},

@@ -21,6 +21,20 @@ const machineIDPath = "/etc/machine-id"
 func ObserveHostFingerprint() (string, error)            { return observeHostFingerprint() }
 func ObserveBeforeInventory(paths Paths) (string, error) { return observeBeforeInventory(paths) }
 
+func BeforeInventoryPaths(paths Paths) []string {
+	nginxPaths := nginx.FixedPaths()
+	if paths != FixedPaths() {
+		nginxPaths = testNginxPaths(paths)
+	}
+	roots := []string{paths.Journal, paths.StartupAuthority, paths.CommitPath, paths.PersistentRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath}
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
+		roots = append(roots, filepath.Join(paths.SystemdRoot, name))
+	}
+	roots = append(roots, filepath.Join(paths.SystemdRoot, "nginx.service"))
+	sort.Strings(roots)
+	return roots
+}
+
 func observeHostFingerprint() (string, error) {
 	data, err := readRootRegular(machineIDPath, 4096, 0o644)
 	if err != nil {
@@ -40,18 +54,8 @@ func observeHostFingerprint() (string, error) {
 }
 
 func observeBeforeInventory(paths Paths) (string, error) {
-	nginxPaths := nginx.FixedPaths()
-	if paths != FixedPaths() {
-		nginxPaths = testNginxPaths(paths)
-	}
-	roots := []string{paths.Journal, paths.StartupAuthority, paths.CommitPath, paths.PersistentRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath}
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
-		roots = append(roots, filepath.Join(paths.SystemdRoot, name))
-	}
-	roots = append(roots, filepath.Join(paths.SystemdRoot, "nginx.service"))
-	sort.Strings(roots)
 	hasher := sha256.New()
-	for _, path := range roots {
+	for _, path := range BeforeInventoryPaths(paths) {
 		var stat unix.Stat_t
 		err := unix.Lstat(path, &stat)
 		if err != nil {

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/packages"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"net/url"
 	"os"
@@ -18,7 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const ProtectedInputSchemaVersion = "lanpanel.qualification.protected-input.v3"
+const ProtectedInputSchemaVersion = "lanpanel.qualification.protected-input.v4"
 
 var orderedJourney = []string{
 	"clean_install",
@@ -39,13 +41,17 @@ var orderedJourney = []string{
 type ArtifactReferences struct {
 	CandidateBinary      string            `json:"candidate_binary"`
 	SourceArchive        string            `json:"source_archive"`
+	SBOM                 string            `json:"sbom"`
 	SourceRoot           string            `json:"source_root"`
 	TargetProfile        string            `json:"target_profile"`
 	SideEffectPlan       string            `json:"side_effect_plan"`
 	InstallManifest      string            `json:"install_manifest"`
 	DependencyAuthority  string            `json:"dependency_authority"`
 	DependencyAssets     map[string]string `json:"dependency_assets"`
+	JourneySpecification string            `json:"journey_specification"`
+	PackageTemplate      string            `json:"package_template"`
 	CleanupReport        string            `json:"cleanup_report"`
+	ExecutorAttestation  string            `json:"executor_attestation"`
 	QualificationSummary string            `json:"qualification_summary"`
 }
 
@@ -90,6 +96,8 @@ type Prepared struct {
 	CandidateBytes           []byte
 	SourceDigest             string
 	ProtectedAuthorityDigest string
+	ExternalVantageDigest    string
+	TailnetPeerDigest        string
 }
 
 func OrderedJourney() []string { return append([]string(nil), orderedJourney...) }
@@ -120,6 +128,10 @@ func Prepare(inputPath string) (Prepared, error) {
 	if err != nil {
 		return Prepared{}, err
 	}
+	sbomBytes, _, err := readProtectedFile(input.Artifacts.SBOM, 16<<20, true)
+	if err != nil {
+		return Prepared{}, err
+	}
 	targetBytes, _, err := readProtectedFile(input.Artifacts.TargetProfile, 4<<20, true)
 	if err != nil {
 		return Prepared{}, err
@@ -135,6 +147,35 @@ func Prepare(inputPath string) (Prepared, error) {
 	dependencyBytes, _, err := readProtectedFile(input.Artifacts.DependencyAuthority, 4<<20, true)
 	if err != nil {
 		return Prepared{}, err
+	}
+	journeyBytes, _, err := readProtectedFile(input.Artifacts.JourneySpecification, 4<<20, true)
+	if err != nil {
+		return Prepared{}, err
+	}
+	packageTemplateBytes, _, err := readProtectedFile(input.Artifacts.PackageTemplate, 4<<20, true)
+	if err != nil {
+		return Prepared{}, err
+	}
+	journey, err := DecodeJourneySpec(journeyBytes)
+	if err != nil {
+		return Prepared{}, err
+	}
+	vantage, vantageDigest, err := LoadVantageAuthority(input.ExternalVantageRef)
+	if err != nil {
+		return Prepared{}, err
+	}
+	if vantage.ExpectedSourceIPv4 == journey.PublicIPv4 {
+		return Prepared{}, fmt.Errorf("external vantage and target public IPv4 must differ")
+	}
+	if journey.TailnetLiveEnabled != (input.TailnetPeerRef != "") {
+		return Prepared{}, fmt.Errorf("tailnet journey selection and protected peer authority differ")
+	}
+	tailnetPeerDigest := ""
+	if journey.TailnetLiveEnabled {
+		_, tailnetPeerDigest, err = loadTailnetPeer(input.TailnetPeerRef)
+		if err != nil {
+			return Prepared{}, err
+		}
 	}
 	assets := make(map[string][]byte, len(input.Artifacts.DependencyAssets))
 	assetNames := make([]string, 0, len(input.Artifacts.DependencyAssets))
@@ -165,12 +206,31 @@ func Prepare(inputPath string) (Prepared, error) {
 		return Prepared{}, authorityErr
 	}
 	protectedAuthorityDigest := release.DigestBytes(protectedAuthorityBytes)
-	if manifest.RunID != input.RunID || manifest.AuthorizedHostFingerprint != input.SSH.MachineFingerprint || manifest.ProtectedAuthorityDigest != protectedAuthorityDigest || manifest.ACMEAccountContact != input.ACME.Contact {
+	if manifest.RunID != input.RunID || manifest.SourceArchive.Digest != release.DigestBytes(archive) || manifest.SourceArchive.Bytes != uint64(len(archive)) || manifest.SBOM.Digest != release.DigestBytes(sbomBytes) || manifest.SBOM.Bytes != uint64(len(sbomBytes)) || manifest.AuthorizedHostFingerprint != input.SSH.MachineFingerprint || manifest.JourneySpecDigest != release.DigestBytes(journeyBytes) || manifest.PackageTemplateDigest != release.DigestBytes(packageTemplateBytes) || manifest.TailnetPeerDigest != tailnetPeerDigest || manifest.ExternalVantageDigest != vantageDigest || manifest.ProtectedAuthorityDigest != protectedAuthorityDigest || manifest.ACMEAccountContact != input.ACME.Contact {
 		return Prepared{}, fmt.Errorf("protected input does not match qualification manifest")
 	}
 	install, err := release.VerifyQualificationInstallAuthority(release.DigestBytes(manifestBytes), manifestBytes, targetBytes, planBytes, dependencyBytes, candidate, assets, release.QualificationInstallObservation{HostFingerprint: input.SSH.MachineFingerprint, ObservedAt: manifest.CreatedAt})
 	if err != nil {
 		return Prepared{}, err
+	}
+	var template packages.Plan
+	if err := release.DecodeCanonical(packageTemplateBytes, &template); err != nil {
+		return Prepared{}, err
+	}
+	plan, err := release.DecodeLiveSideEffectPlan(planBytes)
+	if err != nil {
+		return Prepared{}, err
+	}
+	templateProbe := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + release.DigestBytes([]byte("prepare-package-template-request")), Allowed: true, ObservedAt: manifest.CreatedAt, ValidUntil: manifest.CreatedAt.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "template_validation", Disposition: preflight.FindingPassed, Summary: "immutable template validation", Identity: manifest.RunID}}}
+	if _, err := BindQualificationPackagePlan(template, manifest, plan, install.Identity().Profile, templateProbe, manifest.CreatedAt); err != nil {
+		return Prepared{}, fmt.Errorf("qualification package template differs from exact profile: %w", err)
+	}
+	var dependency release.QualificationDependencyAuthority
+	if err := release.DecodeCanonical(dependencyBytes, &dependency); err != nil {
+		return Prepared{}, err
+	}
+	if err := release.ValidateReleaseSPDX(sbomBytes, candidate, install.Identity().CandidateDigest, manifest.ReleaseTag, dependency, install.Identity().Profile); err != nil {
+		return Prepared{}, fmt.Errorf("qualification SBOM does not bind exact candidate/dependency/profile closure: %w", err)
 	}
 	sourceDigest, err := release.VerifySourceArchiveAgainstCleanTree(input.Artifacts.SourceRoot, archive)
 	if err != nil {
@@ -179,7 +239,7 @@ func Prepare(inputPath string) (Prepared, error) {
 	if sourceDigest != manifest.SourceTreeDigest {
 		return Prepared{}, fmt.Errorf("qualification source digest changed")
 	}
-	return Prepared{Input: input, InputDigest: release.DigestBytes(inputBytes), Install: *install, PlanBytes: planBytes, PlanDigest: release.DigestBytes(planBytes), InstallManifestDigest: release.DigestBytes(manifestBytes), CandidateBytes: candidate, SourceDigest: sourceDigest, ProtectedAuthorityDigest: protectedAuthorityDigest}, nil
+	return Prepared{Input: input, InputDigest: release.DigestBytes(inputBytes), Install: *install, PlanBytes: planBytes, PlanDigest: release.DigestBytes(planBytes), InstallManifestDigest: release.DigestBytes(manifestBytes), CandidateBytes: candidate, SourceDigest: sourceDigest, ProtectedAuthorityDigest: protectedAuthorityDigest, ExternalVantageDigest: vantageDigest, TailnetPeerDigest: tailnetPeerDigest}, nil
 }
 
 func VerifyFinalReadiness(inputPath string) (Prepared, release.LiveCleanupReport, error) {
@@ -198,19 +258,30 @@ func VerifyFinalReadiness(inputPath string) (Prepared, release.LiveCleanupReport
 	if err != nil {
 		return Prepared{}, release.LiveCleanupReport{}, err
 	}
-	report, err := release.VerifyLiveCleanup(prepared.PlanBytes, reportBytes, prepared.InstallManifestDigest, prepared.InputDigest)
+	attestationBytes, _, err := readProtectedFile(prepared.Input.Artifacts.ExecutorAttestation, 4<<20, true)
 	if err != nil {
 		return Prepared{}, release.LiveCleanupReport{}, err
 	}
-	_ = report
-	return Prepared{}, release.LiveCleanupReport{}, fmt.Errorf("trusted live executor attestation is not connected; final readiness remains disabled")
+	report, attestation, err := release.VerifyLiveCleanup(prepared.PlanBytes, reportBytes, attestationBytes, prepared.InstallManifestDigest, prepared.InputDigest)
+	if err != nil {
+		return Prepared{}, release.LiveCleanupReport{}, err
+	}
+	identity := prepared.Install.Identity()
+	expectedTailnet := "not_live_tested"
+	if prepared.TailnetPeerDigest != "" {
+		expectedTailnet = "live_tested"
+	}
+	if attestation.CandidateDigest != identity.CandidateDigest || attestation.TargetProfileDigest != identity.ProfileDigest || attestation.TargetHostFingerprint != prepared.Input.SSH.MachineFingerprint || attestation.ExternalVantageDigest != prepared.ExternalVantageDigest || attestation.DNSProvider != prepared.Input.DNS.Provider || attestation.TailnetLiveStatus != expectedTailnet {
+		return Prepared{}, release.LiveCleanupReport{}, fmt.Errorf("trusted live executor attestation authority differs")
+	}
+	return prepared, report, nil
 }
 
 func validateInput(input ProtectedInput) error {
-	if input.SchemaVersion != ProtectedInputSchemaVersion || input.RunID == "" || input.RunID != strings.TrimSpace(input.RunID) || input.SSH.Address == "" || input.SSH.User == "" || !release.ValidDigest(input.SSH.HostKeySHA256) || !machineFingerprintPattern.MatchString(input.SSH.MachineFingerprint) || !protectedReference(input.SSH.CredentialRef) || !canonicalQualificationACMEDirectory(input.ACME.DirectoryURL) || !acmeaccount.ValidContact(input.ACME.Contact) || !input.ACME.TOSAccepted || !slices.Contains([]string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}, input.DNS.Provider) || input.DNS.BaseDomain == "" || !protectedReference(input.DNS.CredentialRef) || !protectedReference(input.ExternalVantageRef) || input.TailnetPeerRef != "" && !protectedReference(input.TailnetPeerRef) {
+	if input.SchemaVersion != ProtectedInputSchemaVersion || input.RunID == "" || input.RunID != strings.TrimSpace(input.RunID) || func() bool { _, err := canonicalSSHAddress(input.SSH.Address); return err != nil }() || input.SSH.User != "root" || !release.ValidDigest(input.SSH.HostKeySHA256) || !machineFingerprintPattern.MatchString(input.SSH.MachineFingerprint) || !protectedReference(input.SSH.CredentialRef) || !canonicalQualificationACMEDirectory(input.ACME.DirectoryURL) || !acmeaccount.ValidContact(input.ACME.Contact) || !input.ACME.TOSAccepted || input.DNS.Provider != "cloudflare" || !canonicalDomain(input.DNS.BaseDomain) || !protectedReference(input.DNS.CredentialRef) || !protectedReference(input.ExternalVantageRef) || input.TailnetPeerRef != "" && !protectedReference(input.TailnetPeerRef) {
 		return fmt.Errorf("qualification protected input is invalid")
 	}
-	paths := []string{input.Artifacts.CandidateBinary, input.Artifacts.SourceArchive, input.Artifacts.SourceRoot, input.Artifacts.TargetProfile, input.Artifacts.SideEffectPlan, input.Artifacts.InstallManifest, input.Artifacts.DependencyAuthority, input.Artifacts.CleanupReport, input.Artifacts.QualificationSummary}
+	paths := []string{input.Artifacts.CandidateBinary, input.Artifacts.SourceArchive, input.Artifacts.SBOM, input.Artifacts.SourceRoot, input.Artifacts.TargetProfile, input.Artifacts.SideEffectPlan, input.Artifacts.InstallManifest, input.Artifacts.DependencyAuthority, input.Artifacts.JourneySpecification, input.Artifacts.PackageTemplate, input.Artifacts.CleanupReport, input.Artifacts.ExecutorAttestation, input.Artifacts.QualificationSummary}
 	for _, value := range input.Artifacts.DependencyAssets {
 		paths = append(paths, value)
 	}

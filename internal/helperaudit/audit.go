@@ -84,6 +84,15 @@ func Run(root string) error {
 				if !spawnCalls[name] {
 					return true
 				}
+				if relative == "internal/qualification/generator_linux.go" {
+					function := enclosingFunction(file, value.Pos())
+					allowed := name == "exec.Command" && function == "requireExactCleanCommit" && len(value.Args) >= 1 && stringLiteral(value.Args[0]) == "git" || name == "exec.LookPath" && function == "buildCandidate" && len(value.Args) == 1 && stringLiteral(value.Args[0]) == "go" || name == "exec.Command" && function == "buildCandidate" && len(value.Args) >= 1 && expressionName(value.Args[0]) == "goBinary"
+					if !allowed {
+						err = fmt.Errorf("release generator process API %s is not fixed", name)
+						return false
+					}
+					return true
+				}
 				if relative == "internal/process/managed_exec_linux.go" {
 					if name != "unix.Exec" || enclosingFunction(file, value.Pos()) != "Execute" || len(value.Args) != 3 || expressionName(value.Args[0]) != "authority.Service.Executable" {
 						err = fmt.Errorf("managed executor exec shape is not exact")

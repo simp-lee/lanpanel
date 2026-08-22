@@ -128,6 +128,12 @@ func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
 		t.Fatalf("valid changed external status rejected: %v", err)
 	}
+	response.Resource.Status = "source_verified_runtime_unknown"
+	response.Resource.Reason = "source identities exact; runtime health is not proved by source verification"
+	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
+		t.Fatalf("conservative runtime-unknown status rejected: %v", err)
+	}
+	response.Resource.Status = "healthy"
 	response.Resource.Reason = ""
 	if ValidateResponse(OperationDomainStatus, response) == nil {
 		t.Fatal("status without remediation reason accepted")

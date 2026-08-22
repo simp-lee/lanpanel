@@ -43,7 +43,7 @@ func RegisterStaticRoot(ctx context.Context, resourceID, path, actor string) (re
 	if err != nil {
 		return result, err
 	}
-	root := domain.StaticContentRoot{ID: identity.ID, Path: identity.Path, Fingerprint: identity.Fingerprint, Device: identity.Device}
+	root := domain.StaticContentRoot{ID: identity.ID, OwnerResourceID: resourceID, Path: identity.Path, Fingerprint: identity.Fingerprint, Device: identity.Device}
 	rootRaw, _ := json.Marshal(root)
 	execution, err := beginBasic(ctx, operations.StaticRootRegister, "resource/"+resourceID, actor, operations.SafetyBinding{ResourceID: resourceID, CandidateDigest: identity.Fingerprint, CandidateBundle: shaDigest(rootRaw), Deadline: time.Now().UTC().Add(time.Minute)})
 	if err != nil {

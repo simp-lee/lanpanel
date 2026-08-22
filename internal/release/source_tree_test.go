@@ -16,6 +16,16 @@ func TestSourceArchiveMustMatchCleanTrackedTree(t *testing.T) {
 	runGit(t, root, "add", "main.go")
 	runGit(t, root, "-c", "user.name=LanPanel Test", "-c", "user.email=test@lanpanel.invalid", "commit", "--quiet", "-m", "fixture")
 	archive := sourceArchiveFixture(t)
+	generated, generatedDigest, generateErr := GenerateSourceArchive(root, "v1.0.0")
+	if generateErr != nil || !ValidDigest(generatedDigest) {
+		t.Fatalf("canonical source archive generator failed: digest=%q err=%v", generatedDigest, generateErr)
+	}
+	if exact, verifyErr := VerifySourceArchiveAgainstCleanTree(root, generated); verifyErr != nil || exact != generatedDigest {
+		t.Fatalf("generated source archive did not self-verify: digest=%q err=%v", exact, verifyErr)
+	}
+	if content, readErr := ReadSourceArchiveFile(generated, "v1.0.0", "main.go", 1<<20); readErr != nil || string(content) != "package main\n" {
+		t.Fatalf("canonical source archive file read failed: content=%q err=%v", content, readErr)
+	}
 	digest, err := VerifySourceArchiveAgainstCleanTree(root, archive)
 	if err != nil || !ValidDigest(digest) {
 		t.Fatalf("clean archive was not bound to tracked tree: digest=%q err=%v", digest, err)
