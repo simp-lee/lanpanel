@@ -1,9 +1,12 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"reflect"
 	"strings"
 	"testing"
@@ -264,7 +267,7 @@ func TestInstallationSchema(t *testing.T) {
 		incomplete := domainBundle("bundle-incomplete", testDigest)
 		incomplete.DomainHTTPS.Certificate.BindingIdentity = ""
 		record.LastAppliedBundle = pointerBundle(incomplete)
-		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "certificate pointer") {
+		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "certificate complete identity") {
 			t.Fatalf("ValidateInstallation(incomplete domain bundle) error = %v", err)
 		}
 
@@ -538,6 +541,119 @@ func TestInstallationRejectsResourcesBeyondRecoveryCapacity(t *testing.T) {
 	}
 }
 
+func TestDecodeInstallationRejectsConflictingHeadscaleDomains(t *testing.T) {
+	for name, mutate := range map[string]func(*HeadscaleDomain){
+		"equal": func(headscale *HeadscaleDomain) {
+			headscale.MagicDNSNamespace = headscale.ControlDomain
+		},
+		"control_within_magicdns": func(headscale *HeadscaleDomain) {
+			headscale.ControlDomain = "control." + headscale.MagicDNSNamespace
+		},
+		"magicdns_within_control": func(headscale *HeadscaleDomain) {
+			headscale.MagicDNSNamespace = "mesh." + headscale.ControlDomain
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			installation := validGAInstallation()
+			mutate(installation.Headscale)
+			data, err := json.Marshal(installation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeInstallation(data); err == nil || !strings.Contains(err.Error(), "domains conflict") {
+				t.Fatalf("DecodeInstallation(conflicting Headscale domains) error = %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeInstallationRejectsNoncanonicalStaticRootIDs(t *testing.T) {
+	for name, id := range map[string]string{
+		"non_hex":    "static_0000000000000000000000000000000g",
+		"uppercase":  "static_0000000000000000000000000000000A",
+		"whitespace": "static_0000000000000000000000000000000 ",
+		"control":    "static_0000000000000000000000000000000\x00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			installation := validGAInstallation()
+			installation.StaticRoots = []StaticContentRoot{{ID: id, OwnerResourceID: installation.Resources[0].ID, Path: "/srv/example-static", Fingerprint: testDigest, Device: 1}}
+			data, err := json.Marshal(installation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeInstallation(data); err == nil || !strings.Contains(err.Error(), "static_roots[0] identity invalid") {
+				t.Fatalf("DecodeInstallation(static ID %q) error = %v", id, err)
+			}
+		})
+	}
+}
+
+func TestCertificateSANIdentityMatchesStageIssuedSingleDomainVector(t *testing.T) {
+	const expected = "sha256:fafc5334b24801d62c56fc90e7850b20e426994cd2b578dcb532a602b9d28c91"
+	if got := certificateSANIdentity([]string{"control.example.com"}); got != expected {
+		t.Fatalf("single-domain SAN identity = %q, want StageIssued vector %q", got, expected)
+	}
+}
+
+func TestDomainCertificateSANIdentityMatchesStageIssuedMultiDomainVector(t *testing.T) {
+	const expected = "sha256:2d4da7ea966cbf76da0fb0c0f1ded13a4b3765addd7c53f499c4cca12fcf822b"
+	if got := certificateSANIdentity([]string{"alias.example.com", "app.example.com"}); got != expected {
+		t.Fatalf("multi-domain SAN identity = %q, want StageIssued vector %q", got, expected)
+	}
+	bundle := domainBundle("bundle-stage-issued-san", testDigest)
+	bundle.DomainHTTPS.Certificate.SANIdentity = expected
+	if err := validateBundle(bundle, PublicationDomainHTTPS); err != nil {
+		t.Fatalf("unsorted exact_domains with StageIssued SAN vector rejected: %v", err)
+	}
+}
+
+func TestHeadscaleCertificateSANBindsControlDomain(t *testing.T) {
+	value := enabledTestHeadscaleDomain()
+	if err := ValidateHeadscale(*value); err != nil {
+		t.Fatalf("valid Headscale certificate rejected: %v", err)
+	}
+	value.Certificate.SANIdentity = testDigest
+	if err := ValidateHeadscale(*value); err == nil || !strings.Contains(err.Error(), "SAN identity") {
+		t.Fatalf("Headscale certificate with wrong SAN digest error = %v", err)
+	}
+}
+
+func TestHeadscaleCertificateDNSZoneCoversControlDomain(t *testing.T) {
+	value := enabledTestHeadscaleDomain()
+	authority := &CertificateAuthorityIdentity{CertificateID: value.Applied.CertificateID, DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: testDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: string(acme.ChallengeDNS01), Provider: string(acme.DNSProviderCloudflare), ProfilePath: "/etc/lanpanel/acme/cloudflare.env", ProfileFingerprint: testDigest, CredentialFiles: []CertificateCredentialIdentity{{Key: "CF_DNS_API_TOKEN_FILE", Path: "/etc/lanpanel/acme/cloudflare.token", Fingerprint: testDigest}}, Zone: "example.com"}
+	certificate := completeCertificateWithAuthority(authority, []string{value.ControlDomain})
+	value.Certificate = &certificate
+	if err := ValidateHeadscale(*value); err != nil {
+		t.Fatalf("Headscale DNS-01 zone covering control domain rejected: %v", err)
+	}
+	outsideAuthority := *authority
+	outsideAuthority.Zone = "other.example"
+	outsideCertificate := completeCertificateWithAuthority(&outsideAuthority, []string{value.ControlDomain})
+	value.Certificate = &outsideCertificate
+	if err := ValidateHeadscale(*value); err == nil || !strings.Contains(err.Error(), "zone does not cover") {
+		t.Fatalf("Headscale DNS-01 zone outside control domain error = %v", err)
+	}
+}
+
+func TestHeadscaleAppliedRejectsNoncanonicalCertificateIDs(t *testing.T) {
+	valid := HeadscaleAppliedIdentity{Generation: 1, ConfigDigest: testDigest, ArtifactDigest: testDigest, ServiceIdentity: testDigest, ControlIdentity: testDigest, CertificateID: "cert_00000000000000000000000000000001"}
+	if err := ValidateHeadscaleApplied(valid); err != nil {
+		t.Fatalf("valid applied Headscale identity rejected: %v", err)
+	}
+	for _, certificateID := range []string{
+		"cert_0000000000000000000000000000000g",
+		"cert_0000000000000000000000000000000A",
+		"cert_0000000000000000000000000000000 ",
+		"cert_0000000000000000000000000000000\x00",
+	} {
+		candidate := valid
+		candidate.CertificateID = certificateID
+		if err := ValidateHeadscaleApplied(candidate); err == nil {
+			t.Fatalf("noncanonical certificate ID %q accepted", certificateID)
+		}
+	}
+}
+
 func TestHeadscaleIdentityCannotBeRenamedAdoptedOrDisabled(t *testing.T) {
 	prior := *testHeadscaleDomain()
 	for name, mutate := range map[string]func(*HeadscaleDomain){
@@ -616,6 +732,30 @@ func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
 	}
 }
 
+func TestCompleteInstallationCanonicalRoundTrip(t *testing.T) {
+	installation := validGAInstallation()
+	installation.Headscale = enabledTestHeadscaleDomain()
+	bundle := domainBundle("bundle-complete", testDigest)
+	installation.Resources[0].PublicationRecord.State = PublicationPublished
+	installation.Resources[0].PublicationRecord.LastAppliedDigest = pointer(testDigest)
+	installation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
+	data, err := json.Marshal(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeInstallation(data)
+	if err != nil {
+		t.Fatalf("DecodeInstallation(complete installation) error = %v", err)
+	}
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonical, data) || !reflect.DeepEqual(decoded, installation) {
+		t.Fatal("complete installation did not canonical round-trip")
+	}
+}
+
 func validGAInstallation() Installation {
 	return Installation{
 		SchemaVersion:  InstallationSchemaVersion,
@@ -667,6 +807,17 @@ func testHeadscaleDomain() *HeadscaleDomain {
 	return &HeadscaleDomain{ID: "hds_00000000000000000000000000000001", ControlDomain: "control.example.com", MagicDNSNamespace: "tail.example.net", Policy: "trusted_mesh", Artifact: HeadscaleArtifactIdentity{BaselineDigest: testDigest, Version: "0.25.1", ArchiveDigest: testDigest, ExecutableDigest: testDigest, ConfigContract: "headscale-trusted-mesh-v1", ConfigContractDigest: testDigest}, Database: HeadscaleDatabaseIdentity{UUID: "hdb_00000000000000000000000000000001", SQLitePath: "/var/lib/lanpanel/headscale-runtime/db.sqlite", IdentityBundleDigest: testDigest, Generation: 1, Phase: HeadscaleIdentityCommitted}, DesiredDigest: testDigest, ManagedPaths: HeadscaleManagedPaths()}
 }
 
+func enabledTestHeadscaleDomain() *HeadscaleDomain {
+	value := *testHeadscaleDomain()
+	certificateID := "cert_00000000000000000000000000000001"
+	applied := HeadscaleAppliedIdentity{Generation: 1, ConfigDigest: testDigest, ArtifactDigest: testDigest, ServiceIdentity: testDigest, ControlIdentity: testDigest, CertificateID: certificateID}
+	certificate := completeCertificate(certificateID, []string{value.ControlDomain})
+	value.Applied = &applied
+	value.Certificate = &certificate
+	value.Enabled = true
+	return &value
+}
+
 func publishedResource(health RuntimeHealth) AppResource {
 	resource := validGAInstallation().Resources[0]
 	resource.PublicationRecord.State = PublicationPublished
@@ -703,11 +854,65 @@ func domainBundle(id, configDigest string) PublicationBundle {
 		SiteIdentity:     "site-" + id,
 		DomainHTTPS: &DomainHTTPSBundleIdentity{
 			ExactDomains: []string{"app.example.com", "alias.example.com"},
-			Certificate:  completeCertificate("certificate-pointer", "certificate-binding"),
+			Certificate:  completeCertificate("cert_00000000000000000000000000000002", []string{"alias.example.com", "app.example.com"}),
 			Auth:         AuthBundleIdentity{Mode: AppAccessPublic},
 			Static:       StaticBundleIdentity{RouteIdentities: []string{}},
 			GoAccess:     GoAccessBundleIdentity{Enabled: false},
 		},
+	}
+}
+
+func TestDomainHTTPSBundleRequiresCompleteCertificateAuthority(t *testing.T) {
+	valid := domainBundle("bundle-certificate-authority", testDigest)
+	if err := validateBundle(valid, PublicationDomainHTTPS); err != nil {
+		t.Fatalf("complete HTTP-01 certificate authority rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*CertificateBundleIdentity){
+		"nil_authority": func(certificate *CertificateBundleIdentity) {
+			certificate.Authority = nil
+		},
+		"incomplete_authority": func(certificate *CertificateBundleIdentity) {
+			certificate.Authority.AccountEmail = ""
+		},
+		"invalid_certificate_id": func(certificate *CertificateBundleIdentity) {
+			certificate.Authority.CertificateID = "cert_0000000000000000000000000000000G"
+			certificate.PointerIdentity = "/var/lib/lanpanel/certificates/active/" + certificate.Authority.CertificateID + ".current"
+		},
+		"wrong_active_pointer": func(certificate *CertificateBundleIdentity) {
+			certificate.PointerIdentity = "/var/lib/lanpanel/certificates/active/other.current"
+		},
+		"wrong_san_identity": func(certificate *CertificateBundleIdentity) {
+			certificate.SANIdentity = testDigest
+		},
+		"http_with_dns_field": func(certificate *CertificateBundleIdentity) {
+			certificate.Authority.ProfileFingerprint = testDigest
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bundle := domainBundle("bundle-"+name, testDigest)
+			mutate(&bundle.DomainHTTPS.Certificate)
+			if err := validateBundle(bundle, PublicationDomainHTTPS); err == nil {
+				t.Fatalf("invalid certificate authority accepted: %#v", bundle.DomainHTTPS.Certificate)
+			}
+		})
+	}
+
+	dnsAuthority := &CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000003", DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: testDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: string(acme.ChallengeDNS01), Provider: string(acme.DNSProviderCloudflare), ProfilePath: "/etc/lanpanel/acme/cloudflare.env", ProfileFingerprint: testDigest, CredentialFiles: []CertificateCredentialIdentity{{Key: "CF_DNS_API_TOKEN_FILE", Path: "/etc/lanpanel/acme/cloudflare.token", Fingerprint: testDigest}}, Zone: "example.com"}
+	dnsBundle := domainBundle("bundle-dns-authority", testDigest)
+	dnsBundle.DomainHTTPS.Certificate = completeCertificateWithAuthority(dnsAuthority, []string{"alias.example.com", "app.example.com"})
+	if err := validateBundle(dnsBundle, PublicationDomainHTTPS); err != nil {
+		t.Fatalf("complete DNS-01 certificate authority rejected: %v", err)
+	}
+	outsideAuthority := *dnsAuthority
+	outsideAuthority.Zone = "other.example"
+	outsideBundle := domainBundle("bundle-dns-outside-zone", testDigest)
+	outsideBundle.DomainHTTPS.Certificate = completeCertificateWithAuthority(&outsideAuthority, []string{"alias.example.com", "app.example.com"})
+	if err := validateBundle(outsideBundle, PublicationDomainHTTPS); err == nil || !strings.Contains(err.Error(), "zone does not cover") {
+		t.Fatalf("DNS-01 authority outside exact domains error = %v", err)
+	}
+	dnsBundle.DomainHTTPS.Certificate.Authority.CredentialFiles = nil
+	if err := validateBundle(dnsBundle, PublicationDomainHTTPS); err == nil {
+		t.Fatal("DNS-01 authority without required credential files accepted")
 	}
 }
 
@@ -723,8 +928,21 @@ func TestDisabledGoAccessBundleRetainsExactRetirementAuthority(t *testing.T) {
 	}
 }
 
-func completeCertificate(pointer, binding string) CertificateBundleIdentity {
-	return CertificateBundleIdentity{PointerIdentity: pointer, BindingIdentity: binding, Generation: 1, Fingerprint: testDigest, SANIdentity: testDigest, ChainIdentity: testDigest, IssuerIdentity: testDigest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}
+func completeCertificate(certificateID string, domains []string) CertificateBundleIdentity {
+	authority := &CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: testDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: string(acme.ChallengeHTTP01), CredentialFiles: []CertificateCredentialIdentity{}}
+	return completeCertificateWithAuthority(authority, domains)
+}
+
+func completeCertificateWithAuthority(authority *CertificateAuthorityIdentity, domains []string) CertificateBundleIdentity {
+	binding, err := validateCertificateAuthority(*authority)
+	if err != nil {
+		panic(err)
+	}
+	bindingIdentity, err := acme.BindingDigest(binding)
+	if err != nil {
+		panic(err)
+	}
+	return CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + authority.CertificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest, SANIdentity: certificateSANIdentity(domains), ChainIdentity: testDigest, IssuerIdentity: testDigest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 }
 func pointer(value string) *string { return &value }
 

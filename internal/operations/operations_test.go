@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	managedheadscale "lanpanel/internal/headscale"
@@ -588,7 +590,7 @@ func TestContractionStateCommitsBeforeRuntimeTerminalization(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	beforeInstallation := operationStateInstallation()
 	beforeInstallation.Resources[0].PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 1, RetiredStateGeneration: 1, RetiredServiceIdentity: testDigest("retired-service"), RetiredUnitIdentities: operationUnitIdentities("retired")}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: beforeInstallation.Resources[0].CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: operationCertificateIdentity(), Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 1, RetiredStateGeneration: 1, RetiredServiceIdentity: testDigest("retired-service"), RetiredUnitIdentities: operationUnitIdentities("retired")}}}
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedBundle = &bundle
 	beforeInstallation.Resources[0].PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Unpublish), Target: "resource/" + beforeInstallation.Resources[0].ID, ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{4}, 32)))
@@ -870,7 +872,19 @@ func operationUnitIdentities(label string) []string {
 }
 
 func domainBundleForRetirement(configDigest string) domain.PublicationBundle {
-	return domain.PublicationBundle{ID: "pub_2_00000000000000000000000000000001", Generation: 2, ConfigDigest: configDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest("service"), RetiredUnitIdentities: operationUnitIdentities("service")}}}
+	return domain.PublicationBundle{ID: "pub_2_00000000000000000000000000000001", Generation: 2, ConfigDigest: configDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: operationCertificateIdentity(), Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{RetiredGeneration: 2, RetiredStateGeneration: 2, RetiredServiceIdentity: testDigest("service"), RetiredUnitIdentities: operationUnitIdentities("service")}}}
+}
+
+func operationCertificateIdentity() domain.CertificateBundleIdentity {
+	const certificateID = "cert_00000000000000000000000000000000"
+	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: testDigest("account-key"), AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
+	bindingIdentity, err := acme.BindingDigest(binding)
+	if err != nil {
+		panic(err)
+	}
+	san := sha256.Sum256([]byte("app.example.com"))
+	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 }
 
 func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T) {
@@ -878,7 +892,7 @@ func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T
 	installation := operationStateInstallation()
 	resource := &installation.Resources[0]
 	resource.PublicationRecord.State = domain.PublicationPublished
-	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: domain.CertificateBundleIdentity{PointerIdentity: "pointer", BindingIdentity: "binding", Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: testDigest("san"), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"}, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
+	bundle := domain.PublicationBundle{Generation: 1, ID: "bundle", ConfigDigest: resource.CurrentConfigDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: "endpoint", SiteIdentity: "site", ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.com"}, Certificate: operationCertificateIdentity(), Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
 	resource.PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
 	resource.PublicationRecord.LastAppliedBundle = &bundle
 	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{3}, 32)))

@@ -125,7 +125,7 @@ func LoadDNSBinding(directoryURL, accountKeyPath, accountEmail string, termsAcce
 			return Binding{}, fmt.Errorf("DNS profile contains unknown key %q", key)
 		}
 		if direct[key] {
-			if value == "" || strings.ContainsAny(value, "\x00\r\n= ") {
+			if !validPrincipalValue(value) {
 				return Binding{}, fmt.Errorf("DNS non-secret identity invalid")
 			}
 			principals = append(principals, key+"="+value+";")
@@ -188,35 +188,60 @@ func ValidateBinding(binding Binding) error {
 	}
 	switch binding.Method {
 	case ChallengeHTTP01:
-		if binding.Provider != "" || binding.ProfilePath != "" || len(binding.CredentialFiles) != 0 || binding.Zone != "" {
+		if binding.Provider != "" || binding.ProfilePath != "" || binding.ProfileFingerprint != "" || len(binding.CredentialFiles) != 0 || binding.Zone != "" || binding.Principal != "" {
 			return fmt.Errorf("HTTP-01 binding contains DNS authority")
 		}
 	case ChallengeDNS01:
-		if _, err := ParseDNSProvider(string(binding.Provider)); err != nil || !cleanAbsolute(binding.ProfilePath) || !digest(binding.ProfileFingerprint) || binding.Zone == "" {
+		if _, err := ParseDNSProvider(string(binding.Provider)); err != nil || !cleanAbsolute(binding.ProfilePath) || !digest(binding.ProfileFingerprint) || !validDNSZone(binding.Zone) {
 			return fmt.Errorf("DNS-01 binding invalid")
 		}
 		schema, _ := ProviderSchemaFor(binding.Provider)
-		allowed := map[string]bool{}
-		required := map[string]bool{}
+		allowedFiles := map[string]bool{}
+		requiredFiles := map[string]bool{}
 		direct := map[string]bool{}
+		requiredDirect := map[string]bool{}
 		for _, key := range schema.EnvironmentKeys {
-			allowed[key] = true
-			required[key] = true
+			allowedFiles[key] = true
+			requiredFiles[key] = true
 		}
 		for _, key := range schema.OptionalKeys {
-			allowed[key] = true
+			allowedFiles[key] = true
 		}
 		for _, key := range schema.DirectValues {
 			direct[key] = true
+			delete(allowedFiles, key)
+		}
+		for _, key := range schema.RequiredValues {
+			requiredDirect[key] = true
 		}
 		for index, value := range binding.CredentialFiles {
-			if !allowed[value.Key] || direct[value.Key] || !envKeyPattern.MatchString(value.Key) || !cleanAbsolute(value.Path) || !digest(value.Fingerprint) || index > 0 && binding.CredentialFiles[index-1].Key >= value.Key {
+			if !allowedFiles[value.Key] || !envKeyPattern.MatchString(value.Key) || !cleanAbsolute(value.Path) || !digest(value.Fingerprint) || index > 0 && binding.CredentialFiles[index-1].Key >= value.Key {
 				return fmt.Errorf("DNS credential binding noncanonical")
 			}
-			delete(required, value.Key)
+			delete(requiredFiles, value.Key)
 		}
-		if len(required) != 0 {
+		if len(requiredFiles) != 0 {
 			return fmt.Errorf("DNS credential binding incomplete")
+		}
+		seenDirect := map[string]bool{}
+		principalEntries := []string{}
+		if binding.Principal != "" {
+			if !strings.HasSuffix(binding.Principal, ";") {
+				return fmt.Errorf("DNS principal binding noncanonical")
+			}
+			for _, entry := range strings.Split(strings.TrimSuffix(binding.Principal, ";"), ";") {
+				key, value, present := strings.Cut(entry, "=")
+				canonical := entry + ";"
+				if entry == "" || !present || !direct[key] || seenDirect[key] || !validPrincipalValue(value) || len(principalEntries) > 0 && principalEntries[len(principalEntries)-1] >= canonical {
+					return fmt.Errorf("DNS principal binding noncanonical")
+				}
+				seenDirect[key] = true
+				delete(requiredDirect, key)
+				principalEntries = append(principalEntries, canonical)
+			}
+		}
+		if len(requiredDirect) != 0 || strings.Join(principalEntries, "") != binding.Principal {
+			return fmt.Errorf("DNS principal binding incomplete")
 		}
 	default:
 		return fmt.Errorf("ACME challenge method invalid")
@@ -235,6 +260,23 @@ func BindingDigest(binding Binding) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(data.String()))
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func DNS01ZoneCoversDomains(zone string, domains []string) bool {
+	if !validDNSZone(zone) || len(domains) == 0 {
+		return false
+	}
+	for _, domain := range domains {
+		owner := "_acme-challenge." + domain
+		if owner != zone && !strings.HasSuffix(owner, "."+zone) {
+			return false
+		}
+	}
+	return true
+}
+
+func validPrincipalValue(value string) bool {
+	return value != "" && !strings.ContainsAny(value, "\x00\r\n= ;")
 }
 
 func validDNSZone(value string) bool {
@@ -451,6 +493,10 @@ func digest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
 		return false
 	}
-	_, err := hex.DecodeString(value[7:])
-	return err == nil
+	for _, character := range value[len("sha256:"):] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -1,7 +1,11 @@
 package reservations
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	"reflect"
 	"strings"
@@ -22,6 +26,10 @@ func TestConflictRegistry(t *testing.T) {
 		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
 			t.Fatalf("BuildClaims(control domain inside own MagicDNS namespace) error = %v", err)
 		}
+		installation.SchemaVersion = "invalid"
+		if _, err := BuildClaims(installation); err == nil || errors.As(err, new(ConflictError)) || !strings.Contains(err.Error(), "unsupported schema_version") {
+			t.Fatalf("BuildClaims(invalid schema with overlapping domains) error = %v", err)
+		}
 	})
 
 	t.Run("exact_domain_collision_is_rejected", func(t *testing.T) {
@@ -29,6 +37,14 @@ func TestConflictRegistry(t *testing.T) {
 		installation.Resources[0].Publication.DomainHTTPS.Aliases = []string{installation.Headscale.ControlDomain}
 		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
 			t.Fatalf("BuildClaims(control alias collision) error = %v", err)
+		}
+	})
+
+	t.Run("domain_claim_grammar_is_strict", func(t *testing.T) {
+		for _, value := range []string{"example", "-node.example.com", "node..example.com", "node_example.com"} {
+			if err := validateClaim(Claim{Kind: KindMagicDNSNamespace, Value: value, Owner: "resource:test"}); err == nil {
+				t.Fatalf("invalid domain claim %q accepted", value)
+			}
 		}
 	})
 
@@ -104,7 +120,7 @@ func TestConflictRegistry(t *testing.T) {
 			Listeners:     []domain.BundleListenerIdentity{{Network: "tcp", Port: 19002}},
 			DomainHTTPS: &domain.DomainHTTPSBundleIdentity{
 				ExactDomains: []string{"old.example.com"},
-				Certificate:  domain.CertificateBundleIdentity{PointerIdentity: "old-pointer", BindingIdentity: "old-certificate", Generation: 1, Fingerprint: "sha256:" + strings.Repeat("a", 64), SANIdentity: "sha256:" + strings.Repeat("b", 64), ChainIdentity: "sha256:" + strings.Repeat("c", 64), IssuerIdentity: "sha256:" + strings.Repeat("d", 64), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z"},
+				Certificate:  reservationCertificateIdentity("old.example.com"),
 				Auth:         domain.AuthBundleIdentity{Mode: domain.AppAccessPublic},
 				Static:       domain.StaticBundleIdentity{RouteIdentities: []string{}},
 				GoAccess:     domain.GoAccessBundleIdentity{Enabled: false},
@@ -216,6 +232,18 @@ func hasClaim(claims []Claim, kind Kind, value string) bool {
 }
 
 func stringPointer(value string) *string { return &value }
+
+func reservationCertificateIdentity(exactDomain string) domain.CertificateBundleIdentity {
+	const certificateID = "cert_00000000000000000000000000000000"
+	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: digest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
+	bindingIdentity, err := acme.BindingDigest(binding)
+	if err != nil {
+		panic(err)
+	}
+	san := sha256.Sum256([]byte(exactDomain))
+	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: digest, IssuerIdentity: digest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
+}
 
 func assertConflict(t *testing.T, original, conflicting Claim) {
 	t.Helper()

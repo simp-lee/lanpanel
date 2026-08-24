@@ -60,13 +60,12 @@ func Prepare(request Request) (Prepared, error) {
 		entry.Digest = sum(data)
 		return Prepared{Safety: pending, Entry: &entry}, nil
 	case acme.ChallengeDNS01:
+		if !acme.DNS01ZoneCoversDomains(request.Binding.Zone, domains) {
+			return Prepared{}, fmt.Errorf("DNS challenge owner outside authoritative zone")
+		}
 		owners := make([]string, len(domains))
 		for index, domain := range domains {
-			owner := "_acme-challenge." + domain
-			if owner != request.Binding.Zone && !strings.HasSuffix(owner, "."+request.Binding.Zone) {
-				return Prepared{}, fmt.Errorf("DNS challenge owner outside authoritative zone")
-			}
-			owners[index] = owner
+			owners[index] = "_acme-challenge." + domain
 		}
 		pending.Host = domains[0]
 		pending.TokenPath = "/dns-01"

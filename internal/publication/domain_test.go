@@ -3,6 +3,8 @@ package publication
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"lanpanel/internal/acme"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/nginx"
@@ -15,7 +17,7 @@ import (
 func TestDomainCandidateRejectsNginxDirectiveURL(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: digest, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic, StaticRootID: "static_00000000000000000000000000000000"}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: digest, PolicyDigest: digest, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert_00000000000000000000000000000000.current", BindingIdentity: digest, Generation: 1, Fingerprint: digest, SANIdentity: digest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: digest, IssuerIdentity: digest, Authority: &domain.CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000000"}}
+	certificate := publicationTestCertificate(digest)
 	for _, path := range []string{"/bad;include", "/bad value", "/bad$variable", "/bad{block"} {
 		_, err := PrepareDomain(resource, 2, certificate, "", "", "", "", []nginx.StaticRoute{{URLPath: path, RelativePath: "file", SourcePath: "/srv/static/file", Identity: digest}}, nil)
 		if err == nil {
@@ -27,7 +29,7 @@ func TestDomainCandidateRejectsNginxDirectiveURL(t *testing.T) {
 func TestApplicationManagedDomainForwardsOnlyAuthorizationAndWebSocket(t *testing.T) {
 	value := "sha256:" + strings.Repeat("a", 64)
 	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: value, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP, WebSocket: domain.WebSocketReadiness{Enabled: true, Path: "/ws"}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessApplicationManaged}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: value, PolicyDigest: value, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert_00000000000000000000000000000000/current", BindingIdentity: value, Generation: 1, Fingerprint: value, SANIdentity: value, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: value, IssuerIdentity: value, Authority: &domain.CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000000"}}
+	certificate := publicationTestCertificate(value)
 	candidate, err := PrepareDomain(resource, 2, certificate, "", "", "", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +45,7 @@ func TestApplicationManagedDomainForwardsOnlyAuthorizationAndWebSocket(t *testin
 func TestGoAccessCandidateUsesIndependentBasicAndCredentialCleanWebSocket(t *testing.T) {
 	value := "sha256:" + strings.Repeat("a", 64)
 	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: value, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic, GoAccess: domain.GoAccessPublication{Enabled: true, CredentialID: "cred_00000000000000000000000000000001", CIDRs: []string{"8.8.8.8/32"}, DashboardPath: "/__lanpanel/goaccess/", WebSocketPath: "/__lanpanel/goaccess-ws"}}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: value, PolicyDigest: value, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert_00000000000000000000000000000000/current", BindingIdentity: value, Generation: 1, Fingerprint: value, SANIdentity: value, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: value, IssuerIdentity: value, Authority: &domain.CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000000"}}
+	certificate := publicationTestCertificate(value)
 	goaccessCandidate, err := goaccessruntime.Render("ins_00000000000000000000000000000001", resource, 33, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +82,7 @@ func TestGoAccessReenableReusesRetainedStateWhileRetiringOldUnits(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert_00000000000000000000000000000000/current", BindingIdentity: value, Generation: 1, Fingerprint: value, SANIdentity: value, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: value, IssuerIdentity: value, Authority: &domain.CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000000"}}
+	certificate := publicationTestCertificate(value)
 	candidate, err := PrepareDomain(resource, 3, certificate, "", "", "/srv/goaccess.htpasswd", value, nil, &runtimeCandidate)
 	if err != nil {
 		t.Fatal(err)
@@ -91,10 +93,22 @@ func TestGoAccessReenableReusesRetainedStateWhileRetiringOldUnits(t *testing.T) 
 	}
 }
 
+func publicationTestCertificate(digest string) domain.CertificateBundleIdentity {
+	const certificateID = "cert_00000000000000000000000000000000"
+	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: acmeaccount.ManagedKeyPath, AccountKeyFingerprint: digest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
+	bindingIdentity, err := acme.BindingDigest(binding)
+	if err != nil {
+		panic(err)
+	}
+	san := sha256.Sum256([]byte("app.example.test"))
+	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: digest, IssuerIdentity: digest, Authority: authority}
+}
+
 func TestDomainCandidateBindsTLSAuthStaticAndWebSocket(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
 	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: digest, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, WebSocket: domain.WebSocketReadiness{Enabled: true, Path: "/ws"}, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointUnixSocketActivation}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessBasic, CredentialID: "cred_00000000000000000000000000000001", CIDRs: []string{"8.8.8.8/32"}, StaticRootID: "static_00000000000000000000000000000000"}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: digest, PolicyDigest: digest, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert_00000000000000000000000000000000/current", BindingIdentity: digest, Generation: 1, Fingerprint: digest, SANIdentity: digest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: digest, IssuerIdentity: digest, Authority: &domain.CertificateAuthorityIdentity{CertificateID: "cert_00000000000000000000000000000000"}}
+	certificate := publicationTestCertificate(digest)
 	candidate, err := PrepareDomain(resource, 2, certificate, "/var/lib/lanpanel/credentials/basic/app.htpasswd", digest, "", "", []nginx.StaticRoute{{URLPath: "/robots.txt", RelativePath: "robots.txt", SourcePath: "/srv/static/robots.txt", Identity: digest}}, nil)
 	if err != nil {
 		t.Fatal(err)

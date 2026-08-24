@@ -21,6 +21,64 @@ func TestChallengeMethodIsClosed(t *testing.T) {
 	}
 }
 
+func TestValidateBindingClosesChallengeSpecificAuthority(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	if validPrincipalValue("profile;injected") {
+		t.Fatal("DNS principal value containing frame separator accepted")
+	}
+	if !DNS01ZoneCoversDomains("example.test", []string{"app.example.test", "alias.example.test"}) || DNS01ZoneCoversDomains("other.test", []string{"app.example.test"}) {
+		t.Fatal("DNS-01 zone coverage relation is invalid")
+	}
+	httpBinding := Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/root/account.key", AccountKeyFingerprint: digest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: ChallengeHTTP01, CredentialFiles: []CredentialFile{}}
+	if err := ValidateBinding(httpBinding); err != nil {
+		t.Fatalf("complete HTTP-01 binding rejected: %v", err)
+	}
+	uppercaseDigest := "sha256:" + strings.Repeat("A", 64)
+	uppercaseAccount := httpBinding
+	uppercaseAccount.AccountKeyFingerprint = uppercaseDigest
+	if err := ValidateBinding(uppercaseAccount); err == nil {
+		t.Fatal("uppercase account key fingerprint accepted")
+	}
+	for name, mutate := range map[string]func(*Binding){
+		"provider":            func(binding *Binding) { binding.Provider = DNSProviderCloudflare },
+		"profile_path":        func(binding *Binding) { binding.ProfilePath = "/root/cloudflare.env" },
+		"profile_fingerprint": func(binding *Binding) { binding.ProfileFingerprint = digest },
+		"credential_file": func(binding *Binding) {
+			binding.CredentialFiles = []CredentialFile{{Key: "CF_DNS_API_TOKEN_FILE", Path: "/root/token", Fingerprint: digest}}
+		},
+		"zone":      func(binding *Binding) { binding.Zone = "example.test" },
+		"principal": func(binding *Binding) { binding.Principal = "AWS_REGION=us-east-1;" },
+	} {
+		t.Run("http_with_"+name, func(t *testing.T) {
+			candidate := httpBinding
+			mutate(&candidate)
+			if err := ValidateBinding(candidate); err == nil {
+				t.Fatalf("HTTP-01 binding with %s accepted", name)
+			}
+		})
+	}
+
+	route53 := Binding{DirectoryURL: httpBinding.DirectoryURL, AccountKeyPath: httpBinding.AccountKeyPath, AccountKeyFingerprint: digest, AccountEmail: httpBinding.AccountEmail, TermsAccepted: true, Method: ChallengeDNS01, Provider: DNSProviderRoute53, ProfilePath: "/root/route53.env", ProfileFingerprint: digest, CredentialFiles: []CredentialFile{{Key: "AWS_SHARED_CREDENTIALS_FILE", Path: "/root/aws-credentials", Fingerprint: digest}}, Zone: "example.test", Principal: "AWS_HOSTED_ZONE_ID=zone123;AWS_PROFILE=lanpanel;AWS_REGION=us-east-1;"}
+	if err := ValidateBinding(route53); err != nil {
+		t.Fatalf("complete DNS-01 binding rejected: %v", err)
+	}
+	uppercaseProfile := route53
+	uppercaseProfile.ProfileFingerprint = uppercaseDigest
+	if err := ValidateBinding(uppercaseProfile); err == nil {
+		t.Fatal("uppercase DNS profile fingerprint accepted")
+	}
+	uppercaseCredential := route53
+	uppercaseCredential.CredentialFiles = append([]CredentialFile(nil), route53.CredentialFiles...)
+	uppercaseCredential.CredentialFiles[0].Fingerprint = uppercaseDigest
+	if err := ValidateBinding(uppercaseCredential); err == nil {
+		t.Fatal("uppercase DNS credential fingerprint accepted")
+	}
+	route53.Principal = ""
+	if err := ValidateBinding(route53); err == nil {
+		t.Fatal("DNS-01 binding without required principal accepted")
+	}
+}
+
 func TestProviderSchemasAreClosed(t *testing.T) {
 	for _, provider := range SupportedDNSProviders() {
 		schema, err := ProviderSchemaFor(provider)

@@ -1,7 +1,11 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"lanpanel/internal/acme"
 	"lanpanel/internal/acmeaccount"
 	"net/netip"
 	"net/url"
@@ -19,6 +23,8 @@ const (
 	InstallationSchemaVersion = "lanpanel.installation.ga.v2"
 	MaximumResources          = 256
 )
+
+var ErrHeadscaleDomainConflict = errors.New("headscale control and MagicDNS domains conflict")
 
 type LifecycleState string
 
@@ -725,11 +731,25 @@ func PublicationPrerequisites(installation Installation, resourceID string) erro
 
 var (
 	idPattern               = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
+	certificateIDPattern    = regexp.MustCompile(`^cert_[0-9a-f]{32}$`)
+	staticRootIDPattern     = regexp.MustCompile(`^static_[0-9a-f]{32}$`)
 	headscaleVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
 	headscaleRefPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 )
 
 func validateHeadscale(value HeadscaleDomain) error {
+	if !strings.HasPrefix(value.ID, "hds_") || !idPattern.MatchString(value.ID) {
+		return fmt.Errorf("headscale.id is invalid")
+	}
+	if err := validateDomain(value.ControlDomain); err != nil {
+		return fmt.Errorf("headscale.control_domain: %w", err)
+	}
+	if err := validateDomain(value.MagicDNSNamespace); err != nil {
+		return fmt.Errorf("headscale.magicdns_namespace: %w", err)
+	}
+	if DomainsOverlap(value.ControlDomain, value.MagicDNSNamespace) {
+		return ErrHeadscaleDomainConflict
+	}
 	if value.Policy != "trusted_mesh" {
 		return fmt.Errorf("headscale.policy must be trusted_mesh")
 	}
@@ -803,32 +823,76 @@ func validateHeadscale(value HeadscaleDomain) error {
 }
 
 func ValidateHeadscale(value HeadscaleDomain) error {
-	if !strings.HasPrefix(value.ID, "hds_") || !idPattern.MatchString(value.ID) {
-		return fmt.Errorf("headscale.id is invalid")
-	}
-	if err := validateDomain(value.ControlDomain); err != nil {
-		return fmt.Errorf("headscale.control_domain: %w", err)
-	}
-	if err := validateDomain(value.MagicDNSNamespace); err != nil {
-		return fmt.Errorf("headscale.magicdns_namespace: %w", err)
-	}
-	if value.ControlDomain == value.MagicDNSNamespace {
-		return fmt.Errorf("headscale control and MagicDNS domains conflict")
-	}
 	return validateHeadscale(value)
 }
 
 func validateHeadscaleCertificate(value CertificateBundleIdentity, certificateID, controlDomain string) error {
-	if value.PointerIdentity != "/var/lib/lanpanel/certificates/active/"+certificateID+".current" || !validSHA256Digest(value.BindingIdentity) || value.Generation == 0 || !validSHA256Digest(value.Fingerprint) || !validSHA256Digest(value.SANIdentity) || !validSHA256Digest(value.ChainIdentity) || !validSHA256Digest(value.IssuerIdentity) || value.Authority == nil || value.Authority.CertificateID != certificateID || value.Authority.Method != "http-01" && value.Authority.Method != "dns-01" || value.Authority.DirectoryURL == "" || value.Authority.AccountKeyPath != acmeaccount.ManagedKeyPath || !validSHA256Digest(value.Authority.AccountKeyFingerprint) || !validACMEEmail(value.Authority.AccountEmail) || !value.Authority.TermsAccepted {
-		return fmt.Errorf("headscale certificate authority is incomplete")
+	binding, err := validateCertificateBundleIdentity(value, certificateID)
+	if err != nil {
+		return fmt.Errorf("headscale certificate: %w", err)
+	}
+	if value.SANIdentity != certificateSANIdentity([]string{controlDomain}) {
+		return fmt.Errorf("headscale certificate SAN identity does not bind control_domain")
+	}
+	if binding.Method == acme.ChallengeDNS01 && !acme.DNS01ZoneCoversDomains(binding.Zone, []string{controlDomain}) {
+		return fmt.Errorf("headscale certificate DNS-01 zone does not cover control_domain")
+	}
+	return nil
+}
+
+func validateCertificateBundleIdentity(value CertificateBundleIdentity, certificateID string) (acme.Binding, error) {
+	if value.Authority == nil {
+		return acme.Binding{}, fmt.Errorf("certificate authority is required")
+	}
+	binding, err := validateCertificateAuthority(*value.Authority)
+	if err != nil {
+		return acme.Binding{}, err
+	}
+	if certificateID == "" {
+		certificateID = value.Authority.CertificateID
+	}
+	bindingIdentity, err := acme.BindingDigest(binding)
+	if err != nil {
+		return acme.Binding{}, fmt.Errorf("certificate authority binding: %w", err)
+	}
+	if value.Authority.CertificateID != certificateID {
+		return acme.Binding{}, fmt.Errorf("certificate authority does not bind certificate ID")
+	}
+	if value.PointerIdentity != "/var/lib/lanpanel/certificates/active/"+certificateID+".current" {
+		return acme.Binding{}, fmt.Errorf("certificate active pointer does not bind certificate ID")
+	}
+	if value.BindingIdentity != bindingIdentity || value.Generation == 0 || !validSHA256Digest(value.Fingerprint) || !validSHA256Digest(value.SANIdentity) || !validSHA256Digest(value.ChainIdentity) || !validSHA256Digest(value.IssuerIdentity) {
+		return acme.Binding{}, fmt.Errorf("certificate complete identity is invalid")
 	}
 	deadline, deadlineErr := time.Parse(time.RFC3339, value.NotAfter)
 	wall, wallErr := time.Parse(time.RFC3339, value.LastTrustedWall)
 	if deadlineErr != nil || wallErr != nil || deadline.IsZero() || wall.IsZero() || deadline.Before(wall) {
-		return fmt.Errorf("headscale certificate deadline evidence invalid")
+		return acme.Binding{}, fmt.Errorf("certificate deadline evidence invalid")
 	}
-	_ = controlDomain
-	return nil
+	return binding, nil
+}
+
+func validateCertificateAuthority(value CertificateAuthorityIdentity) (acme.Binding, error) {
+	if !certificateIDPattern.MatchString(value.CertificateID) {
+		return acme.Binding{}, fmt.Errorf("certificate authority certificate ID is invalid")
+	}
+	if value.AccountKeyPath != acmeaccount.ManagedKeyPath {
+		return acme.Binding{}, fmt.Errorf("certificate authority account key path is invalid")
+	}
+	credentials := make([]acme.CredentialFile, len(value.CredentialFiles))
+	for index, credential := range value.CredentialFiles {
+		credentials[index] = acme.CredentialFile{Key: credential.Key, Path: credential.Path, Fingerprint: credential.Fingerprint}
+	}
+	binding := acme.Binding{DirectoryURL: value.DirectoryURL, AccountKeyPath: value.AccountKeyPath, AccountKeyFingerprint: value.AccountKeyFingerprint, AccountEmail: value.AccountEmail, TermsAccepted: value.TermsAccepted, Method: acme.ChallengeMethod(value.Method), Provider: acme.DNSProvider(value.Provider), ProfilePath: value.ProfilePath, ProfileFingerprint: value.ProfileFingerprint, CredentialFiles: credentials, Zone: value.Zone, Principal: value.Principal}
+	if err := acme.ValidateBinding(binding); err != nil {
+		return acme.Binding{}, fmt.Errorf("certificate authority: %w", err)
+	}
+	return binding, nil
+}
+
+func certificateSANIdentity(domains []string) string {
+	digest := sha256.Sum256([]byte(strings.Join(domains, "\x00")))
+	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
 func ValidateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
@@ -836,17 +900,17 @@ func ValidateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
 }
 
 func validateHeadscaleApplied(value HeadscaleAppliedIdentity) error {
-	if value.Generation == 0 || !validSHA256Digest(value.ConfigDigest) || !validSHA256Digest(value.ArtifactDigest) || !validSHA256Digest(value.ServiceIdentity) || !validSHA256Digest(value.ControlIdentity) || !headscaleRefPattern.MatchString(value.CertificateID) {
+	if value.Generation == 0 || !validSHA256Digest(value.ConfigDigest) || !validSHA256Digest(value.ArtifactDigest) || !validSHA256Digest(value.ServiceIdentity) || !validSHA256Digest(value.ControlIdentity) || !certificateIDPattern.MatchString(value.CertificateID) {
 		return fmt.Errorf("headscale applied identity is incomplete")
 	}
 	return nil
 }
 
 func ValidateHeadscaleTransition(prior, candidate HeadscaleDomain) error {
-	if err := validateHeadscale(prior); err != nil {
+	if err := ValidateHeadscale(prior); err != nil {
 		return fmt.Errorf("prior Headscale identity: %w", err)
 	}
-	if err := validateHeadscale(candidate); err != nil {
+	if err := ValidateHeadscale(candidate); err != nil {
 		return fmt.Errorf("candidate Headscale identity: %w", err)
 	}
 	if prior.ID != candidate.ID || prior.ControlDomain != candidate.ControlDomain || prior.MagicDNSNamespace != candidate.MagicDNSNamespace || prior.Policy != candidate.Policy || !reflect.DeepEqual(prior.Artifact, candidate.Artifact) || prior.Database.UUID != candidate.Database.UUID || prior.Database.SQLitePath != candidate.Database.SQLitePath || prior.Database.IdentityBundleDigest != candidate.Database.IdentityBundleDigest || prior.Database.Generation != candidate.Database.Generation || !slices.Equal(prior.ManagedPaths, candidate.ManagedPaths) {
@@ -872,16 +936,7 @@ func ValidateInstallation(installation Installation) error {
 		return err
 	}
 	if installation.Headscale != nil {
-		if !strings.HasPrefix(installation.Headscale.ID, "hds_") || !idPattern.MatchString(installation.Headscale.ID) {
-			return fmt.Errorf("headscale.id is invalid")
-		}
-		if err := validateDomain(installation.Headscale.ControlDomain); err != nil {
-			return fmt.Errorf("headscale.control_domain: %w", err)
-		}
-		if err := validateDomain(installation.Headscale.MagicDNSNamespace); err != nil {
-			return fmt.Errorf("headscale.magicdns_namespace: %w", err)
-		}
-		if err := validateHeadscale(*installation.Headscale); err != nil {
+		if err := ValidateHeadscale(*installation.Headscale); err != nil {
 			return err
 		}
 	}
@@ -925,7 +980,7 @@ func ValidateInstallation(installation Installation) error {
 	staticRootIDs := map[string]struct{}{}
 	staticRootOwners := map[string]string{}
 	for index, root := range installation.StaticRoots {
-		if !strings.HasPrefix(root.ID, "static_") || len(root.ID) != 39 || !idPattern.MatchString(root.OwnerResourceID) || !cleanAbsolutePath(root.Path) || !validSHA256Digest(root.Fingerprint) || root.Device == 0 {
+		if !staticRootIDPattern.MatchString(root.ID) || !idPattern.MatchString(root.OwnerResourceID) || !cleanAbsolutePath(root.Path) || !validSHA256Digest(root.Fingerprint) || root.Device == 0 {
 			return fmt.Errorf("static_roots[%d] identity invalid", index)
 		}
 		if _, duplicate := staticRootIDs[root.ID]; duplicate {
@@ -1690,16 +1745,17 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			seen[exactDomain] = struct{}{}
 		}
 		certificate := identity.Certificate
-		if certificate.PointerIdentity == "" || certificate.BindingIdentity == "" || certificate.PointerIdentity != strings.TrimSpace(certificate.PointerIdentity) || certificate.BindingIdentity != strings.TrimSpace(certificate.BindingIdentity) {
-			return fmt.Errorf("domain_https certificate pointer and binding identities are required")
+		binding, err := validateCertificateBundleIdentity(certificate, "")
+		if err != nil {
+			return fmt.Errorf("domain_https certificate: %w", err)
 		}
-		if certificate.Generation == 0 || !validSHA256Digest(certificate.Fingerprint) || !validSHA256Digest(certificate.SANIdentity) || !validSHA256Digest(certificate.ChainIdentity) || !validSHA256Digest(certificate.IssuerIdentity) {
-			return fmt.Errorf("domain_https certificate complete identity is invalid")
+		sanDomains := append([]string(nil), identity.ExactDomains...)
+		slices.Sort(sanDomains)
+		if certificate.SANIdentity != certificateSANIdentity(sanDomains) {
+			return fmt.Errorf("domain_https certificate SAN identity does not bind exact_domains")
 		}
-		deadline, err := time.Parse(time.RFC3339, certificate.NotAfter)
-		wall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
-		if err != nil || wallErr != nil || deadline.IsZero() || wall.IsZero() || deadline.Before(wall) {
-			return fmt.Errorf("domain_https certificate deadline evidence invalid")
+		if binding.Method == acme.ChallengeDNS01 && !acme.DNS01ZoneCoversDomains(binding.Zone, sanDomains) {
+			return fmt.Errorf("domain_https certificate DNS-01 zone does not cover exact_domains")
 		}
 		switch identity.Auth.Mode {
 		case AppAccessPublic, AppAccessApplicationManaged:
@@ -1717,7 +1773,7 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			return fmt.Errorf("domain_https static bundle inventory incomplete")
 		}
 		for index, route := range identity.Static.Routes {
-			if !strings.HasPrefix(identity.Static.RootID, "static_") || !validStaticURL(route.URLPath, route.Directory) || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || !cleanAbsolutePath(route.SourcePath) || !validSHA256Digest(route.Fingerprint) || index > 0 && identity.Static.Routes[index-1].URLPath >= route.URLPath {
+			if !staticRootIDPattern.MatchString(identity.Static.RootID) || !validStaticURL(route.URLPath, route.Directory) || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || !cleanAbsolutePath(route.SourcePath) || !validSHA256Digest(route.Fingerprint) || index > 0 && identity.Static.Routes[index-1].URLPath >= route.URLPath {
 				return fmt.Errorf("domain_https static route bundle invalid")
 			}
 		}
@@ -1849,6 +1905,17 @@ func validateDomain(value string) error {
 		}
 	}
 	return nil
+}
+
+func ValidateExactDomain(value string) error {
+	return validateDomain(value)
+}
+
+func DomainsOverlap(left, right string) bool {
+	if ValidateExactDomain(left) != nil || ValidateExactDomain(right) != nil {
+		return false
+	}
+	return left == right || strings.HasSuffix(left, "."+right) || strings.HasSuffix(right, "."+left)
 }
 
 func validateHTTPSURL(value string) error {

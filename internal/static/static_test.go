@@ -2,6 +2,19 @@ package staticcontent
 
 import "testing"
 
+func TestRegisterRejectsNoncanonicalStaticRootIDs(t *testing.T) {
+	for _, id := range []string{
+		"static_0000000000000000000000000000000g",
+		"static_0000000000000000000000000000000A",
+		"static_0000000000000000000000000000000 ",
+		"static_0000000000000000000000000000000\x00",
+	} {
+		if _, err := Register(id, t.TempDir(), nil); err == nil || err.Error() != "static root identity invalid" {
+			t.Fatalf("Register(%q) error = %v, want static ID rejection", id, err)
+		}
+	}
+}
+
 func TestStaticMappingGrammarIsClosed(t *testing.T) {
 	cases := []struct {
 		path      string

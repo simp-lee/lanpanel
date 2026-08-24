@@ -3,6 +3,7 @@
 package reservations
 
 import (
+	"errors"
 	"fmt"
 	"lanpanel/internal/domain"
 	"path/filepath"
@@ -130,6 +131,10 @@ func (transaction *Transaction) Commit() error {
 
 func BuildClaims(installation domain.Installation) ([]Claim, error) {
 	if err := domain.ValidateInstallation(installation); err != nil {
+		if installation.Headscale != nil && errors.Is(err, domain.ErrHeadscaleDomainConflict) {
+			owner := "installation:" + installation.InstallationID + ":headscale:" + installation.Headscale.ID
+			return nil, ConflictError{Left: Claim{Kind: KindExactDomain, Value: installation.Headscale.ControlDomain, Owner: owner}, Right: Claim{Kind: KindMagicDNSNamespace, Value: installation.Headscale.MagicDNSNamespace, Owner: owner}}
+		}
 		return nil, err
 	}
 	claims := make([]Claim, 0)
@@ -147,9 +152,6 @@ func BuildClaims(installation domain.Installation) ([]Claim, error) {
 		owner := installationOwner + ":headscale:" + installation.Headscale.ID
 		controlDomain := Claim{Kind: KindExactDomain, Value: installation.Headscale.ControlDomain, Owner: owner}
 		magicDNS := Claim{Kind: KindMagicDNSNamespace, Value: installation.Headscale.MagicDNSNamespace, Owner: owner}
-		if domainsOverlap(controlDomain.Value, magicDNS.Value) {
-			return nil, ConflictError{Left: controlDomain, Right: magicDNS}
-		}
 		claims = append(claims,
 			controlDomain,
 			magicDNS,
@@ -295,8 +297,8 @@ func validateClaim(claim Claim) error {
 			return fmt.Errorf("resource_name must be normalized")
 		}
 	case KindExactDomain, KindMagicDNSNamespace:
-		if claim.Value != strings.ToLower(claim.Value) || strings.HasSuffix(claim.Value, ".") || strings.Contains(claim.Value, "*") {
-			return fmt.Errorf("domain claim must be canonical and exact")
+		if err := domain.ValidateExactDomain(claim.Value); err != nil {
+			return fmt.Errorf("domain claim must be canonical and exact: %w", err)
 		}
 	case KindListener:
 		parts := strings.Split(claim.Value, ":")
@@ -346,7 +348,7 @@ func isDomainKind(kind Kind) bool {
 }
 
 func domainsOverlap(left, right string) bool {
-	return left == right || strings.HasSuffix(left, "."+right) || strings.HasSuffix(right, "."+left)
+	return domain.DomainsOverlap(left, right)
 }
 
 func pathsOverlap(left, right string) bool {
