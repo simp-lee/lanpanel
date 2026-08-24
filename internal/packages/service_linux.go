@@ -39,13 +39,14 @@ type Request struct {
 }
 
 type Service struct {
-	files    *filetxn.Store
-	journal  *FileJournalStore
-	auditor  *LinuxAuditor
-	engine   Engine
-	owner    filetxn.Owner
-	planRoot string
-	mu       sync.Mutex
+	files        *filetxn.Store
+	journal      *FileJournalStore
+	auditor      *LinuxAuditor
+	engine       Engine
+	owner        filetxn.Owner
+	planRoot     string
+	transactions *TransactionFiles
+	mu           sync.Mutex
 }
 
 func OpenFixedService() (*Service, error) {
@@ -88,7 +89,7 @@ func openFixedService(requireNoPending bool) (*Service, error) {
 	}
 	stager := &ArtifactStager{Files: transactionFiles, Launcher: launcher}
 	executor := &HostExecutor{Auditor: auditor, Stager: stager, Files: transactionFiles, Masks: masks, Launcher: launcher}
-	service := &Service{files: files, journal: journals, auditor: auditor, owner: owner, planRoot: FixedPackagePlanRoot}
+	service := &Service{files: files, journal: journals, auditor: auditor, owner: owner, planRoot: FixedPackagePlanRoot, transactions: transactionFiles}
 	service.engine = Engine{Journals: journals, Executor: executor, Monitor: NewLinuxMonitor(), MonitorRequired: false, Now: func() time.Time { return time.Now().UTC() }}
 	pending, err := journals.Pending(context.Background())
 	if err != nil {
@@ -128,13 +129,18 @@ func ExecuteFixedInstallerTransaction(ctx context.Context, plan Plan, result pre
 	if len(pending) > 1 || len(pending) == 1 && pending[0].TransactionID != plan.TransactionID {
 		return Journal{}, fmt.Errorf("foreign pending package transaction blocks clean installer")
 	}
+	var journal Journal
 	if len(pending) == 1 {
-		return service.engine.Resume(ctx, plan, result, pending[0])
+		journal, err = service.engine.Resume(ctx, plan, result, pending[0])
+	} else if existing, readErr := service.journal.Read(ctx, plan.TransactionID); readErr == nil {
+		journal, err = service.engine.Resume(ctx, plan, result, existing)
+	} else {
+		journal, err = service.engine.Execute(ctx, plan, result)
 	}
-	if existing, readErr := service.journal.Read(ctx, plan.TransactionID); readErr == nil {
-		return service.engine.Resume(ctx, plan, result, existing)
+	if err == nil && journal.Phase == JournalCleaned {
+		err = service.transactions.Cleanup(ctx, plan)
 	}
-	return service.engine.Execute(ctx, plan, result)
+	return journal, err
 }
 
 func prepareFixedInstallerLayout() error {
@@ -182,6 +188,11 @@ func (service *Service) Execute(ctx context.Context, request Request) (string, e
 	journal, err := service.engine.Execute(ctx, plan, preflightResult)
 	if err != nil {
 		return "", err
+	}
+	if journal.Phase == JournalCleaned {
+		if err := service.transactions.Cleanup(ctx, plan); err != nil {
+			return "", err
+		}
 	}
 	encoded, err := json.Marshal(journal)
 	if err != nil {

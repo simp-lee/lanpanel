@@ -1011,7 +1011,7 @@ func (admitter *Admitter) ReenterHeadscaleChallengeContraction(ctx context.Conte
 		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("headscale challenge is not contraction-recoverable")
 	}
 	state, err := admitter.safety.Read()
-	if err != nil || !exactCertificateChallenge(state, intent.SafetyBinding) {
+	if err != nil || !exactCertificateChallenge(state, intent.Operation, intent.SafetyBinding) {
 		return Reservation{}, ChildRecord{}, nil, nil, fmt.Errorf("headscale challenge contraction safety authority changed")
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
@@ -1248,7 +1248,7 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 	if err != nil {
 		return fail(err)
 	}
-	if intent.Consumption == nil || currentDigest != intent.Consumption.SafetyDigest && !exactCertificateChallenge(state, intent.SafetyBinding) && !exactCertificatePublicationAuthority(state, intent) {
+	if intent.Consumption == nil || currentDigest != intent.Consumption.SafetyDigest && !exactCertificateChallenge(state, intent.Operation, intent.SafetyBinding) && !exactCertificatePublicationAuthority(state, intent) {
 		return fail(fmt.Errorf("contraction or safety transition preempted remote operation"))
 	}
 	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil && !exactCertificatePublicationAuthority(state, intent) {
@@ -5039,14 +5039,23 @@ func exactCertificatePublicationAuthority(state safety.State, intent Reservation
 	return false
 }
 
-func exactCertificateChallenge(state safety.State, binding SafetyBinding) bool {
+func exactCertificateChallenge(state safety.State, operation Type, binding SafetyBinding) bool {
 	if binding.ResourceID == "headscale" {
 		pending := state.Headscale.ChallengePending
-		return pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle && pending.CertificateIdentity == binding.CertificateIdentity
+		if pending == nil || pending.PlanID != binding.PlanID || pending.Generation != binding.IntentGeneration || pending.CertificateIdentity != binding.CertificateIdentity {
+			return false
+		}
+		if operation == HeadscaleDeploy {
+			return pending.ConfigDigest == binding.CandidateDigest && pending.ACMEBinding == binding.ACMEBinding
+		}
+		return operation == CertificateRenew && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle
+	}
+	if operation != Publish && operation != CertificateRenew {
+		return false
 	}
 	for _, resource := range state.Resources {
 		pending := resource.ChallengePending
-		if resource.ResourceID == binding.ResourceID && pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle {
+		if resource.ResourceID == binding.ResourceID && pending != nil && pending.PlanID == binding.PlanID && pending.Generation == binding.IntentGeneration && pending.SANIdentity == binding.CandidateDigest && pending.ACMEBinding == binding.CandidateBundle && pending.CertificateIdentity == binding.CertificateIdentity {
 			return true
 		}
 	}
@@ -5070,7 +5079,7 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 		return err
 	}
 	if !isContraction(intent.Operation) && currentDigest != intent.Consumption.SafetyDigest {
-		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew || intent.Operation == HeadscaleDeploy) && exactCertificateChallenge(state, intent.SafetyBinding)
+		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew || intent.Operation == HeadscaleDeploy) && exactCertificateChallenge(state, intent.Operation, intent.SafetyBinding)
 		certificateHandoff := intent.Operation == Publish && exactCertificatePublicationAuthority(state, intent)
 		if !ownedChallenge && !certificateHandoff {
 			return fmt.Errorf("contraction or safety transition preempted operation authority")
@@ -5160,7 +5169,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if state.StopFence != nil {
 			return fmt.Errorf("global safety authority blocks Headscale deploy")
 		}
-		ownedChallenge := exactCertificateChallenge(state, binding)
+		ownedChallenge := exactCertificateChallenge(state, operation, binding)
 		if state.Headscale.CertificateExpiry != nil || state.Headscale.Reactivating != nil || state.Headscale.ChallengePending != nil && !ownedChallenge {
 			return fmt.Errorf("headscale marker authority blocks deploy")
 		}
@@ -5169,7 +5178,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if state.StopFence != nil {
 			return fmt.Errorf("headscale renewal blocked by shared safety marker")
 		}
-		ownedChallenge := exactCertificateChallenge(state, binding)
+		ownedChallenge := exactCertificateChallenge(state, operation, binding)
 		expiryChallenge := state.Headscale.CertificateExpiry != nil && binding.ExpiryGeneration == state.Headscale.CertificateExpiry.Generation && (binding.ChallengeMethod == "http-01" || binding.ChallengeMethod == "dns-01")
 		if state.Headscale.CertificateExpiry != nil && !expiryChallenge || state.Headscale.Reactivating != nil || state.Headscale.ChallengePending != nil && !ownedChallenge {
 			return fmt.Errorf("headscale renewal blocked by safety marker")
@@ -5203,7 +5212,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if resource == nil {
 			return fmt.Errorf("publish safety resource binding is missing")
 		}
-		ownedChallenge := exactCertificateChallenge(state, binding)
+		ownedChallenge := exactCertificateChallenge(state, operation, binding)
 		challengeStart := consuming && binding.CertificateIdentity != "" && (binding.ChallengeMethod == "http-01" || binding.ChallengeMethod == "dns-01")
 		if resource.Closing != nil || resource.State == safety.ResourceDeleting || resource.Ownership == safety.OwnershipOrphan || resource.ChallengePending != nil && !ownedChallenge {
 			return fmt.Errorf("resource lifecycle or challenge authority blocks publish")

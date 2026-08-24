@@ -541,9 +541,6 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return err
 		}
 		if strict {
-			if err := verifyCommittedBundle(journal.Paths, journal, commit); err != nil {
-				return err
-			}
 			launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
 			if err != nil {
 				return err

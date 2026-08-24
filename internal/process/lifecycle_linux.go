@@ -70,15 +70,26 @@ func Observe(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle
 	for _, inode := range owned {
 		ownedSet[inode] = struct{}{}
 	}
+	wantAddress := netip.Addr{}
+	if endpointKind == domain.LocalEndpointTCPSocketActivation {
+		wantAddress, err = netip.ParseAddr(bundle.TCPAddress)
+		if err != nil || bundle.TCPPort == 0 {
+			return RuntimeObservation{}, fmt.Errorf("PID1 TCP socket address authority incomplete")
+		}
+	}
 	for _, path := range procNetFiles {
-		inodes, err := readListeners(path)
+		listeners, err := readListeners(path)
 		if err != nil {
 			return RuntimeObservation{}, err
 		}
-		for _, inode := range inodes {
-			if _, present := ownedSet[inode]; present {
-				result.ListenerInodes = append(result.ListenerInodes, inode)
+		for _, listener := range listeners {
+			if _, present := ownedSet[listener.Inode]; !present {
+				continue
 			}
+			if endpointKind == domain.LocalEndpointTCPSocketActivation && (listener.Address != wantAddress || listener.Port != bundle.TCPPort) {
+				return RuntimeObservation{}, fmt.Errorf("inherited TCP listener differs from declared address or port")
+			}
+			result.ListenerInodes = append(result.ListenerInodes, listener.Inode)
 		}
 	}
 	if endpointKind == domain.LocalEndpointTCPSocketActivation {
@@ -268,13 +279,19 @@ func parseProcTCPAddress(value string, ipv6 bool) (netip.Addr, error) {
 	return netip.AddrFrom4(value4), nil
 }
 
-func readListeners(path string) ([]uint64, error) {
+type tcpListener struct {
+	Address netip.Addr
+	Port    uint16
+	Inode   uint64
+}
+
+func readListeners(path string) ([]tcpListener, error) {
 	file, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, err
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
-	result := []uint64{}
+	result := []tcpListener{}
 	scanner := bufio.NewScanner(io.LimitReader(file, 32<<20))
 	first := true
 	for scanner.Scan() {
@@ -286,15 +303,26 @@ func readListeners(path string) ([]uint64, error) {
 		if len(fields) < 10 {
 			continue
 		}
-		state := fields[3]
-		if state != "0A" {
+		if fields[3] != "0A" {
 			continue
+		}
+		addressText, portText, found := strings.Cut(fields[1], ":")
+		if !found {
+			return nil, fmt.Errorf("listener address is invalid")
+		}
+		address, err := parseProcTCPAddress(addressText, len(addressText) == 32)
+		if err != nil {
+			return nil, fmt.Errorf("listener address is invalid: %w", err)
+		}
+		port, err := strconv.ParseUint(portText, 16, 16)
+		if err != nil || port == 0 {
+			return nil, fmt.Errorf("listener port is invalid")
 		}
 		inode, err := strconv.ParseUint(fields[9], 10, 64)
 		if err != nil || inode == 0 {
 			return nil, fmt.Errorf("listener inode is invalid")
 		}
-		result = append(result, inode)
+		result = append(result, tcpListener{Address: address, Port: uint16(port), Inode: inode})
 	}
 	return result, scanner.Err()
 }

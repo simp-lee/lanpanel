@@ -105,6 +105,14 @@ func TestResumeInstallAuthorityChangesOnlyObservationTime(t *testing.T) {
 	_ = manifest
 }
 
+func TestQualificationDependencyAssetsCannotOverwriteReleaseAssets(t *testing.T) {
+	_, authority, _, _ := dependencyAuthorityFixture(t, testProfile())
+	authority.DependencyBaseline.Path = "lanpanel"
+	if _, err := QualificationDependencyAssetPaths(authority); err == nil {
+		t.Fatal("dependency asset overwrote the release candidate path")
+	}
+}
+
 func TestQualificationInstallBindsCandidateTargetHostAndImmutablePlan(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	profile := testProfile()

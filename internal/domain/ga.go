@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -1414,8 +1415,8 @@ func containsControl(value string) bool {
 }
 
 func validateExternalAbsolute(value, label string) error {
-	if value == "" || value != strings.TrimSpace(value) || !filepath.IsAbs(value) || filepath.Clean(value) != value || value == "/" {
-		return fmt.Errorf("%s must be a clean absolute non-root path", label)
+	if !validManagedSystemdPath(value) {
+		return fmt.Errorf("%s must be a clean systemd-safe absolute non-root path", label)
 	}
 	return nil
 }
@@ -1945,10 +1946,22 @@ func validatePaths(label string, paths []string) error {
 }
 
 func validateManagedPath(path string) error {
-	if path == "" || path != strings.TrimSpace(path) || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
-		return fmt.Errorf("must be a clean absolute non-root path")
+	if !validManagedSystemdPath(path) {
+		return fmt.Errorf("must be a clean systemd-safe absolute non-root path")
 	}
 	return nil
+}
+
+func validManagedSystemdPath(value string) bool {
+	if value == "" || value == "/" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsAny(value, `%:\\"'`) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func validSHA256Digest(value string) bool {

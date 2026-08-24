@@ -37,6 +37,19 @@ func TestManagedPolicyCoversDescendantsAndProtectedDestinations(t *testing.T) {
 	}
 }
 
+func TestManagedPolicyRejectsSystemdDirectiveInjection(t *testing.T) {
+	profile := Profile{SchemaVersion: SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, QualificationDigest: digestForTest()}
+	resourceID := "res_00000000000000000000000000000001"
+	for _, path := range []string{"/srv/app/data\nExecStart=/tmp/payload", "/srv/app:/etc", "/srv/app%h", "/srv/app data", `/srv/app\\escape`} {
+		if _, err := Render(profile, resourceID, "/srv/app", "", "", "", []string{path}); err == nil {
+			t.Fatalf("unsafe systemd path accepted: %q", path)
+		}
+	}
+	if _, err := Render(profile, "res_0000000000000000000000000000000z", "/srv/app", "", "", "", nil); err == nil {
+		t.Fatal("invalid resource identity accepted")
+	}
+}
+
 func digestForTest() string {
 	return "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }

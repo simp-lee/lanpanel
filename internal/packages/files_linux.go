@@ -125,6 +125,29 @@ func (files *TransactionFiles) Prepare(ctx context.Context, plan Plan, config, s
 	return nil
 }
 
+func (files *TransactionFiles) Cleanup(ctx context.Context, plan Plan) error {
+	if files == nil || ValidatePlan(plan) != nil || !filepath.IsAbs(files.transactionRoot) || !filepath.IsAbs(files.stagingRoot) {
+		return fmt.Errorf("package cleanup authority is invalid")
+	}
+	for _, root := range []string{files.transactionRoot, files.stagingRoot} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rootFD, err := openPackageRoot(root, files.strict)
+		if err != nil {
+			return err
+		}
+		path := filepath.Join(root, plan.TransactionID)
+		removeErr := os.RemoveAll(path)
+		syncErr := unix.Fsync(rootFD)
+		closeErr := unix.Close(rootFD)
+		if err := errors.Join(removeErr, syncErr, closeErr); err != nil {
+			return fmt.Errorf("remove completed package transaction files: %w", err)
+		}
+	}
+	return nil
+}
+
 func (files *TransactionFiles) validateStagedClosure(ctx context.Context, plan Plan) error {
 	rootFD, err := openPackageRoot(files.stagingRoot, files.strict)
 	if err != nil {

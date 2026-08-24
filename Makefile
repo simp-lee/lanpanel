@@ -145,7 +145,7 @@ ga-playwright-action-boundary:
 
 ga-playwright-auth:
 	$(GO) test -count=1 ./internal/ui ./internal/session ./internal/bootstrap
-	LANPANEL_CHROMIUM_PATH="$${LANPANEL_CHROMIUM_PATH:-$${HOME}/.cache/ms-playwright/chromium-1181/chrome-linux/chrome}" npm run test:auth
+	npm run test:auth
 	@grep -Fq 'Content-Security-Policy' internal/ui/server.go
 	@grep -Fq 'Cache-Control' internal/ui/server.go
 	@grep -Fq 'WebSocketSubprotocol' internal/ui/server.go

@@ -7,7 +7,10 @@ import (
 	"errors"
 	"lanpanel/internal/closure"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/plans"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
+	"lanpanel/internal/target"
 	"testing"
 	"time"
 )
@@ -39,6 +42,33 @@ func TestUnstagedRollbackPreservesReusedAppliedGoAccessOwnership(t *testing.T) {
 	execution := PublicationExecution{Candidate: publication.Candidate{Generation: 5, Bundle: domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{GoAccess: domain.GoAccessBundleIdentity{Enabled: true, Generation: 4, StateGeneration: 4}}}}}
 	if err := execution.rollbackUnstagedGoAccessOwnership(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTemporaryPublicationPlanRequiresFreshEvidenceDigests(t *testing.T) {
+	now := time.Now().UTC()
+	_, preflightResult := headscaleDeployPreflight(t, now)
+	preflightEvidence, err := preflightResult.PlanEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", CurrentConfigDigest: deployTestDigest("config"), PublicationRecord: domain.PublicationRecord{UnpublishedGeneration: 1}, ManagedProcess: &domain.ManagedProcess{Applied: &domain.ProcessBundle{Generation: 1}}}
+	ready := target.Evidence{ResourceID: resource.ID, ConfigDigest: resource.CurrentConfigDigest, EndpointIdentity: deployTestDigest("endpoint"), TransportIdentity: deployTestDigest("transport"), HTTPStatus: 200, ObservedAt: now, Digest: deployTestDigest("ready")}
+	readinessEvidence := plans.Evidence{Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: 1, Digest: ready.Digest, ObservedAt: now}
+	plan := plans.Plan{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: "ui/session/generation/1", Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence}}
+	if !publicationPlanBindingMatches(plan, resource, preflightResult, ready) {
+		t.Fatal("exact temporary publication evidence rejected")
+	}
+	changed := ready
+	changed.Digest = deployTestDigest("changed-ready")
+	if publicationPlanBindingMatches(plan, resource, preflightResult, changed) {
+		t.Fatal("changed target readiness digest retained Plan authority")
+	}
+	changedResult := preflightResult
+	changedResult.Findings = append([]preflight.Finding(nil), preflightResult.Findings...)
+	changedResult.Findings[0].Identity = deployTestDigest("changed-preflight")
+	if publicationPlanBindingMatches(plan, resource, changedResult, ready) {
+		t.Fatal("changed preflight digest retained Plan authority")
 	}
 }
 

@@ -13,6 +13,34 @@ import (
 	"time"
 )
 
+func TestCompletedPackageTransactionFilesAreRemoved(t *testing.T) {
+	root := t.TempDir()
+	transactionRoot := filepath.Join(root, "transactions")
+	stagingRoot := filepath.Join(root, "staging")
+	for _, path := range []string{transactionRoot, stagingRoot} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := testPlan(t, OfflineDebs)
+	for _, path := range []string{filepath.Join(transactionRoot, plan.TransactionID), filepath.Join(stagingRoot, plan.TransactionID)} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "artifact"), []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := newTestTransactionFiles(transactionRoot, stagingRoot).Cleanup(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(transactionRoot, plan.TransactionID), filepath.Join(stagingRoot, plan.TransactionID)} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("completed package path remains: %s: %v", path, err)
+		}
+	}
+}
+
 func TestUnitMasksPreservePreexistingAndRemoveOnlyCreatedMasks(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {

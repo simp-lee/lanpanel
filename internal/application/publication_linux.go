@@ -648,12 +648,10 @@ func publicationPlanBindingMatches(plan plans.Plan, resource domain.AppResource,
 	}
 	matchedPreflight, matchedReadiness := false, false
 	for index := range plan.Evidence {
-		if plan.Evidence[index].Kind == preflightEvidence.Kind && plan.Evidence[index].Identity == preflightEvidence.Identity && plan.Evidence[index].Generation == preflightEvidence.Generation {
-			preflightEvidence.Digest = plan.Evidence[index].Digest
+		if plan.Evidence[index].Kind == preflightEvidence.Kind && plan.Evidence[index].Identity == preflightEvidence.Identity && plan.Evidence[index].Generation == preflightEvidence.Generation && plan.Evidence[index].Digest == preflightEvidence.Digest {
 			matchedPreflight = true
 		}
-		if plan.Evidence[index].Kind == "target_readiness" && plan.Evidence[index].Identity == "resource/"+resource.ID && plan.Evidence[index].Generation == targetEvidenceGeneration(resource) {
-			ready.Digest = plan.Evidence[index].Digest
+		if plan.Evidence[index].Kind == "target_readiness" && plan.Evidence[index].Identity == "resource/"+resource.ID && plan.Evidence[index].Generation == targetEvidenceGeneration(resource) && plan.Evidence[index].Digest == ready.Digest {
 			matchedReadiness = true
 		}
 	}

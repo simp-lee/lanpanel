@@ -201,7 +201,12 @@ func validDigest(value string) bool {
 
 func targetTransportIdentity(target domain.AppTarget) string {
 	if target.Kind == domain.AppTargetTailnetHTTP && target.TailnetHTTP != nil {
-		return "tailnet/" + net.JoinHostPort(target.TailnetHTTP.IP, fmt.Sprint(target.TailnetHTTP.Port))
+		address, addressErr := netip.ParseAddr(target.TailnetHTTP.IP)
+		source, sourceErr := netip.ParseAddr(target.TailnetHTTP.SourceIP)
+		if addressErr != nil || sourceErr != nil {
+			return ""
+		}
+		return "tailnet/" + source.String() + "/" + net.JoinHostPort(address.String(), fmt.Sprint(target.TailnetHTTP.Port))
 	}
 	local := target.LocalHTTP
 	if local == nil {
@@ -249,7 +254,7 @@ func NewTailnetTransport(address, sourceIP string, port uint16, identity string)
 	if err != nil || sourceErr != nil || parsed.IsLoopback() || parsed.IsUnspecified() || !parsed.IsGlobalUnicast() || !source.IsGlobalUnicast() || source.IsLoopback() || source.BitLen() != parsed.BitLen() || port == 0 || identity == "" {
 		return TailnetTransport{}, fmt.Errorf("tailnet readiness endpoint authority invalid")
 	}
-	authority := net.JoinHostPort(address, fmt.Sprint(port))
+	authority := net.JoinHostPort(parsed.String(), fmt.Sprint(port))
 	return TailnetTransport{Address: authority, SourceIP: source.String(), identity: identity + "/tailnet/" + source.String() + "/" + authority}, nil
 }
 

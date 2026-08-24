@@ -79,9 +79,6 @@ func (store *FileJournalStore) Pending(ctx context.Context) ([]Journal, error) {
 	if err != nil {
 		return nil, fmt.Errorf("enumerate package journals: %w", err)
 	}
-	if len(entries) > 256 {
-		return nil, fmt.Errorf("package journal inventory is unbounded")
-	}
 	result := []Journal{}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
@@ -101,6 +98,9 @@ func (store *FileJournalStore) Pending(ctx context.Context) ([]Journal, error) {
 		}
 		if journal.Phase != JournalCleaned {
 			result = append(result, journal)
+			if len(result) > 256 {
+				return nil, fmt.Errorf("pending package journal inventory is unbounded")
+			}
 		}
 	}
 	slices.SortFunc(result, func(left, right Journal) int { return strings.Compare(left.TransactionID, right.TransactionID) })

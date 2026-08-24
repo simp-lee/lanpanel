@@ -203,7 +203,7 @@ func CreatePreauthKey(ctx context.Context, runner AdminRunner, headscaleID strin
 		return PreauthKey{}, nil, err
 	}
 	key, err := normalizePreauth(wire, false)
-	if err != nil || wire.User.ID != userID || wire.Reusable || wire.Ephemeral || len(wire.ACLTags) != 0 || wire.Used {
+	if err != nil || wire.User.ID != userID || wire.Reusable || wire.Ephemeral || len(wire.ACLTags) != 0 || wire.Used || !key.Expiration.After(key.CreatedAt) || key.Expiration.Sub(key.CreatedAt) > expiration {
 		return PreauthKey{}, nil, fmt.Errorf("created preauth key contract changed")
 	}
 	secret := []byte(wire.Key)

@@ -1173,13 +1173,37 @@ func testRegistry(t *testing.T) *Registry {
 func TestExactHeadscaleCertificateChallengeAuthority(t *testing.T) {
 	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
 	state := safety.EmptyState()
-	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
-	if !exactCertificateChallenge(state, binding) {
-		t.Fatal("exact Headscale challenge rejected")
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, ConfigDigest: testDigest("config"), SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
+	if !exactCertificateChallenge(state, CertificateRenew, binding) {
+		t.Fatal("exact Headscale renewal challenge rejected")
+	}
+	deploy := binding
+	deploy.CandidateDigest = state.Headscale.ChallengePending.ConfigDigest
+	deploy.CandidateBundle = testDigest("control-bundle")
+	deploy.ACMEBinding = state.Headscale.ChallengePending.ACMEBinding
+	if !exactCertificateChallenge(state, HeadscaleDeploy, deploy) {
+		t.Fatal("exact Headscale deploy challenge rejected")
+	}
+	deploy.ACMEBinding = testDigest("other-acme")
+	if exactCertificateChallenge(state, HeadscaleDeploy, deploy) {
+		t.Fatal("mismatched Headscale deploy ACME binding accepted")
 	}
 	state.Headscale.ChallengePending.CertificateIdentity = "cert_11111111111111111111111111111111"
-	if exactCertificateChallenge(state, binding) {
+	if exactCertificateChallenge(state, CertificateRenew, binding) {
 		t.Fatal("mismatched Headscale challenge accepted")
+	}
+}
+
+func TestExactAppCertificateChallengeBindsCertificateIdentity(t *testing.T) {
+	binding := SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
+	state := openSafetyState()
+	state.Resources[0].ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
+	if !exactCertificateChallenge(state, Publish, binding) {
+		t.Fatal("exact App challenge rejected")
+	}
+	state.Resources[0].ChallengePending.CertificateIdentity = "cert_11111111111111111111111111111111"
+	if exactCertificateChallenge(state, Publish, binding) {
+		t.Fatal("App challenge with another certificate identity accepted")
 	}
 }
 
@@ -1287,11 +1311,11 @@ func TestHeadscaleRenewalAdmissionAndChallengeBindingAreExact(t *testing.T) {
 	state.Headscale.GenerationSequence = 7
 	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 7, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
 	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_renew", IntentGeneration: 7, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("binding"), CertificateIdentity: state.Headscale.ChallengePending.CertificateIdentity}
-	if !exactCertificateChallenge(state, binding) {
+	if !exactCertificateChallenge(state, CertificateRenew, binding) {
 		t.Fatal("exact Headscale renewal challenge binding rejected")
 	}
 	binding.CandidateBundle = testDigest("other")
-	if exactCertificateChallenge(state, binding) {
+	if exactCertificateChallenge(state, CertificateRenew, binding) {
 		t.Fatal("changed Headscale renewal binding accepted")
 	}
 }

@@ -446,11 +446,19 @@ func QualificationDependencyAssetPaths(authority QualificationDependencyAuthorit
 	}
 	slices.Sort(paths)
 	for index, path := range paths {
-		if !ValidRelativePath(path) || index > 0 && paths[index-1] == path {
+		if !ValidRelativePath(path) || reservedReleaseAssetPath(path) || index > 0 && paths[index-1] == path {
 			return nil, fmt.Errorf("qualification dependency asset inventory is invalid or colliding")
 		}
 	}
 	return paths, nil
+}
+
+func reservedReleaseAssetPath(path string) bool {
+	switch path {
+	case "lanpanel", "LICENSE", "NOTICE", "lanpanel.spdx.json", "dependency-manifest.json", "security-report.json", "qualification-summary.json", "known-limitations.md", "SHA256SUMS", "release.json":
+		return true
+	}
+	return strings.HasPrefix(path, "lanpanel-") && strings.HasSuffix(path, ".tar.gz")
 }
 
 func verifyDependencyAuthority(authority QualificationDependencyAuthority, profile OSProfile, assets map[string][]byte, decoded ...dependencies.Baseline) error {

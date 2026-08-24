@@ -40,6 +40,9 @@ func (executor *LiveExecutor) ensureManagement(ctx context.Context) error {
 	if executor.management != nil {
 		return nil
 	}
+	if executor.target == nil {
+		return fmt.Errorf("management target is unavailable")
+	}
 	client, err := OpenManagementClient(ctx, executor.target)
 	if err != nil {
 		return err

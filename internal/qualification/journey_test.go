@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+func TestEnsureManagementRejectsMissingTarget(t *testing.T) {
+	executor := &LiveExecutor{}
+	if err := executor.ensureManagement(context.Background()); err == nil {
+		t.Fatal("missing reboot target reached management client")
+	}
+}
+
 type fakeExecutor struct {
 	observed int
 	executed []string

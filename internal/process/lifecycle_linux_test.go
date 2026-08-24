@@ -21,6 +21,14 @@ func TestStoppedTCPInventoryRejectsExactListener(t *testing.T) {
 	if err != nil || present {
 		t.Fatalf("foreign present=%t err=%v", present, err)
 	}
+	path := filepath.Join(t.TempDir(), "tcp")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listeners, err := readListeners(path)
+	if err != nil || len(listeners) != 1 || listeners[0].Address != netip.MustParseAddr("127.0.0.9") || listeners[0].Port != 19001 || listeners[0].Inode != 42 {
+		t.Fatalf("listeners=%#v err=%v", listeners, err)
+	}
 }
 
 func TestStoppedObservationRejectsOwnedEndpointResidue(t *testing.T) {

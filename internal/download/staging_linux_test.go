@@ -35,6 +35,30 @@ func TestStagingRereadsExactOwnerModeSizeAndDigest(t *testing.T) {
 	}
 }
 
+func TestFailedStagingVerificationRemovesPartialFile(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "stage-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		t.Fatal(err)
+	}
+	directoryFD, err := unix.Open(filepath.Dir(file.Name()), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := &StagingFile{file: file, path: file.Name(), maximum: 1024, uid: uint32(os.Geteuid()), gid: uint32(os.Getegid()), directoryFD: directoryFD}
+	if _, err := staging.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := staging.CloseVerified(fmt.Sprintf("%x", sha256.Sum256([]byte("different"))), 7); err == nil {
+		t.Fatal("mismatched staging digest accepted")
+	}
+	if _, err := os.Lstat(file.Name()); !os.IsNotExist(err) {
+		t.Fatalf("partial staging file remains: %v", err)
+	}
+}
+
 func TestCreateStagingRejectsUnsafeParentAndNames(t *testing.T) {
 	unsafe := t.TempDir()
 	if _, err := CreateStaging(unsafe, "artifact", uint32(os.Geteuid()), uint32(os.Getegid()), 1024); err == nil {

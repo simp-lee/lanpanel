@@ -65,4 +65,27 @@ func TestPackageJournalFileStorePersistsCanonicalCASPhases(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].TransactionID != prepared.TransactionID {
 		t.Fatalf("pending=%#v error=%v", pending, err)
 	}
+	cleaned := prepared
+	cleaned.TransactionID = "pkg_" + strings.Repeat("5", 64)
+	cleaned.NormalJournalID = "package-" + cleaned.TransactionID
+	cleaned.ChildID = "package-child-" + cleaned.TransactionID
+	cleaned.Phase = JournalCleaned
+	cleaned.MasksComplete = true
+	cleaned.ChildSucceeded = true
+	cleaned.ChildResultDigest = strings.Repeat("6", 64)
+	cleaned.PostconditionDigest = strings.Repeat("7", 64)
+	data, err := encodeJournal(cleaned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.files.Put(context.Background(), store.request(cleaned.TransactionID, nil), data, filetxn.CreateOnly); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.Pending(context.Background())
+	if err != nil || len(pending) != 1 || pending[0].TransactionID != prepared.TransactionID {
+		t.Fatalf("cleaned journal entered pending inventory: %#v, %v", pending, err)
+	}
+	if _, err := store.Read(context.Background(), cleaned.TransactionID); err != nil {
+		t.Fatalf("cleaned retry journal was not retained: %v", err)
+	}
 }

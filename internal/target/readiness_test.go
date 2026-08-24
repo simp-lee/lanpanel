@@ -51,12 +51,25 @@ func TestTailnetReadinessUsesExactVerifiedTransportIdentity(t *testing.T) {
 	defer server.Close()
 	address := strings.TrimPrefix(server.URL, "http://")
 	request := ProbeRequest{ResourceID: "res_00000000000000000000000000000001", ConfigDigest: digest("config"), EndpointIdentity: digest("route"), Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{204}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}, AccessMode: domain.AppAccessPublic, Host: "app.example.test"}
-	identity := request.EndpointIdentity + "/tailnet/100.64.0.2:8080"
+	identity := request.EndpointIdentity + "/tailnet/100.64.0.1/100.64.0.2:8080"
+	transport, err := NewTailnetTransport("100.64.0.2", "100.64.0.1", 8080, request.EndpointIdentity)
+	if err != nil || transport.Identity() != identity {
+		t.Fatalf("real tailnet transport identity=%q error=%v", transport.Identity(), err)
+	}
 	if _, err := Probe(context.Background(), request, dialTransport{address, identity}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tailnet/100.64.0.3:8080"}); err == nil {
-		t.Fatal("mismatched tailnet transport identity accepted")
+	if _, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tailnet/100.64.0.9/100.64.0.2:8080"}); err == nil {
+		t.Fatal("mismatched tailnet source identity accepted")
+	}
+
+	request.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "FD7A:115C:A1E0:0:0:0:0:2", SourceIP: "FD7A:115C:A1E0:0:0:0:0:1", Port: 8080}
+	ipv6Transport, err := NewTailnetTransport(request.Target.TailnetHTTP.IP, request.Target.TailnetHTTP.SourceIP, request.Target.TailnetHTTP.Port, request.EndpointIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Probe(context.Background(), request, dialTransport{address, ipv6Transport.Identity()}); err != nil {
+		t.Fatalf("noncanonical IPv6 tailnet identity rejected: %v", err)
 	}
 }
 

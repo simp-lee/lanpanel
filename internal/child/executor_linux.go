@@ -131,12 +131,22 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if err := command.Start(); err != nil {
 		return Result{}, err
 	}
-	var legoGroup *invocationCgroup
-	if profileID == ProfileLego {
+	var invocationGroup *invocationCgroup
+	groupName := ""
+	switch profileID {
+	case ProfileLego:
 		if invocation.Lego == nil {
 			return Result{}, fmt.Errorf("lego cgroup invocation missing")
 		}
-		legoGroup, err = createInvocationCgroup(invocation.Lego.CertificateID, command.Process.Pid)
+		groupName = "lanpanel-lego-" + invocation.Lego.CertificateID
+	case ProfileAPTDownload, ProfileAPTSimulate, ProfileAPTTransaction, ProfileAPTOfflineTransaction:
+		if invocation.Package == nil {
+			return Result{}, fmt.Errorf("package cgroup invocation missing")
+		}
+		groupName = "lanpanel-package-" + invocation.Package.TransactionID
+	}
+	if groupName != "" {
+		invocationGroup, err = createInvocationCgroup(groupName, command.Process.Pid)
 		if err != nil {
 			terminateErr := terminateProcessGroupBeforeReap(command.Process.Pid)
 			waitErr := command.Wait()
@@ -176,7 +186,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	// Keep the leader unreaped while terminating and checking its process group.
 	// This prevents its numeric PID/PGID from being reused for an unrelated host
 	// process before the final group signal.
-	cgroupErr := legoGroup.KillAndRemove()
+	cgroupErr := invocationGroup.KillAndRemove()
 	if cgroupErr != nil {
 		cgroupErr = &CgroupClosureError{Cause: cgroupErr}
 	}

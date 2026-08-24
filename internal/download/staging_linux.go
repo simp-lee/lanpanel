@@ -44,6 +44,8 @@ func CreateStaging(directory, name string, uid, gid uint32, maximum int64) (*Sta
 	}
 	fail := func() (*StagingFile, error) {
 		_ = unix.Close(fd)
+		_ = unix.Unlinkat(directoryFD, name, 0)
+		_ = unix.Fsync(directoryFD)
 		_ = unix.Close(directoryFD)
 		return nil, fmt.Errorf("initialize download staging file")
 	}
@@ -66,51 +68,71 @@ func (staging *StagingFile) Write(data []byte) (int, error) {
 	return written, err
 }
 
-func (staging *StagingFile) CloseVerified(expectedDigest string, expectedBytes int64) (string, error) {
+func (staging *StagingFile) CloseVerified(expectedDigest string, expectedBytes int64) (path string, resultErr error) {
 	if staging == nil || staging.file == nil || expectedBytes <= 0 || expectedBytes != staging.written || len(expectedDigest) != 64 {
+		if staging != nil {
+			_ = staging.Close()
+		}
 		return "", fmt.Errorf("download staging verification identity is invalid")
 	}
+	verified := false
+	defer func() {
+		if !verified {
+			resultErr = errors.Join(resultErr, staging.Close())
+		}
+	}()
 	file := staging.file
-	staging.file = nil
-	defer func(ignore func() error) { _ = ignore() }(staging.closeDirectory)
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
 		return "", fmt.Errorf("sync download staging file")
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
 		return "", err
 	}
 	hasher := sha256.New()
 	read, err := io.Copy(hasher, io.LimitReader(file, staging.maximum+1))
 	if err != nil || read != expectedBytes || hex.EncodeToString(hasher.Sum(nil)) != expectedDigest {
-		_ = file.Close()
 		return "", fmt.Errorf("reread download staging identity mismatch")
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != staging.uid || stat.Gid != staging.gid || stat.Mode&0o777 != 0o600 || stat.Size != expectedBytes {
-		_ = file.Close()
 		return "", fmt.Errorf("download staging type, owner, mode, link, or size changed")
 	}
 	if err := file.Close(); err != nil {
 		return "", err
 	}
+	staging.file = nil
 	if err := unix.Fsync(staging.directoryFD); err != nil {
 		return "", fmt.Errorf("sync download staging directory: %w", err)
 	}
-	return staging.path, nil
+	path = staging.path
+	if err := staging.closeDirectory(); err != nil {
+		return "", err
+	}
+	verified = true
+	return path, nil
 }
 
 func (staging *StagingFile) Close() error {
 	if staging == nil {
 		return nil
 	}
-	var err error
+	var closeErr error
 	if staging.file != nil {
-		err = staging.file.Close()
+		closeErr = staging.file.Close()
 		staging.file = nil
 	}
-	return errors.Join(err, staging.closeDirectory())
+	var removeErr, syncErr error
+	if staging.directoryFD >= 0 {
+		name := filepath.Base(staging.path)
+		if name == "." || name == ".." || strings.ContainsAny(name, "\x00/\\\r\n") {
+			removeErr = fmt.Errorf("download staging filename is invalid")
+		} else if err := unix.Unlinkat(staging.directoryFD, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			removeErr = err
+		} else if err == nil {
+			syncErr = unix.Fsync(staging.directoryFD)
+		}
+	}
+	return errors.Join(closeErr, removeErr, syncErr, staging.closeDirectory())
 }
 
 func (staging *StagingFile) closeDirectory() error {

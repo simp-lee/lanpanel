@@ -16,6 +16,19 @@ import (
 	"time"
 )
 
+func TestInvocationCgroupNamesAreTyped(t *testing.T) {
+	for _, name := range []string{"lanpanel-lego-cert_" + strings.Repeat("a", 32), "lanpanel-package-pkg_" + strings.Repeat("b", 64)} {
+		if !validInvocationCgroupName(name) {
+			t.Fatalf("valid invocation cgroup rejected: %s", name)
+		}
+	}
+	for _, name := range []string{"lanpanel-package-pkg_" + strings.Repeat("b", 63), "lanpanel-lego-cert_" + strings.Repeat("z", 32), "lanpanel-other-" + strings.Repeat("a", 32)} {
+		if validInvocationCgroupName(name) {
+			t.Fatalf("invalid invocation cgroup accepted: %s", name)
+		}
+	}
+}
+
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
 	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleFallbackStop, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxStart, ProfileNginxTest, ProfileQualificationReboot, ProfileQualificationServices, ProfileQualificationUIRestart, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {

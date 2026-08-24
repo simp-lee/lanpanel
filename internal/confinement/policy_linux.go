@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 )
@@ -55,12 +56,9 @@ func Render(profile Profile, resourceID, workingDirectory, environmentFile, fron
 	if err := ValidateProfile(profile); err != nil {
 		return UnitPolicy{}, err
 	}
-	if resourceID == "" || workingDirectory == "" || !filepath.IsAbs(workingDirectory) || frontend != "" && !filepath.IsAbs(frontend) || backend != "" && !filepath.IsAbs(backend) {
-		return UnitPolicy{}, fmt.Errorf("managed-process policy authority is invalid")
-	}
 	short := strings.TrimPrefix(resourceID, "res_")
-	if len(short) < 20 {
-		return UnitPolicy{}, fmt.Errorf("resource identity is invalid")
+	if len(resourceID) != 36 || len(short) != 32 || !lowerHex(short) || !validSystemdPath(workingDirectory) || environmentFile != "" && !validSystemdPath(environmentFile) || frontend != "" && !validSystemdPath(frontend) || backend != "" && !validSystemdPath(backend) {
+		return UnitPolicy{}, fmt.Errorf("managed-process policy authority is invalid")
 	}
 	cgroup := "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-" + short[:20] + ".slice/lanpanel-app-" + short[:20] + ".service"
 	directives := []string{
@@ -85,7 +83,7 @@ func Render(profile Profile, resourceID, workingDirectory, environmentFile, fron
 		directives = append(directives, "IPAddressDeny="+destination)
 	}
 	for _, path := range writePaths {
-		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		if !validSystemdPath(path) {
 			return UnitPolicy{}, fmt.Errorf("managed-process write path is invalid")
 		}
 		directives = append(directives, "ReadWritePaths="+path)
@@ -300,6 +298,18 @@ func lowerHex(value string) bool {
 	for _, character := range value {
 		allowed := character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
 		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func validSystemdPath(value string) bool {
+	if value == "" || value == "/" || !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsAny(value, `%:\\"'`) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
 			return false
 		}
 	}
