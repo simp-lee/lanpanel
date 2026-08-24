@@ -327,16 +327,30 @@ func reconcileJournalLessResourceUpdates(ctx context.Context) error {
 	return nil
 }
 
-func reconcileResourceUpdate(ctx context.Context, path string) (result error) {
+type resourceRecoveryRuntime struct {
+	openService func() (*FixedService, error)
+	lockRoot    string
+	owner       uint32
+	group       uint32
+}
+
+func reconcileResourceUpdate(ctx context.Context, path string) error {
+	return reconcileResourceUpdateWithRuntime(ctx, path, resourceRecoveryRuntime{openService: OpenFixed, lockRoot: fixedRoot + "/locks", owner: 0, group: 0})
+}
+
+func reconcileResourceUpdateWithRuntime(ctx context.Context, path string, runtime resourceRecoveryRuntime) (result error) {
+	if runtime.openService == nil || runtime.lockRoot == "" {
+		return fmt.Errorf("resource update recovery runtime is invalid")
+	}
 	journal, err := readResourceUpdateJournal(path)
 	if err != nil {
 		return err
 	}
-	service, err := OpenFixed()
+	service, err := runtime.openService()
 	if err != nil {
 		return err
 	}
-	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: runtime.lockRoot, Owner: runtime.owner, Group: runtime.group, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		_ = service.Close()
 		return err
@@ -548,17 +562,24 @@ func reconcileJournalLessResourceCreates(ctx context.Context) error {
 	return nil
 }
 
-func reconcileResourceCreate(ctx context.Context, path string) (result error) {
+func reconcileResourceCreate(ctx context.Context, path string) error {
+	return reconcileResourceCreateWithRuntime(ctx, path, resourceRecoveryRuntime{openService: OpenFixed, lockRoot: fixedRoot + "/locks", owner: 0, group: 0})
+}
+
+func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtime resourceRecoveryRuntime) (result error) {
+	if runtime.openService == nil || runtime.lockRoot == "" {
+		return fmt.Errorf("resource create recovery runtime is invalid")
+	}
 	removeJournal := false
 	journal, err := readCreateJournal(path)
 	if err != nil {
 		return err
 	}
-	service, err := OpenFixed()
+	service, err := runtime.openService()
 	if err != nil {
 		return err
 	}
-	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: runtime.lockRoot, Owner: runtime.owner, Group: runtime.group, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		_ = service.Close()
 		return err

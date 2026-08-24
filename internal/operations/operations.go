@@ -1589,16 +1589,6 @@ func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation
 	return err
 }
 
-func operationNonPublicationCredentials(resource domain.AppResource) []string {
-	values := append([]string(nil), resource.CredentialIDs...)
-	if publication := resource.Publication.DomainHTTPS; publication != nil {
-		values = slices.DeleteFunc(values, func(value string) bool {
-			return value == publication.CredentialID || value == publication.GoAccess.CredentialID
-		})
-	}
-	return values
-}
-
 func credentialReferenced(resource domain.AppResource, credentialID string) bool {
 	if slices.Contains(resource.CredentialIDs, credentialID) || resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID == credentialID {
 		return true
@@ -4099,18 +4089,31 @@ func (admitter *Admitter) CommitResourceUpdate(ctx context.Context, mutation *Mu
 			if installation.Resources[index].ID == candidate.ID {
 				prior := installation.Resources[index]
 				candidate.PublicationRecord = prior.PublicationRecord
-				if candidate.ManagedProcess == nil || prior.ManagedProcess == nil {
-					return fmt.Errorf("resource update managed process is absent")
+				if prior.Target.Kind != candidate.Target.Kind {
+					return fmt.Errorf("resource update target kind changed")
 				}
-				candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
-				candidate.ManagedProcess.Applied = cloneProcessBundle(prior.ManagedProcess.Applied)
-				if prior.Name == candidate.Name && prior.Lifecycle == candidate.Lifecycle && reflect.DeepEqual(prior.Target, candidate.Target) && reflect.DeepEqual(prior.ManagedPaths, candidate.ManagedPaths) && reflect.DeepEqual(operationNonPublicationCredentials(prior), operationNonPublicationCredentials(candidate)) && reflect.DeepEqual(prior.ManagedProcess, candidate.ManagedProcess) && candidate.ManagedProcess.Applied != nil {
-					candidate.ManagedProcess.Applied.ConfigDigest = candidate.CurrentConfigDigest
+				if err := validateResourceManagedProcessPresence(prior); err != nil {
+					return fmt.Errorf("prior resource update authority: %w", err)
 				}
-				candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
-				candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
-				candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
-				candidate.ManagedProcess.LastJobID = prior.ManagedProcess.LastJobID
+				if err := validateResourceManagedProcessPresence(candidate); err != nil {
+					return fmt.Errorf("candidate resource update authority: %w", err)
+				}
+				switch candidate.Target.Kind {
+				case domain.AppTargetLocalHTTP:
+					if candidate.ManagedProcess.ID != prior.ManagedProcess.ID {
+						return fmt.Errorf("resource update managed process identity changed")
+					}
+					candidate.ManagedProcess.Requested = prior.ManagedProcess.Requested
+					candidate.ManagedProcess.Applied = cloneProcessBundle(prior.ManagedProcess.Applied)
+					candidate.ManagedProcess.RuntimeObservation = prior.ManagedProcess.RuntimeObservation
+					candidate.ManagedProcess.LastOperation = prior.ManagedProcess.LastOperation
+					candidate.ManagedProcess.LastOperationResult = prior.ManagedProcess.LastOperationResult
+					candidate.ManagedProcess.LastJobID = prior.ManagedProcess.LastJobID
+				case domain.AppTargetTailnetHTTP:
+					// Tailnet resources have no local process authority to preserve.
+				default:
+					return fmt.Errorf("resource update target kind is unsupported")
+				}
 				installation.Resources[index] = candidate
 				found = true
 			}
@@ -6243,6 +6246,15 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			}
 			continue
 		}
+		if oldResource.Target.Kind != resource.Target.Kind {
+			return fmt.Errorf("resource %q target kind changed", resource.ID)
+		}
+		if err := validateResourceManagedProcessPresence(oldResource); err != nil {
+			return fmt.Errorf("resource %q prior authority: %w", resource.ID, err)
+		}
+		if err := validateResourceManagedProcessPresence(resource); err != nil {
+			return fmt.Errorf("resource %q candidate authority: %w", resource.ID, err)
+		}
 		if protectedResourceStateEqual(oldResource, resource) {
 			delete(oldResources, resource.ID)
 			continue
@@ -6254,7 +6266,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
 		}
 		jobID := resource.PublicationRecord.LastJobID
-		if resource.ManagedProcess != nil && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || reflect.DeepEqual(resource.PublicationRecord, oldResource.PublicationRecord)) {
+		if resource.Target.Kind == domain.AppTargetLocalHTTP && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || reflect.DeepEqual(resource.PublicationRecord, oldResource.PublicationRecord)) {
 			jobID = resource.ManagedProcess.LastJobID
 		}
 		if resource.PublicationRecord.ContractionIntent != nil {
@@ -6406,6 +6418,22 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	return nil
 }
 
+func validateResourceManagedProcessPresence(resource domain.AppResource) error {
+	switch resource.Target.Kind {
+	case domain.AppTargetLocalHTTP:
+		if resource.ManagedProcess == nil {
+			return fmt.Errorf("local_http resource requires managed process authority")
+		}
+	case domain.AppTargetTailnetHTTP:
+		if resource.ManagedProcess != nil {
+			return fmt.Errorf("tailnet_http resource must not carry managed process authority")
+		}
+	default:
+		return fmt.Errorf("resource target kind %q is unsupported", resource.Target.Kind)
+	}
+	return nil
+}
+
 func validateNewResourceAuthority(document persist.Document, resource domain.AppResource) error {
 	var match *Reservation
 	for _, key := range persist.EntryKeys(document, "intents") {
@@ -6421,7 +6449,13 @@ func validateNewResourceAuthority(document persist.Document, resource domain.App
 			match = &copy
 		}
 	}
-	if match == nil || match.Target != string(plans.TargetInstallation) || match.AdmissionSource != AdmissionUI || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != 1 || resource.ManagedProcess == nil || resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.Applied != nil {
+	if match == nil || match.Target != string(plans.TargetInstallation) || match.AdmissionSource != AdmissionUI || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != 1 {
+		return fmt.Errorf("new resource lacks exact authenticated durable creation authority")
+	}
+	if err := validateResourceManagedProcessPresence(resource); err != nil {
+		return fmt.Errorf("new resource lacks exact authenticated durable creation authority: %w", err)
+	}
+	if resource.Target.Kind == domain.AppTargetLocalHTTP && (resource.ManagedProcess.Requested != domain.ProcessRequestedStopped || resource.ManagedProcess.Applied != nil) {
 		return fmt.Errorf("new resource lacks exact authenticated durable creation authority")
 	}
 	record, err := jobs.LoadEntries(document.Entries, match.JobID)
@@ -6528,7 +6562,16 @@ func validateOperationResourceDelta(before, after domain.AppResource, operation 
 		afterPublication.LastOperation = ""
 		afterPublication.LastOperationResult = ""
 		afterPublication.LastJobID = ""
-		if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(beforePublication, afterPublication) || before.ManagedProcess == nil || after.ManagedProcess == nil || before.ManagedProcess.Requested != after.ManagedProcess.Requested || !reflect.DeepEqual(before.ManagedProcess.Applied, after.ManagedProcess.Applied) || !reflect.DeepEqual(before.ManagedProcess.RuntimeObservation, after.ManagedProcess.RuntimeObservation) {
+		if before.Lifecycle != after.Lifecycle || !reflect.DeepEqual(beforePublication, afterPublication) || before.Target.Kind != after.Target.Kind {
+			return fmt.Errorf("resource update changed applied lifecycle, publication, or target kind")
+		}
+		if err := validateResourceManagedProcessPresence(before); err != nil {
+			return fmt.Errorf("resource update prior authority: %w", err)
+		}
+		if err := validateResourceManagedProcessPresence(after); err != nil {
+			return fmt.Errorf("resource update candidate authority: %w", err)
+		}
+		if before.Target.Kind == domain.AppTargetLocalHTTP && (before.ManagedProcess.ID != after.ManagedProcess.ID || before.ManagedProcess.Requested != after.ManagedProcess.Requested || !reflect.DeepEqual(before.ManagedProcess.Applied, after.ManagedProcess.Applied) || !reflect.DeepEqual(before.ManagedProcess.RuntimeObservation, after.ManagedProcess.RuntimeObservation) || before.ManagedProcess.LastOperation != after.ManagedProcess.LastOperation || before.ManagedProcess.LastOperationResult != after.ManagedProcess.LastOperationResult || before.ManagedProcess.LastJobID != after.ManagedProcess.LastJobID) {
 			return fmt.Errorf("resource update changed applied lifecycle or process state")
 		}
 		return nil
@@ -6675,7 +6718,17 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 }
 
 func protectedResourceStateEqual(left, right domain.AppResource) bool {
-	return left.Lifecycle == right.Lifecycle && reflect.DeepEqual(left.PublicationRecord, right.PublicationRecord) && reflect.DeepEqual(left.ManagedProcess, right.ManagedProcess)
+	return left.Lifecycle == right.Lifecycle && reflect.DeepEqual(left.PublicationRecord, right.PublicationRecord) && protectedManagedProcessStateEqual(left.ManagedProcess, right.ManagedProcess)
+}
+
+func protectedManagedProcessStateEqual(left, right *domain.ManagedProcess) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftState, rightState := *left, *right
+	leftState.Service, rightState.Service = domain.ManagedService{}, domain.ManagedService{}
+	leftState.ReferenceBinding, rightState.ReferenceBinding = nil, nil
+	return reflect.DeepEqual(leftState, rightState)
 }
 
 func contractionOperationCode(operation Type) domain.OperationCode {

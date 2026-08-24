@@ -21,6 +21,7 @@ import (
 	"lanpanel/internal/sources"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1348,6 +1349,339 @@ func TestHeadscaleCertificateExpiryProposalUsesIndependentActiveAuthority(t *tes
 	if validExpiryProposal(CertificateExpiry, state, binding, now) {
 		t.Fatal("stale Headscale expiry generation accepted")
 	}
+}
+
+func TestNewResourceAuthorityMatchesTargetManagedProcessContract(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	candidate := tailnetOperationResource()
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(ResourceCreate), Target: "installation", ActorIdentity: "ui/session/generation/1"}, now, bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := jobs.Start(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionUI, Operation: ResourceCreate, Target: "installation", Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: candidate.ID}, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: AdmissionUI, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	encode := func(value any) json.RawMessage {
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	document := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+
+	local := operationStateInstallation().Resources[0]
+	local.PublicationRecord = domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}
+	local.CurrentConfigDigest = candidate.CurrentConfigDigest
+	cases := []struct {
+		name      string
+		resource  domain.AppResource
+		wantError bool
+	}{
+		{name: "tailnet_without_process", resource: candidate},
+		{name: "tailnet_with_process", resource: func() domain.AppResource {
+			value := candidate
+			value.ManagedProcess = &domain.ManagedProcess{Requested: domain.ProcessRequestedStopped}
+			return value
+		}(), wantError: true},
+		{name: "local_with_process", resource: local},
+		{name: "local_without_process", resource: func() domain.AppResource {
+			value := local
+			value.ManagedProcess = nil
+			return value
+		}(), wantError: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateNewResourceAuthority(document, test.resource)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateNewResourceAuthority() error=%v wantError=%t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestResourceUpdateDeltaMatchesTargetManagedProcessContract(t *testing.T) {
+	tailnet := tailnetOperationResource()
+	updatedTailnet := tailnet
+	updatedTailnet.Name = "Peer Updated"
+	if err := validateOperationResourceDelta(tailnet, updatedTailnet, ResourceUpdate); err != nil {
+		t.Fatalf("Tailnet update rejected: %v", err)
+	}
+
+	withProcess := updatedTailnet
+	withProcess.ManagedProcess = &domain.ManagedProcess{Requested: domain.ProcessRequestedStopped}
+	if err := validateOperationResourceDelta(tailnet, withProcess, ResourceUpdate); err == nil {
+		t.Fatal("Tailnet update carrying managed process accepted")
+	}
+
+	local := operationStateInstallation().Resources[0]
+	local.ManagedProcess.Applied = operationProcessBundle(local.CurrentConfigDigest)
+	local.ManagedProcess.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeHealthy, ObservedAt: "2025-01-01T00:00:00Z", Reason: "observed"}
+	updatedLocal := local
+	process := *local.ManagedProcess
+	process.Service.Arguments = []string{"--updated"}
+	updatedLocal.ManagedProcess = &process
+	updatedLocal.Name = "Local Updated"
+	if err := validateOperationResourceDelta(local, updatedLocal, ResourceUpdate); err != nil {
+		t.Fatalf("Local update preserving process state rejected: %v", err)
+	}
+	changedRequested := updatedLocal
+	changedProcess := *updatedLocal.ManagedProcess
+	changedProcess.Requested = domain.ProcessRequestedRunning
+	changedRequested.ManagedProcess = &changedProcess
+	if err := validateOperationResourceDelta(local, changedRequested, ResourceUpdate); err == nil {
+		t.Fatal("Local update changed requested process state")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*domain.ManagedProcess)
+	}{
+		{name: "process_id", mutate: func(value *domain.ManagedProcess) { value.ID = "proc_11111111111111111111111111111111" }},
+		{name: "last_operation", mutate: func(value *domain.ManagedProcess) { value.LastOperation = domain.OperationProcessStart }},
+		{name: "last_operation_result", mutate: func(value *domain.ManagedProcess) { value.LastOperationResult = domain.OperationFailed }},
+		{name: "last_job_id", mutate: func(value *domain.ManagedProcess) { value.LastJobID = "job_changed" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := updatedLocal
+			process := *updatedLocal.ManagedProcess
+			test.mutate(&process)
+			changed.ManagedProcess = &process
+			if err := validateOperationResourceDelta(local, changed, ResourceUpdate); err == nil {
+				t.Fatal("Local update changed protected process operation state")
+			}
+		})
+	}
+
+	withoutProcess := local
+	withoutProcess.ManagedProcess = nil
+	if err := validateOperationResourceDelta(local, withoutProcess, ResourceUpdate); err == nil {
+		t.Fatal("Local update without managed process accepted")
+	}
+
+	switched := tailnet
+	switched.Target = local.Target
+	switched.ManagedProcess = local.ManagedProcess
+	if err := validateOperationResourceDelta(tailnet, switched, ResourceUpdate); err == nil {
+		t.Fatal("resource update switched target kind")
+	}
+}
+
+func TestTailnetResourceCreateCommitsReservationOwnershipSafetyAndNormal(t *testing.T) {
+	runTailnetResourceCreate(t)
+}
+
+func TestTailnetResourceUpdatePreservesAbsentManagedProcess(t *testing.T) {
+	runTailnetResourceUpdate(t)
+}
+
+func TestLocalResourceUpdatePreservesManagedRuntimeState(t *testing.T) {
+	installation := operationStateInstallation()
+	prior := &installation.Resources[0]
+	prior.ManagedProcess.Applied = operationProcessBundle(prior.CurrentConfigDigest)
+	prior.ManagedProcess.LastOperation = domain.OperationProcessStop
+	prior.ManagedProcess.LastOperationResult = domain.OperationSucceeded
+	prior.ManagedProcess.LastJobID = "job_prior_process"
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("local-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: prior.PublicationRecord.UnpublishedGeneration, Reason: "initial"}}}
+	candidate := *prior
+	process := *prior.ManagedProcess
+	process.Requested = domain.ProcessRequestedRunning
+	process.Applied = nil
+	process.RuntimeObservation = nil
+	process.LastOperation = ""
+	process.LastOperationResult = ""
+	process.LastJobID = ""
+	process.Service.Arguments = []string{"--updated"}
+	candidate.ManagedProcess = &process
+	candidate.Name = "Local Updated"
+	candidate.CurrentConfigDigest = testDigest("local-update-candidate")
+	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
+	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err != nil {
+		t.Fatal(err)
+	}
+	harness.revision++
+	if _, err := harness.admitter.Complete(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, "complete", nil, []jobs.Postcondition{{Kind: "resource_config_saved", Status: jobs.PostconditionVerified, Identity: candidate.CurrentConfigDigest}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	updated := readOperationResource(t, harness.normal, prior.ID)
+	if updated.ManagedProcess == nil || !reflect.DeepEqual(updated.ManagedProcess.Service.Arguments, []string{"--updated"}) || updated.ManagedProcess.Requested != prior.ManagedProcess.Requested || !reflect.DeepEqual(updated.ManagedProcess.Applied, prior.ManagedProcess.Applied) || !reflect.DeepEqual(updated.ManagedProcess.RuntimeObservation, prior.ManagedProcess.RuntimeObservation) || updated.ManagedProcess.LastOperation != prior.ManagedProcess.LastOperation || updated.ManagedProcess.LastOperationResult != prior.ManagedProcess.LastOperationResult || updated.ManagedProcess.LastJobID != prior.ManagedProcess.LastJobID {
+		t.Fatalf("prior process=%#v updated process=%#v", prior.ManagedProcess, updated.ManagedProcess)
+	}
+}
+
+func runTailnetResourceCreate(t *testing.T) {
+	t.Helper()
+	candidate := tailnetOperationResource()
+	installation := tailnetOperationInstallation(nil)
+	state := safety.EmptyState()
+	harness := beginResourceOperation(t, ResourceCreate, installation, &state, SafetyBinding{ResourceID: candidate.ID})
+
+	ownershipDigest := testDigest("tailnet-ownership")
+	state.Resources = []safety.ResourceSafety{{ResourceID: candidate.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownershipDigest, StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+	harness.safety.state = state
+	if state.Resources[0].OwnershipDigest != ownershipDigest || state.Resources[0].StickyUnpublished == nil {
+		t.Fatal("ownership and safety authority were not committed before normal authority")
+	}
+	if err := harness.admitter.CommitResourceCreate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, ResourceCreateCommit{Resource: candidate}); err != nil {
+		t.Fatal(err)
+	}
+	harness.revision++
+	job, err := harness.admitter.Complete(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, "complete", nil, []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: candidate.CurrentConfigDigest}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Result != jobs.ResultSucceeded {
+		t.Fatalf("resource create job=%#v", job)
+	}
+	created := readOperationResource(t, harness.normal, candidate.ID)
+	if created.ManagedProcess != nil || created.Target.Kind != domain.AppTargetTailnetHTTP || created.PublicationRecord.LastOperation != domain.OperationResourceCreate {
+		t.Fatalf("created Tailnet resource=%#v", created)
+	}
+}
+
+func runTailnetResourceUpdate(t *testing.T) {
+	t.Helper()
+	prior := tailnetOperationResource()
+	installation := tailnetOperationInstallation(&prior)
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("tailnet-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+	candidate := prior
+	candidate.Name = "Peer Updated"
+	candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
+	candidate.CurrentConfigDigest = testDigest("tailnet-update-candidate")
+	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
+
+	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err != nil {
+		t.Fatal(err)
+	}
+	harness.revision++
+	job, err := harness.admitter.Complete(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, "complete", nil, []jobs.Postcondition{{Kind: "resource_config_saved", Status: jobs.PostconditionVerified, Identity: candidate.CurrentConfigDigest}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := readOperationResource(t, harness.normal, prior.ID)
+	if job.Result != jobs.ResultSucceeded || updated.ManagedProcess != nil || updated.Name != candidate.Name || !reflect.DeepEqual(updated.Target, candidate.Target) || updated.PublicationRecord.LastOperation != domain.OperationResourceUpdate {
+		t.Fatalf("job=%#v updated=%#v", job, updated)
+	}
+}
+
+type resourceOperationHarness struct {
+	normal      *persist.Store
+	manager     *locks.Manager
+	mutationSet *MutationSet
+	safety      *fakeSafety
+	admitter    *Admitter
+	mutation    *MutationLease
+	exposure    *locks.Lease
+	jobID       string
+	revision    uint64
+}
+
+func beginResourceOperation(t *testing.T, operation Type, installation domain.Installation, state *safety.State, binding SafetyBinding) *resourceOperationHarness {
+	t.Helper()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	safetyStore := &fakeSafety{state: *state, authority: manager.Authority()}
+	admitter := newResourceOperationAdmitter(t, normal, safetyStore, now)
+	raw, err := persist.EncodeEntry(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 1, func(transaction *persist.Transaction) error {
+		return transaction.Create("installations/current", raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "installation"
+	if operation == ResourceUpdate {
+		target = "resource/" + binding.ResourceID
+	}
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: operation, Target: target, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	releaseErr := admission.Release()
+	if err != nil || releaseErr != nil {
+		t.Fatal(errors.Join(err, releaseErr))
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), target, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := admitter.BeginUI(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := &resourceOperationHarness{normal: normal, manager: manager, mutationSet: mutationSet, safety: safetyStore, admitter: admitter, mutation: mutation, exposure: exposure, jobID: job.ID, revision: intent.IntentGeneration}
+	t.Cleanup(func() {
+		if harness.mutation != nil || harness.exposure != nil {
+			_ = ReleaseExposure(harness.mutation, harness.exposure)
+		}
+		_ = harness.mutationSet.Close()
+		_ = harness.normal.Close()
+		_ = harness.manager.Close()
+	})
+	return harness
+}
+
+func newResourceOperationAdmitter(t *testing.T, normal *persist.Store, state *fakeSafety, now time.Time) *Admitter {
+	t.Helper()
+	table, err := NewBranchTable([]ResultBranch{{Name: "complete", Result: jobs.ResultSucceeded, Postcondition: jobs.PostconditionVerified}, {Name: "no_effect", Result: jobs.ResultFailed, Postcondition: jobs.PostconditionVerified}, {Name: "known_residual", Result: jobs.ResultPartial, Postcondition: jobs.PostconditionKnown}, {Name: "executor_died", Result: jobs.ResultInterrupted, Postcondition: jobs.PostconditionKnown}, {Name: "source_unknown", Result: jobs.ResultUnknown, Postcondition: jobs.PostconditionUnobserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry([]Registration{{Operation: ResourceCreate, Owner: "resource", Results: table}, {Operation: ResourceUpdate, Owner: "resource", Results: table}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := NewAdmitter(normal, state, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{7}, 256)), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return admitter
+}
+
+func tailnetOperationInstallation(resource *domain.AppResource) domain.Installation {
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.23.45.67", Port: 23456}, Connector: &domain.TailnetConnector{ID: "con_00000000000000000000000000000001", ControlURL: "https://control.example.test", ManagedPaths: domain.ConnectorManagedPaths()}}
+	if resource != nil {
+		installation.Resources = []domain.AppResource{*resource}
+	}
+	return installation
+}
+
+func tailnetOperationResource() domain.AppResource {
+	return domain.AppResource{ID: "res_00000000000000000000000000000001", Name: "Peer App", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: testDigest("tailnet-config"), Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}}
+}
+
+func operationProcessBundle(configDigest string) *domain.ProcessBundle {
+	return &domain.ProcessBundle{Generation: 1, ConfigDigest: configDigest, UnitDigest: testDigest("unit"), SocketUnitDigest: testDigest("socket"), PolicyDigest: testDigest("policy"), AccountDigest: testDigest("account"), ExecutableDigest: testDigest("executable"), WorkingDirectoryIdentity: testDigest("working-directory"), Cgroup: "/sys/fs/cgroup/lanpanel-app", FrontendEndpoint: "/run/lanpanel/app.sock", EndpointSocketUnits: []string{"lanpanel-app.socket"}, ApplicationUID: 1000, ApplicationGID: 1000, FrontendGID: 33, FrontendMode: 0o660, ManagedPaths: []string{"/var/lib/lanpanel/resources/res_00000000000000000000000000000001"}}
+}
+
+func readOperationResource(t *testing.T, normal *persist.Store, resourceID string) domain.AppResource {
+	t.Helper()
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, resource := range installation.Resources {
+		if resource.ID == resourceID {
+			return resource
+		}
+	}
+	t.Fatalf("resource %q missing", resourceID)
+	return domain.AppResource{}
 }
 
 func testOperationInstallation() domain.Installation {

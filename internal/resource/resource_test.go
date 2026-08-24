@@ -61,6 +61,38 @@ func TestPrepareUpdatePreservesPriorSnapshot(t *testing.T) {
 	if installation.Resources[0].Name != "Prior" || updated.Name != "Candidate" {
 		t.Fatalf("prior=%q updated=%q", installation.Resources[0].Name, updated.Name)
 	}
+
+	candidate.ManagedProcess = nil
+	if _, err := PrepareUpdate(installation, candidate); err == nil {
+		t.Fatal("Local update candidate without managed process accepted")
+	}
+}
+
+func TestPrepareTailnetUpdatePreservesAbsentProcess(t *testing.T) {
+	prior, err := NewTailnet(TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: "Peer App", PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ReadinessPath: "/ready", Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}}, bytes.NewReader(bytes.Repeat([]byte{4}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}, Connector: &domain.TailnetConnector{ID: "con_00000000000000000000000000000001", ControlURL: "https://control.example.test", ManagedPaths: domain.ConnectorManagedPaths()}, Resources: []domain.AppResource{prior}}
+	candidate := prior
+	candidate.Name = "Peer Updated"
+	updated, err := PrepareUpdate(installation, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ManagedProcess != nil || updated.Target.Kind != domain.AppTargetTailnetHTTP {
+		t.Fatalf("updated Tailnet resource=%#v", updated)
+	}
+	candidate.ManagedProcess = &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedStopped}
+	if _, err := PrepareUpdate(installation, candidate); err == nil {
+		t.Fatal("Tailnet update candidate carrying managed process accepted")
+	}
+	candidate = prior
+	candidate.Target = domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: domain.LocalEndpointRelayUnix}}
+	candidate.ManagedProcess = &domain.ManagedProcess{ID: "proc_00000000000000000000000000000001", Requested: domain.ProcessRequestedStopped, Service: domain.ManagedService{Executable: "/usr/local/bin/example", WorkingDirectory: "/srv/example"}}
+	if _, err := PrepareUpdate(installation, candidate); err == nil {
+		t.Fatal("Tailnet update switched target kind")
+	}
 }
 
 func TestArgumentsRejectExpansionAndKnownSecret(t *testing.T) {
