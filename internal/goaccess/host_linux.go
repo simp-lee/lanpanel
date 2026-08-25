@@ -233,88 +233,16 @@ func verifyAccountAuthority(candidate Candidate, requireComplete, requireLocked 
 	if requireComplete && !markerPresent {
 		return fmt.Errorf("GoAccess retained account origin marker missing")
 	}
-	type expected struct {
-		name        string
-		id, primary uint32
-	}
-	users := []expected{{candidate.User, candidate.UID, candidate.GID}, {candidate.RelayUser, candidate.RelayUID, candidate.RelayGID}}
-	primaryOwners := map[uint32]string{candidate.GID: candidate.User, candidate.RelayGID: candidate.RelayUser}
-	comments := map[string]string{candidate.User: candidate.Accounts.Application.Comment, candidate.RelayUser: candidate.Accounts.Relay.Comment}
-	groups := []expected{{candidate.Group, candidate.GID, 0}, {candidate.RelayGroup, candidate.RelayGID, 0}}
 	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
 		return err
-	}
-	foundUsers := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(passwd)), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) != 7 {
-			continue
-		}
-		id, idErr := strconv.ParseUint(fields[2], 10, 32)
-		primary, primaryErr := strconv.ParseUint(fields[3], 10, 32)
-		if idErr != nil || primaryErr != nil {
-			continue
-		}
-		if owner, protected := primaryOwners[uint32(primary)]; protected && fields[0] != owner {
-			return fmt.Errorf("GoAccess primary group identity collides")
-		}
-		for _, want := range users {
-			if fields[0] == want.name && uint32(id) != want.id || uint32(id) == want.id && fields[0] != want.name {
-				return fmt.Errorf("GoAccess user identity collides")
-			}
-			if fields[0] == want.name {
-				if !markerPresent || uint32(primary) != want.primary || fields[4] != comments[want.name] || fields[5] != "/nonexistent" || fields[6] != "/usr/sbin/nologin" {
-					return fmt.Errorf("GoAccess user identity differs")
-				}
-				foundUsers[want.name] = true
-			}
-		}
 	}
 	groupBytes, err := os.ReadFile("/etc/group")
 	if err != nil {
 		return err
 	}
-	foundGroups := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(groupBytes)), "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) != 4 {
-			continue
-		}
-		id, idErr := strconv.ParseUint(fields[2], 10, 32)
-		if idErr != nil {
-			continue
-		}
-		for _, want := range groups {
-			if fields[0] == want.name && uint32(id) != want.id || uint32(id) == want.id && fields[0] != want.name {
-				return fmt.Errorf("GoAccess group identity collides")
-			}
-			if fields[0] == want.name {
-				if !markerPresent || fields[3] != "" {
-					return fmt.Errorf("GoAccess group identity differs")
-				}
-				foundGroups[want.name] = true
-			}
-		}
-		for _, user := range users {
-			for _, member := range strings.Split(fields[3], ",") {
-				if member == user.name {
-					return fmt.Errorf("GoAccess user has supplementary group")
-				}
-			}
-		}
-	}
-	if markerPresent && requireComplete {
-		for _, want := range users {
-			if !foundUsers[want.name] {
-				return fmt.Errorf("GoAccess user missing")
-			}
-		}
-		for _, want := range groups {
-			if !foundGroups[want.name] {
-				return fmt.Errorf("GoAccess group missing")
-			}
-		}
+	if err := verifyGoAccessAccountDatabases(candidate, markerPresent, requireComplete, passwd, groupBytes); err != nil {
+		return err
 	}
 	if markerPresent && requireLocked {
 		present, identities, inspectErr := identity.InspectResourceAccountFiles(candidate.Accounts, "/etc/passwd", "/etc/group", "/etc/shadow")
@@ -342,9 +270,102 @@ func verifyAccountAuthority(candidate Candidate, requireComplete, requireLocked 
 				locked[fields[0]] = true
 			}
 		}
-		for _, want := range users {
-			if !locked[want.name] {
+		for _, name := range []string{candidate.User, candidate.RelayUser} {
+			if !locked[name] {
 				return fmt.Errorf("GoAccess user is not locked")
+			}
+		}
+	}
+	return nil
+}
+
+func verifyGoAccessAccountDatabases(candidate Candidate, markerPresent, requireComplete bool, passwd, groupBytes []byte) error {
+	type expected struct {
+		name        string
+		id, primary uint32
+	}
+	users := []expected{{candidate.User, candidate.UID, candidate.GID}, {candidate.RelayUser, candidate.RelayUID, candidate.RelayGID}}
+	primaryOwners := map[uint32]string{candidate.GID: candidate.User, candidate.RelayGID: candidate.RelayUser}
+	comments := map[string]string{candidate.User: candidate.Accounts.Application.Comment, candidate.RelayUser: candidate.Accounts.Relay.Comment}
+	groups := []expected{{candidate.Group, candidate.GID, 0}, {candidate.RelayGroup, candidate.RelayGID, 0}}
+	foundUsers := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(passwd)), "\n") {
+		fields := strings.Split(line, ":")
+		managedName := fields[0] == candidate.User || fields[0] == candidate.RelayUser
+		if len(fields) != 7 {
+			if managedName {
+				return fmt.Errorf("GoAccess user identity is malformed")
+			}
+			continue
+		}
+		id, idErr := strconv.ParseUint(fields[2], 10, 32)
+		primary, primaryErr := strconv.ParseUint(fields[3], 10, 32)
+		if idErr != nil || primaryErr != nil {
+			if managedName {
+				return fmt.Errorf("GoAccess user identity is malformed")
+			}
+			continue
+		}
+		if owner, protected := primaryOwners[uint32(primary)]; protected && fields[0] != owner {
+			return fmt.Errorf("GoAccess primary group identity collides")
+		}
+		for _, want := range users {
+			if fields[0] == want.name && uint32(id) != want.id || uint32(id) == want.id && fields[0] != want.name {
+				return fmt.Errorf("GoAccess user identity collides")
+			}
+			if fields[0] == want.name {
+				if !markerPresent || fields[1] != identity.ManagedPasswordPlaceholder || uint32(primary) != want.primary || fields[4] != comments[want.name] || fields[5] != "/nonexistent" || fields[6] != "/usr/sbin/nologin" {
+					return fmt.Errorf("GoAccess user identity differs")
+				}
+				foundUsers[want.name] = true
+			}
+		}
+	}
+	foundGroups := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(string(groupBytes)), "\n") {
+		fields := strings.Split(line, ":")
+		managedName := fields[0] == candidate.Group || fields[0] == candidate.RelayGroup
+		if len(fields) != 4 {
+			if managedName {
+				return fmt.Errorf("GoAccess group identity is malformed")
+			}
+			continue
+		}
+		id, idErr := strconv.ParseUint(fields[2], 10, 32)
+		if idErr != nil {
+			if managedName {
+				return fmt.Errorf("GoAccess group identity is malformed")
+			}
+			continue
+		}
+		for _, want := range groups {
+			if fields[0] == want.name && uint32(id) != want.id || uint32(id) == want.id && fields[0] != want.name {
+				return fmt.Errorf("GoAccess group identity collides")
+			}
+			if fields[0] == want.name {
+				if !markerPresent || fields[1] != identity.ManagedPasswordPlaceholder || fields[3] != "" {
+					return fmt.Errorf("GoAccess group identity differs")
+				}
+				foundGroups[want.name] = true
+			}
+		}
+		for _, user := range users {
+			for _, member := range strings.Split(fields[3], ",") {
+				if member == user.name {
+					return fmt.Errorf("GoAccess user has supplementary group")
+				}
+			}
+		}
+	}
+	if markerPresent && requireComplete {
+		for _, want := range users {
+			if !foundUsers[want.name] {
+				return fmt.Errorf("GoAccess user missing")
+			}
+		}
+		for _, want := range groups {
+			if !foundGroups[want.name] {
+				return fmt.Errorf("GoAccess group missing")
 			}
 		}
 	}

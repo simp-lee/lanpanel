@@ -112,7 +112,7 @@ func inspectResourceAccountFiles(_ AccountSet, set ResourceAccountSet, passwdPat
 		if !userOK && !groupOK && !shadowOK {
 			continue
 		}
-		if !userOK || !groupOK || !shadowOK || user.uid == 0 || group.gid == 0 || user.gid != group.gid || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell || len(group.members) != 0 || !lockedPassword(password) {
+		if !userOK || !groupOK || !shadowOK || user.password != ManagedPasswordPlaceholder || group.password != ManagedPasswordPlaceholder || user.uid == 0 || group.gid == 0 || user.gid != group.gid || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell || len(group.members) != 0 || !lockedPassword(password) {
 			return false, nil, fmt.Errorf("resource account %q collides or differs from exact origin", spec.User)
 		}
 		for name, other := range users {
@@ -194,13 +194,13 @@ func InspectResourceAccountDeletionFiles(set ResourceAccountSet, passwdPath, gro
 		user, userOK := users[spec.User]
 		group, groupOK := groups[spec.Group]
 		password, shadowOK := shadow[spec.User]
-		if userOK && (!groupOK || user.uid != want.UID || user.gid != want.GID || group.gid != want.GID || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell) {
+		if userOK && (!groupOK || user.password != ManagedPasswordPlaceholder || user.uid != want.UID || user.gid != want.GID || group.gid != want.GID || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell) {
 			return AccountDeletionState{}, fmt.Errorf("resource deletion user identity differs")
 		}
 		if shadowOK && !lockedPassword(password) {
 			return AccountDeletionState{}, fmt.Errorf("resource deletion shadow identity differs")
 		}
-		if groupOK && (group.gid != want.GID || len(group.members) != 0) {
+		if groupOK && (group.password != ManagedPasswordPlaceholder || group.gid != want.GID || len(group.members) != 0) {
 			return AccountDeletionState{}, fmt.Errorf("resource deletion group identity differs")
 		}
 		state.Users[index] = userOK || shadowOK

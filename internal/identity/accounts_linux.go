@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	LockedHome                  = "/nonexistent"
-	NoLoginShell                = "/usr/sbin/nologin"
+	LockedHome   = "/nonexistent"
+	NoLoginShell = "/usr/sbin/nologin"
+	// ManagedPasswordPlaceholder is the exact passwd/group field written by systemd-sysusers for these specs.
+	ManagedPasswordPlaceholder  = "x"
 	maximumAccountDatabaseBytes = 4 << 20
 )
 
@@ -199,7 +201,7 @@ func inspectAccountFiles(set AccountSet, passwdPath, groupPath, shadowPath strin
 	client, clientExists := groups[set.HelperClientGroup]
 	foundAny := false
 	if clientExists {
-		if len(client.members) != 0 || client.gid == 0 {
+		if client.password != ManagedPasswordPlaceholder || len(client.members) != 0 || client.gid == 0 {
 			return false, nil, fmt.Errorf("helper client group is unsafe")
 		}
 	}
@@ -220,10 +222,10 @@ func inspectAccountFiles(set AccountSet, passwdPath, groupPath, shadowPath strin
 			return false, nil, fmt.Errorf("installation helper client group is missing")
 		}
 		if allowPartial {
-			if groupExists && (group.gid == 0 || len(group.members) != 0) {
+			if groupExists && (group.password != ManagedPasswordPlaceholder || group.gid == 0 || len(group.members) != 0) {
 				return false, nil, fmt.Errorf("partial installation group %q is unsafe", spec.Group)
 			}
-			if userExists && (user.uid == 0 || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell) {
+			if userExists && (user.password != ManagedPasswordPlaceholder || user.uid == 0 || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell) {
 				return false, nil, fmt.Errorf("partial installation user %q is unsafe", spec.User)
 			}
 			if shadowExists && !lockedPassword(password) {
@@ -236,7 +238,7 @@ func inspectAccountFiles(set AccountSet, passwdPath, groupPath, shadowPath strin
 				continue
 			}
 		}
-		if !userExists || !groupExists || !shadowExists || user.uid == 0 || user.gid != group.gid || group.gid == 0 || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell || len(group.members) != 0 || !lockedPassword(password) || seenUID[user.uid] {
+		if !userExists || !groupExists || !shadowExists || user.password != ManagedPasswordPlaceholder || group.password != ManagedPasswordPlaceholder || user.uid == 0 || user.gid != group.gid || group.gid == 0 || user.comment != spec.Comment || user.home != spec.Home || user.shell != spec.Shell || len(group.members) != 0 || !lockedPassword(password) || seenUID[user.uid] {
 			return false, nil, fmt.Errorf("installation account %q collides or differs from its exact origin", spec.User)
 		}
 		for name, other := range users {
@@ -287,12 +289,14 @@ func IdentityFor(set AccountSet, role AccountRole) (AccountIdentity, bool) {
 }
 
 type passwdEntry struct {
+	password             string
 	uid, gid             uint32
 	comment, home, shell string
 }
 type groupEntry struct {
-	gid     uint32
-	members []string
+	password string
+	gid      uint32
+	members  []string
 }
 
 func parsePasswd(data []byte) (map[string]passwdEntry, error) {
@@ -311,7 +315,7 @@ func parsePasswd(data []byte) (map[string]passwdEntry, error) {
 		if _, duplicate := result[fields[0]]; duplicate {
 			return nil, fmt.Errorf("passwd database duplicates a user")
 		}
-		result[fields[0]] = passwdEntry{uint32(uid), uint32(gid), fields[4], fields[5], fields[6]}
+		result[fields[0]] = passwdEntry{password: fields[1], uid: uint32(uid), gid: uint32(gid), comment: fields[4], home: fields[5], shell: fields[6]}
 	}
 	return result, scanner.Err()
 }
@@ -335,7 +339,7 @@ func parseGroups(data []byte) (map[string]groupEntry, error) {
 		if _, duplicate := result[fields[0]]; duplicate {
 			return nil, fmt.Errorf("group database duplicates a group")
 		}
-		result[fields[0]] = groupEntry{uint32(gid), members}
+		result[fields[0]] = groupEntry{password: fields[1], gid: uint32(gid), members: members}
 	}
 	return result, scanner.Err()
 }

@@ -326,6 +326,43 @@ func TestAccountLockAcquisitionIsBoundedAndContextAware(t *testing.T) {
 	}
 }
 
+func TestGoAccessAccountDatabasesRequireExactManagedPasswordFields(t *testing.T) {
+	authority, err := deriveAccountAuthority("ins_00000000000000000000000000000001", "res_00000000000000000000000000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := Candidate{
+		UID: authority.uid, GID: authority.gid, RelayUID: authority.relayUID, RelayGID: authority.relayGID,
+		User: authority.user, Group: authority.group, RelayUser: authority.relayUser, RelayGroup: authority.relayGroup,
+		Accounts: authority.accounts,
+	}
+	passwd := fmt.Sprintf("foreign:$6$foreign:9000:9000:Foreign:/home/foreign:/bin/sh\n%s:x:%d:%d:%s:/nonexistent:/usr/sbin/nologin\n%s:x:%d:%d:%s:/nonexistent:/usr/sbin/nologin\n", candidate.User, candidate.UID, candidate.GID, candidate.Accounts.Application.Comment, candidate.RelayUser, candidate.RelayUID, candidate.RelayGID, candidate.Accounts.Relay.Comment)
+	group := fmt.Sprintf("foreign::9000:\n%s:x:%d:\n%s:x:%d:\n", candidate.Group, candidate.GID, candidate.RelayGroup, candidate.RelayGID)
+	if err := verifyGoAccessAccountDatabases(candidate, true, true, []byte(passwd), []byte(group)); err != nil {
+		t.Fatalf("exact managed and non-x foreign records were rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		passwd string
+		group  string
+	}{
+		{name: "empty passwd", passwd: strings.Replace(passwd, candidate.User+":x:", candidate.User+"::", 1), group: group},
+		{name: "passwd hash", passwd: strings.Replace(passwd, candidate.User+":x:", candidate.User+":$6$direct-hash:", 1), group: group},
+		{name: "wrong passwd placeholder", passwd: strings.Replace(passwd, candidate.RelayUser+":x:", candidate.RelayUser+":!:", 1), group: group},
+		{name: "malformed managed passwd", passwd: candidate.User + ":malformed\n", group: group},
+		{name: "empty group password", passwd: passwd, group: strings.Replace(group, candidate.Group+":x:", candidate.Group+"::", 1)},
+		{name: "group password hash", passwd: passwd, group: strings.Replace(group, candidate.RelayGroup+":x:", candidate.RelayGroup+":$6$direct-hash:", 1)},
+		{name: "malformed managed group", passwd: passwd, group: candidate.Group + ":malformed\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := verifyGoAccessAccountDatabases(candidate, true, true, []byte(test.passwd), []byte(test.group)); err == nil {
+				t.Fatal("invalid managed GoAccess database record was accepted")
+			}
+		})
+	}
+}
+
 func TestRetainedAccountAuthorityCannotBeRecreated(t *testing.T) {
 	candidate := Candidate{Paths: Paths{Sysusers: filepath.Join(t.TempDir(), "missing.conf")}}
 	if err := verifyAccountAuthority(candidate, true, true); err == nil || !strings.Contains(err.Error(), "retained account origin marker missing") {

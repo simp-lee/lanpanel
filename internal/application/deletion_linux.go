@@ -25,6 +25,12 @@ type ResourceDeleteResult struct {
 	JobID string `json:"job_id"`
 }
 
+const (
+	deletePasswdPath = "/etc/passwd"
+	deleteGroupPath  = "/etc/group"
+	deleteShadowPath = "/etc/shadow"
+)
+
 func exactDeleteOwnership(resource domain.AppResource, record ownership.Record) bool {
 	return exactDeleteOwnershipID(resource.ID, record)
 }
@@ -172,13 +178,7 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 			return ResourceDeleteResult{}, errors.Join(observeErr, fmt.Errorf("resource cgroup or listener is not stopped"))
 		}
 	}
-	accountSet, _ := identity.ResourceAccounts(installation.InstallationID, resource.ID, resource.Target.LocalHTTP != nil && resource.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix)
-	_, accounts, _ := identity.InspectResourceAccountFiles(accountSet, "/etc/passwd", "/etc/group", "/etc/shadow")
-	uids := []uint32{}
-	for _, account := range accounts {
-		uids = append(uids, account.UID)
-	}
-	removed, err := manageddeletion.Cleanup(*resource, uids)
+	removed, err := cleanupDeleteInventory(*resource, installation)
 	if err != nil {
 		return ResourceDeleteResult{}, err
 	}
@@ -436,13 +436,29 @@ func verifyDeleteRuntimeClosed(ctx context.Context, resource domain.AppResource)
 }
 
 func cleanupDeleteInventory(resource domain.AppResource, installation domain.Installation) ([]string, error) {
-	accountSet, _ := identity.ResourceAccounts(installation.InstallationID, resource.ID, resource.Target.LocalHTTP != nil && resource.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix)
-	_, accounts, _ := identity.InspectResourceAccountFiles(accountSet, "/etc/passwd", "/etc/group", "/etc/shadow")
-	uids := []uint32{}
+	return cleanupDeleteInventoryWithCleanup(resource, installation, deletePasswdPath, deleteGroupPath, deleteShadowPath, manageddeletion.Cleanup)
+}
+
+func cleanupDeleteInventoryWithCleanup(resource domain.AppResource, installation domain.Installation, passwdPath, groupPath, shadowPath string, cleanup func(domain.AppResource, []uint32) ([]string, error)) ([]string, error) {
+	if cleanup == nil {
+		return nil, fmt.Errorf("resource deletion cleanup is unavailable")
+	}
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
+		return cleanup(resource, nil)
+	}
+	accountSet, err := identity.ResourceAccounts(installation.InstallationID, resource.ID, resource.Target.LocalHTTP != nil && resource.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix)
+	if err != nil {
+		return nil, fmt.Errorf("construct resource deletion accounts: %w", err)
+	}
+	_, accounts, err := identity.InspectResourceAccountFiles(accountSet, passwdPath, groupPath, shadowPath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect resource deletion accounts: %w", err)
+	}
+	uids := make([]uint32, 0, len(accounts))
 	for _, account := range accounts {
 		uids = append(uids, account.UID)
 	}
-	return manageddeletion.Cleanup(resource, uids)
+	return cleanup(resource, uids)
 }
 
 func completeRecoveredDelete(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, intent operations.Reservation, closureDigest string, succeeded bool) error {
