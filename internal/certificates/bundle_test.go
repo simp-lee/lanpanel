@@ -8,11 +8,13 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"lanpanel/internal/filetxn"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +71,61 @@ func TestObserveIdentityRejectsUnsafeMembersBeforeReading(t *testing.T) {
 			}
 			if _, err := ObserveIdentity(parent, id, 1, owner); err == nil {
 				t.Fatal("unsafe certificate bundle member was accepted")
+			}
+		})
+	}
+}
+
+func TestVerifyBundleMaterialBindsCertificateKeyAndIdentity(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	chain, key := issuedFixture(t, now, []string{"control.example.test"})
+	material := validateFixtureMaterial(t, chain, key, []string{"control.example.test"}, now)
+	base := "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000001-00000000000000000001"
+	identity := materialIdentity(base, "cert_00000000000000000000000000000001", 1, material, now)
+	if err := verifyBundleMaterial(base, identity, material.CertificatePEM(), material.PrivateKeyPEM()); err != nil {
+		t.Fatalf("valid bundle material rejected: %v", err)
+	}
+	otherChain, otherKey := issuedFixture(t, now, []string{"control.example.test"})
+	tests := []struct {
+		name        string
+		certificate []byte
+		privateKey  []byte
+		mutate      func(*Identity)
+	}{
+		{name: "certificate", certificate: otherChain},
+		{name: "private-key", privateKey: otherKey},
+		{name: "SAN", mutate: func(value *Identity) {
+			value.Domains = []string{"other.example.test"}
+			value.SANIdentity = sum([]byte(strings.Join(value.Domains, "\x00")))
+		}},
+		{name: "chain", mutate: func(value *Identity) { value.ChainIdentity = sum([]byte("other-chain")) }},
+		{name: "fingerprint", mutate: func(value *Identity) { value.Fingerprint = sum([]byte("other-leaf")) }},
+		{name: "issuer-root", mutate: func(value *Identity) { value.IssuerIdentity = sum([]byte("other-issuer")) }},
+		{name: "not-before", mutate: func(value *Identity) { value.NotBefore = value.NotBefore.Add(time.Second) }},
+		{name: "not-after", mutate: func(value *Identity) { value.NotAfter = value.NotAfter.Add(time.Second) }},
+		{name: "certificate-path", mutate: func(value *Identity) {
+			value.CertificatePath = filepath.Join(filepath.Dir(base), "other", "certificate.pem")
+		}},
+		{name: "private-key-path", mutate: func(value *Identity) {
+			value.PrivateKeyPath = filepath.Join(filepath.Dir(base), "other", "private-key.pem")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := identity
+			certificate := material.CertificatePEM()
+			privateKey := material.PrivateKeyPEM()
+			if test.certificate != nil {
+				certificate = test.certificate
+			}
+			if test.privateKey != nil {
+				privateKey = test.privateKey
+			}
+			if test.mutate != nil {
+				test.mutate(&candidate)
+			}
+			if err := verifyBundleMaterial(base, candidate, certificate, privateKey); err == nil {
+				t.Fatal("modified bundle material was accepted")
 			}
 		})
 	}
@@ -154,6 +211,48 @@ func TestIssuedCertificateRequiresExactSANKeyAndChain(t *testing.T) {
 	otherDER, _ := x509.MarshalPKCS8PrivateKey(other)
 	if _, err := ValidateIssuedWithRoots(chain, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: otherDER}), []string{"a.example.test", "b.example.test"}, now, "https://acme.example.test/directory", roots); err == nil {
 		t.Fatal("wrong key accepted")
+	}
+}
+
+func validateFixtureMaterial(t *testing.T, chain, key []byte, domains []string, now time.Time) IssuedMaterial {
+	t.Helper()
+	certificates, err := parseCertificateChain(chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(certificates[len(certificates)-1])
+	material, err := ValidateIssuedWithRoots(chain, key, domains, now, "https://acme.example.test/directory", roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return material
+}
+
+func materialIdentity(base, id string, generation uint64, material IssuedMaterial, now time.Time) Identity {
+	value := Identity{SchemaVersion: SchemaVersion, ID: id, Generation: generation, Domains: append([]string(nil), material.domains...), SANIdentity: sum([]byte(strings.Join(material.domains, "\x00"))), Fingerprint: material.fingerprint, ChainIdentity: material.chainIdentity, IssuerIdentity: material.issuerIdentity, BindingIdentity: sum([]byte("binding")), LastTrustedWall: now, NotBefore: material.notBefore, NotAfter: material.notAfter, CertificatePath: filepath.Join(base, "certificate.pem"), PrivateKeyPath: filepath.Join(base, "private-key.pem")}
+	value.DirectoryIdentity = identityDigest(value)
+	return value
+}
+
+func rewriteBundleIdentity(t *testing.T, path string, mutate func(*Identity)) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value Identity
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatal(err)
+	}
+	mutate(&value)
+	value.DirectoryIdentity = identityDigest(value)
+	raw, err = json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

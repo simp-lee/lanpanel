@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math/rand/v2"
+	"io"
 	"net"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 type DNSObservation struct {
@@ -115,167 +117,202 @@ func (NetDNSObserver) Observe(ctx context.Context, server, owner string) (DNSObs
 	return result, nil
 }
 
+const (
+	dnsQueryTimeout       = 5 * time.Second
+	maximumDNSMessageSize = 4096
+)
+
 func rawDNSQuery(ctx context.Context, server, owner string, kind uint16) (DNSObservation, error) {
-	name, err := dnsName(owner)
-	if err != nil {
-		return DNSObservation{}, err
+	return rawDNSQueryAddress(ctx, server, net.JoinHostPort(server, "53"), owner, kind)
+}
+
+func rawDNSQueryAddress(ctx context.Context, server, address, owner string, kind uint16) (DNSObservation, error) {
+	if server == "" || address == "" || owner == "" {
+		return DNSObservation{}, fmt.Errorf("DNS query authority invalid")
 	}
-	id := uint16(rand.Uint32())
-	query := make([]byte, 12, 12+len(name)+4)
-	binary.BigEndian.PutUint16(query, id)
-	binary.BigEndian.PutUint16(query[4:], 1)
-	query = append(query, name...)
-	query = append(query, byte(kind>>8), byte(kind), 0, 1)
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	connection, err := dialer.DialContext(ctx, "udp", net.JoinHostPort(server, "53"))
-	if err != nil {
-		return DNSObservation{}, err
+	questionName := dns.Fqdn(strings.ToLower(strings.TrimSuffix(owner, ".")))
+	if _, valid := dns.IsDomainName(questionName); !valid {
+		return DNSObservation{}, fmt.Errorf("DNS name invalid")
 	}
-	defer func(ignore func() error) { _ = ignore() }(connection.Close)
-	deadline := time.Now().Add(5 * time.Second)
+	query := new(dns.Msg)
+	query.SetQuestion(questionName, kind)
+	query.Id = dns.Id()
+	query.RecursionDesired = false
+	wireQuery, err := query.Pack()
+	if err != nil {
+		return DNSObservation{}, fmt.Errorf("pack DNS query: %w", err)
+	}
+	deadline := time.Now().Add(dnsQueryTimeout)
 	if value, ok := ctx.Deadline(); ok && value.Before(deadline) {
 		deadline = value
 	}
-	_ = connection.SetDeadline(deadline)
-	if _, err := connection.Write(query); err != nil {
+	if err := ctx.Err(); err != nil {
 		return DNSObservation{}, err
 	}
-	buffer := make([]byte, 4096)
-	n, err := connection.Read(buffer)
+	udpResponse, remoteAddress, err := exchangeDNSMessage(ctx, "udp", address, wireQuery, deadline)
 	if err != nil {
 		return DNSObservation{}, err
 	}
-	message := buffer[:n]
-	if len(message) < 12 || binary.BigEndian.Uint16(message) != id || message[2]&0x80 == 0 || message[2]&0x02 != 0 {
-		return DNSObservation{}, fmt.Errorf("DNS response invalid or truncated")
+	udpMessage, udpObservation, err := validateDNSResponse(udpResponse, query, server, owner)
+	if err != nil {
+		return DNSObservation{}, err
 	}
-	result := DNSObservation{Server: server, Owner: owner, Authoritative: message[2]&0x04 != 0, RCode: message[3] & 0x0f}
-	questions := int(binary.BigEndian.Uint16(message[4:]))
-	answers := int(binary.BigEndian.Uint16(message[6:]))
+	if !udpMessage.Truncated {
+		return udpObservation, nil
+	}
+	tcpResponse, _, err := exchangeDNSMessage(ctx, "tcp", remoteAddress, wireQuery, deadline)
+	if err != nil {
+		return DNSObservation{}, err
+	}
+	tcpMessage, tcpObservation, err := validateDNSResponse(tcpResponse, query, server, owner)
+	if err != nil {
+		return DNSObservation{}, err
+	}
+	if tcpMessage.Truncated {
+		return DNSObservation{}, fmt.Errorf("DNS TCP response truncated")
+	}
+	return tcpObservation, nil
+}
+
+func exchangeDNSMessage(ctx context.Context, network, address string, query []byte, deadline time.Time) ([]byte, string, error) {
+	dialer := net.Dialer{Deadline: deadline}
+	connection, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func(ignore func() error) { _ = ignore() }(connection.Close)
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.SetDeadline(time.Now()) })
+	defer stopCancellation()
+	if err := connection.SetDeadline(deadline); err != nil {
+		return nil, "", err
+	}
+	if network == "tcp" {
+		if len(query) > int(^uint16(0)) {
+			return nil, "", fmt.Errorf("DNS query oversized")
+		}
+		framed := make([]byte, 2+len(query))
+		binary.BigEndian.PutUint16(framed, uint16(len(query)))
+		copy(framed[2:], query)
+		if err := writeDNSMessage(connection, framed); err != nil {
+			return nil, "", dnsContextError(ctx, err)
+		}
+		var prefix [2]byte
+		if _, err := io.ReadFull(connection, prefix[:]); err != nil {
+			return nil, "", dnsContextError(ctx, err)
+		}
+		length := int(binary.BigEndian.Uint16(prefix[:]))
+		if length < 12 || length > maximumDNSMessageSize {
+			return nil, "", fmt.Errorf("DNS TCP response size invalid")
+		}
+		response := make([]byte, length)
+		if _, err := io.ReadFull(connection, response); err != nil {
+			return nil, "", dnsContextError(ctx, err)
+		}
+		return response, connection.RemoteAddr().String(), nil
+	}
+	if err := writeDNSMessage(connection, query); err != nil {
+		return nil, "", dnsContextError(ctx, err)
+	}
+	response := make([]byte, maximumDNSMessageSize+1)
+	n, err := connection.Read(response)
+	if err != nil {
+		return nil, "", dnsContextError(ctx, err)
+	}
+	if n > maximumDNSMessageSize {
+		return nil, "", fmt.Errorf("DNS UDP response size invalid")
+	}
+	return response[:n], connection.RemoteAddr().String(), nil
+}
+
+func writeDNSMessage(connection net.Conn, value []byte) error {
+	for len(value) != 0 {
+		n, err := connection.Write(value)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		value = value[n:]
+	}
+	return nil
+}
+
+func dnsContextError(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	return err
+}
+
+func validateDNSResponse(value []byte, query *dns.Msg, server, owner string) (*dns.Msg, DNSObservation, error) {
+	if len(value) < 12 || len(value) > maximumDNSMessageSize {
+		return nil, DNSObservation{}, fmt.Errorf("DNS response size invalid")
+	}
+	if err := requireCompleteDNSWire(value); err != nil {
+		return nil, DNSObservation{}, err
+	}
+	message := new(dns.Msg)
+	if err := message.Unpack(value); err != nil {
+		return nil, DNSObservation{}, fmt.Errorf("DNS response invalid: %w", err)
+	}
+	if message.Id != query.Id || !message.Response || message.Opcode != query.Opcode || len(query.Question) != 1 || len(message.Question) != 1 || !sameDNSQuestion(message.Question[0], query.Question[0]) {
+		return nil, DNSObservation{}, fmt.Errorf("DNS response identity invalid")
+	}
+	if !message.Authoritative || message.Rcode != dns.RcodeSuccess && message.Rcode != dns.RcodeNameError {
+		return nil, DNSObservation{}, fmt.Errorf("DNS response authority or rcode invalid")
+	}
+	result := DNSObservation{Server: server, Owner: owner, Authoritative: true, RCode: uint8(message.Rcode)}
+	for _, answer := range message.Answer {
+		if answer.Header().Class != dns.ClassINET {
+			return nil, DNSObservation{}, fmt.Errorf("DNS answer class invalid")
+		}
+		switch record := answer.(type) {
+		case *dns.TXT:
+			result.TXT = append(result.TXT, record.Txt...)
+		case *dns.CNAME:
+			result.CNAME = dnsTarget(record.Target)
+		case *dns.DNAME:
+			result.DNAME = dnsTarget(record.Target)
+		}
+	}
+	return message, result, nil
+}
+
+func requireCompleteDNSWire(value []byte) error {
 	offset := 12
+	questions := int(binary.BigEndian.Uint16(value[4:6]))
 	for range questions {
-		offset, err = skipDNSName(message, offset)
-		if err != nil || offset+4 > len(message) {
-			return DNSObservation{}, fmt.Errorf("DNS question invalid")
+		_, next, err := dns.UnpackDomainName(value, offset)
+		if err != nil || next+4 > len(value) {
+			return fmt.Errorf("DNS question wire invalid")
 		}
-		offset += 4
+		offset = next + 4
 	}
-	for range answers {
-		offset, err = skipDNSName(message, offset)
-		if err != nil || offset+10 > len(message) {
-			return DNSObservation{}, fmt.Errorf("DNS answer invalid")
+	records := int(binary.BigEndian.Uint16(value[6:8])) + int(binary.BigEndian.Uint16(value[8:10])) + int(binary.BigEndian.Uint16(value[10:12]))
+	for range records {
+		_, next, err := dns.UnpackRR(value, offset)
+		if err != nil || next <= offset {
+			return fmt.Errorf("DNS record wire invalid")
 		}
-		recordType := binary.BigEndian.Uint16(message[offset:])
-		length := int(binary.BigEndian.Uint16(message[offset+8:]))
-		offset += 10
-		if offset+length > len(message) {
-			return DNSObservation{}, fmt.Errorf("DNS answer truncated")
-		}
-		data := message[offset : offset+length]
-		switch recordType {
-		case 16:
-			values, err := decodeTXT(data)
-			if err != nil {
-				return DNSObservation{}, err
-			}
-			result.TXT = append(result.TXT, values...)
-		case 5:
-			name, err := decodeDNSName(message, offset)
-			if err != nil {
-				return DNSObservation{}, err
-			}
-			result.CNAME = name
-		case 39:
-			name, err := decodeDNSName(message, offset)
-			if err != nil {
-				return DNSObservation{}, err
-			}
-			result.DNAME = name
-		}
-		offset += length
+		offset = next
 	}
-	return result, nil
+	if offset != len(value) {
+		return fmt.Errorf("DNS response contains trailing wire data")
+	}
+	return nil
 }
 
-func dnsName(value string) ([]byte, error) {
-	value = strings.TrimSuffix(strings.ToLower(value), ".")
-	parts := strings.Split(value, ".")
-	result := []byte{}
-	for _, part := range parts {
-		if part == "" || len(part) > 63 {
-			return nil, fmt.Errorf("DNS name invalid")
-		}
-		result = append(result, byte(len(part)))
-		result = append(result, part...)
+func dnsTarget(value string) string {
+	value = strings.ToLower(value)
+	if value == "." {
+		return value
 	}
-	return append(result, 0), nil
+	return strings.TrimSuffix(value, ".")
 }
 
-func skipDNSName(message []byte, offset int) (int, error) {
-	for steps := 0; steps < 128; steps++ {
-		if offset >= len(message) {
-			return 0, fmt.Errorf("DNS name truncated")
-		}
-		length := int(message[offset])
-		offset++
-		if length&0xc0 == 0xc0 {
-			if offset >= len(message) {
-				return 0, fmt.Errorf("DNS pointer truncated")
-			}
-			return offset + 1, nil
-		}
-		if length == 0 {
-			return offset, nil
-		}
-		if length > 63 || offset+length > len(message) {
-			return 0, fmt.Errorf("DNS label invalid")
-		}
-		offset += length
-	}
-	return 0, fmt.Errorf("DNS name unbounded")
-}
-
-func decodeDNSName(message []byte, offset int) (string, error) {
-	labels := []string{}
-	visited := map[int]bool{}
-	for steps := 0; steps < 128; steps++ {
-		if offset >= len(message) || visited[offset] {
-			return "", fmt.Errorf("DNS name invalid")
-		}
-		visited[offset] = true
-		length := int(message[offset])
-		offset++
-		if length&0xc0 == 0xc0 {
-			if offset >= len(message) {
-				return "", fmt.Errorf("DNS pointer truncated")
-			}
-			offset = (length&0x3f)<<8 | int(message[offset])
-			continue
-		}
-		if length == 0 {
-			return strings.Join(labels, "."), nil
-		}
-		if length > 63 || offset+length > len(message) {
-			return "", fmt.Errorf("DNS label invalid")
-		}
-		labels = append(labels, strings.ToLower(string(message[offset:offset+length])))
-		offset += length
-	}
-	return "", fmt.Errorf("DNS name unbounded")
-}
-
-func decodeTXT(data []byte) ([]string, error) {
-	result := []string{}
-	for len(data) != 0 {
-		length := int(data[0])
-		data = data[1:]
-		if length > len(data) {
-			return nil, fmt.Errorf("DNS TXT invalid")
-		}
-		result = append(result, string(data[:length]))
-		data = data[length:]
-	}
-	return result, nil
+func sameDNSQuestion(left, right dns.Question) bool {
+	return strings.EqualFold(left.Name, right.Name) && left.Qtype == right.Qtype && left.Qclass == right.Qclass
 }
 
 func digestValue(value string) string {

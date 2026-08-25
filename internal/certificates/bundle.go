@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	SchemaVersion         = "lanpanel.certificate.bundle.v1"
+	SchemaVersion         = "lanpanel.certificate.bundle.v2"
 	minimumIssuedLifetime = time.Hour
 )
 
@@ -157,12 +157,13 @@ func ValidateIssuedWithRoots(certificateChainPEM, privateKeyPEM []byte, domains 
 	if err != nil || directory.Scheme != "https" || directory.Host == "" {
 		return IssuedMaterial{}, fmt.Errorf("issued certificate directory authority invalid")
 	}
-	certificates, err := parseCertificateChain(certificateChainPEM)
-	if err != nil || len(certificates) < 2 {
-		return IssuedMaterial{}, fmt.Errorf("issued certificate chain invalid")
+	inspected, err := inspectBundleMaterial(certificateChainPEM, privateKeyPEM)
+	if err != nil {
+		return IssuedMaterial{}, fmt.Errorf("issued certificate material invalid: %w", err)
 	}
+	certificates := inspected.certificates
 	leaf := certificates[0]
-	if leaf.IsCA || leaf.SerialNumber == nil || leaf.SerialNumber.BitLen() < 64 || !slices.Equal(canonicalDomains(leaf.DNSNames), domains) || len(leaf.ExtKeyUsage) != 1 || leaf.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth || now.Before(leaf.NotBefore) || !leaf.NotAfter.After(now.Add(minimumIssuedLifetime)) {
+	if leaf.IsCA || leaf.SerialNumber == nil || leaf.SerialNumber.BitLen() < 64 || !slices.Equal(inspected.domains, domains) || len(leaf.ExtKeyUsage) != 1 || leaf.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth || now.Before(leaf.NotBefore) || !leaf.NotAfter.After(now.Add(minimumIssuedLifetime)) {
 		return IssuedMaterial{}, fmt.Errorf("issued leaf identity invalid")
 	}
 	if len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 || len(leaf.URIs) != 0 {
@@ -182,20 +183,12 @@ func ValidateIssuedWithRoots(certificateChainPEM, privateKeyPEM []byte, domains 
 	if err != nil || len(verified) == 0 || len(verified[0]) < 2 {
 		return IssuedMaterial{}, fmt.Errorf("issued certificate chain is not trusted")
 	}
-	root := verified[0][len(verified[0])-1]
-	privateKey, err := parsePrivateKey(privateKeyPEM)
-	if err != nil {
-		return IssuedMaterial{}, err
-	}
-	if !publicKeysEqual(leaf.PublicKey, privateKey.Public()) {
-		return IssuedMaterial{}, fmt.Errorf("issued certificate key mismatch")
-	}
-	canonicalKey, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	canonicalKey, err := x509.MarshalPKCS8PrivateKey(inspected.privateKey)
 	if err != nil {
 		return IssuedMaterial{}, fmt.Errorf("canonicalize issued private key: %w", err)
 	}
 	canonicalKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: canonicalKey})
-	return IssuedMaterial{certificatePEM: append([]byte(nil), certificateChainPEM...), privateKeyPEM: canonicalKeyPEM, domains: domains, fingerprint: sum(leaf.Raw), chainIdentity: sum(certificateChainPEM), issuerIdentity: sum(append([]byte(directory.Host+"\x00"), root.Raw...)), notBefore: leaf.NotBefore.UTC(), notAfter: leaf.NotAfter.UTC()}, nil
+	return IssuedMaterial{certificatePEM: append([]byte(nil), certificateChainPEM...), privateKeyPEM: canonicalKeyPEM, domains: domains, fingerprint: sum(leaf.Raw), chainIdentity: sum(certificateChainPEM), issuerIdentity: inspected.issuerIdentity, notBefore: leaf.NotBefore.UTC(), notAfter: leaf.NotAfter.UTC()}, nil
 }
 
 func StageIssued(ctx context.Context, parent, id string, generation uint64, bindingIdentity string, material IssuedMaterial, owner filetxn.Owner, now time.Time) (Identity, error) {
@@ -230,8 +223,11 @@ func ObserveIdentity(parent, id string, generation uint64, owner filetxn.Owner) 
 	var identity Identity
 	decoder := json.NewDecoder(bytes.NewReader(identityRaw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || ValidateIdentity(identity) != nil || identity.ID != id || identity.Generation != generation || identity.CertificatePath != filepath.Join(base, "certificate.pem") || identity.PrivateKeyPath != filepath.Join(base, "private-key.pem") {
+	if decoder.Decode(&identity) != nil || decoder.Decode(&struct{}{}) != io.EOF || ValidateIdentity(identity) != nil || identity.ID != id || identity.Generation != generation {
 		return Identity{}, fmt.Errorf("certificate identity observation invalid")
+	}
+	if err := verifyBundleMaterial(base, identity, certificateRaw, privateRaw); err != nil {
+		return Identity{}, err
 	}
 	request := filetxn.DirectoryRequest{ParentPath: parent, Parent: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o700}, TargetName: name, Directory: filetxn.Metadata{Owner: owner, Mode: 0o700}, Members: []filetxn.DirectoryMember{{Name: "certificate.pem", Data: certificateRaw, Owner: owner, Mode: 0o600, Maximum: 1 << 20}, {Name: "identity.json", Data: identityRaw, Owner: owner, Mode: 0o600, Maximum: 64 << 10}, {Name: "private-key.pem", Data: privateRaw, Owner: owner, Mode: 0o600, Maximum: 1 << 20}}}
 	if _, err := filetxn.VerifyDirectory(request); err != nil {
@@ -324,6 +320,78 @@ func identityDigest(identity Identity) string {
 	copy.DirectoryIdentity = ""
 	raw, _ := json.Marshal(copy)
 	return sum(raw)
+}
+
+type inspectedBundleMaterial struct {
+	certificates   []*x509.Certificate
+	privateKey     crypto.Signer
+	domains        []string
+	fingerprint    string
+	chainIdentity  string
+	issuerIdentity string
+	notBefore      time.Time
+	notAfter       time.Time
+}
+
+func verifyBundleMaterial(base string, identity Identity, certificatePEM, privateKeyPEM []byte) error {
+	if !cleanAbsolute(base) || identity.CertificatePath != filepath.Join(base, "certificate.pem") || identity.PrivateKeyPath != filepath.Join(base, "private-key.pem") {
+		return fmt.Errorf("certificate bundle material paths differ from identity")
+	}
+	material, err := inspectBundleMaterial(certificatePEM, privateKeyPEM)
+	if err != nil {
+		return fmt.Errorf("certificate bundle material invalid: %w", err)
+	}
+	if !slices.Equal(material.domains, identity.Domains) || identity.SANIdentity != sum([]byte(strings.Join(material.domains, "\x00"))) || identity.Fingerprint != material.fingerprint || identity.ChainIdentity != material.chainIdentity || identity.IssuerIdentity != material.issuerIdentity || !identity.NotBefore.Equal(material.notBefore) || !identity.NotAfter.Equal(material.notAfter) {
+		return fmt.Errorf("certificate bundle material differs from identity")
+	}
+	return nil
+}
+
+func inspectBundleMaterial(certificatePEM, privateKeyPEM []byte) (inspectedBundleMaterial, error) {
+	certificates, err := parseCertificateChain(certificatePEM)
+	if err != nil || len(certificates) < 2 {
+		return inspectedBundleMaterial{}, fmt.Errorf("certificate chain invalid")
+	}
+	seen := make(map[string]bool, len(certificates))
+	for index, certificate := range certificates {
+		fingerprint := sum(certificate.Raw)
+		if seen[fingerprint] {
+			return inspectedBundleMaterial{}, fmt.Errorf("certificate chain duplicates identity")
+		}
+		seen[fingerprint] = true
+		if index+1 < len(certificates) {
+			issuer := certificates[index+1]
+			if !issuer.IsCA || certificate.CheckSignatureFrom(issuer) != nil {
+				return inspectedBundleMaterial{}, fmt.Errorf("certificate chain order or signature invalid")
+			}
+		}
+	}
+	leaf := certificates[0]
+	domains, err := validateDomains(leaf.DNSNames)
+	if err != nil || len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 || len(leaf.URIs) != 0 {
+		return inspectedBundleMaterial{}, fmt.Errorf("certificate SAN material invalid")
+	}
+	privateKey, err := parsePrivateKey(privateKeyPEM)
+	if err != nil {
+		return inspectedBundleMaterial{}, err
+	}
+	if !publicKeysEqual(leaf.PublicKey, privateKey.Public()) {
+		return inspectedBundleMaterial{}, fmt.Errorf("certificate private key mismatch")
+	}
+	issuerFingerprints := make([]string, 0, len(certificates)-1)
+	for _, certificate := range certificates[1:] {
+		issuerFingerprints = append(issuerFingerprints, sum(certificate.Raw))
+	}
+	return inspectedBundleMaterial{
+		certificates:   certificates,
+		privateKey:     privateKey,
+		domains:        domains,
+		fingerprint:    sum(leaf.Raw),
+		chainIdentity:  sum(certificatePEM),
+		issuerIdentity: sum([]byte(strings.Join(issuerFingerprints, "\x00"))),
+		notBefore:      leaf.NotBefore.UTC(),
+		notAfter:       leaf.NotAfter.UTC(),
+	}, nil
 }
 
 func parseCertificateChain(value []byte) ([]*x509.Certificate, error) {

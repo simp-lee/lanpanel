@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lanpanel/internal/filetxn"
 	"lanpanel/internal/identity"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -217,25 +219,26 @@ func pointerPaths(pointer Pointer) (string, string, string, error) {
 }
 
 func verifyBundleTarget(path string) error {
-	if !strings.HasPrefix(path, FixedBundlesRoot+string(filepath.Separator)) || filepath.Clean(path) != path {
+	if !strings.HasPrefix(path, FixedBundlesRoot+string(filepath.Separator)) || filepath.Clean(path) != path || filepath.Dir(path) != FixedBundlesRoot {
 		return fmt.Errorf("certificate target outside fixed root")
-	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("certificate target invalid")
 	}
 	name := filepath.Base(path)
 	separator := strings.LastIndex(name, "-")
 	if separator <= 0 {
 		return fmt.Errorf("certificate target identity invalid")
 	}
-	stage, err := identity.CertificateStageIdentityFor(name[:separator])
+	certificateIdentity := name[:separator]
+	generationText := name[separator+1:]
+	generation, err := strconv.ParseUint(generationText, 10, 64)
+	if err != nil || name != bundleName(certificateIdentity, generation) {
+		return fmt.Errorf("certificate target generation invalid")
+	}
+	stage, err := identity.CertificateStageIdentityFor(certificateIdentity)
 	if err != nil {
 		return err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
-	if !ok || stat.Uid != stage.UID || stat.Gid != stage.GID {
-		return fmt.Errorf("certificate target owner invalid")
+	if _, err := ObserveIdentity(FixedBundlesRoot, certificateIdentity, generation, filetxn.Owner{UID: stage.UID, GID: stage.GID}); err != nil {
+		return fmt.Errorf("certificate target bundle invalid: %w", err)
 	}
 	return nil
 }
