@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -16,6 +17,23 @@ type emptyOwnershipAuthority struct{}
 
 func (emptyOwnershipAuthority) InventoryAuthority() (map[string]string, bool, error) {
 	return map[string]string{}, true, nil
+}
+
+func TestAppContractionFenceBindsEveryRetainedMarker(t *testing.T) {
+	resource := safety.ResourceSafety{
+		StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 3},
+		Closing:           &safety.GenerationMarker{Kind: safety.MarkerClosing, Generation: 4},
+		CertificateExpiry: &safety.DeadlineMarker{Generation: 2},
+	}
+	markers, authorities, certificateGeneration, err := appContractionFenceBindings(resource, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []safety.MarkerGeneration{{Kind: "sticky_unpublished", Generation: 3}, {Kind: "closing", Generation: 4}, {Kind: "certificate_expiry", Generation: 2}}
+	expectedAuthorities := []safety.MarkerGeneration{{Kind: "closing", Generation: 4}, {Kind: "certificate_expiry", Generation: 2}}
+	if !reflect.DeepEqual(markers, expected) || !reflect.DeepEqual(authorities, expectedAuthorities) || certificateGeneration != 2 {
+		t.Fatalf("markers=%v authorities=%v certificate=%d", markers, authorities, certificateGeneration)
+	}
 }
 
 func TestStopFenceProjectsCommittedEmergencyGlobalAuthority(t *testing.T) {

@@ -134,22 +134,120 @@ func (service *EmergencyService) Snapshot() (EmergencySnapshot, error) {
 	return EmergencySnapshot{Inventory: inventory, GlobalGeneration: authority.GlobalClose.Generation}, nil
 }
 
+func projectedFenceSafetyGenerations(scope safety.FenceScope, state safety.State) []safety.MarkerGeneration {
+	result := []safety.MarkerGeneration{}
+	if state.GlobalClose.Phase != safety.GlobalCloseNone {
+		result = append(result, safety.MarkerGeneration{Kind: "global_close", Generation: state.GlobalClose.Generation})
+	}
+	switch scope.Kind {
+	case "app":
+		for _, resource := range state.Resources {
+			if resource.ResourceID == scope.ResourceID {
+				result = append(result, appContractionMarkerGenerations(resource)...)
+				break
+			}
+		}
+	case "headscale":
+		if state.Headscale.CertificateExpiry != nil {
+			result = append(result, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: state.Headscale.CertificateExpiry.Generation})
+		}
+		if state.Headscale.ChallengePending != nil {
+			result = append(result, safety.MarkerGeneration{Kind: "challenge_pending", Generation: state.Headscale.ChallengePending.Generation})
+		}
+		if state.Headscale.Reactivating != nil {
+			result = append(result, safety.MarkerGeneration{Kind: "reactivating", Generation: state.Headscale.Reactivating.Generation})
+		}
+	}
+	return result
+}
+
+func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, snapshot EmergencySnapshot, authority safety.EmergencyState, state safety.State) error {
+	if state.GlobalClose.Phase == safety.GlobalCloseNone || authority.GlobalClose.Generation != state.GlobalClose.Generation || service.normal == nil {
+		return fmt.Errorf("fence-cleared global recovery authority is incomplete")
+	}
+	host, err := FixedHost(snapshot.Inventory)
+	if err != nil {
+		return err
+	}
+	if _, err := host.ContractDisk(ctx, snapshot.Inventory); err != nil {
+		return err
+	}
+	if err := host.TestClosedGraph(ctx); err != nil {
+		return err
+	}
+	runtime, observeErr := host.Observe(ctx)
+	stoppedErr := closure.VerifyStopped(runtime)
+	if observeErr != nil || stoppedErr != nil {
+		return fmt.Errorf("fence-cleared global recovery runtime is not stopped: %w", errors.Join(observeErr, stoppedErr))
+	}
+	unpublished := make(map[string]uint64, len(state.Resources))
+	ownership := make(map[string]string, len(state.Resources))
+	for _, resource := range state.Resources {
+		if resource.StickyUnpublished == nil || resource.Closing != nil {
+			return fmt.Errorf("fence-cleared global recovery resource is not converged")
+		}
+		unpublished[resource.ResourceID] = resource.StickyUnpublished.Generation
+		ownership[resource.ResourceID] = resource.OwnershipDigest
+	}
+	closureDigest := snapshot.Inventory.Digest
+	globalProof := &safety.GlobalConvergenceProof{Generation: state.GlobalClose.Generation, InventoryDigest: safety.OwnershipInventoryDigest(ownership), OwnedGraphDigest: snapshot.Inventory.Digest, RuntimeClosureDigest: closureDigest, UnpublishedGenerations: unpublished, NginxTestPassed: true, RuntimeClosed: true}
+	current := authority
+	if authority.GlobalClose.Phase != safety.GlobalCloseNone {
+		cleared := authority
+		cleared.Sequence++
+		cleared.GlobalClose.Phase = safety.GlobalCloseNone
+		cleared.ClearProof = &safety.EmergencyClearProof{Generation: globalProof.Generation, InventoryDigest: globalProof.InventoryDigest, OwnedGraphDigest: globalProof.OwnedGraphDigest, RuntimeClosureDigest: globalProof.RuntimeClosureDigest, NginxTestPassed: true, RuntimeClosed: true}
+		if err := service.emergency.Commit(service.exposure, safety.RoleGlobalCloseConvergence, authority.Sequence, cleared); err != nil {
+			return err
+		}
+		current = cleared
+	} else {
+		proof := authority.ClearProof
+		if proof == nil || proof.Generation != globalProof.Generation || proof.InventoryDigest != globalProof.InventoryDigest || proof.OwnedGraphDigest != snapshot.Inventory.Digest || proof.RuntimeClosureDigest != snapshot.Inventory.Digest || !proof.NginxTestPassed || !proof.RuntimeClosed {
+			return fmt.Errorf("fence-cleared emergency global proof changed")
+		}
+		globalProof.OwnedGraphDigest = proof.OwnedGraphDigest
+		globalProof.RuntimeClosureDigest = proof.RuntimeClosureDigest
+		closureDigest = proof.RuntimeClosureDigest
+	}
+	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, unpublished, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = current.Sequence
+	next.GlobalClose = current.GlobalClose
+	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleGlobalCloseConvergence, state.Revision, next, safety.TransitionProof{GlobalClose: globalProof}); err != nil {
+		return err
+	}
+	service.safetyState = &next
+	return nil
+}
+
 func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlobal uint64, expectedInventory string) error {
 	snapshot, err := service.Snapshot()
 	if err != nil || snapshot.GlobalGeneration != expectedGlobal || snapshot.Inventory.Digest != expectedInventory || !snapshot.Inventory.Complete || service.safetyStore == nil || service.safetyState == nil {
 		return fmt.Errorf("exact closed recovery authority is incomplete: %w", err)
 	}
 	authority, err := service.emergency.Authority()
-	if err != nil || authority.GlobalClose.Phase == safety.GlobalCloseNone || authority.StopFence == nil || authority.StopFence.AccessMayRemain || !authority.StopFence.MasterStopped || !authority.StopFence.WorkersStopped || !authority.StopFence.ListenersStopped {
+	if err != nil {
 		return fmt.Errorf("verified stopped emergency fence is unavailable: %w", err)
 	}
 	state := *service.safetyState
+	if authority.StopFence == nil && state.StopFence == nil {
+		return service.recoverFenceClearedGlobal(ctx, snapshot, authority, state)
+	}
+	emergencyFenceActive := authority.StopFence != nil && !authority.StopFence.AccessMayRemain && authority.StopFence.MasterStopped && authority.StopFence.WorkersStopped && authority.StopFence.ListenersStopped
+	emergencyFenceCleared := authority.StopFence == nil && state.StopFence != nil && authority.ClearProof != nil && authority.ClearProof.StopFenceGeneration == state.StopFence.FenceGeneration && authority.ClearProof.InventoryDigest == state.StopFence.InventoryDigest && authority.ClearProof.OwnedGraphDigest == state.StopFence.OwnedGraphDigest && authority.ClearProof.NginxTestPassed && authority.ClearProof.RuntimeClosed
+	if !emergencyFenceActive && !emergencyFenceCleared {
+		return fmt.Errorf("verified stopped emergency fence is unavailable")
+	}
 	if state.StopFence != nil {
 		if err := service.validateStopFenceOrigin(*state.StopFence); err != nil {
 			return err
 		}
 	}
-	if !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
+	if emergencyFenceActive && !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
 		emergencyFence := authority.StopFence
 		authorities := []safety.MarkerGeneration{}
 		if emergencyFence.GlobalGeneration != 0 {
@@ -158,12 +256,16 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		if emergencyFence.ClosingGeneration != 0 {
 			authorities = append(authorities, safety.MarkerGeneration{Kind: "closing", Generation: emergencyFence.ClosingGeneration})
 		}
-		projected := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}, FenceGeneration: emergencyFence.Generation, CreatedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC(), SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: emergencyFence.OwnershipDigest, OperationRef: emergencyFence.OperationRef, SafetyIntentID: emergencyFence.SafetyIntentID, SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration}}
+		if emergencyFence.CertificateGeneration != 0 {
+			authorities = append(authorities, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: emergencyFence.CertificateGeneration})
+		}
 		projectedState := state
 		projectedState.Revision++
 		projectedState.AuthoritySequence = authority.Sequence
 		projectedState.GlobalClose = authority.GlobalClose
 		projectedState.StopFenceSequence = authority.StopFenceSequence
+		scope := safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}
+		projected := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: scope, FenceGeneration: emergencyFence.Generation, CreatedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC(), SafetyGenerations: projectedFenceSafetyGenerations(scope, projectedState), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: emergencyFence.OwnershipDigest, OperationRef: emergencyFence.OperationRef, SafetyIntentID: emergencyFence.SafetyIntentID, SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration}}
 		projectedState.StopFence = &projected
 		if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleContraction, state.Revision, projectedState, safety.TransitionProof{}); err != nil {
 			return fmt.Errorf("project emergency fence into normal safety: %w", err)
@@ -201,31 +303,10 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, generations, snapshot.Inventory.Digest, state.Checksum, time.Now().UTC(), nil); err != nil {
 		return err
 	}
-	state.Revision++
-	state.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
-	unpublished := map[string]uint64{}
-	for index := range state.Resources {
-		resource := &state.Resources[index]
-		generation := generations[resource.ResourceID]
-		if resource.Closing != nil {
-			generation = resource.Closing.Generation
-		}
-		resource.GenerationSequence = generation
-		resource.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: "recovered_closed"}
-		resource.Closing, resource.ChallengePending, resource.Reactivating = nil, nil, nil
-		generations[resource.ResourceID] = generation
-		unpublished[resource.ResourceID] = generation
+	unpublished := make(map[string]uint64, len(generations))
+	for resourceID, generation := range generations {
+		unpublished[resourceID] = generation
 	}
-	closingProofs := map[string]safety.ClosingConvergenceProof{}
-	for _, before := range service.safetyState.Resources {
-		if before.Closing != nil {
-			closingProofs[before.ResourceID] = safety.ClosingConvergenceProof{ResourceID: before.ResourceID, ClosingGeneration: before.Closing.Generation, UnpublishedGeneration: before.Closing.Generation, OwnershipDigest: before.OwnershipDigest, RuntimeClosureDigest: snapshot.Inventory.Digest}
-		}
-	}
-	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleContraction, service.safetyState.Revision, state, safety.TransitionProof{Closings: closingProofs}); err != nil {
-		return err
-	}
-	service.safetyState = &state
 	closureDigest := snapshot.Inventory.Digest
 	if state.StopFence == nil {
 		return fmt.Errorf("normal stop fence is unavailable for exact recovery")
@@ -233,18 +314,35 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	if err := service.validateStopFenceOrigin(*state.StopFence); err != nil {
 		return err
 	}
-	clearProof := &safety.EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFence.Generation, StopFenceDigest: safety.EmergencyFenceDigest(*authority.StopFence), InventoryDigest: snapshot.Inventory.FullOwnershipDigest, OwnedGraphDigest: snapshot.Inventory.Digest, RuntimeClosureDigest: closureDigest, NginxTestPassed: true, RuntimeClosed: true}
 	withoutFence := authority
-	withoutFence.Sequence++
-	withoutFence.StopFence = nil
-	withoutFence.ClearProof = clearProof
-	if err := service.emergency.Commit(service.exposure, safety.RoleJournalConvergence, authority.Sequence, withoutFence); err != nil {
-		return err
+	if emergencyFenceActive {
+		clearProof := &safety.EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFence.Generation, StopFenceDigest: safety.EmergencyFenceDigest(*authority.StopFence), InventoryDigest: authority.StopFence.InventoryDigest, OwnedGraphDigest: authority.StopFence.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, NginxTestPassed: true, RuntimeClosed: true}
+		withoutFence.Sequence++
+		withoutFence.StopFence = nil
+		withoutFence.ClearProof = clearProof
+		if err := service.emergency.Commit(service.exposure, safety.RoleJournalConvergence, authority.Sequence, withoutFence); err != nil {
+			return err
+		}
 	}
-	normalWithoutFence := state
-	normalWithoutFence.Revision++
-	normalWithoutFence.AuthoritySequence = withoutFence.Sequence
-	normalWithoutFence.StopFence = nil
+	nextState := state
+	nextState.Revision++
+	nextState.AuthoritySequence = withoutFence.Sequence
+	nextState.StopFence = nil
+	nextState.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	closingProofs := map[string]safety.ClosingConvergenceProof{}
+	for index := range nextState.Resources {
+		resource := &nextState.Resources[index]
+		generation := generations[resource.ResourceID]
+		if resource.Closing != nil {
+			generation = resource.Closing.Generation
+			closingProofs[resource.ResourceID] = safety.ClosingConvergenceProof{ResourceID: resource.ResourceID, ClosingGeneration: generation, UnpublishedGeneration: generation, OwnershipDigest: resource.OwnershipDigest, RuntimeClosureDigest: snapshot.Inventory.Digest}
+		}
+		resource.GenerationSequence = generation
+		resource.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: "recovered_closed"}
+		resource.Closing, resource.ChallengePending, resource.Reactivating = nil, nil, nil
+		generations[resource.ResourceID] = generation
+		unpublished[resource.ResourceID] = generation
+	}
 	stopProof := &safety.StopFenceConvergenceProof{Kind: state.StopFence.Kind, FenceGeneration: state.StopFence.FenceGeneration, FenceDigest: safety.StopFenceDigest(*state.StopFence), InventoryDigest: state.StopFence.InventoryDigest, OwnedGraphDigest: state.StopFence.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}
 	if state.StopFence.Contraction != nil {
 		stopProof.JournalRef = state.StopFence.Contraction.OperationRef
@@ -255,21 +353,29 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	} else if state.StopFence.CertificateActivation != nil {
 		stopProof.JournalRef = state.StopFence.CertificateActivation.JournalRef
 	}
-	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleJournalConvergence, state.Revision, normalWithoutFence, safety.TransitionProof{StopFence: stopProof}); err != nil {
+	transitionProof := safety.TransitionProof{StopFence: stopProof, Closings: closingProofs}
+	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleJournalConvergence, state.Revision, nextState, transitionProof); err != nil {
 		return err
 	}
+	state = nextState
+	service.safetyState = &state
+	if withoutFence.GlobalClose.Phase == safety.GlobalCloseNone {
+		return nil
+	}
+
 	globalProof := &safety.GlobalConvergenceProof{Generation: withoutFence.GlobalClose.Generation, InventoryDigest: snapshot.Inventory.FullOwnershipDigest, OwnedGraphDigest: snapshot.Inventory.Digest, RuntimeClosureDigest: closureDigest, UnpublishedGenerations: unpublished, NginxTestPassed: true, RuntimeClosed: true}
 	cleared := withoutFence
 	cleared.Sequence++
 	cleared.GlobalClose.Phase = safety.GlobalCloseNone
+	cleared.ClearProof = &safety.EmergencyClearProof{Generation: globalProof.Generation, InventoryDigest: globalProof.InventoryDigest, OwnedGraphDigest: globalProof.OwnedGraphDigest, RuntimeClosureDigest: globalProof.RuntimeClosureDigest, NginxTestPassed: true, RuntimeClosed: true}
 	if err := service.emergency.Commit(service.exposure, safety.RoleGlobalCloseConvergence, withoutFence.Sequence, cleared); err != nil {
 		return err
 	}
-	normalCleared := normalWithoutFence
+	normalCleared := state
 	normalCleared.Revision++
 	normalCleared.AuthoritySequence = cleared.Sequence
 	normalCleared.GlobalClose = cleared.GlobalClose
-	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleGlobalCloseConvergence, normalWithoutFence.Revision, normalCleared, safety.TransitionProof{GlobalClose: globalProof}); err != nil {
+	if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleGlobalCloseConvergence, state.Revision, normalCleared, safety.TransitionProof{GlobalClose: globalProof}); err != nil {
 		return err
 	}
 	service.safetyState = &normalCleared
@@ -323,6 +429,10 @@ func (service *EmergencyService) PersistClosing(_ context.Context, inventory clo
 	if current.GlobalClose.Phase != safety.GlobalCloseNone {
 		service.globalCommitted = true
 		return nil
+	}
+	reservationOutstanding := current.StopFence == nil && current.ReservedStopFenceKind != "" && service.safetyState != nil && current.StopFenceSequence > service.safetyState.StopFenceSequence
+	if current.StopFence != nil || reservationOutstanding || service.safetyState != nil && service.safetyState.StopFence != nil {
+		return fmt.Errorf("existing stop fence must converge before global close")
 	}
 	next := current
 	next.Sequence++
@@ -449,6 +559,9 @@ func (service *EmergencyService) PersistStopFence(_ context.Context, inventory c
 	}
 	if current.StopFence != nil {
 		return nil
+	}
+	if service.safetyState != nil && service.safetyState.StopFence != nil {
+		return fmt.Errorf("normal stop fence must converge before emergency fence allocation")
 	}
 	if current.GlobalClose.Phase == safety.GlobalCloseNone {
 		return fmt.Errorf("stop fence requires prior global close authority")

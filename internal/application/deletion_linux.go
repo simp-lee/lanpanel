@@ -141,6 +141,9 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	resource = freshResource
 	installation = freshInstallation
 	owned = freshOwned
+	if err := operations.RequireNoActiveCertificateExpiry(fresh, target.ID); err != nil {
+		return ResourceDeleteResult{}, err
+	}
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return ResourceDeleteResult{}, err
@@ -291,6 +294,9 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 		}
 	}
 	closureDigest := digestLifecycle(struct{ ResourceID, ConfigDigest string }{intent.SafetyBinding.ResourceID, intent.SafetyBinding.CandidateDigest})
+	if err := operations.RequireNoActiveCertificateExpiry(document, intent.SafetyBinding.ResourceID); err != nil {
+		return err
+	}
 	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err

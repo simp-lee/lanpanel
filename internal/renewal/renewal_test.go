@@ -52,6 +52,23 @@ func TestHeadscaleRenewalUsesOnlyCommittedControlCertificate(t *testing.T) {
 	}
 }
 
+func TestHeadscaleRenewalIsIdleDuringGlobalClose(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	deadline := now.Add(20 * 24 * time.Hour)
+	headscale := &domain.HeadscaleDomain{Enabled: true, Applied: &domain.HeadscaleAppliedIdentity{CertificateID: "cert_00000000000000000000000000000001"}, Certificate: &domain.CertificateBundleIdentity{Generation: 1, Fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BindingIdentity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NotAfter: deadline.Format(time.RFC3339), LastTrustedWall: now.Add(-time.Minute).Format(time.RFC3339)}}
+	for _, phase := range []safety.GlobalClosePhase{safety.GlobalCloseClosing, safety.GlobalCloseEmergency} {
+		t.Run(string(phase), func(t *testing.T) {
+			state := safety.EmptyState()
+			state.GlobalClose = safety.GlobalClose{Phase: phase, Generation: 1}
+			state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: headscale.Certificate.Fingerprint, Binding: headscale.Certificate.BindingIdentity, NotAfter: deadline, LastTrustedWall: now.Add(-time.Minute)}
+			decision, err := EvaluateHeadscale(now, 30*24*time.Hour, headscale, state)
+			if err != nil || decision != DecisionIdle {
+				t.Fatalf("decision=%s err=%v", decision, err)
+			}
+		})
+	}
+}
+
 func TestRenewalContractsExpiredOrRegressedClock(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	regressed := publication(now, now.Add(time.Hour))

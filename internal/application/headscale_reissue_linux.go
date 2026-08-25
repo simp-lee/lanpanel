@@ -95,7 +95,7 @@ func (s *FixedService) CreateHeadscaleReissuePlan(ctx context.Context, actor Act
 	if err != nil {
 		return plans.Plan{}, err
 	}
-	if state.StopFence != nil || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil {
+	if state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil {
 		return plans.Plan{}, fmt.Errorf("headscale reissue safety authority unavailable")
 	}
 	if state.Headscale.CertificateExpiry != nil {
@@ -177,6 +177,9 @@ func beginHeadscaleCertificateRenew(ctx context.Context, plan *plans.Plan, actor
 	state, err := service.safety.Read()
 	if err != nil {
 		return fail(err)
+	}
+	if state.GlobalClose.Phase != safety.GlobalCloseNone {
+		return fail(fmt.Errorf("global close blocks Headscale certificate action"))
 	}
 	if plan != nil {
 		if err := requireHeadscaleReissueSafetyEvidence(*plan, state, headscale.ID, time.Now().UTC()); err != nil {

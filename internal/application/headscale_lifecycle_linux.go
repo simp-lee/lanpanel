@@ -20,6 +20,8 @@ import (
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -136,53 +138,65 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	return err
 }
 
-func recordObservedHeadscaleExpiry(ctx context.Context, service *FixedService, document persist.Document, headscale *domain.HeadscaleDomain, generation uint64, deadline time.Time, journal control.Journal) (returnErr error) {
-	admitter, err := service.TimerAdmitter()
-	if err != nil {
-		return err
+func headscaleExpiryJournalMatchesNormal(installation domain.Installation, journal control.Journal) bool {
+	headscale := installation.Headscale
+	identity := journal.Certificate
+	if headscale == nil || headscale.Certificate == nil || identity == nil || headscale.Applied == nil || headscale.Certificate.Authority == nil || journal.InstallationID != installation.InstallationID {
+		return false
 	}
-	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
-	if err != nil {
-		return err
+	applied, err := control.AppliedIdentity(journal.Candidate)
+	if err != nil || !reflect.DeepEqual(applied, *headscale.Applied) || journal.Candidate.HeadscaleID != headscale.ID || journal.Candidate.DatabaseUUID != headscale.Database.UUID || journal.Candidate.DatabaseGeneration != headscale.Database.Generation || journal.Candidate.ControlDomain != headscale.ControlDomain || journal.Candidate.MagicDNSNamespace != headscale.MagicDNSNamespace || !reflect.DeepEqual(journal.Candidate.Artifact, headscale.Artifact) {
+		return false
 	}
-	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.CertificateExpiry, Target: "headscale/" + headscale.ID, ActorIdentity: "recovery/headscale-certificate-expiry", Source: operations.AdmissionTimer, SafetyBinding: operations.SafetyBinding{ResourceID: "headscale", ExpiryGeneration: generation, Deadline: deadline, CandidateBundle: headscale.Certificate.BindingIdentity}, ExpectedRevision: document.Revision})
-	releaseErr := admission.Release()
-	if admitErr != nil || releaseErr != nil {
-		return errors.Join(admitErr, releaseErr)
-	}
-	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
-	if err != nil {
-		return err
-	}
-	defer func() { returnErr = errors.Join(returnErr, mutationSet.Close()) }()
-	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "headscale/"+headscale.ID, service.manager)
-	if err != nil {
-		return err
-	}
-	defer func() { returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure)) }()
-	inventory := safety.OwnershipInventoryDigest(map[string]string{})
-	request := preflight.ContractionRequest{Kind: preflight.ContractionExpiry, Target: "headscale/" + headscale.ID, Generation: generation, OwnershipInventoryDigest: inventory, ClosureAuthorityDigest: headscale.Certificate.Fingerprint}
-	result, err := preflight.EvaluateContraction(request, preflight.ContractionObservations{ExecutorUID: uint32(os.Geteuid()), InventoryComplete: true, OwnershipInventoryDigest: inventory, ClosureAuthorityDigest: headscale.Certificate.Fingerprint, ObservedAt: time.Now().UTC()})
-	if err != nil {
-		return err
-	}
-	fresh, err := service.normal.Read()
-	if err != nil {
-		return err
-	}
-	intent, err := admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ContractionRequest: &request, ContractionPreflight: &result})
-	if err != nil {
-		return err
-	}
-	bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
-	if err != nil {
-		return err
-	}
-	_, err = admitter.Complete(ctx, mutation, exposure, intent.IntentGeneration, job.ID, "complete", nil, []jobs.Postcondition{{Kind: "headscale_control_expired_closed", Status: jobs.PostconditionVerified, Identity: bundle.Digest}}, "")
-	return err
+	certificate := headscale.Certificate
+	notAfter, notAfterErr := time.Parse(time.RFC3339, certificate.NotAfter)
+	lastWall, lastWallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
+	return notAfterErr == nil && lastWallErr == nil && journal.Candidate.CertificateID == identity.ID &&
+		headscale.Applied.CertificateID == identity.ID && certificate.Authority.CertificateID == identity.ID &&
+		certificate.Generation == identity.Generation && certificate.Fingerprint == identity.Fingerprint && certificate.BindingIdentity == identity.BindingIdentity && certificate.SANIdentity == identity.SANIdentity && certificate.ChainIdentity == identity.ChainIdentity && certificate.IssuerIdentity == identity.IssuerIdentity &&
+		notAfter.Equal(identity.NotAfter.Truncate(time.Second)) && lastWall.Equal(identity.LastTrustedWall.Truncate(time.Second))
 }
 
-func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedService, document persist.Document, headscale *domain.HeadscaleDomain, journal control.Journal, intent operations.Reservation) (returnErr error) {
+func readLockedHeadscaleExpiryAuthority(service *FixedService, headscale *domain.HeadscaleDomain, expectedJournal control.Journal) (persist.Document, control.Journal, error) {
+	document, err := service.normal.Read()
+	if err != nil {
+		return persist.Document{}, control.Journal{}, err
+	}
+	installation, err := loadHeadscaleInstallation(document)
+	if err != nil {
+		return persist.Document{}, control.Journal{}, err
+	}
+	if installation.Headscale == nil || installation.Headscale.ID != headscale.ID || !reflect.DeepEqual(installation.Headscale.Certificate, headscale.Certificate) {
+		return persist.Document{}, control.Journal{}, fmt.Errorf("Headscale expiry normal authority changed under lock")
+	}
+	journal, err := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
+	if err != nil {
+		return persist.Document{}, control.Journal{}, err
+	}
+	if !reflect.DeepEqual(journal, expectedJournal) || !headscaleExpiryJournalMatchesNormal(installation, journal) {
+		return persist.Document{}, control.Journal{}, fmt.Errorf("Headscale expiry control journal changed under lock")
+	}
+	return document, journal, nil
+}
+
+func requireHeadscaleExpirySafety(state safety.State, headscale *domain.HeadscaleDomain, intent operations.Reservation) error {
+	active := state.Headscale.ActiveCertificate
+	marker := state.Headscale.CertificateExpiry
+	certificate := headscale.Certificate
+	if state.GlobalClose.Phase != safety.GlobalCloseNone || certificate == nil || active == nil || active.Generation != certificate.Generation || active.Fingerprint != certificate.Fingerprint || active.Binding != certificate.BindingIdentity || marker == nil || marker.Generation != intent.SafetyBinding.ExpiryGeneration || !marker.Deadline.Equal(intent.SafetyBinding.Deadline) || marker.Binding != intent.SafetyBinding.CandidateBundle {
+		return fmt.Errorf("Headscale expiry safety authority changed under lock")
+	}
+	return nil
+}
+
+func requireHeadscaleExpiryBundle(state safety.State, bundle control.ActivationBundle) error {
+	if state.Headscale.ControlEntryDigest == "" || bundle.Entry.Digest != state.Headscale.ControlEntryDigest {
+		return fmt.Errorf("Headscale expiry control graph authority changed under lock")
+	}
+	return nil
+}
+
+func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedService, _ persist.Document, headscale *domain.HeadscaleDomain, journal control.Journal, intent operations.Reservation) (returnErr error) {
 	admitter, err := service.TimerAdmitter()
 	if err != nil {
 		return err
@@ -197,6 +211,38 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 		return err
 	}
 	defer func() { returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure)) }()
+	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	lockedJournal, err := store.Read()
+	if err != nil {
+		return err
+	}
+	expectedJournal := journal
+	expectedJournal.Phase = lockedJournal.Phase
+	if lockedJournal.Phase != control.PhaseCommitted && lockedJournal.Phase != control.PhaseExpired {
+		return fmt.Errorf("Headscale expiry control journal changed under lock")
+	}
+	lockedDocument, lockedJournal, err := readLockedHeadscaleExpiryAuthority(service, headscale, expectedJournal)
+	if err != nil {
+		return err
+	}
+	lockedIntent, err := admitter.OperationIntent(intent.JobID)
+	if err != nil {
+		return fmt.Errorf("Headscale expiry intent changed under lock: %w", err)
+	}
+	if lockedIntent.JobID != intent.JobID || lockedIntent.Operation != operations.CertificateExpiry || lockedIntent.Target != intent.Target || lockedIntent.SafetyBinding.ExpiryGeneration != intent.SafetyBinding.ExpiryGeneration {
+		return fmt.Errorf("Headscale expiry intent changed under lock")
+	}
+	intent = lockedIntent
+	journal = lockedJournal
+	if intent.Phase == operations.PhaseTerminal {
+		if journal.Phase == control.PhaseExpired {
+			return nil
+		}
+		return fmt.Errorf("terminal Headscale expiry left committed control")
+	}
+	if intent.Phase != operations.PhaseReserved && intent.Phase != operations.PhaseLocalIntent {
+		return fmt.Errorf("Headscale expiry intent has unsupported phase %q", intent.Phase)
+	}
 	if intent.Phase == operations.PhaseReserved {
 		inventory := safety.OwnershipInventoryDigest(map[string]string{})
 		request := preflight.ContractionRequest{Kind: preflight.ContractionExpiry, Target: intent.Target, Generation: intent.SafetyBinding.ExpiryGeneration, OwnershipInventoryDigest: inventory, ClosureAuthorityDigest: headscale.Certificate.Fingerprint}
@@ -204,11 +250,7 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 		if evaluateErr != nil {
 			return evaluateErr
 		}
-		fresh, readErr := service.normal.Read()
-		if readErr != nil {
-			return readErr
-		}
-		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: intent.JobID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ContractionRequest: &request, ContractionPreflight: &result})
+		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: intent.JobID, ExpectedRevision: lockedDocument.Revision, IntentGeneration: lockedDocument.Revision + 1, ContractionRequest: &request, ContractionPreflight: &result})
 		if err != nil {
 			return err
 		}
@@ -229,17 +271,31 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 		if _, err := service.safety.Commit(ctx, exposure, safety.RoleCertificateActivation, freshState.Revision, next, safety.TransitionProof{}); err != nil {
 			return err
 		}
+		freshState = next
+	}
+	if err := requireHeadscaleExpirySafety(freshState, headscale, intent); err != nil {
+		return err
 	}
 	bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
 	if err != nil {
 		return err
+	}
+	if err := requireHeadscaleExpiryBundle(freshState, bundle); err != nil {
+		return err
+	}
+	if journal.Phase == control.PhaseExpired {
+		fresh, err := service.normal.Read()
+		if err != nil {
+			return err
+		}
+		_, completeErr := admitter.Complete(context.WithoutCancel(ctx), mutation, exposure, fresh.Revision, intent.JobID, "complete", nil, []jobs.Postcondition{{Kind: "headscale_control_expired_closed", Status: jobs.PostconditionVerified, Identity: bundle.Digest}}, "")
+		return completeErr
 	}
 	host, err := control.NewActivationHost()
 	if err != nil {
 		return err
 	}
 	closureErr := host.CloseControl(ctx, bundle)
-	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	if closureErr == nil {
 		expired := journal
 		expired.Phase = control.PhaseExpired
@@ -266,6 +322,201 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 	}
 	_, completeErr := admitter.Complete(context.WithoutCancel(ctx), mutation, exposure, fresh.Revision, intent.JobID, branch, nil, []jobs.Postcondition{{Kind: "headscale_control_expired_closed", Status: post, Identity: bundle.Digest}}, code)
 	return errors.Join(closureErr, completeErr)
+}
+
+func commitDiscrepantHeadscaleExpiryMarker(ctx context.Context, service *FixedService, headscale *domain.HeadscaleDomain, journal control.Journal, generation uint64, deadline time.Time) (returnErr error) {
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return err
+	}
+	cleanup := &certificateContractionCleanup{mutationSet: mutationSet}
+	defer func() { returnErr = errors.Join(returnErr, cleanup.Close()) }()
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "headscale/"+headscale.ID, service.manager)
+	if err != nil {
+		return err
+	}
+	cleanup.mutation = mutation
+	cleanup.exposure = exposure
+	if _, _, err := readLockedHeadscaleExpiryAuthority(service, headscale, journal); err != nil {
+		return err
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if state.GlobalClose.Phase != safety.GlobalCloseNone {
+		return fmt.Errorf("global close blocks discrepant Headscale expiry marker")
+	}
+	if state.Headscale.CertificateExpiry != nil {
+		if state.Headscale.CertificateExpiry.Generation == generation && state.Headscale.CertificateExpiry.Deadline.Equal(deadline) && state.Headscale.CertificateExpiry.Binding == headscale.Certificate.BindingIdentity {
+			return nil
+		}
+		return fmt.Errorf("discrepant Headscale expiry marker changed")
+	}
+	active := state.Headscale.ActiveCertificate
+	if active == nil || active.Generation != headscale.Certificate.Generation || active.Fingerprint != headscale.Certificate.Fingerprint || active.Binding != headscale.Certificate.BindingIdentity || state.Headscale.GenerationSequence+1 != generation {
+		return fmt.Errorf("discrepant Headscale expiry safety authority changed")
+	}
+	next := state
+	next.Revision++
+	next.Headscale.GenerationSequence = generation
+	next.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: generation, Deadline: deadline, Binding: headscale.Certificate.BindingIdentity}
+	_, err = service.safety.Commit(ctx, exposure, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
+	return err
+}
+
+func requireExpiredHeadscaleClosureLocked(service *FixedService, exposure *locks.Lease, headscale *domain.HeadscaleDomain, journal control.Journal, binding operations.SafetyBinding) (persist.Document, string, error) {
+	document, lockedJournal, err := readLockedHeadscaleExpiryAuthority(service, headscale, journal)
+	if err != nil {
+		return persist.Document{}, "", fmt.Errorf("expired Headscale closure authority changed under lock: %w", err)
+	}
+	if lockedJournal.Phase != control.PhaseExpired {
+		return persist.Document{}, "", fmt.Errorf("expired Headscale closure authority changed under lock")
+	}
+	lockedState, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return persist.Document{}, "", err
+	}
+	if err := requireHeadscaleExpirySafety(lockedState, headscale, operations.Reservation{SafetyBinding: binding}); err != nil {
+		return persist.Document{}, "", err
+	}
+	bundle, err := control.BuildActivation(lockedJournal.InstallationID, lockedJournal.Candidate, *lockedJournal.Certificate)
+	if err != nil {
+		return persist.Document{}, "", err
+	}
+	if err := requireHeadscaleExpiryBundle(lockedState, bundle); err != nil {
+		return persist.Document{}, "", err
+	}
+	return document, bundle.Digest, nil
+}
+
+func validateExpiredHeadscaleClosure(ctx context.Context, service *FixedService, headscale *domain.HeadscaleDomain, journal control.Journal, intent *operations.Reservation, generation uint64, deadline time.Time) (returnErr error) {
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, mutationSet.Close()) }()
+	target := "headscale/" + headscale.ID
+	if intent != nil {
+		target = intent.Target
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, target, service.manager)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure)) }()
+	binding := operations.SafetyBinding{ResourceID: "headscale", ExpiryGeneration: generation, Deadline: deadline, CandidateBundle: headscale.Certificate.BindingIdentity}
+	if intent != nil {
+		binding = intent.SafetyBinding
+	}
+	_, _, err = requireExpiredHeadscaleClosureLocked(service, exposure, headscale, journal, binding)
+	return err
+}
+
+func recordHeadscaleExpiryReconciliation(ctx context.Context, service *FixedService, headscale *domain.HeadscaleDomain, journal control.Journal, generation uint64, deadline time.Time) (returnErr error) {
+	target := "journal/headscale-certificate-expiry-" + strconv.FormatUint(generation, 10)
+	binding := operations.SafetyBinding{ResourceID: "headscale", ExpiryGeneration: generation, Deadline: deadline, CandidateBundle: headscale.Certificate.BindingIdentity}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	var intent operations.Reservation
+	for key, raw := range document.Entries {
+		if !strings.HasPrefix(key, "intents/") {
+			continue
+		}
+		var candidate operations.Reservation
+		if json.Unmarshal(raw, &candidate) == nil && candidate.Operation == operations.AutomaticReconciliation && candidate.Target == target && candidate.Phase != operations.PhaseRejected {
+			if intent.JobID != "" {
+				return fmt.Errorf("multiple Headscale expiry reconciliation intents")
+			}
+			intent = candidate
+		}
+	}
+	if intent.Phase == operations.PhaseTerminal {
+		return validateExpiredHeadscaleClosure(ctx, service, headscale, journal, nil, generation, deadline)
+	}
+	if intent.JobID == "" {
+		admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
+		if err != nil {
+			return err
+		}
+		job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.AutomaticReconciliation, Target: target, ActorIdentity: "recovery/headscale-certificate-expiry", Source: operations.AdmissionTimer, SafetyBinding: binding, ExpectedRevision: document.Revision})
+		releaseErr := admission.Release()
+		if admitErr != nil || releaseErr != nil {
+			return errors.Join(admitErr, releaseErr)
+		}
+		intent, err = admitter.OperationIntent(job.ID)
+		if err != nil {
+			return err
+		}
+	}
+	planlessStarted := intent.Phase != operations.PhaseReserved
+	defer func() {
+		if !planlessStarted {
+			returnErr = errors.Join(returnErr, rejectReservedCertificateExpiry(ctx, service, admitter, intent.JobID, "certificate_setup_failed"))
+		}
+	}()
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, mutationSet.Close()) }()
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, target, service.manager)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure)) }()
+	lockedDocument, closureDigest, err := requireExpiredHeadscaleClosureLocked(service, exposure, headscale, journal, binding)
+	if err != nil {
+		return err
+	}
+	intent, err = admitter.OperationIntent(intent.JobID)
+	if err != nil {
+		return fmt.Errorf("Headscale expiry reconciliation intent changed: %w", err)
+	}
+	if intent.Operation != operations.AutomaticReconciliation || intent.Target != target {
+		return fmt.Errorf("Headscale expiry reconciliation intent changed")
+	}
+	if intent.Phase == operations.PhaseReserved {
+		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: intent.JobID, ExpectedRevision: lockedDocument.Revision, IntentGeneration: lockedDocument.Revision + 1})
+		if err != nil {
+			return err
+		}
+		planlessStarted = true
+	} else if intent.Phase != operations.PhaseLocalIntent {
+		return fmt.Errorf("Headscale expiry reconciliation phase changed")
+	}
+	fresh, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	_, err = admitter.Complete(ctx, mutation, exposure, fresh.Revision, intent.JobID, "complete", nil, []jobs.Postcondition{{Kind: "headscale_control_expired_closed", Status: jobs.PostconditionVerified, Identity: closureDigest}}, "")
+	return err
+}
+
+func findHeadscaleExpiryIntent(document persist.Document, target string, generation uint64) (operations.Reservation, bool, error) {
+	var result operations.Reservation
+	for key, raw := range document.Entries {
+		if !strings.HasPrefix(key, "intents/") {
+			continue
+		}
+		var intent operations.Reservation
+		if err := json.Unmarshal(raw, &intent); err != nil {
+			return operations.Reservation{}, false, err
+		}
+		if intent.Operation == operations.CertificateExpiry && intent.Target == target && intent.SafetyBinding.ExpiryGeneration == generation {
+			if result.JobID != "" {
+				return operations.Reservation{}, false, fmt.Errorf("multiple Headscale expiry intents")
+			}
+			result = intent
+		}
+	}
+	return result, result.JobID != "", nil
 }
 
 func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (returnErr error) {
@@ -295,6 +546,9 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 	if err != nil {
 		return err
 	}
+	if state.GlobalClose.Phase != safety.GlobalCloseNone {
+		return nil
+	}
 	active := state.Headscale.ActiveCertificate
 	if active == nil || active.Fingerprint != headscale.Certificate.Fingerprint || active.Binding != headscale.Certificate.BindingIdentity {
 		return fmt.Errorf("headscale expiry active authority changed")
@@ -303,35 +557,58 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 	if now.Before(active.LastTrustedWall) || active.LastTrustedWall.Before(wall) || !active.NotAfter.Equal(deadline) {
 		effective = now
 	}
-	if effective.After(now) {
-		return nil
-	}
 	generation := state.Headscale.GenerationSequence + 1
+	markerNeeded := state.Headscale.CertificateExpiry == nil
 	if state.Headscale.CertificateExpiry != nil {
 		generation = state.Headscale.CertificateExpiry.Generation
 		effective = state.Headscale.CertificateExpiry.Deadline
 	}
+	existingExpiryIntent, foundExpiryIntent, err := findHeadscaleExpiryIntent(document, "headscale/"+headscale.ID, generation)
+	if err != nil {
+		return err
+	}
+	if foundExpiryIntent && markerNeeded {
+		effective = existingExpiryIntent.SafetyBinding.Deadline
+	}
+	if markerNeeded && effective.After(now) && !foundExpiryIntent {
+		return nil
+	}
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	journal, err := store.Read()
-	if err != nil || journal.Certificate == nil {
+	if err != nil {
 		return fmt.Errorf("headscale expiry lifecycle journal changed: %w", err)
 	}
+	if journal.Certificate == nil || !headscaleExpiryJournalMatchesNormal(installation, journal) {
+		return fmt.Errorf("headscale expiry lifecycle journal changed")
+	}
+	if markerNeeded && !foundExpiryIntent && !effective.Equal(active.NotAfter) {
+		if err := commitDiscrepantHeadscaleExpiryMarker(ctx, service, headscale, journal, generation, effective); err != nil {
+			return err
+		}
+	}
 	if journal.Phase == control.PhaseCommitted {
-		var running operations.Reservation
+		var existing operations.Reservation
 		for key, raw := range document.Entries {
 			if !strings.HasPrefix(key, "intents/") {
 				continue
 			}
 			var candidate operations.Reservation
-			if json.Unmarshal(raw, &candidate) == nil && candidate.Operation == operations.CertificateExpiry && candidate.Target == "headscale/"+headscale.ID && candidate.SafetyBinding.ExpiryGeneration == generation && candidate.Phase != operations.PhaseTerminal && candidate.Phase != operations.PhaseRejected {
-				if running.JobID != "" {
+			if json.Unmarshal(raw, &candidate) == nil && candidate.Operation == operations.CertificateExpiry && candidate.Target == "headscale/"+headscale.ID && candidate.SafetyBinding.ExpiryGeneration == generation {
+				if existing.JobID != "" {
 					return fmt.Errorf("multiple Headscale expiry intents")
 				}
-				running = candidate
+				existing = candidate
 			}
 		}
-		if running.JobID != "" {
-			return resumeExpiredHeadscaleCertificate(ctx, service, document, headscale, journal, running)
+		if existing.JobID != "" {
+			switch existing.Phase {
+			case operations.PhaseReserved, operations.PhaseLocalIntent:
+				return resumeExpiredHeadscaleCertificate(ctx, service, document, headscale, journal, existing)
+			case operations.PhaseTerminal, operations.PhaseRejected:
+				return fmt.Errorf("terminal Headscale expiry with committed control requires independent contraction")
+			default:
+				return fmt.Errorf("Headscale expiry intent has unsupported phase %q", existing.Phase)
+			}
 		}
 	}
 	if journal.Phase == control.PhaseExpired {
@@ -348,37 +625,18 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 				existing = candidate
 			}
 		}
-		if existing.JobID == "" {
-			return recordObservedHeadscaleExpiry(ctx, service, document, headscale, generation, effective, journal)
-		}
 		if existing.Phase == operations.PhaseTerminal {
-			return nil
+			return validateExpiredHeadscaleClosure(ctx, service, headscale, journal, &existing, generation, effective)
 		}
-		admitter, err := service.TimerAdmitter()
-		if err != nil {
-			return err
+		if existing.JobID == "" || existing.Phase == operations.PhaseRejected {
+			return recordHeadscaleExpiryReconciliation(ctx, service, headscale, journal, generation, effective)
 		}
-		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
-		if err != nil {
-			return err
+		if existing.Phase != operations.PhaseReserved && existing.Phase != operations.PhaseLocalIntent {
+			return fmt.Errorf("expired Headscale intent has unsupported phase %q", existing.Phase)
 		}
-		defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
-		mutation, exposure, err := mutationSet.AcquireExposure(ctx, existing.Target, service.manager)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
-		fresh, err := service.normal.Read()
-		if err != nil {
-			return err
-		}
-		bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
-		if err != nil {
-			return err
-		}
-		_, err = admitter.Complete(ctx, mutation, exposure, fresh.Revision, existing.JobID, "complete", nil, []jobs.Postcondition{{Kind: "headscale_control_expired_closed", Status: jobs.PostconditionVerified, Identity: bundle.Digest}}, "")
-		return err
+		return resumeExpiredHeadscaleCertificate(ctx, service, document, headscale, journal, existing)
 	}
+
 	if journal.Phase != control.PhaseCommitted {
 		return fmt.Errorf("headscale expiry lifecycle phase changed")
 	}
@@ -397,10 +655,14 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 			}
 		}
 		if existing.JobID != "" {
-			if existing.Phase == operations.PhaseTerminal {
-				return nil
+			switch existing.Phase {
+			case operations.PhaseReserved, operations.PhaseLocalIntent:
+				return resumeExpiredHeadscaleCertificate(ctx, service, document, headscale, journal, existing)
+			case operations.PhaseTerminal, operations.PhaseRejected:
+				return fmt.Errorf("terminal Headscale expiry with committed control requires independent contraction")
+			default:
+				return fmt.Errorf("Headscale expiry intent has unsupported phase %q", existing.Phase)
 			}
-			return resumeExpiredHeadscaleCertificate(ctx, service, document, headscale, journal, existing)
 		}
 	}
 	admitter, err := service.TimerAdmitter()
@@ -426,6 +688,11 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 		return err
 	}
 	defer func() { returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure)) }()
+	lockedDocument, lockedJournal, err := readLockedHeadscaleExpiryAuthority(service, headscale, journal)
+	if err != nil {
+		return err
+	}
+	journal = lockedJournal
 	inventoryDigest := safety.OwnershipInventoryDigest(map[string]string{})
 	closureDigest := headscale.Certificate.Fingerprint
 	request := preflight.ContractionRequest{Kind: preflight.ContractionExpiry, Target: "headscale/" + headscale.ID, Generation: generation, OwnershipInventoryDigest: inventoryDigest, ClosureAuthorityDigest: closureDigest}
@@ -433,11 +700,7 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 	if err != nil {
 		return err
 	}
-	freshDocument, err := service.normal.Read()
-	if err != nil {
-		return err
-	}
-	intent, err := admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: freshDocument.Revision, IntentGeneration: freshDocument.Revision + 1, ContractionRequest: &request, ContractionPreflight: &result})
+	intent, err := admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: lockedDocument.Revision, IntentGeneration: lockedDocument.Revision + 1, ContractionRequest: &request, ContractionPreflight: &result})
 	if err != nil {
 		return err
 	}
@@ -456,9 +719,16 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 		if _, err := service.safety.Commit(ctx, exposure, safety.RoleCertificateActivation, freshState.Revision, next, safety.TransitionProof{}); err != nil {
 			return err
 		}
+		freshState = next
+	}
+	if err := requireHeadscaleExpirySafety(freshState, headscale, intent); err != nil {
+		return err
 	}
 	bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
 	if err != nil {
+		return err
+	}
+	if err := requireHeadscaleExpiryBundle(freshState, bundle); err != nil {
 		return err
 	}
 	host, err := control.NewActivationHost()

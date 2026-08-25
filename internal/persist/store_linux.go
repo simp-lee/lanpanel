@@ -33,12 +33,13 @@ const (
 
 var (
 	canonicalNamespaceOwners = map[string]string{
-		"installations": "persist.installations.v1",
-		"plans":         "plans.v1",
-		"jobs":          "jobs.v1",
-		"intents":       "operations.intents.v1",
-		"children":      "operations.children.v1",
-		"journals":      "operations.journals.v1",
+		"installations":      "persist.installations.v1",
+		"plans":              "plans.v1",
+		"jobs":               "jobs.v1",
+		"intents":            "operations.intents.v1",
+		"expiry_generations": "operations.expiry.generations.v1",
+		"children":           "operations.children.v1",
+		"journals":           "operations.journals.v1",
 	}
 	ErrMissing          = errors.New("normal state is missing")
 	ErrRevision         = errors.New("normal state revision mismatch")

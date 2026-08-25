@@ -34,6 +34,36 @@ func (authority *NormalAuthority) PersistClosing(ctx context.Context, inventory 
 		return fmt.Errorf("normal contraction authority is incomplete")
 	}
 	authority.InventoryDigest = inventory.Digest
+	if !authority.Global && len(authority.Generations) != 0 {
+		persisted := 0
+		for _, resource := range authority.SafetyState.Resources {
+			generation, selected := authority.Generations[resource.ResourceID]
+			if !selected {
+				continue
+			}
+			if resource.Closing != nil {
+				if resource.Closing.Generation != generation {
+					return fmt.Errorf("persisted closing generation changed")
+				}
+				persisted++
+				continue
+			}
+			if resource.StickyUnpublished != nil {
+				if resource.StickyUnpublished.Generation > generation {
+					return fmt.Errorf("persisted closed generation changed")
+				}
+				if resource.StickyUnpublished.Generation == generation {
+					persisted++
+				}
+			}
+		}
+		if persisted == len(authority.Generations) {
+			return nil
+		}
+		if persisted != 0 {
+			return fmt.Errorf("persisted contraction generation inventory is incomplete")
+		}
+	}
 	next := authority.SafetyState
 	next.Revision++
 	next.Resources = append([]safety.ResourceSafety(nil), authority.SafetyState.Resources...)
@@ -96,11 +126,58 @@ func (authority *NormalAuthority) CommitUnpublished(ctx context.Context, invento
 	if authority.InventoryDigest != inventory.Digest {
 		return fmt.Errorf("normal contraction inventory changed")
 	}
+	intent, err := authority.Admitter.OperationIntent(authority.JobID)
+	if err != nil {
+		return err
+	}
+	if intent.ContractionDigest != "" {
+		if intent.ContractionDigest != inventory.Digest {
+			return fmt.Errorf("persisted normal contraction inventory changed")
+		}
+		return nil
+	}
 	if err := authority.Admitter.CommitContractionState(ctx, authority.Mutation, authority.Exposure, authority.Revision, authority.JobID, operations.ContractionCommit{ClosureAuthorityDigest: inventory.Digest, UnpublishedGenerations: authority.Generations}); err != nil {
 		return err
 	}
 	authority.Revision++
 	return nil
+}
+
+func appContractionMarkerGenerations(resource safety.ResourceSafety) []safety.MarkerGeneration {
+	result := []safety.MarkerGeneration{}
+	if resource.StickyUnpublished != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "sticky_unpublished", Generation: resource.StickyUnpublished.Generation})
+	}
+	if resource.Closing != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "closing", Generation: resource.Closing.Generation})
+	}
+	if resource.Contraction != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "contraction", Generation: resource.Contraction.Generation})
+	}
+	if resource.CertificateExpiry != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: resource.CertificateExpiry.Generation})
+	}
+	if resource.ChallengePending != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "challenge_pending", Generation: resource.ChallengePending.Generation})
+	}
+	if resource.Reactivating != nil {
+		result = append(result, safety.MarkerGeneration{Kind: "reactivating", Generation: resource.Reactivating.Generation})
+	}
+	return result
+}
+
+func appContractionFenceBindings(resource safety.ResourceSafety, closingGeneration uint64) ([]safety.MarkerGeneration, []safety.MarkerGeneration, uint64, error) {
+	if resource.Closing == nil || resource.Closing.Generation != closingGeneration {
+		return nil, nil, 0, fmt.Errorf("app stop fence closing authority is unavailable")
+	}
+	safetyGenerations := appContractionMarkerGenerations(resource)
+	authorities := []safety.MarkerGeneration{{Kind: "closing", Generation: closingGeneration}}
+	certificateGeneration := uint64(0)
+	if resource.CertificateExpiry != nil {
+		certificateGeneration = resource.CertificateExpiry.Generation
+		authorities = append(authorities, safety.MarkerGeneration{Kind: "certificate_expiry", Generation: certificateGeneration})
+	}
+	return safetyGenerations, authorities, certificateGeneration, nil
 }
 
 func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventory closure.Inventory) error {
@@ -111,30 +188,47 @@ func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventor
 	if err != nil || emergency.StopFence != nil {
 		return fmt.Errorf("emergency stop-fence high-water is unavailable: %w", err)
 	}
-	globalGeneration, closingGeneration := uint64(0), uint64(0)
+	globalGeneration, closingGeneration, certificateGeneration := uint64(0), uint64(0), uint64(0)
 	scopeKind, resourceID := "installation", ""
 	authorities := []safety.MarkerGeneration{}
+	safetyGenerations := []safety.MarkerGeneration{}
 	if emergency.GlobalClose.Phase != safety.GlobalCloseNone {
 		globalGeneration = emergency.GlobalClose.Generation
 		authorities = append(authorities, safety.MarkerGeneration{Kind: "global_close", Generation: globalGeneration})
+		safetyGenerations = append(safetyGenerations, authorities...)
 	} else if len(authority.Generations) == 1 {
 		scopeKind = "app"
 		for id, generation := range authority.Generations {
 			resourceID, closingGeneration = id, generation
 		}
-		authorities = append(authorities, safety.MarkerGeneration{Kind: "closing", Generation: closingGeneration})
 	} else {
 		return fmt.Errorf("stop fence lacks global or exact App contraction authority")
 	}
 	observed := time.Now().UTC()
 	ownershipDigest := inventory.FullOwnershipDigest
 	if scopeKind == "app" {
+		var resourceAuthority *safety.ResourceSafety
+		for index := range authority.SafetyState.Resources {
+			resource := &authority.SafetyState.Resources[index]
+			if resource.ResourceID == resourceID && resource.Closing != nil && resource.Closing.Generation == closingGeneration {
+				resourceAuthority = resource
+				break
+			}
+		}
+		if resourceAuthority == nil {
+			return fmt.Errorf("app stop fence closing authority is unavailable")
+		}
+		var bindingErr error
+		safetyGenerations, authorities, certificateGeneration, bindingErr = appContractionFenceBindings(*resourceAuthority, closingGeneration)
+		if bindingErr != nil {
+			return bindingErr
+		}
 		ownershipDigest = inventory.ResourceOwnership[resourceID]
 		if ownershipDigest == "" {
 			return fmt.Errorf("app stop fence ownership digest is unavailable")
 		}
 	}
-	emergencyFence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), ScopeKind: scopeKind, ResourceID: resourceID, Generation: emergency.StopFenceSequence + 1, GlobalGeneration: globalGeneration, ClosingGeneration: closingGeneration, OwnershipDigest: ownershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: observed.Unix(), OperationRef: func() string {
+	emergencyFence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), ScopeKind: scopeKind, ResourceID: resourceID, Generation: emergency.StopFenceSequence + 1, GlobalGeneration: globalGeneration, ClosingGeneration: closingGeneration, CertificateGeneration: certificateGeneration, OwnershipDigest: ownershipDigest, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, ObservedUnix: observed.Unix(), OperationRef: func() string {
 		if authority.PlanID != "" {
 			return authority.PlanID
 		}
@@ -148,7 +242,7 @@ func (authority *NormalAuthority) PersistStopFence(ctx context.Context, inventor
 	if err := authority.Emergency.Commit(authority.Exposure, safety.RoleContraction, emergency.Sequence, emergencyNext); err != nil {
 		return err
 	}
-	normalFence := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), Scope: safety.FenceScope{Kind: scopeKind, ResourceID: resourceID}, FenceGeneration: emergencyNext.StopFenceSequence, CreatedAt: observed, SafetyGenerations: append([]safety.MarkerGeneration(nil), authorities...), OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, Observation: safety.StopObservation{ObservedAt: observed}, AccessMayRemain: true, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: ownershipDigest, OperationRef: emergencyFence.OperationRef}}
+	normalFence := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: string(authority.Operation), Scope: safety.FenceScope{Kind: scopeKind, ResourceID: resourceID}, FenceGeneration: emergencyNext.StopFenceSequence, CreatedAt: observed, SafetyGenerations: append([]safety.MarkerGeneration(nil), safetyGenerations...), OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, Observation: safety.StopObservation{ObservedAt: observed}, AccessMayRemain: true, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: ownershipDigest, OperationRef: emergencyFence.OperationRef}}
 	next := authority.SafetyState
 	next.Revision++
 	next.AuthoritySequence = emergencyNext.Sequence
@@ -203,8 +297,24 @@ func (authority *NormalAuthority) FinalizeClosure(ctx context.Context, inventory
 	if authority.SafetyState.StopFence != nil {
 		return nil
 	}
+	persisted := 0
+	for _, resource := range authority.SafetyState.Resources {
+		generation, selected := authority.Generations[resource.ResourceID]
+		if !selected || resource.Closing != nil || resource.StickyUnpublished == nil {
+			continue
+		}
+		if resource.StickyUnpublished.Generation != generation {
+			return fmt.Errorf("persisted closure generation changed")
+		}
+		persisted++
+	}
+	if !authority.Global && persisted == len(authority.Generations) && persisted != 0 {
+		return nil
+	}
+	if !authority.Global && persisted != 0 {
+		return fmt.Errorf("persisted closure generation inventory is incomplete")
+	}
 	next := authority.SafetyState
-	next.Revision++
 	next.Resources = append([]safety.ResourceSafety(nil), authority.SafetyState.Resources...)
 	proofs := map[string]safety.ClosingConvergenceProof{}
 	for index := range next.Resources {
@@ -213,17 +323,26 @@ func (authority *NormalAuthority) FinalizeClosure(ctx context.Context, inventory
 		if !ok {
 			continue
 		}
-		if resource.Closing == nil || resource.Closing.Generation != generation {
+		if resource.Closing == nil {
+			if resource.StickyUnpublished == nil || resource.StickyUnpublished.Generation != generation {
+				return fmt.Errorf("closing safety identity changed before finalization")
+			}
+			continue
+		}
+		if resource.Closing.Generation != generation {
 			return fmt.Errorf("closing safety identity changed before finalization")
 		}
 		resource.Closing = nil
 		resource.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: "closed"}
 		proofs[resource.ResourceID] = safety.ClosingConvergenceProof{ResourceID: resource.ResourceID, ClosingGeneration: generation, UnpublishedGeneration: generation, OwnershipDigest: resource.OwnershipDigest, RuntimeClosureDigest: closureDigest}
 	}
-	if _, err := authority.Safety.Commit(ctx, authority.Exposure, safety.RoleContraction, authority.SafetyState.Revision, next, safety.TransitionProof{Closings: proofs}); err != nil {
-		return err
+	if len(proofs) != 0 {
+		next.Revision++
+		if _, err := authority.Safety.Commit(ctx, authority.Exposure, safety.RoleContraction, authority.SafetyState.Revision, next, safety.TransitionProof{Closings: proofs}); err != nil {
+			return err
+		}
+		authority.SafetyState = next
 	}
-	authority.SafetyState = next
 	if !authority.Global {
 		return nil
 	}

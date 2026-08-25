@@ -25,6 +25,7 @@ import (
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/resource"
+	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
 	"os"
 	"os/signal"
@@ -1606,7 +1607,7 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		_ = service.Close()
 		return independent(decisionErr)
 	}
-	if state.Headscale.CertificateExpiry != nil {
+	if state.GlobalClose.Phase == safety.GlobalCloseNone && state.Headscale.CertificateExpiry != nil {
 		headscaleDecision = renewal.DecisionContract
 	}
 	decisions := map[string]renewal.Decision{}

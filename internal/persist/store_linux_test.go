@@ -182,7 +182,7 @@ func TestVersionedNormalTransaction(t *testing.T) {
 		}
 		defer func(ignore func() error) { _ = ignore() }(store.Close)
 		validator := func(string, json.RawMessage) error { return nil }
-		for namespace, owner := range map[string]string{"plans": "plans.v1", "jobs": "jobs.v1", "intents": "operations.intents.v1", "children": "operations.children.v1", "journals": "operations.journals.v1"} {
+		for namespace, owner := range map[string]string{"plans": "plans.v1", "jobs": "jobs.v1", "intents": "operations.intents.v1", "expiry_generations": "operations.expiry.generations.v1", "children": "operations.children.v1", "journals": "operations.journals.v1"} {
 			if err := store.RegisterCanonicalNamespace(namespace, owner, validator, nil); err != nil {
 				t.Fatal(err)
 			}

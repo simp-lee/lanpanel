@@ -550,6 +550,7 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 	for _, resource := range next.Resources {
 		afterResources[resource.ResourceID] = resource
 	}
+	stopFenceConvergence := current.StopFence != nil && next.StopFence == nil
 	for id, after := range afterResources {
 		before, present := beforeResources[id]
 		if !present {
@@ -558,7 +559,7 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			}
 			continue
 		}
-		if err := validateResourceTransition(role, before, after, proof); err != nil {
+		if err := validateResourceTransition(role, before, after, proof, stopFenceConvergence); err != nil {
 			return fmt.Errorf("resource %s: %w", id, err)
 		}
 	}
@@ -706,7 +707,7 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 	return nil
 }
 
-func validateResourceTransition(role ClearRole, before, after ResourceSafety, proof TransitionProof) error {
+func validateResourceTransition(role ClearRole, before, after ResourceSafety, proof TransitionProof, stopFenceConvergence bool) error {
 	if role == RoleCertificateHandoff {
 		pending, active := before.ChallengePending, after.Reactivating
 		if pending == nil || before.Reactivating != nil || after.ChallengePending != nil || active == nil || active.PlanID != pending.PlanID || active.Generation != pending.Generation || active.PriorGeneration+1 != pending.Generation || active.CandidateDigest != pending.ConfigDigest || !reflect.DeepEqual(active.BaseMarkers, pending.BaseMarkers) || !isDigest(active.CandidateBundle) {
@@ -739,10 +740,15 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 			return fmt.Errorf("ownership authority transition lacks exact contraction or activation proof")
 		}
 	}
-	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction); err != nil {
+	additionalMarkerOwners := []ClearRole{}
+	journalConvergence := role == RoleJournalConvergence && stopFenceConvergence && proof.StopFence != nil
+	if journalConvergence {
+		additionalMarkerOwners = append(additionalMarkerOwners, RoleJournalConvergence)
+	}
+	if err := markerTransition(role, before.StickyUnpublished, after.StickyUnpublished, RoleContraction, ClearBaseContraction, additionalMarkerOwners...); err != nil {
 		return err
 	}
-	if err := markerTransition(role, before.Closing, after.Closing, RoleContraction, ClearClosing); err != nil {
+	if err := markerTransition(role, before.Closing, after.Closing, RoleContraction, ClearClosing, additionalMarkerOwners...); err != nil {
 		return err
 	}
 	if before.Closing != nil && after.Closing == nil {
@@ -778,11 +784,15 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleCertificateActivation, ClearBaseContraction); err != nil {
 		return err
 	}
-	if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
-		return err
+	if !(journalConvergence && before.ChallengePending != nil && after.ChallengePending == nil) {
+		if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
+			return err
+		}
 	}
-	if err := reactivationTransition(role, before.GenerationSequence, before.Reactivating, after.Reactivating); err != nil {
-		return err
+	if !(journalConvergence && before.Reactivating != nil && after.Reactivating == nil) {
+		if err := reactivationTransition(role, before.GenerationSequence, before.Reactivating, after.Reactivating); err != nil {
+			return err
+		}
 	}
 	if before.Reactivating != nil && after.Reactivating == nil && role == RolePublish && !validReactivationProof(before, after, proof.Reactivation) {
 		return fmt.Errorf("reactivation clear lacks exact convergence proof")
@@ -827,6 +837,11 @@ func markerTransition(role ClearRole, before, after *GenerationMarker, owner Cle
 		return nil
 	}
 	if after == nil {
+		for _, additional := range additionalOwners {
+			if role == additional {
+				return nil
+			}
+		}
 		return AuthorizeClear(role, clear, "")
 	}
 	if role != owner {

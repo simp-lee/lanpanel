@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
+	"lanpanel/internal/plans"
 	"time"
 )
 
@@ -294,7 +295,7 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 		if err != nil {
 			return false, err
 		}
-		if (intent.Operation == Unpublish || intent.Operation == CloseAll || intent.Operation == Publish) && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+		if (intent.Operation == Unpublish || intent.Operation == CloseAll || intent.Operation == Publish || intent.Operation == CertificateExpiry) && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
 			pending[intent.JobID] = intent
 		}
 	}
@@ -302,11 +303,44 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 		return false, nil
 	}
 	_, _, err := normal.Update(ctx, exposure, document.Revision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-len(pending)); err != nil {
+			return err
+		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
 		}
 		for jobID, intent := range pending {
+			if intent.Phase == PhaseReserved {
+				record, err := jobs.Load(transaction, jobID)
+				if err != nil {
+					return fmt.Errorf("reserved interrupted contraction job changed: %w", err)
+				}
+				if record.Status != jobs.StatusReserved {
+					return fmt.Errorf("reserved interrupted contraction job changed")
+				}
+				record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultFailed, Postconditions: []jobs.Postcondition{{Kind: "mutation_not_started", Status: jobs.PostconditionVerified, Identity: jobID}}, ErrorCode: "contraction_authority_failed"}, now)
+				if err != nil {
+					return err
+				}
+				if err := jobs.Replace(transaction, record); err != nil {
+					return err
+				}
+				if intent.AdmissionSource == AdmissionPlan {
+					if _, err := plans.Reject(transaction, intent.PlanID, jobID, now); err != nil {
+						return err
+					}
+				}
+				intent.Phase = PhaseRejected
+				raw, err := persist.EncodeEntry(intent)
+				if err != nil {
+					return err
+				}
+				if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+					return err
+				}
+				continue
+			}
 			retirements := map[int][]domain.GoAccessRetirementIdentity{}
 			for index := range installation.Resources {
 				resource := &installation.Resources[index]

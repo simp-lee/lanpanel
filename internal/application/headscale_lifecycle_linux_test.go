@@ -6,6 +6,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"lanpanel/internal/certificates"
+	"lanpanel/internal/control"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/safety"
@@ -19,6 +22,33 @@ type emptySafetyOwnership struct{}
 
 func (emptySafetyOwnership) InventoryAuthority() (map[string]string, bool, error) {
 	return map[string]string{}, true, nil
+}
+
+func headscaleExpiryTestAuthority(t *testing.T) (domain.Installation, control.Journal) {
+	t.Helper()
+	now := time.Unix(1_700_000_000, 123_456_789).UTC()
+	identity := &certificates.Identity{ID: "cert_00000000000000000000000000000001", Generation: 2, Fingerprint: applicationTestDigest("certificate"), BindingIdentity: applicationTestDigest("binding"), SANIdentity: applicationTestDigest("san"), ChainIdentity: applicationTestDigest("chain"), IssuerIdentity: applicationTestDigest("issuer"), NotAfter: now.Add(time.Hour), LastTrustedWall: now}
+	artifact := domain.HeadscaleArtifactIdentity{ExecutableDigest: applicationTestDigest("executable"), ConfigContract: control.ConfigContract}
+	candidate := control.Candidate{SchemaVersion: control.CandidateSchema, HeadscaleID: "headscale_00000000000000000000000000000001", DatabaseUUID: "database-uuid", DatabaseGeneration: 1, Generation: 2, ControlDomain: "control.example.test", MagicDNSNamespace: "example.test", Artifact: artifact, ConfigDigest: applicationTestDigest("config"), PolicyDigest: applicationTestDigest("policy"), UnitDigest: applicationTestDigest("unit"), ServiceIdentity: applicationTestDigest("service"), ControlIdentity: applicationTestDigest("control"), CertificateID: identity.ID, CertificateBinding: applicationTestDigest("initial-binding"), Paths: control.FixedPaths(), ControlBackend: control.ControlBackend, AdminBackend: control.AdminBackend, MetricsBackend: control.MetricsBackend, STUNBackend: control.STUNBackend}
+	applied, err := control.AppliedIdentity(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headscale := &domain.HeadscaleDomain{ID: candidate.HeadscaleID, ControlDomain: candidate.ControlDomain, MagicDNSNamespace: candidate.MagicDNSNamespace, Artifact: artifact, Database: domain.HeadscaleDatabaseIdentity{UUID: candidate.DatabaseUUID, Generation: candidate.DatabaseGeneration}, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity, SANIdentity: identity.SANIdentity, ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), Authority: &domain.CertificateAuthorityIdentity{CertificateID: identity.ID}}}
+	installation := domain.Installation{InstallationID: "installation-current", Headscale: headscale}
+	journal := control.Journal{InstallationID: installation.InstallationID, Candidate: candidate, Certificate: identity}
+	return installation, journal
+}
+
+func TestHeadscaleExpiryJournalMatchesCommittedNormalCertificate(t *testing.T) {
+	installation, journal := headscaleExpiryTestAuthority(t)
+	if !headscaleExpiryJournalMatchesNormal(installation, journal) {
+		t.Fatal("exact Headscale control and normal certificate authority did not match")
+	}
+	journal.Candidate.ControlIdentity = applicationTestDigest("other")
+	if headscaleExpiryJournalMatchesNormal(installation, journal) {
+		t.Fatal("mismatched Headscale applied control identity matched normal certificate")
+	}
 }
 
 func TestHeadscaleCertificateContractionFenceCommitsEmergencyAuthorityFirst(t *testing.T) {

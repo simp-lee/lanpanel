@@ -65,7 +65,7 @@ func EvaluateHeadscale(now time.Time, renewBefore time.Duration, headscale *doma
 	if headscale == nil || !headscale.Enabled || headscale.Applied == nil || headscale.Certificate == nil {
 		return DecisionIdle, nil
 	}
-	if state.StopFence != nil {
+	if state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone {
 		return DecisionIdle, nil
 	}
 	certificate := headscale.Certificate

@@ -145,6 +145,15 @@ type HeadscaleDeployBinding struct {
 	PreflightResult  preflight.Result           `json:"preflight_result"`
 }
 
+type ExpiryGenerationRecord struct {
+	SchemaVersion    string    `json:"schema_version"`
+	ResourceID       string    `json:"resource_id"`
+	Target           string    `json:"target"`
+	ExpiryGeneration uint64    `json:"expiry_generation"`
+	JobID            string    `json:"job_id"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 type Reservation struct {
 	SchemaVersion       string                          `json:"schema_version"`
 	JobID               string                          `json:"job_id"`
@@ -406,6 +415,11 @@ func Register(normal *persist.Store) error {
 			return err
 		}
 	}
+	if !normal.NamespaceRegistered("expiry_generations") {
+		if err := normal.RegisterCanonicalNamespace("expiry_generations", "operations.expiry.generations.v1", validateExpiryGenerationEntry, validateExpiryGenerationTransition); err != nil {
+			return err
+		}
+	}
 	if !normal.NamespaceRegistered("children") {
 		if err := normal.RegisterCanonicalNamespace("children", "operations.children.v1", validateChildEntry, validateChildTransition); err != nil {
 			return err
@@ -505,6 +519,13 @@ func latestDocumentTime(document persist.Document) (time.Time, error) {
 			take(intent.Consumption.ConfirmedAt)
 		}
 	}
+	for _, key := range persist.EntryKeys(document, "expiry_generations") {
+		highWater, err := decodeExpiryGenerationRecord(document.Entries[key])
+		if err != nil {
+			return time.Time{}, err
+		}
+		take(highWater.CreatedAt)
+	}
 	return latest, nil
 }
 
@@ -567,6 +588,43 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 		if active >= maximumActiveOperationGraphs {
 			return fmt.Errorf("active operation graph limit %d is reached", maximumActiveOperationGraphs)
 		}
+		if !isContraction(request.Operation) && request.SafetyBinding.ResourceID != "" && request.SafetyBinding.ResourceID != "headscale" {
+			if raw, present := transaction.Get(expiryGenerationKey(request.SafetyBinding.ResourceID)); present {
+				highWater, err := decodeExpiryGenerationRecord(raw)
+				if err != nil {
+					return err
+				}
+				for _, resource := range state.Resources {
+					if resource.ResourceID == request.SafetyBinding.ResourceID && resource.CertificateExpiry == nil && highWater.ExpiryGeneration == resource.GenerationSequence+1 {
+						return fmt.Errorf("target has a recorded certificate expiry contraction")
+					}
+				}
+			}
+		}
+		if request.Operation == CertificateExpiry && request.SafetyBinding.ResourceID != "headscale" {
+			if raw, present := transaction.Get(expiryGenerationKey(request.SafetyBinding.ResourceID)); present {
+				highWater, err := decodeExpiryGenerationRecord(raw)
+				if err != nil {
+					return err
+				}
+				if request.SafetyBinding.ExpiryGeneration <= highWater.ExpiryGeneration {
+					return fmt.Errorf("certificate expiry generation already has an operation graph")
+				}
+			}
+			for _, key := range transaction.Keys("intents") {
+				raw, _ := transaction.Get(key)
+				existing, err := decodeReservation(raw)
+				if err != nil {
+					return err
+				}
+				if existing.Operation == CertificateExpiry && existing.SafetyBinding.ResourceID == request.SafetyBinding.ResourceID && existing.SafetyBinding.ExpiryGeneration == request.SafetyBinding.ExpiryGeneration {
+					return fmt.Errorf("certificate expiry generation already has an operation graph")
+				}
+				if existing.Operation == ResourceDelete && existing.SafetyBinding.ResourceID == request.SafetyBinding.ResourceID && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+					return fmt.Errorf("certificate expiry is blocked by nonterminal resource deletion")
+				}
+			}
+		}
 		if !isContraction(request.Operation) {
 			for _, key := range transaction.Keys("intents") {
 				raw, _ := transaction.Get(key)
@@ -574,9 +632,31 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 				if err != nil {
 					return err
 				}
-				if (existing.Target == request.Target || existing.SafetyBinding.ResourceID != "" && existing.SafetyBinding.ResourceID == request.SafetyBinding.ResourceID) && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+				sameResource := existing.Target == request.Target || existing.SafetyBinding.ResourceID != "" && existing.SafetyBinding.ResourceID == request.SafetyBinding.ResourceID
+				if sameResource && existing.Operation == CertificateExpiry && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+					return fmt.Errorf("target has a nonterminal certificate expiry contraction")
+				}
+				if sameResource && existing.Operation == AutomaticReconciliation && existing.SafetyBinding.ResourceID == "headscale" && strings.HasPrefix(existing.Target, "journal/headscale-certificate-expiry-") && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
+					return fmt.Errorf("Headscale certificate action is blocked by expiry reconciliation")
+				}
+				if sameResource && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
 					return fmt.Errorf("target already has a nonterminal expansion authority")
 				}
+			}
+		}
+		if request.Operation == CertificateExpiry && request.SafetyBinding.ResourceID != "headscale" {
+			highWater := ExpiryGenerationRecord{SchemaVersion: "lanpanel.operation.expiry-generation.v1", ResourceID: request.SafetyBinding.ResourceID, Target: request.Target, ExpiryGeneration: request.SafetyBinding.ExpiryGeneration, JobID: record.ID, CreatedAt: observedNow}
+			raw, encodeErr := persist.EncodeEntry(highWater)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			key := expiryGenerationKey(highWater.ResourceID)
+			if _, present := transaction.Get(key); present {
+				if err := transaction.Replace(key, raw); err != nil {
+					return err
+				}
+			} else if err := transaction.Create(key, raw); err != nil {
+				return err
 			}
 		}
 		if err := jobs.Put(transaction, record); err != nil {
@@ -638,19 +718,22 @@ func (admitter *Admitter) rejectReservation(ctx context.Context, admission *lock
 			if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
 				return err
 			}
+			reservation, err := loadReservation(transaction, jobID)
+			if err != nil {
+				return err
+			}
 			record, err := jobs.Load(transaction, jobID)
 			if err != nil {
 				return err
+			}
+			if reservation.Phase != PhaseReserved || record.Status != jobs.StatusReserved {
+				return fmt.Errorf("reservation is no longer reserved")
 			}
 			record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultFailed, Postconditions: []jobs.Postcondition{{Kind: "mutation_not_started", Status: jobs.PostconditionVerified, Identity: jobID}}, ErrorCode: code}, observedNow)
 			if err != nil {
 				return err
 			}
 			if err := jobs.Replace(transaction, record); err != nil {
-				return err
-			}
-			reservation, err := loadReservation(transaction, jobID)
-			if err != nil {
 				return err
 			}
 			if reservation.AdmissionSource == AdmissionPlan {
@@ -3533,6 +3616,21 @@ func (admitter *Admitter) CommitResourceDeleteRemoval(ctx context.Context, mutat
 			}
 		}
 		installation.StaticRoots = staticRoots
+		for _, key := range transaction.Keys("intents") {
+			rawIntent, _ := transaction.Get(key)
+			expiryIntent, decodeErr := decodeReservation(rawIntent)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if expiryIntent.Operation == CertificateExpiry && expiryIntent.SafetyBinding.ResourceID == resourceID && expiryIntent.Phase != PhaseTerminal && expiryIntent.Phase != PhaseRejected {
+				return fmt.Errorf("resource delete is blocked by nonterminal certificate expiry")
+			}
+		}
+		if _, present := transaction.Get(expiryGenerationKey(resourceID)); present {
+			if err := transaction.Delete(expiryGenerationKey(resourceID)); err != nil {
+				return err
+			}
+		}
 		raw, err := persist.EncodeEntry(installation)
 		if err != nil {
 			return err
@@ -5118,9 +5216,18 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	contraction := isContraction(operation)
 	if operation == CertificateExpiry {
-		valid := validExpiryBinding(operation, state, binding) || !consuming && validExpiryProposal(operation, state, binding, now)
-		if !valid || binding.Deadline.IsZero() || binding.Deadline.After(now) {
+		if binding.ResourceID == "headscale" && state.GlobalClose.Phase != safety.GlobalCloseNone {
+			return fmt.Errorf("global close blocks Headscale certificate expiry")
+		}
+		existing := validExpiryBinding(operation, state, binding)
+		proposal := validExpiryProposal(operation, state, binding, now)
+		if binding.Deadline.IsZero() || !existing && (!proposal || binding.Deadline.After(now)) {
 			return fmt.Errorf("expiry contraction authority binding is stale, absent, or not due")
+		}
+	}
+	if operation == AutomaticReconciliation && binding.ResourceID == "headscale" {
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || !validExpiryBinding(CertificateExpiry, state, binding) {
+			return fmt.Errorf("Headscale expiry reconciliation authority is stale or globally blocked")
 		}
 	}
 	if operation == StartupContraction && !validStartupBinding(state, binding) {
@@ -5178,7 +5285,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		}
 	}
 	if operation == CertificateRenew && binding.ResourceID == "headscale" {
-		if state.StopFence != nil {
+		if state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone {
 			return fmt.Errorf("headscale renewal blocked by shared safety marker")
 		}
 		ownedChallenge := exactCertificateChallenge(state, operation, binding)
@@ -5346,7 +5453,7 @@ func validExpiryProposal(operation Type, state safety.State, binding SafetyBindi
 		return binding.Deadline.Equal(deadline)
 	}
 	for _, resource := range state.Resources {
-		if resource.ResourceID != binding.ResourceID || binding.ExpiryGeneration != resource.GenerationSequence+1 || resource.CertificateExpiry != nil || resource.ActiveCertificate == nil || binding.CandidateBundle != resource.ActiveCertificate.Binding {
+		if resource.ResourceID != binding.ResourceID || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || binding.ExpiryGeneration != resource.GenerationSequence+1 || resource.CertificateExpiry != nil || resource.ActiveCertificate == nil || binding.CandidateBundle != resource.ActiveCertificate.Binding {
 			continue
 		}
 		deadline := resource.ActiveCertificate.NotAfter
@@ -5420,7 +5527,10 @@ func (admitter *Admitter) AuthorizeStateIndependentContraction(operation Type, b
 			return fmt.Errorf("emergency global generation binding is stale")
 		}
 	case CertificateExpiry:
-		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() || binding.Deadline.After(now) {
+		if binding.ResourceID == "headscale" && state.GlobalClose.Phase != safety.GlobalCloseNone {
+			return fmt.Errorf("global close blocks state-independent Headscale certificate expiry")
+		}
+		if !validExpiryBinding(operation, state, binding) || binding.Deadline.IsZero() {
 			return fmt.Errorf("state-independent expiry binding is stale or not due")
 		}
 	case StartupContraction:
@@ -5470,6 +5580,73 @@ func loadReservationEntries(entries map[string]json.RawMessage, jobID string) (R
 		return Reservation{}, fmt.Errorf("operation reservation is missing")
 	}
 	return decodeReservation(raw)
+}
+
+func expiryGenerationKey(resourceID string) string { return "expiry_generations/" + resourceID }
+
+func decodeExpiryGenerationRecord(raw json.RawMessage) (ExpiryGenerationRecord, error) {
+	var value ExpiryGenerationRecord
+	if err := decodeStrict(raw, &value); err != nil {
+		return ExpiryGenerationRecord{}, err
+	}
+	kind, identity, separated := strings.Cut(value.Target, "/")
+	exactTarget := separated && value.ResourceID != "headscale" && kind == "resource" && identity == value.ResourceID
+	if value.SchemaVersion != "lanpanel.operation.expiry-generation.v1" || !validIdentityRef(value.ResourceID) || !validIdentityRef(value.Target) || !exactTarget || value.ExpiryGeneration == 0 || !validIdentityRef(value.JobID) || value.CreatedAt.IsZero() {
+		return ExpiryGenerationRecord{}, fmt.Errorf("certificate expiry generation high-water is invalid")
+	}
+	return value, nil
+}
+
+func RequireNoActiveCertificateExpiry(document persist.Document, resourceID string) error {
+	for _, key := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(key, "intents/"))
+		if err != nil {
+			return err
+		}
+		if intent.Operation == CertificateExpiry && intent.SafetyBinding.ResourceID == resourceID && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			return fmt.Errorf("resource is blocked by nonterminal certificate expiry")
+		}
+	}
+	return nil
+}
+
+func ExpiryGenerationHighWater(document persist.Document, resourceID string) (ExpiryGenerationRecord, bool, error) {
+	raw, present := document.Entries[expiryGenerationKey(resourceID)]
+	if !present {
+		return ExpiryGenerationRecord{}, false, nil
+	}
+	value, err := decodeExpiryGenerationRecord(raw)
+	return value, err == nil, err
+}
+
+func validateExpiryGenerationEntry(key string, raw json.RawMessage) error {
+	value, err := decodeExpiryGenerationRecord(raw)
+	if err != nil {
+		return err
+	}
+	if key != expiryGenerationKey(value.ResourceID) {
+		return fmt.Errorf("certificate expiry generation high-water key is invalid")
+	}
+	return nil
+}
+
+func validateExpiryGenerationTransition(_ string, before, after json.RawMessage) error {
+	if len(after) == 0 {
+		_, err := decodeExpiryGenerationRecord(before)
+		return err
+	}
+	next, err := decodeExpiryGenerationRecord(after)
+	if err != nil || len(before) == 0 {
+		return err
+	}
+	current, err := decodeExpiryGenerationRecord(before)
+	if err != nil {
+		return err
+	}
+	if next.ResourceID != current.ResourceID || next.Target != current.Target || next.ExpiryGeneration <= current.ExpiryGeneration || next.JobID == current.JobID || next.CreatedAt.Before(current.CreatedAt) {
+		return fmt.Errorf("certificate expiry generation high-water did not advance exactly")
+	}
+	return nil
 }
 
 func validateIntentEntry(key string, raw json.RawMessage) error {
@@ -6071,8 +6248,94 @@ func validateLinks(document persist.Document) error {
 	return nil
 }
 
+func validateExpiryGenerationProvenance(before, after persist.Document) error {
+	for _, key := range persist.EntryKeys(after, "expiry_generations") {
+		if raw, present := before.Entries[key]; present && string(raw) == string(after.Entries[key]) {
+			continue
+		}
+		record, err := decodeExpiryGenerationRecord(after.Entries[key])
+		if err != nil {
+			return err
+		}
+		if _, existed := before.Entries[reservationKey(record.JobID)]; existed {
+			return fmt.Errorf("certificate expiry generation high-water intent predates its transition")
+		}
+		if _, existed := before.Entries["jobs/"+record.JobID]; existed {
+			return fmt.Errorf("certificate expiry generation high-water job predates its transition")
+		}
+		intent, err := loadReservationEntries(after.Entries, record.JobID)
+		if err != nil {
+			return fmt.Errorf("certificate expiry generation high-water lacks exact intent provenance: %w", err)
+		}
+		if intent.Operation != CertificateExpiry || intent.Target != record.Target || intent.SafetyBinding.ResourceID != record.ResourceID || intent.SafetyBinding.ExpiryGeneration != record.ExpiryGeneration || !intent.CreatedAt.Equal(record.CreatedAt) {
+			return fmt.Errorf("certificate expiry generation high-water lacks exact intent provenance")
+		}
+		job, err := jobs.LoadEntries(after.Entries, record.JobID)
+		if err != nil {
+			return fmt.Errorf("certificate expiry generation high-water lacks exact job provenance: %w", err)
+		}
+		if job.Operation != string(CertificateExpiry) || job.Target != record.Target || !job.StartedAt.Equal(record.CreatedAt) {
+			return fmt.Errorf("certificate expiry generation high-water lacks exact job provenance")
+		}
+	}
+	return nil
+}
+
+func validateExpiryGenerationRemoval(before, after persist.Document) error {
+	for _, key := range persist.EntryKeys(before, "expiry_generations") {
+		if _, present := after.Entries[key]; present {
+			continue
+		}
+		record, err := decodeExpiryGenerationRecord(before.Entries[key])
+		if err != nil {
+			return err
+		}
+		oldInstallation, err := loadInstallationEntries(before.Entries)
+		if err != nil {
+			return err
+		}
+		newInstallation, err := loadInstallationEntries(after.Entries)
+		if err != nil {
+			return err
+		}
+		oldPresent, newPresent := false, false
+		for _, resource := range oldInstallation.Resources {
+			oldPresent = oldPresent || resource.ID == record.ResourceID
+		}
+		for _, resource := range newInstallation.Resources {
+			newPresent = newPresent || resource.ID == record.ResourceID
+		}
+		if !oldPresent || newPresent {
+			return fmt.Errorf("certificate expiry generation high-water deletion lacks resource removal")
+		}
+		matchedDelete := false
+		for _, intentKey := range persist.EntryKeys(after, "intents") {
+			intent, loadErr := loadReservationEntries(after.Entries, strings.TrimPrefix(intentKey, "intents/"))
+			if loadErr != nil {
+				return loadErr
+			}
+			if intent.Operation == ResourceDelete && intent.Target == "resource/"+record.ResourceID && intent.Phase == PhaseLocalIntent {
+				matchedDelete = true
+			}
+			if intent.Operation == CertificateExpiry && intent.SafetyBinding.ResourceID == record.ResourceID && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+				return fmt.Errorf("certificate expiry generation high-water deletion has active expiry")
+			}
+		}
+		if !matchedDelete {
+			return fmt.Errorf("certificate expiry generation high-water deletion lacks resource-delete intent")
+		}
+	}
+	return nil
+}
+
 func validateOperationStateTransitions(before, after persist.Document) error {
 	if err := validateOperationRetentionTransition(before, after); err != nil {
+		return err
+	}
+	if err := validateExpiryGenerationProvenance(before, after); err != nil {
+		return err
+	}
+	if err := validateExpiryGenerationRemoval(before, after); err != nil {
 		return err
 	}
 	beforeRaw, beforePresent := before.Entries["installations/current"]
@@ -6895,6 +7158,20 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 			return fmt.Errorf("GoAccess retirement must be startup-bound")
 		}
 		return validateGoAccessRetirementBinding(binding)
+	}
+	if request.Operation == AutomaticReconciliation && strings.HasPrefix(request.Target, "journal/headscale-certificate-expiry-") {
+		expected := SafetyBinding{ExpiryGeneration: binding.ExpiryGeneration, ResourceID: "headscale", Deadline: binding.Deadline, CandidateBundle: binding.CandidateBundle}
+		if request.Source != AdmissionTimer || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || binding.CandidateBundle == "" || !reflect.DeepEqual(binding, expected) {
+			return fmt.Errorf("Headscale expiry reconciliation requires exact timer authority")
+		}
+		return nil
+	}
+	if request.Operation == CertificateExpiry {
+		expected := SafetyBinding{ExpiryGeneration: binding.ExpiryGeneration, ResourceID: binding.ResourceID, Deadline: binding.Deadline, CandidateBundle: binding.CandidateBundle}
+		if request.Source != AdmissionTimer || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || binding.CandidateBundle == "" || !reflect.DeepEqual(binding, expected) {
+			return fmt.Errorf("certificate expiry requires exact timer deadline authority")
+		}
+		return nil
 	}
 	if request.Operation == HeadscaleInitialize && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {

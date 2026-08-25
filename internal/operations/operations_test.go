@@ -477,8 +477,8 @@ func TestOperationAdmissionContract(t *testing.T) {
 		futureDeadline := time.Now().UTC().Add(time.Hour)
 		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 5, Deadline: futureDeadline, Binding: "future"}
 		state.Resources[0].GenerationSequence = 5
-		if err := authorize(CertificateExpiry, state, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 5, Deadline: futureDeadline}, false, time.Now()); err == nil {
-			t.Fatal("timer expiry contracted before its bound deadline")
+		if err := authorize(CertificateExpiry, state, SafetyBinding{ResourceID: "res_00000000000000000000000000000001", ExpiryGeneration: 5, Deadline: futureDeadline, CandidateBundle: "future"}, false, time.Now()); err != nil {
+			t.Fatalf("durable expiry marker stopped being actionable after clock rollback: %v", err)
 		}
 		state.Resources[0].CertificateExpiry = &safety.DeadlineMarker{Generation: 4, Deadline: deadline, Binding: "certificate"}
 		state.Resources[0].GenerationSequence = 4
@@ -534,6 +534,101 @@ func TestOperationAdmissionContract(t *testing.T) {
 			t.Fatal("unavailability proof from another store was accepted")
 		}
 	})
+}
+
+func TestCertificateExpiryAdmissionReusesOneGenerationGraph(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	resourceID := "res_00000000000000000000000000000001"
+	target := "resource/" + resourceID
+	bindingID := testDigest("certificate-binding")
+	deadline := now.Add(-time.Minute)
+
+	for _, phase := range []Phase{PhaseReserved, PhaseRejected, PhaseLocalIntent, PhaseTerminal} {
+		t.Run(string(phase), func(t *testing.T) {
+			normal, manager, admission, mutationSet := newOperationStores(t)
+			defer func() { _ = normal.Close() }()
+			defer func() { _ = mutationSet.Close() }()
+			defer func() { _ = manager.Close() }()
+			defer func() { _ = admission.Release() }()
+
+			state := openSafetyState()
+			state.Resources[0].GenerationSequence = 3
+			state.Resources[0].ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: testDigest("certificate"), Binding: bindingID, NotAfter: deadline, LastTrustedWall: deadline.Add(-time.Hour)}
+			admitter, err := NewAdmitter(normal, &fakeSafety{state: state, authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{9}, 512)), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := AdmitRequest{Operation: CertificateExpiry, Target: target, ActorIdentity: "timer/certificate-expiry", Source: AdmissionTimer, SafetyBinding: SafetyBinding{ResourceID: resourceID, ExpiryGeneration: 4, Deadline: deadline, CandidateBundle: bindingID}, ExpectedRevision: 1}
+			record, err := admitter.Admit(context.Background(), admission, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			revision := uint64(2)
+			switch phase {
+			case PhaseReserved:
+			case PhaseRejected:
+				if err := admitter.RejectReservation(context.Background(), admission, revision, record.ID, "certificate_setup_failed"); err != nil {
+					t.Fatal(err)
+				}
+				revision++
+			case PhaseLocalIntent, PhaseTerminal:
+				if err := admission.Release(); err != nil {
+					t.Fatal(err)
+				}
+				mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), target, manager)
+				if err != nil {
+					t.Fatal(err)
+				}
+				preflightRequest, preflightResult := contractionPreflight(preflight.ContractionExpiry, target, 4, now)
+				if _, err := admitter.BeginPlanless(context.Background(), mutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: revision, IntentGeneration: revision + 1, ContractionRequest: &preflightRequest, ContractionPreflight: &preflightResult}); err != nil {
+					t.Fatal(err)
+				}
+				revision++
+				if phase == PhaseTerminal {
+					if _, err := admitter.Complete(context.Background(), mutation, exposure, revision, record.ID, "no_effect", nil, []jobs.Postcondition{{Kind: "mutation_not_started", Status: jobs.PostconditionVerified, Identity: record.ID}}, "contraction_authority_failed"); err != nil {
+						t.Fatal(err)
+					}
+					revision++
+				}
+				if err := ReleaseExposure(mutation, exposure); err != nil {
+					t.Fatal(err)
+				}
+				admission, err = manager.Acquire(context.Background(), locks.MutationAdmission)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if phase == PhaseLocalIntent {
+				if err := admitter.RejectReservation(context.Background(), admission, revision, record.ID, "certificate_setup_failed"); err == nil || !strings.Contains(err.Error(), "no longer reserved") {
+					t.Fatalf("local intent was overwritten by reservation cleanup: %v", err)
+				}
+			}
+			request.ExpectedRevision = revision
+			if _, err := admitter.Admit(context.Background(), admission, request); err == nil || !strings.Contains(err.Error(), "already has an operation graph") {
+				t.Fatalf("duplicate expiry graph admission error=%v", err)
+			}
+			document, err := normal.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches := 0
+			for _, key := range persist.EntryKeys(document, "intents") {
+				var intent Reservation
+				if err := json.Unmarshal(document.Entries[key], &intent); err != nil {
+					t.Fatal(err)
+				}
+				if intent.Operation == CertificateExpiry && intent.SafetyBinding.ResourceID == resourceID && intent.SafetyBinding.ExpiryGeneration == 4 {
+					matches++
+					if intent.Phase != phase {
+						t.Fatalf("phase=%s want=%s", intent.Phase, phase)
+					}
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("matching expiry graphs=%d", matches)
+			}
+		})
+	}
 }
 
 func TestOperationPreflightEvidenceSeparatesExpansionAndContraction(t *testing.T) {
@@ -1178,7 +1273,7 @@ func testRegistry(t *testing.T) *Registry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry, err := NewRegistry([]Registration{{Operation: Publish, Owner: "publication", Results: table}, {Operation: AutomaticReconciliation, Owner: "startup-recovery", Results: table}})
+	registry, err := NewRegistry([]Registration{{Operation: Publish, Owner: "publication", Results: table}, {Operation: CertificateExpiry, Owner: "certificate-expiry", Results: table}, {Operation: AutomaticReconciliation, Owner: "startup-recovery", Results: table}})
 	if err != nil {
 		t.Fatal(err)
 	}
