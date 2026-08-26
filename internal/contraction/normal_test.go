@@ -19,6 +19,15 @@ func (emptyOwnershipAuthority) InventoryAuthority() (map[string]string, bool, er
 	return map[string]string{}, true, nil
 }
 
+func TestEmergencyRecoveryAcceptsOnlyAppScopedPublishContractionFence(t *testing.T) {
+	if !supportedContractionFenceOrigin(operations.Publish, safety.FenceScope{Kind: "app", ResourceID: "res_one"}) {
+		t.Fatal("exact App publish recovery fence was rejected")
+	}
+	if supportedContractionFenceOrigin(operations.Publish, safety.FenceScope{Kind: "installation"}) || supportedContractionFenceOrigin(operations.Publish, safety.FenceScope{Kind: "headscale"}) {
+		t.Fatal("publish contraction fence escaped exact App scope")
+	}
+}
+
 func TestAppContractionFenceBindsEveryRetainedMarker(t *testing.T) {
 	resource := safety.ResourceSafety{
 		StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 3},

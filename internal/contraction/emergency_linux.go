@@ -455,6 +455,13 @@ func (service *EmergencyService) PersistClosing(_ context.Context, inventory clo
 	return nil
 }
 
+func supportedContractionFenceOrigin(operation operations.Type, scope safety.FenceScope) bool {
+	if operation == operations.Publish {
+		return scope.Kind == "app" && scope.ResourceID != ""
+	}
+	return operation == operations.CloseAll || operation == operations.Unpublish || operation == operations.CertificateExpiry
+}
+
 func (service *EmergencyService) validateStopFenceOrigin(fence safety.StopFence) error {
 	if fence.IngressActivation != nil {
 		expected := operations.Publish
@@ -497,7 +504,7 @@ func (service *EmergencyService) validateStopFenceOrigin(fence safety.StopFence)
 	origin := fence.Contraction
 	if origin.OperationRef != "" {
 		expected := operations.Type(fence.OriginOperation)
-		if expected != operations.CloseAll && expected != operations.Unpublish && expected != operations.CertificateExpiry {
+		if !supportedContractionFenceOrigin(expected, fence.Scope) {
 			return fmt.Errorf("contraction fence operation is unsupported")
 		}
 		return service.validateIntentFenceOrigin(origin.OperationRef, fence.Scope, "contraction", expected)

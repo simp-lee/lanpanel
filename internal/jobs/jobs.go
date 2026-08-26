@@ -48,6 +48,8 @@ var (
 		"managed_basic_interrupted":                  {},
 		"managed_basic_hash_failed":                  {},
 		"static_root_registration_interrupted":       {},
+		"temporary_http_activation_recovery":         {},
+		"temporary_http_no_effect":                   {},
 		"external_htpasswd_registration_interrupted": {},
 		"foreign_database_evidence":                  {},
 		"goaccess_retirement_recovery":               {},

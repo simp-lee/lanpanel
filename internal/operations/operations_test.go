@@ -882,6 +882,25 @@ func TestPublicationRetirementAuthoritySurvivesCertificateJobMutation(t *testing
 	}
 }
 
+func TestUnpublishedGenerationRestoreExceptionIsTemporaryHTTPOnly(t *testing.T) {
+	resource := operationStateInstallation().Resources[0]
+	resource.Publication = domain.AppPublication{Kind: domain.PublicationTemporaryHTTP, TemporaryHTTP: &domain.TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 18080}}
+	resource.PublicationRecord.State = domain.PublicationActivating
+	resource.PublicationRecord.UnpublishedGeneration = 4
+	resource.PublicationRecord.ActivationIntent = &domain.ActivationIntent{PriorState: domain.PublicationUnpublished, Candidate: domain.PublicationBundle{Kind: domain.PublicationTemporaryHTTP, TemporaryHTTP: &domain.TemporaryHTTPBundleIdentity{}}}
+	restored := resource
+	restored.PublicationRecord.State = domain.PublicationUnpublished
+	if !temporaryPublicationRestoredUnpublished(resource, restored) {
+		t.Fatal("exact Temporary HTTP prior restore was rejected")
+	}
+	domainResource := resource
+	domainResource.Publication = domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{}}
+	domainResource.PublicationRecord.ActivationIntent = &domain.ActivationIntent{PriorState: domain.PublicationUnpublished, Candidate: domain.PublicationBundle{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{}}}
+	if temporaryPublicationRestoredUnpublished(domainResource, restored) {
+		t.Fatal("Domain HTTPS received the Temporary HTTP generation exception")
+	}
+}
+
 func TestGoAccessRetirementKeepsPublishJobRunningUntilFinalCommit(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	installation := operationStateInstallation()

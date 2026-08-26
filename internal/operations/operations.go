@@ -3175,6 +3175,79 @@ func (admitter *Admitter) CompleteGoAccessContractionReconciliation(ctx context.
 	return completed, err
 }
 
+func (admitter *Admitter) TerminalizeTemporaryPublicationNoEffect(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, expected SafetyBinding, code string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || expected.ResourceID == "" || expected.PlanID == "" || expected.IntentGeneration == 0 || !exactDigest(expected.CandidateDigest) || !exactDigest(expected.CandidateBundle) {
+		return jobs.Record{}, fmt.Errorf("temporary publication no-effect authority invalid")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+expected.ResourceID || mutation.Target() != intent.Target || !reflect.DeepEqual(intent.SafetyBinding, expected) || intent.PlanID != expected.PlanID {
+			return fmt.Errorf("temporary publication no-effect intent changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != expected.ResourceID {
+				continue
+			}
+			if resource.Publication.Kind != domain.PublicationTemporaryHTTP || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.State == domain.PublicationActivating {
+				return fmt.Errorf("temporary publication already has activation effect")
+			}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("temporary publication no-effect resource missing")
+		}
+		for _, key := range transaction.Keys("journals") {
+			raw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if err := decodeStrict(raw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID == jobID {
+				return fmt.Errorf("temporary publication no-effect retains journal authority")
+			}
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("temporary publication no-effect job changed: %w", err)
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultFailed, Postconditions: []jobs.Postcondition{{Kind: "temporary_http_not_activated", Status: jobs.PostconditionVerified, Identity: expected.CandidateBundle}}, ErrorCode: code}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
+}
+
 func (admitter *Admitter) RejectPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, code string) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return fmt.Errorf("publication rejection requires exact authority")
@@ -3304,6 +3377,107 @@ func (admitter *Admitter) ConvergeCommittedPublicationContraction(ctx context.Co
 		return transaction.Replace("installations/current", raw)
 	})
 	return err
+}
+
+func (admitter *Admitter) TerminalizeInterruptedTemporaryPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, expected SafetyBinding, generation uint64, paths []string, runtimeDigest string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || expected.ResourceID == "" || expected.PlanID == "" || generation == 0 || !exactDigest(expected.CandidateDigest) || !exactDigest(expected.CandidateBundle) || !exactDigest(runtimeDigest) {
+		return jobs.Record{}, fmt.Errorf("temporary publication contraction authority invalid")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		if err := pruneTerminalGraphs(transaction, maximumTerminalOperationGraphs-1); err != nil {
+			return err
+		}
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != Publish || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+expected.ResourceID || mutation.Target() != intent.Target || intent.PlanID != expected.PlanID || !reflect.DeepEqual(intent.SafetyBinding, expected) {
+			return fmt.Errorf("temporary publication contraction intent changed")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		found := false
+		for index := range installation.Resources {
+			resource := &installation.Resources[index]
+			if resource.ID != expected.ResourceID {
+				continue
+			}
+			active := resource.PublicationRecord.ActivationIntent
+			if resource.Publication.Kind != domain.PublicationTemporaryHTTP || resource.PublicationRecord.State != domain.PublicationActivating || active == nil || active.JobID != jobID || active.PlanID != expected.PlanID || active.Generation != expected.IntentGeneration || active.Candidate.TemporaryHTTP == nil || active.Candidate.ConfigDigest != expected.CandidateDigest || publication.RequireBundleDigest(active.Candidate, expected.CandidateBundle) != nil {
+				return fmt.Errorf("temporary publication activation authority changed")
+			}
+			resource.PublicationRecord.State = domain.PublicationUnpublished
+			resource.PublicationRecord.UnpublishedGeneration = generation
+			resource.PublicationRecord.ActivationIntent = nil
+			resource.PublicationRecord.LastOperation = domain.OperationPublish
+			resource.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+			resource.PublicationRecord.LastJobID = jobID
+			resource.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: observed.Format(time.RFC3339), Reason: "temporary_http_activation_contracted"}
+			found = true
+		}
+		if !found {
+			return fmt.Errorf("temporary publication contraction resource missing")
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		journalFound := false
+		for _, key := range transaction.Keys("journals") {
+			journalRaw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if err := decodeStrict(journalRaw, &journal); err != nil {
+				return err
+			}
+			if journal.JobID != jobID {
+				continue
+			}
+			if journalFound || journal.ID != "activation-"+jobID || journal.Kind != JournalAppActivation || journal.Operation != Publish || journal.Target != intent.Target || journal.Generation != intent.IntentGeneration || journal.ArtifactDigest != expected.CandidateBundle || journal.Phase != JournalPrepared {
+				return fmt.Errorf("temporary publication contraction journal changed")
+			}
+			journalFound = true
+			journal.Phase = JournalTerminal
+			journalRaw, err = persist.EncodeEntry(journal)
+			if err != nil {
+				return err
+			}
+			if err := transaction.Replace(key, journalRaw); err != nil {
+				return err
+			}
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("temporary publication contraction job changed: %w", err)
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultInterrupted, ModifiedPaths: paths, Postconditions: []jobs.Postcondition{{Kind: "temporary_http_activation_contracted", Status: jobs.PostconditionVerified, Identity: runtimeDigest}}, ErrorCode: "temporary_http_activation_recovery"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err = persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
 }
 
 func (admitter *Admitter) TerminalizeInterruptedPublication(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, resourceID string, generation uint64, paths []string, runtimeDigest string) (jobs.Record, error) {
@@ -6328,6 +6502,11 @@ func validateExpiryGenerationRemoval(before, after persist.Document) error {
 	return nil
 }
 
+func temporaryPublicationRestoredUnpublished(oldResource, resource domain.AppResource) bool {
+	activation := oldResource.PublicationRecord.ActivationIntent
+	return oldResource.Publication.Kind == domain.PublicationTemporaryHTTP && oldResource.Publication.TemporaryHTTP != nil && oldResource.PublicationRecord.State == domain.PublicationActivating && activation != nil && activation.Candidate.Kind == domain.PublicationTemporaryHTTP && activation.Candidate.TemporaryHTTP != nil && activation.PriorState == domain.PublicationUnpublished && resource.PublicationRecord.UnpublishedGeneration == oldResource.PublicationRecord.UnpublishedGeneration
+}
+
 func validateOperationStateTransitions(before, after persist.Document) error {
 	if err := validateOperationRetentionTransition(before, after); err != nil {
 		return err
@@ -6526,7 +6705,9 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			return fmt.Errorf("resource %q unpublished generation regressed", resource.ID)
 		}
 		if resource.PublicationRecord.State == domain.PublicationUnpublished && oldResource.PublicationRecord.State != domain.PublicationUnpublished && resource.PublicationRecord.UnpublishedGeneration <= oldResource.PublicationRecord.UnpublishedGeneration {
-			return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
+			if !temporaryPublicationRestoredUnpublished(oldResource, resource) {
+				return fmt.Errorf("resource %q contraction did not allocate a fresh unpublished generation", resource.ID)
+			}
 		}
 		jobID := resource.PublicationRecord.LastJobID
 		if resource.Target.Kind == domain.AppTargetLocalHTTP && (resource.ManagedProcess.LastJobID != oldResource.ManagedProcess.LastJobID || reflect.DeepEqual(resource.PublicationRecord, oldResource.PublicationRecord)) {

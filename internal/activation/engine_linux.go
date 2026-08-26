@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -249,6 +250,31 @@ func (host Host) ObserveCurrent(ctx context.Context) (closure.RuntimeSnapshot, e
 	return host.observer(manifest).Observe(ctx)
 }
 
+func exactTemporaryEntryPresent(entries []nginx.Entry, candidate nginx.Entry) bool {
+	for _, entry := range entries {
+		if reflect.DeepEqual(entry, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func (host Host) VerifyTemporary(ctx context.Context, candidate publication.Candidate, target domain.AppTarget) (string, error) {
+	manifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return "", err
+	}
+	matched := exactTemporaryEntryPresent(manifest.Entries, candidate.Entry)
+	if !matched {
+		return "", fmt.Errorf("temporary HTTP runtime manifest candidate missing")
+	}
+	snapshot, err := host.observer(manifest).Observe(ctx)
+	if err != nil || snapshot.Master == nil {
+		return "", fmt.Errorf("temporary HTTP runtime observation failed: %w", err)
+	}
+	return probeTemporary(ctx, candidate, target, snapshot)
+}
+
 func (host Host) VerifyDomain(ctx context.Context, candidate publication.Candidate, target domain.AppTarget) (string, error) {
 	manifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
@@ -268,6 +294,19 @@ func (host Host) VerifyDomain(ctx context.Context, candidate publication.Candida
 		return "", fmt.Errorf("domain runtime observation failed: %w", err)
 	}
 	return probeDomain(ctx, candidate, target, snapshot)
+}
+
+func (host Host) AuditManifest(context.Context) (nginx.Manifest, error) {
+	return nginx.Audit(host.Paths, host.Owner)
+}
+
+func (host Host) ProbeTemporaryClosure(ctx context.Context, inventory closure.Inventory) (string, error) {
+	manifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return "", err
+	}
+	probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: host.Paths.AuditPath}
+	return probe.Run(ctx, inventory)
 }
 
 func (host Host) StopAndVerify(ctx context.Context) (closure.RuntimeSnapshot, error) {

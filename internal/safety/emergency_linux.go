@@ -414,7 +414,8 @@ func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool
 	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && (role != RoleGlobalCloseConvergence || next.GlobalClose.Generation != current.GlobalClose.Generation || !validEmergencyClearProof(next.ClearProof, current)) {
 		return false
 	}
-	if current.GlobalClose.Phase == GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && !sameEmergencyClearProof(current.ClearProof, next.ClearProof) {
+	stopFenceClear := current.StopFence != nil && next.StopFence == nil
+	if current.GlobalClose.Phase == GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone && !sameEmergencyClearProof(current.ClearProof, next.ClearProof) && !stopFenceClear {
 		return false
 	}
 	if current.NormalInitialized && !next.NormalInitialized {

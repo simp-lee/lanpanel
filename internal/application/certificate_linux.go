@@ -1713,7 +1713,11 @@ func (execution *CertificateExecution) ContinueDomainPublication(ctx context.Con
 }
 
 func publicationExecutionFromCertificate(execution *CertificateExecution, candidate publication.Candidate, state safety.State, owned ownership.Record, deadline time.Time) *PublicationExecution {
-	return &PublicationExecution{Service: execution.Service, Admitter: execution.Admitter, MutationSet: execution.MutationSet, Mutation: execution.Mutation, Exposure: execution.Exposure, JobID: execution.JobID, Revision: execution.Revision, Resource: execution.Resource, Candidate: candidate, SafetyState: state, Ownership: owned, PlanID: execution.Plan.ID, InstallationID: execution.InstallationID, ActivationDeadline: deadline}
+	marker := safety.Reactivating{}
+	if resource := findSafetyResource(state, execution.Resource.ID); resource != nil && resource.Reactivating != nil {
+		marker = *resource.Reactivating
+	}
+	return &PublicationExecution{Service: execution.Service, Admitter: execution.Admitter, MutationSet: execution.MutationSet, Mutation: execution.Mutation, Exposure: execution.Exposure, JobID: execution.JobID, Revision: execution.Revision, Resource: execution.Resource, Candidate: candidate, SafetyState: state, Reactivating: marker, Ownership: owned, PlanID: execution.Plan.ID, InstallationID: execution.InstallationID, ActivationDeadline: deadline}
 }
 
 func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, identity certificates.Identity) (jobs.Record, error) {
@@ -2388,7 +2392,7 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 			continue
 		}
 		var intent operations.Reservation
-		if json.Unmarshal(raw, &intent) != nil || (intent.Operation != operations.Publish && intent.Operation != operations.CertificateRenew) || (intent.Phase != operations.PhaseReserved && intent.Phase != operations.PhaseLocalIntent) {
+		if json.Unmarshal(raw, &intent) != nil || (intent.Operation != operations.Publish && intent.Operation != operations.CertificateRenew) || (intent.Phase != operations.PhaseReserved && intent.Phase != operations.PhaseLocalIntent) || intent.SafetyBinding.CertificateIdentity == "" || (intent.SafetyBinding.ChallengeMethod != "http-01" && intent.SafetyBinding.ChallengeMethod != "dns-01") {
 			continue
 		}
 		hasJournal, hasChild, hasChallenge := false, false, false

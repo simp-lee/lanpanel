@@ -23,9 +23,29 @@ import (
 	"lanpanel/internal/safety"
 	"lanpanel/internal/target"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"time"
 )
+
+type temporaryPublicationBeginStage uint8
+
+const (
+	temporaryPublicationReserved temporaryPublicationBeginStage = iota + 1
+	temporaryPublicationSafetyCommitted
+	temporaryPublicationPlanConsumed
+	temporaryPublicationIntentCommitted
+	temporaryPublicationJournalCommitted
+	temporaryPublicationOwnershipCommitted
+	temporaryPublicationOwnershipConverged
+)
+
+func temporaryPublicationBeginFailureCode(stage temporaryPublicationBeginStage) string {
+	if stage >= temporaryPublicationPlanConsumed {
+		return "temporary_http_no_effect"
+	}
+	return "publication_revalidation_failed"
+}
 
 type PublicationExecution struct {
 	Service            *FixedService
@@ -38,6 +58,7 @@ type PublicationExecution struct {
 	Resource           domain.AppResource
 	Candidate          publication.Candidate
 	SafetyState        safety.State
+	Reactivating       safety.Reactivating
 	Ownership          ownership.Record
 	PlanID             string
 	InstallationID     string
@@ -107,33 +128,83 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 		return fail(err)
 	}
 	binding := operations.SafetyBinding{ResourceID: resource.ID, PlanID: plan.ID, IntentGeneration: generation, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, Deadline: plan.ExpiresAt}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.Publish, Target: "resource/" + resource.ID, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.Publish, Target: "resource/" + resource.ID, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	var admissionCleanupErr error
+	if admitErr != nil && job.ID != "" {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		admissionCleanupErr = rejectExactTemporaryReservation(cleanupCtx, service, admitter, admission, job.ID, binding, "publication_revalidation_failed")
+		cancelCleanup()
+	}
 	releaseErr := admission.Release()
-	if err != nil || releaseErr != nil {
-		return fail(errors.Join(err, releaseErr))
+	if releaseErr != nil && admitErr == nil && job.ID != "" {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		admissionCleanupErr = rejectReservedTemporaryPublication(cleanupCtx, service, admitter, job.ID, binding, "publication_revalidation_failed")
+		cancelCleanup()
+	}
+	if admitErr != nil || releaseErr != nil || admissionCleanupErr != nil {
+		return fail(errors.Join(admitErr, releaseErr, admissionCleanupErr))
+	}
+	rejectAdmitted := func(cause error) (*PublicationExecution, error) {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancelCleanup()
+		rejectErr := rejectReservedTemporaryPublication(cleanupCtx, service, admitter, job.ID, binding, "publication_revalidation_failed")
+		return fail(errors.Join(cause, rejectErr))
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
-		return fail(err)
+		return rejectAdmitted(err)
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
 	activationDeadline := time.Now().UTC().Add(time.Minute)
 	if err != nil {
-		_ = mutationSet.Close()
-		return fail(err)
+		return rejectAdmitted(errors.Join(err, mutationSet.Close()))
 	}
+	stage := temporaryPublicationReserved
+	var reactivating safety.Reactivating
 	cleanup := func(cause error) (*PublicationExecution, error) {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancelCleanup()
+		rejectReserved := false
+		markerPresent := false
+		var recoveryErr error
+		if reactivating.Generation != 0 {
+			markerPresent, recoveryErr = exactTemporaryMarkerPresent(service, exposure, resource.ID, reactivating)
+			if recoveryErr == nil && markerPresent {
+				var host temporaryPublicationRecoveryHost
+				document, readErr := service.normal.Read()
+				if readErr == nil {
+					var recovery temporaryPublicationRecovery
+					recovery, readErr = loadTemporaryPublicationRecovery(document, resource.ID, reactivating)
+					if readErr == nil {
+						var recoveryStage temporaryPublicationRecoveryStage
+						recoveryStage, readErr = classifyTemporaryPublicationRecovery(recovery)
+						if readErr == nil && (recoveryStage == temporaryRecoveryActivationDurable || recoveryStage == temporaryRecoveryCommitted) {
+							var fixedHost activation.Host
+							fixedHost, readErr = activation.NewFixedHost()
+							host = fixedHost
+						}
+					}
+				}
+				if readErr == nil {
+					rejectReserved, recoveryErr = recoverTemporaryPublicationLocked(cleanupCtx, service, admitter, mutation, exposure, resource.ID, job.ID, reactivating, host, temporaryPublicationBeginFailureCode(stage))
+				} else {
+					recoveryErr = readErr
+				}
+			}
+		}
+		if recoveryErr == nil && !markerPresent {
+			if stage == temporaryPublicationReserved {
+				rejectReserved = true
+			} else {
+				recoveryErr = fmt.Errorf("temporary publication marker disappeared after stage %d", stage)
+			}
+		}
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
 		closeErr := mutationSet.Close()
-		admission, reacquireErr := service.manager.Acquire(context.WithoutCancel(ctx), locks.MutationAdmission)
-		if reacquireErr == nil {
-			document, readErr := service.normal.Read()
-			if readErr == nil {
-				reacquireErr = admitter.RejectReservation(context.WithoutCancel(ctx), admission, document.Revision, job.ID, "publication_revalidation_failed")
-			}
-			reacquireErr = errors.Join(reacquireErr, admission.Release())
+		if recoveryErr == nil && rejectReserved {
+			recoveryErr = rejectReservedTemporaryPublication(cleanupCtx, service, admitter, job.ID, binding, temporaryPublicationBeginFailureCode(stage))
 		}
-		return fail(errors.Join(cause, releaseErr, closeErr, reacquireErr))
+		return fail(errors.Join(cause, recoveryErr, releaseErr, closeErr))
 	}
 	fresh, err := service.normal.Read()
 	if err != nil || fresh.Revision != document.Revision+1 {
@@ -196,14 +267,17 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	}
 	snapshots := baseSnapshot(*nextResource)
 	nextResource.GenerationSequence = generation
-	nextResource.Reactivating = &safety.Reactivating{Generation: generation, PriorGeneration: generation - 1, PlanID: plan.ID, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, BaseMarkers: snapshots, TemporaryHTTP: true}
+	reactivating = safety.Reactivating{Generation: generation, PriorGeneration: generation - 1, PlanID: plan.ID, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, BaseMarkers: snapshots, TemporaryHTTP: true}
+	nextResource.Reactivating = &reactivating
 	if _, err := service.safety.Commit(ctx, exposure, safety.RolePublish, freshState.Revision, next, safety.TransitionProof{}); err != nil {
 		return cleanup(err)
 	}
+	stage = temporaryPublicationSafetyCommitted
 	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: plan.NonceDigest})
 	if err != nil {
 		return cleanup(err)
 	}
+	stage = temporaryPublicationPlanConsumed
 	activationIntent := domain.ActivationIntent{ID: "activation-" + job.ID, JobID: job.ID, PlanID: plan.ID, Generation: generation, Candidate: candidate.Bundle, PriorState: freshResource.PublicationRecord.State}
 	if freshResource.PublicationRecord.State == domain.PublicationPublished {
 		activationIntent.Prior = freshResource.PublicationRecord.LastAppliedBundle
@@ -211,11 +285,13 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	if err := admitter.CommitPublicationBegin(ctx, mutation, exposure, intent.IntentGeneration, job.ID, operations.PublicationBeginCommit{ResourceID: resource.ID, Intent: activationIntent}); err != nil {
 		return cleanup(err)
 	}
+	stage = temporaryPublicationIntentCommitted
 	revision := intent.IntentGeneration + 1
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "activation-" + job.ID, JobID: job.ID, Kind: operations.JournalAppActivation, Operation: operations.Publish, InstallationID: freshInstallation.InstallationID, Target: "resource/" + resource.ID, Generation: intent.IntentGeneration, Deadline: plan.ExpiresAt, ArtifactDigest: candidate.BundleDigest, ResourceIDs: []string{resource.ID}, ChildIDs: []string{}, Phase: operations.JournalPrepared}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "activation-" + job.ID, JobID: job.ID, Kind: operations.JournalAppActivation, Operation: operations.Publish, InstallationID: freshInstallation.InstallationID, Target: "resource/" + resource.ID, Generation: intent.IntentGeneration, Deadline: plan.ExpiresAt, ArtifactDigest: candidate.BundleDigest, ResourceIDs: []string{resource.ID}, ChildIDs: nil, Phase: operations.JournalPrepared}
 	if err := admitter.PutJournal(ctx, mutation, exposure, revision, journal, true); err != nil {
 		return cleanup(err)
 	}
+	stage = temporaryPublicationJournalCommitted
 	revision++
 	owned, err := service.ownership.Read(resource.ID)
 	if err != nil {
@@ -244,6 +320,7 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	if err != nil {
 		return cleanup(err)
 	}
+	stage = temporaryPublicationOwnershipCommitted
 	safetyAfterOwnership, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return cleanup(err)
@@ -261,7 +338,8 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 			}
 		}
 	}
-	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Ownership: persisted, PlanID: plan.ID, InstallationID: installation.InstallationID, ActivationDeadline: activationDeadline}, nil
+	stage = temporaryPublicationOwnershipConverged
+	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Reactivating: reactivating, Ownership: persisted, PlanID: plan.ID, InstallationID: installation.InstallationID, ActivationDeadline: activationDeadline}, nil
 }
 
 func goAccessSharedRetained(resource domain.AppResource) bool {
@@ -269,6 +347,15 @@ func goAccessSharedRetained(resource domain.AppResource) bool {
 		return bundle.DomainHTTPS.GoAccess.Enabled || bundle.DomainHTTPS.GoAccess.RetiredGeneration != 0
 	}
 	return false
+}
+
+func (execution *PublicationExecution) restoreTemporaryPrior(ctx context.Context) error {
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancelCleanup()
+	if err := execution.Admitter.RejectPublication(cleanupCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); err != nil {
+		return err
+	}
+	return execution.Service.RestorePublicationSafety(cleanupCtx, execution.Exposure, execution.Resource.ID, execution.Reactivating)
 }
 
 func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, error) {
@@ -334,14 +421,22 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 				return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, pruneErr))
 			}
 		}
+		var failure *activation.Failure
+		priorRestored := errors.As(err, &failure) && failure.PriorRestored
+		if execution.Candidate.Bundle.TemporaryHTTP != nil && priorRestored {
+			if restoreErr := execution.restoreTemporaryPrior(ctx); restoreErr == nil {
+				return jobs.Record{}, err
+			} else {
+				return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, restoreErr))
+			}
+		}
 		if activationCtx.Err() != nil {
 			return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, activationCtx.Err()))
 		}
-		var failure *activation.Failure
-		if !errors.As(err, &failure) || !failure.PriorRestored {
+		if !priorRestored {
 			return jobs.Record{}, execution.failClosed(ctx, err)
 		}
-		if restoreErr := execution.Service.RestorePublicationSafety(activationCtx, execution.Exposure, execution.Resource.ID); restoreErr == nil {
+		if restoreErr := execution.Service.RestorePublicationSafety(activationCtx, execution.Exposure, execution.Resource.ID, execution.Reactivating); restoreErr == nil {
 			if rejectErr := execution.Admitter.RejectPublication(activationCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); rejectErr == nil {
 				return jobs.Record{}, err
 			} else {
@@ -361,15 +456,14 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 		next := state
 		next.Revision++
 		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
-		proof := &safety.ReactivationConvergenceProof{ResourceID: execution.Resource.ID, Generation: execution.Candidate.Generation, CandidateDigest: execution.Candidate.Bundle.ConfigDigest, CandidateBundle: execution.Candidate.BundleDigest, RuntimeClosureDigest: result.RuntimeDigest}
+		proof := &safety.ReactivationConvergenceProof{ResourceID: execution.Resource.ID, PlanID: execution.Reactivating.PlanID, Generation: execution.Candidate.Generation, CandidateDigest: execution.Candidate.Bundle.ConfigDigest, CandidateBundle: execution.Candidate.BundleDigest, RuntimeClosureDigest: result.RuntimeDigest}
 		found := false
 		for index := range next.Resources {
 			resource := &next.Resources[index]
 			if resource.ResourceID == execution.Resource.ID {
-				if resource.Reactivating == nil {
-					return fmt.Errorf("publication reactivation authority disappeared")
+				if resource.Reactivating == nil || !reflect.DeepEqual(*resource.Reactivating, execution.Reactivating) {
+					return fmt.Errorf("publication reactivation authority changed")
 				}
-				proof.PlanID = resource.Reactivating.PlanID
 				resource.StickyUnpublished = nil
 				resource.Contraction = nil
 				resource.CertificateExpiry = nil
@@ -554,7 +648,7 @@ func (execution *PublicationExecution) rollbackUnstagedGoAccessOwnership(ctx con
 }
 
 func (execution *PublicationExecution) restorePriorAfterStaging(ctx context.Context, cause error) error {
-	restoreErr := execution.Service.RestorePublicationSafety(ctx, execution.Exposure, execution.Resource.ID)
+	restoreErr := execution.Service.RestorePublicationSafety(ctx, execution.Exposure, execution.Resource.ID, execution.Reactivating)
 	if restoreErr == nil {
 		restoreErr = execution.Admitter.RejectPublication(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "goaccess_staging_restored_prior")
 	}

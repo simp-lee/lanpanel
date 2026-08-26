@@ -20,21 +20,45 @@ import (
 	"time"
 )
 
+func readPublicationRecoverySafety(ctx context.Context, service *FixedService) (safety.State, error) {
+	exposure, err := service.manager.Acquire(ctx, locks.Exposure)
+	if err != nil {
+		return safety.State{}, err
+	}
+	state, readErr := service.safety.ReadForRecovery(exposure)
+	return state, errors.Join(readErr, exposure.Release())
+}
+
 func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	service, err := OpenFixed()
 	if err != nil {
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(service.Close)
-	state, err := service.safety.Read()
+	state, err := readPublicationRecoverySafety(ctx, service)
+	if err != nil {
+		return err
+	}
+	if err := reconcileMarkerlessTemporaryReservations(ctx, service, state); err != nil {
+		return err
+	}
+	state, err = readPublicationRecoverySafety(ctx, service)
 	if err != nil {
 		return err
 	}
 	for _, authority := range state.Resources {
-		if authority.Reactivating == nil && (authority.Closing == nil || authority.Closing.Reason != "interrupted_domain_activation" && authority.Closing.Reason != "committed_domain_recovery") {
+		temporaryRecovery := authority.Reactivating != nil && authority.Reactivating.TemporaryHTTP || authority.Reactivating == nil && authority.Closing != nil && temporaryClosingReason(authority.Closing.Reason)
+		if temporaryRecovery {
+			if err := reconcileInterruptedTemporaryPublication(ctx, service, authority, fixedRoot+"/locks", 0, 0, nil); err != nil {
+				return err
+			}
+			state, err = readPublicationRecoverySafety(ctx, service)
+			if err != nil {
+				return err
+			}
 			continue
 		}
-		if authority.Reactivating != nil && authority.Reactivating.TemporaryHTTP {
+		if authority.Reactivating == nil && (authority.Closing == nil || authority.Closing.Reason != "interrupted_domain_activation" && authority.Closing.Reason != "committed_domain_recovery") {
 			continue
 		}
 		document, err := service.normal.Read()
@@ -50,7 +74,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			if err := resumeCommittedDomainContraction(ctx, service, resource, *authority.Closing); err != nil {
 				return err
 			}
-			state, err = service.safety.Read()
+			state, err = readPublicationRecoverySafety(ctx, service)
 			if err != nil {
 				return err
 			}
@@ -60,7 +84,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			if err := convergeCommittedDomainPublication(ctx, service, resource, *authority.Reactivating); err != nil {
 				return err
 			}
-			state, err = service.safety.Read()
+			state, err = readPublicationRecoverySafety(ctx, service)
 			if err != nil {
 				return err
 			}
@@ -84,7 +108,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			if err := errors.Join(err, releaseErr, closeErr); err != nil {
 				return err
 			}
-			state, err = service.safety.Read()
+			state, err = readPublicationRecoverySafety(ctx, service)
 			if err != nil {
 				return err
 			}
@@ -209,7 +233,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 		if err := errors.Join(err, pointerErr, releaseErr, closeErr); err != nil {
 			return err
 		}
-		state, err = service.safety.Read()
+		state, err = readPublicationRecoverySafety(ctx, service)
 		if err != nil {
 			return err
 		}
@@ -678,7 +702,7 @@ func convergeInterruptedDomainClosing(ctx context.Context, service *FixedService
 		if item.ResourceID != resourceID {
 			continue
 		}
-		if item.Closing == nil || item.Closing.Generation != generation {
+		if item.Closing == nil || item.Closing.Generation != generation || item.Closing.Reason != reason {
 			return fmt.Errorf("interrupted closing authority changed")
 		}
 		proof = &safety.ClosingConvergenceProof{ResourceID: resourceID, ClosingGeneration: generation, UnpublishedGeneration: generation, OwnershipDigest: item.OwnershipDigest, RuntimeClosureDigest: runtimeDigest}

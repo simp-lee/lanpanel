@@ -25,6 +25,7 @@ import (
 	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
 	"os"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -168,7 +169,7 @@ func (s *FixedService) NormalInstallationID() string {
 func (s *FixedService) SafetyState() (safety.State, error)     { return s.safety.Read() }
 func (s *FixedService) SafetyStore() *safety.Store             { return s.safety }
 func (s *FixedService) EmergencyStore() *safety.EmergencyStore { return s.emergency }
-func (s *FixedService) RestorePublicationSafety(ctx context.Context, lease *locks.Lease, resourceID string) error {
+func (s *FixedService) RestorePublicationSafety(ctx context.Context, lease *locks.Lease, resourceID string, expected safety.Reactivating) error {
 	state, err := s.safety.ReadForRecovery(lease)
 	if err != nil {
 		return err
@@ -176,10 +177,19 @@ func (s *FixedService) RestorePublicationSafety(ctx context.Context, lease *lock
 	next := state
 	next.Revision++
 	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	found := false
 	for index := range next.Resources {
-		if next.Resources[index].ResourceID == resourceID {
-			next.Resources[index].Reactivating = nil
+		if next.Resources[index].ResourceID != resourceID {
+			continue
 		}
+		if next.Resources[index].Reactivating == nil || !reflect.DeepEqual(*next.Resources[index].Reactivating, expected) || expected.PlanID == "" || expected.Generation == 0 || expected.CandidateDigest == "" || expected.CandidateBundle == "" {
+			return fmt.Errorf("publication reactivation authority changed")
+		}
+		next.Resources[index].Reactivating = nil
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("publication safety resource missing")
 	}
 	_, err = s.safety.Commit(ctx, lease, safety.RoleContraction, state.Revision, next, safety.TransitionProof{})
 	return err

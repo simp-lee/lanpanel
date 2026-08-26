@@ -6,8 +6,26 @@ import (
 	"context"
 	"errors"
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/nginx"
 	"testing"
 )
+
+func TestTemporaryRuntimeEntryRequiresExactGenerationAndIdentity(t *testing.T) {
+	candidate := nginx.Entry{Kind: nginx.EntryTemporary, ResourceID: "res_one", Relative: "temporary/res_one.conf", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Listeners: []string{"tcp:0.0.0.0:18080"}, Generation: 2, Temporary: &nginx.TemporarySite{PublicIPv4: "8.8.8.8", Port: 18080, HostAuthority: "8.8.8.8:18080", UpstreamNetwork: "unix", UpstreamAddress: "/run/app.sock", ReadinessPath: "/ready"}}
+	prior := candidate
+	prior.Generation = 1
+	if exactTemporaryEntryPresent([]nginx.Entry{prior}, candidate) {
+		t.Fatal("prior temporary generation satisfied current runtime authority")
+	}
+	wrongIdentity := candidate
+	wrongIdentity.Digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if exactTemporaryEntryPresent([]nginx.Entry{wrongIdentity}, candidate) {
+		t.Fatal("same-generation wrong temporary identity satisfied runtime authority")
+	}
+	if !exactTemporaryEntryPresent([]nginx.Entry{candidate}, candidate) {
+		t.Fatal("exact temporary runtime entry was rejected")
+	}
+}
 
 func TestCertificatePointerHandoffAcceptsExactCandidate(t *testing.T) {
 	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
