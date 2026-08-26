@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const LifecycleVersion = release.SupportedHeadscaleVersion
+const (
+	LifecycleVersion                    = release.SupportedHeadscaleVersion
+	preauthTimestampSerializationWindow = time.Second
+)
 
 type AdminRunner interface {
 	Run(context.Context, child.HeadscaleInvocation) ([]byte, error)
@@ -193,7 +196,9 @@ func CreatePreauthKey(ctx context.Context, runner AdminRunner, headscaleID strin
 	if userID == 0 || expiration <= 0 || expiration > 24*time.Hour || expiration%time.Second != 0 {
 		return PreauthKey{}, nil, fmt.Errorf("preauth key request is invalid")
 	}
+	startedAt := time.Now().UTC()
 	raw, err := runner.Run(ctx, child.HeadscaleInvocation{HeadscaleID: headscaleID, AdminAction: child.HeadscalePreauthCreate, Identifier: strconv.FormatUint(userID, 10), ExpirationSeconds: uint32(expiration / time.Second)})
+	finishedAt := time.Now().UTC()
 	if err != nil {
 		return PreauthKey{}, nil, err
 	}
@@ -203,7 +208,8 @@ func CreatePreauthKey(ctx context.Context, runner AdminRunner, headscaleID strin
 		return PreauthKey{}, nil, err
 	}
 	key, err := normalizePreauth(wire, false)
-	if err != nil || wire.User.ID != userID || wire.Reusable || wire.Ephemeral || len(wire.ACLTags) != 0 || wire.Used || !key.Expiration.After(key.CreatedAt) || key.Expiration.Sub(key.CreatedAt) > expiration {
+	validatedAt := time.Now().UTC()
+	if err != nil || wire.User.ID != userID || wire.Reusable || wire.Ephemeral || len(wire.ACLTags) != 0 || wire.Used || validateCreatedPreauthTimes(key, expiration, startedAt, finishedAt, validatedAt) != nil {
 		return PreauthKey{}, nil, fmt.Errorf("created preauth key contract changed")
 	}
 	secret := []byte(wire.Key)
@@ -319,6 +325,17 @@ func normalizeUser(value userWire) (User, error) {
 		return User{}, fmt.Errorf("headscale user identity is invalid")
 	}
 	return User{ID: value.ID, Name: value.Name, CreatedAt: created}, nil
+}
+
+func validateCreatedPreauthTimes(key PreauthKey, requested time.Duration, startedAt, finishedAt, validatedAt time.Time) error {
+	if startedAt.IsZero() || finishedAt.Before(startedAt) || validatedAt.Before(finishedAt) || !key.CreatedAt.After(startedAt.Add(-preauthTimestampSerializationWindow)) || key.CreatedAt.After(finishedAt) || !key.Expiration.After(validatedAt) {
+		return fmt.Errorf("created preauth key timestamps are not fresh")
+	}
+	lifetime := key.Expiration.Sub(key.CreatedAt)
+	if lifetime > requested || requested-lifetime >= preauthTimestampSerializationWindow {
+		return fmt.Errorf("created preauth key lifetime changed")
+	}
+	return nil
 }
 
 func normalizePreauth(value preauthWire, listed bool) (PreauthKey, error) {

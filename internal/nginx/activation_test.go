@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 )
@@ -28,8 +29,16 @@ func TestActivationSnapshotRestoresExactPriorGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := InstallEntry(context.Background(), paths, owner, candidate); err != nil {
+	prospective, err := ProspectiveManifest(prior, candidate)
+	if err != nil {
 		t.Fatal(err)
+	}
+	installed, _, err := InstallEntry(context.Background(), paths, owner, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(prospective, installed) {
+		t.Fatal("prospective Nginx manifest differs from installed graph")
 	}
 	if _, err := RestoreActivation(context.Background(), paths, owner, candidate, snapshot); err != nil {
 		t.Fatal(err)

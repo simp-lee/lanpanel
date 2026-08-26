@@ -4,6 +4,7 @@ package control
 
 import (
 	"encoding/binary"
+	"fmt"
 	"lanpanel/internal/identity"
 	"os"
 	"path/filepath"
@@ -37,6 +38,79 @@ func TestHeadscaleEffectiveUnitObservationIsClosed(t *testing.T) {
 	if _, err := parseHeadscaleUnitProperties(append(raw, []byte("User=other\n")...)); err == nil {
 		t.Fatal("duplicate effective property accepted")
 	}
+}
+
+func TestHostListenersOnCandidatePortsDoNotBlockIsolatedCandidate(t *testing.T) {
+	procRoot := headscaleProcFixture(t, 42, false, map[string][]string{
+		"tcp": {
+			procNetworkRow("0100007F:1F90", "00000000:0000", "0A", 111),
+			procNetworkRow("0100007F:2382", "00000000:0000", "0A", 333),
+		},
+	})
+	if err := requireHostCandidateListenersAbsentAt(procRoot, 42); err != nil {
+		t.Fatalf("unrelated host 8080/9090 listeners blocked private candidate: %v", err)
+	}
+}
+
+func TestCandidateHostNetworkNamespaceEscapeIsRejected(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		table string
+		row   string
+	}{
+		{name: "TCP", table: "tcp", row: procNetworkRow("0100007F:1F90", "00000000:0000", "0A", 222)},
+		{name: "UDP", table: "udp", row: procNetworkRow("00000000:0D96", "00000000:0000", "07", 222)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			procRoot := headscaleProcFixture(t, 42, true, map[string][]string{test.table: {test.row}})
+			if err := requireHostCandidateListenersAbsentAt(procRoot, 42); err == nil {
+				t.Fatal("candidate host-network namespace escape was accepted")
+			}
+		})
+	}
+}
+
+func headscaleProcFixture(t *testing.T, pid int, sameNamespace bool, rows map[string][]string) string {
+	t.Helper()
+	root := t.TempDir()
+	hostNamespace := filepath.Join(root, "host-netns")
+	candidateNamespace := filepath.Join(root, "candidate-netns")
+	if err := os.WriteFile(hostNamespace, []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if sameNamespace {
+		candidateNamespace = hostNamespace
+	} else if err := os.WriteFile(candidateNamespace, []byte("candidate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for process, namespace := range map[int]string{1: hostNamespace, pid: candidateNamespace} {
+		nsRoot := filepath.Join(root, fmt.Sprintf("%d/ns", process))
+		if err := os.MkdirAll(nsRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(namespace, filepath.Join(nsRoot, "net")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	netRoot := filepath.Join(root, "1/net")
+	if err := os.MkdirAll(netRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+	for _, table := range []string{"tcp", "tcp6", "udp", "udp6"} {
+		data := header + strings.Join(rows[table], "\n")
+		if len(rows[table]) != 0 {
+			data += "\n"
+		}
+		if err := os.WriteFile(filepath.Join(netRoot, table), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func procNetworkRow(local, remote, state string, inode uint64) string {
+	return fmt.Sprintf("0: %s %s %s 00000000:00000000 00:00000000 00000000 0 0 %d", local, remote, state, inode)
 }
 
 func TestProtectedHeadscaleDatabaseRequiresSQLiteEnvelope(t *testing.T) {

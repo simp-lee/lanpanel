@@ -84,9 +84,23 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	if err := ValidateActivation(bundle); err != nil {
 		return result, err
 	}
-	priorManifest, err := nginx.Audit(host.nginxPaths, host.owner)
+	if err := ValidateActivationAuthority(bundle, authority); err != nil {
+		return result, err
+	}
+	if host == nil || host.launcher == nil {
+		return result, fmt.Errorf("headscale activation host authority unavailable")
+	}
+	activationSnapshot, err := nginx.SnapshotActivation(host.nginxPaths, host.owner, bundle.Entry)
 	if err != nil {
 		return result, err
+	}
+	priorManifest := activationSnapshot.Manifest
+	candidateManifest, err := nginx.ProspectiveManifest(priorManifest, bundle.Entry)
+	if err != nil {
+		return result, err
+	}
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: candidateManifest, Safety: authority.Safety, Installation: &authority.Installation, Ownership: authority.Ownership, Now: authority.ObservedAt}); !decision.Allowed {
+		return result, fmt.Errorf("headscale control pre-activation rejected: %s", decision.Reason)
 	}
 	runtimeHost, err := nginxactivation.NewFixedHost()
 	if err != nil {
@@ -109,36 +123,54 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 		priorGeneration = bundle.Certificate.Generation - 1
 	}
 	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, ExpectedPriorGeneration: priorGeneration}
-	pointerResult, err := certificates.ActivatePointer(ctx, pointer)
-	if err != nil {
-		return result, err
+	pointerResult, pointerErr := certificates.ActivatePointer(ctx, pointer)
+	if pointerResult.CandidateTarget == "" {
+		if pointerErr == nil {
+			pointerErr = fmt.Errorf("certificate pointer activation result is incomplete")
+		}
+		return result, pointerErr
 	}
 	result.CertificateTarget = pointerResult.CandidateTarget
-	installed := false
-	socketsStarted := false
+	entryMutationAttempted := false
+	socketMutationAttempted := false
 	defer func() {
 		if resultErr == nil {
 			return
 		}
 		recovery := context.Background()
-		var cleanup error
-		if socketsStarted {
-			cleanup = host.run(recovery, child.ProfileHeadscaleActivateStop, child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: bundle.Candidate.HeadscaleID}})
-		}
-		if installed {
-			_, _, removeErr := nginx.RemoveEntry(recovery, host.nginxPaths, host.owner, bundle.Entry)
-			cleanup = errors.Join(cleanup, removeErr, host.run(recovery, child.ProfileNginxTest, child.Invocation{}), host.run(recovery, child.ProfileNginxReloadSignal, child.Invocation{}))
-		}
-		cleanup = errors.Join(cleanup, certificates.RestorePointer(recovery, pointer, pointerResult.CandidateTarget))
+		cleanup := runActivationRollback(socketMutationAttempted, entryMutationAttempted, activationRollbackActions{
+			stopSockets: func() error {
+				return host.run(recovery, child.ProfileHeadscaleActivateStop, child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: bundle.Candidate.HeadscaleID}})
+			},
+			removeEntry: func() error {
+				_, restoreErr := nginx.RestoreActivation(recovery, host.nginxPaths, host.owner, bundle.Entry, activationSnapshot)
+				return restoreErr
+			},
+			testNginx: func() error {
+				return host.run(recovery, child.ProfileNginxTest, child.Invocation{})
+			},
+			reloadNginx: func() error {
+				currentRuntime, observeErr := runtimeHost.ObserveRuntime(recovery, priorManifest)
+				if observeErr != nil {
+					return observeErr
+				}
+				reloadErr := host.run(recovery, child.ProfileNginxReloadSignal, child.Invocation{})
+				_, waitErr := runtimeHost.WaitForPriorWorkers(recovery, priorManifest, currentRuntime.Workers)
+				return errors.Join(reloadErr, waitErr)
+			},
+			restorePointer: func() error {
+				return certificates.RestorePointer(recovery, pointer, pointerResult.CandidateTarget)
+			},
+		})
 		result.PriorRestored = cleanup == nil
 		resultErr = errors.Join(resultErr, cleanup)
 	}()
+	if pointerErr != nil {
+		return result, pointerErr
+	}
+	entryMutationAttempted = true
 	manifest, _, err := nginx.InstallEntry(ctx, host.nginxPaths, host.owner, bundle.Entry)
 	if err != nil {
-		return result, err
-	}
-	installed = true
-	if err := ValidateActivationAuthority(bundle, authority); err != nil {
 		return result, err
 	}
 	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: authority.Safety, Installation: &authority.Installation, Ownership: authority.Ownership, Now: authority.ObservedAt}); !decision.Allowed {
@@ -151,10 +183,10 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 		return result, err
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: bundle.Candidate.HeadscaleID}}
+	socketMutationAttempted = true
 	if err := host.run(ctx, child.ProfileHeadscaleActivateStart, invocation); err != nil {
 		return result, err
 	}
-	socketsStarted = true
 	if err := host.run(ctx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
 		return result, err
 	}
@@ -177,6 +209,32 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	result.NginxDigest = manifest.MainDigest
 	result.RuntimeDigest = hashBytes([]byte(bundle.Digest + "\x00" + manifest.GenerationID + "\x00" + runtimeDigest + "\x00stun-ok\x00" + effectiveDigest))
 	return result, nil
+}
+
+type activationRollbackActions struct {
+	stopSockets    func() error
+	removeEntry    func() error
+	testNginx      func() error
+	reloadNginx    func() error
+	restorePointer func() error
+}
+
+func runActivationRollback(socketMutationAttempted, entryMutationAttempted bool, actions activationRollbackActions) error {
+	var rollbackErr error
+	if socketMutationAttempted {
+		rollbackErr = errors.Join(rollbackErr, actions.stopSockets())
+	}
+	if entryMutationAttempted {
+		removeErr := actions.removeEntry()
+		rollbackErr = errors.Join(rollbackErr, removeErr)
+		testErr := actions.testNginx()
+		rollbackErr = errors.Join(rollbackErr, testErr)
+		if removeErr == nil && testErr == nil {
+			rollbackErr = errors.Join(rollbackErr, actions.reloadNginx())
+		}
+	}
+	restoreErr := actions.restorePointer()
+	return errors.Join(rollbackErr, restoreErr)
 }
 
 func headscaleChallengeEntry(bundle ActivationBundle, prepared challenge.Prepared) (nginx.Entry, error) {

@@ -413,29 +413,49 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 
 // Contract removes only manifest-bound App/challenge/temporary entries. It
 // never restores an enable after the caller has persisted contraction authority.
+func ProspectiveManifest(manifest Manifest, entry Entry) (Manifest, error) {
+	prospective, _, _, err := prospectiveManifestEntry(manifest, entry)
+	return prospective, err
+}
+
+func prospectiveManifestEntry(manifest Manifest, entry Entry) (Manifest, bool, []byte, error) {
+	if err := ValidateManifest(manifest); err != nil {
+		return Manifest{}, false, nil, err
+	}
+	manifest.Entries = append([]Entry(nil), manifest.Entries...)
+	replaceIndex := -1
+	for index, current := range manifest.Entries {
+		if current.Relative == entry.Relative || current.ResourceID == entry.ResourceID && current.Kind == entry.Kind {
+			if current.Relative != entry.Relative || current.ResourceID != entry.ResourceID || current.Kind != entry.Kind {
+				return Manifest{}, false, nil, fmt.Errorf("nginx active entry identity conflicts")
+			}
+			replaceIndex = index
+		}
+	}
+	data, err := RenderEntry(entry)
+	if err != nil {
+		return Manifest{}, false, nil, err
+	}
+	entry.Digest = digest(data)
+	if replaceIndex >= 0 {
+		manifest.Entries = append(manifest.Entries[:replaceIndex], manifest.Entries[replaceIndex+1:]...)
+	}
+	manifest.Entries = canonicalEntries(append(manifest.Entries, entry))
+	if err := ValidateManifest(manifest); err != nil {
+		return Manifest{}, false, nil, err
+	}
+	return manifest, replaceIndex >= 0, data, nil
+}
+
 func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry Entry) (Manifest, []string, error) {
 	manifest, err := Audit(paths, owner)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	replaceIndex := -1
-	for index, current := range manifest.Entries {
-		if current.Relative == entry.Relative || current.ResourceID == entry.ResourceID && current.Kind == entry.Kind {
-			if current.Relative != entry.Relative || current.ResourceID != entry.ResourceID || current.Kind != entry.Kind {
-				return Manifest{}, nil, fmt.Errorf("nginx active entry identity conflicts")
-			}
-			replaceIndex = index
-		}
-	}
-	if replaceIndex >= 0 {
-		manifest.Entries = append(manifest.Entries[:replaceIndex], manifest.Entries[replaceIndex+1:]...)
-	}
-	data, err := RenderEntry(entry)
+	manifest, replacing, data, err := prospectiveManifestEntry(manifest, entry)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	entry.Digest = digest(data)
-	manifest.Entries = canonicalEntries(append(manifest.Entries, entry))
 	txn, err := filetxn.Open(filetxn.Config{RootPath: paths.ConfigRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingPath: paths.StagingPath(), Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}}, filetxn.Options{})
 	if err != nil {
 		return Manifest{}, nil, err
@@ -445,7 +465,7 @@ func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry E
 	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative))
 	var existing *filetxn.Metadata
 	mode := filetxn.CreateOnly
-	if replaceIndex >= 0 {
+	if replacing {
 		existing = &metadata
 		mode = filetxn.ReplaceOnly
 	}

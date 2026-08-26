@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -51,7 +52,7 @@ func (runtime *SystemdRuntime) RequireAbsent(ctx context.Context, candidate Cand
 	if properties["Id"] != "lanpanel-headscale.service" || properties["LoadState"] != "not-found" || properties["ActiveState"] != "inactive" || properties["MainPID"] != "0" || properties["FragmentPath"] != "" || properties["DropInPaths"] != "" {
 		return fmt.Errorf("foreign Headscale service authority already exists")
 	}
-	return requireHostCandidateListenersAbsent()
+	return nil
 }
 
 func (runtime *SystemdRuntime) InitializeDatabase(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (DatabaseEvidence, error) {
@@ -94,10 +95,6 @@ func (runtime *SystemdRuntime) StartAndProbe(ctx context.Context, rendered Rende
 		_ = runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
 		return ServiceEvidence{}, err
 	}
-	if err := requireHostCandidateListenersAbsent(); err != nil {
-		_ = runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
-		return ServiceEvidence{}, err
-	}
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: hashBytes(append([]byte(rendered.Candidate.ServiceIdentity+"\x00"), show...)), PublicSTUNOpen: false}, nil
 }
 
@@ -108,9 +105,6 @@ func (runtime *SystemdRuntime) ObserveActive(ctx context.Context, rendered Rende
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
 	show, err := runtime.show(ctx, invocation, rendered, account, true)
 	if err != nil {
-		return ServiceEvidence{}, err
-	}
-	if err := requireHostCandidateListenersAbsent(); err != nil {
 		return ServiceEvidence{}, err
 	}
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: hashBytes(append([]byte(rendered.Candidate.ServiceIdentity+"\x00"), show...)), PublicSTUNOpen: false}, nil
@@ -128,9 +122,8 @@ func (runtime *SystemdRuntime) StopAndVerify(ctx context.Context, candidate Cand
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: candidate.HeadscaleID}}
 	stopErr := runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
 	show, showErr := runtime.show(context.WithoutCancel(ctx), invocation, Rendered{Candidate: candidate}, account, false)
-	listenerErr := requireHostCandidateListenersAbsent()
 	_ = show
-	return errors.Join(stopErr, showErr, listenerErr)
+	return errors.Join(stopErr, showErr)
 }
 
 func (runtime *SystemdRuntime) run(ctx context.Context, profile child.ProfileID, invocation child.Invocation) error {
@@ -167,6 +160,13 @@ func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invoca
 	if active {
 		if properties["ActiveState"] != "active" || properties["SubState"] != "running" || properties["MainPID"] == "" || properties["MainPID"] == "0" {
 			return nil, fmt.Errorf("headscale candidate service is not privately probed")
+		}
+		mainPID, err := strconv.Atoi(properties["MainPID"])
+		if err != nil || mainPID <= 1 {
+			return nil, fmt.Errorf("headscale candidate MainPID is invalid")
+		}
+		if err := requireHostCandidateListenersAbsent(mainPID); err != nil {
+			return nil, err
 		}
 	} else if properties["ActiveState"] != "inactive" || properties["SubState"] == "running" || properties["MainPID"] != "0" {
 		return nil, fmt.Errorf("headscale candidate service remained active")
@@ -283,25 +283,24 @@ func protectedRuntimeFile(path string, account identity.AccountIdentity, sqliteM
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), true, nil
 }
 
-func requireHostCandidateListenersAbsent() error {
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"} {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			_, port, ok := strings.Cut(fields[1], ":")
-			if !ok {
-				continue
-			}
-			if port == "1F90" || port == "C50B" || port == "2382" || port == "0D96" {
-				return fmt.Errorf("headscale candidate endpoint escaped private network namespace")
-			}
-		}
+func requireHostCandidateListenersAbsent(mainPID int) error {
+	return requireHostCandidateListenersAbsentAt("/proc", mainPID)
+}
+
+func requireHostCandidateListenersAbsentAt(procRoot string, mainPID int) error {
+	if !filepath.IsAbs(procRoot) || filepath.Clean(procRoot) != procRoot || mainPID <= 1 {
+		return fmt.Errorf("headscale candidate listener authority is invalid")
+	}
+	hostNamespace, err := os.Stat(filepath.Join(procRoot, "1", "ns", "net"))
+	if err != nil {
+		return fmt.Errorf("observe host network namespace: %w", err)
+	}
+	candidateNamespace, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(mainPID), "ns", "net"))
+	if err != nil {
+		return fmt.Errorf("observe Headscale candidate network namespace: %w", err)
+	}
+	if os.SameFile(hostNamespace, candidateNamespace) {
+		return fmt.Errorf("headscale candidate endpoint escaped private network namespace")
 	}
 	return nil
 }
