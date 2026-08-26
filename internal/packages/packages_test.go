@@ -113,6 +113,18 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 	}
 }
 
+func TestRuntimeSnapshotCloneOwnsNestedPackageSlices(t *testing.T) {
+	plan := testPlan(t, StagedDebs)
+	original := RuntimeSnapshot{Installed: clonePackages(plan.Packages)}
+	cloned := cloneRuntimeSnapshot(original)
+	original.Installed[1].AffectedUnits[0] = "other.service"
+	original.Installed[1].PossibleListeners[0] = "tcp/8080"
+	original.Installed[1].Source.OfficialAuthorities[0] = "other.example.test"
+	if cloned.Installed[1].AffectedUnits[0] != "nginx.service" || cloned.Installed[1].PossibleListeners[0] != "tcp/443" || cloned.Installed[1].Source.OfficialAuthorities[0] != "downloads.example.test" {
+		t.Fatalf("runtime snapshot clone shared nested package slices: %#v", cloned.Installed[1])
+	}
+}
+
 func TestPackageTransactionRequiresFreshSharedExpansionPreflight(t *testing.T) {
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
@@ -131,6 +143,36 @@ func TestPackageTransactionRequiresFreshSharedExpansionPreflight(t *testing.T) {
 	engine.Now = func() time.Time { return result.ValidUntil.Add(time.Nanosecond) }
 	if _, err := engine.Execute(context.Background(), plan, result); err == nil {
 		t.Fatal("package transaction accepted stale preflight")
+	}
+}
+
+func TestPackageResumePreflightErrorsReturnFencedJournal(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	tests := []struct {
+		name   string
+		change func(*Engine, *preflight.Result)
+	}{
+		{name: "blocked", change: func(_ *Engine, result *preflight.Result) {
+			result.Allowed = false
+			result.Findings[0].Disposition = preflight.FindingBlocked
+		}},
+		{name: "deadline", change: func(engine *Engine, _ *preflight.Result) {
+			engine.Now = func() time.Time { return plan.Deadline }
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := newFakeExecutor(plan)
+			journal := testJournal(t, plan, executor.audit.Before, JournalPrepared, nil)
+			current := journal
+			journals := &memoryJournals{current: &current}
+			engine, result := testEngine(journals, executor, &fakeMonitor{})
+			test.change(&engine, &result)
+			resumed, err := engine.Resume(context.Background(), plan, result, journal)
+			if err == nil || !reflect.DeepEqual(resumed, journal) || !reflect.DeepEqual(*journals.current, journal) || executor.mutationCount() != 0 {
+				t.Fatalf("preflight error lost fenced journal: resumed=%#v durable=%#v calls=%d err=%v", resumed, journals.current, executor.mutationCount(), err)
+			}
+		})
 	}
 }
 
@@ -159,10 +201,11 @@ func TestPackageTransactionJournalsMasksMonitorsAndUsesTypedChild(t *testing.T) 
 func TestPackageTransactionPreservesPreparedJournalAcrossMaskCommitFault(t *testing.T) {
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
+	prior := cloneRuntimeSnapshot(executor.audit.Before)
 	journals := &memoryJournals{failAt: JournalMasksApplied}
 	engine, result := testEngine(journals, executor, &fakeMonitor{})
 	journal, err := engine.Execute(context.Background(), plan, result)
-	if err == nil || journal.Phase != JournalMasking || len(journal.Masks) != 1 || len(executor.unmasked) != 0 || !reflect.DeepEqual(journal.Prior, executor.audit.Before) {
+	if err == nil || journal.Phase != JournalMasking || len(journal.Masks) != 1 || len(executor.unmasked) != 0 || !reflect.DeepEqual(journal.Prior, prior) {
 		t.Fatalf("journal=%#v unmasked=%v error=%v", journal, executor.unmasked, err)
 	}
 }
@@ -249,6 +292,319 @@ func TestCommittedPackageCleanupResumesAfterPlanAndPreflightExpiry(t *testing.T)
 	}
 }
 
+func TestPackageResumeRejectsRuntimeDriftBeforeNextMutation(t *testing.T) {
+	phases := []JournalPhase{JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasksApplied}
+	drifts := []struct {
+		name   string
+		change func(*RuntimeSnapshot, Plan)
+	}{
+		{name: "installed", change: func(snapshot *RuntimeSnapshot, plan Plan) {
+			snapshot.Installed = clonePackages(plan.Packages[:1])
+		}},
+		{name: "system_packages", change: func(snapshot *RuntimeSnapshot, _ Plan) {
+			snapshot.SystemPackages[0].Version = "2"
+		}},
+		{name: "unit", change: func(snapshot *RuntimeSnapshot, _ Plan) {
+			snapshot.Units[0].Active = true
+		}},
+		{name: "listener", change: func(snapshot *RuntimeSnapshot, _ Plan) {
+			snapshot.Listeners[0].Port = 23
+		}},
+	}
+	for _, phase := range phases {
+		for _, drift := range drifts {
+			t.Run(string(phase)+"/"+drift.name, func(t *testing.T) {
+				plan := testPlan(t, OfflineDebs)
+				executor := newFakeExecutor(plan)
+				masks := []MaskIdentity(nil)
+				if phase == JournalMasksApplied {
+					masks = []MaskIdentity{{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1}}
+				}
+				journal := testJournal(t, plan, executor.audit.Before, phase, masks)
+				if phase == JournalMasksApplied {
+					executor.audit.Before.Units[0].Masked = true
+				}
+				current := journal
+				journals := &memoryJournals{current: &current}
+				drift.change(&executor.audit.Before, plan)
+				engine, result := testEngine(journals, executor, &fakeMonitor{})
+				resumed, err := engine.Resume(context.Background(), plan, result, journal)
+				if err == nil || resumed.Phase != phase {
+					t.Fatalf("drift resumed from %s: journal=%#v err=%v", phase, resumed, err)
+				}
+				if executor.mutationCount() != 0 || !reflect.DeepEqual(*journals.current, journal) {
+					t.Fatalf("drift mutated after %s: calls=%d durable=%#v", phase, executor.mutationCount(), journals.current)
+				}
+			})
+		}
+	}
+}
+
+func TestPackageResumeAcceptsExactPreMaskRuntime(t *testing.T) {
+	for _, phase := range []JournalPhase{JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged} {
+		t.Run(string(phase), func(t *testing.T) {
+			plan := testPlan(t, OfflineDebs)
+			executor := newFakeExecutor(plan)
+			journal := testJournal(t, plan, executor.audit.Before, phase, nil)
+			current := journal
+			journals := &memoryJournals{current: &current}
+			engine, result := testEngine(journals, executor, &fakeMonitor{})
+			resumed, err := engine.Resume(context.Background(), plan, result, journal)
+			if err != nil || resumed.Phase != JournalCleaned || executor.runCount != 1 {
+				t.Fatalf("exact %s runtime did not recover: journal=%#v runs=%d err=%v", phase, resumed, executor.runCount, err)
+			}
+		})
+	}
+}
+
+func TestPackageResumeRejectsUnsafeNoAutostartPolicyBeforeMutation(t *testing.T) {
+	for _, phase := range []JournalPhase{JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasksApplied} {
+		t.Run(string(phase), func(t *testing.T) {
+			plan := testPlan(t, OfflineDebs)
+			executor := newFakeExecutor(plan)
+			masks := []MaskIdentity(nil)
+			if phase == JournalMasksApplied {
+				masks = []MaskIdentity{{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1}}
+			}
+			journal := testJournal(t, plan, executor.audit.Before, phase, masks)
+			if phase == JournalMasksApplied {
+				executor.audit.Before.Units[0].Masked = true
+			}
+			executor.audit.NoAutostart.Mode = 0o644
+			current := journal
+			journals := &memoryJournals{current: &current}
+			engine, result := testEngine(journals, executor, &fakeMonitor{})
+			resumed, err := engine.Resume(context.Background(), plan, result, journal)
+			if err == nil || resumed.Phase != phase || executor.mutationCount() != 0 || !reflect.DeepEqual(*journals.current, journal) {
+				t.Fatalf("unsafe policy resumed %s: journal=%#v calls=%d durable=%#v err=%v", phase, resumed, executor.mutationCount(), journals.current, err)
+			}
+		})
+	}
+}
+
+func TestPackageResumeMaskingAllowsOnlyPersistedMaskRuntimeDifference(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	identity := MaskIdentity{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1}
+
+	t.Run("persisted mask", func(t *testing.T) {
+		executor := newFakeExecutor(plan)
+		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{identity})
+		executor.audit.Before.Units[0].Masked = true
+		current := journal
+		journals := &memoryJournals{current: &current}
+		engine, result := testEngine(journals, executor, &fakeMonitor{})
+		resumed, err := engine.Resume(context.Background(), plan, result, journal)
+		if err != nil || resumed.Phase != JournalCleaned || executor.maskCount != 0 || executor.runCount != 1 {
+			t.Fatalf("exact persisted mask did not resume: journal=%#v masks=%d runs=%d err=%v", resumed, executor.maskCount, executor.runCount, err)
+		}
+	})
+
+	t.Run("missing persisted effect", func(t *testing.T) {
+		executor := newFakeExecutor(plan)
+		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{identity})
+		current := journal
+		journals := &memoryJournals{current: &current}
+		engine, result := testEngine(journals, executor, &fakeMonitor{})
+		if _, err := engine.Resume(context.Background(), plan, result, journal); err == nil {
+			t.Fatal("recorded created mask was accepted while runtime remained unmasked")
+		}
+		if executor.mutationCount() != 0 || !reflect.DeepEqual(*journals.current, journal) {
+			t.Fatalf("missing mask effect changed fenced journal: calls=%d durable=%#v", executor.mutationCount(), journals.current)
+		}
+	})
+
+	t.Run("unpersisted unrelated mask", func(t *testing.T) {
+		executor := newFakeExecutor(plan)
+		executor.audit.Before.Units = append(executor.audit.Before.Units, UnitState{Name: "other.service"})
+		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{identity})
+		executor.audit.Before.Units[0].Masked = true
+		executor.audit.Before.Units[1].Masked = true
+		current := journal
+		journals := &memoryJournals{current: &current}
+		engine, result := testEngine(journals, executor, &fakeMonitor{})
+		if _, err := engine.Resume(context.Background(), plan, result, journal); err == nil {
+			t.Fatal("unpersisted unit mask was adopted during resume")
+		}
+		if executor.mutationCount() != 0 || !reflect.DeepEqual(*journals.current, journal) {
+			t.Fatalf("unpersisted mask changed fenced journal: calls=%d durable=%#v", executor.mutationCount(), journals.current)
+		}
+	})
+
+	t.Run("unpersisted affected mask", func(t *testing.T) {
+		plan := testPlanWithTwoUnits(t)
+		executor := newFakeExecutor(plan)
+		units := affectedUnits(plan.Packages)
+		prefix := []MaskIdentity{{Unit: units[0], Device: 1, Inode: 1, CTimeSec: 1}}
+		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, prefix)
+		executor.audit.Before.Units[0].Masked = true
+		executor.audit.Before.Units[1].Masked = true
+		current := journal
+		journals := &memoryJournals{current: &current}
+		engine, result := testEngine(journals, executor, &fakeMonitor{})
+		if _, err := engine.Resume(context.Background(), plan, result, journal); err == nil {
+			t.Fatal("unpersisted affected-unit mask was re-adopted during resume")
+		}
+		if executor.mutationCount() != 0 || !reflect.DeepEqual(*journals.current, journal) {
+			t.Fatalf("affected-unit adoption changed fenced prefix: calls=%d durable=%#v", executor.mutationCount(), journals.current)
+		}
+	})
+}
+
+func TestPackageMaskCallbackRequiresExactUnitPrefix(t *testing.T) {
+	plan := testPlanWithTwoUnits(t)
+	units := affectedUnits(plan.Packages)
+	exact := []MaskIdentity{
+		{Unit: units[0], Device: 1, Inode: 1, CTimeSec: 1},
+		{Unit: units[1], Device: 1, Inode: 2, CTimeSec: 1},
+	}
+	wrongOwnership := exact[0]
+	wrongOwnership.Preexisting = true
+	tests := []struct {
+		name      string
+		callbacks []MaskIdentity
+		persisted int
+	}{
+		{name: "wrong first unit", callbacks: []MaskIdentity{exact[1]}},
+		{name: "wrong ownership", callbacks: []MaskIdentity{wrongOwnership}},
+		{name: "duplicate unit", callbacks: []MaskIdentity{exact[0], exact[0]}, persisted: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := newFakeExecutor(plan)
+			executor.maskFunc = func(_ []string, persist func(MaskIdentity) error) (MaskResult, error) {
+				persisted := []MaskIdentity{}
+				for _, identity := range test.callbacks {
+					if err := persist(identity); err != nil {
+						return MaskResult{Masks: persisted}, err
+					}
+					persisted = append(persisted, identity)
+				}
+				return MaskResult{Masks: persisted}, nil
+			}
+			journals := &memoryJournals{}
+			engine, result := testEngine(journals, executor, &fakeMonitor{})
+			journal, err := engine.Execute(context.Background(), plan, result)
+			if err == nil || journal.Phase != JournalMasking || len(journal.Masks) != test.persisted || executor.runCount != 0 {
+				t.Fatalf("callback prefix accepted: journal=%#v runs=%d err=%v", journal, executor.runCount, err)
+			}
+		})
+	}
+}
+
+func TestPackageMaskResultMustEqualPersistedIdentities(t *testing.T) {
+	plan := testPlanWithTwoUnits(t)
+	units := affectedUnits(plan.Packages)
+	recorded := []MaskIdentity{
+		{Unit: units[0], Device: 1, Inode: 1, CTimeSec: 1},
+		{Unit: units[1], Device: 1, Inode: 2, CTimeSec: 1},
+	}
+	tests := []struct {
+		name   string
+		result func([]MaskIdentity) []MaskIdentity
+	}{
+		{name: "identity", result: func(values []MaskIdentity) []MaskIdentity {
+			values[0].Inode++
+			return values
+		}},
+		{name: "list", result: func(values []MaskIdentity) []MaskIdentity { return values[:1] }},
+		{name: "order", result: func(values []MaskIdentity) []MaskIdentity {
+			return []MaskIdentity{values[1], values[0]}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor := newFakeExecutor(plan)
+			executor.maskFunc = func(_ []string, persist func(MaskIdentity) error) (MaskResult, error) {
+				for _, identity := range recorded {
+					if err := persist(identity); err != nil {
+						return MaskResult{}, err
+					}
+				}
+				returned := test.result(append([]MaskIdentity(nil), recorded...))
+				return MaskResult{Masks: returned}, nil
+			}
+			journals := &memoryJournals{}
+			engine, result := testEngine(journals, executor, &fakeMonitor{})
+			journal, err := engine.Execute(context.Background(), plan, result)
+			if err == nil || journal.Phase != JournalMasking || !slices.Equal(journal.Masks, recorded) || executor.runCount != 0 || len(executor.unmaskCalls) != 0 {
+				t.Fatalf("mask result mismatch was accepted: journal=%#v runs=%d unmask=%#v err=%v", journal, executor.runCount, executor.unmaskCalls, err)
+			}
+			if journals.current == nil || !reflect.DeepEqual(*journals.current, journal) {
+				t.Fatalf("exact persisted mask journal was not retained: %#v", journals.current)
+			}
+		})
+	}
+}
+
+func TestMaskingTransitionCannotRewritePersistedIdentity(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	mask := MaskIdentity{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1, CTimeNsec: 1}
+	before := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{mask})
+	after := before
+	after.Phase = JournalMasksApplied
+	after.MasksComplete = true
+	if err := ValidateJournalTransition(before, after); err != nil {
+		t.Fatalf("exact mask completion transition failed: %v", err)
+	}
+	changes := []struct {
+		name   string
+		change func(*MaskIdentity)
+	}{
+		{name: "unit", change: func(value *MaskIdentity) { value.Unit = "other.service" }},
+		{name: "preexisting", change: func(value *MaskIdentity) { value.Preexisting = true }},
+		{name: "device", change: func(value *MaskIdentity) { value.Device++ }},
+		{name: "inode", change: func(value *MaskIdentity) { value.Inode++ }},
+		{name: "ctime_sec", change: func(value *MaskIdentity) { value.CTimeSec++ }},
+		{name: "ctime_nsec", change: func(value *MaskIdentity) { value.CTimeNsec++ }},
+	}
+	for _, change := range changes {
+		t.Run(change.name, func(t *testing.T) {
+			rewritten := after
+			rewritten.Masks = append([]MaskIdentity(nil), after.Masks...)
+			change.change(&rewritten.Masks[0])
+			if err := ValidateJournalTransition(before, rewritten); err == nil {
+				t.Fatal("mask identity rewrite was accepted")
+			}
+		})
+	}
+}
+
+func TestPackageTransactionNeverDeletesPreexistingMask(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	executor.audit.Before.Units[0].Masked = true
+	journals := &memoryJournals{}
+	engine, result := testEngine(journals, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err != nil || journal.Phase != JournalCleaned || len(journal.Masks) != 1 || !journal.Masks[0].Preexisting {
+		t.Fatalf("preexisting mask transaction failed: journal=%#v err=%v", journal, err)
+	}
+	if len(executor.unmaskCalls) != 1 || len(executor.unmaskCalls[0]) != 0 {
+		t.Fatalf("preexisting mask reached unmask: %#v", executor.unmaskCalls)
+	}
+	if len(executor.verifyCalls) == 0 || !slices.Equal(executor.verifyCalls[len(executor.verifyCalls)-1], journal.Masks) {
+		t.Fatalf("preexisting mask was not verified before cleanup: %#v", executor.verifyCalls)
+	}
+
+	executor = newFakeExecutor(plan)
+	executor.audit.Before.Units[0].Masked = true
+	identity := MaskIdentity{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1}
+	committed := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{identity})
+	committed.Phase = JournalCommitted
+	committed.MasksComplete = true
+	committed.ChildSucceeded = true
+	committed.ChildResultDigest = strings.Repeat("3", 64)
+	committed.PostconditionDigest = strings.Repeat("4", 64)
+	current := committed
+	journals = &memoryJournals{current: &current}
+	engine, result = testEngine(journals, executor, &fakeMonitor{})
+	resumed, err := engine.Resume(context.Background(), plan, result, committed)
+	if err == nil || resumed.Phase != JournalCommitted || len(executor.unmaskCalls) != 0 || !reflect.DeepEqual(*journals.current, committed) {
+		t.Fatalf("wrong ownership reached cleanup: journal=%#v unmask=%#v err=%v", resumed, executor.unmaskCalls, err)
+	}
+}
+
 func TestPackageTransactionPreservesPartialJournalAndMasksOnTimeout(t *testing.T) {
 	plan := testPlan(t, OfflineDebs)
 	executor := newFakeExecutor(plan)
@@ -318,11 +674,53 @@ func testPlan(t *testing.T, mode Mode) Plan {
 	return plan
 }
 
+func testPlanWithTwoUnits(t *testing.T) Plan {
+	t.Helper()
+	plan := testPlan(t, OfflineDebs)
+	plan.Packages = clonePackages(plan.Packages)
+	plan.Packages[1].AffectedUnits = []string{"nginx.service", "nginx.socket"}
+	closure, err := ClosureDigest(plan.Packages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Authority.FrozenClosureDigest = closure
+	return plan
+}
+
+func testJournal(t *testing.T, plan Plan, prior RuntimeSnapshot, phase JournalPhase, masks []MaskIdentity) Journal {
+	t.Helper()
+	planDigest, authorityDigest, err := transactionDigests(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := Journal{
+		SchemaVersion:   PackageJournalSchemaVersion,
+		TransactionID:   plan.TransactionID,
+		NormalJournalID: "package-" + plan.TransactionID,
+		ChildID:         "package-child-" + plan.TransactionID,
+		JobID:           plan.JobID,
+		PlanDigest:      planDigest,
+		AuthorityDigest: authorityDigest,
+		PackageProfile:  child.ProfileAPTOfflineTransaction,
+		Prior:           cloneRuntimeSnapshot(prior),
+		Phase:           phase,
+		Masks:           append([]MaskIdentity{}, masks...),
+	}
+	if phase == JournalMasksApplied {
+		journal.MasksComplete = true
+	}
+	if err := ValidateJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	return journal
+}
+
 func clonePackages(values []Package) []Package {
 	result := append([]Package(nil), values...)
 	for index := range result {
 		result[index].AffectedUnits = append([]string(nil), result[index].AffectedUnits...)
 		result[index].PossibleListeners = append([]string(nil), result[index].PossibleListeners...)
+		result[index].Source.OfficialAuthorities = slices.Clone(result[index].Source.OfficialAuthorities)
 	}
 	return result
 }
@@ -360,17 +758,30 @@ func (store *memoryJournals) Advance(_ context.Context, before, after Journal) e
 }
 
 type fakeExecutor struct {
-	audit      Audit
-	observed   Postcondition
-	profile    child.ProfileID
-	invocation child.Invocation
-	unmasked   []string
-	runErr     error
-	runCount   int
+	audit        Audit
+	observed     Postcondition
+	profile      child.ProfileID
+	invocation   child.Invocation
+	unmasked     []string
+	unmaskCalls  [][]MaskIdentity
+	verifyCalls  [][]MaskIdentity
+	maskFunc     func([]string, func(MaskIdentity) error) (MaskResult, error)
+	runErr       error
+	prepareCount int
+	stageCount   int
+	resolveCount int
+	maskCount    int
+	runCount     int
 }
 
 func newFakeExecutor(plan Plan) *fakeExecutor {
-	before := RuntimeSnapshot{SystemPackages: []InstalledPackage{{Name: "base-files", Version: "1", Architecture: "amd64"}}, Units: []UnitState{{Name: "nginx.service"}}, Listeners: []Listener{{Protocol: "tcp", Port: 22, Owner: "sshd"}}}
+	units := make([]UnitState, 0, len(affectedUnits(plan.Packages)))
+	maskedUnits := make([]UnitState, 0, len(affectedUnits(plan.Packages)))
+	for _, unit := range affectedUnits(plan.Packages) {
+		units = append(units, UnitState{Name: unit})
+		maskedUnits = append(maskedUnits, UnitState{Name: unit, Masked: true})
+	}
+	before := RuntimeSnapshot{SystemPackages: []InstalledPackage{{Name: "base-files", Version: "1", Architecture: "amd64"}}, Units: units, Listeners: []Listener{{Protocol: "tcp", Port: 22, Owner: "sshd"}}}
 	configuration := []ObservedConfig{{Path: "/etc/apt/apt.conf", Kind: APTConfig, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte("// safe\n")}}
 	repositories := []ObservedRepository{}
 	if plan.Mode == DistroRepository {
@@ -385,14 +796,20 @@ func newFakeExecutor(plan Plan) *fakeExecutor {
 	htpasswd := &FileIdentity{Path: "/usr/bin/htpasswd", UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, Digest: strings.Repeat("8", 64)}
 	systemPackages := append(append([]InstalledPackage(nil), before.SystemPackages...), InstalledPackage{Name: "apache2-utils", Version: plan.Packages[0].Version, Architecture: "amd64"}, InstalledPackage{Name: "nginx", Version: plan.Packages[1].Version, Architecture: "amd64"})
 	slices.SortFunc(systemPackages, func(left, right InstalledPackage) int { return strings.Compare(left.Name, right.Name) })
-	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: []UnitState{{Name: "nginx.service", Masked: true}}, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
+	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: maskedUnits, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
 }
 
 func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
-	return executor.audit, nil
+	audit := executor.audit
+	audit.Before = cloneRuntimeSnapshot(executor.audit.Before)
+	return audit, nil
 }
-func (executor *fakeExecutor) Stage(_ context.Context, _ Plan) error { return nil }
+func (executor *fakeExecutor) Stage(_ context.Context, _ Plan) error {
+	executor.stageCount++
+	return nil
+}
 func (executor *fakeExecutor) Prepare(_ context.Context, _ Plan, config, _ []byte) error {
+	executor.prepareCount++
 	if len(config) == 0 {
 		return errors.New("missing package config")
 	}
@@ -400,13 +817,23 @@ func (executor *fakeExecutor) Prepare(_ context.Context, _ Plan, config, _ []byt
 }
 
 func (executor *fakeExecutor) Resolve(_ context.Context, plan Plan) ([]Package, error) {
+	executor.resolveCount++
 	return clonePackages(plan.Packages), nil
 }
 
 func (executor *fakeExecutor) Mask(_ context.Context, units []string, persist func(MaskIdentity) error) (MaskResult, error) {
+	executor.maskCount++
+	if executor.maskFunc != nil {
+		return executor.maskFunc(units, persist)
+	}
 	identities := make([]MaskIdentity, 0, len(units))
-	for index, unit := range units {
-		identity := MaskIdentity{Unit: unit, Device: 1, Inode: uint64(index + 1), CTimeSec: 1}
+	for _, unit := range units {
+		index := slices.IndexFunc(executor.audit.Before.Units, func(state UnitState) bool { return state.Name == unit })
+		if index < 0 {
+			return MaskResult{Masks: identities}, fmt.Errorf("unknown fake unit %q", unit)
+		}
+		identity := MaskIdentity{Unit: unit, Preexisting: executor.audit.Before.Units[index].Masked, Device: 1, Inode: uint64(index + 1), CTimeSec: 1}
+		executor.audit.Before.Units[index].Masked = true
 		if err := persist(identity); err != nil {
 			return MaskResult{Masks: identities}, err
 		}
@@ -416,6 +843,7 @@ func (executor *fakeExecutor) Mask(_ context.Context, units []string, persist fu
 }
 
 func (executor *fakeExecutor) VerifyMasks(_ context.Context, masks []MaskIdentity) error {
+	executor.verifyCalls = append(executor.verifyCalls, append([]MaskIdentity(nil), masks...))
 	if !validMaskIdentities(masks) {
 		return errors.New("invalid masks")
 	}
@@ -433,8 +861,18 @@ func (executor *fakeExecutor) Observe(_ context.Context, _ Plan) (Postcondition,
 }
 
 func (executor *fakeExecutor) Unmask(_ context.Context, masks []MaskIdentity) error {
-	executor.unmasked = createdMaskNames(masks)
+	executor.unmaskCalls = append(executor.unmaskCalls, append([]MaskIdentity(nil), masks...))
+	for _, mask := range masks {
+		if mask.Preexisting {
+			return errors.New("fake executor was asked to remove a preexisting mask")
+		}
+	}
+	executor.unmasked = maskNames(masks)
 	return nil
+}
+
+func (executor *fakeExecutor) mutationCount() int {
+	return executor.prepareCount + executor.stageCount + executor.resolveCount + executor.maskCount + executor.runCount
 }
 
 type fakeMonitor struct {

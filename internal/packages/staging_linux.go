@@ -51,7 +51,7 @@ func (stager *ArtifactStager) Stage(ctx context.Context, plan Plan) error {
 		name := pkg.ArtifactDigest + ".deb"
 		target := filepath.Join(directory, name)
 		if _, err := os.Lstat(target); err == nil {
-			if err := validateStagedPath(target, pkg); err != nil {
+			if err := validateStagedPath(target, pkg, stager.Files.strict); err != nil {
 				return err
 			}
 			continue
@@ -107,6 +107,10 @@ func (stager *ArtifactStager) stageDistroCache(ctx context.Context, plan Plan, s
 	if err != nil {
 		return fmt.Errorf("enumerate distro package cache: %w", err)
 	}
+	owner, group := uint32(0), uint32(0)
+	if !stager.Files.strict {
+		owner, group = uint32(os.Geteuid()), uint32(os.Getegid())
+	}
 	matched := map[string]bool{}
 	for _, entry := range entries {
 		if entry.Name() == "lock" || entry.Name() == "partial" && entry.IsDir() {
@@ -125,7 +129,7 @@ func (stager *ArtifactStager) stageDistroCache(ctx context.Context, plan Plan, s
 			return fmt.Errorf("distro package cache descriptor is invalid")
 		}
 		var stat unix.Stat_t
-		if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o022 != 0 || stat.Size <= 0 || stat.Size > 4<<30 {
+		if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != owner || stat.Gid != group || stat.Mode&0o022 != 0 || stat.Size <= 0 || stat.Size > 4<<30 {
 			_ = file.Close()
 			return fmt.Errorf("distro package cache member identity is unsafe")
 		}
@@ -140,6 +144,20 @@ func (stager *ArtifactStager) stageDistroCache(ctx context.Context, plan Plan, s
 		if !ok || matched[digest] {
 			_ = file.Close()
 			return fmt.Errorf("distro package cache differs from the frozen closure")
+		}
+		destinationPath := filepath.Join(stagingDirectory, pkg.ArtifactDigest+".deb")
+		if _, err := os.Lstat(destinationPath); err == nil {
+			if err := file.Close(); err != nil {
+				return err
+			}
+			if err := validateStagedPath(destinationPath, pkg, stager.Files.strict); err != nil {
+				return err
+			}
+			matched[digest] = true
+			continue
+		} else if !os.IsNotExist(err) {
+			_ = file.Close()
+			return fmt.Errorf("inspect distro package staging identity: %w", err)
 		}
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			_ = file.Close()
@@ -167,18 +185,27 @@ func (stager *ArtifactStager) stageDistroCache(ctx context.Context, plan Plan, s
 	return ctx.Err()
 }
 
-func validateStagedPath(path string, pkg Package) error {
+func validateStagedPath(path string, pkg Package, strict bool) error {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open existing staged package no-follow: %w", err)
 	}
-	defer func() { _ = unix.Close(fd) }()
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("existing staged package descriptor is invalid")
+	}
+	defer func() { _ = file.Close() }()
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Size != pkg.ArtifactBytes {
+	owner, group := uint32(0), uint32(0)
+	if !strict {
+		owner, group = uint32(os.Geteuid()), uint32(os.Getegid())
+	}
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != owner || stat.Gid != group || stat.Mode&0o777 != 0o600 || stat.Size != pkg.ArtifactBytes {
 		return fmt.Errorf("existing staged package identity is unsafe")
 	}
 	hasher := sha256.New()
-	read, err := io.Copy(hasher, io.LimitReader(os.NewFile(uintptr(fd), filepath.Base(path)), pkg.ArtifactBytes+1))
+	read, err := io.Copy(hasher, io.LimitReader(file, pkg.ArtifactBytes+1))
 	if err != nil || read != pkg.ArtifactBytes || hex.EncodeToString(hasher.Sum(nil)) != pkg.ArtifactDigest {
 		return fmt.Errorf("existing staged package bytes differ from exact closure")
 	}
