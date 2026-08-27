@@ -61,6 +61,13 @@ type (
 	pointerRestorer  func(context.Context, certificates.Pointer, string) error
 )
 
+func reverseCandidatePointer(ctx context.Context, pointer certificates.Pointer, expectedCandidate string) error {
+	if pointer.ExpectedPriorGeneration == 0 {
+		return certificates.RemovePointer(ctx, pointer, expectedCandidate)
+	}
+	return certificates.RestorePointer(ctx, pointer, expectedCandidate)
+}
+
 func activateCandidatePointer(ctx context.Context, pointer certificates.Pointer, expected string, activate pointerActivator, restore pointerRestorer) (certificates.PointerResult, error) {
 	result, err := activate(ctx, pointer)
 	if err == nil && result.CandidateTarget == expected {
@@ -103,7 +110,7 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	mutated := true
 	var pointerResult certificates.PointerResult
 	if candidate.CertificatePointer != nil {
-		pointerResult, err = activateCandidatePointer(ctx, *candidate.CertificatePointer, candidate.CertificateCandidatePath, certificates.ActivatePointer, certificates.RestorePointer)
+		pointerResult, err = activateCandidatePointer(ctx, *candidate.CertificatePointer, candidate.CertificateCandidatePath, certificates.ActivatePointer, reverseCandidatePointer)
 		if err != nil {
 			return Result{}, err
 		}
@@ -120,7 +127,7 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 		_, restoreErr := nginx.RestoreActivation(recoveryCtx, host.Paths, host.Owner, candidate.Entry, priorDisk)
 		restoreErr = errors.Join(observeCandidateErr, restoreErr)
 		if candidate.CertificatePointer != nil {
-			restoreErr = errors.Join(restoreErr, certificates.RestorePointer(recoveryCtx, *candidate.CertificatePointer, pointerResult.CandidateTarget))
+			restoreErr = errors.Join(restoreErr, reverseCandidatePointer(recoveryCtx, *candidate.CertificatePointer, pointerResult.CandidateTarget))
 		}
 		if restoreErr == nil {
 			if routeErr := nginx.VerifyTailnetRoutes(priorDisk.Manifest); routeErr != nil {

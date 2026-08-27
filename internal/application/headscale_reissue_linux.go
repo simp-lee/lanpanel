@@ -14,6 +14,7 @@ import (
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/challenge"
 	"lanpanel/internal/child"
+	"lanpanel/internal/closure"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
@@ -25,11 +26,20 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/safety"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
 	"time"
 )
+
+func headscaleReissueMarkerMatches(active *safety.HeadscaleReactivating, expected safety.ChallengePending, bundle control.ActivationBundle, candidate certificates.Identity) bool {
+	return active != nil && active.PlanID == expected.PlanID && active.Generation == expected.Generation && active.PriorGeneration+1 == active.Generation && active.ControlGeneration == bundle.Entry.Generation && active.CertificateGeneration == candidate.Generation && active.CertificateFingerprint == candidate.Fingerprint && active.CandidateDigest == expected.ConfigDigest && active.CandidateBundle == bundle.Digest && active.ActivationDigest == bundle.Digest && active.ControlEntryDigest == bundle.Entry.Digest && slices.Equal(active.BaseMarkers, expected.BaseMarkers) && !active.ProbePending && active.ProbeCorrelation == "" && active.CertificateUntil.Equal(candidate.NotAfter) && active.CertificateLastTrustedWall.Equal(candidate.LastTrustedWall)
+}
+
+func headscaleChallengeMatchesExpected(pending *safety.ChallengePending, expected safety.ChallengePending) bool {
+	return pending != nil && reflect.DeepEqual(*pending, expected)
+}
 
 func (execution *CertificateExecution) headscaleActivationBundle() (control.ActivationBundle, error) {
 	if execution == nil || !execution.Headscale {
@@ -163,6 +173,10 @@ func beginHeadscaleCertificateRenew(ctx context.Context, plan *plans.Plan, actor
 		return fail(fmt.Errorf("headscale renewal requires committed certificate authority"))
 	}
 	prior := *headscale.Certificate
+	controlJournal, err := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
+	if err != nil || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || !headscaleExpiryJournalMatchesNormal(installation, controlJournal) {
+		return fail(fmt.Errorf("headscale renewal prior control certificate authority changed: %w", err))
+	}
 	binding := requested
 	if plan == nil {
 		binding, err = bindingFromCertificateAuthority(prior.Authority)
@@ -284,6 +298,13 @@ func beginHeadscaleCertificateRenew(ctx context.Context, plan *plans.Plan, actor
 	if err != nil || freshInstallation.Headscale.Certificate == nil || !reflect.DeepEqual(*freshInstallation.Headscale.Certificate, prior) {
 		return cleanup(errors.Join(fmt.Errorf("headscale applied certificate changed"), operations.ReleaseExposure(mutation, exposure)))
 	}
+	lockedControlJournal, controlErr := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
+	priorTarget, targetErr := certificates.BundlePath(prior.Authority.CertificateID, prior.Generation)
+	activeTarget, pointerErr := certificates.ObservePointer(prior.Authority.CertificateID)
+	bundleErr := certificates.VerifyBundleIdentity(prior.Authority.CertificateID, prior.Generation, certificateBundleIdentity(prior))
+	if controlErr != nil || !reflect.DeepEqual(lockedControlJournal, controlJournal) || !headscaleExpiryJournalMatchesNormal(freshInstallation, lockedControlJournal) || targetErr != nil || pointerErr != nil || activeTarget != priorTarget || bundleErr != nil {
+		return cleanup(errors.Join(fmt.Errorf("headscale prior certificate lineage changed under lock"), controlErr, targetErr, pointerErr, bundleErr, operations.ReleaseExposure(mutation, exposure)))
+	}
 	var intent operations.Reservation
 	if plan == nil {
 		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
@@ -299,7 +320,7 @@ func beginHeadscaleCertificateRenew(ctx context.Context, plan *plans.Plan, actor
 	}
 	priorPath, _ := certificates.BundlePath(prior.Authority.CertificateID, prior.Generation)
 	candidatePath, _ := certificates.BundlePath(prior.Authority.CertificateID, prior.Generation+1)
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + job.ID, JobID: job.ID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: installation.InstallationID, Target: "headscale/" + headscale.ID, Generation: intent.IntentGeneration, Deadline: operationDeadline, ArtifactDigest: bindingDigest, ChildIDs: []string{childRecord.ID}, Phase: operations.JournalPrepared, Certificate: &operations.CertificateJournalIdentity{CertificateID: prior.Authority.CertificateID, PriorGeneration: prior.Generation, CandidateGeneration: prior.Generation + 1, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, StageUID: stageIdentity.UID, StageGID: stageIdentity.GID}}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + job.ID, JobID: job.ID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: installation.InstallationID, Target: "headscale/" + headscale.ID, Generation: intent.IntentGeneration, Deadline: operationDeadline, ArtifactDigest: bindingDigest, ChildIDs: []string{childRecord.ID}, Phase: operations.JournalPrepared, Certificate: &operations.CertificateJournalIdentity{CertificateID: prior.Authority.CertificateID, PriorGeneration: prior.Generation, CandidateGeneration: prior.Generation + 1, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, PriorBundleIdentity: certificateBundleIdentity(prior), Challenge: prepared.Safety, StageUID: stageIdentity.UID, StageGID: stageIdentity.GID}}
 	current, err := service.normal.Read()
 	if err != nil {
 		return cleanup(errors.Join(err, operations.ReleaseExposure(mutation, exposure)))
@@ -388,12 +409,96 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 	if err != nil {
 		return err
 	}
+	fenceRollback := func(cause error) error {
+		execution := &CertificateExecution{Service: service, Exposure: exposure, JobID: journal.JobID}
+		prior := domain.CertificateBundleIdentity{Generation: certificate.PriorGeneration, Fingerprint: certificate.PriorFingerprint, BindingIdentity: certificate.PriorBundleIdentity.BindingIdentity}
+		candidate := certificates.Identity{ID: certificate.CertificateID, Generation: certificate.CandidateGeneration}
+		return execution.fencePlannedHeadscaleReissue(ctx, prior, candidate, cause)
+	}
 	if pointer == certificate.PriorPointer {
-		if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
-			return err
+		installation, loadErr := loadHeadscaleInstallation(document)
+		priorMatches := loadErr == nil && installation.Headscale.Certificate != nil && certificateBundleMatches(*installation.Headscale.Certificate, certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity)
+		if !priorMatches {
+			return fenceRollback(errors.Join(loadErr, fmt.Errorf("Headscale rollback normal certificate does not match prior authority")))
 		}
-		if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
-			return err
+		if err := certificates.VerifyBundleIdentity(certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity); err != nil {
+			return fenceRollback(err)
+		}
+		controlJournal, controlErr := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
+		if controlErr != nil || controlJournal.Certificate == nil || controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || installation.Headscale.Applied == nil {
+			return fenceRollback(errors.Join(controlErr, fmt.Errorf("Headscale rollback control certificate authority changed")))
+		}
+		candidateIdentity, candidateErr := certificates.ObserveIdentity(certificates.FixedBundlesRoot, certificate.CertificateID, certificate.CandidateGeneration, filetxn.Owner{UID: certificate.StageUID, GID: certificate.StageGID})
+		candidatePresent := candidateErr == nil
+		if candidateErr != nil && !errors.Is(candidateErr, os.ErrNotExist) || candidatePresent && certificates.BundleIdentityFor(candidateIdentity) != certificate.CandidateBundleIdentity {
+			return fenceRollback(errors.Join(candidateErr, fmt.Errorf("Headscale rollback candidate certificate authority changed")))
+		}
+		priorActivation, priorActivationErr := control.BuildActivation(controlJournal.InstallationID, controlJournal.Candidate, *controlJournal.Certificate)
+		if priorActivationErr != nil {
+			return fenceRollback(priorActivationErr)
+		}
+		var reactivationBundle control.ActivationBundle
+		if candidatePresent {
+			var bundleErr error
+			reactivationBundle, bundleErr = control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, candidateIdentity, *controlJournal.Certificate, *installation.Headscale.Applied)
+			if bundleErr != nil {
+				return fenceRollback(bundleErr)
+			}
+		}
+		manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if auditErr != nil {
+			return fenceRollback(auditErr)
+		}
+		if controlJournal.Phase == control.PhaseExpired {
+			for _, entry := range manifest.Entries {
+				if entry.Kind == nginx.EntryControl {
+					return fenceRollback(fmt.Errorf("expired Headscale control entry remained after rollback"))
+				}
+			}
+			host, hostErr := activation.NewFixedHost()
+			runtime, runtimeErr := host.ObserveRuntime(ctx, manifest)
+			if hostErr != nil || runtimeErr != nil {
+				return fenceRollback(errors.Join(hostErr, runtimeErr))
+			}
+			if runtime.Master == nil {
+				if len(runtime.Workers) != 0 || len(runtime.Listeners) != 0 {
+					return fenceRollback(fmt.Errorf("expired Headscale runtime closure is inconsistent"))
+				}
+			} else {
+				if err := host.Reload(ctx); err != nil {
+					return fenceRollback(err)
+				}
+				if _, err := host.WaitForPriorWorkers(ctx, manifest, runtime.Workers); err != nil {
+					return fenceRollback(err)
+				}
+				inventory := closure.Inventory{Complete: true, Digest: priorActivation.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: controlJournal.Candidate.ControlDomain, Digest: priorActivation.Entry.Digest}}}
+				probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: nginx.FixedPaths().AuditPath}
+				if _, err := probe.Run(ctx, inventory); err != nil {
+					return fenceRollback(err)
+				}
+			}
+		} else {
+			entryMatched := false
+			for _, entry := range manifest.Entries {
+				entryMatched = entryMatched || reflect.DeepEqual(entry, priorActivation.Entry)
+			}
+			if !entryMatched {
+				return fenceRollback(fmt.Errorf("Headscale prior control entry changed"))
+			}
+			host, hostErr := activation.NewFixedHost()
+			priorRuntime, runtimeErr := host.ObserveRuntime(ctx, manifest)
+			if hostErr != nil || runtimeErr != nil || priorRuntime.Master == nil {
+				return fenceRollback(errors.Join(hostErr, runtimeErr, fmt.Errorf("Headscale prior runtime unavailable")))
+			}
+			if err := host.Reload(ctx); err != nil {
+				return fenceRollback(err)
+			}
+			if _, err := host.WaitForPriorWorkers(ctx, manifest, priorRuntime.Workers); err != nil {
+				return fenceRollback(err)
+			}
+			if err := host.VerifyServedCertificate(ctx, installation.Headscale.ControlDomain, certificate.PriorFingerprint); err != nil {
+				return fenceRollback(err)
+			}
 		}
 		freshDocument, readErr := service.normal.Read()
 		if readErr != nil {
@@ -414,16 +519,28 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		}
 		freshSafety, safetyErr := service.safety.ReadForRecovery(exposure)
 		if safetyErr != nil {
-			return safetyErr
+			return fenceRollback(safetyErr)
+		}
+		if !activeCertificateMatchesIdentity(freshSafety.Headscale.ActiveCertificate, *controlJournal.Certificate) {
+			return fenceRollback(fmt.Errorf("Headscale rollback safety certificate does not match prior authority"))
 		}
 		if freshSafety.Headscale.Reactivating != nil {
 			active := *freshSafety.Headscale.Reactivating
+			if !headscaleReissueMarkerMatches(&active, certificate.Challenge, reactivationBundle, candidateIdentity) {
+				return fenceRollback(fmt.Errorf("Headscale rollback reactivation marker changed"))
+			}
 			contracted := freshSafety
 			contracted.Revision++
 			contracted.Headscale.Reactivating = nil
 			if _, err := service.safety.Commit(ctx, exposure, safety.RolePublish, freshSafety.Revision, contracted, safety.TransitionProof{Headscale: headscaleConvergenceProof(active, headscaleFailureDigest("interrupted-renewal\x00"+journal.JobID))}); err != nil {
-				return err
+				return fenceRollback(err)
 			}
+		}
+		if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity, certificate.StageUID, certificate.StageGID); err != nil {
+			return err
+		}
+		if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
+			return err
 		}
 		pending := safety.ChallengePending{PlanID: intent.SafetyBinding.PlanID, Generation: intent.SafetyBinding.IntentGeneration, SANIdentity: intent.SafetyBinding.CandidateDigest, ACMEBinding: intent.SafetyBinding.CandidateBundle}
 		_, err = admitter.TerminalizeContractedCertificate(ctx, mutation, exposure, freshDocument.Revision, journal.JobID, pending, headscaleFailureDigest("interrupted-renewal\x00"+journal.JobID))
@@ -444,15 +561,26 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 	if err != nil {
 		return err
 	}
-	normalCandidate := installation.Headscale.Certificate.Generation == candidateIdentity.Generation && installation.Headscale.Certificate.Fingerprint == candidateIdentity.Fingerprint && installation.Headscale.Certificate.BindingIdentity == candidateIdentity.BindingIdentity
+	if certificates.BundleIdentityFor(candidateIdentity) != certificate.CandidateBundleIdentity {
+		return fmt.Errorf("completed Headscale renewal candidate bundle identity changed")
+	}
+	normalCandidate := certificateBundleMatches(*installation.Headscale.Certificate, certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity)
+	normalPrior := certificate.PriorGeneration > 0 && certificateBundleMatches(*installation.Headscale.Certificate, certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity)
+	if !normalCandidate && !normalPrior {
+		return fmt.Errorf("completed Headscale renewal normal certificate differs from candidate and prior authority")
+	}
 	if normalCandidate && journal.RuntimeDigest == "" {
 		return fmt.Errorf("completed Headscale renewal lacks durable runtime evidence")
 	}
-	if !normalCandidate && (journal.RuntimeDigest == "" || installation.Headscale.Certificate.BindingIdentity != candidateIdentity.BindingIdentity) {
-		pointerAuthority := certificates.Pointer{CertificateID: certificate.CertificateID, CandidateGeneration: certificate.CandidateGeneration, ExpectedPriorGeneration: certificate.PriorGeneration}
+	if normalPrior && (journal.RuntimeDigest == "" || installation.Headscale.Certificate.BindingIdentity != candidateIdentity.BindingIdentity) {
+		pointerAuthority := certificatePointerFromJournal(certificate)
 		controlJournal, controlErr := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
-		if controlErr != nil {
-			return controlErr
+		if controlErr != nil || controlJournal.Certificate == nil || controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || installation.Headscale.Applied == nil {
+			return errors.Join(controlErr, fmt.Errorf("Headscale rollback control certificate authority changed"))
+		}
+		reactivationBundle, bundleErr := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, candidateIdentity, *controlJournal.Certificate, *installation.Headscale.Applied)
+		if bundleErr != nil {
+			return bundleErr
 		}
 		runtimeHost, runtimeHostErr := activation.NewFixedHost()
 		if runtimeHostErr != nil {
@@ -468,15 +596,8 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		}
 		stopped := runtime.Master == nil && len(runtime.Workers) == 0 && len(runtime.Listeners) == 0
 		if controlJournal.Phase == control.PhaseExpired {
-			if installation.Headscale.Applied == nil {
-				return fmt.Errorf("expired Headscale rollback applied authority missing")
-			}
-			bundle, bundleErr := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, candidateIdentity, *installation.Headscale.Applied)
-			if bundleErr != nil {
-				return bundleErr
-			}
 			if stopped {
-				if _, _, removeErr := nginx.RemoveEntry(ctx, nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, bundle.Entry); removeErr != nil {
+				if _, _, removeErr := nginx.RemoveEntry(ctx, nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, reactivationBundle.Entry); removeErr != nil {
 					return removeErr
 				}
 			} else {
@@ -484,7 +605,7 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 				if hostErr != nil {
 					return hostErr
 				}
-				if closeErr := controlHost.CloseControl(ctx, bundle); closeErr != nil {
+				if closeErr := controlHost.CloseControl(ctx, reactivationBundle); closeErr != nil {
 					return closeErr
 				}
 			}
@@ -501,12 +622,6 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 					return restoreErr
 				}
 			}
-		}
-		if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
-			return err
-		}
-		if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
-			return err
 		}
 		freshDocument, readErr := service.normal.Read()
 		if readErr != nil {
@@ -527,19 +642,44 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		}
 		freshSafety, safetyErr := service.safety.ReadForRecovery(exposure)
 		if safetyErr != nil {
-			return safetyErr
+			return fenceRollback(safetyErr)
+		}
+		if !activeCertificateMatchesIdentity(freshSafety.Headscale.ActiveCertificate, *controlJournal.Certificate) {
+			return fenceRollback(fmt.Errorf("Headscale rollback safety certificate does not match prior authority"))
 		}
 		if freshSafety.Headscale.Reactivating != nil {
 			active := *freshSafety.Headscale.Reactivating
+			if !headscaleReissueMarkerMatches(&active, certificate.Challenge, reactivationBundle, candidateIdentity) {
+				return fenceRollback(fmt.Errorf("Headscale rollback reactivation marker changed"))
+			}
 			contracted := freshSafety
 			contracted.Revision++
 			contracted.Headscale.Reactivating = nil
 			if _, err := service.safety.Commit(ctx, exposure, safety.RolePublish, freshSafety.Revision, contracted, safety.TransitionProof{Headscale: headscaleConvergenceProof(active, headscaleFailureDigest("interrupted-binding-change\x00"+journal.JobID))}); err != nil {
-				return err
+				return fenceRollback(err)
 			}
+		}
+		if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity, certificate.StageUID, certificate.StageGID); err != nil {
+			return err
+		}
+		if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
+			return err
 		}
 		pending := safety.ChallengePending{PlanID: intent.SafetyBinding.PlanID, Generation: intent.SafetyBinding.IntentGeneration, SANIdentity: intent.SafetyBinding.CandidateDigest, ACMEBinding: intent.SafetyBinding.CandidateBundle}
 		_, err = admitter.TerminalizeContractedCertificate(ctx, mutation, exposure, freshDocument.Revision, journal.JobID, pending, headscaleFailureDigest("interrupted-binding-change\x00"+journal.JobID))
+		return err
+	}
+	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	controlJournal, err := store.Read()
+	if err != nil || controlJournal.Certificate == nil {
+		return fmt.Errorf("completed Headscale renewal control certificate authority missing: %w", err)
+	}
+	controlCandidate := controlJournal.Phase == control.PhaseCommitted && reflect.DeepEqual(*controlJournal.Certificate, candidateIdentity)
+	controlPrior := (controlJournal.Phase == control.PhaseCommitted || controlJournal.Phase == control.PhaseExpired) && controlJournal.Certificate.ID == certificate.CertificateID && controlJournal.Certificate.Generation == certificate.PriorGeneration && certificates.BundleIdentityFor(*controlJournal.Certificate) == certificate.PriorBundleIdentity
+	if (!controlCandidate && !controlPrior) || !headscaleControlCandidateMatchesNormal(installation, controlJournal) {
+		return fmt.Errorf("completed Headscale renewal control journal lineage changed")
+	}
+	if err := verifyLiveHeadscaleCertificate(ctx, installation.InstallationID, controlJournal.Candidate, candidateIdentity); err != nil {
 		return err
 	}
 	binding, err := bindingFromCertificateAuthority(installation.Headscale.Certificate.Authority)
@@ -547,13 +687,13 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		return err
 	}
 	candidate, err := headscaleCertificateBundle(candidateIdentity, binding)
-	if err != nil || candidate.Fingerprint != certificate.CandidateFingerprint {
+	if err != nil || candidate.Generation != certificate.CandidateGeneration || candidate.Authority == nil || candidate.Authority.CertificateID != certificate.CertificateID || certificateBundleIdentity(candidate) != certificate.CandidateBundleIdentity {
 		return fmt.Errorf("completed Headscale renewal candidate changed: %w", err)
 	}
 	revision := document.Revision
 	if !reflect.DeepEqual(*installation.Headscale.Certificate, candidate) {
 		prior := *installation.Headscale.Certificate
-		if prior.Generation != certificate.PriorGeneration || prior.Fingerprint != certificate.PriorFingerprint {
+		if prior.Generation != certificate.PriorGeneration || prior.Authority == nil || prior.Authority.CertificateID != certificate.CertificateID || certificateBundleIdentity(prior) != certificate.PriorBundleIdentity {
 			return fmt.Errorf("completed Headscale renewal prior changed")
 		}
 		if err := admitter.CommitHeadscaleCertificateRenewal(ctx, mutation, exposure, revision, journal.JobID, prior, candidate); err != nil {
@@ -574,39 +714,61 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 	if err != nil {
 		return err
 	}
-	if state.Headscale.ActiveCertificate == nil || state.Headscale.ActiveCertificate.Fingerprint != candidate.Fingerprint {
+	expectedActiveCertificate := &safety.ActiveCertificateAuthority{Generation: candidate.Generation, Fingerprint: candidate.Fingerprint, Binding: candidate.BindingIdentity, NotAfter: candidateIdentity.NotAfter, LastTrustedWall: candidateIdentity.LastTrustedWall}
+	candidateActive := activeCertificateMatchesExpected(state.Headscale.ActiveCertificate, expectedActiveCertificate)
+	if controlCandidate {
+		if !candidateActive || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil {
+			return fmt.Errorf("completed Headscale renewal committed control safety changed")
+		}
+	} else if state.Headscale.ChallengePending != nil {
+		if !headscaleChallengeMatchesExpected(state.Headscale.ChallengePending, certificate.Challenge) {
+			return fmt.Errorf("completed Headscale renewal challenge marker changed")
+		}
 		next := state
 		next.Revision++
-		next.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: candidate.Generation, Fingerprint: candidate.Fingerprint, Binding: candidate.BindingIdentity, NotAfter: candidateIdentity.NotAfter, LastTrustedWall: candidateIdentity.LastTrustedWall}
-		role := safety.RoleCertificateActivation
-		proof := safety.TransitionProof{}
-		if state.Headscale.ChallengePending != nil {
-			next.Headscale.ChallengePending = nil
-		} else if state.Headscale.Reactivating != nil && len(journal.RuntimeDigest) == 71 && strings.HasPrefix(journal.RuntimeDigest, "sha256:") {
-			active := *state.Headscale.Reactivating
-			next.Headscale.Reactivating = nil
-			next.Headscale.CertificateExpiry = nil
-			next.Headscale.ControlEntryDigest = active.ControlEntryDigest
-			role = safety.RolePublish
-			proof.Headscale = headscaleConvergenceProof(active, journal.RuntimeDigest)
-		} else {
-			return fmt.Errorf("completed Headscale renewal safety changed")
-		}
-		if _, err := service.safety.Commit(ctx, exposure, role, state.Revision, next, proof); err != nil {
+		next.Headscale.ActiveCertificate = expectedActiveCertificate
+		next.Headscale.ChallengePending = nil
+		if _, err := service.safety.Commit(ctx, exposure, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{}); err != nil {
 			return err
 		}
+	} else if state.Headscale.Reactivating != nil {
+		if len(journal.RuntimeDigest) != 71 || !strings.HasPrefix(journal.RuntimeDigest, "sha256:") || installation.Headscale.Applied == nil {
+			return fmt.Errorf("completed Headscale renewal runtime authority missing")
+		}
+		reactivationBundle, bundleErr := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, candidateIdentity, *controlJournal.Certificate, *installation.Headscale.Applied)
+		if bundleErr != nil || !headscaleReissueMarkerMatches(state.Headscale.Reactivating, certificate.Challenge, reactivationBundle, candidateIdentity) {
+			return fmt.Errorf("completed Headscale renewal reactivation marker changed: %w", bundleErr)
+		}
+		active := *state.Headscale.Reactivating
+		next := state
+		next.Revision++
+		next.Headscale.ActiveCertificate = expectedActiveCertificate
+		next.Headscale.Reactivating = nil
+		next.Headscale.CertificateExpiry = nil
+		next.Headscale.ControlEntryDigest = active.ControlEntryDigest
+		if _, err := service.safety.Commit(ctx, exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Headscale: headscaleConvergenceProof(active, journal.RuntimeDigest)}); err != nil {
+			return err
+		}
+	} else if !candidateActive {
+		return fmt.Errorf("completed Headscale renewal safety differs from candidate authority")
 	}
 	state, err = service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
 	}
-	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
-	controlJournal, err := store.Read()
-	if err != nil {
-		return err
+	currentControlJournal, err := store.Read()
+	if err != nil || !reflect.DeepEqual(currentControlJournal, controlJournal) {
+		return fmt.Errorf("completed Headscale renewal control journal changed during convergence: %w", err)
 	}
-	if controlJournal.Certificate == nil || controlJournal.Certificate.Fingerprint != candidate.Fingerprint {
-		if _, err := store.CommitRenewal(ctx, controlJournal, candidateIdentity, func() string {
+	controlJournal = currentControlJournal
+	if controlJournal.Certificate == nil {
+		return fmt.Errorf("completed Headscale renewal control certificate authority missing")
+	}
+	if !reflect.DeepEqual(*controlJournal.Certificate, candidateIdentity) {
+		if controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity {
+			return fmt.Errorf("completed Headscale renewal control certificate authority changed")
+		}
+		if _, err := store.CommitRenewal(ctx, controlJournal, certificate.PriorBundleIdentity, candidateIdentity, func() string {
 			if len(journal.RuntimeDigest) == 71 && strings.HasPrefix(journal.RuntimeDigest, "sha256:") {
 				return journal.RuntimeDigest
 			}
@@ -638,7 +800,7 @@ func (execution *CertificateExecution) fencePlannedHeadscaleReissue(ctx context.
 		return stopUnfencedHeadscaleReissue(ctx, errors.Join(cause, err))
 	}
 	if state.Headscale.CertificateExpiry == nil {
-		if err := execution.Service.MarkHeadscaleCertificateActivationUncertain(ctx, execution.Exposure, state.Headscale.ActiveCertificate.Binding, now); err != nil {
+		if err := execution.Service.MarkHeadscaleCertificateActivationUncertain(ctx, execution.Exposure, prior.BindingIdentity, now); err != nil {
 			return stopUnfencedHeadscaleReissue(ctx, errors.Join(cause, err))
 		}
 	}
@@ -661,7 +823,7 @@ func (execution *CertificateExecution) fencePlannedHeadscaleReissue(ctx context.
 }
 
 func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx context.Context, controlJournal control.Journal, bundle control.ActivationBundle, prior, candidate domain.CertificateBundleIdentity, identity certificates.Identity, reactivating safety.HeadscaleReactivating, cause error) error {
-	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, ExpectedPriorGeneration: prior.Generation}
+	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
 	var physicalErr error
 	if controlJournal.Phase == control.PhaseExpired {
 		host, err := control.NewActivationHost()
@@ -693,10 +855,15 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 	if err != nil {
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
 	}
-	if installation.Headscale.Certificate != nil && reflect.DeepEqual(*installation.Headscale.Certificate, candidate) {
+	switch {
+	case installation.Headscale.Certificate != nil && reflect.DeepEqual(*installation.Headscale.Certificate, candidate):
 		err = execution.Admitter.RestoreHeadscaleCertificateRenewal(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID, candidate, prior)
-	} else if installation.Headscale.DeployIntent != nil {
-		err = execution.Admitter.ContractHeadscaleReissueActivation(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID)
+	case installation.Headscale.Certificate != nil && reflect.DeepEqual(*installation.Headscale.Certificate, prior):
+		if installation.Headscale.DeployIntent != nil {
+			err = execution.Admitter.ContractHeadscaleReissueActivation(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID)
+		}
+	default:
+		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback normal certificate differs from candidate and prior authority")))
 	}
 	if err != nil {
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
@@ -705,7 +872,13 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 	if err != nil {
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
 	}
+	if !activeCertificateMatchesBundle(state.Headscale.ActiveCertificate, prior) {
+		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback safety certificate does not match prior authority")))
+	}
 	if state.Headscale.Reactivating != nil {
+		if !reflect.DeepEqual(*state.Headscale.Reactivating, reactivating) {
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback reactivation marker changed")))
+		}
 		next := state
 		next.Revision++
 		next.Headscale.Reactivating = nil
@@ -754,14 +927,17 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 		return jobs.Record{}, err
 	}
 	installation, err := loadHeadscaleInstallation(document)
-	if err != nil || installation.Headscale.Applied == nil {
+	if err != nil || prior.Authority == nil || installation.Headscale.Applied == nil || installation.Headscale.Certificate == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, prior) {
 		return jobs.Record{}, fmt.Errorf("expired Headscale installation changed")
 	}
-	bundle, err := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, identity, *installation.Headscale.Applied)
+	if controlJournal.Certificate.ID != prior.Authority.CertificateID || controlJournal.Certificate.Generation != prior.Generation || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificateBundleIdentity(prior) {
+		return jobs.Record{}, fmt.Errorf("expired Headscale prior control certificate authority changed")
+	}
+	bundle, err := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, identity, *controlJournal.Certificate, *installation.Headscale.Applied)
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: "headscale/" + execution.HeadscaleID, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: func() string { value, _ := certificates.BundlePath(identity.ID, prior.Generation); return value }(), CandidatePointer: func() string { value, _ := certificates.BundlePath(identity.ID, identity.Generation); return value }(), PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: "headscale/" + execution.HeadscaleID, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: func() string { value, _ := certificates.BundlePath(identity.ID, prior.Generation); return value }(), CandidatePointer: func() string { value, _ := certificates.BundlePath(identity.ID, identity.Generation); return value }(), PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, PriorBundleIdentity: certificateBundleIdentity(prior), CandidateBundleIdentity: certificates.BundleIdentityFor(identity), Challenge: execution.Challenge.Safety, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
 		return jobs.Record{}, err
 	}
@@ -818,7 +994,7 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 		if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: next, Installation: &installation, Ownership: ownershipAuthority, Now: time.Now().UTC()}); !decision.Allowed {
 			return jobs.Record{}, fmt.Errorf("headscale reissue reload rejected: %s", decision.Reason)
 		}
-		pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, ExpectedPriorGeneration: prior.Generation}
+		pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
 		activationResult, resultErr := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint)
 		activateErr = resultErr
 		var failure *activation.Failure
@@ -868,7 +1044,7 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Headscale: headscaleConvergenceProof(*reactivating, runtimeDigest)}); err != nil {
 		return jobs.Record{}, execution.restorePlannedHeadscaleReissue(context.WithoutCancel(ctx), controlJournal, bundle, prior, candidate, identity, *reactivating, err)
 	}
-	if _, err := controlStore.CommitRenewal(ctx, controlJournal, identity, runtimeDigest); err != nil {
+	if _, err := controlStore.CommitRenewal(ctx, controlJournal, certificateBundleIdentity(prior), identity, runtimeDigest); err != nil {
 		return jobs.Record{}, execution.fencePlannedHeadscaleReissue(context.WithoutCancel(ctx), prior, identity, err)
 	}
 	record, completeErr := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", []string{identity.CertificatePath, identity.PrivateKeyPath, journal.Certificate.CandidatePointer}, []jobs.Postcondition{{Kind: "headscale_control_reissued_and_served", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}}, "")
@@ -899,7 +1075,7 @@ func ExecuteHeadscaleCertificateRenewal(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", abort(err)
 	}
-	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC())
+	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
 	if err != nil {
 		return "", abort(err)
 	}
@@ -932,7 +1108,7 @@ func ExecuteHeadscaleCertificateReissue(ctx context.Context, actor Actor, payloa
 	if err != nil {
 		return abort(err)
 	}
-	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC())
+	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
 	if err != nil {
 		return abort(err)
 	}

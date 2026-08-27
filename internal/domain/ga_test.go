@@ -868,7 +868,7 @@ func completeCertificateWithAuthority(authority *CertificateAuthorityIdentity, d
 	if err != nil {
 		panic(err)
 	}
-	return CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + authority.CertificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest, SANIdentity: certificateSANIdentity(domains), ChainIdentity: testDigest, IssuerIdentity: testDigest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
+	return CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + authority.CertificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest, SANIdentity: certificateSANIdentity(domains), ChainIdentity: testDigest, IssuerIdentity: testDigest, DirectoryIdentity: testDigest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 }
 func pointer(value string) *string { return &value }
 

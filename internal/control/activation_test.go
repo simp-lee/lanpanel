@@ -115,16 +115,16 @@ func TestReactivationBundleBindsPriorControlAndChangedCertificateAuthority(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	bundle, err := BuildReactivation("ins_00000000000000000000000000000001", rendered.Candidate, second, prior)
+	bundle, err := BuildReactivation("ins_00000000000000000000000000000001", rendered.Candidate, second, first, prior)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bundle.Prior == nil || bundle.Certificate.BindingIdentity == first.BindingIdentity || bundle.Digest == "" {
+	if bundle.Prior == nil || bundle.PriorCertificate == nil || bundle.PriorCertificate.DirectoryIdentity != first.DirectoryIdentity || bundle.Certificate.BindingIdentity == first.BindingIdentity || bundle.Digest == "" {
 		t.Fatal("Headscale reactivation did not bind prior and changed certificate authority")
 	}
 	changed := prior
 	changed.ControlIdentity = testDigest("other")
-	if _, err := BuildReactivation(bundle.InstallationID, rendered.Candidate, second, changed); err == nil {
+	if _, err := BuildReactivation(bundle.InstallationID, rendered.Candidate, second, first, changed); err == nil {
 		t.Fatal("mismatched prior Headscale control accepted")
 	}
 }

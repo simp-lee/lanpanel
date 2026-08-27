@@ -145,6 +145,16 @@ func TestCommittedRenewalAdvancesCertificateBindingOnly(t *testing.T) {
 	if err := execution.StageCertificate(context.Background(), issue, first); err != nil {
 		t.Fatal(err)
 	}
+	rewrittenIdentity := first
+	rewrittenIdentity.ChainIdentity = testDigest("rewritten-chain")
+	rewrittenIdentity.DirectoryIdentity = ""
+	rewrittenRaw, _ := json.Marshal(rewrittenIdentity)
+	rewrittenIdentity.DirectoryIdentity = testDigest(string(rewrittenRaw))
+	rewrittenJournal := execution.Journal()
+	rewrittenJournal.Certificate = &rewrittenIdentity
+	if sameJournalAuthority(execution.Journal(), rewrittenJournal) {
+		t.Fatal("staged control certificate bundle authority was mutable")
+	}
 	bundle, err := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, first)
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +185,10 @@ func TestCommittedRenewalAdvancesCertificateBindingOnly(t *testing.T) {
 	second.DirectoryIdentity = ""
 	raw, _ := json.Marshal(second)
 	second.DirectoryIdentity = testDigest(string(raw))
-	renewed, err := store.CommitRenewal(context.Background(), committed, second, testDigest("runtime-two"))
+	if _, err := store.CommitRenewal(context.Background(), committed, certificates.BundleIdentityFor(second), second, testDigest("runtime-two")); err == nil {
+		t.Fatal("renewal accepted mismatched prior bundle authority")
+	}
+	renewed, err := store.CommitRenewal(context.Background(), committed, certificates.BundleIdentityFor(first), second, testDigest("runtime-two"))
 	if err != nil {
 		t.Fatal(err)
 	}

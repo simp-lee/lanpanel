@@ -42,6 +42,33 @@ import (
 	"time"
 )
 
+func certificateBundleIdentity(value domain.CertificateBundleIdentity) certificates.BundleIdentity {
+	return certificates.BundleIdentity{Fingerprint: value.Fingerprint, SANIdentity: value.SANIdentity, ChainIdentity: value.ChainIdentity, IssuerIdentity: value.IssuerIdentity, BindingIdentity: value.BindingIdentity, DirectoryIdentity: value.DirectoryIdentity}
+}
+
+func certificatePointerFromJournal(value operations.CertificateJournalIdentity) certificates.Pointer {
+	return certificates.Pointer{CertificateID: value.CertificateID, CandidateGeneration: value.CandidateGeneration, CandidateIdentity: value.CandidateBundleIdentity, ExpectedPriorGeneration: value.PriorGeneration, ExpectedPriorIdentity: value.PriorBundleIdentity}
+}
+
+func certificateBundleMatches(value domain.CertificateBundleIdentity, certificateID string, generation uint64, identity certificates.BundleIdentity) bool {
+	pointer, err := certificates.ActivePointerPath(certificateID)
+	return err == nil && value.Authority != nil && value.Authority.CertificateID == certificateID && value.PointerIdentity == pointer && value.Generation == generation && certificateBundleIdentity(value) == identity
+}
+
+func activeCertificateMatchesExpected(active, expected *safety.ActiveCertificateAuthority) bool {
+	return active != nil && expected != nil && active.Generation == expected.Generation && active.Fingerprint == expected.Fingerprint && active.Binding == expected.Binding && active.NotAfter.Equal(expected.NotAfter) && !active.LastTrustedWall.Before(expected.LastTrustedWall)
+}
+
+func activeCertificateMatchesBundle(active *safety.ActiveCertificateAuthority, certificate domain.CertificateBundleIdentity) bool {
+	expected, err := activeCertificateAuthority(certificate)
+	return err == nil && activeCertificateMatchesExpected(active, expected)
+}
+
+func activeCertificateMatchesIdentity(active *safety.ActiveCertificateAuthority, identity certificates.Identity) bool {
+	expected := &safety.ActiveCertificateAuthority{Generation: identity.Generation, Fingerprint: identity.Fingerprint, Binding: identity.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
+	return activeCertificateMatchesExpected(active, expected)
+}
+
 type CertificateExecution struct {
 	Service          *FixedService
 	Admitter         *operations.Admitter
@@ -252,7 +279,7 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	if err != nil {
 		return fail(err)
 	}
-	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: certificateID, CandidateGeneration: 1, CandidatePointer: candidatePath, StageUID: stageUID, StageGID: stageGID}
+	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: certificateID, CandidateGeneration: 1, CandidatePointer: candidatePath, Challenge: prepared.Safety, StageUID: stageUID, StageGID: stageGID}
 	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + job.ID, JobID: job.ID, Kind: operations.JournalCertificateActivation, Operation: operations.Publish, InstallationID: installation.InstallationID, Target: "resource/" + resource.ID, Generation: intent.IntentGeneration, Deadline: plan.ExpiresAt, ArtifactDigest: bindingDigest, ResourceIDs: []string{resource.ID}, ChildIDs: []string{childID}, Phase: operations.JournalPrepared, Certificate: certificateJournal}
 	identityDocument, err := service.normal.Read()
 	if err != nil {
@@ -464,8 +491,19 @@ func BeginCertificateRenew(ctx context.Context, resourceID string) (*Certificate
 		return fail(err)
 	}
 	_, freshResource, err := loadCertificateResource(fresh.Entries, resource.ID)
-	if err != nil || freshResource.PublicationRecord.State != domain.PublicationPublished || freshResource.PublicationRecord.LastAppliedBundle == nil || freshResource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil || freshResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate.Fingerprint != prior.Fingerprint || freshResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate.BindingIdentity != prior.BindingIdentity {
+	if err != nil || freshResource.PublicationRecord.State != domain.PublicationPublished || freshResource.PublicationRecord.LastAppliedBundle == nil || freshResource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil || !reflect.DeepEqual(freshResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate, prior) {
 		return fail(fmt.Errorf("applied certificate changed before renewal"))
+	}
+	priorTarget, err := certificates.BundlePath(prior.Authority.CertificateID, prior.Generation)
+	if err != nil {
+		return fail(err)
+	}
+	activeTarget, err := certificates.ObservePointer(prior.Authority.CertificateID)
+	if err != nil || activeTarget != priorTarget {
+		return fail(fmt.Errorf("applied certificate pointer changed before renewal: %w", err))
+	}
+	if err := certificates.VerifyBundleIdentity(prior.Authority.CertificateID, prior.Generation, certificateBundleIdentity(prior)); err != nil {
+		return fail(err)
 	}
 	intent, err := admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
@@ -484,7 +522,7 @@ func BeginCertificateRenew(ctx context.Context, resourceID string) (*Certificate
 	if err != nil {
 		return fail(err)
 	}
-	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: prior.Authority.CertificateID, PriorGeneration: prior.Generation, CandidateGeneration: prior.Generation + 1, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, StageUID: stageUID, StageGID: stageGID}
+	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: prior.Authority.CertificateID, PriorGeneration: prior.Generation, CandidateGeneration: prior.Generation + 1, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, PriorBundleIdentity: certificateBundleIdentity(prior), Challenge: prepared.Safety, StageUID: stageUID, StageGID: stageGID}
 	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + job.ID, JobID: job.ID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: installation.InstallationID, Target: "resource/" + resource.ID, Generation: intent.IntentGeneration, Deadline: operationDeadline, ArtifactDigest: bindingDigest, ResourceIDs: []string{resource.ID}, ChildIDs: []string{childID}, Phase: operations.JournalPrepared, Certificate: certificateJournal}
 	identityDocument, err := service.normal.Read()
 	if err != nil {
@@ -1194,6 +1232,28 @@ func cleanupCertificateSetup(ctx context.Context, service *FixedService, admitte
 	return err
 }
 
+func (execution *CertificateExecution) AuthorizeStagedCertificate(ctx context.Context, identity certificates.Identity) error {
+	if execution == nil || execution.Mutation == nil || execution.Exposure == nil || certificates.ValidateIdentity(identity) != nil || identity.ID != execution.Challenge.Safety.CertificateIdentity || identity.Generation != execution.BundleGeneration || identity.BindingIdentity != execution.Child.InputDigest {
+		return fmt.Errorf("staged certificate authorization identity invalid")
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil || document.Revision != execution.Revision {
+		return fmt.Errorf("staged certificate authorization revision changed: %w", err)
+	}
+	raw, present := document.Entries["journals/certificate-"+execution.JobID]
+	var journal operations.JournalRecord
+	if !present || json.Unmarshal(raw, &journal) != nil || journal.Phase != operations.JournalPrepared || journal.Certificate == nil || journal.Certificate.CandidateFingerprint != "" || journal.Certificate.CandidateBundleIdentity != (certificates.BundleIdentity{}) || !reflect.DeepEqual(journal.Certificate.Challenge, execution.Challenge.Safety) {
+		return fmt.Errorf("staged certificate journal authority changed")
+	}
+	journal.Certificate.CandidateFingerprint = identity.Fingerprint
+	journal.Certificate.CandidateBundleIdentity = certificates.BundleIdentityFor(identity)
+	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
+		return err
+	}
+	execution.Revision++
+	return nil
+}
+
 func (execution *CertificateExecution) Reenter(ctx context.Context) (operations.Reservation, error) {
 	document, err := execution.Service.normal.Read()
 	if err != nil {
@@ -1404,7 +1464,7 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 			return errors.Join(cause, err)
 		}
 		if journal.Certificate != nil {
-			cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.StageUID, journal.Certificate.StageGID)
+			cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.CandidateBundleIdentity, journal.Certificate.StageUID, journal.Certificate.StageGID)
 			if cleanupErr != nil {
 				return errors.Join(cause, cleanupErr)
 			}
@@ -1575,12 +1635,12 @@ func (execution *CertificateExecution) PreparePublicationCertificate(ctx context
 	if err != nil {
 		return domain.CertificateBundleIdentity{}, err
 	}
-	certificate := domain.CertificateBundleIdentity{PointerIdentity: pointerIdentity, BindingIdentity: identity.BindingIdentity, Generation: identity.Generation, Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, Authority: authority}
+	certificate := domain.CertificateBundleIdentity{PointerIdentity: pointerIdentity, BindingIdentity: identity.BindingIdentity, Generation: identity.Generation, Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, DirectoryIdentity: identity.DirectoryIdentity, Authority: authority}
 	candidatePath, err := certificates.BundlePath(identity.ID, identity.Generation)
 	if err != nil {
 		return domain.CertificateBundleIdentity{}, err
 	}
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.Publish, InstallationID: execution.InstallationID, Target: "resource/" + execution.Resource.ID, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: []string{execution.Resource.ID}, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidatePointer: candidatePath, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.Publish, InstallationID: execution.InstallationID, Target: "resource/" + execution.Resource.ID, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: []string{execution.Resource.ID}, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidatePointer: candidatePath, CandidateFingerprint: identity.Fingerprint, CandidateBundleIdentity: certificates.BundleIdentityFor(identity), Challenge: execution.Challenge.Safety, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
 		return domain.CertificateBundleIdentity{}, err
 	}
@@ -1753,7 +1813,7 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	candidate := domain.CertificateBundleIdentity{PointerIdentity: pointerIdentity, BindingIdentity: identity.BindingIdentity, Generation: identity.Generation, Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, Authority: &authority}
+	candidate := domain.CertificateBundleIdentity{PointerIdentity: pointerIdentity, BindingIdentity: identity.BindingIdentity, Generation: identity.Generation, Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, NotAfter: identity.NotAfter.Format(time.RFC3339), LastTrustedWall: identity.LastTrustedWall.Format(time.RFC3339), ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, DirectoryIdentity: identity.DirectoryIdentity, Authority: &authority}
 	if execution.Headscale {
 		candidate, err = headscaleCertificateBundle(identity, execution.Binding)
 		if err != nil {
@@ -1773,7 +1833,7 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if execution.Headscale {
 		target, resourceIDs = "headscale/"+execution.HeadscaleID, nil
 	}
-	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: target, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: resourceIDs, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
+	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: target, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: resourceIDs, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, PriorBundleIdentity: certificateBundleIdentity(prior), CandidateBundleIdentity: certificates.BundleIdentityFor(identity), Challenge: execution.Challenge.Safety, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
 		return jobs.Record{}, err
 	}
@@ -1781,7 +1841,7 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	if err := verifyManagedACMEBinding(execution.Binding); err != nil {
 		return jobs.Record{}, err
 	}
-	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, ExpectedPriorGeneration: prior.Generation}
+	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
 	activationResult, err := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint)
 	if err != nil {
 		var failure *activation.Failure
@@ -1866,7 +1926,7 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 			return jobs.Record{}, readErr
 		}
 		runtimeDigest := headscaleFailureDigest(activationResult.Runtime.Generation + "\x00" + identity.Fingerprint)
-		if _, commitJournalErr := store.CommitRenewal(ctx, priorJournal, identity, runtimeDigest); commitJournalErr != nil {
+		if _, commitJournalErr := store.CommitRenewal(ctx, priorJournal, certificateBundleIdentity(prior), identity, runtimeDigest); commitJournalErr != nil {
 			return jobs.Record{}, commitJournalErr
 		}
 	}
@@ -2743,10 +2803,15 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 			_ = mutationSet.Close()
 			return err
 		}
-		candidateCommitted := applied.Generation == certificate.CandidateGeneration && applied.Fingerprint == certificate.CandidateFingerprint && applied.Authority != nil && applied.Authority.CertificateID == certificate.CertificateID && safetyResource.ActiveCertificate.Generation == certificate.CandidateGeneration && safetyResource.ActiveCertificate.Fingerprint == certificate.CandidateFingerprint && pointer == certificate.CandidatePointer && childRecord.Outcome == operations.ChildSucceeded
-		priorRetained := journal.Phase == operations.JournalTerminal && certificate.PriorGeneration > 0 && applied.Generation == certificate.PriorGeneration && applied.Fingerprint == certificate.PriorFingerprint && safetyResource.ActiveCertificate.Generation == certificate.PriorGeneration && safetyResource.ActiveCertificate.Fingerprint == certificate.PriorFingerprint && pointer == certificate.PriorPointer
+		candidateCommitted := certificateBundleMatches(applied, certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity) && activeCertificateMatchesBundle(safetyResource.ActiveCertificate, applied) && pointer == certificate.CandidatePointer && childRecord.Outcome == operations.ChildSucceeded
+		priorRetained := journal.Phase == operations.JournalTerminal && certificate.PriorGeneration > 0 && certificateBundleMatches(applied, certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity) && activeCertificateMatchesBundle(safetyResource.ActiveCertificate, applied) && pointer == certificate.PriorPointer
 		if priorRetained {
-			if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
+			if err := certificates.VerifyBundleIdentity(certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity); err != nil {
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
+				return err
+			}
+			if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity, certificate.StageUID, certificate.StageGID); err != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
 				return err
@@ -2770,6 +2835,11 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
 			return fmt.Errorf("completed renewal candidate changed")
+		}
+		if err := certificates.VerifyBundleIdentity(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity); err != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return err
 		}
 		host, err := activation.NewFixedHost()
 		if err != nil {
@@ -2976,10 +3046,12 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 					normalResource = &installation.Resources[index]
 				}
 			}
-			appliedFingerprint := ""
+			appliedCandidate, appliedPrior := false, false
 			serverName := pending.Host
 			if normalResource != nil && normalResource.PublicationRecord.LastAppliedBundle != nil && normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS != nil {
-				appliedFingerprint = normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate.Fingerprint
+				appliedCertificate := normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate
+				appliedCandidate = certificateBundleMatches(appliedCertificate, certificateIdentity.CertificateID, certificateIdentity.CandidateGeneration, certificateIdentity.CandidateBundleIdentity)
+				appliedPrior = certificateIdentity.PriorGeneration > 0 && certificateBundleMatches(appliedCertificate, certificateIdentity.CertificateID, certificateIdentity.PriorGeneration, certificateIdentity.PriorBundleIdentity)
 			}
 			host, hostErr := activation.NewFixedHost()
 			if hostErr != nil {
@@ -2988,39 +3060,67 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				return hostErr
 			}
 			switch {
-			case certificateIdentity.PriorGeneration == 0 && observedPointer == certificateIdentity.CandidatePointer && appliedFingerprint == certificateIdentity.CandidateFingerprint:
+			case certificateIdentity.PriorGeneration == 0 && observedPointer == certificateIdentity.CandidatePointer && appliedCandidate:
 				return fenceAndRelease(fmt.Errorf("publication committed before certificate handoff terminalized"))
 			case certificateIdentity.PriorGeneration == 0 && observedPointer == certificateIdentity.CandidatePointer:
-				restoreErr := certificates.RestorePointer(ctx, certificates.Pointer{CertificateID: certificateIdentity.CertificateID, CandidateGeneration: certificateIdentity.CandidateGeneration}, certificateIdentity.CandidatePointer)
+				restoreErr := certificates.RemovePointer(ctx, certificatePointerFromJournal(*certificateIdentity), certificateIdentity.CandidatePointer)
 				if restoreErr != nil {
 					return fenceAndRelease(restoreErr)
 				}
-			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && appliedFingerprint != certificateIdentity.CandidateFingerprint:
-				restoreErr := host.RestoreCertificate(ctx, certificates.Pointer{CertificateID: certificateIdentity.CertificateID, CandidateGeneration: certificateIdentity.CandidateGeneration, ExpectedPriorGeneration: certificateIdentity.PriorGeneration}, certificateIdentity.CandidatePointer, serverName, certificateIdentity.PriorFingerprint)
+			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && !appliedCandidate && !appliedPrior:
+				return fenceAndRelease(fmt.Errorf("certificate normal state differs from candidate and prior authority"))
+			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && appliedPrior:
+				restoreErr := host.RestoreCertificate(ctx, certificatePointerFromJournal(*certificateIdentity), certificateIdentity.CandidatePointer, serverName, certificateIdentity.PriorFingerprint)
 				if restoreErr != nil {
 					return fenceAndRelease(restoreErr)
 				}
-			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && appliedFingerprint == certificateIdentity.CandidateFingerprint:
+			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && appliedCandidate:
+				if err := certificates.VerifyBundleIdentity(certificateIdentity.CertificateID, certificateIdentity.CandidateGeneration, certificateIdentity.CandidateBundleIdentity); err != nil {
+					return fenceAndRelease(err)
+				}
 				if err := host.VerifyServedCertificate(ctx, serverName, certificateIdentity.CandidateFingerprint); err != nil {
 					return fenceAndRelease(err)
 				}
 				committedCertificate = true
-				if resource.ActiveCertificate == nil || resource.ActiveCertificate.Generation != certificateIdentity.CandidateGeneration {
-					if normalResource == nil || normalResource.PublicationRecord.LastAppliedBundle == nil || normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
-						return fenceAndRelease(fmt.Errorf("committed certificate recovery authority missing"))
+				if normalResource == nil || normalResource.PublicationRecord.LastAppliedBundle == nil || normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
+					return fenceAndRelease(fmt.Errorf("committed certificate recovery authority missing"))
+				}
+				candidateCertificate := normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate
+				if !activeCertificateMatchesBundle(resource.ActiveCertificate, candidateCertificate) {
+					priorIdentity, observeErr := certificates.ObserveIdentity(certificates.FixedBundlesRoot, certificateIdentity.CertificateID, certificateIdentity.PriorGeneration, filetxn.Owner{UID: certificateIdentity.StageUID, GID: certificateIdentity.StageGID})
+					if observeErr != nil || certificates.BundleIdentityFor(priorIdentity) != certificateIdentity.PriorBundleIdentity || !activeCertificateMatchesIdentity(resource.ActiveCertificate, priorIdentity) {
+						return fenceAndRelease(errors.Join(fmt.Errorf("certificate recovery safety authority differs from candidate and prior"), observeErr))
 					}
-					if err := service.CommitRenewedCertificateAuthority(ctx, exposure, resource.ResourceID, normalResource.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate); err != nil {
+					if err := service.CommitRenewedCertificateAuthority(ctx, exposure, resource.ResourceID, candidateCertificate); err != nil {
 						return fenceAndRelease(err)
 					}
 				}
-			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.PriorPointer && appliedFingerprint != certificateIdentity.PriorFingerprint:
+			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.PriorPointer && !appliedPrior:
 				return fenceAndRelease(fmt.Errorf("certificate normal state differs from prior pointer"))
+			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.PriorPointer && appliedPrior:
+				if err := certificates.VerifyBundleIdentity(certificateIdentity.CertificateID, certificateIdentity.PriorGeneration, certificateIdentity.PriorBundleIdentity); err != nil {
+					return fenceAndRelease(err)
+				}
+				manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+				priorRuntime, runtimeErr := host.ObserveRuntime(ctx, manifest)
+				if auditErr != nil || runtimeErr != nil || priorRuntime.Master == nil {
+					return fenceAndRelease(errors.Join(auditErr, runtimeErr, fmt.Errorf("certificate prior runtime unavailable")))
+				}
+				if err := host.Reload(ctx); err != nil {
+					return fenceAndRelease(err)
+				}
+				if _, err := host.WaitForPriorWorkers(ctx, manifest, priorRuntime.Workers); err != nil {
+					return fenceAndRelease(err)
+				}
+				if err := host.VerifyServedCertificate(ctx, serverName, certificateIdentity.PriorFingerprint); err != nil {
+					return fenceAndRelease(err)
+				}
 			case certificateIdentity.PriorGeneration > 0 && observedPointer != certificateIdentity.PriorPointer || certificateIdentity.PriorGeneration == 0 && observedPointer != "":
 				return fenceAndRelease(fmt.Errorf("certificate pointer differs from journal"))
 			}
 		}
 		if !committedCertificate {
-			if err := certificates.RemoveInactiveBundle(certificateIdentity.CertificateID, certificateIdentity.CandidateGeneration, certificateIdentity.StageUID, certificateIdentity.StageGID); err != nil {
+			if err := certificates.RemoveInactiveBundle(certificateIdentity.CertificateID, certificateIdentity.CandidateGeneration, certificateIdentity.CandidateBundleIdentity, certificateIdentity.StageUID, certificateIdentity.StageGID); err != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
 				return err

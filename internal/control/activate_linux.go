@@ -116,13 +116,15 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 		}
 	}
 	priorGeneration := uint64(0)
+	priorIdentity := certificates.BundleIdentity{}
 	if bundle.Prior != nil {
-		if bundle.Certificate.Generation < 2 {
-			return result, fmt.Errorf("headscale reactivation certificate generation invalid")
+		if bundle.PriorCertificate == nil {
+			return result, fmt.Errorf("headscale reactivation prior certificate identity missing")
 		}
-		priorGeneration = bundle.Certificate.Generation - 1
+		priorGeneration = bundle.PriorCertificate.Generation
+		priorIdentity = certificates.BundleIdentityFor(*bundle.PriorCertificate)
 	}
-	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, ExpectedPriorGeneration: priorGeneration}
+	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, CandidateIdentity: certificates.BundleIdentityFor(bundle.Certificate), ExpectedPriorGeneration: priorGeneration, ExpectedPriorIdentity: priorIdentity}
 	pointerResult, pointerErr := certificates.ActivatePointer(ctx, pointer)
 	if pointerResult.CandidateTarget == "" {
 		if pointerErr == nil {
@@ -159,6 +161,9 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 				return errors.Join(reloadErr, waitErr)
 			},
 			restorePointer: func() error {
+				if pointer.ExpectedPriorGeneration == 0 {
+					return certificates.RemovePointer(recovery, pointer, pointerResult.CandidateTarget)
+				}
 				return certificates.RestorePointer(recovery, pointer, pointerResult.CandidateTarget)
 			},
 		})
@@ -354,7 +359,7 @@ func (host *ActivationHost) CloseControl(ctx context.Context, bundle ActivationB
 }
 
 func (host *ActivationHost) Contract(ctx context.Context, bundle ActivationBundle) error {
-	if host == nil || ValidateActivation(bundle) != nil {
+	if host == nil || ValidateActivation(bundle) != nil || bundle.Prior != nil {
 		return fmt.Errorf("headscale activation host authority unavailable")
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: bundle.Candidate.HeadscaleID}}
@@ -378,11 +383,11 @@ func (host *ActivationHost) Contract(ctx context.Context, bundle ActivationBundl
 		controlAbsentErr = requireControlAbsent(context.WithoutCancel(ctx), bundle.Candidate.ControlDomain)
 	}
 	serviceErr := host.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
-	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, ExpectedPriorGeneration: 0}
+	pointer := certificates.Pointer{CertificateID: bundle.Certificate.ID, CandidateGeneration: bundle.Certificate.Generation, CandidateIdentity: certificates.BundleIdentityFor(bundle.Certificate)}
 	current, observeErr := certificates.ObservePointer(bundle.Certificate.ID)
 	var pointerErr error
 	if observeErr == nil && current != "" {
-		pointerErr = certificates.RestorePointer(context.WithoutCancel(ctx), pointer, current)
+		pointerErr = certificates.RemovePointer(context.WithoutCancel(ctx), pointer, current)
 	}
 	listenerErr := requirePublicSTUNAbsent()
 	return errors.Join(stopErr, removeErr, reloadErr, controlAbsentErr, serviceErr, observeErr, pointerErr, listenerErr)

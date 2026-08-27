@@ -198,8 +198,8 @@ func (store *Store) Contract(ctx context.Context, prior Journal) (Journal, error
 	return next, nil
 }
 
-func (store *Store) CommitRenewal(ctx context.Context, prior Journal, certificate certificates.Identity, runtimeDigest string) (Journal, error) {
-	if (prior.Phase != PhaseCommitted && prior.Phase != PhaseExpired) || prior.Certificate == nil || certificate.ID != prior.Certificate.ID || certificate.Generation != prior.Certificate.Generation+1 || !digestValue(runtimeDigest) || certificates.ValidateIdentity(certificate) != nil {
+func (store *Store) CommitRenewal(ctx context.Context, prior Journal, expectedPrior certificates.BundleIdentity, certificate certificates.Identity, runtimeDigest string) (Journal, error) {
+	if (prior.Phase != PhaseCommitted && prior.Phase != PhaseExpired) || prior.Certificate == nil || certificates.ValidateBundleIdentity(expectedPrior) != nil || certificates.BundleIdentityFor(*prior.Certificate) != expectedPrior || certificate.ID != prior.Certificate.ID || certificate.Generation != prior.Certificate.Generation+1 || !digestValue(runtimeDigest) || certificates.ValidateIdentity(certificate) != nil {
 		return Journal{}, fmt.Errorf("headscale renewal journal authority invalid")
 	}
 	next := prior
@@ -279,13 +279,21 @@ func (store *Store) open() (*filetxn.Store, error) {
 }
 
 func sameJournalAuthority(left, right Journal) bool {
+	leftPhase, rightPhase := left.Phase, right.Phase
+	leftCertificate, rightCertificate := left.Certificate, right.Certificate
 	left.Phase, right.Phase = "", ""
 	left.Database, right.Database = nil, nil
 	left.Service, right.Service = nil, nil
 	left.Certificate, right.Certificate = nil, nil
 	left.ActivationDigest, right.ActivationDigest = "", ""
 	left.RuntimeDigest, right.RuntimeDigest = "", ""
-	return reflect.DeepEqual(left, right)
+	if !reflect.DeepEqual(left, right) {
+		return false
+	}
+	certificateUnchanged := reflect.DeepEqual(leftCertificate, rightCertificate)
+	certificateStaged := leftCertificate == nil && rightCertificate != nil && leftPhase == PhaseCertificatePending && rightPhase == PhaseCertificateStaged
+	certificateRenewed := leftCertificate != nil && rightCertificate != nil && (leftPhase == PhaseCommitted || leftPhase == PhaseExpired) && rightPhase == PhaseCommitted && leftCertificate.ID == rightCertificate.ID && leftCertificate.Generation+1 == rightCertificate.Generation
+	return certificateUnchanged || certificateStaged || certificateRenewed
 }
 
 func validPhaseAdvance(left, right Phase) bool {

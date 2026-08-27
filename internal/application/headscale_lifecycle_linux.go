@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
@@ -15,6 +16,7 @@ import (
 	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/preflight"
@@ -25,6 +27,33 @@ import (
 	"strings"
 	"time"
 )
+
+func verifyLiveHeadscaleCertificate(ctx context.Context, installationID string, candidate control.Candidate, certificate certificates.Identity) error {
+	bundle, err := control.BuildActivation(installationID, candidate, certificate)
+	if err != nil {
+		return err
+	}
+	manifest, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, entry := range manifest.Entries {
+		matched = matched || reflect.DeepEqual(entry, bundle.Entry)
+	}
+	if !matched {
+		return fmt.Errorf("Headscale live control entry differs from certificate authority")
+	}
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	runtime, err := host.ObserveRuntime(ctx, manifest)
+	if err != nil || runtime.Master == nil {
+		return fmt.Errorf("Headscale live runtime unavailable: %w", err)
+	}
+	return host.VerifyServedCertificate(ctx, candidate.ControlDomain, certificate.Fingerprint)
+}
 
 func headscaleCertificateBundle(value certificates.Identity, binding acme.Binding) (domain.CertificateBundleIdentity, error) {
 	if certificates.ValidateIdentity(value) != nil {
@@ -39,7 +68,7 @@ func headscaleCertificateBundle(value certificates.Identity, binding acme.Bindin
 		credentials[index] = domain.CertificateCredentialIdentity{Key: file.Key, Path: file.Path, Fingerprint: file.Fingerprint}
 	}
 	authority := &domain.CertificateAuthorityIdentity{CertificateID: value.ID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), Provider: string(binding.Provider), ProfilePath: binding.ProfilePath, ProfileFingerprint: binding.ProfileFingerprint, CredentialFiles: credentials, Zone: binding.Zone, Principal: binding.Principal}
-	return domain.CertificateBundleIdentity{PointerIdentity: pointer, BindingIdentity: value.BindingIdentity, Generation: value.Generation, Fingerprint: value.Fingerprint, SANIdentity: value.SANIdentity, NotAfter: value.NotAfter.Format("2006-01-02T15:04:05Z07:00"), LastTrustedWall: value.LastTrustedWall.Format("2006-01-02T15:04:05Z07:00"), ChainIdentity: value.ChainIdentity, IssuerIdentity: value.IssuerIdentity, Authority: authority}, nil
+	return domain.CertificateBundleIdentity{PointerIdentity: pointer, BindingIdentity: value.BindingIdentity, Generation: value.Generation, Fingerprint: value.Fingerprint, SANIdentity: value.SANIdentity, NotAfter: value.NotAfter.Format("2006-01-02T15:04:05Z07:00"), LastTrustedWall: value.LastTrustedWall.Format("2006-01-02T15:04:05Z07:00"), ChainIdentity: value.ChainIdentity, IssuerIdentity: value.IssuerIdentity, DirectoryIdentity: value.DirectoryIdentity, Authority: authority}, nil
 }
 
 // CompleteHeadscaleLifecycle installs the durable certificate/start authority
@@ -54,23 +83,41 @@ func headscaleLifecycleNormalCommitted(service *FixedService, journal control.Jo
 		return false, err
 	}
 	headscale := installation.Headscale
-	if headscale == nil || headscale.DeployIntent != nil || !headscale.Enabled || headscale.Applied == nil || headscale.Certificate == nil {
+	if !headscaleControlCandidateMatchesNormal(installation, journal) || headscale.DeployIntent != nil || !headscale.Enabled || headscale.Certificate == nil || headscale.Certificate.Authority == nil || journal.Certificate == nil {
 		return false, nil
 	}
-	return headscale.Certificate.Fingerprint == journal.Certificate.Fingerprint && headscale.Certificate.BindingIdentity == journal.Certificate.BindingIdentity && headscale.Applied.CertificateID == journal.Certificate.ID, nil
+	return headscale.Certificate.Authority.CertificateID == journal.Certificate.ID && headscale.Certificate.Generation == journal.Certificate.Generation && certificateBundleIdentity(*headscale.Certificate) == certificates.BundleIdentityFor(*journal.Certificate), nil
 }
 
 func verifyCommittedHeadscaleLifecycle(service *FixedService, journal control.Journal, state safety.State) error {
 	committed, err := headscaleLifecycleNormalCommitted(service, journal)
-	if err != nil || !committed || journal.Certificate == nil || state.Headscale.Reactivating != nil || state.Headscale.ActiveCertificate == nil || state.Headscale.ActiveCertificate.Fingerprint != journal.Certificate.Fingerprint || state.Headscale.ActiveCertificate.Binding != journal.Certificate.BindingIdentity {
+	if err != nil || !committed || journal.Certificate == nil || state.Headscale.Reactivating != nil {
 		return fmt.Errorf("committed Headscale lifecycle authority incomplete: %w", err)
+	}
+	expectedActive := &safety.ActiveCertificateAuthority{Generation: journal.Certificate.Generation, Fingerprint: journal.Certificate.Fingerprint, Binding: journal.Certificate.BindingIdentity, NotAfter: journal.Certificate.NotAfter, LastTrustedWall: journal.Certificate.LastTrustedWall}
+	if !activeCertificateMatchesExpected(state.Headscale.ActiveCertificate, expectedActive) {
+		return fmt.Errorf("committed Headscale lifecycle active certificate authority changed")
 	}
 	return nil
 }
 
 func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedService, journal control.Journal, _ safety.State) (returnErr error) {
-	if journal.Certificate == nil {
-		return fmt.Errorf("headscale lifecycle certificate missing")
+	if journal.Certificate == nil || (journal.Phase != control.PhaseActivated && journal.Phase != control.PhaseCommitted) {
+		return fmt.Errorf("headscale lifecycle certificate or phase missing")
+	}
+	target, err := certificates.BundlePath(journal.Certificate.ID, journal.Certificate.Generation)
+	if err != nil {
+		return err
+	}
+	activePointer, err := certificates.ObservePointer(journal.Certificate.ID)
+	if err != nil || activePointer != target {
+		return fmt.Errorf("headscale lifecycle active pointer changed: %w", err)
+	}
+	if err := certificates.VerifyBundleIdentity(journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)); err != nil {
+		return err
+	}
+	if err := verifyLiveHeadscaleCertificate(ctx, journal.InstallationID, journal.Candidate, *journal.Certificate); err != nil {
+		return err
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
@@ -89,15 +136,16 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	}
 	if fresh.Headscale.Reactivating != nil {
 		active := fresh.Headscale.Reactivating
-		if active.PlanID != journal.PlanID || active.CertificateFingerprint != journal.Certificate.Fingerprint {
+		bundle, bundleErr := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
+		candidateDigest, candidateDigestErr := control.Digest(journal.Candidate)
+		if bundleErr != nil || candidateDigestErr != nil {
+			return errors.Join(bundleErr, candidateDigestErr)
+		}
+		if active.PlanID != journal.PlanID || active.Generation != journal.IntentGeneration || active.PriorGeneration+1 != active.Generation || active.ControlGeneration != journal.Candidate.Generation || active.CertificateGeneration != journal.Certificate.Generation || active.CertificateFingerprint != journal.Certificate.Fingerprint || active.CandidateDigest != journal.Candidate.ConfigDigest || active.CandidateBundle != candidateDigest || active.ActivationDigest != bundle.Digest || active.ControlEntryDigest != bundle.Entry.Digest || !active.CertificateUntil.Equal(journal.Certificate.NotAfter) || !active.CertificateLastTrustedWall.Equal(journal.Certificate.LastTrustedWall) {
 			return fmt.Errorf("headscale lifecycle reactivation changed")
 		}
 		next := fresh
 		next.Revision++
-		bundle, bundleErr := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
-		if bundleErr != nil {
-			return bundleErr
-		}
 		next.Headscale.ControlEntryDigest = bundle.Entry.Digest
 		next.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: journal.Certificate.Generation, Fingerprint: journal.Certificate.Fingerprint, Binding: journal.Certificate.BindingIdentity, NotAfter: journal.Certificate.NotAfter, LastTrustedWall: journal.Certificate.LastTrustedWall}
 		next.Headscale.Reactivating = nil
@@ -106,7 +154,8 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 		}
 		fresh = next
 	}
-	if fresh.Headscale.ActiveCertificate == nil || fresh.Headscale.ActiveCertificate.Fingerprint != journal.Certificate.Fingerprint {
+	expectedActive := &safety.ActiveCertificateAuthority{Generation: journal.Certificate.Generation, Fingerprint: journal.Certificate.Fingerprint, Binding: journal.Certificate.BindingIdentity, NotAfter: journal.Certificate.NotAfter, LastTrustedWall: journal.Certificate.LastTrustedWall}
+	if !activeCertificateMatchesExpected(fresh.Headscale.ActiveCertificate, expectedActive) {
 		return fmt.Errorf("headscale lifecycle active certificate missing")
 	}
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
@@ -114,20 +163,25 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	if err != nil {
 		return err
 	}
-	if current.Phase != control.PhaseCommitted {
+	if !reflect.DeepEqual(current, journal) {
+		return fmt.Errorf("headscale lifecycle control journal lineage changed")
+	}
+	if current.Phase == control.PhaseActivated {
 		committed := current
 		committed.Phase = control.PhaseCommitted
 		if err := store.Replace(ctx, current, committed); err != nil {
 			return err
 		}
 		current = committed
+	} else if current.Phase != control.PhaseCommitted {
+		return fmt.Errorf("headscale lifecycle control phase changed")
 	}
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
 	}
 	installation, err := loadHeadscaleInstallation(document)
-	if err != nil || installation.Headscale.Certificate == nil {
+	if err != nil || installation.Headscale.Certificate == nil || installation.Headscale.Certificate.Authority == nil || installation.Headscale.Certificate.Authority.CertificateID != journal.Certificate.ID || installation.Headscale.Certificate.Generation != journal.Certificate.Generation || certificateBundleIdentity(*installation.Headscale.Certificate) != certificates.BundleIdentityFor(*journal.Certificate) {
 		return fmt.Errorf("committed Headscale lifecycle normal authority missing")
 	}
 	admitter, err := service.TimerAdmitter()
@@ -138,14 +192,19 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	return err
 }
 
-func headscaleExpiryJournalMatchesNormal(installation domain.Installation, journal control.Journal) bool {
+func headscaleControlCandidateMatchesNormal(installation domain.Installation, journal control.Journal) bool {
 	headscale := installation.Headscale
-	identity := journal.Certificate
-	if headscale == nil || headscale.Certificate == nil || identity == nil || headscale.Applied == nil || headscale.Certificate.Authority == nil || journal.InstallationID != installation.InstallationID {
+	if headscale == nil || headscale.Applied == nil || journal.InstallationID != installation.InstallationID {
 		return false
 	}
 	applied, err := control.AppliedIdentity(journal.Candidate)
-	if err != nil || !reflect.DeepEqual(applied, *headscale.Applied) || journal.Candidate.HeadscaleID != headscale.ID || journal.Candidate.DatabaseUUID != headscale.Database.UUID || journal.Candidate.DatabaseGeneration != headscale.Database.Generation || journal.Candidate.ControlDomain != headscale.ControlDomain || journal.Candidate.MagicDNSNamespace != headscale.MagicDNSNamespace || !reflect.DeepEqual(journal.Candidate.Artifact, headscale.Artifact) {
+	return err == nil && reflect.DeepEqual(applied, *headscale.Applied) && journal.Candidate.HeadscaleID == headscale.ID && journal.Candidate.DatabaseUUID == headscale.Database.UUID && journal.Candidate.DatabaseGeneration == headscale.Database.Generation && journal.Candidate.ControlDomain == headscale.ControlDomain && journal.Candidate.MagicDNSNamespace == headscale.MagicDNSNamespace && reflect.DeepEqual(journal.Candidate.Artifact, headscale.Artifact)
+}
+
+func headscaleExpiryJournalMatchesNormal(installation domain.Installation, journal control.Journal) bool {
+	headscale := installation.Headscale
+	identity := journal.Certificate
+	if !headscaleControlCandidateMatchesNormal(installation, journal) || headscale.Certificate == nil || identity == nil || headscale.Certificate.Authority == nil {
 		return false
 	}
 	certificate := headscale.Certificate
@@ -153,7 +212,7 @@ func headscaleExpiryJournalMatchesNormal(installation domain.Installation, journ
 	lastWall, lastWallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
 	return notAfterErr == nil && lastWallErr == nil && journal.Candidate.CertificateID == identity.ID &&
 		headscale.Applied.CertificateID == identity.ID && certificate.Authority.CertificateID == identity.ID &&
-		certificate.Generation == identity.Generation && certificate.Fingerprint == identity.Fingerprint && certificate.BindingIdentity == identity.BindingIdentity && certificate.SANIdentity == identity.SANIdentity && certificate.ChainIdentity == identity.ChainIdentity && certificate.IssuerIdentity == identity.IssuerIdentity &&
+		certificate.Generation == identity.Generation && certificate.Fingerprint == identity.Fingerprint && certificate.BindingIdentity == identity.BindingIdentity && certificate.SANIdentity == identity.SANIdentity && certificate.ChainIdentity == identity.ChainIdentity && certificate.IssuerIdentity == identity.IssuerIdentity && certificate.DirectoryIdentity == identity.DirectoryIdentity &&
 		notAfter.Equal(identity.NotAfter.Truncate(time.Second)) && lastWall.Equal(identity.LastTrustedWall.Truncate(time.Second))
 }
 

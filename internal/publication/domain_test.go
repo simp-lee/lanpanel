@@ -42,6 +42,24 @@ func TestApplicationManagedDomainForwardsOnlyAuthorizationAndWebSocket(t *testin
 	}
 }
 
+func TestDomainCandidateCarriesExactPriorCertificatePointerAuthority(t *testing.T) {
+	value := "sha256:" + strings.Repeat("a", 64)
+	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: value, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: value, PolicyDigest: value, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
+	prior := publicationTestCertificate(value)
+	resource.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{DomainHTTPS: &domain.DomainHTTPSBundleIdentity{Certificate: prior}}
+	candidateCertificate := prior
+	candidateCertificate.Generation = 2
+	candidateCertificate.Fingerprint = "sha256:" + strings.Repeat("b", 64)
+	candidateCertificate.ChainIdentity = "sha256:" + strings.Repeat("c", 64)
+	candidate, err := PrepareDomain(resource, 2, candidateCertificate, "", "", "", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.CertificatePointer == nil || candidate.CertificatePointer.ExpectedPriorGeneration != prior.Generation || candidate.CertificatePointer.ExpectedPriorIdentity != certificatePointerBundleIdentity(prior) || candidate.CertificatePointer.CandidateIdentity != certificatePointerBundleIdentity(candidateCertificate) {
+		t.Fatalf("certificate pointer authority=%+v", candidate.CertificatePointer)
+	}
+}
+
 func TestGoAccessCandidateUsesIndependentBasicAndCredentialCleanWebSocket(t *testing.T) {
 	value := "sha256:" + strings.Repeat("a", 64)
 	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: value, Target: domain.AppTarget{Kind: domain.AppTargetLocalHTTP}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic, GoAccess: domain.GoAccessPublication{Enabled: true, CredentialID: "cred_00000000000000000000000000000001", CIDRs: []string{"8.8.8.8/32"}, DashboardPath: "/__lanpanel/goaccess/", WebSocketPath: "/__lanpanel/goaccess-ws"}}}, ManagedProcess: &domain.ManagedProcess{Requested: domain.ProcessRequestedRunning, Applied: &domain.ProcessBundle{ConfigDigest: value, PolicyDigest: value, FrontendEndpoint: "/run/lanpanel/apps/app.sock"}}}
@@ -102,7 +120,7 @@ func publicationTestCertificate(digest string) domain.CertificateBundleIdentity 
 	}
 	san := sha256.Sum256([]byte("app.example.test"))
 	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
-	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: digest, IssuerIdentity: digest, Authority: authority}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", ChainIdentity: digest, IssuerIdentity: digest, DirectoryIdentity: digest, Authority: authority}
 }
 
 func TestDomainCandidateBindsTLSAuthStaticAndWebSocket(t *testing.T) {
@@ -124,7 +142,7 @@ func TestDomainCandidateBindsTLSAuthStaticAndWebSocket(t *testing.T) {
 	if candidate.Bundle.DomainHTTPS.Auth.ReferenceIdentity != expectedReference {
 		t.Fatal("credential content fingerprint was not bound")
 	}
-	if candidate.CertificatePointer == nil || len(candidate.OwnershipListeners) != 0 {
+	if candidate.CertificatePointer == nil || candidate.CertificatePointer.CandidateIdentity != certificatePointerBundleIdentity(certificate) || len(candidate.OwnershipListeners) != 0 {
 		t.Fatalf("candidate authority incomplete")
 	}
 }

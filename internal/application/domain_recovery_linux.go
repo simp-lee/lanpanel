@@ -979,10 +979,12 @@ func restoreInterruptedDomainPointer(ctx context.Context, intent domain.Activati
 		return fmt.Errorf("interrupted certificate pointer authority missing")
 	}
 	priorGeneration := uint64(0)
+	priorIdentity := certificates.BundleIdentity{}
 	if intent.Prior != nil && intent.Prior.DomainHTTPS != nil && intent.Prior.DomainHTTPS.Certificate.Authority != nil && intent.Prior.DomainHTTPS.Certificate.Authority.CertificateID == candidate.Certificate.Authority.CertificateID {
 		priorGeneration = intent.Prior.DomainHTTPS.Certificate.Generation
+		priorIdentity = certificateBundleIdentity(intent.Prior.DomainHTTPS.Certificate)
 	}
-	pointer := certificates.Pointer{CertificateID: candidate.Certificate.Authority.CertificateID, CandidateGeneration: candidate.Certificate.Generation, ExpectedPriorGeneration: priorGeneration}
+	pointer := certificates.Pointer{CertificateID: candidate.Certificate.Authority.CertificateID, CandidateGeneration: candidate.Certificate.Generation, CandidateIdentity: certificateBundleIdentity(candidate.Certificate), ExpectedPriorGeneration: priorGeneration, ExpectedPriorIdentity: priorIdentity}
 	candidatePath, err := certificates.BundlePath(pointer.CertificateID, pointer.CandidateGeneration)
 	if err != nil {
 		return err
@@ -992,6 +994,9 @@ func restoreInterruptedDomainPointer(ctx context.Context, intent domain.Activati
 		return err
 	}
 	if observed == candidatePath {
+		if priorGeneration == 0 {
+			return certificates.RemovePointer(ctx, pointer, candidatePath)
+		}
 		return certificates.RestorePointer(ctx, pointer, candidatePath)
 	}
 	priorPath := ""
@@ -1003,6 +1008,9 @@ func restoreInterruptedDomainPointer(ctx context.Context, intent domain.Activati
 	}
 	if observed != priorPath {
 		return fmt.Errorf("interrupted certificate pointer identity changed")
+	}
+	if priorGeneration != 0 {
+		return certificates.VerifyBundleIdentity(pointer.CertificateID, priorGeneration, priorIdentity)
 	}
 	return nil
 }

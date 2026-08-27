@@ -31,20 +31,21 @@ func FixedActivationPaths() ActivationPaths {
 }
 
 type ActivationBundle struct {
-	SchemaVersion  string                           `json:"schema_version"`
-	InstallationID string                           `json:"installation_id"`
-	Candidate      Candidate                        `json:"candidate"`
-	Certificate    certificates.Identity            `json:"certificate"`
-	Prior          *domain.HeadscaleAppliedIdentity `json:"prior,omitempty"`
-	Paths          ActivationPaths                  `json:"paths"`
-	ServiceUser    string                           `json:"service_user"`
-	ServiceGroup   string                           `json:"service_group"`
-	ControlSocket  []byte                           `json:"control_socket"`
-	ControlRelay   []byte                           `json:"control_relay"`
-	STUNSocket     []byte                           `json:"stun_socket"`
-	STUNRelay      []byte                           `json:"stun_relay"`
-	Entry          nginx.Entry                      `json:"entry"`
-	Digest         string                           `json:"digest"`
+	SchemaVersion    string                           `json:"schema_version"`
+	InstallationID   string                           `json:"installation_id"`
+	Candidate        Candidate                        `json:"candidate"`
+	Certificate      certificates.Identity            `json:"certificate"`
+	PriorCertificate *certificates.Identity           `json:"prior_certificate,omitempty"`
+	Prior            *domain.HeadscaleAppliedIdentity `json:"prior,omitempty"`
+	Paths            ActivationPaths                  `json:"paths"`
+	ServiceUser      string                           `json:"service_user"`
+	ServiceGroup     string                           `json:"service_group"`
+	ControlSocket    []byte                           `json:"control_socket"`
+	ControlRelay     []byte                           `json:"control_relay"`
+	STUNSocket       []byte                           `json:"stun_socket"`
+	STUNRelay        []byte                           `json:"stun_relay"`
+	Entry            nginx.Entry                      `json:"entry"`
+	Digest           string                           `json:"digest"`
 }
 
 type ActivationAuthority struct {
@@ -63,6 +64,16 @@ func ValidateActivationAuthority(bundle ActivationBundle, authority ActivationAu
 	if intent.Phase != domain.HeadscaleDeployActivating || intent.ActivationDigest != bundle.Digest || intent.CertificateFingerprint != bundle.Certificate.Fingerprint || !reflect.DeepEqual(intent.Prior, bundle.Prior) || !reflect.DeepEqual(intent.Candidate, AppliedFromActivation(bundle)) || active == nil || active.ActivationDigest != bundle.Digest || active.ControlEntryDigest != bundle.Entry.Digest || active.CertificateFingerprint != bundle.Certificate.Fingerprint || active.ControlGeneration != bundle.Entry.Generation {
 		return fmt.Errorf("headscale activation runtime binding changed")
 	}
+	if bundle.PriorCertificate != nil {
+		prior := authority.Installation.Headscale.Certificate
+		expectedIdentity := certificates.BundleIdentity{}
+		if prior != nil {
+			expectedIdentity = certificates.BundleIdentity{Fingerprint: prior.Fingerprint, SANIdentity: prior.SANIdentity, ChainIdentity: prior.ChainIdentity, IssuerIdentity: prior.IssuerIdentity, BindingIdentity: prior.BindingIdentity, DirectoryIdentity: prior.DirectoryIdentity}
+		}
+		if prior == nil || prior.Authority == nil || prior.Authority.CertificateID != bundle.PriorCertificate.ID || prior.Generation != bundle.PriorCertificate.Generation || expectedIdentity != certificates.BundleIdentityFor(*bundle.PriorCertificate) {
+			return fmt.Errorf("headscale activation prior certificate authority changed")
+		}
+	}
 	return nil
 }
 
@@ -74,15 +85,16 @@ func BuildActivation(installationID string, candidate Candidate, certificate cer
 	return bundle, ValidateActivation(bundle)
 }
 
-func BuildReactivation(installationID string, candidate Candidate, certificate certificates.Identity, prior domain.HeadscaleAppliedIdentity) (ActivationBundle, error) {
+func BuildReactivation(installationID string, candidate Candidate, certificate, priorCertificate certificates.Identity, prior domain.HeadscaleAppliedIdentity) (ActivationBundle, error) {
 	applied, appliedErr := AppliedIdentity(candidate)
-	if appliedErr != nil || !reflect.DeepEqual(applied, prior) {
+	if appliedErr != nil || !reflect.DeepEqual(applied, prior) || certificates.ValidateIdentity(priorCertificate) != nil || priorCertificate.ID != certificate.ID || priorCertificate.Generation+1 != certificate.Generation || !slices.Equal(priorCertificate.Domains, certificate.Domains) {
 		return ActivationBundle{}, fmt.Errorf("headscale reactivation prior invalid")
 	}
 	bundle, err := renderActivation(installationID, candidate, certificate)
 	if err != nil {
 		return ActivationBundle{}, err
 	}
+	bundle.PriorCertificate = &priorCertificate
 	bundle.Prior = &prior
 	digest, err := ActivationDigest(bundle)
 	if err != nil {
@@ -130,9 +142,15 @@ func ValidateActivation(bundle ActivationBundle) error {
 		return fmt.Errorf("headscale activation bundle is invalid")
 	}
 	expected, err := renderActivation(bundle.InstallationID, bundle.Candidate, bundle.Certificate)
-	if err == nil && bundle.Prior != nil {
+	if err == nil && (bundle.Prior != nil || bundle.PriorCertificate != nil) {
+		applied, appliedErr := AppliedIdentity(bundle.Candidate)
+		if bundle.Prior == nil || bundle.PriorCertificate == nil || appliedErr != nil || !reflect.DeepEqual(applied, *bundle.Prior) || certificates.ValidateIdentity(*bundle.PriorCertificate) != nil || bundle.PriorCertificate.ID != bundle.Certificate.ID || bundle.PriorCertificate.Generation+1 != bundle.Certificate.Generation || !slices.Equal(bundle.PriorCertificate.Domains, bundle.Certificate.Domains) {
+			return fmt.Errorf("headscale activation prior certificate identity changed")
+		}
 		prior := *bundle.Prior
+		priorCertificate := *bundle.PriorCertificate
 		expected.Prior = &prior
+		expected.PriorCertificate = &priorCertificate
 		expected.Digest = ""
 		expected.Digest, err = ActivationDigest(expected)
 	}

@@ -4,6 +4,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"lanpanel/internal/acme"
@@ -14,9 +15,11 @@ import (
 	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/operations"
+	"lanpanel/internal/persist"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/safety"
 	"reflect"
+	"slices"
 	"time"
 )
 
@@ -24,6 +27,22 @@ type headscaleActivationHost interface {
 	Stage(context.Context, control.ActivationBundle) error
 	Activate(context.Context, control.ActivationBundle, control.ActivationAuthority) (control.ActivationResult, error)
 	Contract(context.Context, control.ActivationBundle) error
+}
+
+func headscaleActivationMarkerMatches(active *safety.HeadscaleReactivating, journal control.Journal, expected safety.ChallengePending, bundle control.ActivationBundle) bool {
+	candidateDigest, err := control.Digest(journal.Candidate)
+	return err == nil && active != nil && active.PlanID == expected.PlanID && active.Generation == expected.Generation && active.PriorGeneration+1 == active.Generation && active.ControlGeneration == journal.Candidate.Generation && active.CertificateGeneration == journal.Certificate.Generation && active.CertificateFingerprint == journal.Certificate.Fingerprint && active.CandidateDigest == expected.ConfigDigest && active.CandidateBundle == candidateDigest && active.ActivationDigest == bundle.Digest && active.ControlEntryDigest == bundle.Entry.Digest && slices.Equal(active.BaseMarkers, expected.BaseMarkers) && !active.ProbePending && active.ProbeCorrelation == "" && active.CertificateUntil.Equal(journal.Certificate.NotAfter) && active.CertificateLastTrustedWall.Equal(journal.Certificate.LastTrustedWall)
+}
+
+func requireHeadscaleOperationCertificate(document persist.Document, jobID string, identity certificates.Identity, allowTerminal bool) (operations.JournalRecord, error) {
+	raw, present := document.Entries["journals/certificate-"+jobID]
+	var journal operations.JournalRecord
+	decodeErr := json.Unmarshal(raw, &journal)
+	validPhase := journal.Phase == operations.JournalActive || allowTerminal && journal.Phase == operations.JournalTerminal
+	if !present || decodeErr != nil || journal.Kind != operations.JournalCertificateActivation || journal.Operation != operations.HeadscaleDeploy || !validPhase || journal.Certificate == nil || journal.Certificate.CertificateID != identity.ID || journal.Certificate.CandidateGeneration != identity.Generation || journal.Certificate.CandidateBundleIdentity != certificates.BundleIdentityFor(identity) {
+		return operations.JournalRecord{}, fmt.Errorf("Headscale operation certificate bundle authority changed")
+	}
+	return journal, nil
 }
 
 // ActivateControl performs only S17B's mutation-to-exposure transition. The
@@ -53,6 +72,9 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 	}
 	document, err := execution.Service.normal.Read()
 	if err != nil {
+		return err
+	}
+	if _, err := requireHeadscaleOperationCertificate(document, execution.JobID, *journal.Certificate, false); err != nil {
 		return err
 	}
 	installation, err := loadHeadscaleInstallation(document)
@@ -140,24 +162,54 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 }
 
 func reconcileInterruptedHeadscaleActivation(ctx context.Context, service *FixedService, journal control.Journal, state safety.State) (returnErr error) {
-	active := state.Headscale.Reactivating
-	if active == nil || journal.Certificate == nil || active.PlanID != journal.PlanID || active.Generation != journal.IntentGeneration || active.ControlGeneration != journal.Candidate.Generation || active.CertificateGeneration != journal.Certificate.Generation || active.CertificateFingerprint != journal.Certificate.Fingerprint {
-		return fmt.Errorf("interrupted Headscale activation lost exact safety authority")
-	}
-	document, err := service.normal.Read()
-	if err != nil {
-		return err
-	}
-	installation, err := loadHeadscaleInstallation(document)
-	if err != nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != journal.JobID {
-		return fmt.Errorf("interrupted Headscale activation lost domain authority: %w", err)
+	if journal.Certificate == nil {
+		return fmt.Errorf("interrupted Headscale activation certificate authority missing")
 	}
 	bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
 	if err != nil {
 		return err
 	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	operationJournal, err := requireHeadscaleOperationCertificate(document, journal.JobID, *journal.Certificate, true)
+	if err != nil || !headscaleActivationMarkerMatches(state.Headscale.Reactivating, journal, operationJournal.Certificate.Challenge, bundle) {
+		return fmt.Errorf("interrupted Headscale activation lost exact safety authority: %w", err)
+	}
+	active := state.Headscale.Reactivating
+	installation, err := loadHeadscaleInstallation(document)
+	if err != nil || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != journal.JobID {
+		return fmt.Errorf("interrupted Headscale activation lost domain authority: %w", err)
+	}
 	admitter, err := service.TimerAdmitter()
 	if err != nil {
+		return err
+	}
+	if operationJournal.Phase == operations.JournalTerminal {
+		if journal.Phase != control.PhaseContracted || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployContracted {
+			return fmt.Errorf("contracted Headscale activation lineage changed")
+		}
+		mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+		if err != nil {
+			return err
+		}
+		mutation, exposure, err := mutationSet.AcquireExposure(ctx, "headscale/"+journal.Candidate.HeadscaleID, service.manager)
+		if err != nil {
+			return errors.Join(err, mutationSet.Close())
+		}
+		defer func() {
+			returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure), mutationSet.Close())
+		}()
+		freshSafety, err := service.safety.ReadForRecovery(exposure)
+		if err != nil || !headscaleActivationMarkerMatches(freshSafety.Headscale.Reactivating, journal, operationJournal.Certificate.Challenge, bundle) {
+			return fmt.Errorf("contracted Headscale activation safety changed: %w", err)
+		}
+		next := freshSafety
+		next.Revision++
+		activeAuthority := *freshSafety.Headscale.Reactivating
+		next.Headscale.Reactivating = nil
+		_, err = service.safety.Commit(context.WithoutCancel(ctx), exposure, safety.RoleContraction, freshSafety.Revision, next, safety.TransitionProof{Headscale: headscaleConvergenceProof(activeAuthority, bundle.Digest)})
 		return err
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
@@ -191,7 +243,7 @@ func reconcileInterruptedHeadscaleActivation(ctx context.Context, service *Fixed
 	stage, stageErr := identity.CertificateStageIdentityFor(journal.Candidate.CertificateID)
 	physicalErr = errors.Join(physicalErr, stageErr)
 	if stageErr == nil {
-		physicalErr = errors.Join(physicalErr, acme.RemoveStage(journal.Candidate.CertificateID, stage.UID, stage.GID), acme.RemoveWebroot(journal.Candidate.CertificateID, stage.UID, stage.GID), certificates.RemoveInactiveBundle(journal.Candidate.CertificateID, journal.Certificate.Generation, stage.UID, stage.GID))
+		physicalErr = errors.Join(physicalErr, acme.RemoveStage(journal.Candidate.CertificateID, stage.UID, stage.GID), acme.RemoveWebroot(journal.Candidate.CertificateID, stage.UID, stage.GID), certificates.RemoveInactiveBundle(journal.Candidate.CertificateID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate), stage.UID, stage.GID))
 	}
 	if physicalErr != nil {
 		observed, fallbackErr := activationHost.FallbackStop(context.WithoutCancel(ctx), bundle)
@@ -212,7 +264,7 @@ func reconcileInterruptedHeadscaleActivation(ctx context.Context, service *Fixed
 		return err
 	}
 	freshSafety, err := service.safety.ReadForRecovery(exposure)
-	if err != nil || freshSafety.Headscale.Reactivating == nil || freshSafety.Headscale.Reactivating.PlanID != journal.PlanID {
+	if err != nil || !headscaleActivationMarkerMatches(freshSafety.Headscale.Reactivating, journal, operationJournal.Certificate.Challenge, bundle) {
 		return fmt.Errorf("headscale activation contraction safety changed: %w", err)
 	}
 	next := freshSafety

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	managedheadscale "lanpanel/internal/headscale"
@@ -279,15 +280,18 @@ const (
 )
 
 type CertificateJournalIdentity struct {
-	CertificateID        string `json:"certificate_id"`
-	PriorGeneration      uint64 `json:"prior_generation,omitempty"`
-	CandidateGeneration  uint64 `json:"candidate_generation"`
-	PriorPointer         string `json:"prior_pointer,omitempty"`
-	CandidatePointer     string `json:"candidate_pointer"`
-	PriorFingerprint     string `json:"prior_fingerprint,omitempty"`
-	CandidateFingerprint string `json:"candidate_fingerprint,omitempty"`
-	StageUID             uint32 `json:"stage_uid,omitempty"`
-	StageGID             uint32 `json:"stage_gid,omitempty"`
+	CertificateID           string                      `json:"certificate_id"`
+	PriorGeneration         uint64                      `json:"prior_generation,omitempty"`
+	CandidateGeneration     uint64                      `json:"candidate_generation"`
+	PriorPointer            string                      `json:"prior_pointer,omitempty"`
+	CandidatePointer        string                      `json:"candidate_pointer"`
+	PriorFingerprint        string                      `json:"prior_fingerprint,omitempty"`
+	CandidateFingerprint    string                      `json:"candidate_fingerprint,omitempty"`
+	PriorBundleIdentity     certificates.BundleIdentity `json:"prior_bundle_identity"`
+	CandidateBundleIdentity certificates.BundleIdentity `json:"candidate_bundle_identity"`
+	Challenge               safety.ChallengePending     `json:"challenge"`
+	StageUID                uint32                      `json:"stage_uid,omitempty"`
+	StageGID                uint32                      `json:"stage_gid,omitempty"`
 }
 type JournalRecord struct {
 	SchemaVersion      string                      `json:"schema_version"`
@@ -2456,7 +2460,8 @@ func (admitter *Admitter) CommitCertificatePublicationBegin(ctx context.Context,
 			}
 		}
 		certificate := certificateJournal.Certificate
-		if certificateKey == "" || certificateJournal.Phase != JournalActive || certificate == nil || certificate.CertificateID != bundle.DomainHTTPS.Certificate.Authority.CertificateID || certificate.CandidateFingerprint != bundle.DomainHTTPS.Certificate.Fingerprint {
+		expectedCertificateIdentity := certificates.BundleIdentity{Fingerprint: bundle.DomainHTTPS.Certificate.Fingerprint, SANIdentity: bundle.DomainHTTPS.Certificate.SANIdentity, ChainIdentity: bundle.DomainHTTPS.Certificate.ChainIdentity, IssuerIdentity: bundle.DomainHTTPS.Certificate.IssuerIdentity, BindingIdentity: bundle.DomainHTTPS.Certificate.BindingIdentity, DirectoryIdentity: bundle.DomainHTTPS.Certificate.DirectoryIdentity}
+		if certificateKey == "" || certificateJournal.Phase != JournalActive || certificate == nil || certificate.CertificateID != bundle.DomainHTTPS.Certificate.Authority.CertificateID || certificate.CandidateGeneration != bundle.DomainHTTPS.Certificate.Generation || certificate.CandidateFingerprint != bundle.DomainHTTPS.Certificate.Fingerprint || certificate.CandidateBundleIdentity != expectedCertificateIdentity {
 			return fmt.Errorf("certificate publication staged identity missing")
 		}
 		original := intent.SafetyBinding
@@ -4272,14 +4277,21 @@ func (admitter *Admitter) CompleteHeadscaleDeploy(ctx context.Context, mutation 
 		if err != nil {
 			return err
 		}
-		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || installation.Headscale == nil || installation.Headscale.DeployIntent != nil || installation.Headscale.Certificate == nil || installation.Headscale.Certificate.Fingerprint != commit.Certificate.Fingerprint || state.Headscale.Reactivating != nil || state.Headscale.ActiveCertificate == nil || state.Headscale.ActiveCertificate.Fingerprint != commit.Certificate.Fingerprint {
+		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || commit.Certificate.Authority == nil || installation.Headscale == nil || installation.Headscale.DeployIntent != nil || installation.Headscale.Certificate == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, commit.Certificate) || state.Headscale.Reactivating != nil {
 			return fmt.Errorf("headscale lifecycle completion authority incomplete")
 		}
 		journalKey := "journals/certificate-" + jobID
 		raw, present := transaction.Get(journalKey)
 		var journal JournalRecord
-		if !present || decodeStrict(raw, &journal) != nil || journal.Phase != JournalActive {
+		expectedBundleIdentity := certificates.BundleIdentity{Fingerprint: commit.Certificate.Fingerprint, SANIdentity: commit.Certificate.SANIdentity, ChainIdentity: commit.Certificate.ChainIdentity, IssuerIdentity: commit.Certificate.IssuerIdentity, BindingIdentity: commit.Certificate.BindingIdentity, DirectoryIdentity: commit.Certificate.DirectoryIdentity}
+		if !present || decodeStrict(raw, &journal) != nil || journal.Phase != JournalActive || journal.Certificate == nil || journal.Certificate.CertificateID != commit.Certificate.Authority.CertificateID || journal.Certificate.CandidateGeneration != commit.Certificate.Generation || journal.Certificate.CandidateBundleIdentity != expectedBundleIdentity {
 			return fmt.Errorf("headscale lifecycle journal changed")
+		}
+		notAfter, notAfterErr := time.Parse(time.RFC3339, commit.Certificate.NotAfter)
+		lastTrustedWall, lastTrustedWallErr := time.Parse(time.RFC3339, commit.Certificate.LastTrustedWall)
+		active := state.Headscale.ActiveCertificate
+		if notAfterErr != nil || lastTrustedWallErr != nil || active == nil || active.Generation != commit.Certificate.Generation || active.Fingerprint != commit.Certificate.Fingerprint || active.Binding != commit.Certificate.BindingIdentity || !active.NotAfter.Equal(notAfter) || active.LastTrustedWall.Before(lastTrustedWall) {
+			return fmt.Errorf("headscale lifecycle active certificate authority changed")
 		}
 		journal.Phase = JournalTerminal
 		encoded, err := persist.EncodeEntry(journal)
@@ -6037,28 +6049,33 @@ func validateJournalEntry(key string, raw json.RawMessage) error {
 
 func validateCertificateJournalIdentity(value JournalRecord) error {
 	identity := value.Certificate
-	if identity == nil || !validIdentityRef(identity.CertificateID) || identity.CandidateGeneration == 0 || identity.StageUID == 0 || identity.StageGID == 0 {
+	if identity == nil || !validIdentityRef(identity.CertificateID) || identity.CandidateGeneration == 0 || identity.StageUID == 0 || identity.StageGID == 0 || identity.Challenge.Generation == 0 || identity.Challenge.PlanID == "" || identity.Challenge.CertificateIdentity != identity.CertificateID {
 		return fmt.Errorf("certificate journal pointer identity missing")
 	}
 	candidate := fmt.Sprintf("/var/lib/lanpanel/certificates/bundles/%s-%020d", identity.CertificateID, identity.CandidateGeneration)
 	if identity.CandidatePointer != candidate {
 		return fmt.Errorf("certificate journal candidate pointer invalid")
 	}
+	zeroBundleIdentity := certificates.BundleIdentity{}
 	if identity.PriorGeneration == 0 {
-		if identity.PriorPointer != "" || identity.PriorFingerprint != "" {
+		if identity.PriorPointer != "" || identity.PriorFingerprint != "" || identity.PriorBundleIdentity != zeroBundleIdentity {
 			return fmt.Errorf("certificate journal unexpected prior identity")
 		}
 	} else {
 		prior := fmt.Sprintf("/var/lib/lanpanel/certificates/bundles/%s-%020d", identity.CertificateID, identity.PriorGeneration)
-		if identity.PriorPointer != prior || !exactDigest(identity.PriorFingerprint) || identity.CandidateGeneration != identity.PriorGeneration+1 {
+		if identity.PriorPointer != prior || !exactDigest(identity.PriorFingerprint) || identity.CandidateGeneration != identity.PriorGeneration+1 || certificates.ValidateBundleIdentity(identity.PriorBundleIdentity) != nil || identity.PriorBundleIdentity.Fingerprint != identity.PriorFingerprint {
 			return fmt.Errorf("certificate journal prior identity invalid")
 		}
 	}
-	if identity.CandidateFingerprint != "" && !exactDigest(identity.CandidateFingerprint) {
-		return fmt.Errorf("certificate journal candidate fingerprint invalid")
+	if identity.CandidateFingerprint == "" {
+		if identity.CandidateBundleIdentity != zeroBundleIdentity {
+			return fmt.Errorf("certificate journal unexpected candidate identity")
+		}
+	} else if !exactDigest(identity.CandidateFingerprint) || certificates.ValidateBundleIdentity(identity.CandidateBundleIdentity) != nil || identity.CandidateBundleIdentity.Fingerprint != identity.CandidateFingerprint {
+		return fmt.Errorf("certificate journal candidate identity invalid")
 	}
 	if value.Phase == JournalActive && identity.CandidateFingerprint == "" {
-		return fmt.Errorf("active certificate journal lacks candidate fingerprint")
+		return fmt.Errorf("active certificate journal lacks candidate identity")
 	}
 	return nil
 }
@@ -6153,20 +6170,25 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 	oldValue.RuntimeDigest = ""
 	newValue.RuntimeDigest = ""
 	oldCandidateFingerprint, newCandidateFingerprint := "", ""
+	oldCandidateIdentity, newCandidateIdentity := certificates.BundleIdentity{}, certificates.BundleIdentity{}
 	var oldUID, oldGID, newUID, newGID uint32
 	if oldValue.Certificate != nil {
 		oldCandidateFingerprint = oldValue.Certificate.CandidateFingerprint
+		oldCandidateIdentity = oldValue.Certificate.CandidateBundleIdentity
 		oldUID = oldValue.Certificate.StageUID
 		oldGID = oldValue.Certificate.StageGID
 		oldValue.Certificate.CandidateFingerprint = ""
+		oldValue.Certificate.CandidateBundleIdentity = certificates.BundleIdentity{}
 		oldValue.Certificate.StageUID = 0
 		oldValue.Certificate.StageGID = 0
 	}
 	if newValue.Certificate != nil {
 		newCandidateFingerprint = newValue.Certificate.CandidateFingerprint
+		newCandidateIdentity = newValue.Certificate.CandidateBundleIdentity
 		newUID = newValue.Certificate.StageUID
 		newGID = newValue.Certificate.StageGID
 		newValue.Certificate.CandidateFingerprint = ""
+		newValue.Certificate.CandidateBundleIdentity = certificates.BundleIdentity{}
 		newValue.Certificate.StageUID = 0
 		newValue.Certificate.StageGID = 0
 	}
@@ -6175,16 +6197,17 @@ func validateJournalTransition(_ string, before, after json.RawMessage) error {
 	if !reflect.DeepEqual(oldValue, newValue) {
 		return fmt.Errorf("journal identity was rewritten")
 	}
-	filledCandidate := oldCandidateFingerprint == "" && exactDigest(newCandidateFingerprint) && oldUID == newUID && oldGID == newGID && oldUID != 0 && oldPhase == JournalPrepared && newPhase == JournalActive
-	sameCandidate := oldCandidateFingerprint == newCandidateFingerprint && oldUID == newUID && oldGID == newGID
+	filledCandidate := oldCandidateFingerprint == "" && oldCandidateIdentity == (certificates.BundleIdentity{}) && exactDigest(newCandidateFingerprint) && certificates.ValidateBundleIdentity(newCandidateIdentity) == nil && newCandidateIdentity.Fingerprint == newCandidateFingerprint && oldUID == newUID && oldGID == newGID && oldUID != 0 && oldPhase == JournalPrepared && (newPhase == JournalPrepared || newPhase == JournalActive)
+	sameCandidate := oldCandidateFingerprint == newCandidateFingerprint && oldCandidateIdentity == newCandidateIdentity && oldUID == newUID && oldGID == newGID
 	if !filledCandidate && !sameCandidate {
-		return fmt.Errorf("journal candidate fingerprint was rewritten")
+		return fmt.Errorf("journal candidate bundle identity was rewritten")
 	}
 	runtimeFilled := oldRuntime == "" && exactDigest(newRuntime) && oldPhase == JournalActive && newPhase == JournalTerminal
 	if oldRuntime != newRuntime && !runtimeFilled {
 		return fmt.Errorf("journal runtime evidence was rewritten")
 	}
-	if oldPhase == JournalTerminal || oldPhase == JournalPrepared && newPhase != JournalActive && newPhase != JournalTerminal || oldPhase == JournalActive && newPhase != JournalTerminal {
+	preparedAuthorization := oldPhase == JournalPrepared && newPhase == JournalPrepared && filledCandidate
+	if oldPhase == JournalTerminal || oldPhase == JournalPrepared && newPhase != JournalActive && newPhase != JournalTerminal && !preparedAuthorization || oldPhase == JournalActive && newPhase != JournalTerminal {
 		return fmt.Errorf("journal transition is invalid")
 	}
 	return nil
@@ -6301,8 +6324,8 @@ func validateLinks(document persist.Document) error {
 					return fmt.Errorf("staged Headscale certificate journal is missing")
 				}
 				var journal JournalRecord
-				if err := decodeStrict(rawJournal, &journal); err != nil || journal.Certificate == nil || journal.Certificate.CandidateFingerprint != deploy.CertificateFingerprint {
-					return fmt.Errorf("staged Headscale certificate fingerprint changed")
+				if err := decodeStrict(rawJournal, &journal); err != nil || journal.Certificate == nil || journal.Certificate.CertificateID != deploy.Candidate.CertificateID || journal.Certificate.CandidateGeneration != 1 || journal.Certificate.CandidateFingerprint != deploy.CertificateFingerprint || journal.Certificate.CandidateBundleIdentity.BindingIdentity != deploy.CertificateBinding {
+					return fmt.Errorf("staged Headscale certificate identity changed")
 				}
 			default:
 				return fmt.Errorf("headscale deploy domain phase is invalid")

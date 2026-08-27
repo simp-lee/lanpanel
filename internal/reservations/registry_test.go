@@ -242,7 +242,7 @@ func reservationCertificateIdentity(exactDomain string) domain.CertificateBundle
 	}
 	san := sha256.Sum256([]byte(exactDomain))
 	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
-	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: digest, IssuerIdentity: digest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: digest, SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: digest, IssuerIdentity: digest, DirectoryIdentity: digest, NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 }
 
 func assertConflict(t *testing.T, original, conflicting Claim) {

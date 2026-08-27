@@ -20,6 +20,10 @@ import (
 
 const PlaintextWarning = "Public plaintext HTTP; anyone can access it; never transmit credentials, cookies, or sensitive data. It remains open until explicit unpublish or close-all."
 
+func certificatePointerBundleIdentity(value domain.CertificateBundleIdentity) certificates.BundleIdentity {
+	return certificates.BundleIdentity{Fingerprint: value.Fingerprint, SANIdentity: value.SANIdentity, ChainIdentity: value.ChainIdentity, IssuerIdentity: value.IssuerIdentity, BindingIdentity: value.BindingIdentity, DirectoryIdentity: value.DirectoryIdentity}
+}
+
 type Candidate struct {
 	ResourceID               string
 	Generation               uint64
@@ -175,14 +179,16 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 		return Candidate{}, err
 	}
 	priorGeneration := uint64(0)
+	expectedPriorIdentity := certificates.BundleIdentity{}
 	if prior := resource.PublicationRecord.LastAppliedBundle; prior != nil && prior.DomainHTTPS != nil && prior.DomainHTTPS.Certificate.Authority != nil && prior.DomainHTTPS.Certificate.Authority.CertificateID == certificate.Authority.CertificateID {
 		priorGeneration = prior.DomainHTTPS.Certificate.Generation
+		expectedPriorIdentity = certificatePointerBundleIdentity(prior.DomainHTTPS.Certificate)
 	}
 	candidatePath, err := certificates.BundlePath(certificate.Authority.CertificateID, certificate.Generation)
 	if err != nil {
 		return Candidate{}, err
 	}
-	pointer := &certificates.Pointer{CertificateID: certificate.Authority.CertificateID, CandidateGeneration: certificate.Generation, ExpectedPriorGeneration: priorGeneration}
+	pointer := &certificates.Pointer{CertificateID: certificate.Authority.CertificateID, CandidateGeneration: certificate.Generation, CandidateIdentity: certificatePointerBundleIdentity(certificate), ExpectedPriorGeneration: priorGeneration, ExpectedPriorIdentity: expectedPriorIdentity}
 	prior, priorDigest, err := priorPublication(resource)
 	if err != nil {
 		return Candidate{}, err

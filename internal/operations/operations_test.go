@@ -9,6 +9,7 @@ import (
 	"errors"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	managedheadscale "lanpanel/internal/headscale"
@@ -999,7 +1000,7 @@ func operationCertificateIdentity() domain.CertificateBundleIdentity {
 	}
 	san := sha256.Sum256([]byte("app.example.com"))
 	authority := &domain.CertificateAuthorityIdentity{CertificateID: certificateID, DirectoryURL: binding.DirectoryURL, AccountKeyPath: binding.AccountKeyPath, AccountKeyFingerprint: binding.AccountKeyFingerprint, AccountEmail: binding.AccountEmail, TermsAccepted: binding.TermsAccepted, Method: string(binding.Method), CredentialFiles: []domain.CertificateCredentialIdentity{}}
-	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
+	return domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + certificateID + ".current", BindingIdentity: bindingIdentity, Generation: 1, Fingerprint: testDigest("cert"), SANIdentity: "sha256:" + hex.EncodeToString(san[:]), ChainIdentity: testDigest("chain"), IssuerIdentity: testDigest("issuer"), DirectoryIdentity: testDigest("directory"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 }
 
 func TestCommittedPublicationCanContractWithoutRewritingTerminalJob(t *testing.T) {
@@ -1102,7 +1103,7 @@ func TestInterruptedCertificateRemoteWaitTerminalizesOnlyAfterContraction(t *tes
 	terminalChild.Outcome = ChildUnknown
 	terminalChild.TerminalAt = pointerTime(now.Add(time.Second))
 	terminalChild.ResultDigest = testDigest("closed")
-	journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + record.ID, JobID: record.ID, Kind: JournalCertificateActivation, Operation: CertificateRenew, InstallationID: installation.InstallationID, Target: intent.Target, Generation: 2, Deadline: intent.SafetyBinding.Deadline, ArtifactDigest: testDigest("binding"), SafetyMarkerDigest: testDigest("marker"), ResourceIDs: []string{installation.Resources[0].ID}, ChildIDs: []string{child.ID}, Phase: JournalPrepared, Certificate: &CertificateJournalIdentity{CertificateID: "cert_00000000000000000000000000000000", PriorGeneration: 1, CandidateGeneration: 2, PriorPointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000001", CandidatePointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000002", PriorFingerprint: testDigest("prior"), StageUID: 1200, StageGID: 1200}}
+	journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + record.ID, JobID: record.ID, Kind: JournalCertificateActivation, Operation: CertificateRenew, InstallationID: installation.InstallationID, Target: intent.Target, Generation: 2, Deadline: intent.SafetyBinding.Deadline, ArtifactDigest: testDigest("binding"), SafetyMarkerDigest: testDigest("marker"), ResourceIDs: []string{installation.Resources[0].ID}, ChildIDs: []string{child.ID}, Phase: JournalPrepared, Certificate: &CertificateJournalIdentity{CertificateID: "cert_00000000000000000000000000000000", PriorGeneration: 1, CandidateGeneration: 2, PriorPointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000001", CandidatePointer: "/var/lib/lanpanel/certificates/bundles/cert_00000000000000000000000000000000-00000000000000000002", PriorFingerprint: testDigest("prior"), PriorBundleIdentity: certificates.BundleIdentity{Fingerprint: testDigest("prior"), SANIdentity: testDigest("prior-san"), ChainIdentity: testDigest("prior-chain"), IssuerIdentity: testDigest("prior-issuer"), BindingIdentity: testDigest("prior-binding"), DirectoryIdentity: testDigest("prior-directory")}, Challenge: safety.ChallengePending{Generation: 2, PlanID: "cert_00000000000000000000000000000000", CertificateIdentity: "cert_00000000000000000000000000000000"}, StageUID: 1200, StageGID: 1200}}
 	terminalJournal := journal
 	terminalJournal.Phase = JournalTerminal
 	encode := func(value any) json.RawMessage {

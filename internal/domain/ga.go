@@ -481,16 +481,17 @@ type DomainHTTPSBundleIdentity struct {
 }
 
 type CertificateBundleIdentity struct {
-	PointerIdentity string                        `json:"pointer_identity"`
-	BindingIdentity string                        `json:"binding_identity"`
-	Generation      uint64                        `json:"generation,omitempty"`
-	Fingerprint     string                        `json:"fingerprint,omitempty"`
-	SANIdentity     string                        `json:"san_identity,omitempty"`
-	NotAfter        string                        `json:"not_after,omitempty"`
-	LastTrustedWall string                        `json:"last_trusted_wall,omitempty"`
-	ChainIdentity   string                        `json:"chain_identity,omitempty"`
-	IssuerIdentity  string                        `json:"issuer_identity,omitempty"`
-	Authority       *CertificateAuthorityIdentity `json:"authority,omitempty"`
+	PointerIdentity   string                        `json:"pointer_identity"`
+	BindingIdentity   string                        `json:"binding_identity"`
+	Generation        uint64                        `json:"generation,omitempty"`
+	Fingerprint       string                        `json:"fingerprint,omitempty"`
+	SANIdentity       string                        `json:"san_identity,omitempty"`
+	NotAfter          string                        `json:"not_after,omitempty"`
+	LastTrustedWall   string                        `json:"last_trusted_wall,omitempty"`
+	ChainIdentity     string                        `json:"chain_identity,omitempty"`
+	IssuerIdentity    string                        `json:"issuer_identity,omitempty"`
+	DirectoryIdentity string                        `json:"directory_identity,omitempty"`
+	Authority         *CertificateAuthorityIdentity `json:"authority,omitempty"`
 }
 type CertificateAuthorityIdentity struct {
 	CertificateID         string                          `json:"certificate_id"`
@@ -861,7 +862,7 @@ func validateCertificateBundleIdentity(value CertificateBundleIdentity, certific
 	if value.PointerIdentity != "/var/lib/lanpanel/certificates/active/"+certificateID+".current" {
 		return acme.Binding{}, fmt.Errorf("certificate active pointer does not bind certificate ID")
 	}
-	if value.BindingIdentity != bindingIdentity || value.Generation == 0 || !validSHA256Digest(value.Fingerprint) || !validSHA256Digest(value.SANIdentity) || !validSHA256Digest(value.ChainIdentity) || !validSHA256Digest(value.IssuerIdentity) {
+	if value.BindingIdentity != bindingIdentity || value.Generation == 0 || !validSHA256Digest(value.Fingerprint) || !validSHA256Digest(value.SANIdentity) || !validSHA256Digest(value.ChainIdentity) || !validSHA256Digest(value.IssuerIdentity) || !validSHA256Digest(value.DirectoryIdentity) {
 		return acme.Binding{}, fmt.Errorf("certificate complete identity is invalid")
 	}
 	deadline, deadlineErr := time.Parse(time.RFC3339, value.NotAfter)

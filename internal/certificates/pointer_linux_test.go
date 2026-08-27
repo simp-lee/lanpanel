@@ -14,8 +14,13 @@ import (
 	"time"
 )
 
+func pointerTestIdentity(value string) BundleIdentity {
+	return BundleIdentity{Fingerprint: sum([]byte("fingerprint-" + value)), SANIdentity: sum([]byte("san-" + value)), ChainIdentity: sum([]byte("chain-" + value)), IssuerIdentity: sum([]byte("issuer-" + value)), BindingIdentity: sum([]byte("binding-" + value)), DirectoryIdentity: sum([]byte("directory-" + value))}
+}
+
 func TestCertificatePointerRejectsUnfixedOrRegressingIdentity(t *testing.T) {
-	for _, value := range []Pointer{{CertificateID: "bad", CandidateGeneration: 2, ExpectedPriorGeneration: 1}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 1, ExpectedPriorGeneration: 1}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 0}} {
+	candidate, prior := pointerTestIdentity("candidate"), pointerTestIdentity("prior")
+	for _, value := range []Pointer{{CertificateID: "bad", CandidateGeneration: 2, CandidateIdentity: candidate, ExpectedPriorGeneration: 1, ExpectedPriorIdentity: prior}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 1, CandidateIdentity: candidate, ExpectedPriorGeneration: 1, ExpectedPriorIdentity: prior}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 0, CandidateIdentity: candidate}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1, ExpectedPriorIdentity: prior}, {CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, CandidateIdentity: candidate, ExpectedPriorGeneration: 1}} {
 		if _, _, _, err := pointerPaths(value); err == nil {
 			t.Fatalf("accepted %#v", value)
 		}
@@ -23,7 +28,7 @@ func TestCertificatePointerRejectsUnfixedOrRegressingIdentity(t *testing.T) {
 }
 
 func TestCertificatePointerPathsStayInFixedRoots(t *testing.T) {
-	value := Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
+	value := Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, CandidateIdentity: pointerTestIdentity("candidate"), ExpectedPriorGeneration: 1, ExpectedPriorIdentity: pointerTestIdentity("prior")}
 	path, candidate, prior, err := pointerPaths(value)
 	if err != nil {
 		t.Fatal(err)
@@ -112,16 +117,118 @@ func TestObserveIdentityAndPointerRejectModifiedBundleMaterial(t *testing.T) {
 			if _, err := ObserveIdentity(FixedBundlesRoot, certificateID, generation, owner); err != nil {
 				t.Fatalf("valid ObserveIdentity failed: %v", err)
 			}
-			if err := verifyBundleTarget(target); err != nil {
+			expected := BundleIdentityFor(value)
+			if err := verifyBundleTarget(target, expected); err != nil {
 				t.Fatalf("valid pointer target failed: %v", err)
 			}
 			test.mutate(value)
 			if _, err := ObserveIdentity(FixedBundlesRoot, certificateID, generation, owner); err == nil {
 				t.Fatal("ObserveIdentity accepted modified bundle")
 			}
-			if err := verifyBundleTarget(target); err == nil {
+			if err := verifyBundleTarget(target, expected); err == nil {
 				t.Fatal("pointer validation accepted modified bundle")
 			}
 		})
+	}
+}
+
+func TestCertificatePointerBindsCandidateAndRestoresExactPriorIdentity(t *testing.T) {
+	if os.Geteuid() != 0 || os.Getegid() != 0 {
+		t.Skip("requires root-owned fixed certificate roots")
+	}
+	if _, err := os.Lstat(FixedRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Skip("requires an isolated root with no existing /var/lib/lanpanel/certificates")
+	}
+	if err := os.MkdirAll(FixedBundlesRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(FixedActiveRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	certificateID := "cert_00000000000000000000000000000002"
+	activePath, _ := ActivePointerPath(certificateID)
+	priorPath, _ := BundlePath(certificateID, 1)
+	candidatePath, _ := BundlePath(certificateID, 2)
+	defer func() {
+		_ = os.Remove(activePath)
+		_ = os.RemoveAll(candidatePath)
+		_ = os.RemoveAll(priorPath)
+		_ = os.Remove(FixedActiveRoot)
+		_ = os.Remove(FixedBundlesRoot)
+		_ = os.Remove(FixedRoot)
+	}()
+	stage, err := identity.CertificateStageIdentityFor(certificateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := filetxn.Owner{UID: stage.UID, GID: stage.GID}
+	now := time.Now().UTC().Truncate(time.Second)
+	priorChain, priorKey := issuedFixture(t, now, []string{"control.example.test"})
+	priorMaterial := validateFixtureMaterial(t, priorChain, priorKey, []string{"control.example.test"}, now)
+	prior, err := StageIssued(context.Background(), FixedBundlesRoot, certificateID, 1, sum([]byte("binding")), priorMaterial, owner, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedChain, expectedKey := issuedFixture(t, now, []string{"control.example.test"})
+	expectedMaterial := validateFixtureMaterial(t, expectedChain, expectedKey, []string{"control.example.test"}, now)
+	expectedCandidate, err := StageIssued(context.Background(), FixedBundlesRoot, certificateID, 2, sum([]byte("binding")), expectedMaterial, owner, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(candidatePath); err != nil {
+		t.Fatal(err)
+	}
+	otherCandidate, err := StageIssued(context.Background(), FixedBundlesRoot, certificateID, 2, sum([]byte("binding")), expectedMaterial, owner, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorPointer := Pointer{CertificateID: certificateID, CandidateGeneration: 1, CandidateIdentity: BundleIdentityFor(prior)}
+	if result, err := ActivatePointer(context.Background(), priorPointer); err != nil || !result.Durable {
+		t.Fatalf("activate prior: result=%+v err=%v", result, err)
+	}
+	mismatched := Pointer{CertificateID: certificateID, CandidateGeneration: 2, CandidateIdentity: BundleIdentityFor(expectedCandidate), ExpectedPriorGeneration: 1, ExpectedPriorIdentity: BundleIdentityFor(prior)}
+	if result, err := ActivatePointer(context.Background(), mismatched); err == nil || result.CandidateTarget != "" {
+		t.Fatalf("self-consistent replacement candidate activated: result=%+v err=%v", result, err)
+	}
+	if observed, err := ObservePointer(certificateID); err != nil || observed != priorPath {
+		t.Fatalf("failed activation changed pointer: observed=%q err=%v", observed, err)
+	}
+	valid := Pointer{CertificateID: certificateID, CandidateGeneration: 2, CandidateIdentity: BundleIdentityFor(otherCandidate), ExpectedPriorGeneration: 1, ExpectedPriorIdentity: BundleIdentityFor(prior)}
+	if result, err := ActivatePointer(context.Background(), valid); err != nil || !result.Durable || result.CandidateTarget != candidatePath {
+		t.Fatalf("activate exact candidate: result=%+v err=%v", result, err)
+	}
+	if err := os.RemoveAll(priorPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StageIssued(context.Background(), FixedBundlesRoot, certificateID, 1, sum([]byte("binding")), priorMaterial, owner, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestorePointer(context.Background(), valid, candidatePath); err == nil {
+		t.Fatal("self-consistent replacement prior was restored")
+	}
+	if observed, err := ObservePointer(certificateID); err != nil || observed != candidatePath {
+		t.Fatalf("failed restoration changed pointer: observed=%q err=%v", observed, err)
+	}
+	if err := os.RemoveAll(priorPath); err != nil {
+		t.Fatal(err)
+	}
+	restoredPrior, err := StageIssued(context.Background(), FixedBundlesRoot, certificateID, 1, sum([]byte("binding")), priorMaterial, owner, now)
+	if err != nil || BundleIdentityFor(restoredPrior) != BundleIdentityFor(prior) {
+		t.Fatalf("restage exact prior: identity=%+v err=%v", restoredPrior, err)
+	}
+	if err := RestorePointer(context.Background(), valid, candidatePath); err != nil {
+		t.Fatalf("restore exact prior: %v", err)
+	}
+	if observed, err := ObservePointer(certificateID); err != nil || observed != priorPath {
+		t.Fatalf("restored pointer=%q err=%v", observed, err)
+	}
+	if err := RestorePointer(context.Background(), priorPointer, priorPath); err == nil {
+		t.Fatal("prior-less restoration authority was accepted")
+	}
+	if err := RemovePointer(context.Background(), priorPointer, priorPath); err != nil {
+		t.Fatalf("remove exact initial candidate: %v", err)
+	}
+	if observed, err := ObservePointer(certificateID); err != nil || observed != "" {
+		t.Fatalf("removed pointer=%q err=%v", observed, err)
 	}
 }

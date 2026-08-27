@@ -51,6 +51,26 @@ type Identity struct {
 	DirectoryIdentity string    `json:"directory_identity"`
 }
 
+type BundleIdentity struct {
+	Fingerprint       string `json:"fingerprint"`
+	SANIdentity       string `json:"san_identity"`
+	ChainIdentity     string `json:"chain_identity"`
+	IssuerIdentity    string `json:"issuer_identity"`
+	BindingIdentity   string `json:"binding_identity"`
+	DirectoryIdentity string `json:"directory_identity"`
+}
+
+func BundleIdentityFor(identity Identity) BundleIdentity {
+	return BundleIdentity{Fingerprint: identity.Fingerprint, SANIdentity: identity.SANIdentity, ChainIdentity: identity.ChainIdentity, IssuerIdentity: identity.IssuerIdentity, BindingIdentity: identity.BindingIdentity, DirectoryIdentity: identity.DirectoryIdentity}
+}
+
+func ValidateBundleIdentity(identity BundleIdentity) error {
+	if !digest(identity.Fingerprint) || !digest(identity.SANIdentity) || !digest(identity.ChainIdentity) || !digest(identity.IssuerIdentity) || !digest(identity.BindingIdentity) || !digest(identity.DirectoryIdentity) {
+		return fmt.Errorf("certificate bundle activation identity incomplete")
+	}
+	return nil
+}
+
 type BootstrapMaterial struct {
 	certificatePEM, privateKeyPEM []byte
 	domains                       []string
@@ -191,14 +211,22 @@ func ValidateIssuedWithRoots(certificateChainPEM, privateKeyPEM []byte, domains 
 	return IssuedMaterial{certificatePEM: append([]byte(nil), certificateChainPEM...), privateKeyPEM: canonicalKeyPEM, domains: domains, fingerprint: sum(leaf.Raw), chainIdentity: sum(certificateChainPEM), issuerIdentity: inspected.issuerIdentity, notBefore: leaf.NotBefore.UTC(), notAfter: leaf.NotAfter.UTC()}, nil
 }
 
-func StageIssued(ctx context.Context, parent, id string, generation uint64, bindingIdentity string, material IssuedMaterial, owner filetxn.Owner, now time.Time) (Identity, error) {
-	if id == "" || generation == 0 || !digest(bindingIdentity) || !cleanAbsolute(parent) || now.IsZero() {
+func StageIssued(ctx context.Context, parent, id string, generation uint64, bindingIdentity string, material IssuedMaterial, owner filetxn.Owner, now time.Time, authorize ...func(Identity) error) (Identity, error) {
+	if id == "" || generation == 0 || !digest(bindingIdentity) || !cleanAbsolute(parent) || now.IsZero() || len(authorize) > 1 {
 		return Identity{}, fmt.Errorf("certificate staging authority invalid")
 	}
 	name := fmt.Sprintf("%s-%020d", id, generation)
 	base := filepath.Join(parent, name)
 	identity := Identity{SchemaVersion: SchemaVersion, ID: id, Generation: generation, Domains: material.domains, SANIdentity: sum([]byte(strings.Join(material.domains, "\x00"))), Fingerprint: material.fingerprint, ChainIdentity: material.chainIdentity, IssuerIdentity: material.issuerIdentity, BindingIdentity: bindingIdentity, LastTrustedWall: now.UTC(), NotBefore: material.notBefore, NotAfter: material.notAfter, CertificatePath: filepath.Join(base, "certificate.pem"), PrivateKeyPath: filepath.Join(base, "private-key.pem")}
 	identity.DirectoryIdentity = identityDigest(identity)
+	if len(authorize) == 1 {
+		if authorize[0] == nil {
+			return Identity{}, fmt.Errorf("certificate staging identity authorizer missing")
+		}
+		if err := authorize[0](identity); err != nil {
+			return Identity{}, err
+		}
+	}
 	raw, _ := json.Marshal(identity)
 	request := filetxn.DirectoryRequest{ParentPath: parent, Parent: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o700}, TargetName: name, Directory: filetxn.Metadata{Owner: owner, Mode: 0o700}, Members: []filetxn.DirectoryMember{{Name: "certificate.pem", Data: material.certificatePEM, Owner: owner, Mode: 0o600, Maximum: 1 << 20}, {Name: "identity.json", Data: raw, Owner: owner, Mode: 0o600, Maximum: 64 << 10}, {Name: "private-key.pem", Data: material.privateKeyPEM, Owner: owner, Mode: 0o600, Maximum: 1 << 20}}}
 	if _, err := filetxn.CommitNewDirectory(ctx, request); err != nil {

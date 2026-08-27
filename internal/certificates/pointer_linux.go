@@ -25,7 +25,9 @@ const (
 type Pointer struct {
 	CertificateID           string
 	CandidateGeneration     uint64
+	CandidateIdentity       BundleIdentity
 	ExpectedPriorGeneration uint64
+	ExpectedPriorIdentity   BundleIdentity
 }
 type PointerResult struct {
 	PriorTarget     string
@@ -33,10 +35,18 @@ type PointerResult struct {
 	Durable         bool
 }
 
-func RemoveInactiveBundle(certificateIdentity string, generation uint64, uid, gid uint32) error {
+func RemoveInactiveBundle(certificateIdentity string, generation uint64, expected BundleIdentity, uid, gid uint32) error {
 	path, err := BundlePath(certificateIdentity, generation)
 	if err != nil || uid == 0 || gid == 0 {
 		return fmt.Errorf("inactive certificate cleanup identity invalid")
+	}
+	activeRoot, err := unix.Open(FixedActiveRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(activeRoot) }()
+	if err := unix.Flock(activeRoot, unix.LOCK_EX); err != nil {
+		return err
 	}
 	active, err := ObservePointer(certificateIdentity)
 	if err != nil {
@@ -44,6 +54,17 @@ func RemoveInactiveBundle(certificateIdentity string, generation uint64, uid, gi
 	}
 	if active == path {
 		return fmt.Errorf("active certificate bundle cannot be removed")
+	}
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if ValidateBundleIdentity(expected) != nil {
+		return fmt.Errorf("inactive certificate cleanup bundle authority invalid")
+	}
+	if err := verifyBundleTarget(path, expected); err != nil {
+		return err
 	}
 	remaining := 16
 	var remove func(string) error
@@ -131,6 +152,9 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 		return PointerResult{}, err
 	}
 	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+		return PointerResult{}, err
+	}
 	observed, err := readPointer(fd, filepath.Base(path))
 	if errors.Is(err, os.ErrNotExist) {
 		observed = ""
@@ -140,15 +164,34 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 	if observed != prior {
 		return PointerResult{}, fmt.Errorf("certificate prior pointer changed")
 	}
-	if err := verifyBundleTarget(candidate); err != nil {
+	if prior != "" {
+		if err := verifyBundleTarget(prior, pointer.ExpectedPriorIdentity); err != nil {
+			return PointerResult{}, err
+		}
+	}
+	if err := verifyBundleTarget(candidate, pointer.CandidateIdentity); err != nil {
 		return PointerResult{}, err
+	}
+	current, err := readPointer(fd, filepath.Base(path))
+	if errors.Is(err, os.ErrNotExist) {
+		current = ""
+	} else if err != nil {
+		return PointerResult{}, err
+	}
+	if current != prior {
+		return PointerResult{}, fmt.Errorf("certificate prior pointer changed before activation")
 	}
 	temporary := "." + filepath.Base(path) + ".lanpanel-pointer"
 	_ = unix.Unlinkat(fd, temporary, 0)
 	if err := unix.Symlinkat(candidate, fd, temporary); err != nil {
 		return PointerResult{}, err
 	}
-	if err := unix.Renameat(fd, temporary, fd, filepath.Base(path)); err != nil {
+	if prior == "" {
+		err = unix.Renameat2(fd, temporary, fd, filepath.Base(path), unix.RENAME_NOREPLACE)
+	} else {
+		err = unix.Renameat(fd, temporary, fd, filepath.Base(path))
+	}
+	if err != nil {
 		_ = unix.Unlinkat(fd, temporary, 0)
 		return PointerResult{}, err
 	}
@@ -156,7 +199,7 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 	if err := unix.Fsync(fd); err != nil {
 		return result, fmt.Errorf("certificate pointer changed but durability is unknown: %w", err)
 	}
-	current, err := readPointer(fd, filepath.Base(path))
+	current, err = readPointer(fd, filepath.Base(path))
 	if err != nil || current != candidate {
 		return result, fmt.Errorf("certificate pointer verification failed")
 	}
@@ -164,10 +207,50 @@ func ActivatePointer(ctx context.Context, pointer Pointer) (PointerResult, error
 	return result, nil
 }
 
-func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate string) error {
+func RemovePointer(ctx context.Context, pointer Pointer, expectedCandidate string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	path, candidate, prior, err := pointerPaths(pointer)
+	if err != nil || prior != "" {
+		return fmt.Errorf("certificate pointer removal authority invalid: %w", err)
+	}
+	if candidate != expectedCandidate {
+		return fmt.Errorf("candidate certificate pointer mismatch")
+	}
+	parent := filepath.Dir(path)
+	fd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+		return err
+	}
+	current, err := readPointer(fd, filepath.Base(path))
+	if err != nil || current != candidate {
+		return fmt.Errorf("candidate certificate pointer changed")
+	}
+	if err := verifyBundleTarget(candidate, pointer.CandidateIdentity); err != nil {
+		return err
+	}
+	current, err = readPointer(fd, filepath.Base(path))
+	if err != nil || current != candidate {
+		return fmt.Errorf("candidate certificate pointer changed before removal")
+	}
+	if err := unix.Unlinkat(fd, filepath.Base(path), 0); err != nil {
+		return err
+	}
+	return unix.Fsync(fd)
+}
+
+func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path, candidate, prior, err := pointerPaths(pointer)
+	if err != nil || prior == "" {
+		return fmt.Errorf("certificate pointer restoration authority invalid: %w", err)
 	}
 	if candidate != expectedCandidate {
 		return fmt.Errorf("candidate certificate pointer mismatch")
@@ -176,28 +259,21 @@ func RestorePointer(ctx context.Context, pointer Pointer, expectedCandidate stri
 	if err != nil || current != candidate {
 		return fmt.Errorf("candidate certificate pointer changed")
 	}
-	if prior == "" {
-		parent := filepath.Dir(path)
-		fd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = unix.Close(fd) }()
-		if err := unix.Unlinkat(fd, filepath.Base(path), 0); err != nil {
-			return err
-		}
-		return unix.Fsync(fd)
-	}
-	if err := verifyBundleTarget(prior); err != nil {
+	if err := verifyBundleTarget(candidate, pointer.CandidateIdentity); err != nil {
 		return err
 	}
-	reverse := Pointer{CertificateID: pointer.CertificateID, CandidateGeneration: pointer.ExpectedPriorGeneration, ExpectedPriorGeneration: pointer.CandidateGeneration}
+	if err := verifyBundleTarget(prior, pointer.ExpectedPriorIdentity); err != nil {
+		return err
+	}
+	reverse := Pointer{CertificateID: pointer.CertificateID, CandidateGeneration: pointer.ExpectedPriorGeneration, CandidateIdentity: pointer.ExpectedPriorIdentity, ExpectedPriorGeneration: pointer.CandidateGeneration, ExpectedPriorIdentity: pointer.CandidateIdentity}
 	_, err = ActivatePointer(ctx, reverse)
 	return err
 }
 
 func pointerPaths(pointer Pointer) (string, string, string, error) {
-	if !certificateID(pointer.CertificateID) || pointer.CandidateGeneration == 0 || pointer.CandidateGeneration == pointer.ExpectedPriorGeneration {
+	zeroIdentity := BundleIdentity{}
+	invalidPriorIdentity := pointer.ExpectedPriorGeneration == 0 && pointer.ExpectedPriorIdentity != zeroIdentity || pointer.ExpectedPriorGeneration != 0 && ValidateBundleIdentity(pointer.ExpectedPriorIdentity) != nil
+	if !certificateID(pointer.CertificateID) || pointer.CandidateGeneration == 0 || pointer.CandidateGeneration == pointer.ExpectedPriorGeneration || ValidateBundleIdentity(pointer.CandidateIdentity) != nil || invalidPriorIdentity {
 		return "", "", "", fmt.Errorf("certificate pointer authority invalid")
 	}
 	path, err := ActivePointerPath(pointer.CertificateID)
@@ -218,7 +294,18 @@ func pointerPaths(pointer Pointer) (string, string, string, error) {
 	return path, candidate, prior, nil
 }
 
-func verifyBundleTarget(path string) error {
+func VerifyBundleIdentity(certificateIdentity string, generation uint64, expected BundleIdentity) error {
+	path, err := BundlePath(certificateIdentity, generation)
+	if err != nil {
+		return err
+	}
+	return verifyBundleTarget(path, expected)
+}
+
+func verifyBundleTarget(path string, expected BundleIdentity) error {
+	if ValidateBundleIdentity(expected) != nil {
+		return fmt.Errorf("certificate target activation identity invalid")
+	}
 	if !strings.HasPrefix(path, FixedBundlesRoot+string(filepath.Separator)) || filepath.Clean(path) != path || filepath.Dir(path) != FixedBundlesRoot {
 		return fmt.Errorf("certificate target outside fixed root")
 	}
@@ -237,8 +324,12 @@ func verifyBundleTarget(path string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := ObserveIdentity(FixedBundlesRoot, certificateIdentity, generation, filetxn.Owner{UID: stage.UID, GID: stage.GID}); err != nil {
+	observed, err := ObserveIdentity(FixedBundlesRoot, certificateIdentity, generation, filetxn.Owner{UID: stage.UID, GID: stage.GID})
+	if err != nil {
 		return fmt.Errorf("certificate target bundle invalid: %w", err)
+	}
+	if BundleIdentityFor(observed) != expected {
+		return fmt.Errorf("certificate target bundle differs from activation authority")
 	}
 	return nil
 }

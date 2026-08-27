@@ -1542,7 +1542,7 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 	if err != nil {
 		return abort(err)
 	}
-	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC())
+	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
 	if err != nil {
 		return abort(err)
 	}
@@ -1691,7 +1691,7 @@ func executeCertificateRenewal(ctx context.Context, resourceID string) (string, 
 	if err != nil {
 		return "", abort(err)
 	}
-	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: stageIdentity.UID, GID: stageIdentity.GID}, time.Now().UTC())
+	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: stageIdentity.UID, GID: stageIdentity.GID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
 	if err != nil {
 		return "", abort(err)
 	}

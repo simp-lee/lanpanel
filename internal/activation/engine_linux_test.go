@@ -7,6 +7,7 @@ import (
 	"errors"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/nginx"
+	"strings"
 	"testing"
 )
 
@@ -27,8 +28,13 @@ func TestTemporaryRuntimeEntryRequiresExactGenerationAndIdentity(t *testing.T) {
 	}
 }
 
+func testPointerBundleIdentity(value string) certificates.BundleIdentity {
+	digest := "sha256:" + strings.Repeat(value, 64)
+	return certificates.BundleIdentity{Fingerprint: digest, SANIdentity: digest, ChainIdentity: digest, IssuerIdentity: digest, BindingIdentity: digest, DirectoryIdentity: digest}
+}
+
 func TestCertificatePointerHandoffAcceptsExactCandidate(t *testing.T) {
-	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
+	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, CandidateIdentity: testPointerBundleIdentity("a"), ExpectedPriorGeneration: 1, ExpectedPriorIdentity: testPointerBundleIdentity("b")}
 	restored := false
 	result, err := activateCandidatePointer(context.Background(), pointer, "/candidate", func(context.Context, certificates.Pointer) (certificates.PointerResult, error) {
 		return certificates.PointerResult{CandidateTarget: "/candidate", Durable: true}, nil
@@ -74,7 +80,7 @@ func TestCertificatePointerPostRenameRestoreFailureIsReported(t *testing.T) {
 }
 
 func TestCertificatePointerTargetMismatchRestoresBeforeFailure(t *testing.T) {
-	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, ExpectedPriorGeneration: 1}
+	pointer := certificates.Pointer{CertificateID: "cert_00000000000000000000000000000000", CandidateGeneration: 2, CandidateIdentity: testPointerBundleIdentity("a"), ExpectedPriorGeneration: 1, ExpectedPriorIdentity: testPointerBundleIdentity("b")}
 	restoredTarget := ""
 	_, err := activateCandidatePointer(context.Background(), pointer, "/expected", func(context.Context, certificates.Pointer) (certificates.PointerResult, error) {
 		return certificates.PointerResult{CandidateTarget: "/observed", Durable: true}, nil

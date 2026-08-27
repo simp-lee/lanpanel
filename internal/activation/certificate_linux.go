@@ -23,7 +23,7 @@ type CertificateActivationResult struct {
 }
 
 func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.Pointer, serverName, candidateFingerprint, priorFingerprint string) (result CertificateActivationResult, resultErr error) {
-	if host.Launcher == nil || serverName == "" || !certificateFingerprint(candidateFingerprint) {
+	if host.Launcher == nil || serverName == "" || pointer.ExpectedPriorGeneration == 0 || !certificateFingerprint(candidateFingerprint) || !certificateFingerprint(priorFingerprint) || certificates.ValidateBundleIdentity(pointer.CandidateIdentity) != nil || certificates.ValidateBundleIdentity(pointer.ExpectedPriorIdentity) != nil || pointer.CandidateIdentity.Fingerprint != candidateFingerprint || pointer.ExpectedPriorIdentity.Fingerprint != priorFingerprint {
 		return result, fmt.Errorf("certificate activation authority incomplete")
 	}
 	manifest, err := nginx.Audit(host.Paths, host.Owner)
@@ -68,7 +68,7 @@ func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.P
 }
 
 func (host Host) RestoreCertificate(ctx context.Context, pointer certificates.Pointer, expectedCandidate, serverName, priorFingerprint string) error {
-	if pointer.ExpectedPriorGeneration == 0 || !certificateFingerprint(priorFingerprint) {
+	if pointer.ExpectedPriorGeneration == 0 || !certificateFingerprint(priorFingerprint) || certificates.ValidateBundleIdentity(pointer.CandidateIdentity) != nil || certificates.ValidateBundleIdentity(pointer.ExpectedPriorIdentity) != nil || pointer.ExpectedPriorIdentity.Fingerprint != priorFingerprint {
 		return fmt.Errorf("certificate restoration authority incomplete")
 	}
 	manifest, err := nginx.Audit(host.Paths, host.Owner)

@@ -37,27 +37,28 @@ import (
 )
 
 type HeadscaleDeployExecution struct {
-	Service           *FixedService
-	Admitter          *operations.Admitter
-	MutationSet       *operations.MutationSet
-	Mutation          *operations.MutationLease
-	Exposure          *locks.Lease
-	JobID             string
-	Revision          uint64
-	Plan              plans.Plan
-	Installation      domain.Installation
-	Authority         HeadscaleDeployAuthority
-	Local             *control.Execution
-	Host              control.CandidateHost
-	CertificateStaged bool
-	ClosureUncertain  bool
-	Challenge         challenge.Prepared
-	Child             operations.ChildRecord
-	StageUID          uint32
-	StageGID          uint32
-	LegoDigest        string
-	DNSLocks          *acme.OwnerLocks
-	DNSPreflight      *acme.DNSPreflight
+	Service             *FixedService
+	Admitter            *operations.Admitter
+	MutationSet         *operations.MutationSet
+	Mutation            *operations.MutationLease
+	Exposure            *locks.Lease
+	JobID               string
+	Revision            uint64
+	Plan                plans.Plan
+	Installation        domain.Installation
+	Authority           HeadscaleDeployAuthority
+	Local               *control.Execution
+	Host                control.CandidateHost
+	CertificateStaged   bool
+	CertificateIdentity certificates.BundleIdentity
+	ClosureUncertain    bool
+	Challenge           challenge.Prepared
+	Child               operations.ChildRecord
+	StageUID            uint32
+	StageGID            uint32
+	LegoDigest          string
+	DNSLocks            *acme.OwnerLocks
+	DNSPreflight        *acme.DNSPreflight
 }
 
 // BeginHeadscaleDeploy is an internal application boundary. S17C registers the
@@ -300,7 +301,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	if err != nil {
 		return control.IssueRequest{}, err
 	}
-	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: execution.Authority.Rendered.Candidate.CertificateID, CandidateGeneration: 1, CandidatePointer: candidatePath, StageUID: stageIdentity.UID, StageGID: stageIdentity.GID}
+	certificateJournal := &operations.CertificateJournalIdentity{CertificateID: execution.Authority.Rendered.Candidate.CertificateID, CandidateGeneration: 1, CandidatePointer: candidatePath, Challenge: execution.Challenge.Safety, StageUID: stageIdentity.UID, StageGID: stageIdentity.GID}
 	operationJournal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.HeadscaleDeploy, InstallationID: execution.Installation.InstallationID, Target: childRecord.Target, Generation: childRecord.IntentGeneration, Deadline: execution.Plan.ExpiresAt, ArtifactDigest: bindingDigest, ChildIDs: []string{childID}, Phase: operations.JournalPrepared, Certificate: certificateJournal}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, operationJournal, true); err != nil {
 		return control.IssueRequest{}, err
@@ -427,7 +428,7 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 	if err != nil {
 		return certificates.Identity{}, err
 	}
-	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, issueRequest.CertificateID, 1, issueRequest.BindingDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC())
+	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, issueRequest.CertificateID, 1, issueRequest.BindingDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.authorizeStagedCertificate(ctx, identity) })
 	if err != nil {
 		return certificates.Identity{}, err
 	}
@@ -438,15 +439,52 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 	return identity, nil
 }
 
+func (execution *HeadscaleDeployExecution) authorizeStagedCertificate(ctx context.Context, identity certificates.Identity) error {
+	if execution == nil || certificates.ValidateIdentity(identity) != nil || identity.ID != execution.Authority.Rendered.Candidate.CertificateID || identity.Generation != 1 || identity.BindingIdentity != execution.Authority.Rendered.Candidate.CertificateBinding {
+		return fmt.Errorf("Headscale staged certificate authorization identity invalid")
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil {
+		return err
+	}
+	if execution.Mutation == nil && execution.Exposure == nil {
+		_, execution.Mutation, execution.Exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+		if err != nil {
+			return err
+		}
+		execution.Revision = document.Revision + 1
+		document, err = execution.Service.normal.Read()
+	}
+	if err != nil || document.Revision != execution.Revision {
+		return fmt.Errorf("Headscale staged certificate authorization revision changed: %w", err)
+	}
+	raw, present := document.Entries["journals/certificate-"+execution.JobID]
+	var journal operations.JournalRecord
+	if !present || json.Unmarshal(raw, &journal) != nil || journal.Phase != operations.JournalPrepared || journal.Certificate == nil || journal.Certificate.CandidateFingerprint != "" || journal.Certificate.CandidateBundleIdentity != (certificates.BundleIdentity{}) || !reflect.DeepEqual(journal.Certificate.Challenge, execution.Challenge.Safety) {
+		return fmt.Errorf("Headscale staged certificate journal authority changed")
+	}
+	journal.Certificate.CandidateFingerprint = identity.Fingerprint
+	journal.Certificate.CandidateBundleIdentity = certificates.BundleIdentityFor(identity)
+	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
+		return err
+	}
+	execution.Revision++
+	execution.CertificateIdentity = certificates.BundleIdentityFor(identity)
+	return nil
+}
+
 // StageIssuedCertificate accepts only the same request's verified terminal
 // result. It advances to a complete non-applied reactivation candidate but does
 // not load the control site, activate the certificate pointer, or expose STUN.
 func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Context, request control.IssueRequest, identity certificates.Identity, host control.CandidateHost, remote ...acme.IssueResult) (returnErr error) {
-	if execution == nil || execution.Mutation != nil || execution.Exposure != nil {
+	if execution == nil || (execution.Mutation == nil) != (execution.Exposure == nil) {
 		return fmt.Errorf("headscale remote result phase is invalid")
 	}
 	if err := verifyManagedACMEBinding(execution.Authority.Binding); err != nil {
 		return err
+	}
+	if certificates.ValidateIdentity(identity) == nil && identity.ID == execution.Authority.Rendered.Candidate.CertificateID && identity.Generation == 1 {
+		execution.CertificateIdentity = certificates.BundleIdentityFor(identity)
 	}
 	cleanup := true
 	defer func() {
@@ -458,12 +496,17 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 	if err != nil {
 		return err
 	}
-	_, mutation, exposure, err := execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
-	if err != nil {
-		return err
+	mutation, exposure := execution.Mutation, execution.Exposure
+	if mutation == nil {
+		_, mutation, exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+		if err != nil {
+			return err
+		}
+		execution.Mutation, execution.Exposure = mutation, exposure
+		execution.Revision = document.Revision + 1
+	} else if document.Revision != execution.Revision {
+		return fmt.Errorf("Headscale staged certificate revision changed")
 	}
-	execution.Mutation, execution.Exposure = mutation, exposure
-	execution.Revision = document.Revision + 1
 	if execution.Child.ID == "" {
 		return fmt.Errorf("headscale issuer child authority is missing")
 	}
@@ -488,7 +531,7 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 	if err != nil {
 		return err
 	}
-	operationJournal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.HeadscaleDeploy, InstallationID: execution.Installation.InstallationID, Target: terminalChild.Target, Generation: terminalChild.IntentGeneration, Deadline: execution.Plan.ExpiresAt, ArtifactDigest: request.BindingDigest, ChildIDs: []string{terminalChild.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidatePointer: candidatePath, CandidateFingerprint: identity.Fingerprint, StageUID: execution.StageUID, StageGID: execution.StageGID}}
+	operationJournal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.HeadscaleDeploy, InstallationID: execution.Installation.InstallationID, Target: terminalChild.Target, Generation: terminalChild.IntentGeneration, Deadline: execution.Plan.ExpiresAt, ArtifactDigest: request.BindingDigest, ChildIDs: []string{terminalChild.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidatePointer: candidatePath, CandidateFingerprint: identity.Fingerprint, CandidateBundleIdentity: certificates.BundleIdentityFor(identity), Challenge: execution.Challenge.Safety, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, mutation, exposure, execution.Revision, operationJournal, false); err != nil {
 		return err
 	}
@@ -654,7 +697,7 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 		errs = append(errs, err)
 	}
 	if execution.StageUID != 0 && execution.StageGID != 0 {
-		if err := certificates.RemoveInactiveBundle(execution.Authority.Rendered.Candidate.CertificateID, 1, execution.StageUID, execution.StageGID); err != nil {
+		if err := certificates.RemoveInactiveBundle(execution.Authority.Rendered.Candidate.CertificateID, 1, execution.CertificateIdentity, execution.StageUID, execution.StageGID); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -896,7 +939,7 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 		}
 	}
 	certificate := journal.Certificate
-	if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.StageUID, certificate.StageGID); err != nil {
+	if err := certificates.RemoveInactiveBundle(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity, certificate.StageUID, certificate.StageGID); err != nil {
 		return err
 	}
 	if err := errors.Join(acme.RemoveStage(certificate.CertificateID, certificate.StageUID, certificate.StageGID), acme.RemoveWebroot(certificate.CertificateID, certificate.StageUID, certificate.StageGID)); err != nil {
@@ -1055,7 +1098,11 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 	stageIdentity, stageErr := identity.CertificateStageIdentityFor(journal.Candidate.CertificateID)
 	closureErr = errors.Join(closureErr, stageErr, host.StopPrivateService(context.WithoutCancel(ctx), journal.Candidate))
 	if stageErr == nil {
-		closureErr = errors.Join(closureErr, acme.RemoveStage(journal.Candidate.CertificateID, stageIdentity.UID, stageIdentity.GID), acme.RemoveWebroot(journal.Candidate.CertificateID, stageIdentity.UID, stageIdentity.GID), certificates.RemoveInactiveBundle(journal.Candidate.CertificateID, 1, stageIdentity.UID, stageIdentity.GID))
+		cleanupIdentity := certificates.BundleIdentity{}
+		if operationJournal.Certificate != nil {
+			cleanupIdentity = operationJournal.Certificate.CandidateBundleIdentity
+		}
+		closureErr = errors.Join(closureErr, acme.RemoveStage(journal.Candidate.CertificateID, stageIdentity.UID, stageIdentity.GID), acme.RemoveWebroot(journal.Candidate.CertificateID, stageIdentity.UID, stageIdentity.GID), certificates.RemoveInactiveBundle(journal.Candidate.CertificateID, 1, cleanupIdentity, stageIdentity.UID, stageIdentity.GID))
 	}
 	if closureErr == nil {
 		journal, closureErr = store.Contract(ctx, journal)
