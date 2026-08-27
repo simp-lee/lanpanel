@@ -1,6 +1,6 @@
-.DEFAULT_GOAL := check
+.DEFAULT_GOAL := ga-local-gate
 
-.PHONY: build test vet lint check tidy ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
+.PHONY: build test vet lint race check tidy go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
@@ -10,9 +10,14 @@ GA_REWRITE_PACKAGES := ./internal/acme ./internal/activation ./internal/basic ./
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realip internal/realipassets internal/realiprender internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
 GO ?= go
+NPM ?= npm
 PKGS ?= ./...
 GOLANGCI_LINT ?= golangci-lint
+GOVULNCHECK ?= govulncheck
 OSV_SCANNER ?= osv-scanner
+GOLANGCI_LINT_VERSION := 2.11.3
+GOVULNCHECK_VERSION := 1.1.4
+OSV_SCANNER_VERSION := 2.0.3
 BINARY ?= lanpanel
 
 build:
@@ -25,7 +30,11 @@ vet:
 	$(GO) vet $(PKGS)
 
 lint:
-	$(GOLANGCI_LINT) run $(PKGS)
+	@command -v $(GOLANGCI_LINT) >/dev/null || { echo 'pinned golangci-lint is required' >&2; exit 1; }
+	@set -eu; $(GOLANGCI_LINT) version 2>&1 | grep -Eq '^golangci-lint has version $(GOLANGCI_LINT_VERSION)([[:space:]]|$$)'; $(GOLANGCI_LINT) run $(PKGS)
+
+race:
+	$(GO) test -race -count=1 $(PKGS)
 
 tidy:
 	$(GO) mod tidy
@@ -70,11 +79,16 @@ ga-helper-boundary-audit:
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"([^" ]*/)?(sh|bash|dash)"|"([^" ]*/)?(sudo|doas|pkexec|su)"' internal cmd; then echo 'shell or sudo-like executable remains in production' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -n -E 'Command|Arguments|Argv|Unit|Path' internal/helperproto/types.go; then echo 'generic command, unit, argv, or path entered helper request schema' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
-ga-vulnerability-scan:
-	@command -v govulncheck >/dev/null || { echo 'pinned govulncheck is required' >&2; exit 1; }
-	@set -eu; govulncheck -version 2>&1 | grep -Fqx 'Scanner: govulncheck@v1.1.4'; govulncheck ./...
+go-vulnerability-scan:
+	@command -v $(GOVULNCHECK) >/dev/null || { echo 'pinned govulncheck is required' >&2; exit 1; }
+	@set -eu; $(GOVULNCHECK) -version 2>&1 | grep -Fqx 'Scanner: govulncheck@v$(GOVULNCHECK_VERSION)'; $(GOVULNCHECK) ./...
 	@command -v $(OSV_SCANNER) >/dev/null || { echo 'pinned osv-scanner is required' >&2; exit 1; }
-	@set -eu; $(OSV_SCANNER) --version | grep -Fqx 'osv-scanner version: 2.0.3'; $(OSV_SCANNER) scan source --lockfile=go.mod
+	@set -eu; $(OSV_SCANNER) --version | grep -Fqx 'osv-scanner version: $(OSV_SCANNER_VERSION)'; $(OSV_SCANNER) scan source --lockfile=go.mod
+
+ga-vulnerability-scan: go-vulnerability-scan
+
+node-vulnerability-scan:
+	$(NPM) audit --include=dev
 
 ga-release-tooling-selftest: ga-release-identity-selftest ga-qualification-tooling-selftest
 	$(GO) test -count=1 ./internal/release ./internal/dependencies ./internal/packages
@@ -116,8 +130,7 @@ ga-finalize-release:
 	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'final release source worktree must be clean' >&2; exit 1; }
 	$(GO) run ./cmd/lanpanel-qualification release "$(RELEASE_FINALIZE_INPUT)"
 
-ga-local-gate: check lint ga-vulnerability-scan ga-release-tooling-selftest ga-final-asset-selftest
-	$(GO) test -race -count=1 ./...
+ga-local-gate: test vet lint race go-vulnerability-scan check node-vulnerability-scan ga-release-tooling-selftest ga-final-asset-selftest
 
 
 ga-release-identity-selftest:
@@ -231,7 +244,6 @@ ga-headscale-lifecycle-integration:
 	@grep -Fq 'headscale_certificate_reissue' internal/ui/server.go
 
 ga-docs-consistency-check:
-	npm run docs:build
 	@set -eu; for file in README.md README.zh-CN.md; do grep -Fq -- '--auth-key=file:<exact-path>' "$$file"; grep -Fiq 'key revoke' "$$file"; grep -Fiq 'device expire' "$$file"; grep -Eiq 'does not expire automatically|不会自动过期' "$$file"; grep -Eiq 'public plaintext|公网明文' "$$file"; grep -Eiq 'interrupt Headscale control ingress|中断 Headscale control ingress' "$$file"; grep -Fiq 'same-version reinstall' "$$file"; grep -Fiq 'backup/restore' "$$file"; grep -Fiq 'EdgeOne' "$$file"; done
 	@set -eu; if grep -n -Ei 'management CLI example|YAML workflow example|WordPress template|EdgeOne enable' README.md README.zh-CN.md; then echo 'excluded product claim remains in docs' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
