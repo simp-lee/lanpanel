@@ -18,6 +18,70 @@ func TestSecretResultRejectsReplayableContent(t *testing.T) {
 	}
 }
 
+func TestPostconditionLogicalKeysAreUnique(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	newRunning := func(seed byte) Record {
+		t.Helper()
+		record, err := NewReserved(Spec{Operation: "publish", Target: "resource/app-one", ActorIdentity: "session-one"}, now, bytes.NewReader(bytes.Repeat([]byte{seed}, 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err = Start(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+
+	t.Run("same_status", func(t *testing.T) {
+		conditions := []Postcondition{
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-one"},
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-one"},
+		}
+		if _, err := Finish(newRunning(4), Completion{Result: ResultSucceeded, Postconditions: conditions}, now.Add(time.Second)); err == nil {
+			t.Fatal("duplicate postcondition logical key with the same status was accepted")
+		}
+	})
+
+	t.Run("different_status", func(t *testing.T) {
+		conditions := []Postcondition{
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-one"},
+			{Kind: "ingress_closed", Status: PostconditionKnown, Identity: "app-one"},
+		}
+		if _, err := Finish(newRunning(5), Completion{Result: ResultPartial, Postconditions: conditions, ErrorCode: "activation_contracted"}, now.Add(time.Second)); err == nil {
+			t.Fatal("duplicate postcondition logical key with different statuses was accepted")
+		}
+	})
+
+	t.Run("different_identity", func(t *testing.T) {
+		conditions := []Postcondition{
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-two"},
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-one"},
+		}
+		finished, err := Finish(newRunning(6), Completion{Result: ResultSucceeded, Postconditions: conditions}, now.Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(finished.Postconditions) != 2 || finished.Postconditions[0].Identity != "app-one" || finished.Postconditions[1].Identity != "app-two" {
+			t.Fatalf("distinct postconditions were not retained canonically: %#v", finished.Postconditions)
+		}
+	})
+
+	t.Run("different_kind", func(t *testing.T) {
+		conditions := []Postcondition{
+			{Kind: "publication_verified", Status: PostconditionVerified, Identity: "app-one"},
+			{Kind: "ingress_closed", Status: PostconditionVerified, Identity: "app-one"},
+		}
+		finished, err := Finish(newRunning(7), Completion{Result: ResultSucceeded, Postconditions: conditions}, now.Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(finished.Postconditions) != 2 || finished.Postconditions[0].Kind != "ingress_closed" || finished.Postconditions[1].Kind != "publication_verified" {
+			t.Fatalf("distinct postconditions were not retained canonically: %#v", finished.Postconditions)
+		}
+	})
+}
+
 func TestDurableJobResultContract(t *testing.T) {
 	t.Run("terminal_results_are_closed_and_noninterchangeable", func(t *testing.T) {
 		now := time.Unix(1700000000, 0).UTC()

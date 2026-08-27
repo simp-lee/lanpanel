@@ -362,10 +362,16 @@ func Validate(record Record) error {
 			return fmt.Errorf("job modified path is not bounded, clean, and absolute")
 		}
 	}
+	postconditionKeys := make(map[postconditionKey]struct{}, len(record.Postconditions))
 	for _, condition := range record.Postconditions {
 		if !validRef(condition.Kind) || !validRef(condition.Identity) || (condition.Status != PostconditionVerified && condition.Status != PostconditionKnown && condition.Status != PostconditionUnobserved) {
 			return fmt.Errorf("job postcondition is invalid")
 		}
+		key := logicalPostconditionKey(condition)
+		if _, duplicate := postconditionKeys[key]; duplicate {
+			return fmt.Errorf("job postcondition logical key is duplicated")
+		}
+		postconditionKeys[key] = struct{}{}
 	}
 	switch record.Status {
 	case StatusReserved, StatusRunning:
@@ -495,6 +501,15 @@ func compact(values []string) []string {
 		}
 	}
 	return out
+}
+
+type postconditionKey struct {
+	kind     string
+	identity string
+}
+
+func logicalPostconditionKey(value Postcondition) postconditionKey {
+	return postconditionKey{kind: value.Kind, identity: value.Identity}
 }
 
 func canonicalPostconditions(values []Postcondition) []Postcondition {

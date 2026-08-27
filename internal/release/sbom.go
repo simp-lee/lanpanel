@@ -120,8 +120,7 @@ func GenerateReleaseSPDX(binaryPath string, dependency QualificationDependencyAu
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	}
 	for _, tuple := range profile.Packages {
-		id := spdxID("os-" + tuple.Name + "-" + tuple.Architecture)
-		native = append(native, SPDXPackage{Name: tuple.Name, SPDXID: id, VersionInfo: tuple.Version, DownloadLocation: profile.RepositorySource, FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"})
+		native = append(native, spdxOSPackage(tuple, profile.RepositorySource))
 	}
 	document.Packages = append(document.Packages, native...)
 	sort.Slice(document.Packages, func(i, j int) bool { return document.Packages[i].SPDXID < document.Packages[j].SPDXID })
@@ -148,18 +147,66 @@ func ValidateReleaseSPDX(data, candidate []byte, candidateDigest, releaseTag str
 	if err := DecodeCanonical(data, &document); err != nil {
 		return err
 	}
-	byID := make(map[string]SPDXPackage, len(document.Packages))
-	for _, pkg := range document.Packages {
-		byID[pkg.SPDXID] = pkg
+	expected, err := expectedReleaseSPDXPackages(candidate, candidateDigest, releaseTag, dependency, profile)
+	if err != nil {
+		return err
 	}
-	lanpanelPackage, present := byID["SPDXRef-Package-lanpanel"]
-	if !present || lanpanelPackage.VersionInfo != releaseTag || !releaseTagPattern.MatchString(releaseTag) {
-		return fmt.Errorf("release SBOM LanPanel package version differs from release tag")
+	if len(document.Packages) != len(expected) {
+		return fmt.Errorf("release SBOM package inventory differs from the exact expected set")
+	}
+	observedIDs := make(map[string]struct{}, len(document.Packages))
+	for _, observed := range document.Packages {
+		if _, duplicate := observedIDs[observed.SPDXID]; duplicate {
+			return fmt.Errorf("release SBOM package ID %q is duplicated", observed.SPDXID)
+		}
+		observedIDs[observed.SPDXID] = struct{}{}
+		expectedPackage, present := expected[observed.SPDXID]
+		if !present {
+			return fmt.Errorf("release SBOM contains unexpected package %q", observed.SPDXID)
+		}
+		if !spdxPackagesEqual(observed, expectedPackage) {
+			return fmt.Errorf("release SBOM package %q differs from exact candidate evidence", observed.SPDXID)
+		}
+	}
+	for id := range expected {
+		if _, present := observedIDs[id]; !present {
+			return fmt.Errorf("release SBOM omits expected package %q", id)
+		}
+	}
+
+	if len(document.Relationships) != len(expected) {
+		return fmt.Errorf("release SBOM relationship inventory differs from the exact expected set")
+	}
+	described := make(map[string]struct{}, len(document.Relationships))
+	for _, relationship := range document.Relationships {
+		if relationship.SPDXElementID != "SPDXRef-DOCUMENT" || relationship.RelationshipType != "DESCRIBES" {
+			return fmt.Errorf("release SBOM contains an unexpected relationship")
+		}
+		if _, present := expected[relationship.RelatedSPDXElement]; !present {
+			return fmt.Errorf("release SBOM describes unexpected package %q", relationship.RelatedSPDXElement)
+		}
+		if _, duplicate := described[relationship.RelatedSPDXElement]; duplicate {
+			return fmt.Errorf("release SBOM duplicates relationship for package %q", relationship.RelatedSPDXElement)
+		}
+		described[relationship.RelatedSPDXElement] = struct{}{}
+	}
+	for id := range expected {
+		if _, present := described[id]; !present {
+			return fmt.Errorf("release SBOM omits DOCUMENT DESCRIBES relationship for package %q", id)
+		}
+	}
+	return nil
+}
+
+func expectedReleaseSPDXPackages(candidate []byte, candidateDigest, releaseTag string, dependency QualificationDependencyAuthority, profile OSProfile) (map[string]SPDXPackage, error) {
+	if !releaseTagPattern.MatchString(releaseTag) {
+		return nil, fmt.Errorf("release SBOM tag is invalid")
 	}
 	build, err := buildinfo.Read(bytes.NewReader(candidate))
 	if err != nil {
-		return fmt.Errorf("read exact candidate Go module closure: %w", err)
+		return nil, fmt.Errorf("read exact candidate Go module closure: %w", err)
 	}
+	packages := []SPDXPackage{spdxCandidatePackage(releaseTag, candidateDigest)}
 	for _, module := range build.Deps {
 		name, version := module.Path, module.Version
 		if module.Replace != nil {
@@ -168,33 +215,60 @@ func ValidateReleaseSPDX(data, candidate []byte, candidateDigest, releaseTag str
 		if version == "" {
 			version = "(devel)"
 		}
-		observed, present := byID[spdxID(name)]
-		if !present || observed.Name != name || observed.VersionInfo != version {
-			return fmt.Errorf("release SBOM omits exact Go module %q", name)
-		}
+		packages = append(packages, spdxGoPackage(name, version))
 	}
-	expected := []SPDXPackage{
+	packages = append(packages,
 		spdxNativePackage("headscale", dependency.Headscale.Version, dependency.Headscale.ArtifactIdentity, dependency.Headscale.Archive.Digest),
 		spdxNativePackage("lego", dependency.LegoVersion, dependency.LegoArtifactIdentity, dependency.LegoArchive.Digest),
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
-	}
-	for _, pkg := range expected {
-		observed, present := byID[pkg.SPDXID]
-		if !present || observed.Name != pkg.Name || observed.VersionInfo != pkg.VersionInfo || observed.DownloadLocation != pkg.DownloadLocation || len(observed.Checksums) != 1 || observed.Checksums[0] != pkg.Checksums[0] {
-			return fmt.Errorf("release SBOM omits exact native dependency %q", pkg.Name)
-		}
-	}
+	)
 	for _, tuple := range profile.Packages {
-		observed, present := byID[spdxID("os-"+tuple.Name+"-"+tuple.Architecture)]
-		if !present || observed.Name != tuple.Name || observed.VersionInfo != tuple.Version || observed.DownloadLocation != profile.RepositorySource {
-			return fmt.Errorf("release SBOM omits exact OS package %q", tuple.Name)
+		packages = append(packages, spdxOSPackage(tuple, profile.RepositorySource))
+	}
+	expected := make(map[string]SPDXPackage, len(packages))
+	for _, pkg := range packages {
+		if _, duplicate := expected[pkg.SPDXID]; duplicate {
+			return nil, fmt.Errorf("release SBOM expected package ID %q collides", pkg.SPDXID)
+		}
+		expected[pkg.SPDXID] = pkg
+	}
+	return expected, nil
+}
+
+func spdxPackagesEqual(left, right SPDXPackage) bool {
+	if left.Name != right.Name || left.SPDXID != right.SPDXID || left.VersionInfo != right.VersionInfo || left.DownloadLocation != right.DownloadLocation || left.FilesAnalyzed != right.FilesAnalyzed || left.LicenseConcluded != right.LicenseConcluded || left.LicenseDeclared != right.LicenseDeclared || left.CopyrightText != right.CopyrightText || len(left.Checksums) != len(right.Checksums) {
+		return false
+	}
+	for index := range left.Checksums {
+		if left.Checksums[index] != right.Checksums[index] {
+			return false
 		}
 	}
-	return nil
+	return true
+}
+
+func spdxPackage(name, id, version, location string) SPDXPackage {
+	return SPDXPackage{Name: name, SPDXID: id, VersionInfo: version, DownloadLocation: location, FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"}
+}
+
+func spdxCandidatePackage(version, digest string) SPDXPackage {
+	pkg := spdxPackage("lanpanel", "SPDXRef-Package-lanpanel", version, "NOASSERTION")
+	pkg.Checksums = []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: digest}}
+	return pkg
+}
+
+func spdxGoPackage(name, version string) SPDXPackage {
+	return spdxPackage(name, spdxID(name), version, "NOASSERTION")
 }
 
 func spdxNativePackage(name, version, location, digest string) SPDXPackage {
-	return SPDXPackage{Name: name, SPDXID: spdxID("native-" + name), VersionInfo: version, DownloadLocation: location, FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION", Checksums: []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: digest}}}
+	pkg := spdxPackage(name, spdxID("native-"+name), version, location)
+	pkg.Checksums = []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: digest}}
+	return pkg
+}
+
+func spdxOSPackage(tuple PackageTuple, repositorySource string) SPDXPackage {
+	return spdxPackage(tuple.Name, spdxID("os-"+tuple.Name+"-"+tuple.Architecture), tuple.Version, repositorySource)
 }
 
 func spdxID(value string) string {
@@ -219,7 +293,7 @@ func GenerateSPDX(binaryPath string, created time.Time) ([]byte, error) {
 	if mainVersion == "" {
 		mainVersion = "(devel)"
 	}
-	packages := []SPDXPackage{{Name: "lanpanel", SPDXID: "SPDXRef-Package-lanpanel", VersionInfo: mainVersion, DownloadLocation: "NOASSERTION", FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION", Checksums: []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: binaryDigest}}}}
+	packages := []SPDXPackage{spdxCandidatePackage(mainVersion, binaryDigest)}
 	for _, module := range info.Deps {
 		name, version := module.Path, module.Version
 		if module.Replace != nil {
@@ -228,7 +302,7 @@ func GenerateSPDX(binaryPath string, created time.Time) ([]byte, error) {
 		if version == "" {
 			version = "(devel)"
 		}
-		packages = append(packages, SPDXPackage{Name: name, SPDXID: spdxID(name), VersionInfo: version, DownloadLocation: "NOASSERTION", FilesAnalyzed: false, LicenseConcluded: "NOASSERTION", LicenseDeclared: "NOASSERTION", CopyrightText: "NOASSERTION"})
+		packages = append(packages, spdxGoPackage(name, version))
 	}
 	sort.Slice(packages, func(i, j int) bool { return packages[i].SPDXID < packages[j].SPDXID })
 	relationships := make([]SPDXRelationship, len(packages))
