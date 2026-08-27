@@ -3,15 +3,22 @@
 package goaccess
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"lanpanel/internal/child"
 	"lanpanel/internal/domain"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,7 +46,8 @@ func TestRenderUsesPrivateNetworkAndProtectedRelay(t *testing.T) {
 	if strings.Contains(retentionTimer, "Persistent=") {
 		t.Fatal("retention timer created untracked persistent systemd state")
 	}
-	if candidate.Paths.RetentionUnit == "" || candidate.Paths.RetentionTimer == "" || !strings.Contains(string(candidate.RetentionService), candidate.Paths.RetentionLock) || !strings.Contains(string(candidate.RetentionService), "TimeoutStartSec=30s") || !strings.Contains(string(candidate.RetentionService), "LANPANEL_INSTALLATION_ID=ins_00000000000000000000000000000001") || !strings.Contains(socket, "ListenStream=/run/lanpanel-goaccess/") || candidate.ServiceIdentity != digest && len(candidate.ServiceIdentity) != 71 {
+	retentionService := string(candidate.RetentionService)
+	if candidate.Paths.RetentionUnit == "" || candidate.Paths.RetentionTimer == "" || !strings.Contains(retentionService, candidate.Paths.RetentionLock) || !strings.Contains(retentionService, "ExecStart=/usr/lib/lanpanel/lanpanel goaccess-retention") || !strings.Contains(retentionService, "User=root\nGroup=root") || !strings.Contains(retentionService, "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE") || !strings.Contains(retentionService, "TimeoutStartSec=75s") || !strings.Contains(retentionService, "/var/log/lanpanel/nginx-rejections.log") || !strings.Contains(retentionService, "LANPANEL_INSTALLATION_ID=ins_00000000000000000000000000000001") || strings.Contains(retentionService, "/bin/sh") || strings.Contains(retentionService, "/usr/bin/kill") || !strings.Contains(socket, "ListenStream=/run/lanpanel-goaccess/") || candidate.ServiceIdentity != digest && len(candidate.ServiceIdentity) != 71 {
 		t.Fatal("protected endpoint identity missing")
 	}
 }
@@ -138,63 +146,505 @@ func TestCandidateGenerationsHaveIsolatedStateAndEndpoints(t *testing.T) {
 	}
 }
 
-func TestRetentionBoundsCanonicalLogAndRecoversExactTemp(t *testing.T) {
-	directory := t.TempDir()
+func createOversizedAccessLog(t *testing.T, directory string) (string, string) {
+	t.Helper()
+	if err := os.Chmod(directory, resourceLogDirectoryMode); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(directory, "access.log")
 	lock := filepath.Join(directory, "retention.lock")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o640)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = file.Truncate(maximumAccessLogBytes + 4096); err != nil {
+	if err = file.Truncate(maximumAccessLogBytes + 4096); err == nil {
+		_, err = file.WriteAt([]byte("\nlatest\n"), maximumAccessLogBytes+4088)
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = file.WriteAt([]byte("latest"), maximumAccessLogBytes+4090); err != nil {
+	return path, lock
+}
+
+func TestNginxWorkerCanTraverseResourceLogDirectoryOnReopen(t *testing.T) {
+	if path := os.Getenv("LANPANEL_TEST_NGINX_REOPEN_PATH"); path != "" {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("distinct-identity traversal check requires root")
+	}
+	root, err := os.MkdirTemp("/tmp", "lanpanel-nginx-reopen-")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err = file.Close(); err != nil {
+	defer func() { _ = os.RemoveAll(root) }()
+	if err = os.Chmod(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(path+".1.lanpanel", []byte("interrupted"), 0o600); err != nil {
+	testBinary := filepath.Join(root, "goaccess.test")
+	source, err := os.Open(os.Args[0])
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
+	target, err := os.OpenFile(testBinary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		_ = source.Close()
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(target, source)
+	err = errors.Join(copyErr, source.Close(), target.Sync(), target.Close())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceDirectory := filepath.Join(root, "resource")
+	if err = os.Mkdir(resourceDirectory, 0o750); err == nil {
+		err = os.Chown(resourceDirectory, 65533, 65533)
+	}
+	activePath := filepath.Join(resourceDirectory, "access.log")
+	if err == nil {
+		err = os.WriteFile(activePath, nil, 0o640)
+	}
+	if err == nil {
+		err = os.Chown(activePath, 65534, 65533)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	runWorker := func() error {
+		command := exec.Command(testBinary, "-test.run=^TestNginxWorkerCanTraverseResourceLogDirectoryOnReopen$")
+		command.Env = append(os.Environ(), "LANPANEL_TEST_NGINX_REOPEN_PATH="+activePath)
+		command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
+		return command.Run()
+	}
+	if err = runWorker(); err == nil {
+		t.Fatal("worker traversed the former private directory mode")
+	}
+	if err = os.Chmod(resourceDirectory, 0o751); err != nil {
+		t.Fatal(err)
+	}
+	if err = runWorker(); err != nil {
+		t.Fatalf("worker could not reopen the active log through mode 0751: %v", err)
+	}
+}
+
+func TestGlobalRetentionLockSerializesResourceRotations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "global-retention.lock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := acquireExclusiveRetentionLock(context.Background(), path, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if second, acquireErr := acquireExclusiveRetentionLock(ctx, path, uint32(os.Getuid()), uint32(os.Getgid())); acquireErr == nil {
+		_ = unix.Flock(second, unix.LOCK_UN)
+		_ = unix.Close(second)
+		t.Fatal("concurrent resource rotation acquired the global lock")
+	}
+	if err = unix.Flock(first, unix.LOCK_UN); err == nil {
+		err = unix.Close(first)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := acquireExclusiveRetentionLock(context.Background(), path, uint32(os.Getuid()), uint32(os.Getgid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unix.Flock(third, unix.LOCK_UN)
+	if err = unix.Close(third); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetentionBoundsCanonicalLogWithoutCopytruncate(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	if err := rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
 		t.Fatal(err)
 	}
 	current, err := os.Stat(path)
 	if err != nil || current.Size() != 0 {
-		t.Fatalf("current log not truncated: info=%v err=%v", current, err)
+		t.Fatalf("replacement log not created: info=%v err=%v", current, err)
 	}
 	snapshot, err := os.Stat(path + ".1")
 	if err != nil || snapshot.Size() != maximumAccessLogBytes {
 		t.Fatalf("snapshot not bounded: info=%v err=%v", snapshot, err)
 	}
 	tail, err := os.ReadFile(path + ".1")
-	if err != nil || !strings.HasSuffix(string(tail), "latest") {
+	if err != nil || !bytes.Contains(tail, []byte("\nlatest\n")) {
 		t.Fatalf("snapshot did not retain latest bytes: %v", err)
+	}
+	if _, err = os.Lstat(path + ".retention-old"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("renamed source remained: %v", err)
 	}
 }
 
-func TestRetentionRejectsSymlinkSnapshot(t *testing.T) {
+func TestRetentionConcurrentAppendsLandExactlyOnceInOldOrNewLog(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	writer, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var writerMu sync.Mutex
+	var writtenMu sync.Mutex
+	written := []uint64{}
+	var next atomic.Uint64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			value := next.Add(1)
+			writerMu.Lock()
+			_, writeErr := fmt.Fprintf(writer, "record:%020d\n", value)
+			writerMu.Unlock()
+			if writeErr != nil {
+				return
+			}
+			writtenMu.Lock()
+			written = append(written, value)
+			writtenMu.Unlock()
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	reopen := func(_ context.Context, _, _ retentionFileIdentity) error {
+		writerMu.Lock()
+		defer writerMu.Unlock()
+		nextWriter, openErr := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if openErr != nil {
+			return openErr
+		}
+		closeErr := writer.Close()
+		writer = nextWriter
+		return closeErr
+	}
+	err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{
+		NginxUID: uint32(os.Getuid()), Reopen: reopen,
+		Checkpoint: func(retentionCheckpoint) error {
+			time.Sleep(2 * time.Millisecond)
+			return nil
+		},
+	})
+	close(stop)
+	<-done
+	writerMu.Lock()
+	closeErr := writer.Close()
+	writerMu.Unlock()
+	if err != nil || closeErr != nil {
+		t.Fatalf("rotation=%v close=%v", err, closeErr)
+	}
+	observed := map[uint64]int{}
+	for _, name := range []string{path + ".1", path} {
+		data, readErr := os.ReadFile(name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			if !bytes.HasPrefix(line, []byte("record:")) {
+				continue
+			}
+			value, parseErr := strconv.ParseUint(string(bytes.TrimPrefix(line, []byte("record:"))), 10, 64)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			observed[value]++
+		}
+	}
+	writtenMu.Lock()
+	defer writtenMu.Unlock()
+	if len(written) == 0 {
+		t.Fatal("writer produced no concurrent records")
+	}
+	for _, value := range written {
+		if observed[value] != 1 {
+			t.Fatalf("record %d observed %d times", value, observed[value])
+		}
+	}
+}
+
+func TestRetentionRecoversFailuresAroundRenameAndReopen(t *testing.T) {
+	for _, failure := range []retentionCheckpoint{checkpointRenamed, checkpointReplacementBound, checkpointBeforeReopen, checkpointAfterReopen, checkpointSnapshot} {
+		t.Run(string(failure), func(t *testing.T) {
+			path, lock := createOversizedAccessLog(t, t.TempDir())
+			writer, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			reopen := func(_ context.Context, _, _ retentionFileIdentity) error {
+				mu.Lock()
+				defer mu.Unlock()
+				if writer == nil {
+					return nil
+				}
+				next, openErr := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+				if openErr != nil {
+					return openErr
+				}
+				closeErr := writer.Close()
+				writer = nil
+				return errors.Join(closeErr, next.Close())
+			}
+			failed := false
+			options := retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: reopen, Checkpoint: func(current retentionCheckpoint) error {
+				if current == failure && !failed {
+					failed = true
+					return fmt.Errorf("injected %s failure", failure)
+				}
+				return nil
+			}}
+			if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), options); err == nil {
+				t.Fatal("injected failure was not observed")
+			}
+			options.Checkpoint = nil
+			if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), options); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			if writer != nil {
+				_ = writer.Close()
+			}
+			mu.Unlock()
+			data, err := os.ReadFile(path + ".1")
+			if err != nil || !bytes.Contains(data, []byte("\nlatest\n")) {
+				t.Fatalf("recovered snapshot=%v err=%v", bytes.HasSuffix(data, []byte("latest")), err)
+			}
+			for _, residue := range []string{path + ".retention-old", path + ".retention-new", path + ".retention-state", path + ".retention-state.lanpanel", path + ".1.lanpanel"} {
+				if _, err := os.Lstat(residue); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("residue %s remained: %v", residue, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPreparedRetentionRejectsSnapshotStagingBeforeMutation(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	options := retentionOptions{NginxUID: uint32(os.Getuid()), Checkpoint: func(checkpoint retentionCheckpoint) error {
+		if checkpoint == checkpointPrepared {
+			return fmt.Errorf("stop after prepared state")
+		}
+		return nil
+	}}
+	if err := rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), options); err == nil {
+		t.Fatal("prepared checkpoint failure was not observed")
+	}
+	if err := os.WriteFile(path+".1.lanpanel", []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.Checkpoint = nil
+	if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), options); err == nil {
+		t.Fatal("prepared recovery accepted impossible snapshot staging")
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("prepared source changed: %v", err)
+	}
+	if _, err = os.Lstat(path + ".retention-new"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prepared recovery created replacement before rejection: %v", err)
+	}
+}
+
+func TestRetentionRejectsForeignMetadataAndLinks(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		alter func(*testing.T, string)
+		uid   func() uint32
+	}{
+		{name: "snapshot symlink", alter: func(t *testing.T, path string) {
+			outside := path + ".outside"
+			if err := os.WriteFile(outside, []byte("foreign"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, path+".1"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong mode", alter: func(t *testing.T, path string) {
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "multiple links", alter: func(t *testing.T, path string) {
+			if err := os.Link(path, path+".foreign-link"); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unknown state", alter: func(t *testing.T, path string) {
+			if err := os.WriteFile(path+".retention-state", []byte("foreign"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unknown staged replacement", alter: func(t *testing.T, path string) {
+			if err := os.WriteFile(path+".retention-new", []byte("foreign"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong owner authority", alter: func(*testing.T, string) {}, uid: func() uint32 { return uint32(os.Getuid() + 1) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, lock := createOversizedAccessLog(t, t.TempDir())
+			test.alter(t, path)
+			uid := uint32(os.Getuid())
+			if test.uid != nil {
+				uid = test.uid()
+			}
+			before, _ := os.Lstat(path)
+			if err := rotateAccessLog(path, lock, uid, uint32(os.Getgid())); err == nil {
+				t.Fatal("foreign retention artifact was accepted")
+			}
+			after, _ := os.Lstat(path)
+			if before != nil && after != nil && !os.SameFile(before, after) {
+				t.Fatal("foreign source path changed")
+			}
+		})
+	}
+}
+
+func TestRetentionRejectsUnsafeDirectoryBeforeCreatingStateOrLock(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	if err := os.Chmod(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid())); err == nil {
+		t.Fatal("unsafe resource log directory was accepted")
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("source changed after directory rejection: %v", err)
+	}
+	for _, artifact := range []string{lock, path + ".retention-state", path + ".retention-new", path + ".retention-old"} {
+		if _, err = os.Lstat(artifact); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("artifact created before directory rejection: %s: %v", artifact, err)
+		}
+	}
+}
+
+func TestRetentionBelowThresholdHasNoSideEffects(t *testing.T) {
 	directory := t.TempDir()
+	if err := os.Chmod(directory, resourceLogDirectoryMode); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(directory, "access.log")
-	if err := os.WriteFile(path, make([]byte, maximumAccessLogBytes+1), 0o640); err != nil {
+	lock := filepath.Join(directory, "retention.lock")
+	if err := os.WriteFile(path, []byte("small\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	outside := filepath.Join(directory, "outside")
-	if err := os.WriteFile(outside, []byte("foreign"), 0o640); err != nil {
+	if err := os.WriteFile(path+".1", []byte("prior\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outside, path+".1"); err != nil {
+	if err := os.WriteFile(lock, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := rotateAccessLog(path, filepath.Join(directory, "lock"), uint32(os.Getuid()), uint32(os.Getgid()))
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: func(context.Context, retentionFileIdentity, retentionFileIdentity) error { calls++; return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) || calls != 0 {
+		t.Fatalf("below-threshold rotation changed source or reopened Nginx: same=%t calls=%d err=%v", os.SameFile(before, after), calls, err)
+	}
+	if data, err := os.ReadFile(path + ".1"); err != nil || string(data) != "prior\n" {
+		t.Fatalf("prior snapshot changed: %q %v", data, err)
+	}
+	for _, residue := range []string{path + ".retention-old", path + ".retention-new", path + ".retention-state", path + ".retention-state.lanpanel", path + ".1.lanpanel"} {
+		if _, err := os.Lstat(residue); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("below-threshold residue %s: %v", residue, err)
+		}
+	}
+}
+
+func TestSettledRetentionCleanupRejectsRecoveryArtifactsAndSpecialModeBits(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o751); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string][]byte{"access.log": []byte("active\n"), "access.log.1": []byte("retained\n"), ".retention.lock": nil} {
+		mode := os.FileMode(0o640)
+		if name == ".retention.lock" {
+			mode = 0o600
+		}
+		if err := os.WriteFile(filepath.Join(root, name), content, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := verifySettledRetentionLogRoot(context.Background(), root, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "access.log.retention-state")
+	if err := os.WriteFile(statePath, []byte("unknown"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySettledRetentionLogRoot(context.Background(), root, uint32(os.Getuid()), uint32(os.Getgid())); err == nil {
+		t.Fatal("cleanup accepted an unsettled fixed-name recovery artifact")
+	}
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	accessPath := filepath.Join(root, "access.log")
+	if err := os.Chmod(accessPath, 0o640|os.ModeSetuid); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySettledRetentionLogRoot(context.Background(), root, uint32(os.Getuid()), uint32(os.Getgid())); err == nil {
+		t.Fatal("cleanup accepted special mode bits")
+	}
+}
+
+func TestRetentionReopenFailurePreservesUniqueRenamedLog(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	prior := []byte("prior snapshot\n")
+	if err := os.WriteFile(path+".1", prior, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: func(context.Context, retentionFileIdentity, retentionFileIdentity) error {
+		return fmt.Errorf("injected Nginx reopen failure")
+	}})
 	if err == nil {
-		t.Fatal("symlink snapshot accepted")
+		t.Fatal("Nginx reopen failure was hidden")
 	}
-	value, _ := os.ReadFile(outside)
-	if string(value) != "foreign" {
-		t.Fatal("foreign snapshot target changed")
+	old, statErr := os.Stat(path + ".retention-old")
+	if statErr != nil || !os.SameFile(before, old) || old.Size() != before.Size() {
+		t.Fatalf("unique renamed log changed: before=%v old=%v err=%v", before, old, statErr)
+	}
+	if data, readErr := os.ReadFile(path + ".1"); readErr != nil || !bytes.Equal(data, prior) {
+		t.Fatalf("prior snapshot changed on reopen failure: %q %v", data, readErr)
+	}
+	active, activeErr := os.Stat(path)
+	if activeErr != nil || active.Size() != 0 {
+		t.Fatalf("replacement log missing after reopen failure: %v %v", active, activeErr)
 	}
 }
 

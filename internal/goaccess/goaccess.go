@@ -14,10 +14,20 @@ import (
 	"strings"
 )
 
-const Backend = "127.0.0.1:7890"
+const (
+	Backend                  = "127.0.0.1:7890"
+	globalRetentionLockPath  = "/var/log/lanpanel/goaccess/.retention-reopen.lock"
+	resourceLogDirectoryMode = 0o751
+)
 
 type (
-	Paths     struct{ ResourceRoot, StateRoot, Database, Report, AccessLog, Endpoint, ServiceUnit, ServiceEnablement, RelayUnit, RelayEnablement, SocketUnit, SocketEnablement, Sysusers, RetentionUnit, RetentionTimer, RetentionEnablement, RetentionLock string }
+	Paths struct {
+		ResourceRoot, StateRoot, Database, Report                                                             string
+		AccessLog, RetainedLog, RetentionOld, RetentionNew, RetentionState, RetentionStateTemp, RetentionTemp string
+		Endpoint, ServiceUnit, ServiceEnablement, RelayUnit, RelayEnablement                                  string
+		SocketUnit, SocketEnablement, Sysusers, RetentionUnit, RetentionTimer                                 string
+		RetentionEnablement, RetentionLock                                                                    string
+	}
 	Candidate struct {
 		InstallationID                                                     string
 		ResourceID                                                         string
@@ -47,7 +57,19 @@ func DerivePaths(resourceID string, generation uint64) (Paths, error) {
 	unitID := resourceID + "-" + fmt.Sprint(generation)
 	resourceRoot := "/var/lib/lanpanel/goaccess/" + resourceID
 	state := resourceRoot + "/generations/" + fmt.Sprint(generation)
-	return Paths{ResourceRoot: resourceRoot, StateRoot: state, Database: state + "/database", Report: state + "/report/index.html", AccessLog: "/var/log/lanpanel/goaccess/" + resourceID + "/access.log", Endpoint: "/run/lanpanel-goaccess/" + unitID + ".sock", ServiceUnit: "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".service", ServiceEnablement: "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service", RelayUnit: "/etc/systemd/system/lanpanel-goaccess-relay-" + unitID + ".service", RelayEnablement: "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service", SocketUnit: "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".socket", SocketEnablement: "/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket", Sysusers: "/etc/sysusers.d/lanpanel-goaccess-" + resourceID + ".conf", RetentionUnit: "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".service", RetentionTimer: "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".timer", RetentionEnablement: "/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer", RetentionLock: "/var/log/lanpanel/goaccess/" + resourceID + "/.retention.lock"}, nil
+	accessLog := "/var/log/lanpanel/goaccess/" + resourceID + "/access.log"
+	return Paths{
+		ResourceRoot: resourceRoot, StateRoot: state, Database: state + "/database", Report: state + "/report/index.html",
+		AccessLog: accessLog, RetainedLog: accessLog + ".1", RetentionOld: accessLog + ".retention-old", RetentionNew: accessLog + ".retention-new",
+		RetentionState: accessLog + ".retention-state", RetentionStateTemp: accessLog + ".retention-state.lanpanel", RetentionTemp: accessLog + ".1.lanpanel",
+		Endpoint: "/run/lanpanel-goaccess/" + unitID + ".sock", ServiceUnit: "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".service",
+		ServiceEnablement: "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-" + unitID + ".service",
+		RelayUnit:         "/etc/systemd/system/lanpanel-goaccess-relay-" + unitID + ".service", RelayEnablement: "/etc/systemd/system/multi-user.target.wants/lanpanel-goaccess-relay-" + unitID + ".service",
+		SocketUnit: "/etc/systemd/system/lanpanel-goaccess-" + unitID + ".socket", SocketEnablement: "/etc/systemd/system/sockets.target.wants/lanpanel-goaccess-" + unitID + ".socket",
+		Sysusers: "/etc/sysusers.d/lanpanel-goaccess-" + resourceID + ".conf", RetentionUnit: "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".service",
+		RetentionTimer: "/etc/systemd/system/lanpanel-goaccess-retention-" + unitID + ".timer", RetentionEnablement: "/etc/systemd/system/timers.target.wants/lanpanel-goaccess-retention-" + unitID + ".timer",
+		RetentionLock: "/var/log/lanpanel/goaccess/" + resourceID + "/.retention.lock",
+	}, nil
 }
 
 type accountAuthority struct {
@@ -150,7 +172,7 @@ func Render(installationID string, resource domain.AppResource, nginxGID uint32,
 	relay := []byte("[Unit]\nDescription=LanPanel isolated GoAccess relay " + resource.ID + "\nRequires=" + serviceName + " " + socketName + "\nAfter=" + serviceName + " " + socketName + "\nJoinsNamespaceOf=" + serviceName + "\n\n[Service]\nType=simple\nUser=" + fmt.Sprint(relayUID) + "\nGroup=" + fmt.Sprint(relayGID) + "\nExecStartPre=+/usr/lib/lanpanel/lanpanel goaccess-account-guard\nExecStart=/usr/lib/lanpanel/lanpanel goaccess-relay\nSockets=" + socketName + "\nEnvironment=LANPANEL_INSTALLATION_ID=" + installationID + "\nEnvironment=LANPANEL_RESOURCE_ID=" + resource.ID + "\nEnvironment=LANPANEL_GOACCESS_GENERATION=" + fmt.Sprint(generation) + "\nEnvironment=LANPANEL_GOACCESS_BACKEND=" + Backend + "\nPrivateNetwork=yes\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictSUIDSGID=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictAddressFamilies=AF_INET\nUMask=0077\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n")
 	socket := []byte("[Unit]\nDescription=LanPanel protected GoAccess endpoint " + resource.ID + "\nBefore=" + filepath.Base(paths.RelayUnit) + "\n\n[Socket]\nUser=root\nGroup=" + fmt.Sprint(nginxGID) + "\nListenStream=" + paths.Endpoint + "\nSocketMode=0660\nSocketUser=root\nSocketGroup=" + fmt.Sprint(nginxGID) + "\nService=" + filepath.Base(paths.RelayUnit) + "\nFileDescriptorName=goaccess\nRemoveOnStop=yes\nRuntimeDirectory=lanpanel-goaccess\nRuntimeDirectoryMode=0750\nRuntimeDirectoryPreserve=yes\n\n[Install]\nWantedBy=sockets.target\n")
 	sysusers := authority.sysusers
-	retentionService := []byte("[Unit]\nDescription=LanPanel bounded GoAccess retention " + resource.ID + "\n\n[Service]\nType=oneshot\nExecStart=/usr/lib/lanpanel/lanpanel goaccess-retention\nEnvironment=LANPANEL_INSTALLATION_ID=" + installationID + "\nEnvironment=LANPANEL_RESOURCE_ID=" + resource.ID + "\nEnvironment=LANPANEL_GOACCESS_GENERATION=" + fmt.Sprint(generation) + "\nUser=" + fmt.Sprint(uid) + "\nGroup=" + fmt.Sprint(gid) + "\nExecStartPre=+/usr/lib/lanpanel/lanpanel goaccess-account-guard\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictSUIDSGID=yes\nPrivateNetwork=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictAddressFamilies=AF_UNIX\nTimeoutStartSec=30s\nUMask=0077\nReadWritePaths=" + quote(filepath.Dir(paths.AccessLog)) + " " + quote(paths.RetentionLock) + "\n")
+	retentionService := []byte("[Unit]\nDescription=LanPanel bounded GoAccess retention " + resource.ID + "\n\n[Service]\nType=oneshot\nExecStart=/usr/lib/lanpanel/lanpanel goaccess-retention\nEnvironment=LANPANEL_INSTALLATION_ID=" + installationID + "\nEnvironment=LANPANEL_RESOURCE_ID=" + resource.ID + "\nEnvironment=LANPANEL_GOACCESS_GENERATION=" + fmt.Sprint(generation) + "\nUser=root\nGroup=root\nExecStartPre=/usr/lib/lanpanel/lanpanel goaccess-account-guard\nNoNewPrivileges=yes\nCapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictSUIDSGID=yes\nPrivateNetwork=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictAddressFamilies=AF_UNIX\nTimeoutStartSec=75s\nUMask=0077\nReadWritePaths=" + quote(filepath.Dir(paths.AccessLog)) + " " + quote(paths.RetentionLock) + " /var/log/lanpanel/goaccess /var/log/lanpanel/nginx-rejections.log\n")
 	retentionTimer := []byte("[Unit]\nDescription=LanPanel bounded GoAccess retention timer " + resource.ID + "\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=1min\nUnit=" + filepath.Base(paths.RetentionUnit) + "\n\n[Install]\nWantedBy=timers.target\n")
 	identity := managedServiceIdentity(service, relay, socket, sysusers, retentionService, retentionTimer)
 	unitIdentities := []string{digest(service), digest(relay), digest(socket), digest(retentionService), digest(retentionTimer)}

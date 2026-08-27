@@ -303,6 +303,180 @@ func readMasterPID(path string) (int, error) {
 	return pid, nil
 }
 
+type FileIdentity struct {
+	Device uint64
+	Inode  uint64
+}
+
+// WaitFileReopen waits until the exact runtime has switched away from a
+// renamed file. Two complete observations with no old write descriptor close
+// the process-inventory race around a worker exit or respawn.
+func WaitFileReopen(ctx context.Context, observer RuntimeObserver, procRoot, activePath string, priorMaster ProcessIdentity, old, active FileIdentity, timeout time.Duration, retrySignal func(context.Context) error) error {
+	if observer == nil || !filepath.IsAbs(procRoot) || filepath.Clean(procRoot) != procRoot || !filepath.IsAbs(activePath) || filepath.Clean(activePath) != activePath || priorMaster.PID <= 1 || priorMaster.StartTicks == 0 || priorMaster.Cgroup == "" || old.Device == 0 || old.Inode == 0 || active.Device == 0 || active.Inode == 0 || old == active || timeout <= 0 || timeout > time.Minute {
+		return fmt.Errorf("file reopen authority is invalid")
+	}
+	deadline := time.Now().Add(timeout)
+	nextRetry := time.Now().Add(100 * time.Millisecond)
+	retries := 0
+	clearObservations := 0
+	for {
+		var stat unix.Stat_t
+		if err := unix.Lstat(activePath, &stat); err != nil {
+			return fmt.Errorf("replacement file identity unavailable: %w", err)
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || uint64(stat.Dev) != active.Device || stat.Ino != active.Inode {
+			return fmt.Errorf("replacement file identity changed")
+		}
+		snapshot, err := observer.Observe(ctx)
+		if err != nil {
+			return err
+		}
+		if snapshot.Master == nil {
+			if err := VerifyStopped(snapshot); err != nil {
+				return err
+			}
+			return nil
+		}
+		if !snapshot.Complete {
+			return fmt.Errorf("file reopen runtime inventory is incomplete")
+		}
+		if processKey(*snapshot.Master) != processKey(priorMaster) {
+			return fmt.Errorf("file reopen Nginx master identity changed")
+		}
+		processes := make([]ProcessIdentity, 0, len(snapshot.Workers)+1)
+		processes = append(processes, *snapshot.Master)
+		processes = append(processes, snapshot.Workers...)
+		writers, err := WritableFileReferences(procRoot, processes, old.Device, old.Inode)
+		if err != nil {
+			return err
+		}
+		activeMaster, err := WritableFileReferences(procRoot, []ProcessIdentity{*snapshot.Master}, active.Device, active.Inode)
+		if err != nil {
+			return err
+		}
+		if len(writers) == 0 && len(activeMaster) == 1 {
+			clearObservations++
+			if clearObservations == 2 {
+				return nil
+			}
+		} else {
+			clearObservations = 0
+		}
+		now := time.Now()
+		if len(writers) != 0 && retrySignal != nil && retries < 2 && !now.Before(nextRetry) {
+			if err = retrySignal(ctx); err != nil {
+				return err
+			}
+			retries++
+			now = time.Now()
+			nextRetry = now.Add(100 * time.Millisecond)
+		}
+		if !now.Before(deadline) {
+			return fmt.Errorf("runtime did not release the renamed file before the fixed deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// WritableFileReferences returns the exact process identities that still hold a
+// write-capable descriptor for one inode. Each process is rebound to its PID
+// start time before and after inspection so PID reuse cannot create false
+// reopen completion evidence.
+func WritableFileReferences(procRoot string, processes []ProcessIdentity, device, inode uint64) ([]ProcessIdentity, error) {
+	if procRoot == "" {
+		procRoot = "/proc"
+	}
+	if !filepath.IsAbs(procRoot) || filepath.Clean(procRoot) != procRoot || device == 0 || inode == 0 || len(processes) > MaximumRuntimeProcesses {
+		return nil, fmt.Errorf("writable file reference authority is invalid")
+	}
+	result := []ProcessIdentity{}
+	entriesSeen := 0
+	for _, process := range processes {
+		before, err := observeProcess(procRoot, process.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if processKey(before) != processKey(process) {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(process.PID), "fd"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		entriesSeen += len(entries)
+		if entriesSeen > 131072 {
+			return nil, fmt.Errorf("writable file descriptor inventory exceeds bound")
+		}
+		matched := false
+		for _, entry := range entries {
+			fdPath := filepath.Join(procRoot, strconv.Itoa(process.PID), "fd", entry.Name())
+			var stat unix.Stat_t
+			if err := unix.Stat(fdPath, &stat); errors.Is(err, unix.ENOENT) {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+			if uint64(stat.Dev) != device || stat.Ino != inode {
+				continue
+			}
+			flags, err := descriptorFlags(filepath.Join(procRoot, strconv.Itoa(process.PID), "fdinfo", entry.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if flags&unix.O_ACCMODE == unix.O_WRONLY || flags&unix.O_ACCMODE == unix.O_RDWR {
+				matched = true
+				break
+			}
+		}
+		after, err := observeProcess(procRoot, process.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if processKey(after) != processKey(process) {
+			continue
+		}
+		if matched {
+			result = append(result, process)
+		}
+	}
+	return result, nil
+}
+
+func descriptorFlags(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found || key != "flags" {
+			continue
+		}
+		flags, err := strconv.ParseUint(strings.TrimSpace(value), 8, 32)
+		if err != nil {
+			return 0, fmt.Errorf("process descriptor flags are malformed")
+		}
+		return int(flags), nil
+	}
+	return 0, fmt.Errorf("process descriptor flags are missing")
+}
+
 func processSocketInodes(procRoot string, processes []ProcessIdentity) (map[uint64]bool, error) {
 	result := map[uint64]bool{}
 	for _, process := range processes {

@@ -14,6 +14,7 @@ import (
 	"lanpanel/internal/identity"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -158,15 +159,18 @@ func (host Host) Stage(ctx context.Context, resourceID string, candidate Candida
 	for _, directory := range []struct {
 		path           string
 		uid, gid, mode uint32
-	}{{"/var/lib/lanpanel/goaccess", 0, 0, 0o711}, {candidate.Paths.ResourceRoot, 0, 0, 0o711}, {filepath.Join(candidate.Paths.ResourceRoot, "generations"), 0, 0, 0o711}, {candidate.Paths.StateRoot, 0, 0, 0o711}, {candidate.Paths.Database, candidate.UID, candidate.GID, 0o750}, {filepath.Dir(candidate.Paths.Report), candidate.UID, candidate.NginxGID, 0o2750}, {"/var/log/lanpanel/goaccess", 0, 0, 0o711}, {filepath.Dir(candidate.Paths.AccessLog), candidate.UID, candidate.GID, 0o750}, {"/run/lanpanel-goaccess", 0, candidate.NginxGID, 0o750}} {
+	}{{"/var/lib/lanpanel/goaccess", 0, 0, 0o711}, {candidate.Paths.ResourceRoot, 0, 0, 0o711}, {filepath.Join(candidate.Paths.ResourceRoot, "generations"), 0, 0, 0o711}, {candidate.Paths.StateRoot, 0, 0, 0o711}, {candidate.Paths.Database, candidate.UID, candidate.GID, 0o750}, {filepath.Dir(candidate.Paths.Report), candidate.UID, candidate.NginxGID, 0o2750}, {"/var/log/lanpanel/goaccess", 0, 0, 0o711}, {filepath.Dir(candidate.Paths.AccessLog), candidate.UID, candidate.GID, resourceLogDirectoryMode}, {"/run/lanpanel-goaccess", 0, candidate.NginxGID, 0o750}} {
 		if err := ensureDirectory(directory.path, directory.uid, directory.gid, directory.mode); err != nil {
 			return err
 		}
 	}
+	if err := ensureEmptyFile(globalRetentionLockPath, 0, 0, 0o600); err != nil {
+		return err
+	}
 	if err := ensureFile(candidate.Paths.AccessLog, candidate.UID, candidate.GID, 0o640); err != nil {
 		return err
 	}
-	if err := ensureFile(candidate.Paths.RetentionLock, candidate.UID, candidate.GID, 0o600); err != nil {
+	if err := ensureEmptyFile(candidate.Paths.RetentionLock, candidate.UID, candidate.GID, 0o600); err != nil {
 		return err
 	}
 	for _, file := range []struct {
@@ -433,7 +437,7 @@ func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	timer, timerOK := units[timerName]
 	retention, retentionOK := units[retentionName]
 	exact := func(values map[string]string, key, want string) bool { return values[key] == want }
-	if !serviceOK || !relayOK || !socketOK || !exact(service, "LoadState", "loaded") || !exact(relay, "LoadState", "loaded") || !exact(socket, "LoadState", "loaded") || !exact(timer, "LoadState", "loaded") || !exact(retention, "LoadState", "loaded") || !exact(service, "UnitFileState", "enabled") || !exact(relay, "UnitFileState", "enabled") || !exact(socket, "UnitFileState", "enabled") || !exact(timer, "UnitFileState", "enabled") || !exact(service, "ActiveState", "active") || !exact(service, "User", fmt.Sprint(candidate.UID)) || !exact(service, "Group", fmt.Sprint(candidate.GID)) || !exact(service, "SupplementaryGroups", "") || !exact(service, "PrivateNetwork", "yes") || !exact(service, "RestrictAddressFamilies", "AF_INET") || !exact(service, "CapabilityBoundingSet", "") || !exact(service, "AmbientCapabilities", "") || !exact(service, "FragmentPath", candidate.Paths.ServiceUnit) || !exact(service, "DropInPaths", "") || !exact(relay, "ActiveState", "active") || !exact(relay, "User", fmt.Sprint(candidate.RelayUID)) || !exact(relay, "Group", fmt.Sprint(candidate.RelayGID)) || !exact(relay, "PrivateNetwork", "yes") || !exact(relay, "JoinsNamespaceOf", serviceName) || !exact(relay, "RestrictAddressFamilies", "AF_INET") || !exact(relay, "FragmentPath", candidate.Paths.RelayUnit) || !exact(relay, "DropInPaths", "") || !exact(socket, "ActiveState", "active") || !exact(socket, "User", "root") || !exact(socket, "Group", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketUser", "root") || !exact(socket, "SocketGroup", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketMode", "0660") || !exact(socket, "RuntimeDirectory", "lanpanel-goaccess") || !exact(socket, "RuntimeDirectoryMode", "0750") || !exact(socket, "RuntimeDirectoryPreserve", "yes") || !exact(socket, "FragmentPath", candidate.Paths.SocketUnit) || !exact(socket, "DropInPaths", "") || !timerOK || !exact(timer, "ActiveState", "active") || !exact(timer, "FragmentPath", candidate.Paths.RetentionTimer) || !exact(timer, "DropInPaths", "") || !retentionOK || !validRetentionRuntime(retention) || !exact(retention, "User", fmt.Sprint(candidate.UID)) || !exact(retention, "Group", fmt.Sprint(candidate.GID)) || !exact(retention, "PrivateNetwork", "yes") || !exact(retention, "CapabilityBoundingSet", "") || !exact(retention, "AmbientCapabilities", "") || !exact(retention, "FragmentPath", candidate.Paths.RetentionUnit) || !exact(retention, "DropInPaths", "") {
+	if !serviceOK || !relayOK || !socketOK || !exact(service, "LoadState", "loaded") || !exact(relay, "LoadState", "loaded") || !exact(socket, "LoadState", "loaded") || !exact(timer, "LoadState", "loaded") || !exact(retention, "LoadState", "loaded") || !exact(service, "UnitFileState", "enabled") || !exact(relay, "UnitFileState", "enabled") || !exact(socket, "UnitFileState", "enabled") || !exact(timer, "UnitFileState", "enabled") || !exact(service, "ActiveState", "active") || !exact(service, "User", fmt.Sprint(candidate.UID)) || !exact(service, "Group", fmt.Sprint(candidate.GID)) || !exact(service, "SupplementaryGroups", "") || !exact(service, "PrivateNetwork", "yes") || !exact(service, "RestrictAddressFamilies", "AF_INET") || !exact(service, "CapabilityBoundingSet", "") || !exact(service, "AmbientCapabilities", "") || !exact(service, "FragmentPath", candidate.Paths.ServiceUnit) || !exact(service, "DropInPaths", "") || !exact(relay, "ActiveState", "active") || !exact(relay, "User", fmt.Sprint(candidate.RelayUID)) || !exact(relay, "Group", fmt.Sprint(candidate.RelayGID)) || !exact(relay, "PrivateNetwork", "yes") || !exact(relay, "JoinsNamespaceOf", serviceName) || !exact(relay, "RestrictAddressFamilies", "AF_INET") || !exact(relay, "FragmentPath", candidate.Paths.RelayUnit) || !exact(relay, "DropInPaths", "") || !exact(socket, "ActiveState", "active") || !exact(socket, "User", "root") || !exact(socket, "Group", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketUser", "root") || !exact(socket, "SocketGroup", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketMode", "0660") || !exact(socket, "RuntimeDirectory", "lanpanel-goaccess") || !exact(socket, "RuntimeDirectoryMode", "0750") || !exact(socket, "RuntimeDirectoryPreserve", "yes") || !exact(socket, "FragmentPath", candidate.Paths.SocketUnit) || !exact(socket, "DropInPaths", "") || !timerOK || !exact(timer, "ActiveState", "active") || !exact(timer, "FragmentPath", candidate.Paths.RetentionTimer) || !exact(timer, "DropInPaths", "") || !retentionOK || !validRetentionRuntime(retention) || !exact(retention, "User", "root") || !exact(retention, "Group", "root") || !exact(retention, "PrivateNetwork", "yes") || !exact(retention, "CapabilityBoundingSet", "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE") || !exact(retention, "AmbientCapabilities", "") || !exact(retention, "FragmentPath", candidate.Paths.RetentionUnit) || !exact(retention, "DropInPaths", "") {
 		return fmt.Errorf("GoAccess effective isolation differs")
 	}
 	require := func(values map[string]string, expected map[string]string) bool {
@@ -459,11 +463,12 @@ func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	relayExpected["UMask"] = "0077"
 	relayExpected["ProtectProc"] = "invisible"
 	relayExpected["ProcSubset"] = "pid"
-	retentionExpected["ReadWritePaths"] = filepath.Dir(candidate.Paths.AccessLog) + " " + candidate.Paths.RetentionLock
+	retentionExpected["ReadWritePaths"] = filepath.Dir(candidate.Paths.AccessLog) + " " + candidate.Paths.RetentionLock + " /var/log/lanpanel/goaccess /var/log/lanpanel/nginx-rejections.log"
+	retentionExpected["CapabilityBoundingSet"] = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE"
 	retentionExpected["UMask"] = "0077"
 	retentionExpected["RestrictAddressFamilies"] = "AF_UNIX"
-	retentionExpected["TimeoutStartUSec"] = "30s"
-	if !require(service, serviceExpected) || !require(relay, relayExpected) || !require(retention, retentionExpected) || socket["Listen"] != candidate.Paths.Endpoint+" (Stream)" || socket["Service"] != relayName || timer["Unit"] != retentionName || relay["Sockets"] != socketName || !strings.Contains(service["ExecStart"], "/usr/bin/goaccess --no-global-config") || !strings.Contains(service["ExecStart"], candidate.Paths.Database) || !strings.Contains(service["ExecStart"], candidate.Paths.Report) || !strings.Contains(relay["ExecStart"], "/usr/lib/lanpanel/lanpanel goaccess-relay") || !strings.Contains(relay["Environment"], "LANPANEL_INSTALLATION_ID="+candidate.InstallationID) || !strings.Contains(relay["Environment"], "LANPANEL_RESOURCE_ID="+candidate.ResourceID) || !strings.Contains(relay["Environment"], fmt.Sprintf("LANPANEL_GOACCESS_GENERATION=%d", candidate.Generation)) || !strings.Contains(retention["ExecStart"], "/usr/lib/lanpanel/lanpanel goaccess-retention") || !strings.Contains(retention["Environment"], "LANPANEL_INSTALLATION_ID="+candidate.InstallationID) || !strings.Contains(retention["Environment"], "LANPANEL_RESOURCE_ID="+candidate.ResourceID) {
+	retentionExpected["TimeoutStartUSec"] = "1min 15s"
+	if !require(service, serviceExpected) || !require(relay, relayExpected) || !require(retention, retentionExpected) || socket["Listen"] != candidate.Paths.Endpoint+" (Stream)" || socket["Service"] != relayName || timer["Unit"] != retentionName || relay["Sockets"] != socketName || !strings.Contains(service["ExecStart"], "/usr/bin/goaccess --no-global-config") || !strings.Contains(service["ExecStart"], candidate.Paths.Database) || !strings.Contains(service["ExecStart"], candidate.Paths.Report) || !strings.Contains(relay["ExecStart"], "/usr/lib/lanpanel/lanpanel goaccess-relay") || !strings.Contains(relay["Environment"], "LANPANEL_INSTALLATION_ID="+candidate.InstallationID) || !strings.Contains(relay["Environment"], "LANPANEL_RESOURCE_ID="+candidate.ResourceID) || !strings.Contains(relay["Environment"], fmt.Sprintf("LANPANEL_GOACCESS_GENERATION=%d", candidate.Generation)) || !strings.Contains(retention["ExecStart"], "/usr/lib/lanpanel/lanpanel goaccess-retention") || strings.Contains(retention["ExecStartEx"], "flags=privileged") || !strings.Contains(retention["Environment"], "LANPANEL_INSTALLATION_ID="+candidate.InstallationID) || !strings.Contains(retention["Environment"], "LANPANEL_RESOURCE_ID="+candidate.ResourceID) || !strings.Contains(retention["Environment"], fmt.Sprintf("LANPANEL_GOACCESS_GENERATION=%d", candidate.Generation)) {
 		return fmt.Errorf("GoAccess effective hardening differs")
 	}
 	paths, err := DerivePaths(candidate.ResourceID, candidate.Generation)
@@ -830,6 +835,9 @@ func (host Host) CleanupRetained(ctx context.Context, installationID, resourceID
 			return err
 		}
 	}
+	if err := verifySettledRetentionLogs(ctx, installationID, resourceID); err != nil {
+		return err
+	}
 	return host.cleanupRetainedShared(ctx, installationID, resourceID)
 }
 
@@ -837,10 +845,16 @@ func (host Host) CleanupUncommittedShared(ctx context.Context, installationID, r
 	if err := verifyRetainedInventory(ctx, installationID, resourceID, nil); err != nil {
 		return err
 	}
+	if err := verifySettledRetentionLogs(ctx, installationID, resourceID); err != nil {
+		return err
+	}
 	return host.cleanupRetainedShared(ctx, installationID, resourceID)
 }
 
 func (host Host) cleanupRetainedShared(ctx context.Context, installationID, resourceID string) error {
+	if err := verifySettledRetentionLogs(ctx, installationID, resourceID); err != nil {
+		return err
+	}
 	paths, err := DerivePaths(resourceID, 1)
 	if err != nil {
 		return err
@@ -849,7 +863,7 @@ func (host Host) cleanupRetainedShared(ctx context.Context, installationID, reso
 	if err = removeOwnedTree(ctx, paths.ResourceRoot, 0, 0, 0o711); err != nil {
 		return err
 	}
-	if err = removeOwnedTree(ctx, filepath.Dir(paths.AccessLog), uid, gid, 0o750); err != nil {
+	if err = removeOwnedTree(ctx, filepath.Dir(paths.AccessLog), uid, gid, resourceLogDirectoryMode); err != nil {
 		return err
 	}
 	authority, err := deriveAccountAuthority(installationID, resourceID)
@@ -1276,16 +1290,25 @@ func verifyRetainedInventory(ctx context.Context, installationID, resourceID str
 	logInfo, logErr := os.Lstat(logRoot)
 	if logErr == nil {
 		stat, ok := logInfo.Sys().(*syscall.Stat_t)
-		if !ok || !logInfo.IsDir() || logInfo.Mode()&os.ModeSymlink != 0 || stat.Uid != uid || stat.Gid != gid || logInfo.Mode().Perm() != 0o750 {
+		if !ok || !logInfo.IsDir() || logInfo.Mode()&os.ModeSymlink != 0 || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != resourceLogDirectoryMode {
 			return fmt.Errorf("GoAccess log cleanup root unsafe")
 		}
 	} else if !errors.Is(logErr, os.ErrNotExist) {
 		return logErr
 	}
-	allowedLogs := map[string]bool{"access.log": true, "access.log.1": true, "access.log.1.lanpanel": true, ".retention.lock": true}
+	allowedLogs := map[string]bool{"access.log": true, "access.log.1": true, "access.log.1.lanpanel": true, "access.log.retention-old": true, "access.log.retention-new": true, "access.log.retention-state": true, "access.log.retention-state.lanpanel": true, ".retention.lock": true}
 	if err := check(logRoot, func(string) bool { return true }, allowedLogs, false); err != nil {
 		return err
 	}
+	worker, workerErr := user.Lookup("www-data")
+	if workerErr != nil {
+		return workerErr
+	}
+	nginxUIDValue, parseWorkerErr := strconv.ParseUint(worker.Uid, 10, 32)
+	if parseWorkerErr != nil || nginxUIDValue == 0 {
+		return fmt.Errorf("fixed Nginx worker identity invalid during GoAccess cleanup")
+	}
+	nginxUID := uint32(nginxUIDValue)
 	for name := range allowedLogs {
 		info, observeErr := os.Lstat(filepath.Join(logRoot, name))
 		if errors.Is(observeErr, os.ErrNotExist) {
@@ -1295,10 +1318,82 @@ func verifyRetainedInventory(ctx context.Context, installationID, resourceID str
 			return observeErr
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		mode := info.Mode().Perm()
-		modeOK := mode == 0o640 || name == ".retention.lock" && mode == 0o600 || name == "access.log.1.lanpanel" && mode == 0o600
-		if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || stat.Uid != uid || stat.Gid != gid || !modeOK {
+		modeOK := false
+		if ok {
+			mode := stat.Mode & 0o7777
+			switch name {
+			case "access.log", "access.log.1", "access.log.retention-old":
+				modeOK = mode == 0o640
+			case "access.log.1.lanpanel", "access.log.retention-new":
+				modeOK = mode == 0o600 || mode == 0o640
+			case "access.log.retention-state", "access.log.retention-state.lanpanel", ".retention.lock":
+				modeOK = mode == 0o600
+			}
+		}
+		ownerOK := ok && stat.Uid == uid && stat.Gid == gid
+		if ok && (name == "access.log" || name == "access.log.retention-old" || name == "access.log.retention-new") && stat.Uid == nginxUID && stat.Gid == gid {
+			ownerOK = true
+		}
+		rootStaging := name == "access.log.1.lanpanel" || name == "access.log.retention-new" || name == "access.log.retention-state.lanpanel"
+		if ok && rootStaging && stat.Uid == 0 && stat.Gid == 0 && stat.Mode&0o7777 == 0o600 && stat.Size == 0 {
+			ownerOK = true
+		}
+		if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || !ownerOK || !modeOK {
 			return fmt.Errorf("GoAccess retained log cleanup identity unsafe")
+		}
+		if name == ".retention.lock" && stat.Size != 0 || name == "access.log.retention-new" && stat.Size != 0 || (name == "access.log.1" || name == "access.log.1.lanpanel") && (stat.Size < 0 || stat.Size > maximumAccessLogBytes) || (name == "access.log.retention-state" || name == "access.log.retention-state.lanpanel") && (stat.Size < 0 || stat.Size > maximumRetentionState) {
+			return fmt.Errorf("GoAccess retained log cleanup size unsafe")
+		}
+	}
+	return nil
+}
+
+func verifySettledRetentionLogs(ctx context.Context, installationID, resourceID string) error {
+	paths, err := DerivePaths(resourceID, 1)
+	if err != nil || !validInstallationID(installationID) {
+		return errors.Join(err, fmt.Errorf("settled GoAccess retention identity invalid"))
+	}
+	uid, gid, _, _ := numeric(installationID, resourceID)
+	return verifySettledRetentionLogRoot(ctx, filepath.Dir(paths.AccessLog), uid, gid)
+}
+
+func verifySettledRetentionLogRoot(ctx context.Context, root string, uid, gid uint32) error {
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != resourceLogDirectoryMode {
+		return fmt.Errorf("settled GoAccess retention directory unsafe")
+	}
+	count := 0
+	entries, err := boundedDirectoryEntries(ctx, root, &count)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		mode := uint32(0)
+		maximum := int64(-1)
+		switch entry.Name() {
+		case "access.log":
+			mode = 0o640
+		case "access.log.1":
+			mode, maximum = 0o640, maximumAccessLogBytes
+		case ".retention.lock":
+			mode, maximum = 0o600, 0
+		default:
+			return fmt.Errorf("settled GoAccess retention contains unknown artifact %q", entry.Name())
+		}
+		entryInfo, observeErr := os.Lstat(filepath.Join(root, entry.Name()))
+		if observeErr != nil {
+			return observeErr
+		}
+		entryStat, entryOK := entryInfo.Sys().(*syscall.Stat_t)
+		if !entryOK || !entryInfo.Mode().IsRegular() || entryInfo.Mode()&os.ModeSymlink != 0 || entryStat.Nlink != 1 || entryStat.Uid != uid || entryStat.Gid != gid || entryStat.Mode&0o7777 != mode || entryStat.Size < 0 || maximum >= 0 && entryStat.Size > maximum {
+			return fmt.Errorf("settled GoAccess retention artifact unsafe")
 		}
 	}
 	return nil
@@ -1621,7 +1716,7 @@ func verifyRuntimePaths(ctx context.Context, candidate Candidate) error {
 		path           string
 		kind           uint32
 		uid, gid, mode uint32
-	}{{filepath.Dir(candidate.Paths.Endpoint), unix.S_IFDIR, 0, candidate.NginxGID, 0o750}, {candidate.Paths.StateRoot, unix.S_IFDIR, 0, 0, 0o711}, {candidate.Paths.Database, unix.S_IFDIR, candidate.UID, candidate.GID, 0o750}, {filepath.Dir(candidate.Paths.Report), unix.S_IFDIR, candidate.UID, candidate.NginxGID, 0o2750}, {candidate.Paths.Report, unix.S_IFREG, candidate.UID, candidate.NginxGID, 0o640}, {candidate.Paths.AccessLog, unix.S_IFREG, candidate.UID, candidate.GID, 0o640}, {candidate.Paths.RetentionLock, unix.S_IFREG, candidate.UID, candidate.GID, 0o600}, {candidate.Paths.Endpoint, unix.S_IFSOCK, 0, candidate.NginxGID, 0o660}}
+	}{{filepath.Dir(candidate.Paths.Endpoint), unix.S_IFDIR, 0, candidate.NginxGID, 0o750}, {"/var/log/lanpanel/goaccess", unix.S_IFDIR, 0, 0, 0o711}, {filepath.Dir(candidate.Paths.AccessLog), unix.S_IFDIR, candidate.UID, candidate.GID, resourceLogDirectoryMode}, {globalRetentionLockPath, unix.S_IFREG, 0, 0, 0o600}, {candidate.Paths.StateRoot, unix.S_IFDIR, 0, 0, 0o711}, {candidate.Paths.Database, unix.S_IFDIR, candidate.UID, candidate.GID, 0o750}, {filepath.Dir(candidate.Paths.Report), unix.S_IFDIR, candidate.UID, candidate.NginxGID, 0o2750}, {candidate.Paths.Report, unix.S_IFREG, candidate.UID, candidate.NginxGID, 0o640}, {candidate.Paths.AccessLog, unix.S_IFREG, candidate.UID, candidate.GID, 0o640}, {candidate.Paths.RetentionLock, unix.S_IFREG, candidate.UID, candidate.GID, 0o600}, {candidate.Paths.Endpoint, unix.S_IFSOCK, 0, candidate.NginxGID, 0o660}}
 	for {
 		missing := false
 		for _, check := range checks {
@@ -1632,7 +1727,8 @@ func verifyRuntimePaths(ctx context.Context, candidate Candidate) error {
 			} else if err != nil {
 				return fmt.Errorf("GoAccess runtime path unavailable: %w", err)
 			}
-			if stat.Mode&unix.S_IFMT != check.kind || stat.Nlink != 1 && check.kind == unix.S_IFREG || stat.Uid != check.uid || stat.Gid != check.gid || stat.Mode&0o7777 != check.mode {
+			fixedEmpty := check.path == globalRetentionLockPath || check.path == candidate.Paths.RetentionLock
+			if stat.Mode&unix.S_IFMT != check.kind || stat.Nlink != 1 && check.kind == unix.S_IFREG || stat.Uid != check.uid || stat.Gid != check.gid || stat.Mode&0o7777 != check.mode || fixedEmpty && stat.Size != 0 {
 				return fmt.Errorf("GoAccess runtime path identity differs: %s", check.path)
 			}
 		}
@@ -1774,6 +1870,22 @@ func ensureDirectory(path string, uid, gid, mode uint32) error {
 	return unix.Fsync(fd)
 }
 
+func ensureEmptyFile(path string, uid, gid, mode uint32) error {
+	if err := ensureFile(path, uid, gid, mode); err != nil {
+		return err
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if err = unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != mode || stat.Size != 0 {
+		return errors.Join(err, fmt.Errorf("GoAccess fixed empty file identity differs"))
+	}
+	return nil
+}
+
 func ensureFile(path string, uid, gid, mode uint32) error {
 	if err := verifyParentChain(path, uid, gid, true); err != nil {
 		return err
@@ -1811,7 +1923,16 @@ func ensureFile(path string, uid, gid, mode uint32) error {
 	} else if stat.Uid != uid || stat.Gid != gid || stat.Mode&0o7777 != mode {
 		return fmt.Errorf("GoAccess file identity differs")
 	}
-	return unix.Fsync(fd)
+	if err = unix.Fsync(fd); err != nil || !created {
+		return err
+	}
+	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	syncErr := unix.Fsync(parent)
+	closeErr := unix.Close(parent)
+	return errors.Join(syncErr, closeErr)
 }
 
 func replaceFile(path string, data []byte, uid, gid, mode uint32) error {

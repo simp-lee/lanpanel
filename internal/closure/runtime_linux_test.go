@@ -4,8 +4,12 @@ package closure
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type sequenceObserver struct {
@@ -31,6 +35,77 @@ func TestPriorWorkerDrainBindsPIDStartAndCgroup(t *testing.T) {
 	result, err := WaitPriorWorkers(context.Background(), observer, []ProcessIdentity{prior}, time.Second)
 	if err != nil || len(result.Workers) != 1 || result.Workers[0].StartTicks != 101 {
 		t.Fatalf("drain=%#v,%v", result, err)
+	}
+}
+
+func TestWaitFileReopenRequiresOldWritableDescriptorToClose(t *testing.T) {
+	directory := t.TempDir()
+	oldPath, activePath := filepath.Join(directory, "old.log"), filepath.Join(directory, "active.log")
+	oldFile, err := os.OpenFile(oldPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeFile, err := os.OpenFile(activePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = activeFile.Close() }()
+	var oldStat, activeStat unix.Stat_t
+	if err := unix.Fstat(int(oldFile.Fd()), &oldStat); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Fstat(int(activeFile.Fd()), &activeStat); err != nil {
+		t.Fatal(err)
+	}
+	process, err := observeProcess("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &sequenceObserver{snapshots: []RuntimeSnapshot{{ObservedAt: time.Now(), Complete: true, Master: &process, Workers: []ProcessIdentity{}, Listeners: []ListenerIdentity{}, Generation: "test"}}}
+	retries := 0
+	retry := func(context.Context) error {
+		retries++
+		return oldFile.Close()
+	}
+	if err := WaitFileReopen(context.Background(), observer, "/proc", activePath, process, FileIdentity{Device: uint64(oldStat.Dev), Inode: oldStat.Ino}, FileIdentity{Device: uint64(activeStat.Dev), Inode: activeStat.Ino}, time.Second, retry); err != nil {
+		t.Fatal(err)
+	}
+	if retries != 1 {
+		t.Fatalf("reopen retry calls=%d", retries)
+	}
+}
+
+func TestWaitFileReopenRequiresMasterToHoldReplacement(t *testing.T) {
+	directory := t.TempDir()
+	oldPath, activePath := filepath.Join(directory, "old.log"), filepath.Join(directory, "active.log")
+	oldFile, err := os.OpenFile(oldPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeFile, err := os.OpenFile(activePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldStat, activeStat unix.Stat_t
+	if err = unix.Fstat(int(oldFile.Fd()), &oldStat); err == nil {
+		err = unix.Fstat(int(activeFile.Fd()), &activeStat)
+	}
+	if closeErr := oldFile.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := activeFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := observeProcess("/proc", os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := &sequenceObserver{snapshots: []RuntimeSnapshot{{ObservedAt: time.Now(), Complete: true, Master: &process, Workers: []ProcessIdentity{}, Listeners: []ListenerIdentity{}, Generation: "test"}}}
+	if err = WaitFileReopen(context.Background(), observer, "/proc", activePath, process, FileIdentity{Device: uint64(oldStat.Dev), Inode: oldStat.Ino}, FileIdentity{Device: uint64(activeStat.Dev), Inode: activeStat.Ino}, 30*time.Millisecond, nil); err == nil {
+		t.Fatal("reopen completed without an active master write descriptor")
 	}
 }
 
