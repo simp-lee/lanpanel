@@ -28,8 +28,8 @@ func SnapshotActivation(paths Paths, owner filetxn.Owner, entry Entry) (Activati
 	}
 	snapshot := ActivationSnapshot{Manifest: manifest, ManifestBytes: manifestBytes}
 	for _, current := range manifest.Entries {
-		if current.ResourceID == entry.ResourceID || current.Relative == entry.Relative {
-			if current.ResourceID != entry.ResourceID || current.Relative != entry.Relative {
+		if current.Relative == entry.Relative || current.ResourceID == entry.ResourceID && current.Kind == entry.Kind {
+			if current.ResourceID != entry.ResourceID || current.Relative != entry.Relative || current.Kind != entry.Kind {
 				return ActivationSnapshot{}, fmt.Errorf("activation prior identity conflicts")
 			}
 			data, err := os.ReadFile(filepath.Join(paths.ConfigRoot, filepath.FromSlash(current.Relative)))
@@ -54,7 +54,15 @@ func RestoreActivation(ctx context.Context, paths Paths, owner filetxn.Owner, ca
 	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(candidate.Relative))
 	modified := []string{}
 	if snapshot.EntryPresent {
-		result, putErr := txn.Put(ctx, filetxn.Request{Path: entryPath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize}, snapshot.EntryBytes, filetxn.ReplaceOnly)
+		var existing *filetxn.Metadata
+		mode := filetxn.CreateOnly
+		if _, statErr := os.Lstat(entryPath); statErr == nil {
+			existing = &metadata
+			mode = filetxn.ReplaceOnly
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return modified, fmt.Errorf("inspect prior Nginx entry restoration target: %w", statErr)
+		}
+		result, putErr := txn.Put(ctx, filetxn.Request{Path: entryPath, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: existing, New: metadata, MaxBytes: MaximumGraphFileSize}, snapshot.EntryBytes, mode)
 		if putErr != nil || result.State != filetxn.StateDurable {
 			return modified, fmt.Errorf("restore prior Nginx entry: %w", putErr)
 		}

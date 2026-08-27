@@ -11,6 +11,46 @@ import (
 	"testing"
 )
 
+func TestChallengeSnapshotCoexistsWithPublishedResourceEntry(t *testing.T) {
+	paths, prior := installTestGraph(t)
+	owner := testOwner()
+	entry := Entry{Kind: EntryChallenge, ResourceID: "app-one", Relative: ChallengesDirectory + "/app-one.conf", Digest: "sha256:" + repeatHex('0'), Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: 2, Challenge: &ChallengeSite{Hosts: []string{"app.example.test"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_app_one"}}
+	digestValue, err := DigestEntry(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.Digest = digestValue
+	snapshot, err := SnapshotActivation(paths, owner, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.EntryPresent {
+		t.Fatal("published App entry was mistaken for its separate challenge entry")
+	}
+	prospective, err := ProspectiveManifest(prior, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installed, _, err := InstallEntry(context.Background(), paths, owner, entry)
+	if err != nil || !reflect.DeepEqual(installed, prospective) || len(installed.Entries) != len(prior.Entries)+1 {
+		t.Fatalf("coexisting challenge install=%#v err=%v", installed, err)
+	}
+	removalSnapshot, err := SnapshotActivation(paths, owner, entry)
+	if err != nil || !removalSnapshot.EntryPresent {
+		t.Fatalf("installed challenge snapshot=%#v err=%v", removalSnapshot, err)
+	}
+	if _, _, err := RemoveEntry(context.Background(), paths, owner, entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreActivation(context.Background(), paths, owner, entry, removalSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Audit(paths, owner)
+	if err != nil || !reflect.DeepEqual(restored, installed) {
+		t.Fatalf("coexisting challenge removal rollback=%#v err=%v", restored, err)
+	}
+}
+
 func TestActivationSnapshotRestoresExactPriorGraph(t *testing.T) {
 	paths, prior := installTestGraph(t)
 	owner := testOwner()

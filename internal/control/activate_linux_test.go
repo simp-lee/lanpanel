@@ -12,6 +12,22 @@ import (
 	"testing"
 )
 
+func TestChallengeControlEntryComparisonUsesCanonicalEncoding(t *testing.T) {
+	rendered := testRendered(t)
+	certificate := testCertificateIdentity(IssueRequest{JobID: "job_control", PlanID: "plan_control", IntentGeneration: 1, CertificateID: rendered.Candidate.CertificateID, BindingDigest: rendered.Candidate.CertificateBinding, Domain: rendered.Candidate.ControlDomain})
+	bundle, err := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audited := bundle.Entry
+	domainCopy := *audited.Domain
+	domainCopy.Static = nil
+	audited.Domain = &domainCopy
+	if !sameNginxEntry(audited, bundle.Entry) {
+		t.Fatal("canonical audited control entry differs only by an omitted empty route set")
+	}
+}
+
 func TestActivationAuthorityFailurePrecedesPhysicalWork(t *testing.T) {
 	rendered := testRendered(t)
 	certificate := testCertificateIdentity(IssueRequest{JobID: "job_control", PlanID: "plan_control", IntentGeneration: 1, CertificateID: rendered.Candidate.CertificateID, BindingDigest: rendered.Candidate.CertificateBinding, Domain: rendered.Candidate.ControlDomain})

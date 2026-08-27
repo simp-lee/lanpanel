@@ -418,6 +418,11 @@ func ProspectiveManifest(manifest Manifest, entry Entry) (Manifest, error) {
 	return prospective, err
 }
 
+func ProspectiveRemoval(manifest Manifest, expected Entry) (Manifest, error) {
+	prospective, _, err := prospectiveManifestRemoval(manifest, expected)
+	return prospective, err
+}
+
 func prospectiveManifestEntry(manifest Manifest, entry Entry) (Manifest, bool, []byte, error) {
 	if err := ValidateManifest(manifest); err != nil {
 		return Manifest{}, false, nil, err
@@ -485,21 +490,40 @@ func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry E
 	return audited, []string{entryPath, paths.ManifestPath()}, err
 }
 
-func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected Entry) (Manifest, []string, error) {
-	manifest, err := Audit(paths, owner)
-	if err != nil {
-		return Manifest{}, nil, err
+func prospectiveManifestRemoval(manifest Manifest, expected Entry) (Manifest, bool, error) {
+	if err := ValidateManifest(manifest); err != nil {
+		return Manifest{}, false, err
 	}
+	manifest.Entries = append([]Entry(nil), manifest.Entries...)
 	index := -1
 	for currentIndex, current := range manifest.Entries {
-		if current.Relative == expected.Relative {
-			if current.ResourceID != expected.ResourceID || current.Kind != expected.Kind || current.Generation != expected.Generation || current.Digest != expected.Digest {
-				return Manifest{}, nil, fmt.Errorf("nginx exact entry identity changed")
+		if current.Relative == expected.Relative || current.ResourceID == expected.ResourceID && current.Kind == expected.Kind {
+			if current.Relative != expected.Relative || current.ResourceID != expected.ResourceID || current.Kind != expected.Kind || current.Generation != expected.Generation || current.Digest != expected.Digest {
+				return Manifest{}, false, fmt.Errorf("nginx exact entry identity changed")
 			}
 			index = currentIndex
 		}
 	}
 	if index < 0 {
+		return manifest, false, nil
+	}
+	manifest.Entries = append(manifest.Entries[:index], manifest.Entries[index+1:]...)
+	if err := ValidateManifest(manifest); err != nil {
+		return Manifest{}, false, err
+	}
+	return manifest, true, nil
+}
+
+func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected Entry) (Manifest, []string, error) {
+	manifest, err := Audit(paths, owner)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	manifest, present, err := prospectiveManifestRemoval(manifest, expected)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	if !present {
 		return manifest, []string{}, nil
 	}
 	txn, err := filetxn.Open(filetxn.Config{RootPath: paths.ConfigRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingPath: paths.StagingPath(), Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}}, filetxn.Options{})
@@ -513,7 +537,6 @@ func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected
 	if err != nil || result.State != filetxn.StateDurable {
 		return Manifest{}, nil, fmt.Errorf("remove exact Nginx entry: %w", err)
 	}
-	manifest.Entries = append(manifest.Entries[:index], manifest.Entries[index+1:]...)
 	data, err := EncodeManifest(manifest)
 	if err != nil {
 		return Manifest{}, []string{entryPath}, err

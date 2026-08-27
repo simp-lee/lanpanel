@@ -276,7 +276,7 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	if err != nil || state.Headscale.GenerationSequence+1 != execution.Authority.Rendered.Candidate.Generation || state.Headscale.ChallengePending != nil || state.Headscale.Reactivating != nil {
 		return control.IssueRequest{}, fmt.Errorf("headscale challenge safety generation changed")
 	}
-	prepared, err := challenge.Prepare(challenge.Request{ResourceID: execution.Installation.Headscale.ID, PlanID: execution.Plan.ID, Generation: execution.Authority.Rendered.Candidate.Generation, ConfigDigest: execution.Authority.Rendered.Candidate.ConfigDigest, Domains: []string{execution.Installation.Headscale.ControlDomain}, Binding: execution.Authority.Binding, CertificateIdentity: execution.Authority.Rendered.Candidate.CertificateID, Webroot: "/var/lib/lanpanel/certificates/webroot/" + execution.Authority.Rendered.Candidate.CertificateID, BaseMarkers: headscaleBaseSnapshot(state.Headscale)})
+	prepared, err := challenge.Prepare(challenge.Request{ResourceID: "headscale", PlanID: execution.Plan.ID, Generation: execution.Authority.Rendered.Candidate.Generation, ConfigDigest: execution.Authority.Rendered.Candidate.ConfigDigest, Domains: []string{execution.Installation.Headscale.ControlDomain}, Binding: execution.Authority.Binding, CertificateIdentity: execution.Authority.Rendered.Candidate.CertificateID, Webroot: "/var/lib/lanpanel/certificates/webroot/" + execution.Authority.Rendered.Candidate.CertificateID, BaseMarkers: headscaleBaseSnapshot(state.Headscale)})
 	if err != nil {
 		return control.IssueRequest{}, err
 	}
@@ -338,11 +338,16 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 		return control.IssueRequest{}, err
 	}
 	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
+		ownershipAuthority, ownershipErr := fixedOwnershipAuthority(execution.Service.ownership)
+		if ownershipErr != nil {
+			return control.IssueRequest{}, ownershipErr
+		}
 		host, err := activation.NewFixedHost()
 		if err != nil {
 			return control.IssueRequest{}, err
 		}
-		if _, err := host.ActivateChallenge(ctx, prepared); err != nil {
+		authority := activation.ChallengeReloadAuthority{Safety: next, Installation: execution.Installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}
+		if _, err := host.ActivateChallenge(ctx, prepared, authority); err != nil {
 			return control.IssueRequest{}, err
 		}
 	}
@@ -1085,7 +1090,7 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 	}
 	var closureErr error
 	if pending.Method == "http-01" {
-		prepared, prepareErr := challenge.PreparedHTTP(journal.Candidate.HeadscaleID, pending)
+		prepared, prepareErr := challenge.PreparedHTTP("headscale", pending)
 		if prepareErr == nil {
 			var nginxHost activation.Host
 			nginxHost, prepareErr = activation.NewFixedHost()

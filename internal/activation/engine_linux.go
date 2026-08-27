@@ -202,6 +202,10 @@ func currentWorkers(snapshot closure.RuntimeSnapshot) []closure.ProcessIdentity 
 	return append([]closure.ProcessIdentity(nil), snapshot.Workers...)
 }
 
+func canonicalRuntimeListener(value string) string {
+	return strings.Replace(value, "tcp:[::]:", "tcp::::", 1)
+}
+
 func verifyPriorSnapshot(snapshot closure.RuntimeSnapshot, manifest nginx.Manifest) error {
 	if snapshot.Master == nil || snapshot.Generation != manifest.GenerationID {
 		return fmt.Errorf("prior Nginx runtime generation not restored")
@@ -209,11 +213,11 @@ func verifyPriorSnapshot(snapshot closure.RuntimeSnapshot, manifest nginx.Manife
 	expected := map[string]bool{"tcp:0.0.0.0:80": true, "tcp:0.0.0.0:443": true, "tcp::::80": true, "tcp::::443": true}
 	for _, entry := range manifest.Entries {
 		for _, listener := range entry.Listeners {
-			expected[listener] = true
+			expected[canonicalRuntimeListener(listener)] = true
 		}
 	}
 	for _, listener := range snapshot.Listeners {
-		delete(expected, fmt.Sprintf("%s:%s:%d", listener.Protocol, listener.Address, listener.Port))
+		delete(expected, canonicalRuntimeListener(fmt.Sprintf("%s:%s:%d", listener.Protocol, listener.Address, listener.Port)))
 	}
 	if len(expected) != 0 {
 		return fmt.Errorf("prior Nginx listeners not restored")
@@ -242,7 +246,9 @@ func (host Host) WaitForPriorWorkers(ctx context.Context, manifest nginx.Manifes
 func (host Host) observer(manifest nginx.Manifest) closure.ProcObserver {
 	listeners := []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp::::80", "tcp::::443"}
 	for _, entry := range manifest.Entries {
-		listeners = append(listeners, entry.Listeners...)
+		for _, listener := range entry.Listeners {
+			listeners = append(listeners, canonicalRuntimeListener(listener))
+		}
 	}
 	slices.Sort(listeners)
 	listeners = slices.Compact(listeners)

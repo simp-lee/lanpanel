@@ -1968,19 +1968,43 @@ func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Co
 	return errors.Join(cause, stopErr, updateErr)
 }
 
+func (execution *CertificateExecution) challengeReloadAuthority() (activation.ChallengeReloadAuthority, error) {
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil {
+		return activation.ChallengeReloadAuthority{}, err
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil {
+		return activation.ChallengeReloadAuthority{}, err
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge installation authority missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return activation.ChallengeReloadAuthority{}, err
+	}
+	ownershipAuthority, err := fixedOwnershipAuthority(execution.Service.ownership)
+	if err != nil {
+		return activation.ChallengeReloadAuthority{}, err
+	}
+	return activation.ChallengeReloadAuthority{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
+}
+
 func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) error {
 	host, err := activation.NewFixedHost()
 	if err != nil {
 		return err
 	}
 	if execution.Binding.Method == acme.ChallengeHTTP01 {
+		authority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr != nil {
+			return authorityErr
+		}
 		if execution.Headscale {
-			state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
-			if stateErr != nil {
-				return stateErr
-			}
-			if state.Headscale.CertificateExpiry != nil {
-				if _, err := host.ActivateChallenge(ctx, execution.Challenge); err != nil {
+			if authority.Safety.Headscale.CertificateExpiry != nil {
+				if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
 					return err
 				}
 			} else {
@@ -1992,27 +2016,11 @@ func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) er
 				if hostErr != nil {
 					return hostErr
 				}
-				state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
-				if stateErr != nil {
-					return stateErr
-				}
-				document, readErr := execution.Service.normal.Read()
-				if readErr != nil {
-					return readErr
-				}
-				installation, loadErr := loadHeadscaleInstallation(document)
-				if loadErr != nil {
-					return loadErr
-				}
-				ownershipAuthority, ownershipErr := fixedOwnershipAuthority(execution.Service.ownership)
-				if ownershipErr != nil {
-					return ownershipErr
-				}
-				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, state, installation, ownershipAuthority); err != nil {
+				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, authority.Safety, authority.Installation, authority.Ownership); err != nil {
 					return err
 				}
 			}
-		} else if _, err := host.ActivateChallenge(ctx, execution.Challenge); err != nil {
+		} else if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
 			return err
 		}
 	} else {

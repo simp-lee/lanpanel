@@ -6,10 +6,20 @@ import (
 	"context"
 	"errors"
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/closure"
 	"lanpanel/internal/nginx"
 	"strings"
 	"testing"
 )
+
+func TestPriorRuntimeVerificationCanonicalizesIPv6Listeners(t *testing.T) {
+	master := closure.ProcessIdentity{PID: 10}
+	manifest := nginx.Manifest{GenerationID: "gen_ipv6", Entries: []nginx.Entry{{Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}}}}
+	snapshot := closure.RuntimeSnapshot{Master: &master, Generation: manifest.GenerationID, Listeners: []closure.ListenerIdentity{{Protocol: "tcp", Address: "0.0.0.0", Port: 80}, {Protocol: "tcp", Address: "0.0.0.0", Port: 443}, {Protocol: "tcp", Address: "::", Port: 80}, {Protocol: "tcp", Address: "::", Port: 443}}}
+	if err := verifyPriorSnapshot(snapshot, manifest); err != nil {
+		t.Fatalf("IPv6 runtime listener identity was not canonicalized: %v", err)
+	}
+}
 
 func TestTemporaryRuntimeEntryRequiresExactGenerationAndIdentity(t *testing.T) {
 	candidate := nginx.Entry{Kind: nginx.EntryTemporary, ResourceID: "res_one", Relative: "temporary/res_one.conf", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Listeners: []string{"tcp:0.0.0.0:18080"}, Generation: 2, Temporary: &nginx.TemporarySite{PublicIPv4: "8.8.8.8", Port: 18080, HostAuthority: "8.8.8.8:18080", UpstreamNetwork: "unix", UpstreamAddress: "/run/app.sock", ReadinessPath: "/ready"}}
