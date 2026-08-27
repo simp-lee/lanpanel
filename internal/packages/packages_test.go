@@ -787,9 +787,7 @@ func newFakeExecutor(plan Plan) *fakeExecutor {
 	if plan.Mode == DistroRepository {
 		keyring := []byte("keyring")
 		digest := fmt.Sprintf("%x", sha256.Sum256(keyring))
-		configuration = append(configuration,
-			ObservedConfig{Path: "/etc/apt/keyrings/lanpanel.gpg", Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: keyring},
-		)
+		configuration = append(configuration, ObservedConfig{Path: "/etc/apt/keyrings/lanpanel.gpg", Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: keyring})
 		repositories = append(repositories, ObservedRepository{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: append([]string(nil), plan.Repositories[0].Components...), KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digest, Enabled: true})
 	}
 	policy := NoAutostartPolicy{Path: "/usr/sbin/policy-rc.d", Digest: plan.NoAutostartPolicyDigest, UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, SameLanPanelBinary: true}
@@ -804,10 +802,12 @@ func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
 	audit.Before = cloneRuntimeSnapshot(executor.audit.Before)
 	return audit, nil
 }
+
 func (executor *fakeExecutor) Stage(_ context.Context, _ Plan) error {
 	executor.stageCount++
 	return nil
 }
+
 func (executor *fakeExecutor) Prepare(_ context.Context, _ Plan, config, _ []byte) error {
 	executor.prepareCount++
 	if len(config) == 0 {

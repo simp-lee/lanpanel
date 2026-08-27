@@ -342,6 +342,7 @@ func TestAuditBuildEnvironmentIsFixed(t *testing.T) {
 	t.Setenv("GOFLAGS", "-tags=ambient")
 	t.Setenv("GONOPROXY", "*")
 	t.Setenv("GOPRIVATE", "*")
+	t.Setenv("GOROOT", "/ambient/old-go")
 	if err := Run(root); err != nil {
 		t.Fatalf("ambient Go settings changed package loading: %v", err)
 	}
@@ -358,6 +359,20 @@ func TestAuditBuildEnvironmentIsFixed(t *testing.T) {
 		if !present || value != expected {
 			t.Fatalf("%s=%q (present=%t), want %q", name, value, present, expected)
 		}
+	}
+	selected := map[string]string{}
+	for _, entry := range goToolchainEnvironment() {
+		name, value, _ := strings.Cut(entry, "=")
+		selected[name] = value
+	}
+	if _, present := observed["GOROOT"]; present {
+		t.Fatalf("offline package environment retained GOROOT: %#v", observed)
+	}
+	if selected["GOTOOLCHAIN"] != "auto" || selected["GOPROXY"] != "off" || selected["GOSUMDB"] != "sum.golang.org" {
+		t.Fatalf("toolchain selection environment = %#v", selected)
+	}
+	if _, present := selected["GOROOT"]; present {
+		t.Fatalf("toolchain selection environment retained GOROOT: %#v", selected)
 	}
 }
 

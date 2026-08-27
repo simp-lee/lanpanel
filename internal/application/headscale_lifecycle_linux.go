@@ -167,14 +167,14 @@ func readLockedHeadscaleExpiryAuthority(service *FixedService, headscale *domain
 		return persist.Document{}, control.Journal{}, err
 	}
 	if installation.Headscale == nil || installation.Headscale.ID != headscale.ID || !reflect.DeepEqual(installation.Headscale.Certificate, headscale.Certificate) {
-		return persist.Document{}, control.Journal{}, fmt.Errorf("Headscale expiry normal authority changed under lock")
+		return persist.Document{}, control.Journal{}, fmt.Errorf("headscale expiry normal authority changed under lock")
 	}
 	journal, err := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
 	if err != nil {
 		return persist.Document{}, control.Journal{}, err
 	}
 	if !reflect.DeepEqual(journal, expectedJournal) || !headscaleExpiryJournalMatchesNormal(installation, journal) {
-		return persist.Document{}, control.Journal{}, fmt.Errorf("Headscale expiry control journal changed under lock")
+		return persist.Document{}, control.Journal{}, fmt.Errorf("headscale expiry control journal changed under lock")
 	}
 	return document, journal, nil
 }
@@ -184,14 +184,14 @@ func requireHeadscaleExpirySafety(state safety.State, headscale *domain.Headscal
 	marker := state.Headscale.CertificateExpiry
 	certificate := headscale.Certificate
 	if state.GlobalClose.Phase != safety.GlobalCloseNone || certificate == nil || active == nil || active.Generation != certificate.Generation || active.Fingerprint != certificate.Fingerprint || active.Binding != certificate.BindingIdentity || marker == nil || marker.Generation != intent.SafetyBinding.ExpiryGeneration || !marker.Deadline.Equal(intent.SafetyBinding.Deadline) || marker.Binding != intent.SafetyBinding.CandidateBundle {
-		return fmt.Errorf("Headscale expiry safety authority changed under lock")
+		return fmt.Errorf("headscale expiry safety authority changed under lock")
 	}
 	return nil
 }
 
 func requireHeadscaleExpiryBundle(state safety.State, bundle control.ActivationBundle) error {
 	if state.Headscale.ControlEntryDigest == "" || bundle.Entry.Digest != state.Headscale.ControlEntryDigest {
-		return fmt.Errorf("Headscale expiry control graph authority changed under lock")
+		return fmt.Errorf("headscale expiry control graph authority changed under lock")
 	}
 	return nil
 }
@@ -219,7 +219,7 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 	expectedJournal := journal
 	expectedJournal.Phase = lockedJournal.Phase
 	if lockedJournal.Phase != control.PhaseCommitted && lockedJournal.Phase != control.PhaseExpired {
-		return fmt.Errorf("Headscale expiry control journal changed under lock")
+		return fmt.Errorf("headscale expiry control journal changed under lock")
 	}
 	lockedDocument, lockedJournal, err := readLockedHeadscaleExpiryAuthority(service, headscale, expectedJournal)
 	if err != nil {
@@ -227,10 +227,10 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 	}
 	lockedIntent, err := admitter.OperationIntent(intent.JobID)
 	if err != nil {
-		return fmt.Errorf("Headscale expiry intent changed under lock: %w", err)
+		return fmt.Errorf("headscale expiry intent changed under lock: %w", err)
 	}
 	if lockedIntent.JobID != intent.JobID || lockedIntent.Operation != operations.CertificateExpiry || lockedIntent.Target != intent.Target || lockedIntent.SafetyBinding.ExpiryGeneration != intent.SafetyBinding.ExpiryGeneration {
-		return fmt.Errorf("Headscale expiry intent changed under lock")
+		return fmt.Errorf("headscale expiry intent changed under lock")
 	}
 	intent = lockedIntent
 	journal = lockedJournal
@@ -241,7 +241,7 @@ func resumeExpiredHeadscaleCertificate(ctx context.Context, service *FixedServic
 		return fmt.Errorf("terminal Headscale expiry left committed control")
 	}
 	if intent.Phase != operations.PhaseReserved && intent.Phase != operations.PhaseLocalIntent {
-		return fmt.Errorf("Headscale expiry intent has unsupported phase %q", intent.Phase)
+		return fmt.Errorf("headscale expiry intent has unsupported phase %q", intent.Phase)
 	}
 	if intent.Phase == operations.PhaseReserved {
 		inventory := safety.OwnershipInventoryDigest(map[string]string{})
@@ -477,10 +477,10 @@ func recordHeadscaleExpiryReconciliation(ctx context.Context, service *FixedServ
 	}
 	intent, err = admitter.OperationIntent(intent.JobID)
 	if err != nil {
-		return fmt.Errorf("Headscale expiry reconciliation intent changed: %w", err)
+		return fmt.Errorf("headscale expiry reconciliation intent changed: %w", err)
 	}
 	if intent.Operation != operations.AutomaticReconciliation || intent.Target != target {
-		return fmt.Errorf("Headscale expiry reconciliation intent changed")
+		return fmt.Errorf("headscale expiry reconciliation intent changed")
 	}
 	if intent.Phase == operations.PhaseReserved {
 		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: intent.JobID, ExpectedRevision: lockedDocument.Revision, IntentGeneration: lockedDocument.Revision + 1})
@@ -489,7 +489,7 @@ func recordHeadscaleExpiryReconciliation(ctx context.Context, service *FixedServ
 		}
 		planlessStarted = true
 	} else if intent.Phase != operations.PhaseLocalIntent {
-		return fmt.Errorf("Headscale expiry reconciliation phase changed")
+		return fmt.Errorf("headscale expiry reconciliation phase changed")
 	}
 	fresh, err := service.normal.Read()
 	if err != nil {
@@ -607,7 +607,7 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 			case operations.PhaseTerminal, operations.PhaseRejected:
 				return fmt.Errorf("terminal Headscale expiry with committed control requires independent contraction")
 			default:
-				return fmt.Errorf("Headscale expiry intent has unsupported phase %q", existing.Phase)
+				return fmt.Errorf("headscale expiry intent has unsupported phase %q", existing.Phase)
 			}
 		}
 	}
@@ -661,7 +661,7 @@ func ContractExpiredHeadscaleCertificate(ctx context.Context, now time.Time) (re
 			case operations.PhaseTerminal, operations.PhaseRejected:
 				return fmt.Errorf("terminal Headscale expiry with committed control requires independent contraction")
 			default:
-				return fmt.Errorf("Headscale expiry intent has unsupported phase %q", existing.Phase)
+				return fmt.Errorf("headscale expiry intent has unsupported phase %q", existing.Phase)
 			}
 		}
 	}

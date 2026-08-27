@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -183,7 +182,21 @@ func Run(root string) error {
 }
 
 func loadPackages(root string) ([]sourcePackage, map[string]string, error) {
-	command := exec.Command(filepath.Join(runtime.GOROOT(), "bin", "go"), "list", "-mod=readonly", "-buildvcs=false", "-json", "-export", "-deps", "./internal/...", "./cmd/...")
+	goLauncher, err := exec.LookPath("go")
+	if err != nil {
+		return nil, nil, fmt.Errorf("locate go launcher: %w", err)
+	}
+	selection := exec.Command(goLauncher, "env", "GOROOT")
+	selection.Dir = root
+	selection.Env = goToolchainEnvironment()
+	var selectionStderr bytes.Buffer
+	selection.Stderr = &selectionStderr
+	goroot, err := selection.Output()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve selected go toolchain: %w: %s", err, strings.TrimSpace(selectionStderr.String()))
+	}
+	goBinary := filepath.Join(strings.TrimSpace(string(goroot)), "bin", "go")
+	command := exec.Command(goBinary, "list", "-mod=readonly", "-buildvcs=false", "-json", "-export", "-deps", "./internal/...", "./cmd/...")
 	command.Dir = root
 	command.Env = offlineGoEnvironment()
 	var stdout, stderr bytes.Buffer
@@ -231,15 +244,27 @@ func loadPackages(root string) ([]sourcePackage, map[string]string, error) {
 	return packages, exports, nil
 }
 
-func offlineGoEnvironment() []string {
+func goToolchainEnvironment() []string {
+	environment := fixedGoEnvironment("auto")
+	for index, entry := range environment {
+		if strings.HasPrefix(entry, "GOSUMDB=") {
+			environment[index] = "GOSUMDB=sum.golang.org"
+		}
+	}
+	return environment
+}
+
+func offlineGoEnvironment() []string { return fixedGoEnvironment("local") }
+
+func fixedGoEnvironment(toolchain string) []string {
 	overrides := map[string]string{
 		"CGO_ENABLED": "0", "GO111MODULE": "on", "GOARCH": "amd64", "GOAMD64": "v1", "GOENV": "off", "GOEXPERIMENT": "", "GOFLAGS": "", "GOOS": "linux",
-		"GONOPROXY": "", "GOPRIVATE": "", "GOPROXY": "off", "GOSUMDB": "off", "GOTOOLCHAIN": "local", "GOWORK": "off",
+		"GONOPROXY": "", "GOPRIVATE": "", "GOPROXY": "off", "GOSUMDB": "off", "GOTOOLCHAIN": toolchain, "GOWORK": "off",
 	}
 	environment := make([]string, 0, len(os.Environ())+len(overrides))
 	for _, entry := range os.Environ() {
 		name, _, _ := strings.Cut(entry, "=")
-		if _, replaced := overrides[name]; !replaced {
+		if _, replaced := overrides[name]; name != "GOROOT" && !replaced {
 			environment = append(environment, entry)
 		}
 	}
@@ -347,7 +372,7 @@ func (state *auditState) allowProcessCall(file fileAudit, info *types.Info, call
 		}
 		object := assignedObject(call, file.parents, info)
 		if object == nil || object.Name() != "goBinary" {
-			return fmt.Errorf("Go lookup result is not assigned to goBinary")
+			return fmt.Errorf("go lookup result is not assigned to goBinary")
 		}
 		state.goBinary = object
 		count = "generator go lookup"

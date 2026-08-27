@@ -1378,8 +1378,6 @@ func validBasicUsername(value string) bool {
 	return true
 }
 
-func validACMEEmail(value string) bool { return acmeaccount.ValidContact(value) }
-
 func validateManagedProcess(process ManagedProcess) error {
 	if !strings.HasPrefix(process.ID, "proc_") || !idPattern.MatchString(process.ID) {
 		return fmt.Errorf("managed_process.id is invalid")

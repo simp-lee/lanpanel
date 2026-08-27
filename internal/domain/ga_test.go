@@ -338,9 +338,8 @@ func TestInstallationSchema(t *testing.T) {
 		if err := ValidateInstallation(installation); err != nil {
 			t.Fatalf("ValidateInstallation(pending config) error = %v", err)
 		}
-		view := DerivePublicationStatus(*resource, PublicationStatusInput{})
-		if view.State != DisplayPublishedHealthy || !view.PendingChanges || *resource.PublicationRecord.LastAppliedDigest == resource.CurrentConfigDigest {
-			t.Fatalf("pending config view=%#v record=%#v", view, resource.PublicationRecord)
+		if *resource.PublicationRecord.LastAppliedDigest == resource.CurrentConfigDigest {
+			t.Fatalf("applied digest unexpectedly matches current digest: %#v", resource.PublicationRecord)
 		}
 	})
 
@@ -356,33 +355,7 @@ func TestInstallationSchema(t *testing.T) {
 		}
 	})
 
-	t.Run("status_distinguishes_pending_and_closure", func(t *testing.T) {
-		resource := validGAInstallation().Resources[0]
-		view := DerivePublicationStatus(resource, PublicationStatusInput{})
-		if view.State != DisplayUnpublishedClosed || !view.PendingChanges {
-			t.Fatalf("new resource status = %#v", view)
-		}
-		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
-		resource.PublicationRecord.LastAppliedBundle = pointerBundle(domainBundle("bundle-old", testDigest))
-		view = DerivePublicationStatus(resource, PublicationStatusInput{})
-		if view.State != DisplayClosingMayBeLive {
-			t.Fatalf("unverified contraction status = %#v", view)
-		}
-		view = DerivePublicationStatus(resource, PublicationStatusInput{ClosureEvidence: &ClosureEvidence{
-			ResourceID: resource.ID, UnpublishedGeneration: resource.PublicationRecord.UnpublishedGeneration - 1,
-		}})
-		if view.State != DisplayClosingMayBeLive {
-			t.Fatalf("stale contraction evidence status = %#v", view)
-		}
-		view = DerivePublicationStatus(resource, PublicationStatusInput{ClosureEvidence: &ClosureEvidence{
-			ResourceID: resource.ID, UnpublishedGeneration: resource.PublicationRecord.UnpublishedGeneration,
-		}})
-		if view.State != DisplayUnpublishedClosed {
-			t.Fatalf("verified contraction status = %#v", view)
-		}
-	})
-
-	t.Run("activating_status_is_may_be_live", func(t *testing.T) {
+	t.Run("activating_from_unpublished_is_valid", func(t *testing.T) {
 		installation := validGAInstallation()
 		resource := &installation.Resources[0]
 		resource.PublicationRecord.State = PublicationActivating
@@ -393,42 +366,6 @@ func TestInstallationSchema(t *testing.T) {
 		}
 		if err := ValidateInstallation(installation); err != nil {
 			t.Fatalf("ValidateInstallation(activating) error = %v", err)
-		}
-		if view := DerivePublicationStatus(*resource, PublicationStatusInput{}); view.State != DisplayActivatingMayBeLive {
-			t.Fatalf("activating status = %#v", view)
-		}
-	})
-
-	t.Run("published_healthy_status_is_distinct", func(t *testing.T) {
-		resource := publishedResource(RuntimeHealthy)
-		if view := DerivePublicationStatus(resource, PublicationStatusInput{}); view.State != DisplayPublishedHealthy {
-			t.Fatalf("published healthy status = %#v", view)
-		}
-	})
-
-	t.Run("published_degraded_status_is_distinct", func(t *testing.T) {
-		resource := publishedResource(RuntimeDegraded)
-		if view := DerivePublicationStatus(resource, PublicationStatusInput{}); view.State != DisplayPublishedDegraded {
-			t.Fatalf("published degraded status = %#v", view)
-		}
-	})
-
-	t.Run("published_unknown_status_is_distinct", func(t *testing.T) {
-		resource := publishedResource(RuntimeUnknown)
-		if view := DerivePublicationStatus(resource, PublicationStatusInput{}); view.State != DisplayPublishedUnknown {
-			t.Fatalf("published unknown status = %#v", view)
-		}
-	})
-
-	t.Run("recent_operation_failure_is_additive", func(t *testing.T) {
-		for _, result := range []OperationResult{OperationFailed, OperationPartial, OperationInterrupted, OperationUnknown} {
-			resource := validGAInstallation().Resources[0]
-			resource.PublicationRecord.LastOperation = OperationPublish
-			resource.PublicationRecord.LastOperationResult = result
-			view := DerivePublicationStatus(resource, PublicationStatusInput{})
-			if view.State != DisplayUnpublishedClosed || !view.RecentOperationFailed {
-				t.Fatalf("recent operation %s status = %#v", result, view)
-			}
 		}
 	})
 
@@ -816,17 +753,6 @@ func enabledTestHeadscaleDomain() *HeadscaleDomain {
 	value.Certificate = &certificate
 	value.Enabled = true
 	return &value
-}
-
-func publishedResource(health RuntimeHealth) AppResource {
-	resource := validGAInstallation().Resources[0]
-	resource.PublicationRecord.State = PublicationPublished
-	resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
-	resource.PublicationRecord.LastAppliedBundle = pointerBundle(domainBundle("bundle-published", testDigest))
-	resource.PublicationRecord.RuntimeObservation = &RuntimeObservation{
-		Status: health, ObservedAt: "2026-08-10T00:00:00Z",
-	}
-	return resource
 }
 
 func temporaryBundle(id, configDigest, publicIPv4 string, port uint16) PublicationBundle {

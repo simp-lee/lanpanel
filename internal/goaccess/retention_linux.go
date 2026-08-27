@@ -174,7 +174,7 @@ type fixedNginxLogReopener struct {
 
 func (reopener fixedNginxLogReopener) Reopen(ctx context.Context, activePath string, old, active retentionFileIdentity) error {
 	if reopener.launcher == nil || !validInstallationID(reopener.installationID) || reopener.nginxUID == 0 {
-		return fmt.Errorf("Nginx log reopen launcher is unavailable")
+		return fmt.Errorf("nginx log reopen launcher is unavailable")
 	}
 	if err := reopener.restoreManagedLogMetadata(); err != nil {
 		return err
@@ -210,7 +210,7 @@ func (reopener fixedNginxLogReopener) Reopen(ctx context.Context, activePath str
 	}
 	signalErr := errors.Join(oldErr, activeErr)
 	if signalErr == nil && len(oldWriters) == 0 && len(activeMaster) == 0 {
-		signalErr = fmt.Errorf("Nginx runtime is not bound to either retention log inode")
+		signalErr = fmt.Errorf("nginx runtime is not bound to either retention log inode")
 	}
 	if signalErr == nil && len(oldWriters) != 0 {
 		signalErr = signal(ctx)
@@ -298,7 +298,7 @@ func restoreReopenedLogAt(parent int, name string, uid, gid, mode, nginxUID uint
 	var stat unix.Stat_t
 	if err = unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != uid && stat.Uid != nginxUID || stat.Gid != gid || stat.Mode&0o7777 != mode {
 		_ = file.Close()
-		return errors.Join(err, fmt.Errorf("Nginx reopened log metadata is unsafe"))
+		return errors.Join(err, fmt.Errorf("nginx reopened log metadata is unsafe"))
 	}
 	if stat.Uid != uid {
 		err = unix.Fchown(fd, int(uid), int(gid))
@@ -468,7 +468,7 @@ func reopenAndInstallSnapshot(ctx context.Context, parent int, paths rotationPat
 	}
 	if options.Reopen != nil {
 		if err = options.Reopen(ctx, state.Source, *state.Active); err != nil {
-			return state, stateRaw, fmt.Errorf("Nginx access log reopen failed: %w", err)
+			return state, stateRaw, fmt.Errorf("nginx access log reopen failed: %w", err)
 		}
 	}
 	if _, err = validateReplacementLog(parent, filepath.Base(paths.active), *state.Active, uid, gid, options.NginxUID, true); err != nil {

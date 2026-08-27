@@ -637,7 +637,7 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 					return fmt.Errorf("target has a nonterminal certificate expiry contraction")
 				}
 				if sameResource && existing.Operation == AutomaticReconciliation && existing.SafetyBinding.ResourceID == "headscale" && strings.HasPrefix(existing.Target, "journal/headscale-certificate-expiry-") && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
-					return fmt.Errorf("Headscale certificate action is blocked by expiry reconciliation")
+					return fmt.Errorf("headscale certificate action is blocked by expiry reconciliation")
 				}
 				if sameResource && !isContraction(existing.Operation) && existing.Phase != PhaseTerminal && existing.Phase != PhaseRejected {
 					return fmt.Errorf("target already has a nonterminal expansion authority")
@@ -5401,7 +5401,7 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	}
 	if operation == AutomaticReconciliation && binding.ResourceID == "headscale" {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone || !validExpiryBinding(CertificateExpiry, state, binding) {
-			return fmt.Errorf("Headscale expiry reconciliation authority is stale or globally blocked")
+			return fmt.Errorf("headscale expiry reconciliation authority is stale or globally blocked")
 		}
 	}
 	if operation == StartupContraction && !validStartupBinding(state, binding) {
@@ -7343,7 +7343,7 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 	if request.Operation == AutomaticReconciliation && strings.HasPrefix(request.Target, "journal/headscale-certificate-expiry-") {
 		expected := SafetyBinding{ExpiryGeneration: binding.ExpiryGeneration, ResourceID: "headscale", Deadline: binding.Deadline, CandidateBundle: binding.CandidateBundle}
 		if request.Source != AdmissionTimer || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || binding.CandidateBundle == "" || !reflect.DeepEqual(binding, expected) {
-			return fmt.Errorf("Headscale expiry reconciliation requires exact timer authority")
+			return fmt.Errorf("headscale expiry reconciliation requires exact timer authority")
 		}
 		return nil
 	}

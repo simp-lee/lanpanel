@@ -848,7 +848,6 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 		if err := commitDiscrepantCertificateExpiryMarker(ctx, service, resourceID, certificate, expiryGeneration, effectiveDeadline); err != nil {
 			return err
 		}
-		markerNeeded = false
 	}
 	highWater, highWaterPresent, err := operations.ExpiryGenerationHighWater(document, resourceID)
 	if err != nil {

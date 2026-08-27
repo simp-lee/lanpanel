@@ -183,12 +183,12 @@ func TestRawDNSQueryRejectsUnexpectedUDPSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer primary.Close()
+	defer func() { _ = primary.Close() }()
 	foreign, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer foreign.Close()
+	defer func() { _ = foreign.Close() }()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -299,7 +299,7 @@ func startTruncatedDNSServer(t *testing.T, tcpHandler func(int, *dns.Msg, net.Co
 			server.wg.Add(1)
 			go func(current int, connection net.Conn) {
 				defer server.wg.Done()
-				defer connection.Close()
+				defer func() { _ = connection.Close() }()
 				query, readErr := readTCPDNSQuery(connection)
 				if readErr != nil {
 					return

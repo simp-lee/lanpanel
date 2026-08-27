@@ -784,12 +784,12 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleCertificateActivation, ClearBaseContraction); err != nil {
 		return err
 	}
-	if !(journalConvergence && before.ChallengePending != nil && after.ChallengePending == nil) {
+	if !journalConvergence || before.ChallengePending == nil || after.ChallengePending != nil {
 		if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
 			return err
 		}
 	}
-	if !(journalConvergence && before.Reactivating != nil && after.Reactivating == nil) {
+	if !journalConvergence || before.Reactivating == nil || after.Reactivating != nil {
 		if err := reactivationTransition(role, before.GenerationSequence, before.Reactivating, after.Reactivating); err != nil {
 			return err
 		}
