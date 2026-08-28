@@ -3,15 +3,63 @@
 package application
 
 import (
+	"context"
+	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/safety"
 	"testing"
+	"time"
 )
 
 func TestCloseAllGenerationInventoryMayBeExactlyEmpty(t *testing.T) {
 	generations, err := contractionGenerations(domain.Installation{Resources: []domain.AppResource{}}, safety.EmptyState(), nil)
 	if err != nil || len(generations) != 0 {
 		t.Fatalf("empty close-all generations=%v error=%v", generations, err)
+	}
+}
+
+type budgetedGoAccessContractionHost struct {
+	stopBudgets []time.Duration
+}
+
+func (host *budgetedGoAccessContractionHost) Stop(ctx context.Context, _ string, _ uint64) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.DeadlineExceeded
+	}
+	host.stopBudgets = append(host.stopBudgets, time.Until(deadline))
+	return nil
+}
+
+func (*budgetedGoAccessContractionHost) Retire(ctx context.Context, _ string, _ uint64, _ string, _ []string) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (*budgetedGoAccessContractionHost) RemoveGenerationState(context.Context, string, uint64) error {
+	return nil
+}
+
+func (*budgetedGoAccessContractionHost) CleanupUncommittedShared(context.Context, string, string) error {
+	return nil
+}
+
+func TestTimedOutGenerationRetentionLeavesIndependentBudgetForLaterStop(t *testing.T) {
+	const generationBudget = 30 * time.Millisecond
+	overall, cancel := context.WithTimeout(context.Background(), 5*generationBudget)
+	defer cancel()
+	host := &budgetedGoAccessContractionHost{}
+	resourceID := "res_00000000000000000000000000000001"
+	generations := map[string][]goaccessGeneration{resourceID: {
+		{generation: 1, retiredIdentity: "sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", unitIdentities: []string{"one"}},
+		{generation: 2},
+	}}
+	_, err := stopGoAccessGenerations(overall, host, generationBudget, generationBudget, generations, contraction.Result{})
+	if err == nil || len(host.stopBudgets) != 1 {
+		t.Fatalf("generation cleanup error=%v stop budgets=%v", err, host.stopBudgets)
+	}
+	if host.stopBudgets[0] < generationBudget/2 {
+		t.Fatalf("later stop inherited exhausted retention budget: %v", host.stopBudgets[0])
 	}
 }
 

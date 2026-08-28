@@ -11,6 +11,7 @@ import (
 	"io"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
 	"os"
 	"os/user"
@@ -194,13 +195,6 @@ func (reopener fixedNginxLogReopener) Reopen(ctx context.Context, activePath str
 	if prior.Master == nil {
 		return closure.VerifyStopped(prior)
 	}
-	oldFile := closure.FileIdentity{Device: old.Device, Inode: old.Inode}
-	activeFile := closure.FileIdentity{Device: active.Device, Inode: active.Inode}
-	processes := make([]closure.ProcessIdentity, 0, len(prior.Workers)+1)
-	processes = append(processes, *prior.Master)
-	processes = append(processes, prior.Workers...)
-	oldWriters, oldErr := closure.WritableFileReferences("/proc", processes, oldFile.Device, oldFile.Inode)
-	activeMaster, activeErr := closure.WritableFileReferences("/proc", []closure.ProcessIdentity{*prior.Master}, activeFile.Device, activeFile.Inode)
 	signal := func(ctx context.Context) error {
 		result, err := reopener.launcher.Run(ctx, child.ProfileNginxReopenSignal, nil)
 		if err != nil || result.ExitCode != 0 || result.OutputCutOff {
@@ -208,17 +202,120 @@ func (reopener fixedNginxLogReopener) Reopen(ctx context.Context, activePath str
 		}
 		return nil
 	}
-	signalErr := errors.Join(oldErr, activeErr)
-	if signalErr == nil && len(oldWriters) == 0 && len(activeMaster) == 0 {
-		signalErr = fmt.Errorf("nginx runtime is not bound to either retention log inode")
+	audit := func() (nginx.Manifest, error) {
+		return nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
 	}
-	if signalErr == nil && len(oldWriters) != 0 {
-		signalErr = signal(ctx)
+	transitionErr := waitNginxLogTransition(ctx, observer, "/proc", activePath, *prior.Master, closure.FileIdentity{Device: old.Device, Inode: old.Inode}, closure.FileIdentity{Device: active.Device, Inode: active.Inode}, 15*time.Second, audit, closure.WritableFileReferences, signal)
+	return errors.Join(transitionErr, reopener.restoreManagedLogMetadata())
+}
+
+type writableReferenceObserver func(string, []closure.ProcessIdentity, uint64, uint64) ([]closure.ProcessIdentity, error)
+
+// waitNginxLogTransition coordinates timer/final retention with a concurrent
+// graph reload. A bound graph must reopen onto the replacement inode. Once an
+// audited graph is explicitly unbound, two complete process inventories with
+// no writer to either inode are the successful terminal state.
+func waitNginxLogTransition(ctx context.Context, observer closure.RuntimeObserver, procRoot, activePath string, priorMaster closure.ProcessIdentity, old, active closure.FileIdentity, timeout time.Duration, audit func() (nginx.Manifest, error), writable writableReferenceObserver, signal func(context.Context) error) error {
+	if ctx == nil || observer == nil || !filepath.IsAbs(procRoot) || filepath.Clean(procRoot) != procRoot || !filepath.IsAbs(activePath) || filepath.Clean(activePath) != activePath || priorMaster.PID <= 1 || priorMaster.StartTicks == 0 || priorMaster.Cgroup == "" || old.Device == 0 || old.Inode == 0 || active.Device == 0 || active.Inode == 0 || old == active || timeout <= 0 || timeout > time.Minute || audit == nil || writable == nil || signal == nil {
+		return fmt.Errorf("Nginx retention transition authority is invalid")
 	}
-	if signalErr == nil {
-		signalErr = closure.WaitFileReopen(ctx, observer, "/proc", activePath, *prior.Master, oldFile, activeFile, 15*time.Second, signal)
+	deadline := time.Now().Add(timeout)
+	nextSignal := time.Now()
+	signals, clearObservations := 0, 0
+	sawUnbound := false
+	var priorBound *bool
+	for {
+		var stat unix.Stat_t
+		if err := unix.Lstat(activePath, &stat); err != nil {
+			return fmt.Errorf("replacement file identity unavailable: %w", err)
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || uint64(stat.Dev) != active.Device || stat.Ino != active.Inode {
+			return fmt.Errorf("replacement file identity changed")
+		}
+		snapshot, err := observer.Observe(ctx)
+		if err != nil {
+			return err
+		}
+		if snapshot.Master == nil {
+			return closure.VerifyStopped(snapshot)
+		}
+		if !snapshot.Complete {
+			return fmt.Errorf("Nginx retention runtime inventory is incomplete")
+		}
+		if snapshot.Master.PID != priorMaster.PID || snapshot.Master.StartTicks != priorMaster.StartTicks || snapshot.Master.Cgroup != priorMaster.Cgroup {
+			return fmt.Errorf("Nginx retention master identity changed")
+		}
+		manifest, err := audit()
+		if err != nil {
+			return fmt.Errorf("Nginx retention graph inventory unavailable: %w", err)
+		}
+		bound := manifestBindsAccessLog(manifest, activePath)
+		sawUnbound = sawUnbound || !bound
+		if priorBound != nil && *priorBound != bound {
+			clearObservations = 0
+		}
+		boundCopy := bound
+		priorBound = &boundCopy
+
+		processes := make([]closure.ProcessIdentity, 0, len(snapshot.Workers)+1)
+		processes = append(processes, *snapshot.Master)
+		processes = append(processes, snapshot.Workers...)
+		oldWriters, err := writable(procRoot, processes, old.Device, old.Inode)
+		if err != nil {
+			return err
+		}
+		clear := false
+		if !bound {
+			activeWriters, observeErr := writable(procRoot, processes, active.Device, active.Inode)
+			if observeErr != nil {
+				return observeErr
+			}
+			clear = len(oldWriters) == 0 && len(activeWriters) == 0
+		} else {
+			activeMaster, observeErr := writable(procRoot, []closure.ProcessIdentity{*snapshot.Master}, active.Device, active.Inode)
+			if observeErr != nil {
+				return observeErr
+			}
+			clear = len(oldWriters) == 0 && len(activeMaster) == 1
+			if signals == 0 && !sawUnbound && len(oldWriters) == 0 && len(activeMaster) == 0 {
+				return fmt.Errorf("nginx runtime is not bound to either retention log inode")
+			}
+		}
+		if clear {
+			clearObservations++
+			if clearObservations == 2 {
+				return nil
+			}
+		} else {
+			clearObservations = 0
+		}
+		now := time.Now()
+		if bound && len(oldWriters) != 0 && signals < 3 && !now.Before(nextSignal) {
+			if err = signal(ctx); err != nil {
+				return err
+			}
+			signals++
+			now = time.Now()
+			nextSignal = now.Add(100 * time.Millisecond)
+		}
+		if !now.Before(deadline) {
+			return fmt.Errorf("runtime did not settle the retention log before the fixed deadline")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
-	return errors.Join(signalErr, reopener.restoreManagedLogMetadata())
+}
+
+func manifestBindsAccessLog(manifest nginx.Manifest, activePath string) bool {
+	for _, entry := range manifest.Entries {
+		if entry.Domain != nil && entry.Domain.GoAccess != nil && entry.Domain.GoAccess.AccessLog == activePath {
+			return true
+		}
+	}
+	return false
 }
 
 func (reopener fixedNginxLogReopener) restoreManagedLogMetadata() error {

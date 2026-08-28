@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/child"
+	"lanpanel/internal/closure"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/nginx"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +49,7 @@ func TestRenderUsesPrivateNetworkAndProtectedRelay(t *testing.T) {
 		t.Fatal("retention timer created untracked persistent systemd state")
 	}
 	retentionService := string(candidate.RetentionService)
-	if candidate.Paths.RetentionUnit == "" || candidate.Paths.RetentionTimer == "" || !strings.Contains(retentionService, candidate.Paths.RetentionLock) || !strings.Contains(retentionService, "ExecStart=/usr/lib/lanpanel/lanpanel goaccess-retention") || !strings.Contains(retentionService, "User=root\nGroup=root") || !strings.Contains(retentionService, "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE") || !strings.Contains(retentionService, "TimeoutStartSec=75s") || !strings.Contains(retentionService, "/var/log/lanpanel/nginx-rejections.log") || !strings.Contains(retentionService, "LANPANEL_INSTALLATION_ID=ins_00000000000000000000000000000001") || strings.Contains(retentionService, "/bin/sh") || strings.Contains(retentionService, "/usr/bin/kill") || !strings.Contains(socket, "ListenStream=/run/lanpanel-goaccess/") || candidate.ServiceIdentity != digest && len(candidate.ServiceIdentity) != 71 {
+	if candidate.Paths.RetentionUnit == "" || candidate.Paths.RetentionTimer == "" || !strings.Contains(retentionService, candidate.Paths.RetentionLock) || !strings.Contains(retentionService, "ExecStart=/usr/lib/lanpanel/lanpanel goaccess-retention") || !strings.Contains(retentionService, "User=root\nGroup=root") || !strings.Contains(retentionService, "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_SYS_PTRACE") || strings.Contains(retentionService, "CAP_NET_BIND_SERVICE") || !strings.Contains(retentionService, "TimeoutStartSec=75s") || !strings.Contains(retentionService, "/var/log/lanpanel/nginx-rejections.log") || !strings.Contains(retentionService, "LANPANEL_INSTALLATION_ID=ins_00000000000000000000000000000001") || strings.Contains(retentionService, "/bin/sh") || strings.Contains(retentionService, "/usr/bin/kill") || !strings.Contains(socket, "ListenStream=/run/lanpanel-goaccess/") || candidate.ServiceIdentity != digest && len(candidate.ServiceIdentity) != 71 {
 		t.Fatal("protected endpoint identity missing")
 	}
 }
@@ -288,6 +290,116 @@ func TestRetentionBoundsCanonicalLogWithoutCopytruncate(t *testing.T) {
 	}
 	if _, err = os.Lstat(path + ".retention-old"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("renamed source remained: %v", err)
+	}
+}
+
+type fixedRuntimeObserver struct {
+	snapshot closure.RuntimeSnapshot
+	err      error
+}
+
+func (observer fixedRuntimeObserver) Observe(context.Context) (closure.RuntimeSnapshot, error) {
+	return observer.snapshot, observer.err
+}
+
+func TestRetentionCompletesAfterAuditedGraphUnbindAndCompleteNoWriterObservation(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	master := closure.ProcessIdentity{PID: 42, StartTicks: 7, Cgroup: "/system.slice/lanpanel-nginx.service"}
+	observer := fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{ObservedAt: time.Now(), Master: &master, Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}, Complete: true, Generation: "test"}}
+	signals := 0
+	reopen := func(ctx context.Context, old, active retentionFileIdentity) error {
+		return waitNginxLogTransition(ctx, observer, "/proc", path, master, closure.FileIdentity{Device: old.Device, Inode: old.Inode}, closure.FileIdentity{Device: active.Device, Inode: active.Inode}, time.Second,
+			func() (nginx.Manifest, error) { return nginx.Manifest{Entries: []nginx.Entry{}}, nil },
+			func(string, []closure.ProcessIdentity, uint64, uint64) ([]closure.ProcessIdentity, error) {
+				return nil, nil
+			},
+			func(context.Context) error { signals++; return nil })
+	}
+	if err := rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: reopen}); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 0 {
+		t.Fatalf("unbound graph was signaled for reopen %d times", signals)
+	}
+	if active, err := os.Stat(path); err != nil || active.Size() != 0 {
+		t.Fatalf("replacement log not settled: %v %v", active, err)
+	}
+	if snapshot, err := os.Stat(path + ".1"); err != nil || snapshot.Size() != maximumAccessLogBytes {
+		t.Fatalf("retained snapshot not installed: %v %v", snapshot, err)
+	}
+}
+
+func TestRetentionWaitsWhenConcurrentReloadRebindsAnUnboundGraph(t *testing.T) {
+	path, lock := createOversizedAccessLog(t, t.TempDir())
+	master := closure.ProcessIdentity{PID: 42, StartTicks: 7, Cgroup: "/system.slice/lanpanel-nginx.service"}
+	observer := fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{ObservedAt: time.Now(), Master: &master, Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}, Complete: true, Generation: "test"}}
+	auditCalls := 0
+	reopen := func(ctx context.Context, old, active retentionFileIdentity) error {
+		return waitNginxLogTransition(ctx, observer, "/proc", path, master, closure.FileIdentity{Device: old.Device, Inode: old.Inode}, closure.FileIdentity{Device: active.Device, Inode: active.Inode}, time.Second,
+			func() (nginx.Manifest, error) {
+				auditCalls++
+				if auditCalls == 1 {
+					return nginx.Manifest{Entries: []nginx.Entry{}}, nil
+				}
+				return nginx.Manifest{Entries: []nginx.Entry{{Domain: &nginx.DomainSite{GoAccess: &nginx.GoAccessSite{AccessLog: path}}}}}, nil
+			},
+			func(_ string, processes []closure.ProcessIdentity, device, inode uint64) ([]closure.ProcessIdentity, error) {
+				if auditCalls >= 3 && device == active.Device && inode == active.Inode {
+					return append([]closure.ProcessIdentity(nil), processes...), nil
+				}
+				return nil, nil
+			},
+			func(context.Context) error { return nil })
+	}
+	if err := rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: reopen}); err != nil {
+		t.Fatal(err)
+	}
+	if auditCalls < 4 {
+		t.Fatalf("retention did not require stable rebound evidence: audits=%d", auditCalls)
+	}
+}
+
+func TestUnboundRetentionStillFailsOnGraphOrRuntimeInventoryError(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		observer    fixedRuntimeObserver
+		audit       func() (nginx.Manifest, error)
+		writableErr error
+		bound       bool
+	}{
+		{name: "graph inventory", observer: fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{Complete: true, Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}}}, audit: func() (nginx.Manifest, error) {
+			return nginx.Manifest{}, fmt.Errorf("injected graph inventory failure")
+		}},
+		{name: "runtime observation", observer: fixedRuntimeObserver{err: fmt.Errorf("injected runtime observation failure")}, audit: func() (nginx.Manifest, error) { return nginx.Manifest{Entries: []nginx.Entry{}}, nil }},
+		{name: "incomplete runtime inventory", observer: fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{Complete: false}}, audit: func() (nginx.Manifest, error) { return nginx.Manifest{Entries: []nginx.Entry{}}, nil }},
+		{name: "writer inventory", observer: fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{Complete: true, Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}}}, audit: func() (nginx.Manifest, error) { return nginx.Manifest{Entries: []nginx.Entry{}}, nil }, writableErr: fmt.Errorf("injected descriptor inventory failure")},
+		{name: "graph remains bound", observer: fixedRuntimeObserver{snapshot: closure.RuntimeSnapshot{Complete: true, Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}}}, bound: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, lock := createOversizedAccessLog(t, t.TempDir())
+			master := closure.ProcessIdentity{PID: 42, StartTicks: 7, Cgroup: "/system.slice/lanpanel-nginx.service"}
+			if test.observer.err == nil {
+				test.observer.snapshot.Master = &master
+				test.observer.snapshot.ObservedAt = time.Now()
+				test.observer.snapshot.Generation = "test"
+			}
+			audit := test.audit
+			if test.bound {
+				audit = func() (nginx.Manifest, error) {
+					return nginx.Manifest{Entries: []nginx.Entry{{Domain: &nginx.DomainSite{GoAccess: &nginx.GoAccessSite{AccessLog: path}}}}}, nil
+				}
+			}
+			reopen := func(ctx context.Context, old, active retentionFileIdentity) error {
+				return waitNginxLogTransition(ctx, test.observer, "/proc", path, master, closure.FileIdentity{Device: old.Device, Inode: old.Inode}, closure.FileIdentity{Device: active.Device, Inode: active.Inode}, time.Second, audit,
+					func(string, []closure.ProcessIdentity, uint64, uint64) ([]closure.ProcessIdentity, error) {
+						return nil, test.writableErr
+					},
+					func(context.Context) error { return nil })
+			}
+			if err := rotateAccessLog(path, lock, uint32(os.Getuid()), uint32(os.Getgid()), retentionOptions{NginxUID: uint32(os.Getuid()), Reopen: reopen}); err == nil {
+				t.Fatal("incomplete or failed inventory was accepted")
+			}
+		})
 	}
 }
 
@@ -652,10 +764,17 @@ type fakeLauncher struct {
 	results   map[child.ProfileID]child.Result
 	sequences map[child.ProfileID][]child.Result
 	calls     []child.ProfileID
+	budgets   map[child.ProfileID][]time.Duration
 }
 
-func (f *fakeLauncher) RunInvocation(_ context.Context, id child.ProfileID, _ child.Invocation, _ []byte) (child.Result, error) {
+func (f *fakeLauncher) RunInvocation(ctx context.Context, id child.ProfileID, _ child.Invocation, _ []byte) (child.Result, error) {
 	f.calls = append(f.calls, id)
+	if deadline, ok := ctx.Deadline(); ok {
+		if f.budgets == nil {
+			f.budgets = map[child.ProfileID][]time.Duration{}
+		}
+		f.budgets[id] = append(f.budgets[id], time.Until(deadline))
+	}
 	if sequence := f.sequences[id]; len(sequence) != 0 {
 		f.sequences[id] = sequence[1:]
 		return sequence[0], nil
@@ -866,6 +985,10 @@ func TestEnsureStoppedContractsDespiteFinalRetentionFailure(t *testing.T) {
 	}
 	if !slices.Equal(launcher.calls, []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}) {
 		t.Fatalf("emergency retention/stop calls=%v", launcher.calls)
+	}
+	retentionBudgets, stopBudgets := launcher.budgets[child.ProfileGoAccessRetain], launcher.budgets[child.ProfileGoAccessStop]
+	if len(retentionBudgets) != 1 || retentionBudgets[0] < finalRetentionTimeout-time.Second || retentionBudgets[0] > finalRetentionTimeout || len(stopBudgets) != 1 || stopBudgets[0] < stopTimeout-time.Second || stopBudgets[0] > stopTimeout {
+		t.Fatalf("independent retention/stop budgets: retention=%v stop=%v", retentionBudgets, stopBudgets)
 	}
 }
 

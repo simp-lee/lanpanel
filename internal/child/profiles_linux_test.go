@@ -43,7 +43,7 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 		t.Fatalf("persistent Nginx profile=%#v error=%v", start, err)
 	}
 	reopen, err := ResolveProfile(ProfileNginxReopenSignal, Identities{})
-	if err != nil || !reopen.Complete || !reflect.DeepEqual(reopen.Arguments, []string{"-s", "reopen", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/", "-e", "stderr"}) {
+	if err != nil || !reopen.Complete || !reflect.DeepEqual(reopen.Arguments, []string{"-s", "reopen", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/", "-e", "stderr"}) || !reflect.DeepEqual(reopen.AllowedCapabilities, []int{0, 1, 5, 6, 7}) || slices.Contains(reopen.AllowedCapabilities, 10) {
 		t.Fatalf("Nginx reopen profile=%#v error=%v", reopen, err)
 	}
 	stop, err := ResolveProfile(ProfileSystemctlNginxStop, Identities{})
@@ -328,7 +328,7 @@ func TestGoAccessProfilesDeriveOnlyFixedPerResourceUnits(t *testing.T) {
 		}
 	}
 	retain, err := ResolveInvocation(ProfileGoAccessRetain, Identities{}, inv)
-	if err != nil || !reflect.DeepEqual(retain.Arguments, []string{"start", "lanpanel-goaccess-retention-res_00000000000000000000000000000001-2.service"}) {
+	if err != nil || retain.Timeout != 90*time.Second || !reflect.DeepEqual(retain.Arguments, []string{"start", "lanpanel-goaccess-retention-res_00000000000000000000000000000001-2.service"}) {
 		t.Fatalf("retention profile=%v error=%v", retain.Arguments, err)
 	}
 	if _, err = ResolveInvocation(ProfileGoAccessStart, Identities{}, Invocation{}); err == nil {

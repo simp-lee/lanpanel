@@ -307,47 +307,84 @@ func goAccessContractionInventory(installation domain.Installation, resourceIDs 
 	return result
 }
 
+const goAccessContractionCleanupTimeout = time.Minute
+
+type goAccessContractionHost interface {
+	Stop(context.Context, string, uint64) error
+	Retire(context.Context, string, uint64, string, []string) error
+	RemoveGenerationState(context.Context, string, uint64) error
+	CleanupUncommittedShared(context.Context, string, string) error
+}
+
 func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goaccessGeneration, result contraction.Result, runErr error) (contraction.Result, error, bool) {
-	if len(generations) == 0 {
+	generationCount := 0
+	for _, items := range generations {
+		generationCount += len(items)
+	}
+	if generationCount == 0 {
 		return result, runErr, true
 	}
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), time.Minute)
+	generationTimeout := goaccessruntime.GenerationRetirementTimeout + goAccessContractionCleanupTimeout
+	if generationCount > int(time.Duration(1<<63-1)/generationTimeout) {
+		return finishGoAccessClosureFailure(result, runErr, fmt.Errorf("GoAccess contraction generation budget overflow"))
+	}
+	overallTimeout := time.Duration(generationCount) * generationTimeout
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), overallTimeout)
 	defer cancelStop()
 	host, stopErr := goaccessruntime.NewFixedHost()
 	if stopErr == nil {
-		for resourceID, items := range generations {
-			for _, generation := range items {
-				if generation.retiredIdentity == "" {
-					paths, pathErr := operations.GoAccessStopModifiedPaths(resourceID, generation.generation)
-					result.ModifiedPaths = append(result.ModifiedPaths, paths...)
-					stopErr = errors.Join(stopErr, pathErr, host.Stop(stopCtx, resourceID, generation.generation))
-				} else {
-					currentErr := host.Retire(stopCtx, resourceID, generation.generation, generation.retiredIdentity, generation.unitIdentities)
-					if currentErr == nil && generation.removeState {
-						currentErr = host.RemoveGenerationState(stopCtx, resourceID, generation.stateGeneration)
-					}
-					if currentErr == nil && generation.removeShared {
-						currentErr = host.CleanupUncommittedShared(stopCtx, generation.installationID, resourceID)
-					}
-					if currentErr == nil {
-						paths, pathErr := operations.GoAccessRetirementModifiedPaths(resourceID, domain.GoAccessRetirementIdentity{Generation: generation.generation, StateGeneration: generation.stateGeneration, ServiceIdentity: generation.retiredIdentity, RemoveState: generation.removeState, RemoveShared: generation.removeShared, UnitIdentities: append([]string(nil), generation.unitIdentities...)})
-						currentErr = pathErr
-						result.ModifiedPaths = append(result.ModifiedPaths, paths...)
-					}
-					stopErr = errors.Join(stopErr, currentErr)
-				}
-			}
-		}
+		result, stopErr = stopGoAccessGenerations(stopCtx, host, goaccessruntime.GenerationRetirementTimeout, goAccessContractionCleanupTimeout, generations, result)
 	}
-	complete := stopErr == nil
 	if stopErr != nil {
-		if result.AccessClosed {
-			result.Outcome = contraction.OutcomePartial
-			result.ErrorCode = "goaccess_stop_failed"
-		}
-		runErr = errors.Join(runErr, stopErr)
+		return finishGoAccessClosureFailure(result, runErr, stopErr)
 	}
-	return result, runErr, complete
+	return result, runErr, true
+}
+
+func stopGoAccessGenerations(ctx context.Context, host goAccessContractionHost, retirementTimeout, cleanupTimeout time.Duration, generations map[string][]goaccessGeneration, result contraction.Result) (contraction.Result, error) {
+	if ctx == nil || host == nil || retirementTimeout <= 0 || cleanupTimeout <= 0 {
+		return result, fmt.Errorf("GoAccess contraction cleanup budget is invalid")
+	}
+	var stopErr error
+	for resourceID, items := range generations {
+		for _, generation := range items {
+			retirementCtx, cancelRetirement := context.WithTimeout(ctx, retirementTimeout)
+			if generation.retiredIdentity == "" {
+				paths, pathErr := operations.GoAccessStopModifiedPaths(resourceID, generation.generation)
+				result.ModifiedPaths = append(result.ModifiedPaths, paths...)
+				stopErr = errors.Join(stopErr, pathErr, host.Stop(retirementCtx, resourceID, generation.generation))
+				cancelRetirement()
+				continue
+			}
+			currentErr := host.Retire(retirementCtx, resourceID, generation.generation, generation.retiredIdentity, generation.unitIdentities)
+			cancelRetirement()
+			if currentErr == nil && (generation.removeState || generation.removeShared) {
+				cleanupCtx, cancelCleanup := context.WithTimeout(ctx, cleanupTimeout)
+				if generation.removeState {
+					currentErr = host.RemoveGenerationState(cleanupCtx, resourceID, generation.stateGeneration)
+				}
+				if currentErr == nil && generation.removeShared {
+					currentErr = host.CleanupUncommittedShared(cleanupCtx, generation.installationID, resourceID)
+				}
+				cancelCleanup()
+			}
+			if currentErr == nil {
+				paths, pathErr := operations.GoAccessRetirementModifiedPaths(resourceID, domain.GoAccessRetirementIdentity{Generation: generation.generation, StateGeneration: generation.stateGeneration, ServiceIdentity: generation.retiredIdentity, RemoveState: generation.removeState, RemoveShared: generation.removeShared, UnitIdentities: append([]string(nil), generation.unitIdentities...)})
+				currentErr = pathErr
+				result.ModifiedPaths = append(result.ModifiedPaths, paths...)
+			}
+			stopErr = errors.Join(stopErr, currentErr)
+		}
+	}
+	return result, stopErr
+}
+
+func finishGoAccessClosureFailure(result contraction.Result, runErr, stopErr error) (contraction.Result, error, bool) {
+	if result.AccessClosed {
+		result.Outcome = contraction.OutcomePartial
+		result.ErrorCode = "goaccess_stop_failed"
+	}
+	return result, errors.Join(runErr, stopErr), false
 }
 
 func pruneGoAccessContractionOwnership(_ context.Context, service *FixedService, exposure *locks.Lease, sourceJobID string, generations map[string][]goaccessGeneration) error {

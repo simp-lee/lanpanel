@@ -28,6 +28,16 @@ import (
 type invocationLauncher interface {
 	RunInvocation(context.Context, child.ProfileID, child.Invocation, []byte) (child.Result, error)
 }
+
+const (
+	finalRetentionTimeout       = 90 * time.Second
+	unitInventoryTimeout        = 30 * time.Second
+	stopTimeout                 = 45 * time.Second
+	daemonReloadTimeout         = 30 * time.Second
+	retirementEvidenceTimeout   = 2 * time.Second
+	GenerationRetirementTimeout = finalRetentionTimeout + unitInventoryTimeout + stopTimeout + daemonReloadTimeout + retirementEvidenceTimeout
+)
+
 type (
 	Host              struct{ launcher invocationLauncher }
 	ServiceGeneration struct {
@@ -437,7 +447,7 @@ func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	timer, timerOK := units[timerName]
 	retention, retentionOK := units[retentionName]
 	exact := func(values map[string]string, key, want string) bool { return values[key] == want }
-	if !serviceOK || !relayOK || !socketOK || !exact(service, "LoadState", "loaded") || !exact(relay, "LoadState", "loaded") || !exact(socket, "LoadState", "loaded") || !exact(timer, "LoadState", "loaded") || !exact(retention, "LoadState", "loaded") || !exact(service, "UnitFileState", "enabled") || !exact(relay, "UnitFileState", "enabled") || !exact(socket, "UnitFileState", "enabled") || !exact(timer, "UnitFileState", "enabled") || !exact(service, "ActiveState", "active") || !exact(service, "User", fmt.Sprint(candidate.UID)) || !exact(service, "Group", fmt.Sprint(candidate.GID)) || !exact(service, "SupplementaryGroups", "") || !exact(service, "PrivateNetwork", "yes") || !exact(service, "RestrictAddressFamilies", "AF_INET") || !exact(service, "CapabilityBoundingSet", "") || !exact(service, "AmbientCapabilities", "") || !exact(service, "FragmentPath", candidate.Paths.ServiceUnit) || !exact(service, "DropInPaths", "") || !exact(relay, "ActiveState", "active") || !exact(relay, "User", fmt.Sprint(candidate.RelayUID)) || !exact(relay, "Group", fmt.Sprint(candidate.RelayGID)) || !exact(relay, "PrivateNetwork", "yes") || !exact(relay, "JoinsNamespaceOf", serviceName) || !exact(relay, "RestrictAddressFamilies", "AF_INET") || !exact(relay, "FragmentPath", candidate.Paths.RelayUnit) || !exact(relay, "DropInPaths", "") || !exact(socket, "ActiveState", "active") || !exact(socket, "User", "root") || !exact(socket, "Group", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketUser", "root") || !exact(socket, "SocketGroup", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketMode", "0660") || !exact(socket, "RuntimeDirectory", "lanpanel-goaccess") || !exact(socket, "RuntimeDirectoryMode", "0750") || !exact(socket, "RuntimeDirectoryPreserve", "yes") || !exact(socket, "FragmentPath", candidate.Paths.SocketUnit) || !exact(socket, "DropInPaths", "") || !timerOK || !exact(timer, "ActiveState", "active") || !exact(timer, "FragmentPath", candidate.Paths.RetentionTimer) || !exact(timer, "DropInPaths", "") || !retentionOK || !validRetentionRuntime(retention) || !exact(retention, "User", "root") || !exact(retention, "Group", "root") || !exact(retention, "PrivateNetwork", "yes") || !exact(retention, "CapabilityBoundingSet", "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE") || !exact(retention, "AmbientCapabilities", "") || !exact(retention, "FragmentPath", candidate.Paths.RetentionUnit) || !exact(retention, "DropInPaths", "") {
+	if !serviceOK || !relayOK || !socketOK || !exact(service, "LoadState", "loaded") || !exact(relay, "LoadState", "loaded") || !exact(socket, "LoadState", "loaded") || !exact(timer, "LoadState", "loaded") || !exact(retention, "LoadState", "loaded") || !exact(service, "UnitFileState", "enabled") || !exact(relay, "UnitFileState", "enabled") || !exact(socket, "UnitFileState", "enabled") || !exact(timer, "UnitFileState", "enabled") || !exact(service, "ActiveState", "active") || !exact(service, "User", fmt.Sprint(candidate.UID)) || !exact(service, "Group", fmt.Sprint(candidate.GID)) || !exact(service, "SupplementaryGroups", "") || !exact(service, "PrivateNetwork", "yes") || !exact(service, "RestrictAddressFamilies", "AF_INET") || !exact(service, "CapabilityBoundingSet", "") || !exact(service, "AmbientCapabilities", "") || !exact(service, "FragmentPath", candidate.Paths.ServiceUnit) || !exact(service, "DropInPaths", "") || !exact(relay, "ActiveState", "active") || !exact(relay, "User", fmt.Sprint(candidate.RelayUID)) || !exact(relay, "Group", fmt.Sprint(candidate.RelayGID)) || !exact(relay, "PrivateNetwork", "yes") || !exact(relay, "JoinsNamespaceOf", serviceName) || !exact(relay, "RestrictAddressFamilies", "AF_INET") || !exact(relay, "FragmentPath", candidate.Paths.RelayUnit) || !exact(relay, "DropInPaths", "") || !exact(socket, "ActiveState", "active") || !exact(socket, "User", "root") || !exact(socket, "Group", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketUser", "root") || !exact(socket, "SocketGroup", fmt.Sprint(candidate.NginxGID)) || !exact(socket, "SocketMode", "0660") || !exact(socket, "RuntimeDirectory", "lanpanel-goaccess") || !exact(socket, "RuntimeDirectoryMode", "0750") || !exact(socket, "RuntimeDirectoryPreserve", "yes") || !exact(socket, "FragmentPath", candidate.Paths.SocketUnit) || !exact(socket, "DropInPaths", "") || !timerOK || !exact(timer, "ActiveState", "active") || !exact(timer, "FragmentPath", candidate.Paths.RetentionTimer) || !exact(timer, "DropInPaths", "") || !retentionOK || !validRetentionRuntime(retention) || !exact(retention, "User", "root") || !exact(retention, "Group", "root") || !exact(retention, "PrivateNetwork", "yes") || !exact(retention, "CapabilityBoundingSet", "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_SYS_PTRACE") || !exact(retention, "AmbientCapabilities", "") || !exact(retention, "FragmentPath", candidate.Paths.RetentionUnit) || !exact(retention, "DropInPaths", "") {
 		return fmt.Errorf("GoAccess effective isolation differs")
 	}
 	require := func(values map[string]string, expected map[string]string) bool {
@@ -464,7 +474,7 @@ func (host Host) Verify(ctx context.Context, candidate Candidate) error {
 	relayExpected["ProtectProc"] = "invisible"
 	relayExpected["ProcSubset"] = "pid"
 	retentionExpected["ReadWritePaths"] = filepath.Dir(candidate.Paths.AccessLog) + " " + candidate.Paths.RetentionLock + " /var/log/lanpanel/goaccess /var/log/lanpanel/nginx-rejections.log"
-	retentionExpected["CapabilityBoundingSet"] = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_SYS_PTRACE"
+	retentionExpected["CapabilityBoundingSet"] = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_SYS_PTRACE"
 	retentionExpected["UMask"] = "0077"
 	retentionExpected["RestrictAddressFamilies"] = "AF_UNIX"
 	retentionExpected["TimeoutStartUSec"] = "1min 15s"
@@ -1524,8 +1534,10 @@ func goAccessUnitBits(resourceID string, generation uint64) map[string]uint8 {
 }
 
 func (host Host) observedUnitMask(ctx context.Context, resourceID string, generation uint64) (uint8, error) {
+	inventoryCtx, cancel := context.WithTimeout(ctx, unitInventoryTimeout)
+	defer cancel()
 	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
-	shown, err := host.launcher.RunInvocation(ctx, child.ProfileGoAccessShow, invocation, nil)
+	shown, err := host.launcher.RunInvocation(inventoryCtx, child.ProfileGoAccessShow, invocation, nil)
 	if err != nil || shown.ExitCode != 0 {
 		return 0, fmt.Errorf("GoAccess unit inventory unavailable: exit=%d: %w", shown.ExitCode, err)
 	}
@@ -1554,8 +1566,10 @@ func (host Host) finalRetention(ctx context.Context, resourceID string, generati
 	if host.launcher == nil || !validResourceID(resourceID) || generation == 0 {
 		return fmt.Errorf("GoAccess retention authority invalid")
 	}
+	retentionCtx, cancel := context.WithTimeout(ctx, finalRetentionTimeout)
+	defer cancel()
 	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
-	retention, err := host.launcher.RunInvocation(ctx, child.ProfileGoAccessRetain, invocation, nil)
+	retention, err := host.launcher.RunInvocation(retentionCtx, child.ProfileGoAccessRetain, invocation, nil)
 	if err != nil || retention.ExitCode != 0 {
 		return errors.Join(err, fmt.Errorf("final GoAccess retention failed: exit=%d", retention.ExitCode))
 	}
@@ -1571,7 +1585,7 @@ func (host Host) stopUnits(ctx context.Context, resourceID string, generation ui
 	if host.launcher == nil || mask == 0 || mask&^uint8(31) != 0 {
 		return fmt.Errorf("GoAccess stop authority invalid")
 	}
-	stopCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	stopCtx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
 	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation, UnitMask: mask}}
 	result, err := host.launcher.RunInvocation(stopCtx, child.ProfileGoAccessStop, invocation, nil)
@@ -1677,7 +1691,7 @@ func (host Host) RetirementComplete(ctx context.Context, resourceID string, gene
 			return false, observeErr
 		}
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, retirementEvidenceTimeout)
 	defer cancel()
 	if err = host.waitEndpoint(probeCtx, paths.Endpoint, false); err != nil {
 		return false, err
