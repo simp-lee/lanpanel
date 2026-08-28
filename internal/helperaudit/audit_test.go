@@ -66,6 +66,96 @@ func bypass() { _ = exec.Command("/bin/echo") }
 			},
 		},
 		{
+			name:          "direct raw SYS_EXECVE",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass() { _, _, _ = unix.Syscall(unix.SYS_EXECVE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "direct RawSyscall SYS_CLONE",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass() { _, _, _ = unix.RawSyscall(unix.SYS_CLONE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "raw syscall package alias",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import kernel "golang.org/x/sys/unix"
+func bypass() { _, _, _ = kernel.Syscall6(kernel.SYS_EXECVE, 0, 0, 0, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "standard syscall package alias",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import kernel "syscall"
+func bypass() { _, _, _ = kernel.Syscall(kernel.SYS_CLONE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "direct raw SYS_EXECVEAT",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass() { _, _, _ = unix.RawSyscall6(unix.SYS_EXECVEAT, 0, 0, 0, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "AllThreadsSyscall SYS_FORK",
+			errorContains: "outside the fixed authority",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "syscall"
+func bypass() { _, _, _ = syscall.AllThreadsSyscall(syscall.SYS_FORK, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "raw syscall function value",
+			errorContains: "used as a function value",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass() { invoke := unix.RawSyscall; _, _, _ = invoke(unix.SYS_CLONE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "raw SYS_EXECVE function value",
+			errorContains: "used as a function value",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass() { invoke := unix.Syscall; _, _, _ = invoke(unix.SYS_EXECVE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "dynamic raw syscall number",
+			errorContains: "dynamic or unproven syscall number",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
+func bypass(number uintptr) { _, _, _ = unix.Syscall(number, 0, 0, 0) }
+`)
+			},
+		},
+		{
 			name: "selector passed as argument",
 			mutate: func(t *testing.T, root string) {
 				writeFixtureFile(t, root, "internal/other/other.go", `package other
@@ -95,6 +185,61 @@ var Execute = unix.Exec
 import audit "fixture/internal/helperaudit"
 func bypass() error { return audit.Execute("/bin/echo", []string{"echo"}, nil) }
 `)
+			},
+		},
+		{
+			name:          "raw syscall alias from reachable module package",
+			errorContains: "used as a function value",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "sysbridge/bridge.go", `package sysbridge
+import "golang.org/x/sys/unix"
+var Invoke = unix.Syscall
+`)
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import (
+	"fixture/sysbridge"
+	"golang.org/x/sys/unix"
+)
+func bypass() { _, _, _ = sysbridge.Invoke(unix.SYS_EXECVE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "raw syscall go linkname alias",
+			errorContains: "uses go:linkname outside go/types identity",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+import (
+	"syscall"
+	_ "unsafe"
+)
+//go:linkname invoke syscall.Syscall
+func invoke(trap, a1, a2, a3 uintptr) (uintptr, uintptr, syscall.Errno)
+func bypass() { _, _, _ = invoke(syscall.SYS_EXECVE, 0, 0, 0) }
+`)
+			},
+		},
+		{
+			name:          "raw syscall assembly path",
+			errorContains: "contains native source that go/types cannot prove",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+func bypass()
+`)
+				writeFixtureFile(t, root, "internal/other/bypass_amd64.s", `#include "textflag.h"
+TEXT ·bypass(SB), NOSPLIT, $0-0
+	RET
+`)
+			},
+		},
+		{
+			name:          "raw syscall object path",
+			errorContains: "contains native source that go/types cannot prove",
+			mutate: func(t *testing.T, root string) {
+				writeFixtureFile(t, root, "internal/other/other.go", `package other
+func bypass()
+`)
+				writeFixtureFile(t, root, "internal/other/bypass.syso", "")
 			},
 		},
 		{
@@ -323,10 +468,10 @@ func TestImportAliasesDoNotChangeApprovedBoundary(t *testing.T) {
 		replaceFixture(t, root, path, `"os/exec"`, `process "os/exec"`)
 		replaceAllFixture(t, root, path, "exec.", "process.")
 	}
-	replaceFixture(t, root, "internal/child/executor_linux.go", `"golang.org/x/sys/unix"`, `kernel "golang.org/x/sys/unix"`)
-	replaceAllFixture(t, root, "internal/child/executor_linux.go", "unix.Exec", "kernel.Exec")
-	replaceFixture(t, root, "internal/process/managed_exec_linux.go", `"golang.org/x/sys/unix"`, `kernel "golang.org/x/sys/unix"`)
-	replaceFixture(t, root, "internal/process/managed_exec_linux.go", "unix.Exec", "kernel.Exec")
+	for _, path := range []string{"internal/child/executor_linux.go", "internal/process/managed_exec_linux.go", "internal/process/listen_guard_linux.go", "internal/safety/emergency_linux.go"} {
+		replaceFixture(t, root, path, `"golang.org/x/sys/unix"`, `kernel "golang.org/x/sys/unix"`)
+		replaceAllFixture(t, root, path, "unix.", "kernel.")
+	}
 	if err := Run(root); err != nil {
 		t.Fatalf("approved import aliases changed the semantic boundary: %v", err)
 	}
@@ -397,9 +542,19 @@ func bypass() { _ = exec.Command("/bin/echo") }
 func TestUnrelatedSelectorsAreIgnored(t *testing.T) {
 	root := writeAuditFixture(t)
 	writeFixtureFile(t, root, "internal/other/other.go", `package other
+import "golang.org/x/sys/unix"
 type localAPI struct{}
 func (localAPI) Command(string) {}
-func harmless() { var exec localAPI; run := exec.Command; run("value") }
+func (localAPI) Syscall(uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr, uintptr) { return 0, 0, 0 }
+func harmless() {
+	var exec localAPI
+	run := exec.Command
+	run("value")
+	invoke := exec.Syscall
+	_, _, _ = invoke(1, 0, 0, 0)
+	var signal unix.SignalfdSiginfo
+	_ = signal.Syscall
+}
 `)
 	if err := Run(root); err != nil {
 		t.Fatalf("unrelated selector was treated as a process API: %v", err)
@@ -422,8 +577,28 @@ replace golang.org/x/sys => ./third_party/xsys
 go 1.26
 `,
 		"third_party/xsys/unix/unix.go": `package unix
+const (
+	SYS_BPF = 1
+	SYS_CLONE = 2
+	SYS_EXECVE = 3
+	SYS_EXECVEAT = 4
+	SYS_FORK = 5
+	SYS_NEWFSTATAT = 6
+	SYS_PRCTL = 7
+	PR_GET_NO_NEW_PRIVS = 8
+	PR_CAPBSET_READ = 9
+	PR_CAP_AMBIENT = 10
+	PR_CAP_AMBIENT_IS_SET = 11
+)
 func Exec(string, []string, []string) error { return nil }
 func ForkExec(string, []string, any) (int, error) { return 0, nil }
+func Syscall(uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr, uintptr) { return 0, 0, 0 }
+func Syscall6(uintptr, uintptr, uintptr, uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr, uintptr) { return 0, 0, 0 }
+func RawSyscall(uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr, uintptr) { return 0, 0, 0 }
+func RawSyscall6(uintptr, uintptr, uintptr, uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr, uintptr) { return 0, 0, 0 }
+func SyscallNoError(uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr) { return 0, 0 }
+func RawSyscallNoError(uintptr, uintptr, uintptr, uintptr) (uintptr, uintptr) { return 0, 0 }
+type SignalfdSiginfo struct { Syscall int32 }
 `,
 		"internal/helperproto/types.go": `package helperproto
 type Request struct {
@@ -472,6 +647,11 @@ func ExecutePersistentProfile() error {
 	argv := append([]string{profile.Executable}, profile.Arguments...)
 	return unix.Exec(profile.Executable, argv, profile.Environment)
 }
+func assertAppliedIdentity() {
+	_, _, _ = unix.Syscall6(unix.SYS_PRCTL, unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0, 0)
+	_, _, _ = unix.Syscall6(unix.SYS_PRCTL, unix.PR_CAPBSET_READ, 0, 0, 0, 0, 0)
+	_, _, _ = unix.Syscall6(unix.SYS_PRCTL, unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_IS_SET, 0, 0, 0, 0)
+}
 `,
 		"internal/process/managed_exec_linux.go": `package process
 import "golang.org/x/sys/unix"
@@ -483,6 +663,28 @@ func Execute() error {
 	argv := append([]string{authority.Service.Executable}, authority.Service.Arguments...)
 	return unix.Exec(authority.Service.Executable, argv, environment)
 }
+`,
+		"internal/process/listen_guard_linux.go": `package process
+import "golang.org/x/sys/unix"
+func openOrCreateListenGuardMap() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
+func verifyListenGuardMap() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
+func ensureListenGuardLink() {
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+}
+func verifyListenGuardLink() {
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
+}
+func updateListenGuardUID() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
+func pinBPF() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
+func getPinnedBPF() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
+`,
+		"internal/safety/emergency_linux.go": `package safety
+import "golang.org/x/sys/unix"
+func rawLstat() { _, _, _ = unix.Syscall6(unix.SYS_NEWFSTATAT, 0, 0, 0, 0, 0, 0) }
 `,
 		"internal/qualification/generator_linux.go": `package qualification
 import (

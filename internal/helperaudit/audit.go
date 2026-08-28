@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,21 @@ var processFunctions = map[string]bool{
 	"syscall.StartProcess":           true,
 	"golang.org/x/sys/unix.Exec":     true,
 	"golang.org/x/sys/unix.ForkExec": true,
+}
+
+var syscallWrappers = map[string]bool{
+	"golang.org/x/sys/unix.RawSyscall":        true,
+	"golang.org/x/sys/unix.RawSyscall6":       true,
+	"golang.org/x/sys/unix.RawSyscallNoError": true,
+	"golang.org/x/sys/unix.Syscall":           true,
+	"golang.org/x/sys/unix.Syscall6":          true,
+	"golang.org/x/sys/unix.SyscallNoError":    true,
+	"syscall.AllThreadsSyscall":               true,
+	"syscall.AllThreadsSyscall6":              true,
+	"syscall.RawSyscall":                      true,
+	"syscall.RawSyscall6":                     true,
+	"syscall.Syscall":                         true,
+	"syscall.Syscall6":                        true,
 }
 
 var launchMethods = map[string]bool{
@@ -64,6 +80,9 @@ var expectedCensus = []struct {
 	{"generator build output", 1},
 	{"generator build Dir", 1},
 	{"generator build Env", 1},
+	{"raw SYS_BPF", 11},
+	{"raw SYS_NEWFSTATAT", 1},
+	{"raw SYS_PRCTL", 3},
 }
 
 type listedPackage struct {
@@ -72,6 +91,8 @@ type listedPackage struct {
 	Export     string
 	GoFiles    []string
 	CgoFiles   []string
+	SFiles     []string
+	SysoFiles  []string
 	Incomplete bool
 	Error      *struct{ Err string }
 	Module     *struct{ Main bool }
@@ -125,7 +146,7 @@ func Run(root string) error {
 		files := make([]*ast.File, 0, len(packageInfo.files))
 		audits := make([]fileAudit, 0, len(packageInfo.files))
 		for _, path := range packageInfo.files {
-			file, parseErr := parser.ParseFile(fileSet, path, nil, 0)
+			file, parseErr := parser.ParseFile(fileSet, path, nil, parser.ParseComments)
 			if parseErr != nil {
 				return parseErr
 			}
@@ -153,6 +174,11 @@ func Run(root string) error {
 		}
 		for _, file := range audits {
 			if err := state.auditProcessReferences(file, info); err != nil {
+				return err
+			}
+		}
+		for _, file := range audits {
+			if err := state.auditSyscallReferences(file, info); err != nil {
 				return err
 			}
 		}
@@ -225,8 +251,11 @@ func loadPackages(root string) ([]sourcePackage, map[string]string, error) {
 		if item.Export != "" {
 			exports[item.ImportPath] = item.Export
 		}
-		if item.Module == nil || !item.Module.Main || !insideProductionTree(root, item.Dir) || filepath.Clean(item.Dir) == filepath.Join(root, "internal", "helperaudit") {
+		if item.Module == nil || !item.Module.Main || !insideModuleTree(root, item.Dir) || filepath.Clean(item.Dir) == filepath.Join(root, "internal", "helperaudit") {
 			continue
+		}
+		if len(item.SFiles) != 0 || len(item.SysoFiles) != 0 {
+			return nil, nil, fmt.Errorf("audited production package %s contains native source that go/types cannot prove", item.ImportPath)
 		}
 		files := append(append([]string(nil), item.GoFiles...), item.CgoFiles...)
 		sort.Strings(files)
@@ -279,15 +308,19 @@ func fixedGoEnvironment(toolchain string) []string {
 	return environment
 }
 
-func insideProductionTree(root, directory string) bool {
+func insideModuleTree(root, directory string) bool {
 	relative, err := filepath.Rel(root, directory)
-	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return false
-	}
-	return relative == "internal" || strings.HasPrefix(relative, "internal"+string(filepath.Separator)) || relative == "cmd" || strings.HasPrefix(relative, "cmd"+string(filepath.Separator))
+	return err == nil && !filepath.IsAbs(relative) && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func auditForbiddenLiterals(file fileAudit) error {
+	for _, group := range file.file.Comments {
+		for _, comment := range group.List {
+			if comment.Text == "//go:linkname" || strings.HasPrefix(comment.Text, "//go:linkname ") || strings.HasPrefix(comment.Text, "//go:linkname\t") {
+				return fmt.Errorf("production source %s uses go:linkname outside go/types identity", file.relative)
+			}
+		}
+	}
 	for _, imported := range file.file.Imports {
 		path, err := strconv.Unquote(imported.Path.Value)
 		if err == nil && (path == "internal/helperaudit" || strings.HasSuffix(path, "/internal/helperaudit")) {
@@ -337,6 +370,69 @@ func (state *auditState) auditProcessReferences(file fileAudit, info *types.Info
 		return auditErr == nil
 	})
 	return auditErr
+}
+
+func (state *auditState) auditSyscallReferences(file fileAudit, info *types.Info) error {
+	var auditErr error
+	ast.Inspect(file.file, func(node ast.Node) bool {
+		if auditErr != nil {
+			return false
+		}
+		identifier, ok := node.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		function, ok := info.Uses[identifier].(*types.Func)
+		if !ok || function.Pkg() == nil || function.Parent() != function.Pkg().Scope() || !syscallWrappers[objectKey(function)] {
+			return true
+		}
+		expression := ast.Expr(identifier)
+		if selector, ok := file.parents[identifier].(*ast.SelectorExpr); ok && selector.Sel == identifier {
+			expression = selector
+		}
+		call, ok := file.parents[expression].(*ast.CallExpr)
+		if !ok || call.Fun != expression {
+			auditErr = fmt.Errorf("syscall wrapper %s used as a function value in %s", objectKey(function), file.relative)
+			return false
+		}
+		if hasFunctionLiteralAncestor(call, file.parents) {
+			auditErr = fmt.Errorf("syscall wrapper call is hidden in a function literal in %s", file.relative)
+			return false
+		}
+		auditErr = state.allowSyscallCall(file, info, call, function)
+		return auditErr == nil
+	})
+	return auditErr
+}
+
+func (state *auditState) allowSyscallCall(file fileAudit, info *types.Info, call *ast.CallExpr, function types.Object) error {
+	wrapper := objectKey(function)
+	if len(call.Args) == 0 {
+		return fmt.Errorf("syscall wrapper %s has no proven syscall number in %s", wrapper, file.relative)
+	}
+	numberObject := expressionObject(info, call.Args[0])
+	number := objectKey(numberObject)
+	if _, constant := numberObject.(*types.Const); !constant {
+		return fmt.Errorf("syscall wrapper %s uses a dynamic or unproven syscall number in %s", wrapper, file.relative)
+	}
+	declaration := enclosingDeclaration(file.file, call.Pos())
+	count := ""
+	switch {
+	case wrapper == "golang.org/x/sys/unix.Syscall" && number == "golang.org/x/sys/unix.SYS_BPF" && file.relative == "internal/process/listen_guard_linux.go" && declarationNameIs(declaration, "openOrCreateListenGuardMap", "verifyListenGuardMap", "ensureListenGuardLink", "verifyListenGuardLink", "updateListenGuardUID", "pinBPF", "getPinnedBPF"):
+		count = "raw SYS_BPF"
+	case wrapper == "golang.org/x/sys/unix.Syscall6" && number == "golang.org/x/sys/unix.SYS_NEWFSTATAT" && file.relative == "internal/safety/emergency_linux.go" && declarationNameIs(declaration, "rawLstat"):
+		count = "raw SYS_NEWFSTATAT"
+	case wrapper == "golang.org/x/sys/unix.Syscall6" && number == "golang.org/x/sys/unix.SYS_PRCTL" && file.relative == "internal/child/executor_linux.go" && declarationNameIs(declaration, "assertAppliedIdentity"):
+		count = "raw SYS_PRCTL"
+	default:
+		return fmt.Errorf("raw syscall %s through %s is outside the fixed authority in %s", number, wrapper, file.relative)
+	}
+	state.counts[count]++
+	return nil
+}
+
+func declarationNameIs(declaration *ast.FuncDecl, names ...string) bool {
+	return declaration != nil && declaration.Recv == nil && slices.Contains(names, declaration.Name.Name)
 }
 
 func (state *auditState) allowProcessCall(file fileAudit, info *types.Info, call *ast.CallExpr, function types.Object) error {
@@ -739,6 +835,17 @@ func identifierObject(info *types.Info, expression ast.Expr) types.Object {
 		return nil
 	}
 	return info.Uses[identifier]
+}
+
+func expressionObject(info *types.Info, expression ast.Expr) types.Object {
+	switch value := unparenthesized(expression).(type) {
+	case *ast.Ident:
+		return info.Uses[value]
+	case *ast.SelectorExpr:
+		return info.Uses[value.Sel]
+	default:
+		return nil
+	}
 }
 
 func assignedObject(call *ast.CallExpr, parents map[ast.Node]ast.Node, info *types.Info) types.Object {
