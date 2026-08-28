@@ -5,6 +5,10 @@ package control
 import (
 	"context"
 	"errors"
+	"lanpanel/internal/challenge"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/nginx"
+	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -52,6 +56,52 @@ func TestActivationAuthorityFailurePrecedesPhysicalWork(t *testing.T) {
 	entries, readDirErr := os.ReadDir(root)
 	if readDirErr != nil || len(entries) != 1 {
 		t.Fatalf("authority failure created physical output: entries=%v err=%v", entries, readDirErr)
+	}
+}
+
+func TestHeadscaleChallengeRemovalProspectiveBaseIsGuarded(t *testing.T) {
+	rendered := testRendered(t)
+	identity := testCertificateIdentity(IssueRequest{JobID: "job_control", PlanID: "plan_control", IntentGeneration: 1, CertificateID: rendered.Candidate.CertificateID, BindingDigest: rendered.Candidate.CertificateBinding, Domain: rendered.Candidate.ControlDomain})
+	bundle, err := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := safety.ChallengePending{Generation: bundle.Entry.Generation + 1, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: identity.ID, Host: rendered.Candidate.ControlDomain, Hosts: []string{rendered.Candidate.ControlDomain}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/" + identity.ID, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
+	prepared, err := challenge.PreparedHTTP("headscale", pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	challengeEntry, err := headscaleChallengeEntry(bundle, prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := nginx.Manifest{SchemaVersion: nginx.ManifestSchema, InstallationID: bundle.InstallationID, GenerationID: "gen_control", DefaultCertFingerprint: testDigest("default"), MainDigest: testDigest("main"), SanitizerDigest: testDigest("sanitizer"), Entries: []nginx.Entry{challengeEntry}}
+	prospective, err := prospectiveCertificateChallengeRemoval(nginx.ActivationSnapshot{Manifest: manifest, EntryPresent: true, Entry: challengeEntry}, bundle, challengeEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := AppliedIdentity(bundle.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := domain.Installation{Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity}}}
+	state := safety.EmptyState()
+	state.Headscale.GenerationSequence = pending.Generation
+	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: identity.Generation, Fingerprint: identity.Fingerprint, Binding: identity.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
+	state.Headscale.ControlEntryDigest = bundle.Entry.Digest
+	state.Headscale.ChallengePending = &pending
+	input := nginx.GuardInput{Action: nginx.GuardReload, Manifest: prospective, Safety: state, Installation: &installation, Ownership: map[string]string{}, Now: identity.LastTrustedWall}
+	if decision := nginx.Guard(input); !decision.Allowed {
+		t.Fatalf("valid Headscale challenge removal base rejected: %+v", decision)
+	}
+	input.Now = identity.NotAfter
+	if decision := nginx.Guard(input); decision.Allowed {
+		t.Fatal("expired Headscale base control entry was restored by challenge removal")
+	}
+	input.Now = identity.LastTrustedWall
+	input.Safety.Headscale.ControlEntryDigest = testDigest("foreign-control")
+	if decision := nginx.Guard(input); decision.Allowed {
+		t.Fatal("changed Headscale base control entry was restored by challenge removal")
 	}
 }
 

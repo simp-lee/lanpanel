@@ -14,7 +14,6 @@ import (
 	"lanpanel/internal/challenge"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
-	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/safety"
@@ -293,12 +292,12 @@ func (host *ActivationHost) certificateChallengeRuntime(runtimeHost nginxactivat
 	}
 }
 
-func (host *ActivationHost) ActivateCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared, state safety.State, installation domain.Installation, ownershipAuthority map[string]string) error {
+func (host *ActivationHost) ActivateCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared, authority nginxactivation.ChallengeReloadAuthority) error {
 	entry, err := headscaleChallengeEntry(bundle, prepared)
 	if err != nil {
 		return err
 	}
-	diskSnapshot, prospective, err := nginxactivation.PrepareChallengeExpansion(host.nginxPaths, host.owner, entry, nginxactivation.ChallengeReloadAuthority{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()})
+	diskSnapshot, prospective, err := nginxactivation.PrepareChallengeExpansion(host.nginxPaths, host.owner, entry, authority)
 	if err != nil {
 		return fmt.Errorf("headscale challenge reload rejected: %w", err)
 	}
@@ -313,13 +312,20 @@ func (host *ActivationHost) ActivateCertificateChallenge(ctx context.Context, bu
 	if err != nil || priorRuntime.Master == nil {
 		return fmt.Errorf("headscale challenge prior Nginx runtime unavailable: %w", err)
 	}
-	_, err = nginxactivation.CommitChallengeGraph(ctx, host.nginxPaths, host.owner, entry, diskSnapshot, prospective, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
+	_, err = nginxactivation.CommitChallengeGraph(ctx, host.nginxPaths, host.owner, entry, diskSnapshot, prospective, authority, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(changeCtx, host.nginxPaths, host.owner, entry)
 	}, host.certificateChallengeRuntime(runtimeHost, priorRuntime))
 	return err
 }
 
-func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared) error {
+func prospectiveCertificateChallengeRemoval(snapshot nginx.ActivationSnapshot, bundle ActivationBundle, entry nginx.Entry) (nginx.Manifest, error) {
+	if !snapshot.EntryPresent || !sameNginxEntry(snapshot.Entry, entry) && !sameNginxEntry(snapshot.Entry, bundle.Entry) {
+		return nginx.Manifest{}, fmt.Errorf("headscale challenge graph changed before removal")
+	}
+	return nginx.ProspectiveManifest(snapshot.Manifest, bundle.Entry)
+}
+
+func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared, authority nginxactivation.ChallengeReloadAuthority) error {
 	entry, err := headscaleChallengeEntry(bundle, prepared)
 	if err != nil {
 		return err
@@ -328,10 +334,7 @@ func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bund
 	if err != nil {
 		return err
 	}
-	if !diskSnapshot.EntryPresent || !sameNginxEntry(diskSnapshot.Entry, entry) && !sameNginxEntry(diskSnapshot.Entry, bundle.Entry) {
-		return fmt.Errorf("headscale challenge graph changed before removal")
-	}
-	prospective, err := nginx.ProspectiveManifest(diskSnapshot.Manifest, bundle.Entry)
+	prospective, err := prospectiveCertificateChallengeRemoval(diskSnapshot, bundle, entry)
 	if err != nil {
 		return err
 	}
@@ -351,7 +354,7 @@ func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bund
 	if running {
 		runtime = host.certificateChallengeRuntime(runtimeHost, priorRuntime)
 	}
-	_, err = nginxactivation.CommitChallengeGraph(ctx, host.nginxPaths, host.owner, entry, diskSnapshot, prospective, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
+	_, err = nginxactivation.CommitChallengeGraph(ctx, host.nginxPaths, host.owner, entry, diskSnapshot, prospective, authority, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(changeCtx, host.nginxPaths, host.owner, bundle.Entry)
 	}, runtime)
 	return err

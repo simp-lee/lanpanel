@@ -64,9 +64,12 @@ func PrepareChallengeExpansion(paths nginx.Paths, owner filetxn.Owner, entry ngi
 	return snapshot, prospective, nil
 }
 
-func CommitChallengeGraph(ctx context.Context, paths nginx.Paths, owner filetxn.Owner, candidate nginx.Entry, snapshot nginx.ActivationSnapshot, attempted nginx.Manifest, change func(context.Context) (nginx.Manifest, []string, error), runtime ChallengeGraphRuntime) (Result, error) {
+func CommitChallengeGraph(ctx context.Context, paths nginx.Paths, owner filetxn.Owner, candidate nginx.Entry, snapshot nginx.ActivationSnapshot, attempted nginx.Manifest, authority ChallengeReloadAuthority, change func(context.Context) (nginx.Manifest, []string, error), runtime ChallengeGraphRuntime) (Result, error) {
 	if change == nil || runtime.Activate == nil || runtime.Observe == nil || runtime.Restore == nil || nginx.ValidateManifest(snapshot.Manifest) != nil || nginx.ValidateManifest(attempted) != nil {
 		return Result{}, fmt.Errorf("challenge graph transaction authority is invalid")
+	}
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: attempted, Safety: authority.Safety, Installation: &authority.Installation, Ownership: authority.Ownership, Now: authority.ObservedAt}); !decision.Allowed {
+		return Result{}, fmt.Errorf("challenge graph reload rejected before mutation: %s", decision.Reason)
 	}
 	manifest, modified, changeErr := change(ctx)
 	if changeErr == nil {
@@ -89,7 +92,11 @@ func CommitChallengeGraph(ctx context.Context, paths nginx.Paths, owner filetxn.
 	_, restoreDiskErr := nginx.RestoreActivation(recoveryCtx, paths, owner, candidate, snapshot)
 	var restoreRuntimeErr error
 	if restoreDiskErr == nil {
-		restoreRuntimeErr = runtime.Restore(recoveryCtx, snapshot.Manifest, workers)
+		if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: snapshot.Manifest, Safety: authority.Safety, Installation: &authority.Installation, Ownership: authority.Ownership, Now: authority.ObservedAt}); !decision.Allowed {
+			restoreRuntimeErr = fmt.Errorf("challenge graph rollback reload rejected: %s", decision.Reason)
+		} else {
+			restoreRuntimeErr = runtime.Restore(recoveryCtx, snapshot.Manifest, workers)
+		}
 	}
 	restoreErr := errors.Join(observeErr, restoreDiskErr, restoreRuntimeErr)
 	return Result{}, &Failure{Cause: errors.Join(changeErr, restoreErr), PriorRestored: restoreErr == nil}
@@ -135,12 +142,12 @@ func (host Host) ActivateChallenge(ctx context.Context, candidate challenge.Prep
 			return err
 		},
 	}
-	return CommitChallengeGraph(ctx, host.Paths, host.Owner, *candidate.Entry, snapshot, prospective, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
+	return CommitChallengeGraph(ctx, host.Paths, host.Owner, *candidate.Entry, snapshot, prospective, authority, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(changeCtx, host.Paths, host.Owner, *candidate.Entry)
 	}, runtime)
 }
 
-func (host Host) RemoveChallenge(ctx context.Context, candidate challenge.Prepared) (Result, error) {
+func (host Host) RemoveChallenge(ctx context.Context, candidate challenge.Prepared, authority ChallengeReloadAuthority) (Result, error) {
 	if candidate.Entry == nil {
 		return Result{}, nil
 	}
@@ -187,7 +194,7 @@ func (host Host) RemoveChallenge(ctx context.Context, candidate challenge.Prepar
 			},
 		}
 	}
-	return CommitChallengeGraph(ctx, host.Paths, host.Owner, *candidate.Entry, snapshot, prospective, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
+	return CommitChallengeGraph(ctx, host.Paths, host.Owner, *candidate.Entry, snapshot, prospective, authority, func(changeCtx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.RemoveEntry(changeCtx, host.Paths, host.Owner, *candidate.Entry)
 	}, runtime)
 }

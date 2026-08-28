@@ -216,6 +216,30 @@ func runResourceUpdateJournalRecovery(t *testing.T, prior domain.AppResource, pr
 	}
 }
 
+func TestChallengeRecoveryReloadAuthorityIsRereadInsideExposureLock(t *testing.T) {
+	fixture := newResourceRecoveryFixture(t, recoveryResourceInstallation(nil))
+	service := fixture.open(t)
+	defer func() { _ = service.Close() }()
+	if _, err := challengeReloadAuthorityForExposure(service, nil); err == nil {
+		t.Fatal("challenge reload authority was read without the exposure lock")
+	}
+	before, err := service.safety.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceID := "res_00000000000000000000000000000001"
+	set, mutation, exposure := fixture.acquire(t, service, "resource/"+resourceID)
+	defer func() { _ = errors.Join(operations.ReleaseExposure(mutation, exposure), set.Close()) }()
+	record := writeRecoveryOwnershipAndSafety(t, service, exposure, resourceID)
+	authority, err := challengeReloadAuthorityForExposure(service, exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.Resources) != 0 || findSafetyResource(authority.Safety, resourceID) == nil || authority.Ownership[resourceID] != record.Checksum || authority.Installation.InstallationID != "ins_00000000000000000000000000000001" || authority.ObservedAt.IsZero() {
+		t.Fatalf("locked challenge reload authority is stale: before=%#v authority=%#v", before, authority)
+	}
+}
+
 type resourceRecoveryFixture struct {
 	root  string
 	owner filetxn.Owner

@@ -1543,16 +1543,16 @@ func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context
 	if execution == nil || execution.Challenge.Entry == nil {
 		return nil
 	}
+	authority, err := execution.challengeReloadAuthority()
+	if err != nil {
+		return err
+	}
 	if execution.Headscale {
-		state, stateErr := execution.Service.safety.ReadForRecovery(execution.Exposure)
-		if stateErr != nil {
-			return stateErr
-		}
-		if state.Headscale.CertificateExpiry != nil {
-			if state.Headscale.ChallengePending == nil {
+		if authority.Safety.Headscale.CertificateExpiry != nil {
+			if authority.Safety.Headscale.ChallengePending == nil {
 				return nil
 			}
-			_, err := host.RemoveChallenge(ctx, execution.Challenge)
+			_, err := host.RemoveChallenge(ctx, execution.Challenge, authority)
 			return err
 		}
 		bundle, err := execution.headscaleActivationBundle()
@@ -1563,9 +1563,9 @@ func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context
 		if err != nil {
 			return err
 		}
-		return controlHost.RemoveCertificateChallenge(ctx, bundle, execution.Challenge)
+		return controlHost.RemoveCertificateChallenge(ctx, bundle, execution.Challenge, authority)
 	}
-	_, err := host.RemoveChallenge(ctx, execution.Challenge)
+	_, err = host.RemoveChallenge(ctx, execution.Challenge, authority)
 	return err
 }
 
@@ -1614,7 +1614,11 @@ func (execution *CertificateExecution) PreparePublicationCertificate(ctx context
 		return domain.CertificateBundleIdentity{}, err
 	}
 	if execution.Challenge.Entry != nil {
-		if _, err := host.RemoveChallenge(ctx, execution.Challenge); err != nil {
+		authority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr != nil {
+			return domain.CertificateBundleIdentity{}, authorityErr
+		}
+		if _, err := host.RemoveChallenge(ctx, execution.Challenge, authority); err != nil {
 			return domain.CertificateBundleIdentity{}, err
 		}
 	}
@@ -1968,12 +1972,18 @@ func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Co
 	return errors.Join(cause, stopErr, updateErr)
 }
 
-func (execution *CertificateExecution) challengeReloadAuthority() (activation.ChallengeReloadAuthority, error) {
-	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+func challengeReloadAuthorityForExposure(service *FixedService, exposure *locks.Lease) (activation.ChallengeReloadAuthority, error) {
+	if service == nil {
+		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge reload authority unavailable")
+	}
+	if exposure == nil || exposure.Authority() != service.safety.LockAuthority() || !exposure.Holds(locks.Exposure) {
+		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge reload authority requires exposure lock")
+	}
+	state, err := service.safety.Read()
 	if err != nil {
 		return activation.ChallengeReloadAuthority{}, err
 	}
-	document, err := execution.Service.normal.Read()
+	document, err := service.normal.Read()
 	if err != nil {
 		return activation.ChallengeReloadAuthority{}, err
 	}
@@ -1985,11 +1995,18 @@ func (execution *CertificateExecution) challengeReloadAuthority() (activation.Ch
 	if err != nil {
 		return activation.ChallengeReloadAuthority{}, err
 	}
-	ownershipAuthority, err := fixedOwnershipAuthority(execution.Service.ownership)
+	ownershipAuthority, err := fixedOwnershipAuthority(service.ownership)
 	if err != nil {
 		return activation.ChallengeReloadAuthority{}, err
 	}
 	return activation.ChallengeReloadAuthority{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
+}
+
+func (execution *CertificateExecution) challengeReloadAuthority() (activation.ChallengeReloadAuthority, error) {
+	if execution == nil {
+		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge reload execution authority unavailable")
+	}
+	return challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
 }
 
 func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) error {
@@ -2016,7 +2033,7 @@ func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) er
 				if hostErr != nil {
 					return hostErr
 				}
-				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, authority.Safety, authority.Installation, authority.Ownership); err != nil {
+				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, authority); err != nil {
 					return err
 				}
 			}
@@ -2937,6 +2954,13 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			return err
 		}
 		if pending.Method == "http-01" {
+			authority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+			freshResource := findSafetyResource(authority.Safety, resource.ResourceID)
+			if authorityErr != nil || freshResource == nil || freshResource.ChallengePending == nil || !reflect.DeepEqual(*freshResource.ChallengePending, *pending) {
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
+				return errors.Join(authorityErr, fmt.Errorf("interrupted HTTP challenge authority changed under exposure lock"))
+			}
 			host, hostErr := activation.NewFixedHost()
 			if hostErr != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
@@ -2949,7 +2973,7 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				_ = mutationSet.Close()
 				return auditErr
 			}
-			expected, prepareErr := challenge.PreparedHTTP(resource.ResourceID, *pending)
+			expected, prepareErr := challenge.PreparedHTTP(resource.ResourceID, *freshResource.ChallengePending)
 			if prepareErr != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
@@ -2963,7 +2987,7 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 					return fmt.Errorf("interrupted HTTP challenge graph identity changed")
 				}
 			}
-			if _, err := host.RemoveChallenge(ctx, expected); err != nil {
+			if _, err := host.RemoveChallenge(ctx, expected, authority); err != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
 				return err

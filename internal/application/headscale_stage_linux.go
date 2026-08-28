@@ -338,15 +338,14 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 		return control.IssueRequest{}, err
 	}
 	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
-		ownershipAuthority, ownershipErr := fixedOwnershipAuthority(execution.Service.ownership)
-		if ownershipErr != nil {
-			return control.IssueRequest{}, ownershipErr
+		authority, authorityErr := challengeReloadAuthorityForExposure(execution.Service, exposure)
+		if authorityErr != nil || authority.Safety.Headscale.ChallengePending == nil || !challenge.Matches(*authority.Safety.Headscale.ChallengePending, prepared) {
+			return control.IssueRequest{}, errors.Join(authorityErr, fmt.Errorf("headscale challenge reload authority changed under exposure lock"))
 		}
 		host, err := activation.NewFixedHost()
 		if err != nil {
 			return control.IssueRequest{}, err
 		}
-		authority := activation.ChallengeReloadAuthority{Safety: next, Installation: execution.Installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}
 		if _, err := host.ActivateChallenge(ctx, prepared, authority); err != nil {
 			return control.IssueRequest{}, err
 		}
@@ -550,11 +549,15 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 		return err
 	}
 	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
+		authority, authorityErr := challengeReloadAuthorityForExposure(execution.Service, exposure)
+		if authorityErr != nil || authority.Safety.Headscale.ChallengePending == nil || !challenge.Matches(*authority.Safety.Headscale.ChallengePending, execution.Challenge) {
+			return errors.Join(authorityErr, fmt.Errorf("headscale challenge removal authority changed under exposure lock"))
+		}
 		nginxHost, err := activation.NewFixedHost()
 		if err != nil {
 			return err
 		}
-		if _, err := nginxHost.RemoveChallenge(ctx, execution.Challenge); err != nil {
+		if _, err := nginxHost.RemoveChallenge(ctx, execution.Challenge, authority); err != nil {
 			return err
 		}
 		if err := acme.VerifyWebrootEmpty(identity.ID, execution.StageUID, execution.StageGID); err != nil {
@@ -681,9 +684,16 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 			}
 		}
 		if execution.Authority.Binding.Method == acme.ChallengeHTTP01 && execution.Challenge.Entry != nil {
-			nginxHost, err := activation.NewFixedHost()
+			authority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+			if err == nil && (authority.Safety.Headscale.ChallengePending == nil || !challenge.Matches(*authority.Safety.Headscale.ChallengePending, execution.Challenge)) {
+				err = fmt.Errorf("headscale failed challenge removal authority changed under exposure lock")
+			}
 			if err == nil {
-				_, err = nginxHost.RemoveChallenge(ctx, execution.Challenge)
+				var nginxHost activation.Host
+				nginxHost, err = activation.NewFixedHost()
+				if err == nil {
+					_, err = nginxHost.RemoveChallenge(ctx, execution.Challenge, authority)
+				}
 			}
 			if err != nil {
 				errs = append(errs, err)
@@ -917,7 +927,16 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 		returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure), mutationSet.Close())
 	}()
 	if pending.Method == "http-01" {
-		prepared, prepareErr := challenge.PreparedHTTP("headscale", pending)
+		authority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+		if authorityErr != nil || authority.Safety.Headscale.ChallengePending == nil || !reflect.DeepEqual(*authority.Safety.Headscale.ChallengePending, pending) {
+			return errors.Join(authorityErr, fmt.Errorf("interrupted Headscale renewal authority changed under exposure lock"))
+		}
+		lockedControlJournal, lockedControlErr := store.Read()
+		if lockedControlErr != nil || !reflect.DeepEqual(lockedControlJournal, controlJournal) {
+			return errors.Join(lockedControlErr, fmt.Errorf("interrupted Headscale renewal control authority changed under exposure lock"))
+		}
+		controlJournal = lockedControlJournal
+		prepared, prepareErr := challenge.PreparedHTTP("headscale", *authority.Safety.Headscale.ChallengePending)
 		if prepareErr != nil {
 			return prepareErr
 		}
@@ -926,7 +945,7 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 			if hostErr != nil {
 				return hostErr
 			}
-			if _, removeErr := host.RemoveChallenge(ctx, prepared); removeErr != nil {
+			if _, removeErr := host.RemoveChallenge(ctx, prepared, authority); removeErr != nil {
 				return removeErr
 			}
 		} else {
@@ -938,7 +957,7 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 			if hostErr != nil {
 				return hostErr
 			}
-			if removeErr := host.RemoveCertificateChallenge(ctx, bundle, prepared); removeErr != nil {
+			if removeErr := host.RemoveCertificateChallenge(ctx, bundle, prepared, authority); removeErr != nil {
 				return removeErr
 			}
 		}
@@ -1090,12 +1109,19 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 	}
 	var closureErr error
 	if pending.Method == "http-01" {
-		prepared, prepareErr := challenge.PreparedHTTP("headscale", pending)
+		authority, prepareErr := challengeReloadAuthorityForExposure(service, exposure)
+		if prepareErr == nil && (authority.Safety.Headscale.ChallengePending == nil || !reflect.DeepEqual(*authority.Safety.Headscale.ChallengePending, pending)) {
+			prepareErr = fmt.Errorf("interrupted Headscale challenge authority changed under exposure lock")
+		}
+		var prepared challenge.Prepared
+		if prepareErr == nil {
+			prepared, prepareErr = challenge.PreparedHTTP("headscale", *authority.Safety.Headscale.ChallengePending)
+		}
 		if prepareErr == nil {
 			var nginxHost activation.Host
 			nginxHost, prepareErr = activation.NewFixedHost()
 			if prepareErr == nil {
-				_, prepareErr = nginxHost.RemoveChallenge(ctx, prepared)
+				_, prepareErr = nginxHost.RemoveChallenge(ctx, prepared, authority)
 			}
 		}
 		closureErr = errors.Join(closureErr, prepareErr)

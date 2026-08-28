@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/challenge"
 	"lanpanel/internal/closure"
@@ -93,10 +94,32 @@ func assertChallengeSnapshotRestored(t *testing.T, paths nginx.Paths, owner file
 	if err != nil || !bytes.Equal(manifestBytes, snapshot.ManifestBytes) {
 		t.Fatalf("manifest bytes were not restored exactly: %v", err)
 	}
-	entryBytes, err := os.ReadFile(filepath.Join(paths.ConfigRoot, filepath.FromSlash(candidate.Relative)))
+	entryPath := filepath.Join(paths.ConfigRoot, filepath.FromSlash(candidate.Relative))
+	if !snapshot.EntryPresent {
+		if _, err := os.Lstat(entryPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("entry absent from snapshot remains after restoration: %v", err)
+		}
+		return
+	}
+	entryBytes, err := os.ReadFile(entryPath)
 	if err != nil || !bytes.Equal(entryBytes, snapshot.EntryBytes) {
 		t.Fatalf("entry bytes were not restored exactly: %v", err)
 	}
+}
+
+func challengeReloadTestAuthority(prepared challenge.Prepared) ChallengeReloadAuthority {
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: prepared.Entry.ResourceID, GenerationSequence: prepared.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &prepared.Safety}}
+	return ChallengeReloadAuthority{Safety: state, Installation: domain.Installation{}, Ownership: map[string]string{prepared.Entry.ResourceID: challengeTestDigest}, ObservedAt: time.Now().UTC()}
+}
+
+func challengePreparedForEntry(prepared challenge.Prepared, entry nginx.Entry) challenge.Prepared {
+	prepared.Entry = &entry
+	prepared.Safety.Generation = entry.Generation
+	prepared.Safety.Host = entry.Domains[0]
+	prepared.Safety.Hosts = append([]string(nil), entry.Domains...)
+	prepared.Safety.Webroot = entry.Challenge.Webroot
+	return prepared
 }
 
 func TestChallengeExpansionGuardRejectsBeforeDiskMutation(t *testing.T) {
@@ -128,7 +151,10 @@ func TestChallengeInstallFaultsRestoreExactPriorGraph(t *testing.T) {
 		{name: "worker drain", stage: "wait", fault: waitFault},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			paths, owner, prepared, _ := challengeTransactionFixture(t)
+			paths, owner, prepared, prior := challengeTransactionFixture(t)
+			if _, _, err := nginx.RemoveEntry(context.Background(), paths, owner, prior); err != nil {
+				t.Fatal(err)
+			}
 			snapshot, err := nginx.SnapshotActivation(paths, owner, *prepared.Entry)
 			if err != nil {
 				t.Fatal(err)
@@ -163,7 +189,7 @@ func TestChallengeInstallFaultsRestoreExactPriorGraph(t *testing.T) {
 					return nil
 				},
 			}
-			_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, func(ctx context.Context) (nginx.Manifest, []string, error) {
+			_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, challengeReloadTestAuthority(prepared), func(ctx context.Context) (nginx.Manifest, []string, error) {
 				return nginx.InstallEntry(ctx, paths, owner, *prepared.Entry)
 			}, runtime)
 			var failure *Failure
@@ -202,7 +228,7 @@ func TestChallengeInstallReloadFaultRemovesNewEntry(t *testing.T) {
 			return nil
 		},
 	}
-	_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, func(ctx context.Context) (nginx.Manifest, []string, error) {
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, challengeReloadTestAuthority(prepared), func(ctx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(ctx, paths, owner, *prepared.Entry)
 	}, runtime)
 	var failure *Failure
@@ -218,40 +244,44 @@ func TestChallengeInstallReloadFaultRemovesNewEntry(t *testing.T) {
 	}
 }
 
-func TestChallengeRemovalReloadFaultRecreatesExactPriorEntry(t *testing.T) {
-	paths, owner, prepared, prior := challengeTransactionFixture(t)
-	expected := challenge.Prepared{Entry: &prior}
-	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reloadFault := errors.New("removal reload fault")
-	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { return reloadFault },
-		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity) error {
-			if !reflect.DeepEqual(manifest, snapshot.Manifest) {
-				t.Fatal("removal rollback runtime did not receive prior manifest")
+func TestChallengeRemovalTestAndReloadFaultsRecreateExactPriorEntry(t *testing.T) {
+	for _, stage := range []string{"nginx test", "nginx reload"} {
+		t.Run(stage, func(t *testing.T) {
+			paths, owner, prepared, prior := challengeTransactionFixture(t)
+			expected := challengePreparedForEntry(prepared, prior)
+			snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
+			if err != nil {
+				t.Fatal(err)
 			}
-			return nil
-		},
+			prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
+			if err != nil {
+				t.Fatal(err)
+			}
+			activationFault := fmt.Errorf("removal %s fault", stage)
+			runtime := ChallengeGraphRuntime{
+				Activate: func(context.Context, nginx.Manifest) error { return activationFault },
+				Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
+				Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity) error {
+					if !reflect.DeepEqual(manifest, snapshot.Manifest) {
+						t.Fatal("removal rollback runtime did not receive prior manifest")
+					}
+					return nil
+				},
+			}
+			_, err = CommitChallengeGraph(context.Background(), paths, owner, *expected.Entry, snapshot, prospective, challengeReloadTestAuthority(expected), func(ctx context.Context) (nginx.Manifest, []string, error) {
+				return nginx.RemoveEntry(ctx, paths, owner, *expected.Entry)
+			}, runtime)
+			var failure *Failure
+			if !errors.As(err, &failure) || !failure.PriorRestored || !errors.Is(err, activationFault) {
+				t.Fatalf("removal transaction error=%v", err)
+			}
+			assertChallengeSnapshotRestored(t, paths, owner, *prepared.Entry, snapshot)
+		})
 	}
-	_, err = CommitChallengeGraph(context.Background(), paths, owner, *expected.Entry, snapshot, prospective, func(ctx context.Context) (nginx.Manifest, []string, error) {
-		return nginx.RemoveEntry(ctx, paths, owner, *expected.Entry)
-	}, runtime)
-	var failure *Failure
-	if !errors.As(err, &failure) || !failure.PriorRestored || !errors.Is(err, reloadFault) {
-		t.Fatalf("removal transaction error=%v", err)
-	}
-	assertChallengeSnapshotRestored(t, paths, owner, *prepared.Entry, snapshot)
 }
 
 func TestStoppedChallengeRemovalCommitsAndVerifiesStoppedRuntime(t *testing.T) {
-	paths, owner, _, prior := challengeTransactionFixture(t)
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
 	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +295,8 @@ func TestStoppedChallengeRemovalCommitsAndVerifiesStoppedRuntime(t *testing.T) {
 		observations++
 		return closure.RuntimeSnapshot{ObservedAt: time.Now().UTC(), Workers: []closure.ProcessIdentity{}, Listeners: []closure.ListenerIdentity{}, Complete: true, Generation: manifest.GenerationID}, nil
 	})
-	result, err := CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, func(ctx context.Context) (nginx.Manifest, []string, error) {
+	expected := challengePreparedForEntry(prepared, prior)
+	result, err := CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, challengeReloadTestAuthority(expected), func(ctx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.RemoveEntry(ctx, paths, owner, prior)
 	}, runtime)
 	if err != nil || observations != 1 || !reflect.DeepEqual(result.Manifest, prospective) {
@@ -275,6 +306,197 @@ func TestStoppedChallengeRemovalCommitsAndVerifiesStoppedRuntime(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(manifest, prospective) {
 		t.Fatalf("stopped removal graph=%#v err=%v", manifest, err)
 	}
+}
+
+func TestChallengeRemovalGuardRejectsStopFenceBeforeMutationOrReload(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	expected := challengePreparedForEntry(prepared, prior)
+	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := safety.EmptyState()
+	state.GlobalClose = safety.GlobalClose{Phase: safety.GlobalCloseClosing, Generation: 1}
+	state.StopFenceSequence = 1
+	state.StopFence = &safety.StopFence{
+		Kind: safety.StopFenceContraction, OriginOperation: "operation", Scope: safety.FenceScope{Kind: "installation"}, FenceGeneration: 1,
+		CreatedAt: time.Unix(100, 0).UTC(), SafetyGenerations: []safety.MarkerGeneration{{Kind: "global_close", Generation: 1}},
+		OwnedGraphDigest: challengeTestDigest, InventoryDigest: challengeTestDigest, Observation: safety.StopObservation{ObservedAt: time.Unix(101, 0).UTC()}, AccessMayRemain: true,
+		Contraction: &safety.ContractionFence{Authorities: []safety.MarkerGeneration{{Kind: "global_close", Generation: 1}}, OwnershipDigest: challengeTestDigest, OperationRef: "intent/job_challenge"},
+	}
+	if err := safety.Validate(state); err != nil {
+		t.Fatal(err)
+	}
+	changed, reloaded := false, false
+	runtime := ChallengeGraphRuntime{
+		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+	}
+	authority := ChallengeReloadAuthority{Safety: state, Installation: domain.Installation{}, Ownership: map[string]string{}, ObservedAt: time.Now().UTC()}
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
+		changed = true
+		return nginx.RemoveEntry(ctx, paths, owner, *expected.Entry)
+	}, runtime)
+	if err == nil || changed || reloaded {
+		t.Fatalf("stop-fenced removal changed=%t reloaded=%t err=%v", changed, reloaded, err)
+	}
+	assertChallengeSnapshotRestored(t, paths, owner, prior, snapshot)
+}
+
+func TestChallengeRemovalGuardRejectsChangedOwnershipBeforeMutationOrReload(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	expected := challengePreparedForEntry(prepared, prior)
+	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/root/account.key", AccountKeyFingerprint: challengeTestDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
+	retained, err := challenge.Prepare(challenge.Request{ResourceID: "res_retained", PlanID: "plan_retained", Generation: 1, ConfigDigest: challengeTestDigest, Domains: []string{"retained.example.test"}, Binding: binding, CertificateIdentity: "cert_retained", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_retained", BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nginx.InstallEntry(context.Background(), paths, owner, *retained.Entry); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := challengeReloadTestAuthority(expected)
+	authority.Safety.Resources = append(authority.Safety.Resources, safety.ResourceSafety{ResourceID: retained.Entry.ResourceID, GenerationSequence: retained.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &retained.Safety})
+	authority.Ownership[retained.Entry.ResourceID] = "sha256:" + strings.Repeat("b", 64)
+	changed, reloaded := false, false
+	runtime := ChallengeGraphRuntime{
+		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+	}
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
+		changed = true
+		return nginx.RemoveEntry(ctx, paths, owner, prior)
+	}, runtime)
+	if err == nil || changed || reloaded {
+		t.Fatalf("ownership-mismatched removal changed=%t reloaded=%t err=%v", changed, reloaded, err)
+	}
+	assertChallengeSnapshotRestored(t, paths, owner, prior, snapshot)
+}
+
+func TestChallengeRemovalGuardRejectsExpiredRetainedAppBeforeMutationOrReload(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	expected := challengePreparedForEntry(prepared, prior)
+	now := time.Now().UTC().Truncate(time.Second)
+	certificate := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/cert-retained", BindingIdentity: "binding-retained", Generation: 1, Fingerprint: challengeTestDigest, SANIdentity: challengeTestDigest, ChainIdentity: challengeTestDigest, IssuerIdentity: challengeTestDigest, NotAfter: now.Add(-time.Minute).Format(time.RFC3339), LastTrustedWall: now.Add(-time.Hour).Format(time.RFC3339)}
+	entry := nginx.Entry{Kind: nginx.EntryApp, ResourceID: "res_retained", Relative: nginx.AppsDirectory + "/res_retained.conf", Digest: challengeTestDigest, Domains: []string{"retained.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: 1, Domain: &nginx.DomainSite{Hosts: []string{"retained.example.test"}, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", AuthMode: "public", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel/res_retained.sock"}}
+	manifest, _, err := nginx.InstallEntry(context.Background(), paths, owner, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, current := range manifest.Entries {
+		if current.Kind == nginx.EntryApp && current.ResourceID == entry.ResourceID {
+			entry = current
+		}
+	}
+	bundle := domain.PublicationBundle{ID: "bundle-retained", Generation: entry.Generation, ConfigDigest: challengeTestDigest, Kind: domain.PublicationDomainHTTPS, EndpointIdentity: challengeTestDigest, SiteIdentity: entry.Digest, ManagedPaths: []string{}, CredentialIDs: []string{}, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 80}, {Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: append([]string(nil), entry.Domains...), Certificate: certificate, Auth: domain.AuthBundleIdentity{Mode: domain.AppAccessPublic}, Static: domain.StaticBundleIdentity{Routes: []domain.StaticRouteBundleIdentity{}, RouteIdentities: []string{}}, GoAccess: domain.GoAccessBundleIdentity{Enabled: false}}}
+	app := domain.AppResource{ID: entry.ResourceID, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: entry.Domains[0], AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationPublished, LastAppliedBundle: &bundle}}
+	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := challengeReloadTestAuthority(expected)
+	authority.ObservedAt = now
+	authority.Installation.Resources = []domain.AppResource{app}
+	authority.Safety.Resources = append(authority.Safety.Resources, safety.ResourceSafety{ResourceID: entry.ResourceID, GenerationSequence: entry.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, LastTrustedWall: now.Add(-time.Hour), NotAfter: now.Add(-time.Minute)}})
+	authority.Ownership[entry.ResourceID] = challengeTestDigest
+	changed, reloaded := false, false
+	runtime := ChallengeGraphRuntime{
+		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+	}
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
+		changed = true
+		return nginx.RemoveEntry(ctx, paths, owner, prior)
+	}, runtime)
+	if err == nil || changed || reloaded {
+		t.Fatalf("expired-retained-App removal changed=%t reloaded=%t err=%v", changed, reloaded, err)
+	}
+	assertChallengeSnapshotRestored(t, paths, owner, prior, snapshot)
+}
+
+func TestChallengeRemovalAllowedAuthorityCommitsAndReloads(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	expected := challengePreparedForEntry(prepared, prior)
+	snapshot, err := nginx.SnapshotActivation(paths, owner, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := nginx.ProspectiveRemoval(snapshot.Manifest, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloads := 0
+	runtime := ChallengeGraphRuntime{
+		Activate: func(_ context.Context, manifest nginx.Manifest) error {
+			reloads++
+			if !reflect.DeepEqual(manifest, prospective) {
+				t.Fatal("removal reload did not receive guarded prospective manifest")
+			}
+			return nil
+		},
+		Observe: func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) {
+			t.Fatal("successful removal observed rollback")
+			return nil, nil
+		},
+		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error {
+			t.Fatal("successful removal rolled back")
+			return nil
+		},
+	}
+	result, err := CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, challengeReloadTestAuthority(expected), func(ctx context.Context) (nginx.Manifest, []string, error) {
+		return nginx.RemoveEntry(ctx, paths, owner, prior)
+	}, runtime)
+	if err != nil || reloads != 1 || !reflect.DeepEqual(result.Manifest, prospective) {
+		t.Fatalf("allowed removal result=%#v reloads=%d err=%v", result, reloads, err)
+	}
+}
+
+func TestChallengeRollbackReloadRequiresAuthorityForRestoredGraph(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	snapshot, err := nginx.SnapshotActivation(paths, owner, *prepared.Entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prospective, err := nginx.ProspectiveManifest(snapshot.Manifest, *prepared.Entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateErr := errors.New("reload failed")
+	restoredRuntime := false
+	runtime := ChallengeGraphRuntime{
+		Activate: func(context.Context, nginx.Manifest) error { return activateErr },
+		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
+		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error {
+			restoredRuntime = true
+			return nil
+		},
+	}
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, challengeReloadTestAuthority(prepared), func(ctx context.Context) (nginx.Manifest, []string, error) {
+		return nginx.InstallEntry(ctx, paths, owner, *prepared.Entry)
+	}, runtime)
+	var failure *Failure
+	if !errors.As(err, &failure) || failure.PriorRestored || !errors.Is(err, activateErr) || restoredRuntime {
+		t.Fatalf("unauthorized rollback failure=%#v runtimeRestored=%t err=%v", failure, restoredRuntime, err)
+	}
+	assertChallengeSnapshotRestored(t, paths, owner, prior, snapshot)
 }
 
 func TestChallengeGraphTransactionSuccessKeepsProspectiveGraph(t *testing.T) {
@@ -302,7 +524,7 @@ func TestChallengeGraphTransactionSuccessKeepsProspectiveGraph(t *testing.T) {
 			return nil
 		},
 	}
-	result, err := CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, func(ctx context.Context) (nginx.Manifest, []string, error) {
+	result, err := CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, prospective, challengeReloadTestAuthority(prepared), func(ctx context.Context) (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(ctx, paths, owner, *prepared.Entry)
 	}, runtime)
 	if err != nil || !reflect.DeepEqual(result.Manifest, prospective) || !reflect.DeepEqual(calls, []string{"test", "reload", "wait"}) {
