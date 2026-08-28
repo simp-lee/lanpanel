@@ -525,6 +525,78 @@ func TestDecodeInstallationRejectsNoncanonicalStaticRootIDs(t *testing.T) {
 	}
 }
 
+func TestDecodeInstallationUsesRuntimeStaticRelativePathGrammar(t *testing.T) {
+	const rootID = "static_00000000000000000000000000000001"
+	cases := []struct {
+		name         string
+		relativePath string
+		valid        bool
+	}{
+		{name: "backslash", relativePath: `assets\app.js`},
+		{name: "newline", relativePath: "assets/\napp.js"},
+		{name: "nul", relativePath: "assets/\x00app.js"},
+		{name: "del", relativePath: "assets/\x7fapp.js"},
+		{name: "absolute", relativePath: "/etc/passwd"},
+		{name: "parent_escape", relativePath: "../secret"},
+		{name: "legal_nested", relativePath: "assets/app.js", valid: true},
+	}
+	layers := []struct {
+		name      string
+		configure func(*Installation, string)
+	}{
+		{
+			name: "configured_mapping",
+			configure: func(installation *Installation, relativePath string) {
+				publication := installation.Resources[0].Publication.DomainHTTPS
+				publication.StaticRootID = rootID
+				publication.StaticMappings = []StaticMapping{{URLPath: "/assets/app.js", RelativePath: relativePath}}
+			},
+		},
+		{
+			name: "applied_route",
+			configure: func(installation *Installation, relativePath string) {
+				bundle := domainBundle("bundle-static-route", testDigest)
+				bundle.DomainHTTPS.Static = StaticBundleIdentity{
+					RootID: rootID,
+					Routes: []StaticRouteBundleIdentity{{
+						URLPath:      "/assets/app.js",
+						RelativePath: relativePath,
+						SourcePath:   "/srv/example-static/assets/app.js",
+						Fingerprint:  testDigest,
+					}},
+					RouteIdentities: []string{testDigest},
+				}
+				record := &installation.Resources[0].PublicationRecord
+				record.LastAppliedDigest = pointer(testDigest)
+				record.LastAppliedBundle = &bundle
+			},
+		},
+	}
+
+	for _, layer := range layers {
+		t.Run(layer.name, func(t *testing.T) {
+			for _, testCase := range cases {
+				t.Run(testCase.name, func(t *testing.T) {
+					installation := validGAInstallation()
+					installation.StaticRoots = []StaticContentRoot{{ID: rootID, OwnerResourceID: installation.Resources[0].ID, Path: "/srv/example-static", Fingerprint: testDigest, Device: 1}}
+					layer.configure(&installation, testCase.relativePath)
+					data, err := json.Marshal(installation)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, err = DecodeInstallation(data)
+					if testCase.valid && err != nil {
+						t.Fatalf("DecodeInstallation(relative path %q) error = %v", testCase.relativePath, err)
+					}
+					if !testCase.valid && err == nil {
+						t.Fatalf("DecodeInstallation(relative path %q) accepted invalid path", testCase.relativePath)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestCertificateSANIdentityMatchesStageIssuedSingleDomainVector(t *testing.T) {
 	const expected = "sha256:fafc5334b24801d62c56fc90e7850b20e426994cd2b578dcb532a602b9d28c91"
 	if got := certificateSANIdentity([]string{"control.example.com"}); got != expected {

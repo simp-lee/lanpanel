@@ -26,14 +26,24 @@ func TestStaticMappingGrammarIsClosed(t *testing.T) {
 			t.Fatalf("path %q directory=%v got=%v", value.path, value.directory, got)
 		}
 	}
-	for _, value := range []string{"index.html", "assets/app.js"} {
-		if !cleanRelative(value) {
-			t.Fatalf("relative %q rejected", value)
-		}
+	relativeCases := []struct {
+		name  string
+		path  string
+		valid bool
+	}{
+		{name: "backslash", path: `assets\app.js`},
+		{name: "newline", path: "assets/\napp.js"},
+		{name: "nul", path: "assets/\x00app.js"},
+		{name: "del", path: "assets/\x7fapp.js"},
+		{name: "absolute", path: "/etc/passwd"},
+		{name: "parent_escape", path: "../secret"},
+		{name: "legal_nested", path: "assets/app.js", valid: true},
 	}
-	for _, value := range []string{"../secret", "/absolute", "a\\b"} {
-		if cleanRelative(value) {
-			t.Fatalf("relative %q accepted", value)
-		}
+	for _, testCase := range relativeCases {
+		t.Run("relative_"+testCase.name, func(t *testing.T) {
+			if got := cleanRelative(testCase.path); got != testCase.valid {
+				t.Fatalf("cleanRelative(%q) = %v, want %v", testCase.path, got, testCase.valid)
+			}
+		})
 	}
 }

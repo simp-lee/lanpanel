@@ -1345,7 +1345,7 @@ func validateStaticMappings(publication DomainHTTPSPublication) error {
 	}
 	prior := ""
 	for _, mapping := range publication.StaticMappings {
-		if !validStaticURL(mapping.URLPath, mapping.Directory) || mapping.RelativePath == "" || filepath.IsAbs(mapping.RelativePath) || filepath.Clean(mapping.RelativePath) != mapping.RelativePath || strings.HasPrefix(mapping.RelativePath, "..") || prior != "" && prior >= mapping.URLPath {
+		if !validStaticURL(mapping.URLPath, mapping.Directory) || !validStaticRelativePath(mapping.RelativePath) || prior != "" && prior >= mapping.URLPath {
 			return fmt.Errorf("static mapping invalid")
 		}
 		if publication.AccessMode == AppAccessApplicationManaged && !mapping.Anonymous {
@@ -1361,6 +1361,10 @@ func validStaticURL(value string, directory bool) bool {
 		return false
 	}
 	return directory == (value != "/" && strings.HasSuffix(value, "/"))
+}
+
+func validStaticRelativePath(value string) bool {
+	return value != "" && !filepath.IsAbs(value) && filepath.Clean(value) == value && !strings.HasPrefix(value, "..") && !strings.Contains(value, "\\") && !containsControl(value)
 }
 
 func validBasicUsername(value string) bool {
@@ -1772,7 +1776,7 @@ func validateBundle(bundle PublicationBundle, kind PublicationKind) error {
 			return fmt.Errorf("domain_https static bundle inventory incomplete")
 		}
 		for index, route := range identity.Static.Routes {
-			if !staticRootIDPattern.MatchString(identity.Static.RootID) || !validStaticURL(route.URLPath, route.Directory) || route.RelativePath == "" || filepath.IsAbs(route.RelativePath) || filepath.Clean(route.RelativePath) != route.RelativePath || !cleanAbsolutePath(route.SourcePath) || !validSHA256Digest(route.Fingerprint) || index > 0 && identity.Static.Routes[index-1].URLPath >= route.URLPath {
+			if !staticRootIDPattern.MatchString(identity.Static.RootID) || !validStaticURL(route.URLPath, route.Directory) || !validStaticRelativePath(route.RelativePath) || !cleanAbsolutePath(route.SourcePath) || !validSHA256Digest(route.Fingerprint) || index > 0 && identity.Static.Routes[index-1].URLPath >= route.URLPath {
 				return fmt.Errorf("domain_https static route bundle invalid")
 			}
 		}

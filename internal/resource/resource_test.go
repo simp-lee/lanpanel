@@ -68,6 +68,49 @@ func TestPrepareUpdatePreservesPriorSnapshot(t *testing.T) {
 	}
 }
 
+func TestPrepareUpdateRejectsInvalidStaticRelativePaths(t *testing.T) {
+	const rootID = "static_00000000000000000000000000000001"
+	cases := []struct {
+		name         string
+		relativePath string
+		valid        bool
+	}{
+		{name: "backslash", relativePath: `assets\app.js`},
+		{name: "newline", relativePath: "assets/\napp.js"},
+		{name: "nul", relativePath: "assets/\x00app.js"},
+		{name: "del", relativePath: "assets/\x7fapp.js"},
+		{name: "absolute", relativePath: "/etc/passwd"},
+		{name: "parent_escape", relativePath: "../secret"},
+		{name: "legal_nested", relativePath: "assets/app.js", valid: true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			spec := LocalSpec{Name: "Prior", EndpointKind: domain.LocalEndpointRelayUnix, ReadinessPath: "/ready", Service: domain.ManagedService{Executable: "/usr/local/bin/example", WorkingDirectory: "/srv/example", WritePaths: []string{"/srv/example/data"}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "example.test", AccessMode: domain.AppAccessPublic}}}
+			prior, err := NewLocal(spec, bytes.NewReader(bytes.Repeat([]byte{2}, 32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}, StaticRoots: []domain.StaticContentRoot{{ID: rootID, OwnerResourceID: prior.ID, Path: "/srv/example-static", Fingerprint: shaDigest("static-root"), Device: 1}}, Resources: []domain.AppResource{prior}}
+			candidate := prior
+			publication := *candidate.Publication.DomainHTTPS
+			publication.StaticRootID = rootID
+			publication.StaticMappings = []domain.StaticMapping{{URLPath: "/assets/app.js", RelativePath: testCase.relativePath}}
+			candidate.Publication.DomainHTTPS = &publication
+
+			updated, err := PrepareUpdate(installation, candidate)
+			if testCase.valid && err != nil {
+				t.Fatalf("PrepareUpdate(relative path %q) error = %v", testCase.relativePath, err)
+			}
+			if !testCase.valid && err == nil {
+				t.Fatalf("PrepareUpdate(relative path %q) accepted invalid path", testCase.relativePath)
+			}
+			if testCase.valid && updated.Publication.DomainHTTPS.StaticMappings[0].RelativePath != testCase.relativePath {
+				t.Fatalf("PrepareUpdate changed relative path to %q", updated.Publication.DomainHTTPS.StaticMappings[0].RelativePath)
+			}
+		})
+	}
+}
+
 func TestPrepareTailnetUpdatePreservesAbsentProcess(t *testing.T) {
 	prior, err := NewTailnet(TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: "Peer App", PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ReadinessPath: "/ready", Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}}, bytes.NewReader(bytes.Repeat([]byte{4}, 16)))
 	if err != nil {
