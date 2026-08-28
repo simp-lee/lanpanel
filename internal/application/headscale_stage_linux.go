@@ -446,7 +446,7 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 
 func (execution *HeadscaleDeployExecution) authorizeStagedCertificate(ctx context.Context, identity certificates.Identity) error {
 	if execution == nil || certificates.ValidateIdentity(identity) != nil || identity.ID != execution.Authority.Rendered.Candidate.CertificateID || identity.Generation != 1 || identity.BindingIdentity != execution.Authority.Rendered.Candidate.CertificateBinding {
-		return fmt.Errorf("Headscale staged certificate authorization identity invalid")
+		return fmt.Errorf("headscale staged certificate authorization identity invalid")
 	}
 	document, err := execution.Service.normal.Read()
 	if err != nil {
@@ -461,12 +461,12 @@ func (execution *HeadscaleDeployExecution) authorizeStagedCertificate(ctx contex
 		document, err = execution.Service.normal.Read()
 	}
 	if err != nil || document.Revision != execution.Revision {
-		return fmt.Errorf("Headscale staged certificate authorization revision changed: %w", err)
+		return fmt.Errorf("headscale staged certificate authorization revision changed: %w", err)
 	}
 	raw, present := document.Entries["journals/certificate-"+execution.JobID]
 	var journal operations.JournalRecord
 	if !present || json.Unmarshal(raw, &journal) != nil || journal.Phase != operations.JournalPrepared || journal.Certificate == nil || journal.Certificate.CandidateFingerprint != "" || journal.Certificate.CandidateBundleIdentity != (certificates.BundleIdentity{}) || !reflect.DeepEqual(journal.Certificate.Challenge, execution.Challenge.Safety) {
-		return fmt.Errorf("Headscale staged certificate journal authority changed")
+		return fmt.Errorf("headscale staged certificate journal authority changed")
 	}
 	journal.Certificate.CandidateFingerprint = identity.Fingerprint
 	journal.Certificate.CandidateBundleIdentity = certificates.BundleIdentityFor(identity)
@@ -510,7 +510,7 @@ func (execution *HeadscaleDeployExecution) StageIssuedCertificate(ctx context.Co
 		execution.Mutation, execution.Exposure = mutation, exposure
 		execution.Revision = document.Revision + 1
 	} else if document.Revision != execution.Revision {
-		return fmt.Errorf("Headscale staged certificate revision changed")
+		return fmt.Errorf("headscale staged certificate revision changed")
 	}
 	if execution.Child.ID == "" {
 		return fmt.Errorf("headscale issuer child authority is missing")

@@ -419,19 +419,19 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		installation, loadErr := loadHeadscaleInstallation(document)
 		priorMatches := loadErr == nil && installation.Headscale.Certificate != nil && certificateBundleMatches(*installation.Headscale.Certificate, certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity)
 		if !priorMatches {
-			return fenceRollback(errors.Join(loadErr, fmt.Errorf("Headscale rollback normal certificate does not match prior authority")))
+			return fenceRollback(errors.Join(loadErr, fmt.Errorf("headscale rollback normal certificate does not match prior authority")))
 		}
 		if err := certificates.VerifyBundleIdentity(certificate.CertificateID, certificate.PriorGeneration, certificate.PriorBundleIdentity); err != nil {
 			return fenceRollback(err)
 		}
 		controlJournal, controlErr := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
 		if controlErr != nil || controlJournal.Certificate == nil || controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || installation.Headscale.Applied == nil {
-			return fenceRollback(errors.Join(controlErr, fmt.Errorf("Headscale rollback control certificate authority changed")))
+			return fenceRollback(errors.Join(controlErr, fmt.Errorf("headscale rollback control certificate authority changed")))
 		}
 		candidateIdentity, candidateErr := certificates.ObserveIdentity(certificates.FixedBundlesRoot, certificate.CertificateID, certificate.CandidateGeneration, filetxn.Owner{UID: certificate.StageUID, GID: certificate.StageGID})
 		candidatePresent := candidateErr == nil
 		if candidateErr != nil && !errors.Is(candidateErr, os.ErrNotExist) || candidatePresent && certificates.BundleIdentityFor(candidateIdentity) != certificate.CandidateBundleIdentity {
-			return fenceRollback(errors.Join(candidateErr, fmt.Errorf("Headscale rollback candidate certificate authority changed")))
+			return fenceRollback(errors.Join(candidateErr, fmt.Errorf("headscale rollback candidate certificate authority changed")))
 		}
 		priorActivation, priorActivationErr := control.BuildActivation(controlJournal.InstallationID, controlJournal.Candidate, *controlJournal.Certificate)
 		if priorActivationErr != nil {
@@ -483,12 +483,12 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 				entryMatched = entryMatched || reflect.DeepEqual(entry, priorActivation.Entry)
 			}
 			if !entryMatched {
-				return fenceRollback(fmt.Errorf("Headscale prior control entry changed"))
+				return fenceRollback(fmt.Errorf("headscale prior control entry changed"))
 			}
 			host, hostErr := activation.NewFixedHost()
 			priorRuntime, runtimeErr := host.ObserveRuntime(ctx, manifest)
 			if hostErr != nil || runtimeErr != nil || priorRuntime.Master == nil {
-				return fenceRollback(errors.Join(hostErr, runtimeErr, fmt.Errorf("Headscale prior runtime unavailable")))
+				return fenceRollback(errors.Join(hostErr, runtimeErr, fmt.Errorf("headscale prior runtime unavailable")))
 			}
 			if err := host.Reload(ctx); err != nil {
 				return fenceRollback(err)
@@ -522,12 +522,12 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 			return fenceRollback(safetyErr)
 		}
 		if !activeCertificateMatchesIdentity(freshSafety.Headscale.ActiveCertificate, *controlJournal.Certificate) {
-			return fenceRollback(fmt.Errorf("Headscale rollback safety certificate does not match prior authority"))
+			return fenceRollback(fmt.Errorf("headscale rollback safety certificate does not match prior authority"))
 		}
 		if freshSafety.Headscale.Reactivating != nil {
 			active := *freshSafety.Headscale.Reactivating
 			if !headscaleReissueMarkerMatches(&active, certificate.Challenge, reactivationBundle, candidateIdentity) {
-				return fenceRollback(fmt.Errorf("Headscale rollback reactivation marker changed"))
+				return fenceRollback(fmt.Errorf("headscale rollback reactivation marker changed"))
 			}
 			contracted := freshSafety
 			contracted.Revision++
@@ -576,7 +576,7 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		pointerAuthority := certificatePointerFromJournal(certificate)
 		controlJournal, controlErr := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
 		if controlErr != nil || controlJournal.Certificate == nil || controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || installation.Headscale.Applied == nil {
-			return errors.Join(controlErr, fmt.Errorf("Headscale rollback control certificate authority changed"))
+			return errors.Join(controlErr, fmt.Errorf("headscale rollback control certificate authority changed"))
 		}
 		reactivationBundle, bundleErr := control.BuildReactivation(installation.InstallationID, controlJournal.Candidate, candidateIdentity, *controlJournal.Certificate, *installation.Headscale.Applied)
 		if bundleErr != nil {
@@ -645,12 +645,12 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 			return fenceRollback(safetyErr)
 		}
 		if !activeCertificateMatchesIdentity(freshSafety.Headscale.ActiveCertificate, *controlJournal.Certificate) {
-			return fenceRollback(fmt.Errorf("Headscale rollback safety certificate does not match prior authority"))
+			return fenceRollback(fmt.Errorf("headscale rollback safety certificate does not match prior authority"))
 		}
 		if freshSafety.Headscale.Reactivating != nil {
 			active := *freshSafety.Headscale.Reactivating
 			if !headscaleReissueMarkerMatches(&active, certificate.Challenge, reactivationBundle, candidateIdentity) {
-				return fenceRollback(fmt.Errorf("Headscale rollback reactivation marker changed"))
+				return fenceRollback(fmt.Errorf("headscale rollback reactivation marker changed"))
 			}
 			contracted := freshSafety
 			contracted.Revision++
@@ -863,7 +863,7 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 			err = execution.Admitter.ContractHeadscaleReissueActivation(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID)
 		}
 	default:
-		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback normal certificate differs from candidate and prior authority")))
+		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("headscale rollback normal certificate differs from candidate and prior authority")))
 	}
 	if err != nil {
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
@@ -873,11 +873,11 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
 	}
 	if !activeCertificateMatchesBundle(state.Headscale.ActiveCertificate, prior) {
-		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback safety certificate does not match prior authority")))
+		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("headscale rollback safety certificate does not match prior authority")))
 	}
 	if state.Headscale.Reactivating != nil {
 		if !reflect.DeepEqual(*state.Headscale.Reactivating, reactivating) {
-			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("Headscale rollback reactivation marker changed")))
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, fmt.Errorf("headscale rollback reactivation marker changed")))
 		}
 		next := state
 		next.Revision++

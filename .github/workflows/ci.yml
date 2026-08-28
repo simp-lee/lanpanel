@@ -41,23 +41,5 @@ jobs:
       - name: Install matching Playwright Chromium
         run: ./node_modules/.bin/playwright install --with-deps chromium
 
-      - name: Go tests
-        run: make test
-
-      - name: Go race tests
-        run: make race
-
-      - name: Go vet
-        run: make vet
-
-      - name: golangci-lint
-        run: make lint
-
-      - name: Go vulnerability scans
-        run: make go-vulnerability-scan
-
-      - name: Playwright authentication tests
-        run: npm run test:auth
-
-      - name: Node development dependency audit
-        run: make node-vulnerability-scan
+      - name: Run canonical quality gate
+        run: make ga-local-gate

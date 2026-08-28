@@ -40,7 +40,7 @@ func requireHeadscaleOperationCertificate(document persist.Document, jobID strin
 	decodeErr := json.Unmarshal(raw, &journal)
 	validPhase := journal.Phase == operations.JournalActive || allowTerminal && journal.Phase == operations.JournalTerminal
 	if !present || decodeErr != nil || journal.Kind != operations.JournalCertificateActivation || journal.Operation != operations.HeadscaleDeploy || !validPhase || journal.Certificate == nil || journal.Certificate.CertificateID != identity.ID || journal.Certificate.CandidateGeneration != identity.Generation || journal.Certificate.CandidateBundleIdentity != certificates.BundleIdentityFor(identity) {
-		return operations.JournalRecord{}, fmt.Errorf("Headscale operation certificate bundle authority changed")
+		return operations.JournalRecord{}, fmt.Errorf("headscale operation certificate bundle authority changed")
 	}
 	return journal, nil
 }

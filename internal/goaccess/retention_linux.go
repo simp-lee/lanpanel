@@ -217,7 +217,7 @@ type writableReferenceObserver func(string, []closure.ProcessIdentity, uint64, u
 // no writer to either inode are the successful terminal state.
 func waitNginxLogTransition(ctx context.Context, observer closure.RuntimeObserver, procRoot, activePath string, priorMaster closure.ProcessIdentity, old, active closure.FileIdentity, timeout time.Duration, audit func() (nginx.Manifest, error), writable writableReferenceObserver, signal func(context.Context) error) error {
 	if ctx == nil || observer == nil || !filepath.IsAbs(procRoot) || filepath.Clean(procRoot) != procRoot || !filepath.IsAbs(activePath) || filepath.Clean(activePath) != activePath || priorMaster.PID <= 1 || priorMaster.StartTicks == 0 || priorMaster.Cgroup == "" || old.Device == 0 || old.Inode == 0 || active.Device == 0 || active.Inode == 0 || old == active || timeout <= 0 || timeout > time.Minute || audit == nil || writable == nil || signal == nil {
-		return fmt.Errorf("Nginx retention transition authority is invalid")
+		return fmt.Errorf("nginx retention transition authority is invalid")
 	}
 	deadline := time.Now().Add(timeout)
 	nextSignal := time.Now()
@@ -240,14 +240,14 @@ func waitNginxLogTransition(ctx context.Context, observer closure.RuntimeObserve
 			return closure.VerifyStopped(snapshot)
 		}
 		if !snapshot.Complete {
-			return fmt.Errorf("Nginx retention runtime inventory is incomplete")
+			return fmt.Errorf("nginx retention runtime inventory is incomplete")
 		}
 		if snapshot.Master.PID != priorMaster.PID || snapshot.Master.StartTicks != priorMaster.StartTicks || snapshot.Master.Cgroup != priorMaster.Cgroup {
-			return fmt.Errorf("Nginx retention master identity changed")
+			return fmt.Errorf("nginx retention master identity changed")
 		}
 		manifest, err := audit()
 		if err != nil {
-			return fmt.Errorf("Nginx retention graph inventory unavailable: %w", err)
+			return fmt.Errorf("nginx retention graph inventory unavailable: %w", err)
 		}
 		bound := manifestBindsAccessLog(manifest, activePath)
 		sawUnbound = sawUnbound || !bound

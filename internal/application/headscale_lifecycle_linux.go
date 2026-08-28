@@ -42,7 +42,7 @@ func verifyLiveHeadscaleCertificate(ctx context.Context, installationID string, 
 		matched = matched || reflect.DeepEqual(entry, bundle.Entry)
 	}
 	if !matched {
-		return fmt.Errorf("Headscale live control entry differs from certificate authority")
+		return fmt.Errorf("headscale live control entry differs from certificate authority")
 	}
 	host, err := activation.NewFixedHost()
 	if err != nil {
@@ -50,7 +50,7 @@ func verifyLiveHeadscaleCertificate(ctx context.Context, installationID string, 
 	}
 	runtime, err := host.ObserveRuntime(ctx, manifest)
 	if err != nil || runtime.Master == nil {
-		return fmt.Errorf("Headscale live runtime unavailable: %w", err)
+		return fmt.Errorf("headscale live runtime unavailable: %w", err)
 	}
 	return host.VerifyServedCertificate(ctx, candidate.ControlDomain, certificate.Fingerprint)
 }
