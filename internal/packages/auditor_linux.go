@@ -140,7 +140,7 @@ func (auditor *LinuxAuditor) VerifyPackageMasks(ctx context.Context, identities 
 		var stat unix.Stat_t
 		err := unix.Lstat(path, &stat)
 		if present {
-			if err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK || uint64(stat.Dev) != identity.Device || stat.Ino != identity.Inode {
+			if err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK || uint64(stat.Dev) != identity.Device || stat.Ino != identity.Inode || stat.Ctim.Sec != identity.CTimeSec || stat.Ctim.Nsec != identity.CTimeNsec {
 				return fmt.Errorf("PID 1 mask identity changed before verification")
 			}
 			target, err := os.Readlink(path)

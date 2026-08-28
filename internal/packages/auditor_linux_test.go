@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testing.T) {
@@ -68,6 +70,46 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	}
 	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err == nil {
 		t.Fatal("malicious active APT hook was accepted")
+	}
+}
+
+func TestLinuxAuditorVerifiesExactPackageMaskCTime(t *testing.T) {
+	root := t.TempDir()
+	maskRoot := filepath.Join(root, "etc/systemd/system")
+	if err := os.MkdirAll(maskRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const unit = "nginx.service"
+	path := filepath.Join(maskRoot, unit)
+	if err := os.Symlink("/dev/null", path); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	exact := MaskIdentity{Unit: unit, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
+	tests := []struct {
+		name    string
+		change  func(*MaskIdentity)
+		wantErr bool
+	}{
+		{name: "exact"},
+		{name: "ctime seconds", change: func(identity *MaskIdentity) { identity.CTimeSec++ }, wantErr: true},
+		{name: "ctime nanoseconds", change: func(identity *MaskIdentity) { identity.CTimeNsec++ }, wantErr: true},
+	}
+	auditor := newTestLinuxAuditor(&auditLauncher{}, root)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			identity := exact
+			if test.change != nil {
+				test.change(&identity)
+			}
+			err := auditor.VerifyPackageMasks(context.Background(), []MaskIdentity{identity}, true)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("VerifyPackageMasks() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
 	}
 }
 
