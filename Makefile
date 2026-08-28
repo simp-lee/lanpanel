@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := ga-local-gate
 
-.PHONY: build test vet lint race check tidy go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
+.PHONY: build test vet lint race check tidy docs-build go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
@@ -38,6 +38,9 @@ race:
 
 tidy:
 	$(GO) mod tidy
+
+docs-build:
+	$(NPM) run docs:build
 
 ga-contract-audit:
 	@test ! -d internal/qualification/cases
@@ -243,7 +246,7 @@ ga-headscale-lifecycle-integration:
 	@grep -Fq 'CompletePlannedHeadscaleReissue' internal/application/headscale_reissue_linux.go
 	@grep -Fq 'headscale_certificate_reissue' internal/ui/server.go
 
-ga-docs-consistency-check:
+ga-docs-consistency-check: docs-build
 	@set -eu; for file in README.md README.zh-CN.md; do grep -Fq -- '--auth-key=file:<exact-path>' "$$file"; grep -Fiq 'key revoke' "$$file"; grep -Fiq 'device expire' "$$file"; grep -Eiq 'does not expire automatically|不会自动过期' "$$file"; grep -Eiq 'public plaintext|公网明文' "$$file"; grep -Eiq 'interrupt Headscale control ingress|中断 Headscale control ingress' "$$file"; grep -Fiq 'same-version reinstall' "$$file"; grep -Fiq 'backup/restore' "$$file"; grep -Fiq 'EdgeOne' "$$file"; done
 	@set -eu; if grep -n -Ei 'management CLI example|YAML workflow example|WordPress template|EdgeOne enable' README.md README.zh-CN.md; then echo 'excluded product claim remains in docs' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 

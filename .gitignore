@@ -4,6 +4,9 @@
 /build/
 /dist/
 /node_modules/
+/docs/.vitepress/.temp/
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
 
 # Go test and coverage artifacts
 *.test
