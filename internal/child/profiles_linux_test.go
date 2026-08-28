@@ -344,6 +344,17 @@ func TestGoAccessProfilesDeriveOnlyFixedPerResourceUnits(t *testing.T) {
 	if !strings.Contains(joined, ".socket") || !strings.Contains(joined, ".service") || strings.Contains(joined, "relay") {
 		t.Fatalf("subset stop args=%v", stop.Arguments)
 	}
+	timerOnly := inv
+	timerOnly.Resource = &ResourceInvocation{ResourceID: inv.Resource.ResourceID, Generation: 2, UnitMask: 16}
+	timerStop, err := ResolveInvocation(ProfileGoAccessStop, Identities{}, timerOnly)
+	wantTimerStop := []string{"disable", "--now", "lanpanel-goaccess-retention-res_00000000000000000000000000000001-2.timer"}
+	if err != nil || !reflect.DeepEqual(timerStop.Arguments, wantTimerStop) {
+		t.Fatalf("exact timer quiesce profile=%v error=%v", timerStop.Arguments, err)
+	}
+	show, err := ResolveInvocation(ProfileGoAccessShow, Identities{}, inv)
+	if err != nil || !slices.Contains(show.Arguments, "--property=Job") {
+		t.Fatalf("GoAccess quiesce inventory lacks pending-job evidence: %v error=%v", show.Arguments, err)
+	}
 }
 
 func TestOutputIsBoundedAndOnlyDigestsEscape(t *testing.T) {

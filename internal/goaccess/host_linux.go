@@ -31,15 +31,21 @@ type invocationLauncher interface {
 
 const (
 	finalRetentionTimeout       = 90 * time.Second
+	retentionQuiesceTimeout     = 90 * time.Second
 	unitInventoryTimeout        = 30 * time.Second
-	stopTimeout                 = 45 * time.Second
+	stopTimeout                 = time.Minute
 	daemonReloadTimeout         = 30 * time.Second
-	retirementEvidenceTimeout   = 2 * time.Second
-	GenerationRetirementTimeout = finalRetentionTimeout + unitInventoryTimeout + stopTimeout + daemonReloadTimeout + retirementEvidenceTimeout
+	endpointEvidenceTimeout     = 2 * time.Second
+	retentionSettlementTimeout  = 2 * time.Second
+	retirementDeadlineSlack     = 5 * time.Second
+	GenerationRetirementTimeout = unitInventoryTimeout + stopTimeout + retentionQuiesceTimeout + finalRetentionTimeout + stopTimeout + unitInventoryTimeout + endpointEvidenceTimeout + retentionSettlementTimeout + retentionSettlementTimeout + daemonReloadTimeout + retentionSettlementTimeout + unitInventoryTimeout + endpointEvidenceTimeout + retirementDeadlineSlack
 )
 
 type (
-	Host              struct{ launcher invocationLauncher }
+	Host struct {
+		launcher         invocationLauncher
+		endpointObserver func(context.Context, string, bool) error
+	}
 	ServiceGeneration struct {
 		ResourceID string
 		Generation uint64
@@ -754,7 +760,9 @@ func (host Host) Retire(ctx context.Context, resourceID string, generation uint6
 		}
 	}
 	if allFilesAbsent {
-		reload, reloadErr := host.launcher.RunInvocation(ctx, child.ProfileSystemctl, child.Invocation{}, nil)
+		reloadCtx, cancelReload := context.WithTimeout(ctx, daemonReloadTimeout)
+		reload, reloadErr := host.launcher.RunInvocation(reloadCtx, child.ProfileSystemctl, child.Invocation{}, nil)
+		cancelReload()
 		if reloadErr != nil || reload.ExitCode != 0 {
 			return errors.Join(completeErr, reloadErr, fmt.Errorf("GoAccess retirement recovery reload failed: exit=%d", reload.ExitCode))
 		}
@@ -770,23 +778,20 @@ func (host Host) Retire(ctx context.Context, resourceID string, generation uint6
 	if completeErr != nil {
 		return completeErr
 	}
-	retentionErr := host.finalRetention(ctx, resourceID, generation)
 	mask, observeErr := host.observedUnitMask(ctx, resourceID, generation)
 	if observeErr != nil {
-		return errors.Join(retentionErr, observeErr)
+		return observeErr
 	}
-	stopErr := error(nil)
 	if mask != 0 {
-		stopErr = host.stopUnits(ctx, resourceID, generation, mask)
-	}
-	if err = errors.Join(retentionErr, stopErr); err != nil {
+		if err = host.stopObservedGeneration(ctx, resourceID, generation, mask); err != nil {
+			return err
+		}
+	} else if err = host.verifyStoppedGenerationEvidence(ctx, generationPaths); err != nil {
 		return err
 	}
 	removalPaths := []string{unitPaths[0], unitPaths[1], unitPaths[2], unitPaths[4], unitPaths[3]}
-	for _, path := range removalPaths {
-		if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	if err = removeGenerationUnitFiles(ctx, generationPaths, removalPaths); err != nil {
+		return err
 	}
 	parent, err := os.Open("/etc/systemd/system")
 	if err != nil {
@@ -797,7 +802,9 @@ func (host Host) Retire(ctx context.Context, resourceID string, generation uint6
 	if err = errors.Join(syncErr, closeErr); err != nil {
 		return err
 	}
-	reload, reloadErr := host.launcher.RunInvocation(ctx, child.ProfileSystemctl, child.Invocation{}, nil)
+	reloadCtx, cancelReload := context.WithTimeout(ctx, daemonReloadTimeout)
+	reload, reloadErr := host.launcher.RunInvocation(reloadCtx, child.ProfileSystemctl, child.Invocation{}, nil)
+	cancelReload()
 	if reloadErr != nil || reload.ExitCode != 0 {
 		return errors.Join(reloadErr, fmt.Errorf("GoAccess cleanup reload failed"))
 	}
@@ -1505,21 +1512,18 @@ func (host Host) EnsureStopped(ctx context.Context, resourceID string, generatio
 	if host.launcher == nil {
 		return fmt.Errorf("GoAccess host unavailable")
 	}
-	mask, err := host.observedUnitMask(ctx, resourceID, generation)
-	if err != nil {
-		return err
-	}
-	if mask != 0 {
-		retentionErr := host.finalRetention(ctx, resourceID, generation)
-		return errors.Join(retentionErr, host.stopUnits(ctx, resourceID, generation, mask))
-	}
 	paths, err := DerivePaths(resourceID, generation)
 	if err != nil {
 		return err
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	return host.waitEndpoint(probeCtx, paths.Endpoint, false)
+	mask, err := host.observedUnitMask(ctx, resourceID, generation)
+	if err != nil {
+		return err
+	}
+	if mask == 0 {
+		return host.verifyStoppedGenerationEvidence(ctx, paths)
+	}
+	return host.stopObservedGeneration(ctx, resourceID, generation, mask)
 }
 
 func goAccessUnitBits(resourceID string, generation uint64) map[string]uint8 {
@@ -1541,7 +1545,11 @@ func (host Host) observedUnitMask(ctx context.Context, resourceID string, genera
 	if err != nil || shown.ExitCode != 0 {
 		return 0, fmt.Errorf("GoAccess unit inventory unavailable: exit=%d: %w", shown.ExitCode, err)
 	}
-	units, err := parseEffectiveUnits(string(shown.Stdout))
+	return unitMaskFromOutput(shown.Stdout, resourceID, generation)
+}
+
+func unitMaskFromOutput(output []byte, resourceID string, generation uint64) (uint8, error) {
+	units, err := parseEffectiveUnits(string(output))
 	if err != nil {
 		return 0, err
 	}
@@ -1552,10 +1560,13 @@ func (host Host) observedUnitMask(ctx context.Context, resourceID string, genera
 			return 0, fmt.Errorf("GoAccess unit inventory missing %s", id)
 		}
 		if properties["LoadState"] == "not-found" {
-			if properties["ActiveState"] != "inactive" || properties["MainPID"] != "0" || properties["UnitFileState"] != "" {
+			if properties["ActiveState"] != "inactive" || !stoppedMainPID(id, properties) || properties["UnitFileState"] != "" {
 				return 0, fmt.Errorf("not-found GoAccess unit retains runtime authority")
 			}
 			continue
+		}
+		if properties["LoadState"] != "loaded" {
+			return 0, fmt.Errorf("GoAccess unit load state is unsafe")
 		}
 		mask |= bit
 	}
@@ -1577,11 +1588,124 @@ func (host Host) finalRetention(ctx context.Context, resourceID string, generati
 }
 
 func (host Host) Stop(ctx context.Context, resourceID string, generation uint64) error {
-	retentionErr := host.finalRetention(ctx, resourceID, generation)
-	return errors.Join(retentionErr, host.stopUnits(ctx, resourceID, generation, 31))
+	return host.EnsureStopped(ctx, resourceID, generation)
 }
 
-func (host Host) stopUnits(ctx context.Context, resourceID string, generation uint64, mask uint8) error {
+func (host Host) stopObservedGeneration(ctx context.Context, resourceID string, generation uint64, mask uint8) error {
+	if host.launcher == nil || mask == 0 || mask&^uint8(31) != 0 {
+		return fmt.Errorf("GoAccess stop authority invalid")
+	}
+	paths, err := DerivePaths(resourceID, generation)
+	if err != nil {
+		return err
+	}
+	quiesceErr := host.quiesceRetentionTimer(ctx, resourceID, generation, mask)
+	retentionErr := error(nil)
+	stopMask := mask
+	if quiesceErr == nil {
+		retentionErr = host.finalRetention(ctx, resourceID, generation)
+		stopMask &^= 16
+	}
+	stopErr := error(nil)
+	if stopMask != 0 {
+		stopErr = host.runStopUnits(ctx, resourceID, generation, stopMask)
+	}
+	unitErr := host.verifyStoppedUnits(ctx, resourceID, generation, mask)
+	endpointErr := host.verifyEndpointAbsent(ctx, paths.Endpoint)
+	enablementErr := verifyEnablementLinksAbsent(paths)
+	settlementErr := verifyRetentionStateSettledBounded(ctx, paths)
+	return errors.Join(quiesceErr, retentionErr, stopErr, unitErr, endpointErr, enablementErr, settlementErr)
+}
+
+func (host Host) quiesceRetentionTimer(ctx context.Context, resourceID string, generation uint64, expectedMask uint8) error {
+	if expectedMask&16 != 0 {
+		if err := host.runStopUnits(ctx, resourceID, generation, 16); err != nil {
+			return fmt.Errorf("GoAccess retention timer quiesce failed: %w", err)
+		}
+	}
+	quiesceCtx, cancelQuiesce := context.WithTimeout(ctx, retentionQuiesceTimeout)
+	defer cancelQuiesce()
+	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		inventoryCtx, cancelInventory := context.WithTimeout(quiesceCtx, unitInventoryTimeout)
+		shown, showErr := host.launcher.RunInvocation(inventoryCtx, child.ProfileGoAccessShow, invocation, nil)
+		cancelInventory()
+		if showErr != nil || shown.ExitCode != 0 {
+			return fmt.Errorf("GoAccess retention quiesce evidence unavailable: exit=%d: %w", shown.ExitCode, showErr)
+		}
+		settled, err := retentionInvocationQuiesced(shown.Stdout, resourceID, generation, expectedMask)
+		if err != nil {
+			return err
+		}
+		if settled {
+			return nil
+		}
+		select {
+		case <-quiesceCtx.Done():
+			return fmt.Errorf("GoAccess retention invocation did not quiesce: %w", quiesceCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func retentionInvocationQuiesced(output []byte, resourceID string, generation uint64, expectedMask uint8) (bool, error) {
+	mask, err := unitMaskFromOutput(output, resourceID, generation)
+	if err != nil {
+		return false, err
+	}
+	if mask != expectedMask {
+		return false, fmt.Errorf("GoAccess retention quiesce unit authority changed")
+	}
+	units, err := parseEffectiveUnits(string(output))
+	if err != nil {
+		return false, err
+	}
+	unitID := resourceID + "-" + strconv.FormatUint(generation, 10)
+	timerID := "lanpanel-goaccess-retention-" + unitID + ".timer"
+	timer := units[timerID]
+	timerJob, timerJobPresent := timer["Job"]
+	if !timerJobPresent {
+		return false, fmt.Errorf("GoAccess retention timer job evidence is missing")
+	}
+	if expectedMask&16 == 0 {
+		if timer["LoadState"] != "not-found" {
+			return false, fmt.Errorf("GoAccess absent retention timer regained authority")
+		}
+	} else if timer["LoadState"] != "loaded" || timer["ActiveState"] != "inactive" || !stoppedMainPID(timerID, timer) || timer["UnitFileState"] != "disabled" {
+		return false, fmt.Errorf("GoAccess retention timer remained active or enabled")
+	}
+	if timerJob != "" {
+		return false, nil
+	}
+	retention := units["lanpanel-goaccess-retention-"+unitID+".service"]
+	retentionJob, retentionJobPresent := retention["Job"]
+	if !retentionJobPresent {
+		return false, fmt.Errorf("GoAccess retention service job evidence is missing")
+	}
+	if expectedMask&8 == 0 {
+		return retentionJob == "", nil
+	}
+	switch retention["ActiveState"] {
+	case "inactive":
+		if retention["MainPID"] != "0" {
+			return false, fmt.Errorf("inactive GoAccess retention retained a process")
+		}
+		return retentionJob == "", nil
+	case "failed":
+		if retention["MainPID"] != "0" {
+			return false, fmt.Errorf("failed GoAccess retention retained a process")
+		}
+		return retentionJob == "", nil
+	case "activating", "deactivating":
+		return false, nil
+	default:
+		return false, fmt.Errorf("GoAccess retention invocation state is unsafe")
+	}
+}
+
+func (host Host) runStopUnits(ctx context.Context, resourceID string, generation uint64, mask uint8) error {
 	if host.launcher == nil || mask == 0 || mask&^uint8(31) != 0 {
 		return fmt.Errorf("GoAccess stop authority invalid")
 	}
@@ -1592,22 +1716,28 @@ func (host Host) stopUnits(ctx context.Context, resourceID string, generation ui
 	if err != nil || result.ExitCode != 0 {
 		return fmt.Errorf("GoAccess stop failed: exit=%d: %w", result.ExitCode, err)
 	}
-	showInvocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
-	shown, showErr := host.launcher.RunInvocation(stopCtx, child.ProfileGoAccessShow, showInvocation, nil)
+	return nil
+}
+
+func (host Host) verifyStoppedUnits(ctx context.Context, resourceID string, generation uint64, mask uint8) error {
+	inventoryCtx, cancel := context.WithTimeout(ctx, unitInventoryTimeout)
+	defer cancel()
+	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
+	shown, showErr := host.launcher.RunInvocation(inventoryCtx, child.ProfileGoAccessShow, invocation, nil)
 	if showErr != nil || shown.ExitCode != 0 {
 		return fmt.Errorf("GoAccess stopped-unit evidence unavailable: exit=%d: %w", shown.ExitCode, showErr)
 	}
-	if err := verifyStoppedUnitOutput(shown.Stdout, resourceID, generation, mask); err != nil {
-		return err
-	}
-	paths, pathErr := DerivePaths(resourceID, generation)
-	if pathErr != nil {
-		return pathErr
-	}
-	if err := host.waitEndpoint(stopCtx, paths.Endpoint, false); err != nil {
-		return err
-	}
-	return verifyEnablementLinksAbsent(paths)
+	return verifyStoppedUnitOutput(shown.Stdout, resourceID, generation, mask)
+}
+
+func (host Host) verifyEndpointAbsent(ctx context.Context, path string) error {
+	endpointCtx, cancel := context.WithTimeout(ctx, endpointEvidenceTimeout)
+	defer cancel()
+	return host.waitEndpoint(endpointCtx, path, false)
+}
+
+func (host Host) verifyStoppedGenerationEvidence(ctx context.Context, paths Paths) error {
+	return errors.Join(host.verifyEndpointAbsent(ctx, paths.Endpoint), verifyEnablementLinksAbsent(paths), verifyRetentionStateSettledBounded(ctx, paths))
 }
 
 func verifyStoppedUnitOutput(output []byte, resourceID string, generation uint64, mask uint8) error {
@@ -1621,7 +1751,7 @@ func verifyStoppedUnitOutput(output []byte, resourceID string, generation uint64
 			return fmt.Errorf("GoAccess stopped unit missing")
 		}
 		if mask&bit == 0 {
-			if properties["LoadState"] != "not-found" || properties["ActiveState"] != "inactive" || properties["MainPID"] != "0" || properties["UnitFileState"] != "" {
+			if properties["LoadState"] != "not-found" || properties["ActiveState"] != "inactive" || !stoppedMainPID(id, properties) || properties["UnitFileState"] != "" {
 				return fmt.Errorf("excluded GoAccess unit retained authority")
 			}
 			continue
@@ -1630,7 +1760,7 @@ func verifyStoppedUnitOutput(output []byte, resourceID string, generation uint64
 		if bit == 8 {
 			wantState = "static"
 		}
-		if properties["LoadState"] != "loaded" || properties["ActiveState"] != "inactive" || properties["MainPID"] != "0" || properties["UnitFileState"] != wantState {
+		if properties["LoadState"] != "loaded" || properties["ActiveState"] != "inactive" || !stoppedMainPID(id, properties) || properties["UnitFileState"] != wantState {
 			return fmt.Errorf("GoAccess unit remained active or enabled")
 		}
 	}
@@ -1649,13 +1779,21 @@ func validRetentionRuntime(properties map[string]string) bool {
 	}
 }
 
+func stoppedMainPID(id string, properties map[string]string) bool {
+	pid, present := properties["MainPID"]
+	if strings.HasSuffix(id, ".service") {
+		return present && pid == "0"
+	}
+	return !present
+}
+
 func verifyRemovedUnitOutput(output []byte) error {
 	units, err := parseEffectiveUnits(string(output))
 	if err != nil {
 		return err
 	}
-	for _, properties := range units {
-		if properties["LoadState"] != "not-found" || properties["ActiveState"] != "inactive" || properties["MainPID"] != "0" || properties["UnitFileState"] != "" {
+	for id, properties := range units {
+		if properties["LoadState"] != "not-found" || properties["ActiveState"] != "inactive" || !stoppedMainPID(id, properties) || properties["UnitFileState"] != "" {
 			return fmt.Errorf("removed GoAccess unit remains loaded or enabled")
 		}
 	}
@@ -1691,23 +1829,50 @@ func (host Host) RetirementComplete(ctx context.Context, resourceID string, gene
 			return false, observeErr
 		}
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, retirementEvidenceTimeout)
-	defer cancel()
-	if err = host.waitEndpoint(probeCtx, paths.Endpoint, false); err != nil {
+	if err = verifyRetentionStateSettledBounded(ctx, paths); err != nil {
 		return false, err
 	}
 	invocation := child.Invocation{Resource: &child.ResourceInvocation{ResourceID: resourceID, Generation: generation}}
-	shown, showErr := host.launcher.RunInvocation(probeCtx, child.ProfileGoAccessShow, invocation, nil)
+	inventoryCtx, cancelInventory := context.WithTimeout(ctx, unitInventoryTimeout)
+	shown, showErr := host.launcher.RunInvocation(inventoryCtx, child.ProfileGoAccessShow, invocation, nil)
+	cancelInventory()
 	if showErr != nil || shown.ExitCode != 0 {
 		return false, fmt.Errorf("GoAccess retirement evidence unavailable: exit=%d: %w", shown.ExitCode, showErr)
 	}
 	if err = verifyRemovedUnitOutput(shown.Stdout); err != nil {
 		return false, err
 	}
+	if err = host.verifyEndpointAbsent(ctx, paths.Endpoint); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
+func removeGenerationUnitFiles(ctx context.Context, paths Paths, unitPaths []string) error {
+	if err := verifyRetentionStateSettledBounded(ctx, paths); err != nil {
+		return err
+	}
+	for _, path := range unitPaths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRetentionStateSettledBounded(ctx context.Context, paths Paths) error {
+	settlementCtx, cancel := context.WithTimeout(ctx, retentionSettlementTimeout)
+	defer cancel()
+	return verifyRetentionStateSettled(settlementCtx, paths)
+}
+
 func (host Host) waitEndpoint(ctx context.Context, path string, present bool) error {
+	if host.endpointObserver != nil {
+		return host.endpointObserver(ctx, path, present)
+	}
 	deadline := time.NewTicker(50 * time.Millisecond)
 	defer deadline.Stop()
 	for {

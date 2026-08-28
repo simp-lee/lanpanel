@@ -1156,6 +1156,28 @@ func rejectUnboundResidue(parent int, paths rotationPaths) error {
 	return requireAbsentAt(parent, filepath.Base(paths.old), filepath.Base(paths.new), filepath.Base(paths.stateTemp), filepath.Base(paths.snapshotTemp))
 }
 
+// verifyRetentionStateSettled is the deletion fence for the recovery unit.
+// Timer/service quiescence is proved through exact systemd inventory; this
+// separately proves that no journal or renamed/staging artifact still needs
+// that unit for recovery.
+func verifyRetentionStateSettled(ctx context.Context, paths Paths) error {
+	artifacts := []string{paths.RetentionOld, paths.RetentionNew, paths.RetentionState, paths.RetentionStateTemp, paths.RetentionTemp}
+	for _, path := range artifacts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("GoAccess retention settlement authority invalid")
+		}
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("GoAccess retention recovery artifact remained: %s", filepath.Base(path))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
 func requireAbsentAt(parent int, names ...string) error {
 	for _, name := range names {
 		_, present, err := rawStatAt(parent, name)

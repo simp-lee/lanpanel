@@ -6,6 +6,7 @@ import (
 	"context"
 	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
+	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/safety"
 	"testing"
 	"time"
@@ -42,6 +43,17 @@ func (*budgetedGoAccessContractionHost) RemoveGenerationState(context.Context, s
 
 func (*budgetedGoAccessContractionHost) CleanupUncommittedShared(context.Context, string, string) error {
 	return nil
+}
+
+func TestContractionOverallBudgetCoversEveryGenerationRetirementAndCleanup(t *testing.T) {
+	budget, err := goAccessContractionTimeout(3)
+	want := 3 * (goaccessruntime.GenerationRetirementTimeout + goAccessContractionCleanupTimeout)
+	if err != nil || budget != want {
+		t.Fatalf("contraction budget=%v want=%v error=%v", budget, want, err)
+	}
+	if _, err := goAccessContractionTimeout(0); err == nil {
+		t.Fatal("zero-generation overall budget was accepted")
+	}
 }
 
 func TestTimedOutGenerationRetentionLeavesIndependentBudgetForLaterStop(t *testing.T) {

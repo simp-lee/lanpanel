@@ -761,19 +761,32 @@ func TestRetentionReopenFailurePreservesUniqueRenamedLog(t *testing.T) {
 }
 
 type fakeLauncher struct {
-	results   map[child.ProfileID]child.Result
-	sequences map[child.ProfileID][]child.Result
-	calls     []child.ProfileID
-	budgets   map[child.ProfileID][]time.Duration
+	results     map[child.ProfileID]child.Result
+	sequences   map[child.ProfileID][]child.Result
+	calls       []child.ProfileID
+	invocations []child.Invocation
+	contexts    map[child.ProfileID][]context.Context
+	budgets     map[child.ProfileID][]time.Duration
+	run         func(context.Context, child.ProfileID, child.Invocation) (child.Result, error, bool)
 }
 
-func (f *fakeLauncher) RunInvocation(ctx context.Context, id child.ProfileID, _ child.Invocation, _ []byte) (child.Result, error) {
+func (f *fakeLauncher) RunInvocation(ctx context.Context, id child.ProfileID, invocation child.Invocation, _ []byte) (child.Result, error) {
 	f.calls = append(f.calls, id)
+	f.invocations = append(f.invocations, invocation)
+	if f.contexts == nil {
+		f.contexts = map[child.ProfileID][]context.Context{}
+	}
+	f.contexts[id] = append(f.contexts[id], ctx)
 	if deadline, ok := ctx.Deadline(); ok {
 		if f.budgets == nil {
 			f.budgets = map[child.ProfileID][]time.Duration{}
 		}
 		f.budgets[id] = append(f.budgets[id], time.Until(deadline))
+	}
+	if f.run != nil {
+		if result, err, handled := f.run(ctx, id, invocation); handled {
+			return result, err
+		}
 	}
 	if sequence := f.sequences[id]; len(sequence) != 0 {
 		f.sequences[id] = sequence[1:]
@@ -795,9 +808,20 @@ func stoppedUnits(active string) []byte {
 		if strings.HasSuffix(name, ".service") && strings.Contains(name, "goaccess-retention-") {
 			unitFileState = "static"
 		}
-		blocks[index] = fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=%s\nMainPID=%s\nUnitFileState=%s", name, state, pid, unitFileState)
+		mainPID := ""
+		if strings.HasSuffix(name, ".service") {
+			mainPID = "\nMainPID=" + pid
+		}
+		blocks[index] = fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=%s%s\nJob=\nUnitFileState=%s", name, state, mainPID, unitFileState)
 	}
 	return []byte(strings.Join(blocks, "\n\n"))
+}
+
+func runningRetentionUnits() []byte {
+	unit := "lanpanel-goaccess-retention-res_00000000000000000000000000000001-7.service"
+	inactive := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nJob=\nUnitFileState=static", unit)
+	running := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=activating\nMainPID=42\nJob=17\nUnitFileState=static", unit)
+	return []byte(strings.Replace(string(stoppedUnits("")), inactive, running, 1))
 }
 
 func TestCandidateStagingRecoveryRemovesOnlyExactOwnedPrefix(t *testing.T) {
@@ -957,7 +981,8 @@ func TestRetainedStateStagingFreshlyStopsExactPriorGeneration(t *testing.T) {
 	if err := host.ensureRetainedStateStopped(context.Background(), candidate); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(launcher.calls, []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}) {
+	want := []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessStop, child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}
+	if !slices.Equal(launcher.calls, want) {
 		t.Fatalf("retained-state stop calls=%v", launcher.calls)
 	}
 }
@@ -968,12 +993,153 @@ func TestStopRequiresEveryUnitAndEndpointClosed(t *testing.T) {
 	if err := host.Stop(context.Background(), "res_00000000000000000000000000000001", 7); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(launcher.calls, []child.ProfileID{child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}) {
-		t.Fatalf("final retention/stop order=%v", launcher.calls)
+	want := []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessStop, child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}
+	if !slices.Equal(launcher.calls, want) {
+		t.Fatalf("timer quiesce/final retention/stop order=%v", launcher.calls)
+	}
+	if launcher.invocations[1].Resource.UnitMask != 16 || launcher.invocations[4].Resource.UnitMask != 15 {
+		t.Fatalf("timer and remaining-unit masks=%d,%d", launcher.invocations[1].Resource.UnitMask, launcher.invocations[4].Resource.UnitMask)
 	}
 	launcher.results[child.ProfileGoAccessShow] = child.Result{ExitCode: 0, Stdout: stoppedUnits("relay")}
 	if err := host.Stop(context.Background(), "res_00000000000000000000000000000001", 7); err == nil {
 		t.Fatal("active relay accepted as stopped")
+	}
+}
+
+func TestTimerActivationCannotRaceFinalRetentionAfterExactQuiesce(t *testing.T) {
+	timerEnabled, invocationRunning := true, true
+	timerStarts, finalStarts, activationAttempts, showCalls := 1, 0, 0, 0
+	activateTimer := func() {
+		activationAttempts++
+		if timerEnabled {
+			timerStarts++
+			invocationRunning = true
+		}
+	}
+	launcher := &fakeLauncher{results: map[child.ProfileID]child.Result{child.ProfileGoAccessStop: {ExitCode: 0}}}
+	launcher.run = func(_ context.Context, id child.ProfileID, invocation child.Invocation) (child.Result, error, bool) {
+		switch id {
+		case child.ProfileGoAccessStop:
+			if invocation.Resource.UnitMask == 16 {
+				timerEnabled = false
+			} else {
+				activateTimer()
+			}
+			return child.Result{ExitCode: 0}, nil, true
+		case child.ProfileGoAccessShow:
+			showCalls++
+			if showCalls == 1 {
+				timer := "lanpanel-goaccess-retention-res_00000000000000000000000000000001-7.timer"
+				inactive := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=inactive\nJob=\nUnitFileState=disabled", timer)
+				active := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=active\nJob=\nUnitFileState=enabled", timer)
+				initial := strings.Replace(string(runningRetentionUnits()), inactive, active, 1)
+				return child.Result{ExitCode: 0, Stdout: []byte(initial)}, nil, true
+			}
+			if invocationRunning {
+				invocationRunning = false
+				return child.Result{ExitCode: 0, Stdout: runningRetentionUnits()}, nil, true
+			}
+			return child.Result{ExitCode: 0, Stdout: stoppedUnits("")}, nil, true
+		case child.ProfileGoAccessRetain:
+			activateTimer()
+			if invocationRunning {
+				t.Fatal("final retention started before the timer invocation quiesced")
+			}
+			finalStarts++
+			return child.Result{ExitCode: 0}, nil, true
+		default:
+			return child.Result{}, nil, false
+		}
+	}
+	if err := (Host{launcher: launcher}).Stop(context.Background(), "res_00000000000000000000000000000001", 7); err != nil {
+		t.Fatal(err)
+	}
+	if timerStarts != 1 || finalStarts != 1 || activationAttempts != 2 {
+		t.Fatalf("timer starts=%d final starts=%d activation attempts=%d", timerStarts, finalStarts, activationAttempts)
+	}
+	if showCalls < 4 {
+		t.Fatalf("running retention was not independently observed to quiesce: shows=%d", showCalls)
+	}
+}
+
+func TestStopShowAndEndpointEvidenceUseIndependentPhaseContexts(t *testing.T) {
+	launcher := &fakeLauncher{results: map[child.ProfileID]child.Result{child.ProfileGoAccessStop: {ExitCode: 0}, child.ProfileGoAccessShow: {ExitCode: 0, Stdout: stoppedUnits("")}}}
+	var latestStop context.Context
+	launcher.run = func(ctx context.Context, id child.ProfileID, _ child.Invocation) (child.Result, error, bool) {
+		switch id {
+		case child.ProfileGoAccessStop:
+			latestStop = ctx
+		case child.ProfileGoAccessShow:
+			if latestStop != nil && !errors.Is(latestStop.Err(), context.Canceled) {
+				t.Fatalf("Show inherited a live or exhausted stop phase: %v", latestStop.Err())
+			}
+		}
+		return child.Result{}, nil, false
+	}
+	endpointCalls := 0
+	host := Host{launcher: launcher, endpointObserver: func(ctx context.Context, _ string, present bool) error {
+		endpointCalls++
+		if present || latestStop == nil || !errors.Is(latestStop.Err(), context.Canceled) {
+			t.Fatalf("endpoint evidence inherited stop authority: present=%t stop=%v", present, latestStop)
+		}
+		shows := launcher.contexts[child.ProfileGoAccessShow]
+		if len(shows) == 0 || !errors.Is(shows[len(shows)-1].Err(), context.Canceled) || ctx.Err() != nil {
+			t.Fatalf("endpoint evidence context was not independent: shows=%d endpoint=%v", len(shows), ctx.Err())
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) < endpointEvidenceTimeout-time.Second || time.Until(deadline) > endpointEvidenceTimeout {
+			t.Fatalf("endpoint evidence budget=%v", time.Until(deadline))
+		}
+		return nil
+	}}
+	if err := host.Stop(context.Background(), "res_00000000000000000000000000000001", 7); err != nil {
+		t.Fatal(err)
+	}
+	stops, shows := launcher.contexts[child.ProfileGoAccessStop], launcher.contexts[child.ProfileGoAccessShow]
+	if len(stops) != 2 || len(shows) != 3 || endpointCalls != 1 || stops[0] == shows[1] || stops[1] == shows[2] {
+		t.Fatalf("phase contexts were shared: stops=%d shows=%d endpoints=%d", len(stops), len(shows), endpointCalls)
+	}
+	for _, show := range shows {
+		deadline, ok := show.Deadline()
+		if !ok || time.Until(deadline) > unitInventoryTimeout {
+			t.Fatalf("Show phase budget was not independently bounded")
+		}
+	}
+}
+
+func TestRetireDoesNotRemoveRecoveryUnitWithUnsettledJournalOrRenamedLog(t *testing.T) {
+	for _, artifact := range []string{"access.log.retention-state", "access.log.retention-old"} {
+		t.Run(artifact, func(t *testing.T) {
+			root := t.TempDir()
+			paths := Paths{
+				RetentionOld: filepath.Join(root, "access.log.retention-old"), RetentionNew: filepath.Join(root, "access.log.retention-new"),
+				RetentionState: filepath.Join(root, "access.log.retention-state"), RetentionStateTemp: filepath.Join(root, "access.log.retention-state.lanpanel"), RetentionTemp: filepath.Join(root, "access.log.1.lanpanel"),
+			}
+			units := []string{filepath.Join(root, "service.unit"), filepath.Join(root, "retention.service")}
+			for _, path := range units {
+				if err := os.WriteFile(path, []byte("owned unit"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(root, artifact), []byte("recovery"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := removeGenerationUnitFiles(context.Background(), paths, units); err == nil || !strings.Contains(err.Error(), "recovery artifact remained") {
+				t.Fatalf("unsettled retirement error=%v", err)
+			}
+			for _, path := range units {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("recovery unit was removed: %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestGenerationRetirementTimeoutCoversSequentialPhaseLimits(t *testing.T) {
+	minimum := unitInventoryTimeout + stopTimeout + retentionQuiesceTimeout + finalRetentionTimeout + stopTimeout + unitInventoryTimeout + endpointEvidenceTimeout + retentionSettlementTimeout + retentionSettlementTimeout + daemonReloadTimeout + retentionSettlementTimeout + unitInventoryTimeout + endpointEvidenceTimeout
+	if stopTimeout != time.Minute || GenerationRetirementTimeout < minimum {
+		t.Fatalf("retirement timeout=%v minimum=%v stop=%v", GenerationRetirementTimeout, minimum, stopTimeout)
 	}
 }
 
@@ -983,12 +1149,18 @@ func TestEnsureStoppedContractsDespiteFinalRetentionFailure(t *testing.T) {
 	if err := host.EnsureStopped(context.Background(), "res_00000000000000000000000000000001", 7); err == nil || !strings.Contains(err.Error(), "final GoAccess retention failed") {
 		t.Fatalf("retention failure was hidden: %v", err)
 	}
-	if !slices.Equal(launcher.calls, []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}) {
+	want := []child.ProfileID{child.ProfileGoAccessShow, child.ProfileGoAccessStop, child.ProfileGoAccessShow, child.ProfileGoAccessRetain, child.ProfileGoAccessStop, child.ProfileGoAccessShow}
+	if !slices.Equal(launcher.calls, want) {
 		t.Fatalf("emergency retention/stop calls=%v", launcher.calls)
 	}
 	retentionBudgets, stopBudgets := launcher.budgets[child.ProfileGoAccessRetain], launcher.budgets[child.ProfileGoAccessStop]
-	if len(retentionBudgets) != 1 || retentionBudgets[0] < finalRetentionTimeout-time.Second || retentionBudgets[0] > finalRetentionTimeout || len(stopBudgets) != 1 || stopBudgets[0] < stopTimeout-time.Second || stopBudgets[0] > stopTimeout {
+	if len(retentionBudgets) != 1 || retentionBudgets[0] < finalRetentionTimeout-time.Second || retentionBudgets[0] > finalRetentionTimeout || len(stopBudgets) != 2 {
 		t.Fatalf("independent retention/stop budgets: retention=%v stop=%v", retentionBudgets, stopBudgets)
+	}
+	for _, budget := range stopBudgets {
+		if budget < stopTimeout-time.Second || budget > stopTimeout {
+			t.Fatalf("stop did not receive its profile budget: %v", stopBudgets)
+		}
 	}
 }
 
@@ -1026,7 +1198,7 @@ func TestPartialStopAcceptsOnlyExcludedNotFoundUnits(t *testing.T) {
 	resourceID := "res_00000000000000000000000000000001"
 	output := string(stoppedUnits(""))
 	relayID := "lanpanel-goaccess-relay-" + resourceID + "-7.service"
-	output = strings.Replace(output, "Id="+relayID+"\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nUnitFileState=disabled", "Id="+relayID+"\nLoadState=not-found\nActiveState=inactive\nMainPID=0\nUnitFileState=", 1)
+	output = strings.Replace(output, "Id="+relayID+"\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nJob=\nUnitFileState=disabled", "Id="+relayID+"\nLoadState=not-found\nActiveState=inactive\nMainPID=0\nJob=\nUnitFileState=", 1)
 	if err := verifyStoppedUnitOutput([]byte(output), resourceID, 7, 29); err != nil {
 		t.Fatal(err)
 	}
@@ -1044,6 +1216,17 @@ func TestRemovedUnitsRequireNotFoundEvidence(t *testing.T) {
 	}
 	if err := verifyRemovedUnitOutput(stoppedUnits("")); err == nil {
 		t.Fatal("loaded stopped units accepted as removed")
+	}
+}
+
+func TestRetentionQuiesceRejectsPendingServiceJobAfterTimerStops(t *testing.T) {
+	unit := "lanpanel-goaccess-retention-res_00000000000000000000000000000001-7.service"
+	settled := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nJob=\nUnitFileState=static", unit)
+	queued := fmt.Sprintf("Id=%s\nLoadState=loaded\nActiveState=inactive\nMainPID=0\nJob=17\nUnitFileState=static", unit)
+	output := []byte(strings.Replace(string(stoppedUnits("")), settled, queued, 1))
+	quiesced, err := retentionInvocationQuiesced(output, "res_00000000000000000000000000000001", 7, 31)
+	if err != nil || quiesced {
+		t.Fatalf("pending timer activation was accepted: quiesced=%t error=%v", quiesced, err)
 	}
 }
 

@@ -324,11 +324,10 @@ func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goacce
 	if generationCount == 0 {
 		return result, runErr, true
 	}
-	generationTimeout := goaccessruntime.GenerationRetirementTimeout + goAccessContractionCleanupTimeout
-	if generationCount > int(time.Duration(1<<63-1)/generationTimeout) {
-		return finishGoAccessClosureFailure(result, runErr, fmt.Errorf("GoAccess contraction generation budget overflow"))
+	overallTimeout, budgetErr := goAccessContractionTimeout(generationCount)
+	if budgetErr != nil {
+		return finishGoAccessClosureFailure(result, runErr, budgetErr)
 	}
-	overallTimeout := time.Duration(generationCount) * generationTimeout
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), overallTimeout)
 	defer cancelStop()
 	host, stopErr := goaccessruntime.NewFixedHost()
@@ -339,6 +338,14 @@ func stopGoAccessAfterClosure(_ context.Context, generations map[string][]goacce
 		return finishGoAccessClosureFailure(result, runErr, stopErr)
 	}
 	return result, runErr, true
+}
+
+func goAccessContractionTimeout(generationCount int) (time.Duration, error) {
+	generationTimeout := goaccessruntime.GenerationRetirementTimeout + goAccessContractionCleanupTimeout
+	if generationCount <= 0 || generationCount > int(time.Duration(1<<63-1)/generationTimeout) {
+		return 0, fmt.Errorf("GoAccess contraction generation budget is invalid or overflowed")
+	}
+	return time.Duration(generationCount) * generationTimeout, nil
 }
 
 func stopGoAccessGenerations(ctx context.Context, host goAccessContractionHost, retirementTimeout, cleanupTimeout time.Duration, generations map[string][]goaccessGeneration, result contraction.Result) (contraction.Result, error) {
