@@ -5,6 +5,7 @@ package control
 import (
 	"context"
 	"errors"
+	nginxactivation "lanpanel/internal/activation"
 	"lanpanel/internal/challenge"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/nginx"
@@ -45,7 +46,7 @@ func TestActivationAuthorityFailurePrecedesPhysicalWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := (&ActivationHost{}).Activate(context.Background(), bundle, ActivationAuthority{})
+	result, err := (&ActivationHost{}).Activate(context.Background(), bundle, ActivationAuthority{}, nginxactivation.ReloadAuthority{})
 	if err == nil || !strings.Contains(err.Error(), "headscale activation runtime authority invalid") {
 		t.Fatalf("invalid authority did not fail before host access: result=%+v err=%v", result, err)
 	}
@@ -115,9 +116,9 @@ func TestActivationRollbackReloadDependsOnEntryRemovalAndNginxTest(t *testing.T)
 		wantCalls  []string
 		wantErrors []error
 	}{
-		{name: "success", wantCalls: []string{"stop", "remove", "test", "reload", "restore"}},
-		{name: "remove failure", removeErr: removeFailure, wantCalls: []string{"stop", "remove", "test", "restore"}, wantErrors: []error{removeFailure}},
-		{name: "test failure", testErr: testFailure, wantCalls: []string{"stop", "remove", "test", "restore"}, wantErrors: []error{testFailure}},
+		{name: "success", wantCalls: []string{"stop", "remove", "restore", "test", "reload"}},
+		{name: "remove failure", removeErr: removeFailure, wantCalls: []string{"stop", "remove", "restore", "test"}, wantErrors: []error{removeFailure}},
+		{name: "test failure", testErr: testFailure, wantCalls: []string{"stop", "remove", "restore", "test"}, wantErrors: []error{testFailure}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var calls []string

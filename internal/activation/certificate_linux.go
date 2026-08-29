@@ -22,7 +22,87 @@ type CertificateActivationResult struct {
 	Runtime closure.RuntimeSnapshot
 }
 
-func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.Pointer, serverName, candidateFingerprint, priorFingerprint string) (result CertificateActivationResult, resultErr error) {
+type certificateReloadRuntime struct {
+	Audit   func(context.Context) (nginx.Manifest, error)
+	Observe func(context.Context, nginx.Manifest) (closure.RuntimeSnapshot, error)
+	Test    func(context.Context) error
+	Signal  func(context.Context) error
+	Wait    func(context.Context, nginx.Manifest, []closure.ProcessIdentity) (closure.RuntimeSnapshot, error)
+}
+
+func reloadCertificateRuntime(ctx context.Context, authority ReloadAuthority, runtime certificateReloadRuntime) (closure.RuntimeSnapshot, error) {
+	if runtime.Audit == nil || runtime.Observe == nil || runtime.Test == nil || runtime.Signal == nil || runtime.Wait == nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate reload runtime authority incomplete")
+	}
+	manifest, err := runtime.Audit(ctx)
+	if err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	prior, err := runtime.Observe(ctx, manifest)
+	if err != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx unavailable for certificate reload: %w", err)
+	}
+	if prior.Master == nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx unavailable for certificate reload")
+	}
+	if err := runtime.Test(ctx); err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	if _, err := authority.Current(); err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	manifest, err = runtime.Audit(ctx)
+	if err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	if err := guardReload(manifest, authority); err != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate reload rejected: %w", err)
+	}
+	if err := runtime.Signal(ctx); err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	current, err := runtime.Wait(ctx, manifest, prior.Workers)
+	if err != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate reload prior workers remain: %w", err)
+	}
+	if current.Master == nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate reload prior workers remain")
+	}
+	return current, nil
+}
+
+func restoreCertificateRuntime(ctx context.Context, restorePointer func(context.Context) error, reload func(context.Context) (closure.RuntimeSnapshot, error), probe func(context.Context) error) error {
+	if restorePointer == nil || reload == nil || probe == nil {
+		return fmt.Errorf("certificate restoration runtime authority incomplete")
+	}
+	if err := restorePointer(ctx); err != nil {
+		return err
+	}
+	if _, err := reload(ctx); err != nil {
+		return err
+	}
+	return probe(ctx)
+}
+
+func (host Host) ReloadCertificate(ctx context.Context, authority ReloadAuthority) (closure.RuntimeSnapshot, error) {
+	return reloadCertificateRuntime(ctx, authority, certificateReloadRuntime{
+		Audit: func(context.Context) (nginx.Manifest, error) {
+			return nginx.Audit(host.Paths, host.Owner)
+		},
+		Observe: func(observeCtx context.Context, manifest nginx.Manifest) (closure.RuntimeSnapshot, error) {
+			return host.observer(manifest).Observe(observeCtx)
+		},
+		Test: func(testCtx context.Context) error {
+			return host.run(testCtx, child.ProfileNginxTest)
+		},
+		Signal: func(signalCtx context.Context) error {
+			return host.run(signalCtx, child.ProfileNginxReloadSignal)
+		},
+		Wait: host.WaitForPriorWorkers,
+	})
+}
+
+func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.Pointer, serverName, candidateFingerprint, priorFingerprint string, authority, restoreAuthority ReloadAuthority) (result CertificateActivationResult, resultErr error) {
 	if host.Launcher == nil || serverName == "" || pointer.ExpectedPriorGeneration == 0 || !certificateFingerprint(candidateFingerprint) || !certificateFingerprint(priorFingerprint) || certificates.ValidateBundleIdentity(pointer.CandidateIdentity) != nil || certificates.ValidateBundleIdentity(pointer.ExpectedPriorIdentity) != nil || pointer.CandidateIdentity.Fingerprint != candidateFingerprint || pointer.ExpectedPriorIdentity.Fingerprint != priorFingerprint {
 		return result, fmt.Errorf("certificate activation authority incomplete")
 	}
@@ -40,25 +120,19 @@ func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.P
 		if pointerResult.CandidateTarget == "" {
 			return result, err
 		}
-		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, pointerResult.CandidateTarget, serverName, priorFingerprint)
+		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, pointerResult.CandidateTarget, serverName, priorFingerprint, restoreAuthority)
 		return result, &Failure{Cause: errors.Join(err, restoreErr), PriorRestored: restoreErr == nil}
 	}
 	defer func() {
 		if resultErr == nil {
 			return
 		}
-		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, pointerResult.CandidateTarget, serverName, priorFingerprint)
+		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, pointerResult.CandidateTarget, serverName, priorFingerprint, restoreAuthority)
 		resultErr = &Failure{Cause: errors.Join(resultErr, restoreErr), PriorRestored: restoreErr == nil}
 	}()
-	if err := host.run(ctx, child.ProfileNginxTest); err != nil {
+	runtime, err := host.ReloadCertificate(ctx, authority)
+	if err != nil {
 		return result, err
-	}
-	if err := host.run(ctx, child.ProfileNginxReloadSignal); err != nil {
-		return result, err
-	}
-	runtime, err := closure.WaitPriorWorkers(ctx, host.observer(manifest), prior.Workers, nginx.DefaultWorkerTimeout)
-	if err != nil || runtime.Master == nil {
-		return result, fmt.Errorf("certificate activation prior workers remain")
 	}
 	if err := probeServedCertificate(ctx, serverName, candidateFingerprint); err != nil {
 		return result, err
@@ -67,29 +141,17 @@ func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.P
 	return result, nil
 }
 
-func (host Host) RestoreCertificate(ctx context.Context, pointer certificates.Pointer, expectedCandidate, serverName, priorFingerprint string) error {
+func (host Host) RestoreCertificate(ctx context.Context, pointer certificates.Pointer, expectedCandidate, serverName, priorFingerprint string, authority ReloadAuthority) error {
 	if pointer.ExpectedPriorGeneration == 0 || !certificateFingerprint(priorFingerprint) || certificates.ValidateBundleIdentity(pointer.CandidateIdentity) != nil || certificates.ValidateBundleIdentity(pointer.ExpectedPriorIdentity) != nil || pointer.ExpectedPriorIdentity.Fingerprint != priorFingerprint {
 		return fmt.Errorf("certificate restoration authority incomplete")
 	}
-	manifest, err := nginx.Audit(host.Paths, host.Owner)
-	if err != nil {
-		return err
-	}
-	prior, err := host.observer(manifest).Observe(ctx)
-	if err != nil || prior.Master == nil {
-		return fmt.Errorf("nginx unavailable for certificate restoration")
-	}
-	if err := certificates.RestorePointer(ctx, pointer, expectedCandidate); err != nil {
-		return err
-	}
-	if err := host.Reload(ctx); err != nil {
-		return err
-	}
-	runtime, err := closure.WaitPriorWorkers(ctx, host.observer(manifest), prior.Workers, nginx.DefaultWorkerTimeout)
-	if err != nil || runtime.Master == nil {
-		return fmt.Errorf("certificate restoration prior workers remain")
-	}
-	return probeServedCertificate(ctx, serverName, priorFingerprint)
+	return restoreCertificateRuntime(ctx, func(restoreCtx context.Context) error {
+		return certificates.RestorePointer(restoreCtx, pointer, expectedCandidate)
+	}, func(reloadCtx context.Context) (closure.RuntimeSnapshot, error) {
+		return host.ReloadCertificate(reloadCtx, authority)
+	}, func(probeCtx context.Context) error {
+		return probeServedCertificate(probeCtx, serverName, priorFingerprint)
+	})
 }
 
 func (host Host) VerifyServedCertificate(ctx context.Context, serverName, fingerprint string) error {

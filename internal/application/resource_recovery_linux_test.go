@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"lanpanel/internal/activation"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
@@ -21,6 +23,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSafetyCommittedTailnetCreateRecovery(t *testing.T) {
@@ -216,6 +219,58 @@ func runResourceUpdateJournalRecovery(t *testing.T, prior domain.AppResource, pr
 	}
 }
 
+func TestHeadscalePriorReloadAuthorityGuardsPriorInsteadOfInvalidCandidate(t *testing.T) {
+	currentTime := time.Unix(1_800_000_000, 0).UTC()
+	priorDeadline := currentTime.Add(time.Hour)
+	prior := domain.CertificateBundleIdentity{Generation: 1, Fingerprint: recoveryDigest("prior-certificate"), BindingIdentity: recoveryDigest("prior-binding"), NotAfter: priorDeadline.Format(time.RFC3339), LastTrustedWall: currentTime.Add(-time.Hour).Format(time.RFC3339)}
+	entry := nginx.Entry{Kind: nginx.EntryControl, Relative: nginx.ControlDirectory + "/headscale.conf", Digest: recoveryDigest("control-entry"), Domains: []string{"control.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: 1, Domain: &nginx.DomainSite{Hosts: []string{"control.example.test"}, CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_headscale", RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", AuthMode: "application_managed", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel-headscale-control/control.sock", WebSocket: true}}
+	manifest := nginx.Manifest{SchemaVersion: nginx.ManifestSchema, InstallationID: "ins_00000000000000000000000000000001", GenerationID: "gen_control", DefaultCertFingerprint: recoveryDigest("default-certificate"), MainDigest: recoveryDigest("main"), SanitizerDigest: recoveryDigest("sanitizer"), Entries: []nginx.Entry{entry}}
+	applied := domain.HeadscaleAppliedIdentity{Generation: entry.Generation}
+	installation := domain.Installation{InstallationID: manifest.InstallationID, Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &prior}}
+	state := safety.EmptyState()
+	state.Headscale.GenerationSequence = 2
+	state.Headscale.ControlEntryDigest = entry.Digest
+	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: prior.Generation, Fingerprint: prior.Fingerprint, Binding: prior.BindingIdentity, NotAfter: priorDeadline, LastTrustedWall: currentTime.Add(-time.Hour)}
+	base := headscaleBaseSnapshot(state.Headscale)
+	state.Headscale.Reactivating = &safety.HeadscaleReactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan_reissue", ControlGeneration: entry.Generation, CertificateGeneration: 2, CertificateFingerprint: recoveryDigest("candidate-certificate"), CandidateDigest: recoveryDigest("candidate-config"), CandidateBundle: recoveryDigest("candidate-bundle"), ActivationDigest: recoveryDigest("candidate-activation"), ControlEntryDigest: entry.Digest, BaseMarkers: base, CertificateUntil: currentTime.Add(-time.Second), CertificateLastTrustedWall: currentTime.Add(-time.Hour)}
+	if err := safety.Validate(state); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := activation.NewReloadAuthority(func() (activation.ReloadAuthoritySnapshot, error) {
+		return activation.ReloadAuthoritySnapshot{Safety: state, Installation: installation, Ownership: map[string]string{}, ObservedAt: currentTime}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.Guard(manifest); err == nil {
+		t.Fatal("expired candidate unexpectedly authorized the reactivation graph")
+	}
+	expectedReactivating := *state.Headscale.Reactivating
+	priorAuthority, err := headscalePriorCertificateReloadAuthority(authority, prior, expectedReactivating)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := priorAuthority.Guard(manifest); err != nil {
+		t.Fatalf("valid prior certificate rollback was rejected by candidate authority: %v", err)
+	}
+	installation.InstallationID = "ins_00000000000000000000000000000002"
+	if err := priorAuthority.Guard(manifest); err == nil {
+		t.Fatal("mismatched installation authorized prior rollback")
+	}
+	installation.InstallationID = manifest.InstallationID
+	changedReactivating := expectedReactivating
+	changedReactivating.PlanID = "plan_changed"
+	state.Headscale.Reactivating = &changedReactivating
+	if err := priorAuthority.Guard(manifest); err == nil {
+		t.Fatal("changed Headscale reactivation marker authorized prior rollback")
+	}
+	state.Headscale.Reactivating = &expectedReactivating
+	currentTime = priorDeadline
+	if err := priorAuthority.Guard(manifest); err == nil {
+		t.Fatal("expired prior Headscale certificate authorized rollback reload")
+	}
+}
+
 func TestChallengeRecoveryReloadAuthorityIsRereadInsideExposureLock(t *testing.T) {
 	fixture := newResourceRecoveryFixture(t, recoveryResourceInstallation(nil))
 	service := fixture.open(t)
@@ -235,8 +290,19 @@ func TestChallengeRecoveryReloadAuthorityIsRereadInsideExposureLock(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(before.Resources) != 0 || findSafetyResource(authority.Safety, resourceID) == nil || authority.Ownership[resourceID] != record.Checksum || authority.Installation.InstallationID != "ins_00000000000000000000000000000001" || authority.ObservedAt.IsZero() {
-		t.Fatalf("locked challenge reload authority is stale: before=%#v authority=%#v", before, authority)
+	current, err := authority.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.Resources) != 0 || findSafetyResource(current.Safety, resourceID) == nil || current.Ownership[resourceID] != record.Checksum || current.Installation.InstallationID != "ins_00000000000000000000000000000001" || current.ObservedAt.IsZero() {
+		t.Fatalf("locked challenge reload authority is stale: before=%#v authority=%#v", before, current)
+	}
+	if err := operations.ReleaseExposure(mutation, exposure); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure = nil, nil
+	if _, err := authority.Current(); err == nil {
+		t.Fatal("challenge reload authority reused stale state after the exposure lock was released")
 	}
 }
 

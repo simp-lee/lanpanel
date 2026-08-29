@@ -80,12 +80,15 @@ func (host *ActivationHost) Stage(ctx context.Context, bundle ActivationBundle) 
 	return host.run(ctx, child.ProfileSystemctl, child.Invocation{})
 }
 
-func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundle, authority ActivationAuthority) (result ActivationResult, resultErr error) {
+func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundle, authority ActivationAuthority, reloadAuthority nginxactivation.ReloadAuthority) (result ActivationResult, resultErr error) {
 	if err := ValidateActivation(bundle); err != nil {
 		return result, err
 	}
 	if err := ValidateActivationAuthority(bundle, authority); err != nil {
 		return result, err
+	}
+	if _, err := reloadAuthority.Current(); err != nil {
+		return result, fmt.Errorf("headscale activation reload authority invalid: %w", err)
 	}
 	if host == nil || host.launcher == nil {
 		return result, fmt.Errorf("headscale activation host authority unavailable")
@@ -152,12 +155,22 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 				return host.run(recovery, child.ProfileNginxTest, child.Invocation{})
 			},
 			reloadNginx: func() error {
-				currentRuntime, observeErr := runtimeHost.ObserveRuntime(recovery, priorManifest)
+				if _, authorityErr := reloadAuthority.Current(); authorityErr != nil {
+					return authorityErr
+				}
+				currentManifest, auditErr := nginx.Audit(host.nginxPaths, host.owner)
+				if auditErr != nil {
+					return auditErr
+				}
+				currentRuntime, observeErr := runtimeHost.ObserveRuntime(recovery, currentManifest)
 				if observeErr != nil {
 					return observeErr
 				}
+				if guardErr := reloadAuthority.Guard(currentManifest); guardErr != nil {
+					return fmt.Errorf("headscale control rollback reload rejected: %w", guardErr)
+				}
 				reloadErr := host.run(recovery, child.ProfileNginxReloadSignal, child.Invocation{})
-				_, waitErr := runtimeHost.WaitForPriorWorkers(recovery, priorManifest, currentRuntime.Workers)
+				_, waitErr := runtimeHost.WaitForPriorWorkers(recovery, currentManifest, currentRuntime.Workers)
 				return errors.Join(reloadErr, waitErr)
 			},
 			restorePointer: func() error {
@@ -191,6 +204,16 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	socketMutationAttempted = true
 	if err := host.run(ctx, child.ProfileHeadscaleActivateStart, invocation); err != nil {
 		return result, err
+	}
+	if _, err := reloadAuthority.Current(); err != nil {
+		return result, err
+	}
+	manifest, err = nginx.Audit(host.nginxPaths, host.owner)
+	if err != nil {
+		return result, err
+	}
+	if guardErr := reloadAuthority.Guard(manifest); guardErr != nil {
+		return result, fmt.Errorf("headscale control reload rejected at signal: %w", guardErr)
 	}
 	if err := host.run(ctx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
 		return result, err
@@ -229,17 +252,21 @@ func runActivationRollback(socketMutationAttempted, entryMutationAttempted bool,
 	if socketMutationAttempted {
 		rollbackErr = errors.Join(rollbackErr, actions.stopSockets())
 	}
+	var removeErr error
 	if entryMutationAttempted {
-		removeErr := actions.removeEntry()
+		removeErr = actions.removeEntry()
 		rollbackErr = errors.Join(rollbackErr, removeErr)
+	}
+	restoreErr := actions.restorePointer()
+	rollbackErr = errors.Join(rollbackErr, restoreErr)
+	if entryMutationAttempted {
 		testErr := actions.testNginx()
 		rollbackErr = errors.Join(rollbackErr, testErr)
-		if removeErr == nil && testErr == nil {
+		if removeErr == nil && restoreErr == nil && testErr == nil {
 			rollbackErr = errors.Join(rollbackErr, actions.reloadNginx())
 		}
 	}
-	restoreErr := actions.restorePointer()
-	return errors.Join(rollbackErr, restoreErr)
+	return rollbackErr
 }
 
 func headscaleChallengeEntry(bundle ActivationBundle, prepared challenge.Prepared) (nginx.Entry, error) {
@@ -265,8 +292,11 @@ func sameNginxEntry(left, right nginx.Entry) bool {
 
 func (host *ActivationHost) certificateChallengeRuntime(runtimeHost nginxactivation.Host, prior closure.RuntimeSnapshot) nginxactivation.ChallengeGraphRuntime {
 	return nginxactivation.ChallengeGraphRuntime{
-		Activate: func(runCtx context.Context, manifest nginx.Manifest) error {
+		Activate: func(runCtx context.Context, manifest nginx.Manifest, authorize func() error) error {
 			if err := host.run(runCtx, child.ProfileNginxTest, child.Invocation{}); err != nil {
+				return err
+			}
+			if err := authorize(); err != nil {
 				return err
 			}
 			if err := host.run(runCtx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
@@ -279,8 +309,11 @@ func (host *ActivationHost) certificateChallengeRuntime(runtimeHost nginxactivat
 			current, err := runtimeHost.ObserveRuntime(observeCtx, manifest)
 			return current.Workers, err
 		},
-		Restore: func(restoreCtx context.Context, manifest nginx.Manifest, workers []closure.ProcessIdentity) error {
+		Restore: func(restoreCtx context.Context, manifest nginx.Manifest, workers []closure.ProcessIdentity, authorize func() error) error {
 			if err := host.run(restoreCtx, child.ProfileNginxTest, child.Invocation{}); err != nil {
+				return err
+			}
+			if err := authorize(); err != nil {
 				return err
 			}
 			if err := host.run(restoreCtx, child.ProfileNginxReloadSignal, child.Invocation{}); err != nil {
@@ -387,6 +420,35 @@ func (host *ActivationHost) CloseControl(ctx context.Context, bundle ActivationB
 		return err
 	}
 	if _, err := runtimeHost.WaitForPriorWorkers(ctx, manifest, runtime.Workers); err != nil {
+		return err
+	}
+	inventory := closure.Inventory{Complete: true, Digest: bundle.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: bundle.Candidate.ControlDomain, Digest: bundle.Entry.Digest}}}
+	probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: host.nginxPaths.AuditPath, TargetObserved: func(context.Context, closure.Inventory, string, string) (bool, error) { return false, nil }}
+	_, err = probe.Run(ctx, inventory)
+	return err
+}
+
+func (host *ActivationHost) CloseControlCertificateRecovery(ctx context.Context, bundle ActivationBundle, authority nginxactivation.ReloadAuthority) error {
+	if host == nil || ValidateActivation(bundle) != nil {
+		return fmt.Errorf("headscale control certificate recovery authority invalid")
+	}
+	runtimeHost, err := nginxactivation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	prior, err := nginx.Audit(host.nginxPaths, host.owner)
+	if err != nil {
+		return err
+	}
+	runtime, err := runtimeHost.ObserveRuntime(ctx, prior)
+	if err != nil || runtime.Master == nil {
+		return fmt.Errorf("headscale control certificate recovery runtime unavailable: %w", err)
+	}
+	manifest, _, err := nginx.RemoveEntry(ctx, host.nginxPaths, host.owner, bundle.Entry)
+	if err != nil {
+		return err
+	}
+	if _, err := runtimeHost.ReloadCertificate(ctx, authority); err != nil {
 		return err
 	}
 	inventory := closure.Inventory{Complete: true, Digest: bundle.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: bundle.Candidate.ControlDomain, Digest: bundle.Entry.Digest}}}

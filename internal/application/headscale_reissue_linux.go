@@ -33,8 +33,12 @@ import (
 	"time"
 )
 
+func expectedHeadscaleReissueMarker(expected safety.ChallengePending, bundle control.ActivationBundle, candidate certificates.Identity) safety.HeadscaleReactivating {
+	return safety.HeadscaleReactivating{Generation: expected.Generation, PriorGeneration: expected.Generation - 1, PlanID: expected.PlanID, ControlGeneration: bundle.Entry.Generation, CertificateGeneration: candidate.Generation, CertificateFingerprint: candidate.Fingerprint, CandidateDigest: expected.ConfigDigest, CandidateBundle: bundle.Digest, ActivationDigest: bundle.Digest, ControlEntryDigest: bundle.Entry.Digest, BaseMarkers: append([]safety.MarkerSnapshot(nil), expected.BaseMarkers...), CertificateUntil: candidate.NotAfter, CertificateLastTrustedWall: candidate.LastTrustedWall}
+}
+
 func headscaleReissueMarkerMatches(active *safety.HeadscaleReactivating, expected safety.ChallengePending, bundle control.ActivationBundle, candidate certificates.Identity) bool {
-	return active != nil && active.PlanID == expected.PlanID && active.Generation == expected.Generation && active.PriorGeneration+1 == active.Generation && active.ControlGeneration == bundle.Entry.Generation && active.CertificateGeneration == candidate.Generation && active.CertificateFingerprint == candidate.Fingerprint && active.CandidateDigest == expected.ConfigDigest && active.CandidateBundle == bundle.Digest && active.ActivationDigest == bundle.Digest && active.ControlEntryDigest == bundle.Entry.Digest && slices.Equal(active.BaseMarkers, expected.BaseMarkers) && !active.ProbePending && active.ProbeCorrelation == "" && active.CertificateUntil.Equal(candidate.NotAfter) && active.CertificateLastTrustedWall.Equal(candidate.LastTrustedWall)
+	return active != nil && reflect.DeepEqual(*active, expectedHeadscaleReissueMarker(expected, bundle, candidate))
 }
 
 func headscaleChallengeMatchesExpected(pending *safety.ChallengePending, expected safety.ChallengePending) bool {
@@ -465,10 +469,11 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 					return fenceRollback(fmt.Errorf("expired Headscale runtime closure is inconsistent"))
 				}
 			} else {
-				if err := host.Reload(ctx); err != nil {
-					return fenceRollback(err)
+				reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+				if authorityErr != nil {
+					return fenceRollback(authorityErr)
 				}
-				if _, err := host.WaitForPriorWorkers(ctx, manifest, runtime.Workers); err != nil {
+				if _, err := host.ReloadCertificate(ctx, reloadAuthority); err != nil {
 					return fenceRollback(err)
 				}
 				inventory := closure.Inventory{Complete: true, Digest: priorActivation.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: controlJournal.Candidate.ControlDomain, Digest: priorActivation.Entry.Digest}}}
@@ -490,10 +495,16 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 			if hostErr != nil || runtimeErr != nil || priorRuntime.Master == nil {
 				return fenceRollback(errors.Join(hostErr, runtimeErr, fmt.Errorf("headscale prior runtime unavailable")))
 			}
-			if err := host.Reload(ctx); err != nil {
-				return fenceRollback(err)
+			reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+			if authorityErr != nil {
+				return fenceRollback(authorityErr)
 			}
-			if _, err := host.WaitForPriorWorkers(ctx, manifest, priorRuntime.Workers); err != nil {
+			expectedReactivating := expectedHeadscaleReissueMarker(certificate.Challenge, reactivationBundle, candidateIdentity)
+			reloadAuthority, authorityErr = headscalePriorCertificateReloadAuthority(reloadAuthority, *installation.Headscale.Certificate, expectedReactivating)
+			if authorityErr != nil {
+				return fenceRollback(authorityErr)
+			}
+			if _, err := host.ReloadCertificate(ctx, reloadAuthority); err != nil {
 				return fenceRollback(err)
 			}
 			if err := host.VerifyServedCertificate(ctx, installation.Headscale.ControlDomain, certificate.PriorFingerprint); err != nil {
@@ -596,21 +607,25 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		}
 		stopped := runtime.Master == nil && len(runtime.Workers) == 0 && len(runtime.Listeners) == 0
 		if controlJournal.Phase == control.PhaseExpired {
+			if restoreErr := certificates.RestorePointer(ctx, pointerAuthority, certificate.CandidatePointer); restoreErr != nil {
+				return fenceRollback(restoreErr)
+			}
 			if stopped {
 				if _, _, removeErr := nginx.RemoveEntry(ctx, nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, reactivationBundle.Entry); removeErr != nil {
-					return removeErr
+					return fenceRollback(removeErr)
 				}
 			} else {
 				controlHost, hostErr := control.NewActivationHost()
 				if hostErr != nil {
-					return hostErr
+					return fenceRollback(hostErr)
 				}
-				if closeErr := controlHost.CloseControl(ctx, reactivationBundle); closeErr != nil {
-					return closeErr
+				reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+				if authorityErr != nil {
+					return fenceRollback(authorityErr)
 				}
-			}
-			if restoreErr := certificates.RestorePointer(ctx, pointerAuthority, certificate.CandidatePointer); restoreErr != nil {
-				return restoreErr
+				if closeErr := controlHost.CloseControlCertificateRecovery(ctx, reactivationBundle, reloadAuthority); closeErr != nil {
+					return fenceRollback(closeErr)
+				}
 			}
 		} else {
 			if stopped {
@@ -618,8 +633,17 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 					return restoreErr
 				}
 			} else {
-				if restoreErr := runtimeHost.RestoreCertificate(ctx, pointerAuthority, certificate.CandidatePointer, installation.Headscale.ControlDomain, certificate.PriorFingerprint); restoreErr != nil {
-					return restoreErr
+				reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+				if authorityErr != nil {
+					return fenceRollback(authorityErr)
+				}
+				expectedReactivating := expectedHeadscaleReissueMarker(certificate.Challenge, reactivationBundle, candidateIdentity)
+				reloadAuthority, authorityErr = headscalePriorCertificateReloadAuthority(reloadAuthority, *installation.Headscale.Certificate, expectedReactivating)
+				if authorityErr != nil {
+					return fenceRollback(authorityErr)
+				}
+				if restoreErr := runtimeHost.RestoreCertificate(ctx, pointerAuthority, certificate.CandidatePointer, installation.Headscale.ControlDomain, certificate.PriorFingerprint, reloadAuthority); restoreErr != nil {
+					return fenceRollback(restoreErr)
 				}
 			}
 		}
@@ -826,22 +850,27 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
 	var physicalErr error
 	if controlJournal.Phase == control.PhaseExpired {
-		host, err := control.NewActivationHost()
-		if err == nil {
-			physicalErr = host.CloseControl(ctx, bundle)
-			if physicalErr == nil {
-				physicalErr = certificates.RestorePointer(ctx, pointer, func() string { value, _ := certificates.BundlePath(identity.ID, identity.Generation); return value }())
+		candidatePath, _ := certificates.BundlePath(identity.ID, identity.Generation)
+		physicalErr = certificates.RestorePointer(ctx, pointer, candidatePath)
+		if physicalErr == nil {
+			host, err := control.NewActivationHost()
+			if err == nil {
+				reloadAuthority, authorityErr := execution.challengeReloadAuthority()
+				if authorityErr != nil {
+					physicalErr = authorityErr
+				} else {
+					physicalErr = host.CloseControlCertificateRecovery(ctx, bundle, reloadAuthority)
+				}
+			} else {
+				physicalErr = err
 			}
-		} else {
-			physicalErr = err
 		}
 	} else {
-		host, err := activation.NewFixedHost()
-		if err == nil {
-			candidatePath, _ := certificates.BundlePath(identity.ID, identity.Generation)
-			physicalErr = host.RestoreCertificate(ctx, pointer, candidatePath, execution.Challenge.Safety.Hosts[0], prior.Fingerprint)
+		candidatePath, pathErr := certificates.BundlePath(identity.ID, identity.Generation)
+		if pathErr != nil {
+			physicalErr = pathErr
 		} else {
-			physicalErr = err
+			physicalErr = certificates.RestorePointer(ctx, pointer, candidatePath)
 		}
 	}
 	if physicalErr != nil {
@@ -886,6 +915,25 @@ func (execution *CertificateExecution) restorePlannedHeadscaleReissue(ctx contex
 	}
 	if err != nil {
 		return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, err))
+	}
+	if controlJournal.Phase != control.PhaseExpired {
+		host, hostErr := activation.NewFixedHost()
+		if hostErr != nil {
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, hostErr))
+		}
+		reloadAuthority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr == nil {
+			reloadAuthority, authorityErr = headscalePriorCertificateReloadAuthority(reloadAuthority, prior, reactivating)
+		}
+		if authorityErr != nil {
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, authorityErr))
+		}
+		if _, reloadErr := host.ReloadCertificate(ctx, reloadAuthority); reloadErr != nil {
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, reloadErr))
+		}
+		if probeErr := host.VerifyServedCertificate(ctx, execution.Challenge.Safety.Hosts[0], prior.Fingerprint); probeErr != nil {
+			return execution.fencePlannedHeadscaleReissue(ctx, prior, identity, errors.Join(cause, probeErr))
+		}
 	}
 	return cause
 }
@@ -951,7 +999,8 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 		return jobs.Record{}, fmt.Errorf("expired Headscale reissue safety changed: %w", err)
 	}
 	pending := state.Headscale.ChallengePending
-	reactivating := &safety.HeadscaleReactivating{Generation: pending.Generation, PriorGeneration: pending.Generation - 1, PlanID: pending.PlanID, ControlGeneration: bundle.Entry.Generation, CertificateGeneration: identity.Generation, CertificateFingerprint: identity.Fingerprint, CandidateDigest: pending.ConfigDigest, CandidateBundle: bundle.Digest, ActivationDigest: bundle.Digest, ControlEntryDigest: bundle.Entry.Digest, BaseMarkers: append([]safety.MarkerSnapshot(nil), pending.BaseMarkers...), CertificateUntil: identity.NotAfter, CertificateLastTrustedWall: identity.LastTrustedWall}
+	reactivationMarker := expectedHeadscaleReissueMarker(*pending, bundle, identity)
+	reactivating := &reactivationMarker
 	next := state
 	next.Revision++
 	next.Headscale.ChallengePending = nil
@@ -982,7 +1031,11 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 		if hostErr != nil {
 			return jobs.Record{}, hostErr
 		}
-		activationResult, resultErr := activationHost.Activate(ctx, bundle, control.ActivationAuthority{Safety: next, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()})
+		reloadAuthority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr != nil {
+			return jobs.Record{}, authorityErr
+		}
+		activationResult, resultErr := activationHost.Activate(ctx, bundle, control.ActivationAuthority{Safety: next, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, reloadAuthority)
 		activateErr = resultErr
 		priorRestored = activationResult.PriorRestored
 		runtimeDigest = activationResult.RuntimeDigest
@@ -995,7 +1048,15 @@ func (execution *CertificateExecution) CompletePlannedHeadscaleReissue(ctx conte
 			return jobs.Record{}, fmt.Errorf("headscale reissue reload rejected: %s", decision.Reason)
 		}
 		pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
-		activationResult, resultErr := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint)
+		reloadAuthority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr != nil {
+			return jobs.Record{}, authorityErr
+		}
+		restoreAuthority, authorityErr := headscalePriorCertificateReloadAuthority(reloadAuthority, prior, *reactivating)
+		if authorityErr != nil {
+			return jobs.Record{}, authorityErr
+		}
+		activationResult, resultErr := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint, reloadAuthority, restoreAuthority)
 		activateErr = resultErr
 		var failure *activation.Failure
 		if errors.As(resultErr, &failure) {

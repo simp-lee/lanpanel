@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/acme"
+	"lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
@@ -25,7 +26,7 @@ import (
 
 type headscaleActivationHost interface {
 	Stage(context.Context, control.ActivationBundle) error
-	Activate(context.Context, control.ActivationBundle, control.ActivationAuthority) (control.ActivationResult, error)
+	Activate(context.Context, control.ActivationBundle, control.ActivationAuthority, activation.ReloadAuthority) (control.ActivationResult, error)
 	Contract(context.Context, control.ActivationBundle) error
 }
 
@@ -134,10 +135,14 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 		return errors.Join(ownershipErr, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
 	}
 	runtimeAuthority := control.ActivationAuthority{Safety: activationSafety, Installation: activationInstallation, Ownership: ownershipAuthority, ObservedAt: trustedNow}
+	reloadAuthority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+	if err != nil {
+		return errors.Join(err, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
+	}
 	if err := verifyManagedACMEBinding(execution.Authority.Binding); err != nil {
 		return errors.Join(err, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
 	}
-	result, err := host.Activate(ctx, bundle, runtimeAuthority)
+	result, err := host.Activate(ctx, bundle, runtimeAuthority, reloadAuthority)
 	if err != nil {
 		return errors.Join(err, execution.contractActivationFailure(context.WithoutCancel(ctx), host, bundle))
 	}

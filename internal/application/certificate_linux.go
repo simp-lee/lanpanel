@@ -1547,9 +1547,13 @@ func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context
 	if err != nil {
 		return err
 	}
+	currentAuthority, err := authority.Current()
+	if err != nil {
+		return err
+	}
 	if execution.Headscale {
-		if authority.Safety.Headscale.CertificateExpiry != nil {
-			if authority.Safety.Headscale.ChallengePending == nil {
+		if currentAuthority.Safety.Headscale.CertificateExpiry != nil {
+			if currentAuthority.Safety.Headscale.ChallengePending == nil {
 				return nil
 			}
 			_, err := host.RemoveChallenge(ctx, execution.Challenge, authority)
@@ -1846,7 +1850,11 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		return jobs.Record{}, err
 	}
 	pointer := certificates.Pointer{CertificateID: identity.ID, CandidateGeneration: identity.Generation, CandidateIdentity: certificates.BundleIdentityFor(identity), ExpectedPriorGeneration: prior.Generation, ExpectedPriorIdentity: certificateBundleIdentity(prior)}
-	activationResult, err := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint)
+	reloadAuthority, err := execution.challengeReloadAuthority()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	activationResult, err := host.ActivateCertificate(ctx, pointer, execution.Challenge.Safety.Hosts[0], identity.Fingerprint, prior.Fingerprint, reloadAuthority, reloadAuthority)
 	if err != nil {
 		var failure *activation.Failure
 		if errors.As(err, &failure) && !failure.PriorRestored {
@@ -1867,7 +1875,11 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		commitErr = execution.Admitter.CommitCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID, prior, candidate)
 	}
 	if commitErr != nil {
-		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, activationResult.Pointer.CandidateTarget, execution.Challenge.Safety.Hosts[0], prior.Fingerprint)
+		restoreAuthority, authorityErr := execution.challengeReloadAuthority()
+		if authorityErr != nil {
+			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, errors.Join(commitErr, authorityErr))
+		}
+		restoreErr := host.RestoreCertificate(context.WithoutCancel(ctx), pointer, activationResult.Pointer.CandidateTarget, execution.Challenge.Safety.Hosts[0], prior.Fingerprint, restoreAuthority)
 		if restoreErr != nil {
 			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, errors.Join(commitErr, restoreErr))
 		}
@@ -1973,33 +1985,54 @@ func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Co
 }
 
 func challengeReloadAuthorityForExposure(service *FixedService, exposure *locks.Lease) (activation.ChallengeReloadAuthority, error) {
-	if service == nil {
-		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge reload authority unavailable")
+	refresh := func() (activation.ReloadAuthoritySnapshot, error) {
+		if service == nil {
+			return activation.ReloadAuthoritySnapshot{}, fmt.Errorf("challenge reload authority unavailable")
+		}
+		if exposure == nil || exposure.Authority() != service.safety.LockAuthority() || !exposure.Holds(locks.Exposure) {
+			return activation.ReloadAuthoritySnapshot{}, fmt.Errorf("challenge reload authority requires exposure lock")
+		}
+		state, err := service.safety.Read()
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		document, err := service.normal.Read()
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		raw, present := document.Entries["installations/current"]
+		if !present {
+			return activation.ReloadAuthoritySnapshot{}, fmt.Errorf("challenge installation authority missing")
+		}
+		installation, err := domain.DecodeInstallation(raw)
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		ownershipAuthority, err := fixedOwnershipAuthority(service.ownership)
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		return activation.ReloadAuthoritySnapshot{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
 	}
-	if exposure == nil || exposure.Authority() != service.safety.LockAuthority() || !exposure.Holds(locks.Exposure) {
-		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge reload authority requires exposure lock")
-	}
-	state, err := service.safety.Read()
-	if err != nil {
-		return activation.ChallengeReloadAuthority{}, err
-	}
-	document, err := service.normal.Read()
-	if err != nil {
-		return activation.ChallengeReloadAuthority{}, err
-	}
-	raw, present := document.Entries["installations/current"]
-	if !present {
-		return activation.ChallengeReloadAuthority{}, fmt.Errorf("challenge installation authority missing")
-	}
-	installation, err := domain.DecodeInstallation(raw)
-	if err != nil {
-		return activation.ChallengeReloadAuthority{}, err
-	}
-	ownershipAuthority, err := fixedOwnershipAuthority(service.ownership)
-	if err != nil {
-		return activation.ChallengeReloadAuthority{}, err
-	}
-	return activation.ChallengeReloadAuthority{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
+	return activation.NewReloadAuthority(refresh)
+}
+
+func headscalePriorCertificateReloadAuthority(authority activation.ReloadAuthority, prior domain.CertificateBundleIdentity, expected safety.HeadscaleReactivating) (activation.ReloadAuthority, error) {
+	return activation.NewReloadAuthority(func() (activation.ReloadAuthoritySnapshot, error) {
+		current, err := authority.Current()
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		active := current.Safety.Headscale.ActiveCertificate
+		if !activeCertificateMatchesBundle(active, prior) || current.ObservedAt.Before(active.LastTrustedWall) || !current.ObservedAt.Before(active.NotAfter) || current.Installation.Headscale == nil || current.Installation.Headscale.Certificate == nil || !reflect.DeepEqual(*current.Installation.Headscale.Certificate, prior) {
+			return activation.ReloadAuthoritySnapshot{}, fmt.Errorf("headscale prior certificate reload authority is invalid")
+		}
+		if marker := current.Safety.Headscale.Reactivating; marker != nil && !reflect.DeepEqual(*marker, expected) {
+			return activation.ReloadAuthoritySnapshot{}, fmt.Errorf("headscale prior certificate reactivation authority changed")
+		}
+		current.Safety.Headscale.Reactivating = nil
+		return current, nil
+	})
 }
 
 func (execution *CertificateExecution) challengeReloadAuthority() (activation.ChallengeReloadAuthority, error) {
@@ -2019,8 +2052,12 @@ func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) er
 		if authorityErr != nil {
 			return authorityErr
 		}
+		currentAuthority, authorityErr := authority.Current()
+		if authorityErr != nil {
+			return authorityErr
+		}
 		if execution.Headscale {
-			if authority.Safety.Headscale.CertificateExpiry != nil {
+			if currentAuthority.Safety.Headscale.CertificateExpiry != nil {
 				if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
 					return err
 				}
@@ -2955,7 +2992,11 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 		}
 		if pending.Method == "http-01" {
 			authority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
-			freshResource := findSafetyResource(authority.Safety, resource.ResourceID)
+			var currentAuthority activation.ReloadAuthoritySnapshot
+			if authorityErr == nil {
+				currentAuthority, authorityErr = authority.Current()
+			}
+			freshResource := findSafetyResource(currentAuthority.Safety, resource.ResourceID)
 			if authorityErr != nil || freshResource == nil || freshResource.ChallengePending == nil || !reflect.DeepEqual(*freshResource.ChallengePending, *pending) {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
@@ -3102,7 +3143,11 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && !appliedCandidate && !appliedPrior:
 				return fenceAndRelease(fmt.Errorf("certificate normal state differs from candidate and prior authority"))
 			case certificateIdentity.PriorGeneration > 0 && observedPointer == certificateIdentity.CandidatePointer && appliedPrior:
-				restoreErr := host.RestoreCertificate(ctx, certificatePointerFromJournal(*certificateIdentity), certificateIdentity.CandidatePointer, serverName, certificateIdentity.PriorFingerprint)
+				reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+				if authorityErr != nil {
+					return fenceAndRelease(authorityErr)
+				}
+				restoreErr := host.RestoreCertificate(ctx, certificatePointerFromJournal(*certificateIdentity), certificateIdentity.CandidatePointer, serverName, certificateIdentity.PriorFingerprint, reloadAuthority)
 				if restoreErr != nil {
 					return fenceAndRelease(restoreErr)
 				}
@@ -3133,15 +3178,11 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				if err := certificates.VerifyBundleIdentity(certificateIdentity.CertificateID, certificateIdentity.PriorGeneration, certificateIdentity.PriorBundleIdentity); err != nil {
 					return fenceAndRelease(err)
 				}
-				manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
-				priorRuntime, runtimeErr := host.ObserveRuntime(ctx, manifest)
-				if auditErr != nil || runtimeErr != nil || priorRuntime.Master == nil {
-					return fenceAndRelease(errors.Join(auditErr, runtimeErr, fmt.Errorf("certificate prior runtime unavailable")))
+				reloadAuthority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
+				if authorityErr != nil {
+					return fenceAndRelease(authorityErr)
 				}
-				if err := host.Reload(ctx); err != nil {
-					return fenceAndRelease(err)
-				}
-				if _, err := host.WaitForPriorWorkers(ctx, manifest, priorRuntime.Workers); err != nil {
+				if _, err := host.ReloadCertificate(ctx, reloadAuthority); err != nil {
 					return fenceAndRelease(err)
 				}
 				if err := host.VerifyServedCertificate(ctx, serverName, certificateIdentity.PriorFingerprint); err != nil {

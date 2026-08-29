@@ -107,10 +107,27 @@ func assertChallengeSnapshotRestored(t *testing.T, paths nginx.Paths, owner file
 	}
 }
 
-func challengeReloadTestAuthority(prepared challenge.Prepared) ChallengeReloadAuthority {
+func challengeReloadAuthorityFromSnapshot(snapshot *ReloadAuthoritySnapshot, now func() time.Time) ChallengeReloadAuthority {
+	authority, err := NewReloadAuthority(func() (ReloadAuthoritySnapshot, error) {
+		current := *snapshot
+		current.ObservedAt = now()
+		return current, nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return authority
+}
+
+func challengeReloadTestSnapshot(prepared challenge.Prepared) ReloadAuthoritySnapshot {
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prepared.Entry.ResourceID, GenerationSequence: prepared.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &prepared.Safety}}
-	return ChallengeReloadAuthority{Safety: state, Installation: domain.Installation{}, Ownership: map[string]string{prepared.Entry.ResourceID: challengeTestDigest}, ObservedAt: time.Now().UTC()}
+	return ReloadAuthoritySnapshot{Safety: state, Installation: domain.Installation{InstallationID: "ins_challenge"}, Ownership: map[string]string{prepared.Entry.ResourceID: challengeTestDigest}}
+}
+
+func challengeReloadTestAuthority(prepared challenge.Prepared) ChallengeReloadAuthority {
+	snapshot := challengeReloadTestSnapshot(prepared)
+	return challengeReloadAuthorityFromSnapshot(&snapshot, func() time.Time { return time.Now().UTC() })
 }
 
 func challengePreparedForEntry(prepared challenge.Prepared, entry nginx.Entry) challenge.Prepared {
@@ -130,7 +147,8 @@ func TestChallengeExpansionGuardRejectsBeforeDiskMutation(t *testing.T) {
 	}
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prepared.Entry.ResourceID, GenerationSequence: prepared.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &prepared.Safety}}
-	authority := ChallengeReloadAuthority{Safety: state, Installation: domain.Installation{}, Ownership: map[string]string{prepared.Entry.ResourceID: "sha256:" + strings.Repeat("b", 64)}, ObservedAt: time.Now().UTC()}
+	authoritySnapshot := &ReloadAuthoritySnapshot{Safety: state, Installation: domain.Installation{InstallationID: "ins_challenge"}, Ownership: map[string]string{prepared.Entry.ResourceID: "sha256:" + strings.Repeat("b", 64)}}
+	authority := challengeReloadAuthorityFromSnapshot(authoritySnapshot, func() time.Time { return time.Now().UTC() })
 	if _, _, err := PrepareChallengeExpansion(paths, owner, *prepared.Entry, authority); err == nil {
 		t.Fatal("ownership-mismatched challenge expansion was allowed")
 	}
@@ -165,10 +183,13 @@ func TestChallengeInstallFaultsRestoreExactPriorGraph(t *testing.T) {
 			}
 			var calls []string
 			runtime := ChallengeGraphRuntime{
-				Activate: func(context.Context, nginx.Manifest) error {
+				Activate: func(_ context.Context, _ nginx.Manifest, authorize func() error) error {
 					calls = append(calls, "test")
 					if test.stage == "test" {
 						return test.fault
+					}
+					if err := authorize(); err != nil {
+						return err
 					}
 					calls = append(calls, "reload")
 					if test.stage == "reload" {
@@ -181,7 +202,10 @@ func TestChallengeInstallFaultsRestoreExactPriorGraph(t *testing.T) {
 					calls = append(calls, "observe")
 					return []closure.ProcessIdentity{}, nil
 				},
-				Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity) error {
+				Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity, authorize func() error) error {
+					if err := authorize(); err != nil {
+						return err
+					}
 					calls = append(calls, "restore-runtime")
 					if !reflect.DeepEqual(manifest, snapshot.Manifest) {
 						t.Fatal("runtime restoration did not receive prior manifest")
@@ -219,9 +243,12 @@ func TestChallengeInstallReloadFaultRemovesNewEntry(t *testing.T) {
 	}
 	reloadFault := errors.New("new challenge reload fault")
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { return reloadFault },
+		Activate: func(context.Context, nginx.Manifest, func() error) error { return reloadFault },
 		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity) error {
+		Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity, authorize func() error) error {
+			if err := authorize(); err != nil {
+				return err
+			}
 			if !reflect.DeepEqual(manifest, snapshot.Manifest) {
 				t.Fatal("new challenge rollback runtime did not receive prior manifest")
 			}
@@ -259,9 +286,12 @@ func TestChallengeRemovalTestAndReloadFaultsRecreateExactPriorEntry(t *testing.T
 			}
 			activationFault := fmt.Errorf("removal %s fault", stage)
 			runtime := ChallengeGraphRuntime{
-				Activate: func(context.Context, nginx.Manifest) error { return activationFault },
+				Activate: func(context.Context, nginx.Manifest, func() error) error { return activationFault },
 				Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-				Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity) error {
+				Restore: func(_ context.Context, manifest nginx.Manifest, _ []closure.ProcessIdentity, authorize func() error) error {
+					if err := authorize(); err != nil {
+						return err
+					}
 					if !reflect.DeepEqual(manifest, snapshot.Manifest) {
 						t.Fatal("removal rollback runtime did not receive prior manifest")
 					}
@@ -333,11 +363,12 @@ func TestChallengeRemovalGuardRejectsStopFenceBeforeMutationOrReload(t *testing.
 	}
 	changed, reloaded := false, false
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Activate: func(context.Context, nginx.Manifest, func() error) error { reloaded = true; return nil },
 		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error { return nil },
 	}
-	authority := ChallengeReloadAuthority{Safety: state, Installation: domain.Installation{}, Ownership: map[string]string{}, ObservedAt: time.Now().UTC()}
+	authoritySnapshot := &ReloadAuthoritySnapshot{Safety: state, Installation: domain.Installation{InstallationID: "ins_challenge"}, Ownership: map[string]string{}}
+	authority := challengeReloadAuthorityFromSnapshot(authoritySnapshot, func() time.Time { return time.Now().UTC() })
 	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
 		changed = true
 		return nginx.RemoveEntry(ctx, paths, owner, *expected.Entry)
@@ -367,14 +398,15 @@ func TestChallengeRemovalGuardRejectsChangedOwnershipBeforeMutationOrReload(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority := challengeReloadTestAuthority(expected)
-	authority.Safety.Resources = append(authority.Safety.Resources, safety.ResourceSafety{ResourceID: retained.Entry.ResourceID, GenerationSequence: retained.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &retained.Safety})
-	authority.Ownership[retained.Entry.ResourceID] = "sha256:" + strings.Repeat("b", 64)
+	authoritySnapshot := challengeReloadTestSnapshot(expected)
+	authoritySnapshot.Safety.Resources = append(authoritySnapshot.Safety.Resources, safety.ResourceSafety{ResourceID: retained.Entry.ResourceID, GenerationSequence: retained.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &retained.Safety})
+	authoritySnapshot.Ownership[retained.Entry.ResourceID] = "sha256:" + strings.Repeat("b", 64)
+	authority := challengeReloadAuthorityFromSnapshot(&authoritySnapshot, func() time.Time { return time.Now().UTC() })
 	changed, reloaded := false, false
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Activate: func(context.Context, nginx.Manifest, func() error) error { reloaded = true; return nil },
 		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error { return nil },
 	}
 	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
 		changed = true
@@ -411,16 +443,16 @@ func TestChallengeRemovalGuardRejectsExpiredRetainedAppBeforeMutationOrReload(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority := challengeReloadTestAuthority(expected)
-	authority.ObservedAt = now
-	authority.Installation.Resources = []domain.AppResource{app}
-	authority.Safety.Resources = append(authority.Safety.Resources, safety.ResourceSafety{ResourceID: entry.ResourceID, GenerationSequence: entry.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, LastTrustedWall: now.Add(-time.Hour), NotAfter: now.Add(-time.Minute)}})
-	authority.Ownership[entry.ResourceID] = challengeTestDigest
+	authoritySnapshot := challengeReloadTestSnapshot(expected)
+	authoritySnapshot.Installation.Resources = []domain.AppResource{app}
+	authoritySnapshot.Safety.Resources = append(authoritySnapshot.Safety.Resources, safety.ResourceSafety{ResourceID: entry.ResourceID, GenerationSequence: entry.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, LastTrustedWall: now.Add(-time.Hour), NotAfter: now.Add(-time.Minute)}})
+	authoritySnapshot.Ownership[entry.ResourceID] = challengeTestDigest
+	authority := challengeReloadAuthorityFromSnapshot(&authoritySnapshot, func() time.Time { return now })
 	changed, reloaded := false, false
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { reloaded = true; return nil },
+		Activate: func(context.Context, nginx.Manifest, func() error) error { reloaded = true; return nil },
 		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error { return nil },
+		Restore:  func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error { return nil },
 	}
 	_, err = CommitChallengeGraph(context.Background(), paths, owner, prior, snapshot, prospective, authority, func(ctx context.Context) (nginx.Manifest, []string, error) {
 		changed = true
@@ -445,7 +477,10 @@ func TestChallengeRemovalAllowedAuthorityCommitsAndReloads(t *testing.T) {
 	}
 	reloads := 0
 	runtime := ChallengeGraphRuntime{
-		Activate: func(_ context.Context, manifest nginx.Manifest) error {
+		Activate: func(_ context.Context, manifest nginx.Manifest, authorize func() error) error {
+			if err := authorize(); err != nil {
+				return err
+			}
 			reloads++
 			if !reflect.DeepEqual(manifest, prospective) {
 				t.Fatal("removal reload did not receive guarded prospective manifest")
@@ -456,7 +491,7 @@ func TestChallengeRemovalAllowedAuthorityCommitsAndReloads(t *testing.T) {
 			t.Fatal("successful removal observed rollback")
 			return nil, nil
 		},
-		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error {
+		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error {
 			t.Fatal("successful removal rolled back")
 			return nil
 		},
@@ -482,9 +517,12 @@ func TestChallengeRollbackReloadRequiresAuthorityForRestoredGraph(t *testing.T) 
 	activateErr := errors.New("reload failed")
 	restoredRuntime := false
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error { return activateErr },
+		Activate: func(context.Context, nginx.Manifest, func() error) error { return activateErr },
 		Observe:  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) { return nil, nil },
-		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error {
+		Restore: func(_ context.Context, _ nginx.Manifest, _ []closure.ProcessIdentity, authorize func() error) error {
+			if err := authorize(); err != nil {
+				return err
+			}
 			restoredRuntime = true
 			return nil
 		},
@@ -511,15 +549,19 @@ func TestChallengeGraphTransactionSuccessKeepsProspectiveGraph(t *testing.T) {
 	}
 	var calls []string
 	runtime := ChallengeGraphRuntime{
-		Activate: func(context.Context, nginx.Manifest) error {
-			calls = append(calls, "test", "reload", "wait")
+		Activate: func(_ context.Context, _ nginx.Manifest, authorize func() error) error {
+			calls = append(calls, "test")
+			if err := authorize(); err != nil {
+				return err
+			}
+			calls = append(calls, "reload", "wait")
 			return nil
 		},
 		Observe: func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) {
 			t.Fatal("successful transaction attempted rollback observation")
 			return nil, nil
 		},
-		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) error {
+		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error {
 			t.Fatal("successful transaction attempted rollback")
 			return nil
 		},
