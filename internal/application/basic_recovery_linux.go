@@ -11,6 +11,7 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/htpasswdref"
 	"lanpanel/internal/jobs"
+	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/persist"
 	"os"
@@ -67,6 +68,56 @@ func managedBasicJournalInventory(directory string, uid, gid uint32) ([]string, 
 	return result, nil
 }
 
+type managedBasicRecoveryStage uint8
+
+const (
+	managedBasicRecoverySkip managedBasicRecoveryStage = iota
+	managedBasicRecoveryReject
+	managedBasicRecoveryLocal
+	managedBasicRecoveryInvalid
+)
+
+func classifyManagedBasicRecovery(intent operations.Reservation) managedBasicRecoveryStage {
+	if intent.Operation != operations.ManagedBasicCreate && intent.Operation != operations.ManagedBasicRotate && intent.Operation != operations.ManagedBasicDelete {
+		return managedBasicRecoverySkip
+	}
+	switch intent.Phase {
+	case operations.PhaseReserved:
+		return managedBasicRecoveryReject
+	case operations.PhaseLocalIntent:
+		return managedBasicRecoveryLocal
+	case operations.PhaseRejected, operations.PhaseTerminal:
+		return managedBasicRecoverySkip
+	default:
+		return managedBasicRecoveryInvalid
+	}
+}
+
+func rejectReservedBasicOperation(ctx context.Context, service *FixedService, admitter *operations.Admitter, jobID, code string) (returnErr error) {
+	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, admission.Release()) }()
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	raw, present := document.Entries["intents/"+jobID]
+	var intent operations.Reservation
+	if !present || json.Unmarshal(raw, &intent) != nil || intent.JobID != jobID {
+		return fmt.Errorf("reserved Basic operation authority changed")
+	}
+	switch intent.Phase {
+	case operations.PhaseRejected, operations.PhaseTerminal:
+		return nil
+	case operations.PhaseReserved:
+		return admitter.RejectReservation(ctx, admission, document.Revision, jobID, code)
+	default:
+		return fmt.Errorf("reserved Basic operation is no longer rejectable")
+	}
+}
+
 func reconcileJournalLessManagedBasic(ctx context.Context, childClosure string) error {
 	service, err := OpenFixed()
 	if err != nil {
@@ -86,8 +137,23 @@ func reconcileJournalLessManagedBasic(ctx context.Context, childClosure string) 
 			continue
 		}
 		var intent operations.Reservation
-		if json.Unmarshal(raw, &intent) != nil || intent.Phase != operations.PhaseLocalIntent || (intent.Operation != operations.ManagedBasicCreate && intent.Operation != operations.ManagedBasicRotate && intent.Operation != operations.ManagedBasicDelete) {
+		if json.Unmarshal(raw, &intent) != nil {
 			continue
+		}
+		switch classifyManagedBasicRecovery(intent) {
+		case managedBasicRecoverySkip:
+			continue
+		case managedBasicRecoveryReject:
+			if err := rejectReservedBasicOperation(ctx, service, admitter, intent.JobID, "managed_basic_interrupted"); err != nil {
+				return err
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				return err
+			}
+			continue
+		case managedBasicRecoveryInvalid:
+			return fmt.Errorf("managed Basic recovery phase changed")
 		}
 		credentialID := strings.TrimPrefix(intent.Target, "credential/")
 		if intent.Operation == operations.ManagedBasicCreate {
@@ -180,7 +246,7 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	case "delete":
 		expectedOperation = operations.ManagedBasicDelete
 	}
-	if intent.Operation != expectedOperation || intent.Target != target {
+	if intent.Operation != expectedOperation || intent.Target != target || journal.Operation != "create" && intent.SafetyBinding.PriorFingerprint != journal.PriorFingerprint || journal.Operation == "create" && intent.SafetyBinding.PriorFingerprint != "" {
 		return fmt.Errorf("managed Basic recovery intent changed")
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
@@ -216,6 +282,19 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 		return err
 	}
 	credential, present := findBasicCredential(installation, journal.CredentialID)
+	if record.Status == jobs.StatusTerminal && managedBasicPriorChangedCompletion(record) {
+		return removeBasicJournal(path)
+	}
+	if record.Status != jobs.StatusTerminal && (intent.Phase != operations.PhaseLocalIntent || record.Status != jobs.StatusRunning) {
+		return fmt.Errorf("managed Basic recovery phase changed")
+	}
+	if record.Status == jobs.StatusRunning && managedBasicCredentialChanged(journal, present, credential) {
+		_, err := admitter.Complete(ctx, mutation, exposure, document.Revision, journal.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_basic_prior_changed", Status: jobs.PostconditionVerified, Identity: journal.PriorFingerprint}}, "plan_consumption_rejected")
+		if err != nil {
+			return err
+		}
+		return removeBasicJournal(path)
+	}
 	gid, err := nginxGroupGID()
 	if err != nil {
 		return err
@@ -243,23 +322,28 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 		}
 		return removeBasicJournal(path)
 	}
-	if intent.Phase != operations.PhaseLocalIntent || record.Status != jobs.StatusRunning {
-		return fmt.Errorf("managed Basic recovery phase changed")
-	}
 	revision := document.Revision
 	condition := jobs.Postcondition{Kind: "managed_basic_interrupted", Status: jobs.PostconditionKnown, Identity: journal.CredentialID}
 	decision, err := decideManagedBasicRecovery(journal, present, credential, observedFingerprint)
 	if err != nil {
 		return err
 	}
+	prior := managedBasicJournalCredential(journal, journal.PriorFingerprint)
+	if decision.NoEffect {
+		_, err := admitter.Complete(ctx, mutation, exposure, revision, journal.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_basic_prior_changed", Status: jobs.PostconditionVerified, Identity: journal.PriorFingerprint}}, "plan_consumption_rejected")
+		if err != nil {
+			return err
+		}
+		return removeBasicJournal(path)
+	}
 	if decision.CommitFingerprint {
-		if err = admitter.CommitManagedBasicFingerprint(ctx, mutation, exposure, revision, journal.JobID, journal.CredentialID, journal.Username, journal.Path, journal.CandidateFingerprint); err != nil {
+		if err = admitter.CommitManagedBasicFingerprint(ctx, mutation, exposure, revision, journal.JobID, prior, journal.CandidateFingerprint); err != nil {
 			return err
 		}
 		revision++
 	}
 	if decision.CommitDelete {
-		if err = admitter.CommitManagedBasicDelete(ctx, mutation, exposure, revision, journal.JobID, journal.CredentialID); err != nil {
+		if err = admitter.CommitManagedBasicDelete(ctx, mutation, exposure, revision, journal.JobID, prior); err != nil {
 			return err
 		}
 		revision++
@@ -290,6 +374,36 @@ type managedBasicRecoveryDecision struct {
 	DeleteFile        bool
 	FileModified      bool
 	LostDelivery      bool
+	NoEffect          bool
+}
+
+func managedBasicJournalCredential(journal BasicJournal, fingerprint string) domain.Credential {
+	return domain.Credential{ID: journal.CredentialID, Kind: "managed_basic", OwnerResourceID: journal.ResourceID, Username: journal.Username, ManagedPath: journal.Path, Fingerprint: fingerprint}
+}
+
+func managedBasicCredentialChanged(journal BasicJournal, present bool, credential domain.Credential) bool {
+	switch journal.Operation {
+	case "rotate":
+		prior := managedBasicJournalCredential(journal, journal.PriorFingerprint)
+		candidate := managedBasicJournalCredential(journal, journal.CandidateFingerprint)
+		return !present || credential != prior && credential != candidate
+	case "delete":
+		return present && credential != managedBasicJournalCredential(journal, journal.PriorFingerprint)
+	default:
+		return false
+	}
+}
+
+func managedBasicPriorChangedCompletion(record jobs.Record) bool {
+	if record.Result != jobs.ResultFailed || record.ErrorCode != "plan_consumption_rejected" {
+		return false
+	}
+	for _, condition := range record.Postconditions {
+		if condition.Kind == "managed_basic_prior_changed" && condition.Status == jobs.PostconditionVerified {
+			return true
+		}
+	}
+	return false
 }
 
 func decideManagedBasicRecovery(journal BasicJournal, present bool, credential domain.Credential, observed string) (managedBasicRecoveryDecision, error) {
@@ -313,23 +427,26 @@ func decideManagedBasicRecovery(journal BasicJournal, present bool, credential d
 			result.FileModified = true
 		}
 	case "rotate":
-		if !present || credential.Username != journal.Username || credential.ManagedPath != journal.Path {
-			return result, fmt.Errorf("managed Basic rotate state changed")
+		prior := managedBasicJournalCredential(journal, journal.PriorFingerprint)
+		candidate := managedBasicJournalCredential(journal, journal.CandidateFingerprint)
+		if !present || credential != prior && credential != candidate {
+			result.NoEffect = true
+			return result, nil
 		}
 		if observed == journal.CandidateFingerprint {
-			if credential.Fingerprint == journal.PriorFingerprint {
+			if credential == prior {
 				result.CommitFingerprint = true
-			} else if credential.Fingerprint != journal.CandidateFingerprint {
-				return result, fmt.Errorf("managed Basic rotate state ambiguous")
 			}
 			result.FileModified = true
 			result.LostDelivery = true
-		} else if observed != journal.PriorFingerprint || credential.Fingerprint != journal.PriorFingerprint {
+		} else if observed != journal.PriorFingerprint || credential != prior {
 			return result, fmt.Errorf("managed Basic rotate identity ambiguous")
 		}
 	case "delete":
-		if observed != "" && observed != journal.PriorFingerprint {
-			return result, fmt.Errorf("managed Basic delete file changed")
+		prior := managedBasicJournalCredential(journal, journal.PriorFingerprint)
+		if present && credential != prior || observed != "" && observed != journal.PriorFingerprint {
+			result.NoEffect = true
+			return result, nil
 		}
 		result.CommitDelete = present
 		result.DeleteFile = observed != ""

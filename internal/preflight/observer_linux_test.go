@@ -14,6 +14,8 @@ import (
 func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testing.T) {
 	root := t.TempDir()
 	osRelease := filepath.Join(root, "os-release")
+	kernelRelease := filepath.Join(root, "kernel-release")
+	cgroupControllers := filepath.Join(root, "cgroup.controllers")
 	systemd := filepath.Join(root, "systemd")
 	apt := filepath.Join(root, "apt-get")
 	dpkg := filepath.Join(root, "dpkg")
@@ -34,6 +36,8 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 		}
 	}
 	write(osRelease, "ID=debian\nVERSION_ID=13\n", 0o644)
+	write(kernelRelease, "6.12.1-fixture\n", 0o644)
+	write(cgroupControllers, "cpu memory pids\n", 0o644)
 	write(apt, "fixture", 0o700)
 	write(dpkg, "fixture", 0o700)
 	write(tcp, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 101\n", 0o600)
@@ -45,7 +49,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 		t.Fatal(err)
 	}
 	now := time.Unix(1_700_000_000, 0).UTC()
-	observer := newTestLinuxObserver(LinuxPaths{OSRelease: osRelease, SystemdRoot: systemd, APTExecutable: apt, DPKGExecutable: dpkg, TCP: tcp, TCP6: tcp6, UDP: udp, UDP6: udp6}, func(context.Context) (PackageObservation, error) {
+	observer := newTestLinuxObserver(LinuxPaths{OSRelease: osRelease, KernelRelease: kernelRelease, CgroupControllers: cgroupControllers, SystemdRoot: systemd, APTExecutable: apt, DPKGExecutable: dpkg, TCP: tcp, TCP6: tcp6, UDP: udp, UDP6: udp6}, func(context.Context) (PackageObservation, error) {
 		return PackageObservation{Ready: true, Identity: "packages/ready", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64)}, nil
 	}, func() time.Time { return now })
 	request := expansionRequest(ExpansionBootstrap)
@@ -58,7 +62,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observed.Platform.ID != "debian" || observed.Platform.VersionID != "13" || len(observed.Listeners) != 2 || observed.Listeners[0].Port != 80 || observed.Listeners[0].SocketInode != 101 || observed.Listeners[1].Port != 3478 || observed.Listeners[1].SocketInode != 102 {
+	if observed.Platform.ID != "debian" || observed.Platform.VersionID != "13" || observed.KernelRelease != "6.12.1-fixture" || observed.CgroupMode != "unified_v2" || len(observed.Listeners) != 2 || observed.Listeners[0].Port != 80 || observed.Listeners[0].SocketInode != 101 || observed.Listeners[1].Port != 3478 || observed.Listeners[1].SocketInode != 102 {
 		t.Fatalf("observed=%#v", observed)
 	}
 	after, err := treeSnapshot(root)
@@ -67,6 +71,65 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	}
 	if before != after {
 		t.Fatalf("read-only observer mutated fixture tree\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestParseBootstrapDPKGStatusClassifiesHeldPackages(t *testing.T) {
+	for _, status := range []string{"install ok installed", "hold ok installed"} {
+		t.Run(status, func(t *testing.T) {
+			fixture := []byte("Package: systemd\nStatus: " + status + "\nVersion: 257.1\nArchitecture: amd64\nDescription: fixture\n\ttab continuation\n")
+			installed, partial, err := parseBootstrapDPKGStatus(fixture)
+			if err != nil || partial || len(installed) != 1 || installed[0].Name != "systemd" || installed[0].Version != "257.1" || installed[0].Architecture != "amd64" {
+				t.Fatalf("installed=%#v partial=%t err=%v", installed, partial, err)
+			}
+		})
+	}
+
+	heldHalfConfigured := []byte("Package: systemd\nStatus: hold ok half-configured\nVersion: 257.1\nArchitecture: amd64\n")
+	installed, partial, err := parseBootstrapDPKGStatus(heldHalfConfigured)
+	if err != nil || !partial || len(installed) != 0 {
+		t.Fatalf("held half-configured installed=%#v partial=%t err=%v", installed, partial, err)
+	}
+}
+
+func TestParseBootstrapDPKGStatusRejectsMissingRequiredFields(t *testing.T) {
+	fixture := "Package: systemd\nStatus: install ok installed\nVersion: 257.1\nArchitecture: amd64\n"
+	for _, missing := range []string{"Package", "Status", "Version", "Architecture"} {
+		t.Run(missing, func(t *testing.T) {
+			lines := []string{}
+			for _, line := range strings.Split(fixture, "\n") {
+				if line != "" && !strings.HasPrefix(line, missing+":") {
+					lines = append(lines, line)
+				}
+			}
+			if _, _, err := parseBootstrapDPKGStatus([]byte(strings.Join(lines, "\n") + "\n")); err == nil {
+				t.Fatalf("dpkg stanza without %s was accepted", missing)
+			}
+		})
+	}
+}
+
+func TestLinuxObserverRecordsNonUnifiedCgroupV2(t *testing.T) {
+	root := t.TempDir()
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "missing", path: filepath.Join(root, "missing-cgroup.controllers")},
+		{name: "empty", path: filepath.Join(root, "empty-cgroup.controllers")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "empty" {
+				if err := os.WriteFile(test.path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			observer := &LinuxObserver{paths: LinuxPaths{CgroupControllers: test.path}}
+			mode, err := observer.readCgroupMode()
+			if err != nil || mode != "not_unified_v2" {
+				t.Fatalf("mode=%q err=%v", mode, err)
+			}
+		})
 	}
 }
 

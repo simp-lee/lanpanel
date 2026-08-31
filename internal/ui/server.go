@@ -104,16 +104,14 @@ func (s *Server) beginAction(parent context.Context, principal session.Principal
 	if exclusive {
 		s.rotationPending = true
 	}
-	existing := make([]*actionLease, 0, len(s.actions))
-	for current := range s.actions {
-		existing = append(existing, current)
+	if exclusive {
+		for current := range s.actions {
+			current.cancel()
+		}
 	}
 	s.actions[lease] = struct{}{}
 	s.actionMu.Unlock()
 	if exclusive {
-		for _, current := range existing {
-			current.cancel()
-		}
 		for {
 			if ctx.Err() != nil {
 				s.endAction(lease)
@@ -131,6 +129,20 @@ func (s *Server) beginAction(parent context.Context, principal session.Principal
 	return lease
 }
 
+func (s *Server) revalidateAction(lease *actionLease) bool {
+	if lease == nil || lease.ctx.Err() != nil {
+		return false
+	}
+	s.barrier.RLock()
+	valid := s.config.Sessions.Valid(lease.principal)
+	s.barrier.RUnlock()
+	if !valid || lease.ctx.Err() != nil {
+		lease.cancel()
+		return false
+	}
+	return true
+}
+
 func (s *Server) endAction(lease *actionLease) {
 	if lease == nil {
 		return
@@ -146,15 +158,11 @@ func (s *Server) endAction(lease *actionLease) {
 
 func (s *Server) cancelActions(principal *session.Principal, except *actionLease) {
 	s.actionMu.Lock()
-	leases := make([]*actionLease, 0, len(s.actions))
+	defer s.actionMu.Unlock()
 	for lease := range s.actions {
 		if lease != except && (principal == nil || lease.principal == *principal) {
-			leases = append(leases, lease)
+			lease.cancel()
 		}
-	}
-	s.actionMu.Unlock()
-	for _, lease := range leases {
-		lease.cancel()
 	}
 }
 
@@ -509,11 +517,22 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	}
 	lease := s.beginAction(request.Context(), principal, operation == domain.OperationAdminTokenRotate)
 	if lease == nil {
+		s.barrier.RLock()
+		valid := s.config.Sessions.Valid(principal)
+		s.barrier.RUnlock()
+		if !valid {
+			reject(writer, http.StatusUnauthorized)
+			return
+		}
 		reject(writer, http.StatusConflict)
 		return
 	}
 	defer s.endAction(lease)
 	request = request.WithContext(lease.ctx)
+	if !s.revalidateAction(lease) {
+		reject(writer, http.StatusUnauthorized)
+		return
+	}
 	actionFailure := func(err error, status int) {
 		var rejected application.HelperRejection
 		if errors.As(err, &rejected) {

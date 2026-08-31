@@ -32,21 +32,21 @@ type ChallengeReloadAuthority = ReloadAuthority
 
 func NewReloadAuthority(refresh func() (ReloadAuthoritySnapshot, error)) (ReloadAuthority, error) {
 	if refresh == nil {
-		return ReloadAuthority{}, fmt.Errorf("Nginx reload authority refresh is unavailable")
+		return ReloadAuthority{}, fmt.Errorf("nginx reload authority refresh is unavailable")
 	}
 	snapshot, err := refresh()
 	if err != nil {
 		return ReloadAuthority{}, err
 	}
 	if snapshot.ObservedAt.IsZero() {
-		return ReloadAuthority{}, fmt.Errorf("Nginx reload authority time is unavailable")
+		return ReloadAuthority{}, fmt.Errorf("nginx reload authority time is unavailable")
 	}
 	return ReloadAuthority{refresh: refresh}, nil
 }
 
 func (authority ReloadAuthority) Current() (ReloadAuthoritySnapshot, error) {
 	if authority.refresh == nil {
-		return ReloadAuthoritySnapshot{}, fmt.Errorf("Nginx reload authority refresh is unavailable")
+		return ReloadAuthoritySnapshot{}, fmt.Errorf("nginx reload authority refresh is unavailable")
 	}
 	current, err := authority.refresh()
 	if err != nil {
@@ -54,7 +54,7 @@ func (authority ReloadAuthority) Current() (ReloadAuthoritySnapshot, error) {
 	}
 	current.ObservedAt = current.ObservedAt.UTC()
 	if current.ObservedAt.IsZero() {
-		return ReloadAuthoritySnapshot{}, fmt.Errorf("Nginx reload authority time is unavailable")
+		return ReloadAuthoritySnapshot{}, fmt.Errorf("nginx reload authority time is unavailable")
 	}
 	return current, nil
 }
@@ -65,7 +65,7 @@ func (authority ReloadAuthority) Guard(manifest nginx.Manifest) error {
 		return err
 	}
 	if current.Installation.InstallationID == "" || manifest.InstallationID != current.Installation.InstallationID {
-		return fmt.Errorf("Nginx reload installation authority changed")
+		return fmt.Errorf("nginx reload installation authority changed")
 	}
 	decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: current.Safety, Installation: &current.Installation, Ownership: current.Ownership, Now: current.ObservedAt})
 	if !decision.Allowed {
@@ -89,7 +89,7 @@ func guardAuditedReload(paths nginx.Paths, owner filetxn.Owner, expected nginx.M
 	currentBytes, currentErr := nginx.EncodeManifest(current)
 	expectedBytes, expectedErr := nginx.EncodeManifest(expected)
 	if currentErr != nil || expectedErr != nil || !bytes.Equal(currentBytes, expectedBytes) {
-		return errors.Join(currentErr, expectedErr, fmt.Errorf("Nginx reload manifest changed after transaction"))
+		return errors.Join(currentErr, expectedErr, fmt.Errorf("nginx reload manifest changed after transaction"))
 	}
 	return authority.Guard(current)
 }

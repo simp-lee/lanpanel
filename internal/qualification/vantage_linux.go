@@ -143,12 +143,21 @@ func ProbePublic(ctx context.Context, vantage VantageAuthority, probe PublicProb
 	return release.MarshalCanonical(evidence)
 }
 
-func ProbeSTUN(ctx context.Context, target string) ([]byte, error) {
+func ProbeSTUN(ctx context.Context, vantage VantageAuthority, target string) ([]byte, error) {
 	address, err := netip.ParseAddr(target)
-	if err != nil || !address.Is4() || address.String() != target || !publicIPv4(address) {
-		return nil, fmt.Errorf("STUN target authority is invalid")
+	expectedSource, sourceErr := netip.ParseAddr(vantage.ExpectedSourceIPv4)
+	if err != nil || !address.Is4() || address.String() != target || !publicIPv4(address) || vantage.SchemaVersion != VantageAuthoritySchemaVersion || sourceErr != nil || !expectedSource.Is4() || expectedSource.String() != vantage.ExpectedSourceIPv4 || !publicIPv4(expectedSource) || expectedSource == address {
+		return nil, fmt.Errorf("STUN target or vantage authority is invalid")
 	}
-	connection, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: -1}).DialContext(ctx, "udp4", net.JoinHostPort(target, "3478"))
+	response, err := probeSTUNEndpoint(ctx, net.JoinHostPort(target, "3478"), expectedSource)
+	if err != nil {
+		return nil, err
+	}
+	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: "stun:" + target + ":3478", Status: 200, BodyDigest: release.DigestBytes(response), ObservedSourceIP: expectedSource.String()})
+}
+
+func probeSTUNEndpoint(ctx context.Context, endpoint string, expectedSource netip.Addr) ([]byte, error) {
+	connection, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: -1}).DialContext(ctx, "udp4", endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -165,12 +174,92 @@ func ProbeSTUN(ctx context.Context, target string) ([]byte, error) {
 		return nil, err
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(10 * time.Second))
-	response := make([]byte, 2048)
+	response := make([]byte, 64<<10)
 	count, err := connection.Read(response)
-	if err != nil || count < 20 || binary.BigEndian.Uint16(response[:2]) != 0x0101 || binary.BigEndian.Uint32(response[4:8]) != 0x2112a442 || !bytes.Equal(response[8:20], transaction[:]) {
+	mapped, valid := mappedSTUNBindingResponse(response[:count], transaction)
+	if err != nil || !valid || mapped.Addr() != expectedSource {
 		return nil, fmt.Errorf("public STUN binding response is invalid: %w", err)
 	}
-	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: "stun:" + target + ":3478", Status: 200, BodyDigest: release.DigestBytes(response[:count])})
+	return response[:count], nil
+}
+
+func mappedSTUNBindingResponse(response []byte, transaction [12]byte) (netip.AddrPort, bool) {
+	if len(response) < 20 || binary.BigEndian.Uint16(response[0:2]) != 0x0101 || binary.BigEndian.Uint32(response[4:8]) != 0x2112a442 || !bytes.Equal(response[8:20], transaction[:]) {
+		return netip.AddrPort{}, false
+	}
+	declaredLength := int(binary.BigEndian.Uint16(response[2:4]))
+	if declaredLength%4 != 0 || len(response) != 20+declaredLength {
+		return netip.AddrPort{}, false
+	}
+	var mapped netip.AddrPort
+	for offset := 20; offset < len(response); {
+		if len(response)-offset < 4 {
+			return netip.AddrPort{}, false
+		}
+		attributeType := binary.BigEndian.Uint16(response[offset : offset+2])
+		attributeLength := int(binary.BigEndian.Uint16(response[offset+2 : offset+4]))
+		valueStart := offset + 4
+		valueEnd := valueStart + attributeLength
+		paddedEnd := valueStart + ((attributeLength + 3) &^ 3)
+		if valueEnd > len(response) || paddedEnd > len(response) {
+			return netip.AddrPort{}, false
+		}
+		if attributeType == 0x0001 || attributeType == 0x0020 {
+			candidate, ok := parseSTUNMappedAddress(attributeType, response[valueStart:valueEnd], transaction)
+			if mapped.IsValid() || !ok {
+				return netip.AddrPort{}, false
+			}
+			mapped = candidate
+		}
+		offset = paddedEnd
+	}
+	return mapped, mapped.IsValid()
+}
+
+func parseSTUNMappedAddress(attributeType uint16, value []byte, transaction [12]byte) (netip.AddrPort, bool) {
+	if len(value) < 4 || value[0] != 0 {
+		return netip.AddrPort{}, false
+	}
+	port := binary.BigEndian.Uint16(value[2:4])
+	if attributeType == 0x0020 {
+		port ^= uint16(0x2112a442 >> 16)
+	}
+	var address netip.Addr
+	switch value[1] {
+	case 0x01:
+		if len(value) != 8 {
+			return netip.AddrPort{}, false
+		}
+		var raw [4]byte
+		copy(raw[:], value[4:])
+		if attributeType == 0x0020 {
+			cookie := [4]byte{0x21, 0x12, 0xa4, 0x42}
+			for index := range raw {
+				raw[index] ^= cookie[index]
+			}
+		}
+		address = netip.AddrFrom4(raw)
+	case 0x02:
+		if len(value) != 20 {
+			return netip.AddrPort{}, false
+		}
+		var raw [16]byte
+		copy(raw[:], value[4:])
+		if attributeType == 0x0020 {
+			mask := [16]byte{0x21, 0x12, 0xa4, 0x42}
+			copy(mask[4:], transaction[:])
+			for index := range raw {
+				raw[index] ^= mask[index]
+			}
+		}
+		address = netip.AddrFrom16(raw)
+	default:
+		return netip.AddrPort{}, false
+	}
+	if port == 0 || !address.IsValid() || address.IsUnspecified() || address.IsMulticast() {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(address, port), true
 }
 
 func ProbeDERP(ctx context.Context, targetIP, host string) ([]byte, error) {

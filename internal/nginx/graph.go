@@ -906,7 +906,7 @@ func renderDomain(entry Entry) ([]byte, error) {
 			source += "/"
 		}
 		fmt.Fprintf(&output, "  location%s %s {\n", modifier, route.URLPath)
-		if site.AuthMode == "basic" {
+		if site.AuthMode == "basic" && !route.Anonymous {
 			renderLocationAccess(&output, site.HTPasswdPath, site.CIDRs)
 		}
 		fmt.Fprintf(&output, "    disable_symlinks on;\n    alias %s;\n    try_files $request_filename =404;\n    limit_except GET HEAD { deny all; }\n  }\n", quoteNginxArgument(source))

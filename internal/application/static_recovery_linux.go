@@ -14,6 +14,31 @@ import (
 	"strings"
 )
 
+type registrationRecoveryStage uint8
+
+const (
+	registrationRecoverySkip registrationRecoveryStage = iota
+	registrationRecoveryReject
+	registrationRecoveryLocal
+	registrationRecoveryInvalid
+)
+
+func classifyRegistrationRecovery(intent operations.Reservation) registrationRecoveryStage {
+	if intent.Operation != operations.StaticRootRegister && intent.Operation != operations.ExternalHTPasswdRegister {
+		return registrationRecoverySkip
+	}
+	switch intent.Phase {
+	case operations.PhaseReserved:
+		return registrationRecoveryReject
+	case operations.PhaseLocalIntent:
+		return registrationRecoveryLocal
+	case operations.PhaseRejected, operations.PhaseTerminal:
+		return registrationRecoverySkip
+	default:
+		return registrationRecoveryInvalid
+	}
+}
+
 func ReconcileStaticRootRegistrations(ctx context.Context) error {
 	service, err := OpenFixed()
 	if err != nil {
@@ -33,11 +58,27 @@ func ReconcileStaticRootRegistrations(ctx context.Context) error {
 			continue
 		}
 		var intent operations.Reservation
-		if json.Unmarshal(raw, &intent) != nil || (intent.Operation != operations.StaticRootRegister && intent.Operation != operations.ExternalHTPasswdRegister) || intent.Phase == operations.PhaseTerminal {
+		if json.Unmarshal(raw, &intent) != nil {
 			continue
 		}
-		if intent.Phase != operations.PhaseLocalIntent {
-			return fmt.Errorf("static root recovery phase changed")
+		switch classifyRegistrationRecovery(intent) {
+		case registrationRecoverySkip:
+			continue
+		case registrationRecoveryReject:
+			code := "static_root_registration_interrupted"
+			if intent.Operation == operations.ExternalHTPasswdRegister {
+				code = "external_htpasswd_registration_interrupted"
+			}
+			if err := rejectReservedBasicOperation(ctx, service, admitter, intent.JobID, code); err != nil {
+				return err
+			}
+			document, err = service.normal.Read()
+			if err != nil {
+				return err
+			}
+			continue
+		case registrationRecoveryInvalid:
+			return fmt.Errorf("registration recovery phase changed")
 		}
 		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
 		if err != nil {

@@ -5,6 +5,7 @@ package application
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/htpasswdref"
@@ -27,7 +28,7 @@ func pathContainedBy(parent, candidate string) bool {
 	return err == nil && !filepath.IsAbs(relative) && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
-func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor string) (ExternalHTPasswdResult, error) {
+func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor string) (result ExternalHTPasswdResult, resultErr error) {
 	if err := requireNoDegradedAppliedSource(resourceID); err != nil {
 		return ExternalHTPasswdResult{}, err
 	}
@@ -72,19 +73,25 @@ func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor strin
 	if err != nil {
 		return ExternalHTPasswdResult{}, err
 	}
-	defer func(ignore func() error) { _ = ignore() }(execution.Close)
+	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
-		return ExternalHTPasswdResult{}, err
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "external_htpasswd_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "external_htpasswd_revalidation_failed", err)
+		result.Job = completed
+		return result, terminalErr
 	}
 	for _, candidate := range protectedStaticPaths(freshInstallation) {
 		if pathContainedBy(candidate, path) {
-			return ExternalHTPasswdResult{}, fmt.Errorf("external htpasswd overlaps protected managed path")
+			completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "external_htpasswd_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "external_htpasswd_revalidation_failed", fmt.Errorf("external htpasswd overlaps protected managed path"))
+			result.Job = completed
+			return result, terminalErr
 		}
 	}
 	lockedIdentity, err := htpasswdref.Validate(path, gid)
 	if err != nil || !reflect.DeepEqual(lockedIdentity, identity) {
-		return ExternalHTPasswdResult{}, fmt.Errorf("external htpasswd changed before commit")
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "external_htpasswd_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "external_htpasswd_revalidation_failed", errors.Join(fmt.Errorf("external htpasswd changed before commit"), err))
+		result.Job = completed
+		return result, terminalErr
 	}
 	if err := execution.admitter.CommitExternalHTPasswd(ctx, execution.mutation, execution.exposure, execution.intent.IntentGeneration, execution.job.ID, resourceID, credential); err != nil {
 		return ExternalHTPasswdResult{}, err

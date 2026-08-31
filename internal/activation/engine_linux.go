@@ -50,6 +50,10 @@ type Failure struct {
 func (value *Failure) Error() string { return value.Cause.Error() }
 func (value *Failure) Unwrap() error { return value.Cause }
 
+func activationRecoveryFailure(cause, restoreErr error) *Failure {
+	return &Failure{Cause: errors.Join(cause, restoreErr), PriorRestored: restoreErr == nil}
+}
+
 type Host struct {
 	Launcher *child.Launcher
 	Paths    nginx.Paths
@@ -161,11 +165,11 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 				}
 			}
 		}
-		priorRestored := restoreErr == nil
-		resultErr = &Failure{Cause: errors.Join(resultErr, restoreErr), PriorRestored: priorRestored}
+		resultErr = activationRecoveryFailure(resultErr, restoreErr)
 	}()
-	manifest, paths, err := nginx.InstallEntry(ctx, host.Paths, host.Owner, candidate.Entry)
-	activeManifest = manifest
+	manifest, paths, err := installActivationEntry(&activeManifest, func() (nginx.Manifest, []string, error) {
+		return nginx.InstallEntry(ctx, host.Paths, host.Owner, candidate.Entry)
+	})
 	if err != nil {
 		return Result{}, err
 	}
@@ -196,6 +200,14 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 		return Result{}, err
 	}
 	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: runtimeDigest}, nil
+}
+
+func installActivationEntry(activeManifest *nginx.Manifest, install func() (nginx.Manifest, []string, error)) (nginx.Manifest, []string, error) {
+	manifest, paths, err := install()
+	if err == nil {
+		*activeManifest = manifest
+	}
+	return manifest, paths, err
 }
 
 func currentWorkers(snapshot closure.RuntimeSnapshot) []closure.ProcessIdentity {
@@ -263,7 +275,7 @@ func (host Host) ObserveCurrent(ctx context.Context) (closure.RuntimeSnapshot, e
 	return host.observer(manifest).Observe(ctx)
 }
 
-func exactTemporaryEntryPresent(entries []nginx.Entry, candidate nginx.Entry) bool {
+func exactEntryPresent(entries []nginx.Entry, candidate nginx.Entry) bool {
 	for _, entry := range entries {
 		if reflect.DeepEqual(entry, candidate) {
 			return true
@@ -277,7 +289,7 @@ func (host Host) VerifyTemporary(ctx context.Context, candidate publication.Cand
 	if err != nil {
 		return "", err
 	}
-	matched := exactTemporaryEntryPresent(manifest.Entries, candidate.Entry)
+	matched := exactEntryPresent(manifest.Entries, candidate.Entry)
 	if !matched {
 		return "", fmt.Errorf("temporary HTTP runtime manifest candidate missing")
 	}
@@ -293,12 +305,7 @@ func (host Host) VerifyDomain(ctx context.Context, candidate publication.Candida
 	if err != nil {
 		return "", err
 	}
-	matched := false
-	for _, entry := range manifest.Entries {
-		if entry.ResourceID == candidate.ResourceID && entry.Kind == nginx.EntryApp && entry.Digest == candidate.Entry.Digest {
-			matched = true
-		}
-	}
+	matched := exactEntryPresent(manifest.Entries, candidate.Entry)
 	if !matched {
 		return "", fmt.Errorf("domain runtime manifest candidate missing")
 	}

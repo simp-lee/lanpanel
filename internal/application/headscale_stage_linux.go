@@ -794,11 +794,94 @@ func headscaleBaseSnapshot(value safety.HeadscaleSafety) []safety.MarkerSnapshot
 	return []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, certificate}
 }
 
+func classifyJournalLessPreparedHeadscaleDeploy(installation domain.Installation, intent operations.Reservation) (bool, error) {
+	if installation.Headscale == nil || installation.Headscale.DeployIntent == nil {
+		return false, nil
+	}
+	deploy := installation.Headscale.DeployIntent
+	if deploy.Phase != domain.HeadscaleDeployPrepared {
+		return false, fmt.Errorf("headscale deploy control journal is missing after local preparation started")
+	}
+	if intent.Operation != operations.HeadscaleDeploy || intent.Phase != operations.PhaseLocalIntent || intent.HeadscaleDeploy == nil || intent.JobID != deploy.JobID || intent.PlanID != deploy.PlanID || intent.Target != "headscale/"+installation.Headscale.ID || installation.Headscale.LastJobID != deploy.JobID || installation.Headscale.LastOperation != domain.OperationHeadscaleControlDeploy {
+		return false, fmt.Errorf("journal-less prepared Headscale deploy authority changed")
+	}
+	applied, err := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
+	if err != nil || !reflect.DeepEqual(applied, deploy.Candidate) || deploy.Generation != intent.HeadscaleDeploy.Candidate.Generation || deploy.CertificateBinding != intent.HeadscaleDeploy.Candidate.CertificateBinding || deploy.PreflightDigest != intent.HeadscaleDeploy.PreflightResult.RequestDigest {
+		return false, fmt.Errorf("journal-less prepared Headscale candidate changed")
+	}
+	return true, nil
+}
+
+func terminalizeJournalLessPreparedHeadscaleDeploy(ctx context.Context, service *FixedService) error {
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	rawInstallation, present := document.Entries["installations/current"]
+	if !present {
+		return nil
+	}
+	installation, err := domain.DecodeInstallation(rawInstallation)
+	if err != nil {
+		return err
+	}
+	if installation.Headscale == nil || installation.Headscale.DeployIntent == nil {
+		return nil
+	}
+	jobID := installation.Headscale.DeployIntent.JobID
+	raw, present := document.Entries["intents/"+jobID]
+	var intent operations.Reservation
+	if !present || json.Unmarshal(raw, &intent) != nil {
+		return fmt.Errorf("journal-less prepared Headscale operation authority missing")
+	}
+	required, err := classifyJournalLessPreparedHeadscaleDeploy(installation, intent)
+	if err != nil || !required {
+		return err
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return err
+	}
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, service.manager)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
+	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if _, err := store.Read(); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	fresh, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	freshInstallationRaw, installationPresent := fresh.Entries["installations/current"]
+	freshInstallation, err := domain.DecodeInstallation(freshInstallationRaw)
+	freshRaw, freshPresent := fresh.Entries["intents/"+jobID]
+	var freshIntent operations.Reservation
+	if err != nil || !installationPresent || !freshPresent || json.Unmarshal(freshRaw, &freshIntent) != nil {
+		return fmt.Errorf("journal-less prepared Headscale authority changed under lock: %w", err)
+	}
+	required, err = classifyJournalLessPreparedHeadscaleDeploy(freshInstallation, freshIntent)
+	if err != nil || !required {
+		return errors.Join(err, fmt.Errorf("journal-less prepared Headscale deploy is no longer terminalizable"))
+	}
+	_, err = admitter.FailPreparedHeadscaleDeploy(ctx, mutation, exposure, fresh.Revision, jobID)
+	return err
+}
+
 func reconcileInterruptedHeadscaleLocalCandidate(ctx context.Context, service *FixedService) error {
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	journal, err := store.Read()
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
-		return nil
+		return terminalizeJournalLessPreparedHeadscaleDeploy(ctx, service)
 	}
 	if err != nil {
 		return err
@@ -1195,16 +1278,49 @@ func (execution *HeadscaleDeployExecution) Job() jobs.Record {
 	return record
 }
 
+func (execution *HeadscaleDeployExecution) failPreparedDeployWithoutJournal(ctx context.Context) error {
+	if execution == nil || execution.Service == nil || execution.Admitter == nil || execution.Mutation == nil || execution.Exposure == nil || execution.Local != nil {
+		return nil
+	}
+	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if _, err := store.Read(); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil || document.Revision != execution.Revision {
+		return errors.Join(err, fmt.Errorf("prepared Headscale deploy revision changed before failure terminalization"))
+	}
+	installation, err := loadHeadscaleInstallation(document)
+	raw, present := document.Entries["intents/"+execution.JobID]
+	var intent operations.Reservation
+	if err != nil || !present || json.Unmarshal(raw, &intent) != nil {
+		return errors.Join(err, fmt.Errorf("prepared Headscale deploy authority missing before failure terminalization"))
+	}
+	required, err := classifyJournalLessPreparedHeadscaleDeploy(installation, intent)
+	if err != nil || !required {
+		return errors.Join(err, fmt.Errorf("prepared Headscale deploy is not failure-terminalizable"))
+	}
+	_, err = execution.Admitter.FailPreparedHeadscaleDeploy(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID)
+	if err == nil {
+		execution.Revision++
+	}
+	return err
+}
+
 func (execution *HeadscaleDeployExecution) Close() error {
 	if execution == nil {
 		return nil
 	}
 	var err error
-	if execution.Local != nil && !execution.CertificateStaged && !execution.ClosureUncertain {
+	if execution.Local == nil {
+		err = execution.failPreparedDeployWithoutJournal(context.Background())
+	} else if !execution.CertificateStaged && !execution.ClosureUncertain {
 		err = execution.removeFailedChallenge(context.Background(), execution.Host)
 	}
 	if execution.Mutation != nil || execution.Exposure != nil {
-		err = operations.ReleaseExposure(execution.Mutation, execution.Exposure)
+		err = errors.Join(err, operations.ReleaseExposure(execution.Mutation, execution.Exposure))
 		execution.Mutation, execution.Exposure = nil, nil
 	}
 	if execution.MutationSet != nil {

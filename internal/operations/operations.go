@@ -95,6 +95,7 @@ type SafetyBinding struct {
 	IntentGeneration        uint64                              `json:"intent_generation,omitempty"`
 	CandidateDigest         string                              `json:"candidate_digest,omitempty"`
 	CandidateBundle         string                              `json:"candidate_bundle,omitempty"`
+	PriorFingerprint        string                              `json:"prior_fingerprint,omitempty"`
 	ChallengeMethod         string                              `json:"challenge_method,omitempty"`
 	CertificateIdentity     string                              `json:"certificate_identity,omitempty"`
 	ACMEBinding             string                              `json:"acme_binding,omitempty"`
@@ -1590,8 +1591,8 @@ func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation
 	return err
 }
 
-func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, credentialID, username, path, fingerprint string) error {
-	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(fingerprint) {
+func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, prior domain.Credential, fingerprint string) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || prior.Kind != "managed_basic" || !exactDigest(prior.Fingerprint) || !exactDigest(fingerprint) {
 		return fmt.Errorf("managed Basic commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
@@ -1599,7 +1600,7 @@ func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mut
 		if err != nil {
 			return err
 		}
-		if intent.Operation != ManagedBasicRotate || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+credentialID || mutation.Target() != intent.Target {
+		if intent.Operation != ManagedBasicRotate || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+prior.ID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != prior.OwnerResourceID || intent.SafetyBinding.PriorFingerprint != prior.Fingerprint {
 			return fmt.Errorf("managed Basic intent mismatched")
 		}
 		installation, err := loadInstallation(transaction)
@@ -1609,10 +1610,10 @@ func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mut
 		found := false
 		for index := range installation.Credentials {
 			credential := &installation.Credentials[index]
-			if credential.ID != credentialID {
+			if credential.ID != prior.ID {
 				continue
 			}
-			if credential.Kind != "managed_basic" || credential.Username != username || credential.ManagedPath != path {
+			if *credential != prior {
 				return fmt.Errorf("managed Basic credential identity changed")
 			}
 			credential.Fingerprint = fingerprint
@@ -1630,8 +1631,8 @@ func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mut
 	return err
 }
 
-func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, credentialID string) error {
-	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, prior domain.Credential) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || prior.Kind != "managed_basic" || !exactDigest(prior.Fingerprint) {
 		return fmt.Errorf("managed Basic delete requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
@@ -1639,7 +1640,7 @@ func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation
 		if err != nil {
 			return err
 		}
-		if intent.Operation != ManagedBasicDelete || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+credentialID || mutation.Target() != intent.Target {
+		if intent.Operation != ManagedBasicDelete || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+prior.ID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != prior.OwnerResourceID || intent.SafetyBinding.PriorFingerprint != prior.Fingerprint {
 			return fmt.Errorf("managed Basic delete intent mismatched")
 		}
 		installation, err := loadInstallation(transaction)
@@ -1647,16 +1648,16 @@ func (admitter *Admitter) CommitManagedBasicDelete(ctx context.Context, mutation
 			return err
 		}
 		for _, resource := range installation.Resources {
-			if credentialReferenced(resource, credentialID) {
+			if credentialReferenced(resource, prior.ID) {
 				return fmt.Errorf("active resource reference blocks credential delete")
 			}
 		}
 		kept := installation.Credentials[:0]
 		found := false
 		for _, credential := range installation.Credentials {
-			if credential.ID == credentialID {
-				if credential.Kind != "managed_basic" {
-					return fmt.Errorf("credential is not managed Basic")
+			if credential.ID == prior.ID {
+				if credential != prior {
+					return fmt.Errorf("managed Basic credential identity changed")
 				}
 				found = true
 				continue
@@ -3940,6 +3941,81 @@ func (admitter *Admitter) CommitHeadscaleDeployBegin(ctx context.Context, mutati
 		return transaction.Replace("installations/current", raw)
 	})
 	return err
+}
+
+func (admitter *Admitter) FailPreparedHeadscaleDeploy(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (jobs.Record, error) {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
+		return jobs.Record{}, fmt.Errorf("prepared Headscale deploy failure requires exact authority")
+	}
+	observed, err := admitter.trustedNow()
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	var completed jobs.Record
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil {
+			return err
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if intent.Operation != HeadscaleDeploy || intent.Phase != PhaseLocalIntent || intent.HeadscaleDeploy == nil || mutation.Target() != intent.Target || installation.Headscale == nil || installation.Headscale.LastOperation != domain.OperationHeadscaleControlDeploy || installation.Headscale.LastJobID != jobID || installation.Headscale.DeployIntent == nil || installation.Headscale.DeployIntent.JobID != jobID || installation.Headscale.DeployIntent.PlanID != intent.PlanID || installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployPrepared {
+			return fmt.Errorf("prepared Headscale deploy failure authority changed")
+		}
+		deploy := installation.Headscale.DeployIntent
+		applied, appliedErr := control.AppliedIdentity(intent.HeadscaleDeploy.Candidate)
+		if appliedErr != nil || !reflect.DeepEqual(applied, deploy.Candidate) || deploy.Generation != intent.HeadscaleDeploy.Candidate.Generation || deploy.CertificateBinding != intent.HeadscaleDeploy.Candidate.CertificateBinding || deploy.PreflightDigest != intent.HeadscaleDeploy.PreflightResult.RequestDigest {
+			return fmt.Errorf("prepared Headscale deploy failure candidate changed")
+		}
+		for _, key := range transaction.Keys("children") {
+			raw, _ := transaction.Get(key)
+			var child ChildRecord
+			if decodeStrict(raw, &child) == nil && child.JobID == jobID {
+				return fmt.Errorf("prepared Headscale deploy already has durable local work")
+			}
+		}
+		for _, key := range transaction.Keys("journals") {
+			raw, _ := transaction.Get(key)
+			var journal JournalRecord
+			if decodeStrict(raw, &journal) == nil && journal.JobID == jobID {
+				return fmt.Errorf("prepared Headscale deploy already has durable local work")
+			}
+		}
+		record, err := jobs.Load(transaction, jobID)
+		if err != nil || record.Status != jobs.StatusRunning {
+			return fmt.Errorf("prepared Headscale deploy job changed: %w", err)
+		}
+		record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultFailed, Postconditions: []jobs.Postcondition{{Kind: "headscale_deploy_not_started", Status: jobs.PostconditionVerified, Identity: jobID}}, ErrorCode: "headscale_deploy_revalidation_failed"}, observed)
+		if err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, record); err != nil {
+			return err
+		}
+		intent.Phase = PhaseTerminal
+		raw, err := persist.EncodeEntry(intent)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		headscale := *installation.Headscale
+		headscale.DeployIntent = nil
+		installation.Headscale = &headscale
+		raw, err = persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace("installations/current", raw); err != nil {
+			return err
+		}
+		completed = record
+		return nil
+	})
+	return completed, err
 }
 
 func (admitter *Admitter) CommitHeadscaleDeployStaged(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, commit HeadscaleDeployStagedCommit) error {
@@ -6606,10 +6682,11 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			}
 			oldHeadscale, newHeadscale := oldInstallation.Headscale, newInstallation.Headscale
 			completing := oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivated && newHeadscale.DeployIntent == nil
+			failingPrepared := oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployPrepared && newHeadscale.DeployIntent == nil
 			renewing := oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent == nil && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
 			reissueActivating := oldHeadscale.DeployIntent == nil && newHeadscale.DeployIntent != nil && newHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
 			reissueCompleting := oldHeadscale.DeployIntent != nil && oldHeadscale.DeployIntent.Phase == domain.HeadscaleDeployActivating && newHeadscale.DeployIntent == nil && newHeadscale.LastOperation == domain.OperationHeadscaleReissue
-			if (!completing && !renewing && !reissueActivating && !reissueCompleting && newHeadscale.DeployIntent == nil) || newHeadscale.LastJobID == "" || (!renewing && !reissueActivating && !reissueCompleting && newHeadscale.LastOperation != domain.OperationHeadscaleControlDeploy) {
+			if (!completing && !failingPrepared && !renewing && !reissueActivating && !reissueCompleting && newHeadscale.DeployIntent == nil) || newHeadscale.LastJobID == "" || (!renewing && !reissueActivating && !reissueCompleting && newHeadscale.LastOperation != domain.OperationHeadscaleControlDeploy) {
 				return fmt.Errorf("headscale deploy lacks durable intent")
 			}
 			expected := *oldHeadscale
@@ -6619,6 +6696,10 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			expectedOperation := HeadscaleDeploy
 			expectedTarget := string(plans.TargetHeadscale) + "/" + newHeadscale.ID
 			switch {
+			case failingPrepared:
+				expected.DeployIntent = nil
+				beforePhase, afterPhase = PhaseLocalIntent, PhaseTerminal
+				beforeStatus, afterStatus = jobs.StatusRunning, jobs.StatusTerminal
 			case reissueActivating:
 				expected.DeployIntent = newHeadscale.DeployIntent
 				expected.LastOperation = newHeadscale.LastOperation
@@ -7279,6 +7360,9 @@ func validateReservation(value Reservation) error {
 	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || value.SafetyBinding.ACMEBinding != "" && !exactDigest(value.SafetyBinding.ACMEBinding) || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
 		return fmt.Errorf("operation certificate challenge binding invalid")
 	}
+	if (value.Operation == ManagedBasicRotate || value.Operation == ManagedBasicDelete) != (value.SafetyBinding.PriorFingerprint != "") || value.SafetyBinding.PriorFingerprint != "" && !exactDigest(value.SafetyBinding.PriorFingerprint) {
+		return fmt.Errorf("managed Basic prior fingerprint binding invalid")
+	}
 	if err := validateHeadscaleInitializationBinding(value.Operation, value.SafetyBinding, value.HeadscaleBinding); err != nil {
 		return err
 	}
@@ -7357,6 +7441,14 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 	}
 	binding := request.SafetyBinding
+	if request.Operation == ManagedBasicRotate || request.Operation == ManagedBasicDelete {
+		expected := SafetyBinding{ResourceID: binding.ResourceID, Deadline: binding.Deadline, PriorFingerprint: binding.PriorFingerprint}
+		if !exactDigest(binding.PriorFingerprint) || !reflect.DeepEqual(binding, expected) {
+			return fmt.Errorf("managed Basic mutation requires an exact prior fingerprint")
+		}
+	} else if binding.PriorFingerprint != "" {
+		return fmt.Errorf("unrelated operation carried managed Basic prior authority")
+	}
 	if request.Operation == GoAccessRetirement {
 		if request.Source != AdmissionStartup {
 			return fmt.Errorf("GoAccess retirement must be startup-bound")

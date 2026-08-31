@@ -26,14 +26,16 @@ import (
 const maxOSReleaseBytes = 64 << 10
 
 type LinuxPaths struct {
-	OSRelease      string
-	SystemdRoot    string
-	APTExecutable  string
-	DPKGExecutable string
-	TCP            string
-	TCP6           string
-	UDP            string
-	UDP6           string
+	OSRelease         string
+	KernelRelease     string
+	CgroupControllers string
+	SystemdRoot       string
+	APTExecutable     string
+	DPKGExecutable    string
+	TCP               string
+	TCP6              string
+	UDP               string
+	UDP6              string
 }
 
 type LinuxObserver struct {
@@ -47,7 +49,7 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
 	}
-	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", SystemdRoot: "/run/systemd/system", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
+	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", SystemdRoot: "/run/systemd/system", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
 }
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
@@ -91,37 +93,99 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 	if err != nil {
 		return PackageObservation{}, err
 	}
+	installed, partial, err := parseBootstrapDPKGStatus(status)
+	if err != nil {
+		return PackageObservation{}, err
+	}
+	if partial {
+		return PackageObservation{Reason: "dpkg_partial_state"}, nil
+	}
 	systemdVersion, nginxVersion := "", ""
-	for _, paragraph := range strings.Split(strings.TrimSpace(string(status)), "\n\n") {
-		state, name, version, architecture := "", "", "", ""
-		for _, line := range strings.Split(paragraph, "\n") {
-			switch {
-			case strings.HasPrefix(line, "Status:"):
-				state = strings.TrimSpace(strings.TrimPrefix(line, "Status:"))
-			case strings.HasPrefix(line, "Package:"):
-				name = strings.TrimSpace(strings.TrimPrefix(line, "Package:"))
-			case strings.HasPrefix(line, "Version:"):
-				version = strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
-			case strings.HasPrefix(line, "Architecture:"):
-				architecture = strings.TrimSpace(strings.TrimPrefix(line, "Architecture:"))
-			}
+	for _, pkg := range installed {
+		if pkg.Name == "systemd" {
+			systemdVersion = pkg.Version
 		}
-		if state != "" && state != "install ok installed" && state != "deinstall ok config-files" && state != "purge ok not-installed" {
-			return PackageObservation{Reason: "dpkg_partial_state"}, nil
+		if pkg.Name == "nginx" || pkg.Name == "nginx-core" {
+			nginxVersion = pkg.Version
 		}
-		if state == "install ok installed" {
-			if name == "systemd" {
-				systemdVersion = version
-			}
-			if name == "nginx" || name == "nginx-core" {
-				nginxVersion = version
-			}
-			_, _ = fmt.Fprintf(hasher, "%s=%s@%s\n", name, version, architecture)
-		}
+		_, _ = fmt.Fprintf(hasher, "%s=%s@%s\n", pkg.Name, pkg.Version, pkg.Architecture)
 	}
 	_, _ = hasher.Write(status)
 	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
+}
+
+type bootstrapDPKGPackage struct {
+	Name         string
+	Version      string
+	Architecture string
+}
+
+func parseBootstrapDPKGStatus(data []byte) ([]bootstrapDPKGPackage, bool, error) {
+	installed := []bootstrapDPKGPackage{}
+	partial := false
+	for stanzaIndex, paragraph := range strings.Split(string(data), "\n\n") {
+		if strings.TrimSpace(paragraph) == "" {
+			continue
+		}
+		fields := map[string]string{}
+		for _, line := range strings.Split(paragraph, "\n") {
+			if line == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+				continue
+			}
+			key, value, found := strings.Cut(line, ":")
+			if !found || key == "" {
+				return nil, false, fmt.Errorf("dpkg status stanza %d is malformed", stanzaIndex+1)
+			}
+			if _, duplicate := fields[key]; duplicate {
+				return nil, false, fmt.Errorf("dpkg status stanza %d duplicates %s", stanzaIndex+1, key)
+			}
+			fields[key] = strings.TrimSpace(value)
+		}
+		for _, required := range []string{"Package", "Status", "Version", "Architecture"} {
+			if fields[required] == "" {
+				return nil, false, fmt.Errorf("dpkg status stanza %d is missing %s", stanzaIndex+1, required)
+			}
+		}
+		_, errorState, packageState, err := parseDPKGStatusFields(fields["Status"])
+		if err != nil {
+			return nil, false, fmt.Errorf("dpkg status stanza %d: %w", stanzaIndex+1, err)
+		}
+		if errorState != "ok" {
+			partial = true
+			continue
+		}
+		switch packageState {
+		case "installed":
+			installed = append(installed, bootstrapDPKGPackage{Name: fields["Package"], Version: fields["Version"], Architecture: fields["Architecture"]})
+		case "not-installed", "config-files":
+		case "half-installed", "unpacked", "half-configured", "triggers-awaited", "triggers-pending":
+			partial = true
+		}
+	}
+	return installed, partial, nil
+}
+
+func parseDPKGStatusFields(value string) (string, string, string, error) {
+	fields := strings.Fields(value)
+	if len(fields) != 3 {
+		return "", "", "", fmt.Errorf("dpkg Status must contain exactly selection, error, and state fields")
+	}
+	selection, errorState, packageState := fields[0], fields[1], fields[2]
+	switch selection {
+	case "unknown", "install", "hold", "deinstall", "purge":
+	default:
+		return "", "", "", fmt.Errorf("dpkg Status selection field is invalid")
+	}
+	if errorState != "ok" && errorState != "reinstreq" {
+		return "", "", "", fmt.Errorf("dpkg Status error field is invalid")
+	}
+	switch packageState {
+	case "not-installed", "config-files", "half-installed", "unpacked", "half-configured", "triggers-awaited", "triggers-pending", "installed":
+	default:
+		return "", "", "", fmt.Errorf("dpkg Status state field is invalid")
+	}
+	return selection, errorState, packageState, nil
 }
 
 func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
@@ -177,6 +241,14 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
+	kernelRelease, err := observer.readKernelRelease()
+	if err != nil {
+		return ExpansionObservations{}, err
+	}
+	cgroupMode, err := observer.readCgroupMode()
+	if err != nil {
+		return ExpansionObservations{}, err
+	}
 	systemd, err := observeDirectoryComponent(observer.paths.SystemdRoot)
 	if err != nil {
 		return ExpansionObservations{}, err
@@ -218,11 +290,34 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 		disks = append(disks, observation)
 	}
 	return ExpansionObservations{
-		OperatingSystem: "linux", Architecture: runtime.GOARCH, Platform: platform,
+		OperatingSystem: "linux", Architecture: runtime.GOARCH, KernelRelease: kernelRelease, CgroupMode: cgroupMode, Platform: platform,
 		Clock:       observeClock(observer.now().UTC()),
 		ExecutorUID: uint32(os.Geteuid()), Systemd: systemd, APT: apt, DPKG: dpkg, Packages: packages,
 		DNS: dns, Listeners: listeners, ListenerInventoryComplete: true, Paths: paths, Disks: disks,
 	}, nil
+}
+
+func (observer *LinuxObserver) readKernelRelease() (string, error) {
+	data, err := readBoundedProcFile(observer.paths.KernelRelease, 4<<10)
+	if err != nil {
+		return "", fmt.Errorf("observe current kernel release: %w", err)
+	}
+	release := strings.TrimSpace(string(data))
+	if release == "" || !validIdentity(release) || strings.ContainsAny(release, "\x00\r\n") {
+		return "", fmt.Errorf("current kernel release is invalid")
+	}
+	return release, nil
+}
+
+func (observer *LinuxObserver) readCgroupMode() (string, error) {
+	controllers, err := readBoundedProcFile(observer.paths.CgroupControllers, 1<<20)
+	if errors.Is(err, os.ErrNotExist) || err == nil && len(controllers) == 0 {
+		return "not_unified_v2", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("observe unified cgroup v2 state: %w", err)
+	}
+	return "unified_v2", nil
 }
 
 func (observer *LinuxObserver) readPlatform() (PlatformInfo, error) {

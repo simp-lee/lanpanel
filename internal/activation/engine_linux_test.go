@@ -7,7 +7,9 @@ import (
 	"errors"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/publication"
 	"strings"
 	"testing"
 )
@@ -25,16 +27,85 @@ func TestTemporaryRuntimeEntryRequiresExactGenerationAndIdentity(t *testing.T) {
 	candidate := nginx.Entry{Kind: nginx.EntryTemporary, ResourceID: "res_one", Relative: "temporary/res_one.conf", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Listeners: []string{"tcp:0.0.0.0:18080"}, Generation: 2, Temporary: &nginx.TemporarySite{PublicIPv4: "8.8.8.8", Port: 18080, HostAuthority: "8.8.8.8:18080", UpstreamNetwork: "unix", UpstreamAddress: "/run/app.sock", ReadinessPath: "/ready"}}
 	prior := candidate
 	prior.Generation = 1
-	if exactTemporaryEntryPresent([]nginx.Entry{prior}, candidate) {
+	if exactEntryPresent([]nginx.Entry{prior}, candidate) {
 		t.Fatal("prior temporary generation satisfied current runtime authority")
 	}
 	wrongIdentity := candidate
 	wrongIdentity.Digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	if exactTemporaryEntryPresent([]nginx.Entry{wrongIdentity}, candidate) {
+	if exactEntryPresent([]nginx.Entry{wrongIdentity}, candidate) {
 		t.Fatal("same-generation wrong temporary identity satisfied runtime authority")
 	}
-	if !exactTemporaryEntryPresent([]nginx.Entry{candidate}, candidate) {
+	if !exactEntryPresent([]nginx.Entry{candidate}, candidate) {
 		t.Fatal("exact temporary runtime entry was rejected")
+	}
+}
+
+func TestActivationInstallFaultsRecoverWithPriorManifestAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		paths []string
+	}{
+		{name: "entry install", paths: nil},
+		{name: "manifest install", paths: []string{"/entry.conf"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fault := errors.New(test.name + " fault")
+			prior := nginx.Manifest{GenerationID: "prior_generation"}
+			active := prior
+			_, _, err := installActivationEntry(&active, func() (nginx.Manifest, []string, error) {
+				return nginx.Manifest{}, test.paths, fault
+			})
+			if !errors.Is(err, fault) {
+				t.Fatalf("install error=%v", err)
+			}
+			var restoreErr error
+			if active.GenerationID != prior.GenerationID {
+				restoreErr = errors.New("prior runtime manifest authority changed")
+			}
+			failure := activationRecoveryFailure(err, restoreErr)
+			if !failure.PriorRestored || !errors.Is(failure, fault) {
+				t.Fatalf("recovery failure=%#v active=%#v", failure, active)
+			}
+		})
+	}
+}
+
+func TestDomainRuntimeRejectsSameDigestFromPriorGeneration(t *testing.T) {
+	paths, owner, _, _ := challengeTransactionFixture(t)
+	prior := nginx.Entry{
+		Kind:       nginx.EntryApp,
+		ResourceID: "res_challenge",
+		Relative:   nginx.AppsDirectory + "/res_challenge.conf",
+		Digest:     "sha256:" + strings.Repeat("0", 64),
+		Domains:    []string{"app.example.test"},
+		Generation: 1,
+		Domain: &nginx.DomainSite{
+			Hosts:              []string{"app.example.test"},
+			CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_domain",
+			RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log",
+			AuthMode:           "public",
+			UpstreamNetwork:    "unix",
+			UpstreamAddress:    "/run/lanpanel/res_domain.sock",
+		},
+	}
+	var err error
+	prior.Digest, err = nginx.DigestEntry(prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nginx.InstallEntry(context.Background(), paths, owner, prior); err != nil {
+		t.Fatal(err)
+	}
+	candidate := prior
+	candidate.Generation = 2
+	candidateDigest, err := nginx.DigestEntry(candidate)
+	if err != nil || candidateDigest != prior.Digest {
+		t.Fatalf("same rendering digest=%q err=%v", candidateDigest, err)
+	}
+	host := Host{Paths: paths, Owner: owner}
+	_, err = host.VerifyDomain(context.Background(), publication.Candidate{ResourceID: candidate.ResourceID, Entry: candidate}, domain.AppTarget{})
+	if err == nil || !strings.Contains(err.Error(), "manifest candidate missing") {
+		t.Fatalf("prior generation satisfied domain verification: %v", err)
 	}
 }
 

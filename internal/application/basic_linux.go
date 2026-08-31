@@ -50,6 +50,34 @@ func (value *basicExecution) Close() error {
 	return err
 }
 
+func (value *basicExecution) completeNoEffect(ctx context.Context, condition jobs.Postcondition, code string, cause error) (jobs.Record, error) {
+	if value == nil || value.service == nil || value.admitter == nil || value.mutation == nil || value.exposure == nil {
+		return jobs.Record{}, errors.Join(cause, fmt.Errorf("managed Basic no-effect completion authority is unavailable"))
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	document, readErr := value.service.normal.Read()
+	if readErr != nil {
+		return jobs.Record{}, errors.Join(cause, readErr)
+	}
+	completed, completeErr := value.admitter.Complete(cleanupCtx, value.mutation, value.exposure, document.Revision, value.job.ID, "no_effect", nil, []jobs.Postcondition{condition}, code)
+	if completeErr == nil {
+		value.revision = document.Revision + 1
+	}
+	return completed, errors.Join(cause, completeErr)
+}
+
+func basicReservationRejectionCode(operation operations.Type) string {
+	switch operation {
+	case operations.StaticRootRegister:
+		return "static_root_registration_interrupted"
+	case operations.ExternalHTPasswdRegister:
+		return "external_htpasswd_registration_interrupted"
+	default:
+		return "managed_basic_interrupted"
+	}
+}
+
 func beginBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding) (*basicExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -73,26 +101,31 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
 	}
+	rejectReserved := func(cause error) (*basicExecution, error) {
+		rejectErr := rejectReservedBasicOperation(context.WithoutCancel(ctx), service, admitter, job.ID, basicReservationRejectionCode(operation))
+		return fail(errors.Join(cause, rejectErr))
+	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
-		return fail(err)
+		return rejectReserved(err)
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, target, service.manager)
 	if err != nil {
-		_ = mutationSet.Close()
-		return fail(err)
+		closeErr := mutationSet.Close()
+		return rejectReserved(errors.Join(err, closeErr))
+	}
+	cleanupReserved := func(cause error) (*basicExecution, error) {
+		releaseErr := operations.ReleaseExposure(mutation, exposure)
+		closeErr := mutationSet.Close()
+		return rejectReserved(errors.Join(cause, releaseErr, closeErr))
 	}
 	fresh, err := service.normal.Read()
 	if err != nil {
-		_ = operations.ReleaseExposure(mutation, exposure)
-		_ = mutationSet.Close()
-		return fail(err)
+		return cleanupReserved(err)
 	}
 	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	if err != nil {
-		_ = operations.ReleaseExposure(mutation, exposure)
-		_ = mutationSet.Close()
-		return fail(err)
+		return cleanupReserved(err)
 	}
 	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job, revision: intent.IntentGeneration}, nil
 }
@@ -223,7 +256,9 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
 	password, err := basic.NewPassword()
 	if err != nil {
-		return result, err
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_created", Status: jobs.PostconditionVerified, Identity: credentialID}, "managed_basic_generation_failed", err)
+		result.Job = completed
+		return result, terminalErr
 	}
 	defer func() {
 		if resultErr != nil {
@@ -292,14 +327,29 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 	if err := requireNoDegradedAppliedSource(credential.OwnerResourceID); err != nil {
 		return result, err
 	}
-	execution, err := beginBasic(ctx, operations.ManagedBasicRotate, "credential/"+credentialID, actor, operations.SafetyBinding{ResourceID: credential.OwnerResourceID, Deadline: time.Now().UTC().Add(time.Minute)})
+	execution, err := beginBasic(ctx, operations.ManagedBasicRotate, "credential/"+credentialID, actor, operations.SafetyBinding{ResourceID: credential.OwnerResourceID, PriorFingerprint: credential.Fingerprint, Deadline: time.Now().UTC().Add(time.Minute)})
 	if err != nil {
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
+	lockedInstallation, err := loadBasicInstallation(execution.service)
+	if err != nil {
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_rotated", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "managed_basic_revalidation_failed", err)
+		result = ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: credential.Fingerprint}
+		return result, terminalErr
+	}
+	lockedCredential, err := basicCredential(lockedInstallation, credentialID)
+	if err != nil || lockedCredential != credential {
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_prior_changed", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "plan_consumption_rejected", errors.Join(fmt.Errorf("managed Basic credential changed before locked mutation"), err))
+		result = ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: lockedCredential.Fingerprint}
+		return result, terminalErr
+	}
+	credential = lockedCredential
 	password, err := basic.NewPassword()
 	if err != nil {
-		return result, err
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_rotated", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "managed_basic_generation_failed", err)
+		result = ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: credential.Fingerprint}
+		return result, terminalErr
 	}
 	defer func() {
 		if resultErr != nil {
@@ -336,7 +386,7 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 	if err != nil || stored != credential.ManagedPath {
 		return result, fmt.Errorf("managed Basic path changed: %w", err)
 	}
-	if err := execution.admitter.CommitManagedBasicFingerprint(ctx, execution.mutation, execution.exposure, execution.revision, execution.job.ID, credentialID, credential.Username, credential.ManagedPath, generated.Fingerprint); err != nil {
+	if err := execution.admitter.CommitManagedBasicFingerprint(ctx, execution.mutation, execution.exposure, execution.revision, execution.job.ID, credential, generated.Fingerprint); err != nil {
 		return result, err
 	}
 	completed, err := execution.admitter.CompleteWithSecret(ctx, execution.mutation, execution.exposure, execution.revision+1, execution.job.ID, "complete", []string{credential.ManagedPath}, []jobs.Postcondition{{Kind: "managed_basic_rotated", Status: jobs.PostconditionVerified, Identity: generated.Fingerprint}}, "", &jobs.SecretResult{Kind: "managed_basic", ObjectID: credentialID, Fingerprint: generated.Fingerprint, DeliveryAttempted: true, Remedy: "rotate_again"})
@@ -371,33 +421,38 @@ func beginBasicDelete(ctx context.Context, credential domain.Credential, actor, 
 	if err != nil {
 		return fail(err)
 	}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ManagedBasicDelete, Target: "credential/" + credential.ID, ActorIdentity: actor, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: credential.OwnerResourceID, Deadline: plan.ExpiresAt}, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ManagedBasicDelete, Target: "credential/" + credential.ID, ActorIdentity: actor, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: credential.OwnerResourceID, PriorFingerprint: credential.Fingerprint, Deadline: plan.ExpiresAt}, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
 	}
+	rejectReserved := func(cause error) (*basicExecution, error) {
+		rejectErr := rejectReservedBasicOperation(context.WithoutCancel(ctx), service, admitter, job.ID, "managed_basic_interrupted")
+		return fail(errors.Join(cause, rejectErr))
+	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
-		return fail(err)
+		return rejectReserved(err)
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "credential/"+credential.ID, service.manager)
 	if err != nil {
-		_ = mutationSet.Close()
-		return fail(err)
+		closeErr := mutationSet.Close()
+		return rejectReserved(errors.Join(err, closeErr))
+	}
+	cleanupReserved := func(cause error) (*basicExecution, error) {
+		releaseErr := operations.ReleaseExposure(mutation, exposure)
+		closeErr := mutationSet.Close()
+		return rejectReserved(errors.Join(cause, releaseErr, closeErr))
 	}
 	fresh, err := service.normal.Read()
 	if err != nil {
-		_ = operations.ReleaseExposure(mutation, exposure)
-		_ = mutationSet.Close()
-		return fail(err)
+		return cleanupReserved(err)
 	}
 	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: plan.NonceDigest})
 	if err != nil {
-		_ = operations.ReleaseExposure(mutation, exposure)
-		_ = mutationSet.Close()
-		return fail(err)
+		return cleanupReserved(err)
 	}
-	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job}, nil
+	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job, revision: intent.IntentGeneration}, nil
 }
 
 func DeleteManagedBasic(ctx context.Context, credentialID, actor, planID string) (record jobs.Record, resultErr error) {
@@ -424,19 +479,23 @@ func DeleteManagedBasic(ctx context.Context, credentialID, actor, planID string)
 	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
-		return record, err
+		return execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_deleted", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "plan_consumption_rejected", err)
 	}
+	lockedCredential, err := basicCredential(freshInstallation, credentialID)
+	if err != nil || lockedCredential != credential {
+		return execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_prior_changed", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "plan_consumption_rejected", errors.Join(fmt.Errorf("managed Basic credential changed before locked delete"), err))
+	}
+	credential = lockedCredential
 	for _, resource := range freshInstallation.Resources {
 		if applicationCredentialReferenced(resource, credentialID) {
-			_, completeErr := execution.admitter.Complete(ctx, execution.mutation, execution.exposure, execution.intent.IntentGeneration, execution.job.ID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_basic_delete_blocked", Status: jobs.PostconditionVerified, Identity: credentialID}}, "plan_consumption_rejected")
-			return record, errors.Join(fmt.Errorf("active resource reference blocks credential delete"), completeErr)
+			return execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_delete_blocked", Status: jobs.PostconditionVerified, Identity: credentialID}, "plan_consumption_rejected", fmt.Errorf("active resource reference blocks credential delete"))
 		}
 	}
 	journal := BasicJournal{SchemaVersion: basicJournalSchema, JobID: execution.job.ID, Operation: "delete", CredentialID: credentialID, ResourceID: credential.OwnerResourceID, Username: credential.Username, Path: credential.ManagedPath, PriorFingerprint: credential.Fingerprint}
 	if err := writeBasicJournal(ctx, journal); err != nil {
 		return record, err
 	}
-	if err := execution.admitter.CommitManagedBasicDelete(ctx, execution.mutation, execution.exposure, execution.intent.IntentGeneration, execution.job.ID, credentialID); err != nil {
+	if err := execution.admitter.CommitManagedBasicDelete(ctx, execution.mutation, execution.exposure, execution.intent.IntentGeneration, execution.job.ID, credential); err != nil {
 		return record, err
 	}
 	gid, err := nginxGroupGID()

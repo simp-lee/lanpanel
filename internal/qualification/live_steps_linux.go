@@ -358,7 +358,7 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	stun, err := ProbeSTUN(ctx, executor.journey.PublicIPv4)
+	stun, err := ProbeSTUN(ctx, executor.vantage, executor.journey.PublicIPv4)
 	if err != nil {
 		return nil, err
 	}

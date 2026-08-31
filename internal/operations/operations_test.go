@@ -10,6 +10,7 @@ import (
 	"lanpanel/internal/acme"
 	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/control"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	managedheadscale "lanpanel/internal/headscale"
@@ -161,6 +162,261 @@ func TestAuthenticatedResourceUpdateBindsPriorAndCandidateDigests(t *testing.T) 
 	if err := validateSafetyTargetBinding(request); err == nil {
 		t.Fatal("resource update accepted absent digest authority")
 	}
+}
+
+func TestBasicFamilyReservationsRejectAndKnownNoEffectPermitSameProcessRetry(t *testing.T) {
+	cases := []struct {
+		operation Type
+		target    string
+		binding   SafetyBinding
+	}{
+		{ManagedBasicCreate, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
+		{ManagedBasicRotate, "credential/cred_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PriorFingerprint: testDigest("prior")}},
+		{StaticRootRegister, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
+		{ExternalHTPasswdRegister, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
+	}
+	for _, test := range cases {
+		t.Run(string(test.operation), func(t *testing.T) {
+			now := time.Unix(1_700_000_000, 0).UTC()
+			normal, manager, admission, mutationSet := newOperationStores(t)
+			defer func() { _ = normal.Close(); _ = mutationSet.Close(); _ = manager.Close() }()
+			table, err := NewBranchTable([]ResultBranch{{Name: "complete", Result: jobs.ResultSucceeded, Postcondition: jobs.PostconditionVerified}, {Name: "no_effect", Result: jobs.ResultFailed, Postcondition: jobs.PostconditionVerified}, {Name: "known_residual", Result: jobs.ResultPartial, Postcondition: jobs.PostconditionKnown}, {Name: "executor_died", Result: jobs.ResultInterrupted, Postcondition: jobs.PostconditionKnown}, {Name: "source_unknown", Result: jobs.ResultUnknown, Postcondition: jobs.PostconditionUnobserved}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry, err := NewRegistry([]Registration{{Operation: test.operation, Owner: "basic-recovery-test", Results: table}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			random := bytes.Join([][]byte{bytes.Repeat([]byte{9}, 32), bytes.Repeat([]byte{10}, 32), bytes.Repeat([]byte{11}, 32)}, nil)
+			admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(random), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: registry})
+			if err != nil {
+				t.Fatal(err)
+			}
+			job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: test.operation, Target: test.target, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: test.binding, ExpectedRevision: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := admitter.RejectReservation(context.Background(), admission, 2, job.ID, "managed_basic_interrupted"); err != nil {
+				t.Fatal(err)
+			}
+			if err := admission.Release(); err != nil {
+				t.Fatal(err)
+			}
+			intent, err := admitter.OperationIntent(job.ID)
+			document, readErr := normal.Read()
+			record, jobErr := jobs.LoadEntries(document.Entries, job.ID)
+			if err != nil || readErr != nil || jobErr != nil || intent.Phase != PhaseRejected || record.Status != jobs.StatusTerminal || record.Result != jobs.ResultFailed {
+				t.Fatalf("intent=%#v record=%#v errors=%v", intent, record, errors.Join(err, readErr, jobErr))
+			}
+
+			admission, err = manager.Acquire(context.Background(), locks.MutationAdmission)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: test.operation, Target: test.target, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: test.binding, ExpectedRevision: document.Revision})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := admission.Release(); err != nil {
+				t.Fatal(err)
+			}
+			mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), test.target, manager)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh, err := normal.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			localIntent, err := admitter.BeginUI(context.Background(), mutation, exposure, ConsumeRequest{JobID: second.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := admitter.Complete(context.Background(), mutation, exposure, localIntent.IntentGeneration, second.ID, "no_effect", nil, []jobs.Postcondition{{Kind: "mutation_not_started", Status: jobs.PostconditionVerified, Identity: second.ID}}, "plan_consumption_rejected"); err != nil {
+				t.Fatal(err)
+			}
+			if err := ReleaseExposure(mutation, exposure); err != nil {
+				t.Fatal(err)
+			}
+			fresh, err = normal.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			admission, err = manager.Acquire(context.Background(), locks.MutationAdmission)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: test.operation, Target: test.target, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: test.binding, ExpectedRevision: fresh.Revision}); err != nil {
+				t.Fatalf("same-process retry remained blocked: %v", err)
+			}
+			if err := admission.Release(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestManagedBasicRotateCommitRejectsCredentialChangedBeforeTargetLock(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func() { _ = normal.Close(); _ = mutationSet.Close(); _ = manager.Close() }()
+	installation := operationStateInstallation()
+	prior := domain.Credential{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: installation.Resources[0].ID, Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: testDigest("prior")}
+	rotated := prior
+	rotated.Fingerprint = testDigest("rotated")
+	installation.Credentials = []domain.Credential{rotated}
+	raw, err := persist.EncodeEntry(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 1, func(transaction *persist.Transaction) error {
+		return transaction.Create("installations/current", raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	table, err := NewBranchTable([]ResultBranch{{Name: "complete", Result: jobs.ResultSucceeded, Postcondition: jobs.PostconditionVerified}, {Name: "no_effect", Result: jobs.ResultFailed, Postcondition: jobs.PostconditionVerified}, {Name: "known_residual", Result: jobs.ResultPartial, Postcondition: jobs.PostconditionKnown}, {Name: "executor_died", Result: jobs.ResultInterrupted, Postcondition: jobs.PostconditionKnown}, {Name: "source_unknown", Result: jobs.ResultUnknown, Postcondition: jobs.PostconditionUnobserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry([]Registration{{Operation: ManagedBasicRotate, Owner: "basic-test", Results: table}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{10}, 64)), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := SafetyBinding{ResourceID: prior.OwnerResourceID, PriorFingerprint: prior.Fingerprint, Deadline: now.Add(time.Minute)}
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: ManagedBasicRotate, Target: "credential/" + prior.ID, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: binding, ExpectedRevision: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), "credential/"+prior.ID, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ReleaseExposure(mutation, exposure) }()
+	intent, err := admitter.BeginUI(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: 3, IntentGeneration: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.SafetyBinding.PriorFingerprint != prior.Fingerprint {
+		t.Fatalf("prior fingerprint was not durable: %#v", intent.SafetyBinding)
+	}
+	if err := admitter.CommitManagedBasicFingerprint(context.Background(), mutation, exposure, 4, job.ID, prior, testDigest("candidate")); err == nil {
+		t.Fatal("stale managed Basic rotation overwrote the locked credential")
+	}
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := domain.DecodeInstallation(document.Entries["installations/current"])
+	if err != nil || len(persisted.Credentials) != 1 || persisted.Credentials[0] != rotated {
+		t.Fatalf("credential=%#v err=%v", persisted.Credentials, err)
+	}
+}
+
+func TestPreparedHeadscaleDeployFailureClearsIntentAndTerminalizesOperation(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func() { _ = normal.Close(); _ = mutationSet.Close(); _ = manager.Close() }()
+	artifact := domain.HeadscaleArtifactIdentity{BaselineDigest: testDigest("baseline"), Version: "0.25.1", ArchiveDigest: testDigest("archive"), ExecutableDigest: testDigest("executable"), ConfigContract: control.ConfigContract, ConfigContractDigest: testDigest("contract")}
+	candidate := control.Candidate{SchemaVersion: control.CandidateSchema, HeadscaleID: "hds_00000000000000000000000000000001", DatabaseUUID: "hdb_00000000000000000000000000000001", DatabaseGeneration: 1, Generation: 1, ControlDomain: "control.example.test", MagicDNSNamespace: "mesh.example.test", Artifact: artifact, ConfigDigest: testDigest("config"), PolicyDigest: testDigest("policy"), UnitDigest: testDigest("unit"), ServiceIdentity: testDigest("service"), ControlIdentity: testDigest("control"), CertificateID: "cert_00000000000000000000000000000001", CertificateBinding: testDigest("certificate-binding"), Paths: control.FixedPaths(), ControlBackend: control.ControlBackend, AdminBackend: control.AdminBackend, MetricsBackend: control.MetricsBackend, STUNBackend: control.STUNBackend}
+	applied, err := control.AppliedIdentity(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, result := operationHeadscalePreflight(t, now)
+	candidateDigest, err := control.Digest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflightEvidence, err := result.PlanEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	planStore, err := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{11}, 64))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := plans.Spec{Operation: string(HeadscaleDeploy), Target: plans.Target{Kind: plans.TargetHeadscale, ID: candidate.HeadscaleID}, ActorIdentity: "ui/session/generation/1", Config: plans.DigestBinding{Applicable: true, Digest: candidate.ConfigDigest}, Applied: plans.DigestBinding{}, Evidence: []plans.Evidence{preflightEvidence}, ExposureSummary: "headscale_control", Prerequisites: "qualified", Lifetime: plans.MaximumLifetime}
+	plan, err := planStore.Create(context.Background(), admission, 1, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headscale := &domain.HeadscaleDomain{ID: candidate.HeadscaleID, ControlDomain: candidate.ControlDomain, MagicDNSNamespace: candidate.MagicDNSNamespace, Policy: "trusted_mesh", Artifact: artifact, Database: domain.HeadscaleDatabaseIdentity{UUID: candidate.DatabaseUUID, SQLitePath: control.FixedPaths().Database, IdentityBundleDigest: testDigest("identity"), Generation: 1, Phase: domain.HeadscaleIdentityCommitted}, DesiredDigest: testDigest("desired"), ManagedPaths: domain.HeadscaleManagedPaths()}
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.23.45.67", Port: 23456}, Headscale: headscale}
+	rawInstallation, err := persist.EncodeEntry(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 2, func(transaction *persist.Transaction) error {
+		return transaction.Create("installations/current", rawInstallation)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	table, err := NewBranchTable([]ResultBranch{{Name: "complete", Result: jobs.ResultSucceeded, Postcondition: jobs.PostconditionVerified}, {Name: "no_effect", Result: jobs.ResultFailed, Postcondition: jobs.PostconditionVerified}, {Name: "known_residual", Result: jobs.ResultPartial, Postcondition: jobs.PostconditionKnown}, {Name: "executor_died", Result: jobs.ResultInterrupted, Postcondition: jobs.PostconditionKnown}, {Name: "source_unknown", Result: jobs.ResultUnknown, Postcondition: jobs.PostconditionUnobserved}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := NewRegistry([]Registration{{Operation: HeadscaleDeploy, Owner: "headscale-test", Results: table}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBinding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+	admitter, err := NewAdmitter(normal, &fakeSafety{state: safety.EmptyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{12}, 64)), Bindings: trustedBindings{binding: planBinding}, Confirmation: testConfirmation{}, Registry: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := SafetyBinding{ResourceID: "headscale", PlanID: plan.ID, IntentGeneration: 1, CandidateDigest: candidate.ConfigDigest, CandidateBundle: candidateDigest, ChallengeMethod: "http-01", CertificateIdentity: candidate.CertificateID, ACMEBinding: candidate.CertificateBinding, Deadline: plan.ExpiresAt}
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: HeadscaleDeploy, Target: "headscale/" + candidate.HeadscaleID, ActorIdentity: plan.ActorIdentity, PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: binding, HeadscaleDeploy: &HeadscaleDeployBinding{Candidate: candidate, PreflightRequest: request, PreflightResult: result}, ExpectedRevision: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), job.Target, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ReleaseExposure(mutation, exposure) }()
+	intent, err := admitter.ConsumePlan(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: 4, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainIntent := domain.HeadscaleDeployIntent{Generation: 1, PlanID: plan.ID, JobID: job.ID, Phase: domain.HeadscaleDeployPrepared, PreflightDigest: result.RequestDigest, CertificateBinding: candidate.CertificateBinding, Candidate: applied}
+	if err := admitter.CommitHeadscaleDeployBegin(context.Background(), mutation, exposure, intent.IntentGeneration, job.ID, HeadscaleDeployBeginCommit{HeadscaleID: candidate.HeadscaleID, Intent: domainIntent}); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := admitter.FailPreparedHeadscaleDeploy(context.Background(), mutation, exposure, 6, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalIntent, err := admitter.OperationIntent(job.ID)
+	terminalInstallation, installErr := domain.DecodeInstallation(document.Entries["installations/current"])
+	if err != nil || installErr != nil || completed.Status != jobs.StatusTerminal || completed.Result != jobs.ResultFailed || terminalIntent.Phase != PhaseTerminal || terminalInstallation.Headscale.DeployIntent != nil {
+		t.Fatalf("job=%#v intent=%#v deploy=%#v errors=%v", completed, terminalIntent, terminalInstallation.Headscale.DeployIntent, errors.Join(err, installErr))
+	}
+}
+
+func operationHeadscalePreflight(t *testing.T, now time.Time) (preflight.ExpansionRequest, preflight.Result) {
+	t.Helper()
+	profile := preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages"), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, QualificationDigest: testDigest("confinement")}, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: testDigest("profile"), LiveQualified: true}}
+	request := preflight.ExpansionRequest{Scope: preflight.ExpansionHeadscale, Target: "headscale", Generation: 1, Profile: profile, Domains: []string{"control.example.test"}, Disks: []preflight.DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1}}, LastTrustedWall: now.Add(-time.Second)}
+	result, err := preflight.EvaluateExpansion(request, preflight.ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", KernelRelease: "6.12.1", CgroupMode: "unified_v2", Platform: preflight.PlatformInfo{ID: "debian", VersionID: "13"}, Clock: preflight.ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: preflight.ComponentObservation{Available: true, Identity: "systemd/1"}, APT: preflight.ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: preflight.ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: preflight.PackageObservation{Ready: true, Identity: testDigest("observation"), SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages")}, DNS: []preflight.DNSObservation{{Domain: "control.example.test", Addresses: []string{"8.8.8.8"}}}, ListenerInventoryComplete: true, Disks: []preflight.DiskObservation{{Path: "/var/lib/lanpanel", Device: 1, AvailableBytes: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request, result
 }
 
 func TestOperationAdmissionContract(t *testing.T) {
@@ -1364,7 +1620,7 @@ func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
 	snapshotBytes, _ = json.Marshal(snapshot)
 	source := sources.Source{Kind: sources.OfficialCanonical, URL: "https://downloads.example.test/headscale.tar.gz", OfficialAuthorities: []string{"downloads.example.test"}, Artifact: sources.Artifact{Name: "headscale", Version: candidate.Artifact.Version, OperatingOS: "linux", Architecture: "amd64", Digest: strings.TrimPrefix(candidate.Artifact.ArchiveDigest, "sha256:")}}
 	preflightRequest := preflight.ExpansionRequest{Scope: preflight.ExpansionHeadscale, Target: "headscale", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages"), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, QualificationDigest: testDigest("confinement")}, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: testDigest("profile"), LiveQualified: true}}, Domains: []string{candidate.ControlDomain}, Disks: []preflight.DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1}}, LastTrustedWall: now.Add(-time.Second)}
-	preflightResult, err := preflight.EvaluateExpansion(preflightRequest, preflight.ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", Platform: preflight.PlatformInfo{ID: "debian", VersionID: "13"}, Clock: preflight.ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: preflight.ComponentObservation{Available: true, Identity: "systemd/1"}, APT: preflight.ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: preflight.ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: preflight.PackageObservation{Ready: true, Identity: testDigest("package-observation"), SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages")}, DNS: []preflight.DNSObservation{{Domain: candidate.ControlDomain, Addresses: []string{"8.8.8.8"}}}, ListenerInventoryComplete: true, Disks: []preflight.DiskObservation{{Path: "/var/lib/lanpanel", Device: 1, AvailableBytes: 1}}})
+	preflightResult, err := preflight.EvaluateExpansion(preflightRequest, preflight.ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", KernelRelease: "6.12.1", CgroupMode: "unified_v2", Platform: preflight.PlatformInfo{ID: "debian", VersionID: "13"}, Clock: preflight.ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: preflight.ComponentObservation{Available: true, Identity: "systemd/1"}, APT: preflight.ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: preflight.ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: preflight.PackageObservation{Ready: true, Identity: testDigest("package-observation"), SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages")}, DNS: []preflight.DNSObservation{{Domain: candidate.ControlDomain, Addresses: []string{"8.8.8.8"}}}, ListenerInventoryComplete: true, Disks: []preflight.DiskObservation{{Path: "/var/lib/lanpanel", Device: 1, AvailableBytes: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -56,13 +56,24 @@ func (store *emergencyPlanStore) Create(ctx context.Context, actor application.A
 	defer clear(random)
 	id := "plan_" + hex.EncodeToString(random)
 	confirmation := sha256.Sum256([]byte(id + "\x00" + actor.Identity + "\x00" + fmt.Sprint(actor.Generation) + "\x00" + snapshot.Inventory.Digest + "\x00" + fmt.Sprint(snapshot.GlobalGeneration)))
-	plan := emergencyPlan{ID: id, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, GlobalGeneration: snapshot.GlobalGeneration, InventoryDigest: snapshot.Inventory.Digest, ConfirmationDigest: "sha256:" + hex.EncodeToString(confirmation[:]), Emergency: true, ExpiresAt: store.now().Add(10 * time.Minute)}
+	plan := emergencyPlan{ID: id, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, GlobalGeneration: snapshot.GlobalGeneration, InventoryDigest: snapshot.Inventory.Digest, ConfirmationDigest: "sha256:" + hex.EncodeToString(confirmation[:]), Emergency: true}
+	return store.insert(plan)
+}
+
+func (store *emergencyPlanStore) insert(plan emergencyPlan) (emergencyPlan, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	now := store.now()
+	for id, existing := range store.plans {
+		if now.After(existing.ExpiresAt) {
+			delete(store.plans, id)
+		}
+	}
 	if len(store.plans) >= 64 {
 		return emergencyPlan{}, fmt.Errorf("emergency Plan bound reached")
 	}
-	store.plans[id] = plan
+	plan.ExpiresAt = now.Add(10 * time.Minute)
+	store.plans[plan.ID] = plan
 	return plan, nil
 }
 

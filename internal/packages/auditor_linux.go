@@ -395,41 +395,60 @@ func (auditor *LinuxAuditor) readDPKG(ctx context.Context, closure []Package) (D
 	state := DPKGState{}
 	installedByName := map[string]Package{}
 	systemPackages := []InstalledPackage{}
-	for _, paragraph := range strings.Split(strings.TrimSpace(string(data)), "\n\n") {
+	for stanzaIndex, paragraph := range strings.Split(string(data), "\n\n") {
+		if strings.TrimSpace(paragraph) == "" {
+			continue
+		}
 		fields := map[string]string{}
 		scanner := bufio.NewScanner(strings.NewReader(paragraph))
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, " ") {
+			if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
 				continue
 			}
 			key, value, found := strings.Cut(line, ":")
-			if found {
-				fields[key] = strings.TrimSpace(value)
+			if !found || key == "" {
+				return DPKGState{}, nil, nil, fmt.Errorf("dpkg status stanza %d is malformed", stanzaIndex+1)
+			}
+			if _, duplicate := fields[key]; duplicate {
+				return DPKGState{}, nil, nil, fmt.Errorf("dpkg status stanza %d duplicates %s", stanzaIndex+1, key)
+			}
+			fields[key] = strings.TrimSpace(value)
+		}
+		if err := scanner.Err(); err != nil {
+			return DPKGState{}, nil, nil, fmt.Errorf("scan dpkg status stanza %d: %w", stanzaIndex+1, err)
+		}
+		for _, required := range []string{"Package", "Status", "Version", "Architecture"} {
+			if fields[required] == "" {
+				return DPKGState{}, nil, nil, fmt.Errorf("dpkg status stanza %d is missing %s", stanzaIndex+1, required)
 			}
 		}
-		name, status := fields["Package"], fields["Status"]
-		if name == "" || status == "" {
+		name := fields["Package"]
+		_, errorState, packageState, err := parseDPKGStatusFields(fields["Status"])
+		if err != nil {
+			return DPKGState{}, nil, nil, fmt.Errorf("dpkg status stanza %d: %w", stanzaIndex+1, err)
+		}
+		if errorState != "ok" {
+			state.Broken = append(state.Broken, name)
 			continue
 		}
-		switch status {
-		case "install ok installed":
+		switch packageState {
+		case "installed":
 			systemPackages = append(systemPackages, InstalledPackage{Name: name, Version: fields["Version"], Architecture: fields["Architecture"]})
 			if wanted, ok := packageByName(closure, name); ok {
 				wanted.Version = fields["Version"]
 				wanted.Architecture = fields["Architecture"]
 				installedByName[name] = wanted
 			}
-		case "install ok unpacked":
+		case "unpacked":
 			state.Unpacked = append(state.Unpacked, name)
-		case "install ok half-configured":
+		case "half-configured":
 			state.HalfConfigured = append(state.HalfConfigured, name)
-		case "install ok triggers-awaited", "install ok triggers-pending":
+		case "triggers-awaited", "triggers-pending":
 			state.TriggersPending = append(state.TriggersPending, name)
-		default:
-			if strings.HasPrefix(status, "install ") {
-				state.Broken = append(state.Broken, name)
-			}
+		case "half-installed":
+			state.Broken = append(state.Broken, name)
+		case "not-installed", "config-files":
 		}
 	}
 	for _, values := range [][]string{state.HalfConfigured, state.Unpacked, state.TriggersPending, state.Broken} {
@@ -449,6 +468,28 @@ func (auditor *LinuxAuditor) readDPKG(ctx context.Context, closure []Package) (D
 		return DPKGState{}, nil, nil, err
 	}
 	return state, installed, systemPackages, nil
+}
+
+func parseDPKGStatusFields(value string) (string, string, string, error) {
+	fields := strings.Fields(value)
+	if len(fields) != 3 {
+		return "", "", "", fmt.Errorf("dpkg Status must contain exactly selection, error, and state fields")
+	}
+	selection, errorState, packageState := fields[0], fields[1], fields[2]
+	switch selection {
+	case "unknown", "install", "hold", "deinstall", "purge":
+	default:
+		return "", "", "", fmt.Errorf("dpkg Status selection field is invalid")
+	}
+	if errorState != "ok" && errorState != "reinstreq" {
+		return "", "", "", fmt.Errorf("dpkg Status error field is invalid")
+	}
+	switch packageState {
+	case "not-installed", "config-files", "half-installed", "unpacked", "half-configured", "triggers-awaited", "triggers-pending", "installed":
+	default:
+		return "", "", "", fmt.Errorf("dpkg Status state field is invalid")
+	}
+	return selection, errorState, packageState, nil
 }
 
 func (auditor *LinuxAuditor) runtimeSnapshot(plan Plan, installed []Package, systemPackages []InstalledPackage) (RuntimeSnapshot, error) {

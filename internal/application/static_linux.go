@@ -52,11 +52,15 @@ func RegisterStaticRoot(ctx context.Context, resourceID, path, actor string) (re
 	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
-		return result, err
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "static_root_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "static_root_revalidation_failed", err)
+		result.Job = completed
+		return result, terminalErr
 	}
 	lockedIdentity, err := staticcontent.Register(id, path, protectedStaticPaths(freshInstallation))
 	if err != nil || lockedIdentity != identity {
-		return result, fmt.Errorf("static root identity changed before commit")
+		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "static_root_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "static_root_revalidation_failed", errors.Join(fmt.Errorf("static root identity changed before commit"), err))
+		result.Job = completed
+		return result, terminalErr
 	}
 	if err := execution.admitter.CommitStaticRoot(ctx, execution.mutation, execution.exposure, execution.intent.IntentGeneration, execution.job.ID, resourceID, root); err != nil {
 		return result, err

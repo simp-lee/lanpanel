@@ -93,6 +93,40 @@ func TestExpansionScopesCheckOnlyTheirExactPublicListeners(t *testing.T) {
 	}
 }
 
+func TestExpansionPreflightRequiresObservedConfinementIdentity(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	request := expansionRequest(ExpansionDomainHTTPS)
+	tests := []struct {
+		name string
+		edit func(*ExpansionObservations)
+	}{
+		{name: "kernel mismatch", edit: func(value *ExpansionObservations) { value.KernelRelease = "6.12.2" }},
+		{name: "non unified v2", edit: func(value *ExpansionObservations) { value.CgroupMode = "not_unified_v2" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observed := passingExpansionObservations(request, now)
+			test.edit(&observed)
+			result, err := EvaluateExpansion(request, observed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			finding, ok := findingByCode(result.Findings, "managed_confinement")
+			if result.Allowed || !ok || finding.Disposition != FindingBlocked {
+				t.Fatalf("result=%#v finding=%#v", result, finding)
+			}
+		})
+	}
+}
+
+func TestExpansionPreflightRejectsInvalidRequestedConfinement(t *testing.T) {
+	request := expansionRequest(ExpansionDomainHTTPS)
+	request.Profile.ManagedConfinement.CgroupMode = "not_unified_v2"
+	if _, err := EvaluateExpansion(request, passingExpansionObservations(request, time.Unix(1_700_000_000, 0).UTC())); err == nil {
+		t.Fatal("invalid requested confinement was treated as a host observation")
+	}
+}
+
 func TestExpansionPreflightRejectsConflictsClockPackageAndPathDrift(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	request := expansionRequest(ExpansionDomainHTTPS)
@@ -294,7 +328,7 @@ func passingExpansionObservations(request ExpansionRequest, now time.Time) Expan
 	for index, disk := range request.Disks {
 		disks[index] = DiskObservation{Path: disk.Path, Device: uint64(index + 1), AvailableBytes: disk.MinimumAvailableBytes}
 	}
-	return ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", Platform: PlatformInfo{ID: request.Profile.ID, VersionID: request.Profile.VersionID}, Clock: ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: ComponentObservation{Available: true, Identity: "systemd/1"}, APT: ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: PackageObservation{Ready: true, Identity: "sha256:" + strings.Repeat("b", 64), SystemdVersion: request.Profile.SystemdVersion, NginxVersion: request.Profile.NginxVersion, PackageSnapshotDigest: request.Profile.PackageSnapshotDigest}, DNS: dns, ListenerInventoryComplete: true, Paths: paths, Disks: disks}
+	return ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", KernelRelease: request.Profile.ManagedConfinement.KernelRelease, CgroupMode: request.Profile.ManagedConfinement.CgroupMode, Platform: PlatformInfo{ID: request.Profile.ID, VersionID: request.Profile.VersionID}, Clock: ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: ComponentObservation{Available: true, Identity: "systemd/1"}, APT: ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: PackageObservation{Ready: true, Identity: "sha256:" + strings.Repeat("b", 64), SystemdVersion: request.Profile.SystemdVersion, NginxVersion: request.Profile.NginxVersion, PackageSnapshotDigest: request.Profile.PackageSnapshotDigest}, DNS: dns, ListenerInventoryComplete: true, Paths: paths, Disks: disks}
 }
 
 func findingByCode(values []Finding, code string) (Finding, bool) {

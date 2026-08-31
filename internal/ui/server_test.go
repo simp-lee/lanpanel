@@ -3,11 +3,15 @@ package ui
 import (
 	"bytes"
 	"context"
+	"lanpanel/internal/application"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/session"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,6 +28,23 @@ func (v verifier) Source(context.Context) (string, error)         { return v.fp,
 
 type dummyListener struct{}
 
+type gatedRequestBody struct {
+	entered chan struct{}
+	release chan struct{}
+	reader  *bytes.Reader
+	once    sync.Once
+}
+
+func (body *gatedRequestBody) Read(target []byte) (int, error) {
+	body.once.Do(func() {
+		close(body.entered)
+		<-body.release
+	})
+	return body.reader.Read(target)
+}
+
+func (*gatedRequestBody) Close() error { return nil }
+
 func (dummyListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
 func (dummyListener) Close() error              { return nil }
 func (dummyListener) Addr() net.Addr            { return &net.TCPAddr{} }
@@ -33,6 +54,7 @@ func testServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(manager.Close)
 	server, err := New(Config{Listener: dummyListener{}, Authority: "127.1.2.3:52345", InstallationFingerprint: "abcdef", Verifier: verifier{"fp"}, Sessions: manager, Profile: normalProfile{}})
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +72,151 @@ func TestActionLeaseCancelsOnSessionInvalidation(t *testing.T) {
 	case <-lease.ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("action lease was not canceled")
+	}
+}
+
+func TestActionLeaseRevalidatesSessionAfterRegistration(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := server.config.Sessions.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, server.origin(), "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Sessions.Logout(principal)
+	lease := server.beginAction(context.Background(), principal, false)
+	if lease == nil {
+		t.Fatal("stale action lease was not registered for boundary validation")
+	}
+	defer server.endAction(lease)
+	if server.revalidateAction(lease) {
+		t.Fatal("logged-out principal remained valid at the action boundary")
+	}
+	select {
+	case <-lease.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("unauthorized action lease was not canceled")
+	}
+}
+
+func TestActionLeaseRejectsRotationCancellationAtDispatchBoundary(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := server.config.Sessions.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, server.origin(), "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := server.beginAction(context.Background(), principal, false)
+	if lease == nil {
+		t.Fatal("ordinary action lease was not registered")
+	}
+	rotation := make(chan *actionLease, 1)
+	go func() {
+		rotation <- server.beginAction(context.Background(), principal, true)
+	}()
+	select {
+	case <-lease.ctx.Done():
+	case <-time.After(time.Second):
+		server.endAction(lease)
+		t.Fatal("exclusive rotation did not cancel the registered action")
+	}
+	if server.revalidateAction(lease) {
+		server.endAction(lease)
+		t.Fatal("rotation-canceled action crossed the dispatch boundary")
+	}
+	server.endAction(lease)
+	select {
+	case rotationLease := <-rotation:
+		if rotationLease == nil {
+			t.Fatal("exclusive rotation lease was canceled")
+		}
+		server.endAction(rotationLease)
+	case <-time.After(time.Second):
+		t.Fatal("exclusive rotation did not acquire after canceled action exited")
+	}
+}
+
+func TestActionDispatchRejectsRotationAfterRequestValidation(t *testing.T) {
+	server := testServer(t)
+	var invoked atomic.Bool
+	registration, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		invoked.Store(true)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ConnectorMutationResult{}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{registration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := server.config.Sessions.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, server.origin(), "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &gatedRequestBody{entered: make(chan struct{}), release: make(chan struct{}), reader: bytes.NewReader([]byte(`{"control_url":"https://control.example.test"}`))}
+	request := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/connector_binding_set", body)
+	request.Header.Set("Origin", server.origin())
+	request.Header.Set(session.ProofHeader, credentials.Proof)
+	request.Header.Set(session.CSRFHeader, credentials.CSRF)
+	request.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	writer := httptest.NewRecorder()
+	requestDone := make(chan struct{})
+	go func() {
+		server.action(writer, request)
+		close(requestDone)
+	}()
+	select {
+	case <-body.entered:
+	case <-time.After(time.Second):
+		close(body.release)
+		t.Fatal("action did not reach post-validation request decoding")
+	}
+	rotation := make(chan *actionLease, 1)
+	go func() { rotation <- server.beginAction(context.Background(), principal, true) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.actionMu.Lock()
+		pending := server.rotationPending
+		server.actionMu.Unlock()
+		if pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(body.release)
+			t.Fatal("exclusive rotation did not select the in-flight action")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(body.release)
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled HTTP action did not exit")
+	}
+	if invoked.Load() {
+		t.Fatal("rotation-canceled action reached its application handler")
+	}
+	if writer.Code != http.StatusServiceUnavailable {
+		t.Fatalf("canceled action status=%d", writer.Code)
+	}
+	select {
+	case rotationLease := <-rotation:
+		if rotationLease == nil {
+			t.Fatal("exclusive rotation lease was canceled")
+		}
+		server.endAction(rotationLease)
+	case <-time.After(time.Second):
+		t.Fatal("exclusive rotation did not acquire after canceled HTTP action exited")
 	}
 }
 

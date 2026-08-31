@@ -26,17 +26,25 @@ type Stage struct {
 }
 
 func PrepareStage(ctx context.Context, certificateID string, binding Binding, uid, gid uint32) (Stage, error) {
+	root := filepath.Join("/var/lib/lanpanel/certificates/chroot", certificateID)
+	webroot := filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID)
+	cleanup := func() error {
+		return errors.Join(RemoveStage(certificateID, uid, gid), RemoveWebroot(certificateID, uid, gid))
+	}
+	mountSources := []string{"/usr/lib/lanpanel/dependencies/lego", "/etc/ssl/certs/ca-certificates.crt", "/etc/resolv.conf", "/etc/hosts"}
+	return prepareStage(ctx, certificateID, binding, uid, gid, root, webroot, mountSources, cleanup)
+}
+
+func prepareStage(ctx context.Context, certificateID string, binding Binding, uid, gid uint32, root, webroot string, mountSources []string, cleanup func() error) (stage Stage, resultErr error) {
 	if ctx.Err() != nil {
 		return Stage{}, ctx.Err()
 	}
-	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 {
+	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 || cleanup == nil || !filepath.IsAbs(root) || filepath.Clean(root) != root || filepath.Base(root) != certificateID || !filepath.IsAbs(webroot) || filepath.Clean(webroot) != webroot || filepath.Base(webroot) != certificateID || root == webroot {
 		return Stage{}, fmt.Errorf("ACME stage identity invalid")
 	}
 	if err := ValidateBinding(binding); err != nil {
 		return Stage{}, err
 	}
-	root := filepath.Join("/var/lib/lanpanel/certificates/chroot", certificateID)
-	webroot := filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID)
 	for _, path := range []string{root, webroot} {
 		if _, err := os.Lstat(path); err == nil {
 			return Stage{}, fmt.Errorf("ACME stage residue exists")
@@ -44,6 +52,15 @@ func PrepareStage(ctx context.Context, certificateID string, binding Binding, ui
 			return Stage{}, err
 		}
 	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		return Stage{}, err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, cleanup())
+			stage = Stage{}
+		}
+	}()
 	if err := ensureStageDirectory(root, 0, 0); err != nil {
 		return Stage{}, err
 	}
@@ -74,20 +91,17 @@ func PrepareStage(ctx context.Context, certificateID string, binding Binding, ui
 	if err := os.Chmod(filepath.Join(root, "work"), 0o700); err != nil {
 		return Stage{}, err
 	}
-	stage := Stage{CertificateID: certificateID, Root: root, UID: uid, GID: gid}
+	stage = Stage{CertificateID: certificateID, Root: root, UID: uid, GID: gid}
 	if err := stage.installAccountKey(binding); err != nil {
-		_ = stage.Close()
 		return Stage{}, err
 	}
 	for _, source := range credentialPaths(binding) {
 		if err := stage.copyProtected(source, uid, gid); err != nil {
-			_ = stage.Close()
 			return Stage{}, err
 		}
 	}
-	for _, source := range []string{"/usr/lib/lanpanel/dependencies/lego", "/etc/ssl/certs/ca-certificates.crt", "/etc/resolv.conf", "/etc/hosts"} {
+	for _, source := range mountSources {
 		if err := stage.prepareMountTarget(source); err != nil {
-			_ = stage.Close()
 			return Stage{}, err
 		}
 	}

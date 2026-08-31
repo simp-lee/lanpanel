@@ -203,6 +203,8 @@ type DiskObservation struct {
 type ExpansionObservations struct {
 	OperatingSystem           string                `json:"operating_system"`
 	Architecture              string                `json:"architecture"`
+	KernelRelease             string                `json:"kernel_release"`
+	CgroupMode                string                `json:"cgroup_mode"`
 	Platform                  PlatformInfo          `json:"platform"`
 	Clock                     ClockObservation      `json:"clock"`
 	ExecutorUID               uint32                `json:"executor_uid"`

@@ -84,6 +84,12 @@ func (service *Service) Available(actor Actor) []domain.OperationCode {
 }
 
 func (service *Service) Invoke(ctx context.Context, actor Actor, call Call) (Result, error) {
+	if ctx == nil {
+		return Result{}, fmt.Errorf("application context is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if service == nil || actor.Identity == "" || actor.Generation == 0 || actor.Kind != ActorUI && actor.Kind != ActorTimer {
 		return Result{}, fmt.Errorf("application actor is invalid")
 	}

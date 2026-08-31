@@ -4,6 +4,7 @@ package application
 
 import (
 	"lanpanel/internal/domain"
+	"lanpanel/internal/operations"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,8 +13,8 @@ import (
 )
 
 func recoveryFixture(operation string) (BasicJournal, domain.Credential) {
-	journal := BasicJournal{Operation: operation, CredentialID: "cred_00000000000000000000000000000001", Username: "admin", Path: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", PriorFingerprint: "sha256:prior", CandidateFingerprint: "sha256:candidate"}
-	credential := domain.Credential{ID: journal.CredentialID, Username: journal.Username, ManagedPath: journal.Path, Fingerprint: journal.PriorFingerprint}
+	journal := BasicJournal{Operation: operation, CredentialID: "cred_00000000000000000000000000000001", ResourceID: "res_00000000000000000000000000000001", Username: "admin", Path: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", PriorFingerprint: "sha256:prior", CandidateFingerprint: "sha256:candidate"}
+	credential := managedBasicJournalCredential(journal, journal.PriorFingerprint)
 	return journal, credential
 }
 
@@ -70,11 +71,15 @@ func TestCommittedManagedBasicRotateResponseLossConvergesFingerprint(t *testing.
 	}
 }
 
-func TestManagedBasicRecoveryRejectsAmbiguousRotateState(t *testing.T) {
+func TestManagedBasicRecoveryTerminalizesStaleRotateWithoutTouchingNewCredential(t *testing.T) {
 	journal, credential := recoveryFixture("rotate")
 	credential.Fingerprint = "sha256:other"
-	if _, err := decideManagedBasicRecovery(journal, true, credential, journal.CandidateFingerprint); err == nil {
-		t.Fatal("ambiguous rotate accepted")
+	decision, err := decideManagedBasicRecovery(journal, true, credential, journal.CandidateFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.NoEffect || decision.CommitFingerprint || decision.DeleteFile || decision.FileModified {
+		t.Fatalf("stale rotation decision=%#v", decision)
 	}
 }
 
@@ -86,5 +91,30 @@ func TestInterruptedManagedBasicDeleteConvergesMetadataAndFile(t *testing.T) {
 	}
 	if !decision.CommitDelete || !decision.DeleteFile || decision.LostDelivery {
 		t.Fatalf("unexpected decision: %#v", decision)
+	}
+}
+
+func TestOldManagedBasicDeletePlanCannotDeleteRotatedCredential(t *testing.T) {
+	journal, credential := recoveryFixture("delete")
+	credential.Fingerprint = "sha256:rotated"
+	decision, err := decideManagedBasicRecovery(journal, true, credential, credential.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.NoEffect || decision.CommitDelete || decision.DeleteFile || decision.FileModified {
+		t.Fatalf("old delete Plan decision=%#v", decision)
+	}
+}
+
+func TestManagedBasicReservedRestartIsRejectedAndTerminalRecordsAreSkipped(t *testing.T) {
+	intent := operations.Reservation{Operation: operations.ManagedBasicCreate, Phase: operations.PhaseReserved}
+	if stage := classifyManagedBasicRecovery(intent); stage != managedBasicRecoveryReject {
+		t.Fatalf("reserved stage=%v", stage)
+	}
+	for _, phase := range []operations.Phase{operations.PhaseRejected, operations.PhaseTerminal} {
+		intent.Phase = phase
+		if stage := classifyManagedBasicRecovery(intent); stage != managedBasicRecoverySkip {
+			t.Fatalf("terminal phase %q stage=%v", phase, stage)
+		}
 	}
 }

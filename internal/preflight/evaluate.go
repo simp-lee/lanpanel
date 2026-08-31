@@ -34,8 +34,10 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID && validProfileAuthority(request.Profile) && validManagedConfinement(request.Profile.ManagedConfinement)
+	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID
 	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
+	confinementMatches := observed.KernelRelease == request.Profile.ManagedConfinement.KernelRelease && observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
+	add("managed_confinement", confinementMatches, "exact qualified kernel release and cgroup mode", observed.KernelRelease+"/"+observed.CgroupMode)
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
 	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source+"/"+observed.Clock.Now.UTC().Format(time.RFC3339Nano))
 	add("root_executor", observed.ExecutorUID == 0, "actual mutation executor is root", strconv.FormatUint(uint64(observed.ExecutorUID), 10))
@@ -119,7 +121,7 @@ func canonicalDNS(values []DNSObservation) []DNSObservation {
 }
 
 func validateExpansionRequest(request ExpansionRequest) error {
-	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !refPattern.MatchString(request.Profile.SystemdVersion) || !refPattern.MatchString(request.Profile.NginxVersion) || !validDigest(request.Profile.PackageSnapshotDigest) || !validProfileAuthority(request.Profile) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
+	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !refPattern.MatchString(request.Profile.SystemdVersion) || !refPattern.MatchString(request.Profile.NginxVersion) || !validDigest(request.Profile.PackageSnapshotDigest) || !validProfileAuthority(request.Profile) || !validManagedConfinement(request.Profile.ManagedConfinement) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
 		return fmt.Errorf("expansion preflight request identity or profile is invalid")
 	}
 	switch request.Scope {

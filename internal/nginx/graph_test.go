@@ -196,6 +196,58 @@ func TestReloadGuardAllowsExactActivatingDomainAndRejectsStalePlan(t *testing.T)
 	}
 }
 
+func TestBasicStaticRoutesRenderAnonymousAndAuthenticatedBoundaries(t *testing.T) {
+	entry := Entry{
+		Kind:       EntryApp,
+		ResourceID: "res_static",
+		Relative:   AppsDirectory + "/res_static.conf",
+		Digest:     "sha256:" + strings.Repeat("a", 64),
+		Domains:    []string{"static.example.test"},
+		Generation: 1,
+		Domain: &DomainSite{
+			Hosts:              []string{"static.example.test"},
+			CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_static",
+			RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log",
+			AuthMode:           "basic",
+			HTPasswdPath:       "/var/lib/lanpanel/credentials/static.htpasswd",
+			UpstreamNetwork:    "unix",
+			UpstreamAddress:    "/run/lanpanel/res_static.sock",
+			Static: []StaticRoute{
+				{URLPath: "/anonymous.txt", RelativePath: "anonymous.txt", SourcePath: "/srv/static/anonymous.txt", Anonymous: true, Identity: testDigest("anonymous")},
+				{URLPath: "/protected.txt", RelativePath: "protected.txt", SourcePath: "/srv/static/protected.txt", Identity: testDigest("protected")},
+			},
+		},
+	}
+	data, err := RenderEntry(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	location := func(path string) string {
+		marker := "  location = " + path + " {\n"
+		start := strings.Index(text, marker)
+		if start < 0 {
+			t.Fatalf("location %q was not rendered", path)
+		}
+		remainder := text[start+len(marker):]
+		end := strings.Index(remainder, "\n  }\n")
+		if end < 0 {
+			t.Fatalf("location %q rendering was not bounded", path)
+		}
+		return remainder[:end]
+	}
+	anonymous := location("/anonymous.txt")
+	protected := location("/protected.txt")
+	if strings.Contains(anonymous, "auth_basic") || strings.Contains(anonymous, "auth_basic_user_file") {
+		t.Fatalf("anonymous static route rendered Basic authentication:\n%s", anonymous)
+	}
+	for _, directive := range []string{"auth_basic \"Restricted\";", "auth_basic_user_file \"/var/lib/lanpanel/credentials/static.htpasswd\";"} {
+		if !strings.Contains(protected, directive) {
+			t.Fatalf("authenticated static route omitted %q:\n%s", directive, protected)
+		}
+	}
+}
+
 func installTestGraph(t *testing.T) (Paths, Manifest) {
 	t.Helper()
 	root := t.TempDir()

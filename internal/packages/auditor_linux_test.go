@@ -73,6 +73,59 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	}
 }
 
+func TestLinuxAuditorReadDPKGClassifiesHeldAndInstalledStates(t *testing.T) {
+	fixture := strings.Join([]string{
+		"Package: base-files\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\nDescription: fixture\n\ttab continuation\n",
+		"Package: held-installed\nStatus: hold ok installed\nVersion: 2\nArchitecture: amd64\n",
+		"Package: held-half-configured\nStatus: hold ok half-configured\nVersion: 3\nArchitecture: amd64\n",
+		"Package: held-unpacked\nStatus: hold ok unpacked\nVersion: 4\nArchitecture: amd64\n",
+		"Package: held-triggers\nStatus: hold ok triggers-pending\nVersion: 5\nArchitecture: amd64\n",
+		"Package: held-broken\nStatus: hold reinstreq installed\nVersion: 6\nArchitecture: amd64\n",
+	}, "\n")
+	auditor := dpkgFixtureAuditor(t, fixture)
+	state, installed, systemPackages, err := auditor.readDPKG(context.Background(), []Package{{Name: "held-installed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 1 || installed[0].Name != "held-installed" || installed[0].Version != "2" || installed[0].Architecture != "amd64" {
+		t.Fatalf("installed closure=%#v", installed)
+	}
+	if len(systemPackages) != 2 || systemPackages[0].Name != "base-files" || systemPackages[1].Name != "held-installed" {
+		t.Fatalf("system packages=%#v", systemPackages)
+	}
+	if strings.Join(state.HalfConfigured, ",") != "held-half-configured" || strings.Join(state.Unpacked, ",") != "held-unpacked" || strings.Join(state.TriggersPending, ",") != "held-triggers" || strings.Join(state.Broken, ",") != "held-broken" {
+		t.Fatalf("dpkg state=%#v", state)
+	}
+}
+
+func TestLinuxAuditorReadDPKGRejectsMissingRequiredFields(t *testing.T) {
+	fixture := "Package: base-files\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n"
+	for _, missing := range []string{"Package", "Status", "Version", "Architecture"} {
+		t.Run(missing, func(t *testing.T) {
+			lines := []string{}
+			for _, line := range strings.Split(fixture, "\n") {
+				if line != "" && !strings.HasPrefix(line, missing+":") {
+					lines = append(lines, line)
+				}
+			}
+			auditor := dpkgFixtureAuditor(t, strings.Join(lines, "\n")+"\n")
+			if _, _, _, err := auditor.readDPKG(context.Background(), nil); err == nil {
+				t.Fatalf("dpkg stanza without %s was accepted", missing)
+			}
+		})
+	}
+}
+
+func dpkgFixtureAuditor(t *testing.T, status string) *LinuxAuditor {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var/lib/dpkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, root, "var/lib/dpkg/status", []byte(status), 0o644)
+	return newTestLinuxAuditor(&auditLauncher{}, root)
+}
+
 func TestLinuxAuditorVerifiesExactPackageMaskCTime(t *testing.T) {
 	root := t.TempDir()
 	maskRoot := filepath.Join(root, "etc/systemd/system")
