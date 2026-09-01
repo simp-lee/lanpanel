@@ -18,6 +18,9 @@ type ActivationSnapshot struct {
 }
 
 func SnapshotActivation(paths Paths, owner filetxn.Owner, entry Entry) (ActivationSnapshot, error) {
+	if err := requireNoPendingContraction(paths, owner); err != nil {
+		return ActivationSnapshot{}, err
+	}
 	manifest, err := Audit(paths, owner)
 	if err != nil {
 		return ActivationSnapshot{}, err

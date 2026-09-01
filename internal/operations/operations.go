@@ -23,6 +23,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
+	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/sources"
 	"reflect"
@@ -1550,8 +1551,55 @@ func certificateDeadlineAfter(candidate, prior string) bool {
 	return candidateErr == nil && priorErr == nil && candidateTime.After(priorTime)
 }
 
+func requireManagedBasicCandidateChild(transaction *persist.Transaction, jobID, fingerprint string) error {
+	matches := 0
+	for _, key := range transaction.Keys("children") {
+		raw, _ := transaction.Get(key)
+		var child ChildRecord
+		if err := decodeStrict(raw, &child); err != nil {
+			return err
+		}
+		if child.JobID != jobID {
+			continue
+		}
+		matches++
+		if child.Profile != "htpasswd" || child.State != ChildTerminal || child.Outcome != ChildSucceeded || child.ResultDigest != fingerprint {
+			return fmt.Errorf("managed Basic candidate child result changed")
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("managed Basic candidate requires one exact terminal child")
+	}
+	return nil
+}
+
+func requireManagedBasicCandidateChildEntries(entries map[string]json.RawMessage, jobID, fingerprint string) error {
+	matches := 0
+	for key, raw := range entries {
+		if !strings.HasPrefix(key, "children/") {
+			continue
+		}
+		var child ChildRecord
+		if err := decodeStrict(raw, &child); err != nil {
+			return err
+		}
+		if child.JobID != jobID {
+			continue
+		}
+		matches++
+		if child.Profile != "htpasswd" || child.State != ChildTerminal || child.Outcome != ChildSucceeded || child.ResultDigest != fingerprint {
+			return fmt.Errorf("managed Basic candidate child result changed")
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("managed Basic candidate requires one exact terminal child")
+	}
+	return nil
+}
+
 func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, credential domain.Credential) error {
-	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || credential.Kind != "managed_basic" || !exactDigest(credential.Fingerprint) {
+	binding, bindingErr := canonicalValueDigest(credential)
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || credential.Kind != "managed_basic" || !exactDigest(credential.Fingerprint) || bindingErr != nil {
 		return fmt.Errorf("managed Basic create requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
@@ -1559,8 +1607,11 @@ func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation
 		if err != nil {
 			return err
 		}
-		if intent.Operation != ManagedBasicCreate || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+credential.OwnerResourceID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != credential.OwnerResourceID {
+		if intent.Operation != ManagedBasicCreate || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+credential.OwnerResourceID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != credential.OwnerResourceID || intent.OperationBinding != binding {
 			return fmt.Errorf("managed Basic create intent mismatched")
+		}
+		if err := requireManagedBasicCandidateChild(transaction, jobID, credential.Fingerprint); err != nil {
+			return err
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
@@ -1592,7 +1643,10 @@ func (admitter *Admitter) CommitManagedBasicCreate(ctx context.Context, mutation
 }
 
 func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, prior domain.Credential, fingerprint string) error {
-	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || prior.Kind != "managed_basic" || !exactDigest(prior.Fingerprint) || !exactDigest(fingerprint) {
+	candidate := prior
+	candidate.Fingerprint = fingerprint
+	binding, bindingErr := canonicalValueDigest(candidate)
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || prior.Kind != "managed_basic" || !exactDigest(prior.Fingerprint) || !exactDigest(fingerprint) || bindingErr != nil {
 		return fmt.Errorf("managed Basic commit requires exact authority")
 	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
@@ -1600,8 +1654,11 @@ func (admitter *Admitter) CommitManagedBasicFingerprint(ctx context.Context, mut
 		if err != nil {
 			return err
 		}
-		if intent.Operation != ManagedBasicRotate || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+prior.ID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != prior.OwnerResourceID || intent.SafetyBinding.PriorFingerprint != prior.Fingerprint {
+		if intent.Operation != ManagedBasicRotate || intent.Phase != PhaseLocalIntent || intent.Target != "credential/"+prior.ID || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != prior.OwnerResourceID || intent.SafetyBinding.PriorFingerprint != prior.Fingerprint || intent.OperationBinding != binding {
 			return fmt.Errorf("managed Basic intent mismatched")
+		}
+		if err := requireManagedBasicCandidateChild(transaction, jobID, fingerprint); err != nil {
+			return err
 		}
 		installation, err := loadInstallation(transaction)
 		if err != nil {
@@ -4432,12 +4489,19 @@ func (admitter *Admitter) CommitResourceUpdate(ctx context.Context, mutation *Mu
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.ID == "" {
 		return fmt.Errorf("resource update commit requires exact authority")
 	}
+	candidateDigest, digestErr := appresource.ConfigDigest(candidate)
+	if digestErr != nil {
+		return fmt.Errorf("resource update candidate config identity: %w", digestErr)
+	}
+	if candidate.CurrentConfigDigest != candidateDigest {
+		return fmt.Errorf("resource update candidate config identity changed")
+	}
 	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
 		if err != nil {
 			return err
 		}
-		if intent.Operation != ResourceUpdate || intent.Phase != PhaseLocalIntent || intent.SafetyBinding.ResourceID != candidate.ID || mutation.Target() != intent.Target {
+		if intent.Operation != ResourceUpdate || intent.AdmissionSource != AdmissionUI || intent.Phase != PhaseLocalIntent || intent.Target != "resource/"+candidate.ID || intent.SafetyBinding.ResourceID != candidate.ID || intent.SafetyBinding.CandidateDigest != candidateDigest || mutation.Target() != intent.Target {
 			return fmt.Errorf("resource update intent mismatched")
 		}
 		installation, err := loadInstallation(transaction)
@@ -4448,9 +4512,12 @@ func (admitter *Admitter) CommitResourceUpdate(ctx context.Context, mutation *Mu
 		for index := range installation.Resources {
 			if installation.Resources[index].ID == candidate.ID {
 				prior := installation.Resources[index]
+				if intent.SafetyBinding.CandidateBundle != prior.CurrentConfigDigest {
+					return fmt.Errorf("resource update prior config identity changed")
+				}
 				candidate.PublicationRecord = prior.PublicationRecord
-				if prior.Target.Kind != candidate.Target.Kind {
-					return fmt.Errorf("resource update target kind changed")
+				if prior.Lifecycle != candidate.Lifecycle || prior.Target.Kind != candidate.Target.Kind {
+					return fmt.Errorf("resource update lifecycle or target kind changed")
 				}
 				if err := validateResourceManagedProcessPresence(prior); err != nil {
 					return fmt.Errorf("prior resource update authority: %w", err)
@@ -6606,6 +6673,282 @@ func temporaryPublicationRestoredUnpublished(oldResource, resource domain.AppRes
 	return oldResource.Publication.Kind == domain.PublicationTemporaryHTTP && oldResource.Publication.TemporaryHTTP != nil && oldResource.PublicationRecord.State == domain.PublicationActivating && activation != nil && activation.Candidate.Kind == domain.PublicationTemporaryHTTP && activation.Candidate.TemporaryHTTP != nil && activation.PriorState == domain.PublicationUnpublished && resource.PublicationRecord.UnpublishedGeneration == oldResource.PublicationRecord.UnpublishedGeneration
 }
 
+func canonicalValueDigest(value any) (string, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func exactRunningInstallationAuthority(before, after persist.Document, predicate func(Reservation) bool) error {
+	matches := 0
+	for _, key := range persist.EntryKeys(after, "intents") {
+		jobID := strings.TrimPrefix(key, "intents/")
+		afterIntent, err := loadReservationEntries(after.Entries, jobID)
+		if err != nil {
+			return err
+		}
+		afterRecord, err := jobs.LoadEntries(after.Entries, jobID)
+		if err != nil {
+			return fmt.Errorf("installation collection transition lacks current job: %w", err)
+		}
+		if afterIntent.Phase != PhaseLocalIntent || afterRecord.Status != jobs.StatusRunning {
+			continue
+		}
+		beforeIntent, err := loadReservationEntries(before.Entries, jobID)
+		if err != nil {
+			return fmt.Errorf("installation collection transition lacks prior intent: %w", err)
+		}
+		beforeRecord, err := jobs.LoadEntries(before.Entries, jobID)
+		if err != nil {
+			return fmt.Errorf("installation collection transition lacks prior job: %w", err)
+		}
+		if !reflect.DeepEqual(beforeIntent, afterIntent) || beforeRecord.Status != jobs.StatusRunning || !reflect.DeepEqual(beforeRecord, afterRecord) {
+			return fmt.Errorf("installation collection transition changed outside one running local intent")
+		}
+		if predicate(afterIntent) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("installation collection transition has %d exact running authorities", matches)
+	}
+	return nil
+}
+
+func resourceDeleteCollectionAuthority(oldInstallation, newInstallation domain.Installation, intent Reservation, resourceID string) bool {
+	if intent.Operation != ResourceDelete || intent.Target != "resource/"+resourceID || intent.SafetyBinding.ResourceID != resourceID {
+		return false
+	}
+	foundOld := false
+	for _, resource := range oldInstallation.Resources {
+		if resource.ID == resourceID && resource.Lifecycle == domain.LifecycleDeleting && resource.PublicationRecord.LastOperation == domain.OperationResourceDelete && resource.PublicationRecord.LastJobID == intent.JobID {
+			foundOld = true
+		}
+	}
+	for _, resource := range newInstallation.Resources {
+		if resource.ID == resourceID {
+			return false
+		}
+	}
+	return foundOld
+}
+
+func validateCredentialTransition(before, after persist.Document, oldInstallation, newInstallation domain.Installation) error {
+	if reflect.DeepEqual(oldInstallation.Credentials, newInstallation.Credentials) {
+		return nil
+	}
+	oldByID := make(map[string]domain.Credential, len(oldInstallation.Credentials))
+	newByID := make(map[string]domain.Credential, len(newInstallation.Credentials))
+	for _, credential := range oldInstallation.Credentials {
+		oldByID[credential.ID] = credential
+	}
+	for _, credential := range newInstallation.Credentials {
+		newByID[credential.ID] = credential
+	}
+	added := []domain.Credential{}
+	removed := []domain.Credential{}
+	changedOld := []domain.Credential{}
+	changedNew := []domain.Credential{}
+	for id, credential := range newByID {
+		prior, present := oldByID[id]
+		if !present {
+			added = append(added, credential)
+		} else if prior != credential {
+			changedOld = append(changedOld, prior)
+			changedNew = append(changedNew, credential)
+		}
+	}
+	for id, credential := range oldByID {
+		if _, present := newByID[id]; !present {
+			removed = append(removed, credential)
+		}
+	}
+	switch {
+	case len(added) == 1 && len(removed) == 0 && len(changedOld) == 0:
+		candidate := added[0]
+		expected := append(append([]domain.Credential(nil), oldInstallation.Credentials...), candidate)
+		slices.SortFunc(expected, func(a, b domain.Credential) int { return strings.Compare(a.ID, b.ID) })
+		if !slices.Equal(expected, newInstallation.Credentials) {
+			return fmt.Errorf("credential addition reordered unrelated authority")
+		}
+		switch candidate.Kind {
+		case "managed_basic":
+			binding, err := canonicalValueDigest(candidate)
+			if err != nil {
+				return err
+			}
+			jobID := ""
+			if err := exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+				matches := intent.Operation == ManagedBasicCreate && intent.Target == "resource/"+candidate.OwnerResourceID && intent.SafetyBinding.ResourceID == candidate.OwnerResourceID && intent.OperationBinding == binding
+				if matches {
+					jobID = intent.JobID
+				}
+				return matches
+			}); err != nil {
+				return err
+			}
+			return requireManagedBasicCandidateChildEntries(after.Entries, jobID, candidate.Fingerprint)
+		case "external_htpasswd":
+			binding, err := canonicalValueDigest(candidate)
+			if err != nil {
+				return err
+			}
+			return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+				return intent.Operation == ExternalHTPasswdRegister && intent.Target == "resource/"+candidate.OwnerResourceID && intent.SafetyBinding.ResourceID == candidate.OwnerResourceID && intent.SafetyBinding.CandidateDigest == candidate.Fingerprint && intent.SafetyBinding.CandidateBundle == binding
+			})
+		default:
+			return fmt.Errorf("credential addition has no typed operation")
+		}
+	case len(added) == 0 && len(removed) == 0 && len(changedOld) == 1:
+		prior, candidate := changedOld[0], changedNew[0]
+		expectedCredential := prior
+		expectedCredential.Fingerprint = candidate.Fingerprint
+		expectedCollection := append([]domain.Credential(nil), oldInstallation.Credentials...)
+		for index := range expectedCollection {
+			if expectedCollection[index].ID == candidate.ID {
+				expectedCollection[index] = candidate
+			}
+		}
+		if prior.Kind != "managed_basic" || candidate.Fingerprint == prior.Fingerprint || candidate != expectedCredential || !slices.Equal(expectedCollection, newInstallation.Credentials) {
+			return fmt.Errorf("credential update changed fields outside managed Basic fingerprint")
+		}
+		binding, err := canonicalValueDigest(candidate)
+		if err != nil {
+			return err
+		}
+		jobID := ""
+		if err := exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+			matches := intent.Operation == ManagedBasicRotate && intent.Target == "credential/"+prior.ID && intent.SafetyBinding.ResourceID == prior.OwnerResourceID && intent.SafetyBinding.PriorFingerprint == prior.Fingerprint && intent.OperationBinding == binding
+			if matches {
+				jobID = intent.JobID
+			}
+			return matches
+		}); err != nil {
+			return err
+		}
+		return requireManagedBasicCandidateChildEntries(after.Entries, jobID, candidate.Fingerprint)
+	case len(added) == 0 && len(changedOld) == 0 && len(removed) > 0:
+		removedIDs := make(map[string]struct{}, len(removed))
+		for _, credential := range removed {
+			removedIDs[credential.ID] = struct{}{}
+		}
+		expected := make([]domain.Credential, 0, len(oldInstallation.Credentials)-len(removed))
+		for _, credential := range oldInstallation.Credentials {
+			if _, remove := removedIDs[credential.ID]; !remove {
+				expected = append(expected, credential)
+			}
+		}
+		if !slices.Equal(expected, newInstallation.Credentials) {
+			return fmt.Errorf("credential deletion reordered unrelated authority")
+		}
+		return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+			if len(removed) == 1 {
+				prior := removed[0]
+				if prior.Kind == "managed_basic" && intent.Operation == ManagedBasicDelete && intent.Target == "credential/"+prior.ID && intent.SafetyBinding.ResourceID == prior.OwnerResourceID && intent.SafetyBinding.PriorFingerprint == prior.Fingerprint {
+					return true
+				}
+			}
+			resourceID := removed[0].OwnerResourceID
+			for _, credential := range removed {
+				if credential.OwnerResourceID != resourceID {
+					return false
+				}
+			}
+			for _, credential := range oldInstallation.Credentials {
+				if credential.OwnerResourceID == resourceID {
+					if _, retained := newByID[credential.ID]; retained {
+						return false
+					}
+				}
+			}
+			return resourceDeleteCollectionAuthority(oldInstallation, newInstallation, intent, resourceID)
+		})
+	default:
+		return fmt.Errorf("credential collection changed more than one typed operation permits")
+	}
+}
+
+func validateStaticRootTransition(before, after persist.Document, oldInstallation, newInstallation domain.Installation) error {
+	if reflect.DeepEqual(oldInstallation.StaticRoots, newInstallation.StaticRoots) {
+		return nil
+	}
+	oldByID := make(map[string]domain.StaticContentRoot, len(oldInstallation.StaticRoots))
+	newByID := make(map[string]domain.StaticContentRoot, len(newInstallation.StaticRoots))
+	for _, root := range oldInstallation.StaticRoots {
+		oldByID[root.ID] = root
+	}
+	for _, root := range newInstallation.StaticRoots {
+		newByID[root.ID] = root
+	}
+	added := []domain.StaticContentRoot{}
+	removed := []domain.StaticContentRoot{}
+	changed := false
+	for id, root := range newByID {
+		prior, present := oldByID[id]
+		if !present {
+			added = append(added, root)
+		} else if prior != root {
+			changed = true
+		}
+	}
+	for id, root := range oldByID {
+		if _, present := newByID[id]; !present {
+			removed = append(removed, root)
+		}
+	}
+	switch {
+	case len(added) == 1 && len(removed) == 0 && !changed:
+		candidate := added[0]
+		expected := append(append([]domain.StaticContentRoot(nil), oldInstallation.StaticRoots...), candidate)
+		slices.SortFunc(expected, func(a, b domain.StaticContentRoot) int { return strings.Compare(a.ID, b.ID) })
+		if !slices.Equal(expected, newInstallation.StaticRoots) {
+			return fmt.Errorf("static root addition reordered unrelated authority")
+		}
+		binding, err := canonicalValueDigest(candidate)
+		if err != nil {
+			return err
+		}
+		return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+			return intent.Operation == StaticRootRegister && intent.Target == "resource/"+candidate.OwnerResourceID && intent.SafetyBinding.ResourceID == candidate.OwnerResourceID && intent.SafetyBinding.CandidateDigest == candidate.Fingerprint && intent.SafetyBinding.CandidateBundle == binding
+		})
+	case len(added) == 0 && len(removed) > 0 && !changed:
+		removedIDs := make(map[string]struct{}, len(removed))
+		for _, root := range removed {
+			removedIDs[root.ID] = struct{}{}
+		}
+		expected := make([]domain.StaticContentRoot, 0, len(oldInstallation.StaticRoots)-len(removed))
+		for _, root := range oldInstallation.StaticRoots {
+			if _, remove := removedIDs[root.ID]; !remove {
+				expected = append(expected, root)
+			}
+		}
+		if !slices.Equal(expected, newInstallation.StaticRoots) {
+			return fmt.Errorf("static root deletion reordered unrelated authority")
+		}
+		resourceID := removed[0].OwnerResourceID
+		for _, root := range removed {
+			if root.OwnerResourceID != resourceID {
+				return fmt.Errorf("static roots from multiple owners changed together")
+			}
+		}
+		for _, root := range oldInstallation.StaticRoots {
+			if root.OwnerResourceID == resourceID {
+				if _, retained := newByID[root.ID]; retained {
+					return fmt.Errorf("resource deletion retained an owned static root")
+				}
+			}
+		}
+		return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+			return resourceDeleteCollectionAuthority(oldInstallation, newInstallation, intent, resourceID)
+		})
+	default:
+		return fmt.Errorf("static root collection changed more than one typed operation permits")
+	}
+}
+
 func validateOperationStateTransitions(before, after persist.Document) error {
 	if err := validateOperationRetentionTransition(before, after); err != nil {
 		return err
@@ -6629,12 +6972,20 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	if err != nil {
 		return err
 	}
+	if err := validateCredentialTransition(before, after, oldInstallation, newInstallation); err != nil {
+		return err
+	}
+	if err := validateStaticRootTransition(before, after, oldInstallation, newInstallation); err != nil {
+		return err
+	}
 	oldBase, newBase := oldInstallation, newInstallation
 	oldBase.Headscale, newBase.Headscale = nil, nil
 	oldBase.Connector, newBase.Connector = nil, nil
+	oldBase.Credentials, newBase.Credentials = nil, nil
+	oldBase.StaticRoots, newBase.StaticRoots = nil, nil
 	oldBase.Resources, newBase.Resources = nil, nil
 	if !reflect.DeepEqual(oldBase, newBase) {
-		return fmt.Errorf("installation authority outside Headscale/resources changed")
+		return fmt.Errorf("installation authority outside typed Headscale, connector, credential, static-root, or resource transitions changed")
 	}
 	if !reflect.DeepEqual(oldInstallation.Connector, newInstallation.Connector) {
 		if newInstallation.Connector == nil || newInstallation.Connector.LastJobID == "" || (newInstallation.Connector.LastOperation != domain.OperationConnectorBindingSet && newInstallation.Connector.LastOperation != domain.OperationConnectorLogin) {
@@ -6790,6 +7141,13 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			if err := validateNewResourceAuthority(after, resource); err != nil {
 				return err
 			}
+			continue
+		}
+		if !resourceConfigurationEqual(oldResource, resource) {
+			if err := validateResourceUpdateConfigurationTransition(before, after, oldResource, resource); err != nil {
+				return fmt.Errorf("resource %q: %w", resource.ID, err)
+			}
+			delete(oldResources, resource.ID)
 			continue
 		}
 		if oldResource.Target.Kind != resource.Target.Kind {
@@ -7265,8 +7623,48 @@ func validateOperationRetentionTransition(before, after persist.Document) error 
 	return nil
 }
 
+func resourceConfigurationEqual(left, right domain.AppResource) bool {
+	leftConfig, rightConfig := left, right
+	leftConfig.Lifecycle, rightConfig.Lifecycle = "", ""
+	leftConfig.PublicationRecord, rightConfig.PublicationRecord = domain.PublicationRecord{}, domain.PublicationRecord{}
+	if leftConfig.ManagedProcess != nil {
+		process := *leftConfig.ManagedProcess
+		process.Requested = ""
+		process.Applied = nil
+		process.RuntimeObservation = nil
+		process.LastOperation = ""
+		process.LastOperationResult = ""
+		process.LastJobID = ""
+		leftConfig.ManagedProcess = &process
+	}
+	if rightConfig.ManagedProcess != nil {
+		process := *rightConfig.ManagedProcess
+		process.Requested = ""
+		process.Applied = nil
+		process.RuntimeObservation = nil
+		process.LastOperation = ""
+		process.LastOperationResult = ""
+		process.LastJobID = ""
+		rightConfig.ManagedProcess = &process
+	}
+	return reflect.DeepEqual(leftConfig, rightConfig)
+}
+
+func validateResourceUpdateConfigurationTransition(before, after persist.Document, prior, candidate domain.AppResource) error {
+	if prior.ID != candidate.ID || prior.Lifecycle != candidate.Lifecycle || prior.Target.Kind != candidate.Target.Kind || !reflect.DeepEqual(prior.PublicationRecord, candidate.PublicationRecord) || !protectedManagedProcessStateEqual(prior.ManagedProcess, candidate.ManagedProcess) {
+		return fmt.Errorf("resource update combined configuration with applied-state changes")
+	}
+	candidateDigest, err := appresource.ConfigDigest(candidate)
+	if err != nil || candidate.CurrentConfigDigest != candidateDigest {
+		return fmt.Errorf("resource update candidate config identity is not canonical")
+	}
+	return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+		return intent.Operation == ResourceUpdate && intent.AdmissionSource == AdmissionUI && intent.Target == "resource/"+candidate.ID && intent.SafetyBinding.ResourceID == candidate.ID && intent.SafetyBinding.CandidateDigest == candidateDigest && intent.SafetyBinding.CandidateBundle == prior.CurrentConfigDigest
+	})
+}
+
 func protectedResourceStateEqual(left, right domain.AppResource) bool {
-	return left.Lifecycle == right.Lifecycle && reflect.DeepEqual(left.PublicationRecord, right.PublicationRecord) && protectedManagedProcessStateEqual(left.ManagedProcess, right.ManagedProcess)
+	return reflect.DeepEqual(left, right)
 }
 
 func protectedManagedProcessStateEqual(left, right *domain.ManagedProcess) bool {

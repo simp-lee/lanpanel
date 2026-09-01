@@ -277,10 +277,7 @@ func ProbeDERP(ctx context.Context, targetIP, host string) ([]byte, error) {
 	request.Host = host
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "DERP")
-	if err := request.Write(connection); err != nil {
-		return nil, err
-	}
-	response, err := http.ReadResponse(bufio.NewReader(connection), request)
+	response, err := exchangeDERPUpgrade(ctx, connection, request)
 	if err != nil {
 		return nil, err
 	}
@@ -289,6 +286,24 @@ func ProbeDERP(ctx context.Context, targetIP, host string) ([]byte, error) {
 		return nil, fmt.Errorf("public DERP upgrade endpoint did not switch protocols")
 	}
 	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: "https://" + host + "/derp", Status: response.StatusCode, BodyDigest: release.DigestBytes([]byte(response.Header.Get("Upgrade"))), TLSVersion: connection.(*tls.Conn).ConnectionState().Version})
+}
+
+func exchangeDERPUpgrade(ctx context.Context, connection net.Conn, request *http.Request) (*http.Response, error) {
+	if request == nil {
+		return nil, fmt.Errorf("DERP request is unavailable")
+	}
+	if err := performConnIO(ctx, connection, 10*time.Second, func() error { return request.Write(connection) }); err != nil {
+		return nil, err
+	}
+	var response *http.Response
+	if err := performConnIO(ctx, connection, 10*time.Second, func() error {
+		var readErr error
+		response, readErr = http.ReadResponse(bufio.NewReader(connection), request)
+		return readErr
+	}); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func probePublicWebSocket(ctx context.Context, client *http.Client, target string) ([]byte, error) {

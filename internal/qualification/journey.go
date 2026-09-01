@@ -116,7 +116,9 @@ func (runner Runner) Run(ctx context.Context) (release.LiveCleanupReport, error)
 		planned := planByID[step]
 		observeCtx, observeCancel := context.WithTimeout(ctx, runner.ExecutionTimeout)
 		observed, observeErr := runner.Executor.Observe(observeCtx, step)
+		observeContextErr := observeCtx.Err()
 		observeCancel()
+		observeErr = errors.Join(observeErr, observeContextErr)
 		if observeErr != nil {
 			report.ExecutionFailed = len(report.Steps) != 0
 			runErr = errors.Join(runErr, fmt.Errorf("observe live qualification prior state for %q: %w", step, observeErr))
@@ -141,7 +143,9 @@ func (runner Runner) Run(ctx context.Context) (release.LiveCleanupReport, error)
 
 		executeCtx, executeCancel := context.WithTimeout(ctx, runner.ExecutionTimeout)
 		observation, executeErr := runner.Executor.Execute(executeCtx, step)
+		executeContextErr := executeCtx.Err()
 		executeCancel()
+		executeErr = errors.Join(executeErr, executeContextErr)
 		terminalStep := release.JourneyStepResult{MutationID: step, AttemptID: attemptID}
 		switch {
 		case observation.Identity != "" && len(observation.Evidence) != 0 && executeErr == nil:
@@ -205,7 +209,9 @@ func (runner Runner) cleanup(ctx context.Context, report release.LiveCleanupRepo
 		if item.Result == release.CleanupSubmitted {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runner.CleanupTimeout)
 			recovered, recoverErr := runner.Executor.Recover(cleanupCtx, step)
+			recoverContextErr := cleanupCtx.Err()
 			cancel()
+			recoverErr = errors.Join(recoverErr, recoverContextErr)
 			if recoverErr != nil || recovered.Identity == "" {
 				cleanupErr = errors.Join(cleanupErr, recoverErr, fmt.Errorf("submitted live mutation %q cannot be recovered", step))
 				continue
@@ -221,7 +227,9 @@ func (runner Runner) cleanup(ctx context.Context, report release.LiveCleanupRepo
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runner.CleanupTimeout)
 		result, err := runner.Executor.Cleanup(cleanupCtx, step, observation, planByID[step].CleanupPolicy)
+		cleanupContextErr := cleanupCtx.Err()
 		cancel()
+		err = errors.Join(err, cleanupContextErr)
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue

@@ -5,12 +5,41 @@ import (
 	"bytes"
 	"compress/gzip"
 	"lanpanel/internal/dependencies"
+	"lanpanel/internal/filetxn"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestInstallAssetSizeContractBoundariesAndCurrentBinary(t *testing.T) {
+	atLimit := AssetIdentity{Path: "lanpanel", Digest: DigestBytes([]byte("identity")), Bytes: uint64(filetxn.MaximumContentBytes)}
+	if err := validateAsset(atLimit); err != nil {
+		t.Fatalf("asset exactly at installation limit was rejected: %v", err)
+	}
+	overLimit := atLimit
+	overLimit.Bytes++
+	if err := validateAsset(overLimit); err == nil {
+		t.Fatal("asset one byte over installation limit was accepted")
+	}
+
+	output := filepath.Join(t.TempDir(), "lanpanel")
+	command := exec.Command("go", "build", "-o", output, "../../cmd/lanpanel")
+	if data, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build current lanpanel: %v: %s", err, data)
+	}
+	binary, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := AssetIdentity{Path: "lanpanel", Digest: DigestBytes(binary), Bytes: uint64(len(binary))}
+	if err := validateAsset(identity); err != nil {
+		t.Fatalf("current %d-byte binary is not accepted by the unified installation contract: %v", identity.Bytes, err)
+	}
+}
 
 func TestLiveCleanupMustCoverImmutablePlanExactly(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()

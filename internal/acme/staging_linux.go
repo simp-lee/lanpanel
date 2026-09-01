@@ -4,6 +4,8 @@ package acme
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 
@@ -95,8 +96,8 @@ func prepareStage(ctx context.Context, certificateID string, binding Binding, ui
 	if err := stage.installAccountKey(binding); err != nil {
 		return Stage{}, err
 	}
-	for _, source := range credentialPaths(binding) {
-		if err := stage.copyProtected(source, uid, gid); err != nil {
+	for _, credential := range binding.CredentialFiles {
+		if err := stage.copyCredential(credential, uid, gid); err != nil {
 			return Stage{}, err
 		}
 	}
@@ -287,16 +288,40 @@ func (stage Stage) installAccountKey(binding Binding) error {
 	return stage.copyProtectedTo(binding.AccountKeyPath, target, stage.UID, stage.GID, binding.AccountKeyFingerprint)
 }
 
-func (stage Stage) copyProtected(source string, uid, gid uint32) error {
-	return stage.copyProtectedTo(source, source, uid, gid, "")
+func (stage Stage) copyCredential(credential CredentialFile, uid, gid uint32) error {
+	return stage.copyProtectedToVerified(credential.Path, credential.Path, uid, gid, func(data []byte) error {
+		sum := sha256.Sum256(data)
+		fingerprint := "sha256:" + hex.EncodeToString(sum[:])
+		if fingerprint != credential.Fingerprint {
+			return fmt.Errorf("ACME credential changed before staging")
+		}
+		return nil
+	})
 }
 
 func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, accountKeyFingerprint string) error {
+	return stage.copyProtectedToVerified(source, targetPath, uid, gid, func(data []byte) error {
+		fingerprint, err := acmeaccount.Fingerprint(data)
+		if err != nil || fingerprint != accountKeyFingerprint {
+			return fmt.Errorf("ACME account key changed before staging")
+		}
+		return nil
+	})
+}
+
+func (stage Stage) copyProtectedToVerified(source, targetPath string, uid, gid uint32, verify func([]byte) error) error {
 	input, err := openProtected(source)
 	if err != nil {
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(input.Close)
+	data, readErr := io.ReadAll(io.LimitReader(input, 64<<10+1))
+	if readErr != nil || len(data) == 0 || len(data) > 64<<10 {
+		return fmt.Errorf("ACME protected input invalid")
+	}
+	if err := verify(data); err != nil {
+		return err
+	}
 	target := filepath.Join(stage.Root, strings.TrimPrefix(targetPath, "/"))
 	if err := os.MkdirAll(filepath.Dir(target), 0o711); err != nil {
 		return err
@@ -304,18 +329,6 @@ func (stage Stage) copyProtectedTo(source, targetPath string, uid, gid uint32, a
 	output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
 	if err != nil {
 		return err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(input, 64<<10+1))
-	if readErr != nil || len(data) == 0 || len(data) > 64<<10 {
-		_ = output.Close()
-		return fmt.Errorf("ACME protected input invalid")
-	}
-	if accountKeyFingerprint != "" {
-		fingerprint, fingerprintErr := acmeaccount.Fingerprint(data)
-		if fingerprintErr != nil || fingerprint != accountKeyFingerprint {
-			_ = output.Close()
-			return fmt.Errorf("ACME account key changed before staging")
-		}
 	}
 	writeErr := writeFull(output, data)
 	ownerErr := output.Chown(int(uid), int(gid))
@@ -363,15 +376,6 @@ func (stage Stage) prepareMountTarget(source string) error {
 		return fmt.Errorf("ACME mount target invalid")
 	}
 	return nil
-}
-
-func credentialPaths(binding Binding) []string {
-	result := make([]string, len(binding.CredentialFiles))
-	for index, file := range binding.CredentialFiles {
-		result[index] = file.Path
-	}
-	slices.Sort(result)
-	return result
 }
 
 func certificateIDPattern(value string) bool {

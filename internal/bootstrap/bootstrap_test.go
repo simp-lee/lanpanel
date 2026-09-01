@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/child"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
@@ -172,6 +173,106 @@ func TestInstallerPackagePhaseBindsReleaseRepositoryClosureAndPreflight(t *testi
 	plan.Repositories[0].MetadataDigest = strings.Repeat("0", 64)
 	if _, err := validateInstallerPackageAuthority(installed, plan, result); err == nil {
 		t.Fatal("repository metadata drift retained installer package authority")
+	}
+}
+
+func TestPackagePolicyCleanupRecoversAfterSideEffectBeforeJournalAdvance(t *testing.T) {
+	root := t.TempDir()
+	paths := testPaths(root)
+	policyPath := filepath.Join(root, "sbin", "policy-rc.d")
+	if err := os.MkdirAll(filepath.Dir(policyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	policy := []byte("exact package no-autostart policy")
+	if err := os.WriteFile(policyPath, policy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	durable := testJournal(root)
+	durable.Phase = PhaseNginxMasked
+	durable.Paths = paths
+	durable.Release.Binary.Bytes = uint64(len(policy))
+	durable.Release.Binary.Digest = digestBytes(policy)
+	durable.Release.CandidateDigest = durable.Release.Binary.Digest
+	durable.ArtifactDigests["/usr/sbin/policy-rc.d"] = durable.Release.Binary.Digest
+	packageJournal := packages.Journal{
+		SchemaVersion: packages.PackageJournalSchemaVersion, TransactionID: durable.PackageTransactionID,
+		NormalJournalID: "package-" + durable.PackageTransactionID, ChildID: "package-child-" + durable.PackageTransactionID,
+		JobID: "job_" + strings.Repeat("1", 64), PlanDigest: durable.PackagePlanDigest, AuthorityDigest: strings.Repeat("2", 64), PackageProfile: child.ProfileAPTTransaction,
+		Prior: packages.RuntimeSnapshot{}, Phase: packages.JournalCleaned, Masks: []packages.MaskIdentity{}, MasksComplete: true,
+		ChildResultDigest: strings.Repeat("3", 64), ChildSucceeded: true, PostconditionDigest: strings.Repeat("4", 64),
+	}
+	cloneDurable := func() Journal {
+		value := durable
+		value.ArtifactDigests = make(map[string]string, len(durable.ArtifactDigests))
+		for path, digest := range durable.ArtifactDigests {
+			value.ArtifactDigests[path] = digest
+		}
+		return value
+	}
+
+	syncFailure := errors.New("simulated policy directory sync failure")
+	if err := removeBootstrapPolicyWithSync(durable.Release.Binary, durable.Paths, func(int) error { return syncFailure }, syncParentDirectory); !errors.Is(err, syncFailure) {
+		t.Fatalf("policy namespace interruption error=%v", err)
+	}
+	if _, err := os.Lstat(policyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interrupted policy cleanup remains: %v", err)
+	}
+	// Simulate failure to advance the bootstrap journal by reloading its old phase.
+	// The retry must synchronize the already-absent namespace before advancing.
+	retried := cloneDurable()
+	if err := reconcilePackageCommit(&retried, packageJournal); err != nil {
+		t.Fatalf("exact cleaned package state was not idempotently recovered: %v", err)
+	}
+	foreign := packageJournal
+	foreign.PlanDigest = strings.Repeat("5", 64)
+	if err := reconcilePackageCommit(&retried, foreign); err == nil {
+		t.Fatal("missing policy was accepted for a different package journal identity")
+	}
+}
+
+func TestStartupAuthorityRecoversAfterCreateBeforeJournalAdvance(t *testing.T) {
+	journal := testJournal(t.TempDir())
+	journal.FinalCommitDigest = strings.Repeat("f", 64)
+	expected := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: journal.FinalCommitDigest}
+	data, err := encodeCanonical(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "startup-authority.json")
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	if err := finalizeStartupAuthorityFile(path, expected, uid, gid); err != nil {
+		t.Fatalf("exact startup side effect was not durably accepted on old-phase retry: %v", err)
+	}
+
+	changed := expected
+	changed.CommitDigest = strings.Repeat("e", 64)
+	if err := verifyStartupAuthorityFile(path, changed, uid, gid); err == nil {
+		t.Fatal("startup authority bound to another commit was accepted")
+	}
+	if err := verifyStartupAuthorityFile(path, expected, uid+1, gid); err == nil {
+		t.Fatal("startup authority with a foreign UID was accepted")
+	}
+	if err := verifyStartupAuthorityFile(path, expected, uid, gid+1); err == nil {
+		t.Fatal("startup authority with a foreign GID was accepted")
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyStartupAuthorityFile(path, expected, uid, gid); err == nil {
+		t.Fatal("startup authority with a foreign mode was accepted")
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	foreignBytes, _ := encodeCanonical(changed)
+	if err := os.WriteFile(path, foreignBytes, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyStartupAuthorityFile(path, expected, uid, gid); err == nil {
+		t.Fatal("foreign canonical startup authority bytes were accepted")
 	}
 }
 

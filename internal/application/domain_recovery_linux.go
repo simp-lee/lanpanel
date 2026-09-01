@@ -9,14 +9,18 @@ import (
 	"lanpanel/internal/activation"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/contraction"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/filetxn"
 	goaccessruntime "lanpanel/internal/goaccess"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
 	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
 	"reflect"
+	"slices"
 	"time"
 )
 
@@ -29,12 +33,226 @@ func readPublicationRecoverySafety(ctx context.Context, service *FixedService) (
 	return state, errors.Join(readErr, exposure.Release())
 }
 
+func reconcileTerminalNginxContraction(ctx context.Context, service *FixedService) (returnErr error) {
+	exposure, err := service.manager.Acquire(ctx, locks.Exposure)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, exposure.Release()) }()
+	receipt, present, err := nginx.TerminalContractionReceipt(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if err != nil || !present {
+		return err
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	coveredPaths := map[string]bool{}
+	for _, resourceID := range receipt.ResourceIDs {
+		var normal *domain.AppResource
+		for index := range installation.Resources {
+			if installation.Resources[index].ID == resourceID {
+				normal = &installation.Resources[index]
+			}
+		}
+		var independent *safety.ResourceSafety
+		for index := range state.Resources {
+			if state.Resources[index].ResourceID == resourceID {
+				independent = &state.Resources[index]
+			}
+		}
+		if normal == nil || independent == nil || normal.PublicationRecord.State != domain.PublicationUnpublished || normal.PublicationRecord.LastJobID == "" || normal.PublicationRecord.ContractionIntent != nil {
+			return nil
+		}
+		generation := normal.PublicationRecord.UnpublishedGeneration
+		sticky := independent.StickyUnpublished != nil && independent.StickyUnpublished.Generation == generation
+		closing := independent.Closing != nil && independent.Closing.Generation == generation
+		if !sticky && !closing {
+			return nil
+		}
+		intent, err := admitter.OperationIntent(normal.PublicationRecord.LastJobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != operations.PhaseTerminal || intent.ContractionDigest == "" {
+			return nil
+		}
+		expectedTarget := "resource/" + resourceID
+		expectedLastOperation := domain.OperationUnpublish
+		switch intent.Operation {
+		case operations.CloseAll:
+			expectedTarget = "installation"
+			expectedLastOperation = domain.OperationCloseAll
+		case operations.StartupContraction:
+			expectedTarget = "installation"
+		case operations.Unpublish, operations.CertificateExpiry:
+		case operations.Publish:
+			return nil
+		default:
+			return fmt.Errorf("terminal nginx contraction job has a non-contraction operation")
+		}
+		if intent.Target != expectedTarget || normal.PublicationRecord.LastOperation != expectedLastOperation {
+			return fmt.Errorf("terminal nginx contraction job scope changed")
+		}
+		record, err := jobs.LoadEntries(document.Entries, intent.JobID)
+		if err != nil {
+			return err
+		}
+		if record.Status != jobs.StatusTerminal {
+			return nil
+		}
+		for _, path := range record.ModifiedPaths {
+			coveredPaths[path] = true
+		}
+	}
+	for _, path := range receipt.ModifiedPaths {
+		if !coveredPaths[path] {
+			return fmt.Errorf("terminal nginx contraction modified-path evidence is incomplete")
+		}
+	}
+	if !slices.IsSorted(receipt.ResourceIDs) || !slices.IsSorted(receipt.ModifiedPaths) {
+		return fmt.Errorf("terminal nginx contraction receipt is noncanonical")
+	}
+	return nginx.AcknowledgeContraction(context.WithoutCancel(ctx), nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, receipt.ResourceIDs)
+}
+
+func reconcileTerminalContractionClosings(ctx context.Context, service *FixedService) (returnErr error) {
+	exposure, err := service.manager.Acquire(ctx, locks.Exposure)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, exposure.Release()) }()
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	admitter, err := service.TimerAdmitter()
+	if err != nil {
+		return err
+	}
+	type terminalGroup struct {
+		operation       operations.Type
+		inventoryDigest string
+		runtimeDigest   string
+		generations     map[string]uint64
+	}
+	groups := map[string]*terminalGroup{}
+	for _, independent := range state.Resources {
+		if independent.Closing == nil {
+			continue
+		}
+		var normal *domain.AppResource
+		for index := range installation.Resources {
+			if installation.Resources[index].ID == independent.ResourceID {
+				normal = &installation.Resources[index]
+			}
+		}
+		if normal == nil || normal.PublicationRecord.State != domain.PublicationUnpublished || normal.PublicationRecord.UnpublishedGeneration != independent.Closing.Generation || normal.PublicationRecord.ContractionIntent != nil || normal.PublicationRecord.LastJobID == "" {
+			continue
+		}
+		intent, err := admitter.OperationIntent(normal.PublicationRecord.LastJobID)
+		if err != nil {
+			return err
+		}
+		if intent.Phase != operations.PhaseTerminal || intent.Operation == operations.Publish {
+			continue
+		}
+		switch intent.Operation {
+		case operations.Unpublish, operations.CloseAll, operations.CertificateExpiry, operations.StartupContraction:
+		default:
+			continue
+		}
+		record, err := jobs.LoadEntries(document.Entries, intent.JobID)
+		if err != nil {
+			return err
+		}
+		if record.Status != jobs.StatusTerminal || len(record.Postconditions) == 0 {
+			continue
+		}
+		closureKinds := map[string]jobs.PostconditionStatus{}
+		switch record.Result {
+		case jobs.ResultSucceeded:
+			closureKinds["access_closed"] = jobs.PostconditionVerified
+		case jobs.ResultPartial:
+			closureKinds["shared_ingress_down"] = jobs.PostconditionKnown
+			closureKinds["goaccess_retirement_pending"] = jobs.PostconditionKnown
+		default:
+			continue
+		}
+		runtimeDigest := ""
+		for _, condition := range record.Postconditions {
+			if closureKinds[condition.Kind] == condition.Status {
+				runtimeDigest = condition.Identity
+			}
+		}
+		if runtimeDigest == "" {
+			continue
+		}
+		inventoryDigest := intent.ContractionDigest
+		if inventoryDigest == "" {
+			continue
+		}
+		group := groups[intent.JobID]
+		if group == nil {
+			group = &terminalGroup{operation: intent.Operation, inventoryDigest: inventoryDigest, runtimeDigest: runtimeDigest, generations: map[string]uint64{}}
+			groups[intent.JobID] = group
+		}
+		if group.operation != intent.Operation || group.inventoryDigest != inventoryDigest || group.runtimeDigest != runtimeDigest {
+			return fmt.Errorf("terminal contraction closing job evidence changed")
+		}
+		group.generations[independent.ResourceID] = independent.Closing.Generation
+	}
+	for _, group := range groups {
+		authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Exposure: exposure, SafetyState: state, Generations: group.generations, Global: group.operation == operations.CloseAll || group.operation == operations.StartupContraction, InventoryDigest: group.inventoryDigest}
+		if err := authority.ConvergeClosure(context.WithoutCancel(ctx), closure.Inventory{Digest: group.inventoryDigest}, group.runtimeDigest); err != nil {
+			return err
+		}
+		state = authority.SafetyState
+	}
+	return nil
+}
+
+func ReconcileTerminalNginxContraction(ctx context.Context) error {
+	service, err := OpenFixed()
+	if err != nil {
+		return err
+	}
+	defer func(ignore func() error) { _ = ignore() }(service.Close)
+	if err := reconcileTerminalNginxContraction(ctx, service); err != nil {
+		return err
+	}
+	return reconcileTerminalContractionClosings(ctx, service)
+}
+
 func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	service, err := OpenFixed()
 	if err != nil {
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(service.Close)
+	if err := reconcileTerminalNginxContraction(ctx, service); err != nil {
+		return err
+	}
 	state, err := readPublicationRecoverySafety(ctx, service)
 	if err != nil {
 		return err
@@ -100,6 +318,13 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 				return err
 			}
 			mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+			if err == nil {
+				host, hostErr := activation.NewFixedHost()
+				err = hostErr
+				if hostErr == nil {
+					err = host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID)
+				}
+			}
 			if err == nil {
 				err = convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, authority.Closing.Generation, record.Postconditions[0].Identity, "interrupted_domain_activation")
 			}
@@ -226,6 +451,9 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_, err = admitter.TerminalizeInterruptedPublication(ctx, mutation, exposure, freshDocument.Revision, activationIntent.JobID, resource.ID, generation, result.ModifiedPaths, result.RuntimeDigest)
 		}
 		if err == nil && pointerErr == nil {
+			err = host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID)
+		}
+		if err == nil && pointerErr == nil {
 			err = convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, generation, result.RuntimeDigest, "interrupted_domain_activation")
 		}
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
@@ -241,7 +469,13 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	if err := reconcileRetiredGoAccess(ctx, service); err != nil {
 		return err
 	}
-	return reconcilePendingContractionGoAccess(ctx, service)
+	if err := reconcilePendingContractionGoAccess(ctx, service); err != nil {
+		return err
+	}
+	if err := reconcileTerminalNginxContraction(ctx, service); err != nil {
+		return err
+	}
+	return reconcileTerminalContractionClosings(ctx, service)
 }
 
 func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedService) error {
@@ -907,6 +1141,9 @@ func contractCommittedDomainPublication(ctx context.Context, service *FixedServi
 	if err := admitter.ConvergeCommittedPublicationContraction(ctx, mutation, exposure, document.Revision, resource.ID, generation, result.RuntimeDigest); err != nil {
 		return err
 	}
+	if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID); err != nil {
+		return err
+	}
 	return convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, generation, result.RuntimeDigest, "committed_domain_recovery")
 }
 
@@ -969,6 +1206,9 @@ func resumeCommittedDomainContraction(ctx context.Context, service *FixedService
 		}
 	} else if resource.PublicationRecord.State != domain.PublicationUnpublished {
 		return fmt.Errorf("committed domain normal recovery changed")
+	}
+	if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID); err != nil {
+		return err
 	}
 	return convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, closing.Generation, result.RuntimeDigest, "committed_domain_recovery")
 }

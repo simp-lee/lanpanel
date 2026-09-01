@@ -4,6 +4,7 @@ package contraction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
@@ -28,9 +29,15 @@ func FixedHost(inventory closure.Inventory) (Host, error) {
 		return Host{}, err
 	}
 	paths := nginx.FixedPaths()
-	manifest, err := nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
+	owner := filetxn.Owner{UID: 0, GID: 0}
+	manifest, err := nginx.Audit(paths, owner)
 	if err != nil {
-		return Host{}, err
+		auditErr := err
+		var pending bool
+		manifest, pending, err = nginx.PendingContraction(paths, owner)
+		if err != nil || !pending {
+			return Host{}, errors.Join(auditErr, err)
+		}
 	}
 	observer := closure.ProcObserver{UnitCgroup: "/system.slice/lanpanel-nginx.service", Executable: "/usr/sbin/nginx", ExpectedArgv: "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;", PIDPath: paths.PIDPath, Generation: manifest.GenerationID, OwnedListeners: inventoryListeners(inventory)}
 	return Host{Launcher: launcher, Paths: paths, Owner: filetxn.Owner{UID: 0, GID: 0}, Observer: observer, Probe: closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: paths.AuditPath}}, nil
@@ -46,20 +53,34 @@ type Host struct {
 	Guard       func(nginx.Manifest) error
 }
 
-func (host Host) ContractDisk(ctx context.Context, inventory closure.Inventory) ([]string, error) {
+func appResourceIDs(inventory closure.Inventory) []string {
 	resourceIDs := []string{}
 	seen := map[string]bool{}
 	for _, identity := range inventory.Identities {
-		if !seen[identity.ResourceID] {
-			seen[identity.ResourceID] = true
-			resourceIDs = append(resourceIDs, identity.ResourceID)
+		if identity.ResourceID == "headscale" || seen[identity.ResourceID] {
+			continue
 		}
+		seen[identity.ResourceID] = true
+		resourceIDs = append(resourceIDs, identity.ResourceID)
 	}
+	return resourceIDs
+}
+
+func (host Host) ContractDisk(ctx context.Context, inventory closure.Inventory) ([]string, error) {
+	resourceIDs := appResourceIDs(inventory)
 	manifest, paths, err := nginx.Contract(ctx, host.Paths, host.Owner, resourceIDs)
 	if err == nil && host.Guard != nil {
 		err = host.Guard(manifest)
 	}
 	return paths, err
+}
+
+func (host Host) AcknowledgeDiskContraction(ctx context.Context, inventory closure.Inventory) error {
+	resourceIDs := appResourceIDs(inventory)
+	if len(resourceIDs) == 0 {
+		return nil
+	}
+	return nginx.AcknowledgeContraction(ctx, host.Paths, host.Owner, resourceIDs)
 }
 
 func (host Host) TestClosedGraph(ctx context.Context) error {

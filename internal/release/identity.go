@@ -383,8 +383,8 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 }
 
 func validateAsset(asset AssetIdentity) error {
-	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 {
-		return fmt.Errorf("asset identity is incomplete")
+	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 || asset.Bytes > uint64(filetxn.MaximumContentBytes) {
+		return fmt.Errorf("asset identity is incomplete or exceeds the installation size contract")
 	}
 	return nil
 }

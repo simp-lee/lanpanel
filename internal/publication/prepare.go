@@ -98,7 +98,7 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 		if credentialPath == "" || credentialFingerprint == "" {
 			return Candidate{}, fmt.Errorf("domain Basic authority missing")
 		}
-		authIdentity = digest([]byte(publication.CredentialID + "\x00" + credentialPath))
+		authIdentity = CredentialReferenceIdentity(publication.CredentialID, credentialPath, credentialFingerprint)
 	} else if credentialPath != "" || credentialFingerprint != "" {
 		return Candidate{}, fmt.Errorf("domain non-Basic carried credential authority")
 	}
@@ -136,7 +136,7 @@ func PrepareDomain(resource domain.AppResource, generation uint64, certificate d
 		if goaccessCandidate == nil || goaccessCredentialPath == "" || goaccessCredentialFingerprint == "" {
 			return Candidate{}, fmt.Errorf("GoAccess candidate authority missing")
 		}
-		reference := digest([]byte(publication.GoAccess.CredentialID + "\x00" + goaccessCredentialPath))
+		reference := CredentialReferenceIdentity(publication.GoAccess.CredentialID, goaccessCredentialPath, goaccessCredentialFingerprint)
 		route := digest([]byte(publication.GoAccess.DashboardPath + "\x00" + publication.GoAccess.WebSocketPath + "\x00" + goaccessCandidate.Paths.Endpoint + "\x00" + reference))
 		site.GoAccess = &nginx.GoAccessSite{CanonicalHost: publication.CanonicalDomain, CredentialPath: goaccessCredentialPath, CIDRs: append([]string(nil), publication.GoAccess.CIDRs...), DashboardPath: publication.GoAccess.DashboardPath, WebSocketPath: publication.GoAccess.WebSocketPath, Endpoint: goaccessCandidate.Paths.Endpoint, ReportPath: goaccessCandidate.Paths.Report, AccessLog: goaccessCandidate.Paths.AccessLog, Identity: route}
 		goaccessIdentity = domain.GoAccessBundleIdentity{Enabled: true, Generation: goaccessCandidate.Generation, StateGeneration: goaccessCandidate.StateGeneration, CanonicalHost: publication.CanonicalDomain, RetiredGeneration: retiredGoAccessGeneration, RetiredStateGeneration: retiredGoAccessStateGeneration, RetiredServiceIdentity: retiredGoAccessIdentity, RouteIdentity: route, ServiceIdentity: goaccessCandidate.ServiceIdentity, UnitIdentities: append([]string(nil), goaccessCandidate.UnitIdentities...), RetiredUnitIdentities: retiredGoAccessUnits, CredentialIdentity: publication.GoAccess.CredentialID, ReferenceIdentity: reference, CIDRs: append([]string(nil), publication.GoAccess.CIDRs...), DashboardPath: publication.GoAccess.DashboardPath, WebSocketPath: publication.GoAccess.WebSocketPath, Endpoint: goaccessCandidate.Paths.Endpoint, AccessLog: goaccessCandidate.Paths.AccessLog, DatabasePath: goaccessCandidate.Paths.Database, ReportPath: goaccessCandidate.Paths.Report}
@@ -223,6 +223,11 @@ func priorPublication(resource domain.AppResource) (*domain.PublicationBundle, s
 		return nil, "", err
 	}
 	return &bundle, value, nil
+}
+
+// CredentialReferenceIdentity binds a credential reference to the exact content used to prepare it.
+func CredentialReferenceIdentity(credentialID, path, fingerprint string) string {
+	return digest([]byte(credentialID + "\x00" + path + "\x00" + fingerprint))
 }
 
 func BundleDigest(bundle domain.PublicationBundle) (string, error) {

@@ -5,12 +5,15 @@ package packages
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestCompletedPackageTransactionFilesAreRemoved(t *testing.T) {
@@ -41,6 +44,102 @@ func TestCompletedPackageTransactionFilesAreRemoved(t *testing.T) {
 	}
 }
 
+func TestUnitMaskCreationFailsClosedWhenCrashLosesCreatedInodeIdentity(t *testing.T) {
+	tests := []struct {
+		name        string
+		point       MaskPoint
+		persistFail bool
+	}{
+		{name: "after create", point: MaskPointAfterCreate},
+		{name: "before directory fsync", point: MaskPointBeforeDirectorySync},
+		{name: "after directory fsync", point: MaskPointAfterDirectorySync},
+		{name: "identity persist", persistFail: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const unit = "nginx.service"
+			intent := ""
+			persistFailed := false
+			persistIntent := func(value string) error {
+				if intent != "" {
+					return errors.New("duplicate intent")
+				}
+				if _, err := os.Lstat(filepath.Join(directory, unit)); !errors.Is(err, os.ErrNotExist) {
+					return errors.New("namespace changed before durable intent")
+				}
+				intent = value
+				return nil
+			}
+			var durable MaskIdentity
+			persistIdentity := func(value MaskIdentity) error {
+				if test.persistFail && !persistFailed {
+					persistFailed = true
+					return errors.New("identity journal fault")
+				}
+				durable = value
+				intent = ""
+				return nil
+			}
+			fault := func(point MaskPoint, _ string) error {
+				if point == test.point {
+					return errors.New("simulated crash")
+				}
+				return nil
+			}
+			masks := newTestUnitMasksWithFault(directory, fault)
+			if _, err := masks.Mask(context.Background(), []string{unit}, intent, persistIntent, persistIdentity); err == nil {
+				t.Fatal("mask boundary fault did not interrupt the operation")
+			}
+			if intent != unit || durable.Unit != "" {
+				t.Fatalf("fault lost durable intent or prematurely recorded identity: intent=%q identity=%#v", intent, durable)
+			}
+			path := filepath.Join(directory, unit)
+			var before unix.Stat_t
+			if err := unix.Lstat(path, &before); err != nil {
+				t.Fatalf("intended mask is unavailable for recovery: %v", err)
+			}
+
+			recovered, err := newTestUnitMasks(directory).Mask(context.Background(), []string{unit}, intent, func(string) error {
+				return errors.New("recovery tried to replace durable intent")
+			}, persistIdentity)
+			if err == nil || intent != unit || len(recovered.Masks) != 0 || durable.Unit != "" {
+				t.Fatalf("ambiguous created mask was adopted: intent=%q result=%#v durable=%#v err=%v", intent, recovered, durable, err)
+			}
+			var after unix.Stat_t
+			if err := unix.Lstat(path, &after); err != nil || after.Dev != before.Dev || after.Ino != before.Ino {
+				t.Fatalf("fail-closed recovery changed the mask inode: before=%#v after=%#v err=%v", before, after, err)
+			}
+		})
+	}
+}
+
+func TestUnitMaskCreationRejectsConcurrentExactMask(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const unit = "nginx.service"
+	masks := newTestUnitMasks(directory)
+	var durable MaskIdentity
+	_, err := masks.Mask(context.Background(), []string{unit}, "", func(string) error {
+		return os.Symlink("/dev/null", filepath.Join(directory, unit))
+	}, func(identity MaskIdentity) error {
+		durable = identity
+		return nil
+	})
+	if err == nil || durable.Unit != "" {
+		t.Fatalf("concurrent mask was adopted: identity=%#v err=%v", durable, err)
+	}
+	target, readErr := os.Readlink(filepath.Join(directory, unit))
+	if readErr != nil || target != "/dev/null" {
+		t.Fatalf("concurrent mask was changed: target=%q err=%v", target, readErr)
+	}
+}
+
 func TestUnitMasksPreservePreexistingAndRemoveOnlyCreatedMasks(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.Chmod(directory, 0o700); err != nil {
@@ -50,7 +149,7 @@ func TestUnitMasksPreservePreexistingAndRemoveOnlyCreatedMasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	masks := newTestUnitMasks(directory)
-	result, err := masks.Mask(context.Background(), []string{"created.service", "existing.service"}, func(MaskIdentity) error { return nil })
+	result, err := masks.Mask(context.Background(), []string{"created.service", "existing.service"}, "", func(string) error { return nil }, func(MaskIdentity) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +173,7 @@ func TestUnitMasksRefuseToRemoveReplacedMaskIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	masks := newTestUnitMasks(directory)
-	result, err := masks.Mask(context.Background(), []string{"nginx.service"}, func(MaskIdentity) error { return nil })
+	result, err := masks.Mask(context.Background(), []string{"nginx.service"}, "", func(string) error { return nil }, func(MaskIdentity) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +199,7 @@ func TestUnitMasksCleanupIsIdempotentAfterExactRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	masks := newTestUnitMasks(directory)
-	result, err := masks.Mask(context.Background(), []string{"nginx.service"}, func(MaskIdentity) error { return nil })
+	result, err := masks.Mask(context.Background(), []string{"nginx.service"}, "", func(string) error { return nil }, func(MaskIdentity) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

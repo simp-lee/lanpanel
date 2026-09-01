@@ -59,6 +59,10 @@ func (host *temporaryRecoveryRuntimeProbe) ContractResource(context.Context, str
 	return activation.Result{ModifiedPaths: []string{"/etc/lanpanel/nginx/temporary/recovered.conf"}}, nil
 }
 
+func (host *temporaryRecoveryRuntimeProbe) AcknowledgeContraction(context.Context, string) error {
+	return nil
+}
+
 func (host *temporaryRecoveryRuntimeProbe) ProbeTemporaryClosure(_ context.Context, inventory closure.Inventory) (string, error) {
 	host.probeCalls++
 	host.probeInventory = inventory

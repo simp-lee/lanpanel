@@ -441,6 +441,22 @@ func TestProtectedStagingDirectory(t *testing.T) {
 	})
 }
 
+func TestPutInstallationSizeContractAcceptsLimitAndRejectsNextByte(t *testing.T) {
+	store, request := newTestStore(t, nil)
+	defer func(ignore func() error) { _ = ignore() }(store.Close)
+	request.MaxBytes = MaximumContentBytes
+	if _, err := store.Put(context.Background(), request, []byte("within contract"), CreateOnly); err != nil {
+		t.Fatalf("Put() rejected the exact installation size contract: %v", err)
+	}
+
+	other, over := newTestStore(t, nil)
+	defer func(ignore func() error) { _ = ignore() }(other.Close)
+	over.MaxBytes = MaximumContentBytes + 1
+	if _, err := other.Put(context.Background(), over, []byte("small payload"), CreateOnly); err == nil {
+		t.Fatal("Put() accepted a request one byte over the installation size contract")
+	}
+}
+
 func TestPutEnforcesSizeDispositionAndCancellation(t *testing.T) {
 	t.Run("bounded_input_and_operation", func(t *testing.T) {
 		store, request := newTestStore(t, nil)

@@ -2,6 +2,7 @@ package qualification
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"lanpanel/internal/release"
 	"slices"
@@ -168,4 +169,100 @@ func sequenceAttempts() func() (string, error) {
 
 func priorFor(step string) PriorObservation {
 	return PriorObservation{Scope: []byte("scope/" + step), PriorState: []byte("prior/" + step), PlannedMutation: []byte("mutation/" + step), Selector: []byte("selector/" + step)}
+}
+
+type observeDeadlineSuccessExecutor struct{ fakeExecutor }
+
+func (executor *observeDeadlineSuccessExecutor) Observe(ctx context.Context, step string) (PriorObservation, error) {
+	<-ctx.Done()
+	return priorFor(step), nil
+}
+
+type executeDeadlineSuccessExecutor struct{ fakeExecutor }
+
+func (executor *executeDeadlineSuccessExecutor) Execute(ctx context.Context, step string) (MutationObservation, error) {
+	executor.executed = append(executor.executed, step)
+	<-ctx.Done()
+	return MutationObservation{Identity: "timed-out/" + step, Evidence: []byte("late-success/" + step)}, nil
+}
+
+type recoverDeadlineSuccessExecutor struct{ fakeExecutor }
+
+func (executor *recoverDeadlineSuccessExecutor) Recover(ctx context.Context, step string) (MutationObservation, error) {
+	<-ctx.Done()
+	return MutationObservation{Identity: "late-recovery/" + step, Evidence: []byte("late-recovery-evidence")}, nil
+}
+
+type cleanupDeadlineSuccessExecutor struct{ fakeExecutor }
+
+func (executor *cleanupDeadlineSuccessExecutor) Cleanup(ctx context.Context, _ string, _ MutationObservation, _ string) (release.CleanupResult, error) {
+	<-ctx.Done()
+	return release.CleanupCleaned, nil
+}
+
+func TestRunnerRejectsSuccessfulResultsReturnedAfterDeadlines(t *testing.T) {
+	t.Run("observe", func(t *testing.T) {
+		executor := &observeDeadlineSuccessExecutor{}
+		runner, reports := deadlineTestRunner(t, "run-observe-timeout", executor, nil)
+		report, err := runner.Run(context.Background())
+		if !errors.Is(err, context.DeadlineExceeded) || len(report.Steps) != 0 || len(reports.values) != 0 {
+			t.Fatalf("late observe success was accepted: report=%+v err=%v", report, err)
+		}
+	})
+
+	t.Run("execute preserves cleanup identity", func(t *testing.T) {
+		executor := &executeDeadlineSuccessExecutor{}
+		runner, _ := deadlineTestRunner(t, "run-execute-timeout", executor, nil)
+		report, err := runner.Run(context.Background())
+		if !errors.Is(err, context.DeadlineExceeded) || len(report.Steps) != 1 || report.Steps[0].Outcome == release.StepPassed || !report.ExecutionFailed {
+			t.Fatalf("late execute success was accepted: report=%+v err=%v", report, err)
+		}
+		if len(report.Items) != 1 || report.Items[0].ObservedIdentity != "timed-out/"+orderedJourney[0] || report.Items[0].Result != release.CleanupRetained {
+			t.Fatalf("timed-out mutation cleanup identity was not preserved: %+v", report.Items)
+		}
+	})
+
+	t.Run("recover", func(t *testing.T) {
+		executor := &recoverDeadlineSuccessExecutor{}
+		persisted := submittedTestReport(t, "run-recover-timeout", release.CleanupSubmitted)
+		runner, _ := deadlineTestRunner(t, persisted.RunID, executor, &persisted)
+		report, err := runner.Run(context.Background())
+		if !errors.Is(err, context.DeadlineExceeded) || len(report.Items) != 1 || report.Items[0].Result != release.CleanupSubmitted {
+			t.Fatalf("late recover success was accepted: report=%+v err=%v", report, err)
+		}
+	})
+
+	t.Run("cleanup", func(t *testing.T) {
+		executor := &cleanupDeadlineSuccessExecutor{}
+		persisted := submittedTestReport(t, "run-cleanup-timeout", release.CleanupExecuted)
+		runner, _ := deadlineTestRunner(t, persisted.RunID, executor, &persisted)
+		report, err := runner.Run(context.Background())
+		if !errors.Is(err, context.DeadlineExceeded) || len(report.Items) != 1 || report.Items[0].Result != release.CleanupExecuted {
+			t.Fatalf("late cleanup success was accepted: report=%+v err=%v", report, err)
+		}
+	})
+}
+
+func deadlineTestRunner(t *testing.T, runID string, executor Executor, persisted *release.LiveCleanupReport) (Runner, *memoryReports) {
+	t.Helper()
+	plan := testJourneyPlan(t, runID)
+	planBytes, err := release.MarshalCanonical(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest, inputDigest := release.DigestBytes([]byte("manifest")), release.DigestBytes([]byte("input"))
+	now := plan.CreatedAt.Add(time.Minute)
+	reports := &memoryReports{}
+	if persisted != nil {
+		persisted.SideEffectPlanDigest = release.DigestBytes(planBytes)
+		persisted.QualificationInstallManifestDigest = manifestDigest
+		persisted.ProtectedInputDigest = inputDigest
+		reports.values = append(reports.values, *persisted)
+	}
+	return Runner{RunID: runID, Plan: plan, PlanDigest: release.DigestBytes(planBytes), InstallManifestDigest: manifestDigest, ProtectedInputDigest: inputDigest, Executor: executor, Reports: reports, Attestor: fakeAttestor{release.DigestBytes(planBytes), manifestDigest, inputDigest, now}, Attestations: &memoryAttestations{}, Now: func() time.Time { return now }, NewAttemptID: sequenceAttempts(), ExecutionTimeout: 20 * time.Millisecond, CleanupTimeout: 20 * time.Millisecond}, reports
+}
+
+func submittedTestReport(t *testing.T, runID string, result release.CleanupResult) release.LiveCleanupReport {
+	t.Helper()
+	return release.LiveCleanupReport{SchemaVersion: release.LiveCleanupReportSchemaVersion, RunID: runID, Steps: []release.JourneyStepResult{{MutationID: orderedJourney[0], AttemptID: "attempt-1", Outcome: release.StepSubmitted}}, Items: []release.CleanupItem{{MutationID: orderedJourney[0], ObservedIdentity: "pending/attempt-1", Result: result}}}
 }

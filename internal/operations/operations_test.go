@@ -19,6 +19,7 @@ import (
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
+	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/sources"
 	"os"
@@ -318,6 +319,197 @@ func TestManagedBasicRotateCommitRejectsCredentialChangedBeforeTargetLock(t *tes
 	if err != nil || len(persisted.Credentials) != 1 || persisted.Credentials[0] != rotated {
 		t.Fatalf("credential=%#v err=%v", persisted.Credentials, err)
 	}
+}
+
+func TestCredentialAndStaticRootTransitionsRequireExactTypedRunningIntent(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	ownerID := operationStateInstallation().Resources[0].ID
+	managed := domain.Credential{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: ownerID, Username: "admin", ManagedPath: "/etc/lanpanel-public/basic/cred_00000000000000000000000000000001.htpasswd", Fingerprint: testDigest("managed-prior")}
+	external := domain.Credential{ID: "cred_00000000000000000000000000000002", Kind: "external_htpasswd", OwnerResourceID: ownerID, ExternalPath: "/srv/auth/users.htpasswd", Fingerprint: testDigest("external")}
+	root := domain.StaticContentRoot{ID: "static_00000000000000000000000000000001", OwnerResourceID: ownerID, Path: "/srv/example-static", Fingerprint: testDigest("static"), Device: 1}
+	externalBinding, err := canonicalValueDigest(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootBinding, err := canonicalValueDigest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		operation Type
+		target    string
+		binding   SafetyBinding
+		before    func(domain.Installation) domain.Installation
+		after     func(domain.Installation) domain.Installation
+	}{
+		{
+			name: "managed_basic_create", operation: ManagedBasicCreate, target: "resource/" + ownerID,
+			binding: SafetyBinding{ResourceID: ownerID},
+			before:  func(value domain.Installation) domain.Installation { return value },
+			after: func(value domain.Installation) domain.Installation {
+				value.Credentials = []domain.Credential{managed}
+				return value
+			},
+		},
+		{
+			name: "managed_basic_rotate", operation: ManagedBasicRotate, target: "credential/" + managed.ID,
+			binding: SafetyBinding{ResourceID: ownerID, PriorFingerprint: managed.Fingerprint},
+			before: func(value domain.Installation) domain.Installation {
+				value.Credentials = []domain.Credential{managed}
+				return value
+			},
+			after: func(value domain.Installation) domain.Installation {
+				rotated := managed
+				rotated.Fingerprint = testDigest("managed-candidate")
+				value.Credentials = []domain.Credential{rotated}
+				return value
+			},
+		},
+		{
+			name: "managed_basic_delete", operation: ManagedBasicDelete, target: "credential/" + managed.ID,
+			binding: SafetyBinding{ResourceID: ownerID, PriorFingerprint: managed.Fingerprint},
+			before: func(value domain.Installation) domain.Installation {
+				value.Credentials = []domain.Credential{managed}
+				return value
+			},
+			after: func(value domain.Installation) domain.Installation { return value },
+		},
+		{
+			name: "external_htpasswd", operation: ExternalHTPasswdRegister, target: "resource/" + ownerID,
+			binding: SafetyBinding{ResourceID: ownerID, CandidateDigest: external.Fingerprint, CandidateBundle: externalBinding},
+			before:  func(value domain.Installation) domain.Installation { return value },
+			after: func(value domain.Installation) domain.Installation {
+				value.Credentials = []domain.Credential{external}
+				return value
+			},
+		},
+		{
+			name: "static_root", operation: StaticRootRegister, target: "resource/" + ownerID,
+			binding: SafetyBinding{ResourceID: ownerID, CandidateDigest: root.Fingerprint, CandidateBundle: rootBinding},
+			before:  func(value domain.Installation) domain.Installation { return value },
+			after: func(value domain.Installation) domain.Installation {
+				value.StaticRoots = []domain.StaticContentRoot{root}
+				return value
+			},
+		},
+	}
+	encode := func(t *testing.T, value any) json.RawMessage {
+		t.Helper()
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			beforeInstallation := test.before(operationStateInstallation())
+			afterInstallation := test.after(operationStateInstallation())
+			record, err := jobs.NewReserved(jobs.Spec{Operation: string(test.operation), Target: test.target, ActorIdentity: "ui/session/generation/1"}, now, bytes.NewReader(bytes.Repeat([]byte{byte(len(test.name) + 1)}, 32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			running, err := jobs.Start(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := AdmissionUI
+			planID := ""
+			if test.operation == ManagedBasicDelete {
+				source = AdmissionPlan
+				planID = "plan_managed_basic_delete"
+			}
+			intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: planID, AdmissionSource: source, Operation: test.operation, Target: test.target, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: test.binding, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: source, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+			beforeEntries := map[string]json.RawMessage{"installations/current": encode(t, beforeInstallation), reservationKey(record.ID): encode(t, intent), "jobs/" + record.ID: encode(t, running)}
+			afterEntries := map[string]json.RawMessage{"installations/current": encode(t, afterInstallation), reservationKey(record.ID): encode(t, intent), "jobs/" + record.ID: encode(t, running)}
+			if test.operation == ManagedBasicCreate || test.operation == ManagedBasicRotate {
+				candidate := afterInstallation.Credentials[0]
+				intent.OperationBinding, err = canonicalValueDigest(candidate)
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeEntries[reservationKey(record.ID)] = encode(t, intent)
+				afterEntries[reservationKey(record.ID)] = encode(t, intent)
+				terminal := now.Add(time.Second)
+				child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "htpasswd-" + record.ID, JobID: record.ID, InstallationID: beforeInstallation.InstallationID, Operation: test.operation, Target: test.target, IntentGeneration: 2, Profile: "htpasswd", InputDigest: testDigest("input"), ArtifactDigest: testDigest("artifact"), Deadline: now.Add(time.Minute), State: ChildTerminal, Outcome: ChildSucceeded, ResultDigest: candidate.Fingerprint, SubmittedAt: now, TerminalAt: &terminal}
+				beforeEntries["children/"+child.ID] = encode(t, child)
+				afterEntries["children/"+child.ID] = encode(t, child)
+			}
+			before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: beforeEntries}
+			after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: afterEntries}
+			if err := validateOperationStateTransitions(before, after); err != nil {
+				t.Fatalf("exact typed transition rejected: %v", err)
+			}
+			terminalRecord, err := jobs.NewReserved(jobs.Spec{Operation: string(test.operation), Target: test.target, ActorIdentity: "ui/session/generation/old"}, now.Add(-time.Minute), bytes.NewReader(bytes.Repeat([]byte{byte(len(test.name) + 33)}, 32)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminalRecord, err = jobs.Start(terminalRecord)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminalRecord, err = jobs.Finish(terminalRecord, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "prior_complete", Status: jobs.PostconditionVerified, Identity: testDigest("prior")}}}, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			terminalIntent := intent
+			terminalIntent.JobID = terminalRecord.ID
+			terminalIntent.Phase = PhaseTerminal
+			terminalIntent.CreatedAt = now.Add(-time.Minute)
+			before.Entries[reservationKey(terminalRecord.ID)] = encode(t, terminalIntent)
+			before.Entries["jobs/"+terminalRecord.ID] = encode(t, terminalRecord)
+			after.Entries[reservationKey(terminalRecord.ID)] = encode(t, terminalIntent)
+			after.Entries["jobs/"+terminalRecord.ID] = encode(t, terminalRecord)
+			if err := validateOperationStateTransitions(before, after); err != nil {
+				t.Fatalf("retained terminal intent blocked exact current transition: %v", err)
+			}
+			if test.operation == ManagedBasicCreate || test.operation == ManagedBasicRotate {
+				wrongBinding := intent
+				wrongBinding.OperationBinding = testDigest("wrong-managed-basic-candidate")
+				after.Entries[reservationKey(record.ID)] = encode(t, wrongBinding)
+				if err := validateOperationStateTransitions(before, after); err == nil {
+					t.Fatal("managed Basic transition accepted a different candidate binding")
+				}
+				after.Entries[reservationKey(record.ID)] = encode(t, intent)
+			}
+			wrongIntent := intent
+			wrongIntent.Operation = ProcessStop
+			after.Entries[reservationKey(record.ID)] = encode(t, wrongIntent)
+			if err := validateOperationStateTransitions(before, after); err == nil {
+				t.Fatal("collection transition accepted authority from the wrong operation type")
+			}
+		})
+	}
+
+	t.Run("rotation_cannot_change_username", func(t *testing.T) {
+		beforeInstallation := operationStateInstallation()
+		beforeInstallation.Credentials = []domain.Credential{managed}
+		afterInstallation := beforeInstallation
+		afterInstallation.Credentials = append([]domain.Credential(nil), beforeInstallation.Credentials...)
+		afterInstallation.Credentials[0].Username = "operator"
+		afterInstallation.Credentials[0].Fingerprint = testDigest("managed-candidate")
+		record, err := jobs.NewReserved(jobs.Spec{Operation: string(ManagedBasicRotate), Target: "credential/" + managed.ID, ActorIdentity: "ui/session/generation/1"}, now, bytes.NewReader(bytes.Repeat([]byte{31}, 32)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		running, err := jobs.Start(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, AdmissionSource: AdmissionUI, Operation: ManagedBasicRotate, Target: "credential/" + managed.ID, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: ownerID, PriorFingerprint: managed.Fingerprint}, CreatedAt: now, IntentGeneration: 2}
+		intent.OperationBinding, err = canonicalValueDigest(afterInstallation.Credentials[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		terminal := now.Add(time.Second)
+		child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "htpasswd-" + record.ID, JobID: record.ID, InstallationID: beforeInstallation.InstallationID, Operation: ManagedBasicRotate, Target: intent.Target, IntentGeneration: 2, Profile: "htpasswd", InputDigest: testDigest("input"), ArtifactDigest: testDigest("artifact"), Deadline: now.Add(time.Minute), State: ChildTerminal, Outcome: ChildSucceeded, ResultDigest: afterInstallation.Credentials[0].Fingerprint, SubmittedAt: now, TerminalAt: &terminal}
+		before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(t, beforeInstallation), reservationKey(record.ID): encode(t, intent), "jobs/" + record.ID: encode(t, running), "children/" + child.ID: encode(t, child)}}
+		after := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(t, afterInstallation), reservationKey(record.ID): encode(t, intent), "jobs/" + record.ID: encode(t, running), "children/" + child.ID: encode(t, child)}}
+		if err := validateOperationStateTransitions(before, after); err == nil {
+			t.Fatal("managed Basic rotation changed username")
+		}
+	})
 }
 
 func TestPreparedHeadscaleDeployFailureClearsIntentAndTerminalizesOperation(t *testing.T) {
@@ -1868,7 +2060,11 @@ func TestLocalResourceUpdatePreservesManagedRuntimeState(t *testing.T) {
 	process.Service.Arguments = []string{"--updated"}
 	candidate.ManagedProcess = &process
 	candidate.Name = "Local Updated"
-	candidate.CurrentConfigDigest = testDigest("local-update-candidate")
+	candidateDigest, err := appresource.ConfigDigest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.CurrentConfigDigest = candidateDigest
 	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
 	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err != nil {
 		t.Fatal(err)
@@ -1880,6 +2076,76 @@ func TestLocalResourceUpdatePreservesManagedRuntimeState(t *testing.T) {
 	updated := readOperationResource(t, harness.normal, prior.ID)
 	if updated.ManagedProcess == nil || !reflect.DeepEqual(updated.ManagedProcess.Service.Arguments, []string{"--updated"}) || updated.ManagedProcess.Requested != prior.ManagedProcess.Requested || !reflect.DeepEqual(updated.ManagedProcess.Applied, prior.ManagedProcess.Applied) || !reflect.DeepEqual(updated.ManagedProcess.RuntimeObservation, prior.ManagedProcess.RuntimeObservation) || updated.ManagedProcess.LastOperation != prior.ManagedProcess.LastOperation || updated.ManagedProcess.LastOperationResult != prior.ManagedProcess.LastOperationResult || updated.ManagedProcess.LastJobID != prior.ManagedProcess.LastJobID {
 		t.Fatalf("prior process=%#v updated process=%#v", prior.ManagedProcess, updated.ManagedProcess)
+	}
+}
+
+func TestResourceUpdateRejectsReplacedCandidateAndDirectNormalMutation(t *testing.T) {
+	prior := tailnetOperationResource()
+	installation := tailnetOperationInstallation(&prior)
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("tailnet-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+	candidate := prior
+	candidate.Name = "Admitted Candidate"
+	candidateDigest, err := appresource.ConfigDigest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.CurrentConfigDigest = candidateDigest
+	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
+	replaced := candidate
+	replaced.Name = "Replacement Candidate"
+	replacementDigest, err := appresource.ConfigDigest(replaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced.CurrentConfigDigest = replacementDigest
+	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, replaced); err == nil {
+		t.Fatal("resource update accepted a replacement for the admitted candidate")
+	}
+	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err != nil {
+		t.Fatalf("admitted candidate rejected after replacement attempt: %v", err)
+	}
+	if err := ReleaseExposure(harness.mutation, harness.exposure); err != nil {
+		t.Fatal(err)
+	}
+	harness.mutation, harness.exposure = nil, nil
+
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func() { _ = normal.Close(); _ = mutationSet.Close(); _ = manager.Close() }()
+	if err := Register(normal); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := persist.EncodeEntry(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 1, func(transaction *persist.Transaction) error {
+		return transaction.Create("installations/current", raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	exposure, err := manager.Acquire(context.Background(), locks.Exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = exposure.Release() }()
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), exposure, document.Revision, func(transaction *persist.Transaction) error {
+		changed := installation
+		changed.Resources = []domain.AppResource{candidate}
+		encoded, encodeErr := persist.EncodeEntry(changed)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		return transaction.Replace("installations/current", encoded)
+	}); err == nil {
+		t.Fatal("direct normal-state resource configuration mutation was accepted without a running ResourceUpdate intent")
 	}
 }
 
@@ -1922,7 +2188,11 @@ func runTailnetResourceUpdate(t *testing.T) {
 	candidate := prior
 	candidate.Name = "Peer Updated"
 	candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
-	candidate.CurrentConfigDigest = testDigest("tailnet-update-candidate")
+	candidateDigest, err := appresource.ConfigDigest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.CurrentConfigDigest = candidateDigest
 	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
 
 	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err != nil {

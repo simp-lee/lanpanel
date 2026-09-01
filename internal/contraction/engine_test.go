@@ -31,7 +31,7 @@ func (value *traceAuthority) UpdateStopObservation(context.Context, closure.Runt
 	return value.step("stop_observation")
 }
 
-func (value *traceAuthority) FinalizeClosure(context.Context, closure.Inventory, string) error {
+func (value *traceAuthority) FinalizeClosure(context.Context, closure.Inventory, string, []string) error {
 	return value.step("finalize")
 }
 

@@ -4,7 +4,11 @@ package acme
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"lanpanel/internal/acmeaccount"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +27,76 @@ func TestLegoAccountKeyPathUsesPinnedServerAndEmail(t *testing.T) {
 	binding.TermsAccepted = false
 	if _, err := LegoAccountKeyPath(binding); err == nil {
 		t.Fatal("unapproved Terms binding accepted")
+	}
+}
+
+func TestPrepareStageRejectsCredentialChangedAfterBindingAndCleansResidue(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("protected source identity requires root test")
+	}
+	base := t.TempDir()
+	chrootBase := filepath.Join(base, "chroot")
+	webrootBase := filepath.Join(base, "webroot")
+	for _, directory := range []string{chrootBase, webrootBase} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accountKey, err := acmeaccount.Generate(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountPath := filepath.Join(base, "account.key")
+	if err := os.WriteFile(accountPath, accountKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	accountFingerprint, err := acmeaccount.Fingerprint(accountKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := make([]byte, 32)
+	if _, err := rand.Read(credential); err != nil {
+		t.Fatal(err)
+	}
+	credentialPath := filepath.Join(base, "dns-credential")
+	if err := os.WriteFile(credentialPath, credential, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentialSum := sha256.Sum256(credential)
+	credentialFingerprint := "sha256:" + hex.EncodeToString(credentialSum[:])
+	credential[0] ^= 0xff
+	if err := os.WriteFile(credentialPath, credential, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	certificateID := "cert_00000000000000000000000000000000"
+	root := filepath.Join(chrootBase, certificateID)
+	webroot := filepath.Join(webrootBase, certificateID)
+	uid, gid := uint32(2200000), uint32(2200000)
+	binding := Binding{
+		DirectoryURL:          "https://acme.example.test/directory",
+		AccountKeyPath:        accountPath,
+		AccountKeyFingerprint: accountFingerprint,
+		AccountEmail:          "admin@example.test",
+		TermsAccepted:         true,
+		Method:                ChallengeDNS01,
+		Provider:              DNSProviderCloudflare,
+		ProfilePath:           filepath.Join(base, "dns.env"),
+		ProfileFingerprint:    "sha256:" + strings.Repeat("a", 64),
+		CredentialFiles:       []CredentialFile{{Key: "CF_DNS_API_TOKEN_FILE", Path: credentialPath, Fingerprint: credentialFingerprint}},
+		Zone:                  "example.test",
+	}
+	cleanup := func() error {
+		return errors.Join(removeOwnedTree(root, uid, gid, 4096), removeOwnedTree(webroot, uid, gid, 1024))
+	}
+	stage, err := prepareStage(context.Background(), certificateID, binding, uid, gid, root, webroot, nil, cleanup)
+	if err == nil || stage != (Stage{}) || !strings.Contains(err.Error(), "credential changed before staging") {
+		t.Fatalf("changed credential stage=%#v err=%v", stage, err)
+	}
+	for _, path := range []string{root, webroot} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("changed credential left stage residue %q: %v", path, statErr)
+		}
 	}
 }
 

@@ -94,6 +94,16 @@ func guardAuditedReload(paths nginx.Paths, owner filetxn.Owner, expected nginx.M
 	return authority.Guard(current)
 }
 
+func signalAuthorizedReload(paths nginx.Paths, owner filetxn.Owner, expected nginx.Manifest, authority ReloadAuthority, signal func() error) error {
+	if signal == nil {
+		return fmt.Errorf("nginx reload signal authority is unavailable")
+	}
+	if err := guardAuditedReload(paths, owner, expected, authority); err != nil {
+		return err
+	}
+	return signal()
+}
+
 type ChallengeGraphRuntime struct {
 	Activate func(context.Context, nginx.Manifest, func() error) error
 	Observe  func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error)

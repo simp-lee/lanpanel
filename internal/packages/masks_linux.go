@@ -14,9 +14,20 @@ import (
 
 const FixedSystemdMaskDirectory = "/etc/systemd/system"
 
+type MaskPoint string
+
+const (
+	MaskPointAfterCreate         MaskPoint = "after_create"
+	MaskPointBeforeDirectorySync MaskPoint = "before_directory_sync"
+	MaskPointAfterDirectorySync  MaskPoint = "after_directory_sync"
+)
+
+type maskFaultFunc func(MaskPoint, string) error
+
 type UnitMasks struct {
 	directory string
 	strict    bool
+	fault     maskFaultFunc
 }
 
 func NewUnitMasks(directory string) (*UnitMasks, error) {
@@ -31,8 +42,12 @@ func NewUnitMasks(directory string) (*UnitMasks, error) {
 
 func newTestUnitMasks(directory string) *UnitMasks { return &UnitMasks{directory: directory} }
 
-func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(MaskIdentity) error) (MaskResult, error) {
-	if masks == nil || !sortedUniqueUnits(units) || persist == nil {
+func newTestUnitMasksWithFault(directory string, fault maskFaultFunc) *UnitMasks {
+	return &UnitMasks{directory: directory, fault: fault}
+}
+
+func (masks *UnitMasks) Mask(ctx context.Context, units []string, pendingIntent string, persistIntent func(string) error, persistIdentity func(MaskIdentity) error) (MaskResult, error) {
+	if masks == nil || !sortedUniqueUnits(units) || persistIntent == nil || persistIdentity == nil || pendingIntent != "" && (len(units) == 0 || pendingIntent != units[0]) {
 		return MaskResult{}, fmt.Errorf("package unit mask request is invalid")
 	}
 	directory, err := openMaskDirectory(masks.directory, masks.strict)
@@ -46,38 +61,87 @@ func (masks *UnitMasks) Mask(ctx context.Context, units []string, persist func(M
 			return result, err
 		}
 		var stat unix.Stat_t
-		err := unix.Fstatat(directory, unit, &stat, unix.AT_SYMLINK_NOFOLLOW)
-		switch {
-		case err == nil:
-			target, readErr := readlinkAt(directory, unit)
-			if stat.Mode&unix.S_IFMT != unix.S_IFLNK || readErr != nil || target != "/dev/null" {
-				return result, fmt.Errorf("package unit mask collides with a non-mask systemd override")
+		statErr := unix.Fstatat(directory, unit, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if pendingIntent != "" && statErr == nil {
+			return result, fmt.Errorf("package mask intent lacks an exact created-inode identity")
+		}
+		if pendingIntent == "" && statErr == nil {
+			if err := verifyMaskStat(directory, unit, stat); err != nil {
+				return result, err
 			}
-			identity := MaskIdentity{Unit: unit, Preexisting: true, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
-			if err := persist(identity); err != nil {
+			identity := maskIdentity(unit, true, stat)
+			if err := persistIdentity(identity); err != nil {
 				return result, fmt.Errorf("persist preexisting package mask identity: %w", err)
 			}
 			result.Masks = append(result.Masks, identity)
-		case errors.Is(err, unix.ENOENT):
+			continue
+		}
+		if pendingIntent == "" {
+			if !errors.Is(statErr, unix.ENOENT) {
+				return result, fmt.Errorf("inspect package no-autostart mask: %w", statErr)
+			}
+			if err := persistIntent(unit); err != nil {
+				return result, fmt.Errorf("persist package mask intent: %w", err)
+			}
+		} else if pendingIntent != unit {
+			return result, fmt.Errorf("package mask intent does not name the exact next unit")
+		}
+
+		if errors.Is(statErr, unix.ENOENT) {
 			if err := unix.Symlinkat("/dev/null", directory, unit); err != nil {
 				return result, fmt.Errorf("create package no-autostart mask: %w", err)
 			}
-			if err := unix.Fstatat(directory, unit, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFLNK {
-				return result, fmt.Errorf("observe created package no-autostart mask")
+			if err := masks.check(MaskPointAfterCreate, unit); err != nil {
+				return result, err
 			}
-			identity := MaskIdentity{Unit: unit, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
-			if err := persist(identity); err != nil {
-				return result, fmt.Errorf("persist created package mask identity: %w", err)
-			}
-			result.Masks = append(result.Masks, identity)
-		default:
-			return result, fmt.Errorf("inspect package no-autostart mask: %w", err)
+		} else if statErr != nil {
+			return result, fmt.Errorf("inspect intended package no-autostart mask: %w", statErr)
 		}
-	}
-	if err := unix.Fsync(directory); err != nil {
-		return result, fmt.Errorf("sync package no-autostart masks: %w", err)
+		if err := unix.Fstatat(directory, unit, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return result, fmt.Errorf("observe intended package no-autostart mask: %w", err)
+		}
+		if err := verifyMaskStat(directory, unit, stat); err != nil {
+			return result, err
+		}
+		if err := masks.check(MaskPointBeforeDirectorySync, unit); err != nil {
+			return result, err
+		}
+		if err := unix.Fsync(directory); err != nil {
+			return result, fmt.Errorf("sync package no-autostart mask %q: %w", unit, err)
+		}
+		if err := masks.check(MaskPointAfterDirectorySync, unit); err != nil {
+			return result, err
+		}
+		identity := maskIdentity(unit, false, stat)
+		if err := persistIdentity(identity); err != nil {
+			return result, fmt.Errorf("persist durable created package mask identity: %w", err)
+		}
+		result.Masks = append(result.Masks, identity)
+		pendingIntent = ""
 	}
 	return result, nil
+}
+
+func (masks *UnitMasks) check(point MaskPoint, unit string) error {
+	if masks.fault == nil {
+		return nil
+	}
+	if err := masks.fault(point, unit); err != nil {
+		return fmt.Errorf("package mask fault at %s for %q: %w", point, unit, err)
+	}
+	return nil
+}
+
+func verifyMaskStat(directory int, unit string, stat unix.Stat_t) error {
+	target, err := readlinkAt(directory, unit)
+	if stat.Mode&unix.S_IFMT != unix.S_IFLNK || err != nil || target != "/dev/null" {
+		return fmt.Errorf("package unit mask collides with a non-mask systemd override")
+	}
+	return nil
+}
+
+func maskIdentity(unit string, preexisting bool, stat unix.Stat_t) MaskIdentity {
+	return MaskIdentity{Unit: unit, Preexisting: preexisting, Device: uint64(stat.Dev), Inode: stat.Ino, CTimeSec: stat.Ctim.Sec, CTimeNsec: stat.Ctim.Nsec}
 }
 
 func (masks *UnitMasks) Verify(ctx context.Context, identities []MaskIdentity) error {

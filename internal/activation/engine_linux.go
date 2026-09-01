@@ -92,7 +92,7 @@ func NewFixedHost() (Host, error) {
 	return Host{Launcher: launcher, Paths: nginx.FixedPaths(), Owner: filetxn.Owner{UID: 0, GID: 0}}, err
 }
 
-func (host Host) Activate(ctx context.Context, candidate publication.Candidate, target domain.AppTarget) (result Result, resultErr error) {
+func (host Host) Activate(ctx context.Context, candidate publication.Candidate, target domain.AppTarget, reloadAuthority ReloadAuthority) (result Result, resultErr error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	if host.Launcher == nil || (candidate.Entry.Kind != nginx.EntryTemporary && candidate.Entry.Kind != nginx.EntryApp) {
@@ -107,9 +107,12 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	if err != nil || prior.Master == nil {
 		return Result{}, fmt.Errorf("nginx must be running before App activation: %w", err)
 	}
-	priorDisk, err := nginx.SnapshotActivation(host.Paths, host.Owner, candidate.Entry)
+	priorDisk, prospective, err := prepareApplicationExpansion(host.Paths, host.Owner, candidate.Entry, reloadAuthority)
 	if err != nil {
 		return Result{}, err
+	}
+	if !reflect.DeepEqual(priorDisk.Manifest, priorManifest) {
+		return Result{}, fmt.Errorf("nginx graph changed before App activation")
 	}
 	mutated := true
 	var pointerResult certificates.PointerResult
@@ -137,8 +140,17 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 			if routeErr := nginx.VerifyTailnetRoutes(priorDisk.Manifest); routeErr != nil {
 				_, stopErr := host.StopAndVerify(recoveryCtx)
 				restoreErr = errors.Join(routeErr, stopErr)
+			} else if testErr := host.run(recoveryCtx, child.ProfileNginxTest); testErr != nil {
+				restoreErr = testErr
 			} else {
-				restoreErr = host.Reload(recoveryCtx)
+				restoreErr = reloadAuthorizedOrStop(func() error {
+					return guardAuditedReload(host.Paths, host.Owner, priorDisk.Manifest, reloadAuthority)
+				}, func() error {
+					return host.run(recoveryCtx, child.ProfileNginxReloadSignal)
+				}, func() error {
+					_, stopErr := host.StopAndVerify(recoveryCtx)
+					return stopErr
+				})
 			}
 		}
 		if restoreErr == nil {
@@ -165,6 +177,10 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 				}
 			}
 		}
+		if restoreErr != nil {
+			_, stopErr := host.StopAndVerify(recoveryCtx)
+			restoreErr = errors.Join(restoreErr, stopErr)
+		}
 		resultErr = activationRecoveryFailure(resultErr, restoreErr)
 	}()
 	manifest, paths, err := installActivationEntry(&activeManifest, func() (nginx.Manifest, []string, error) {
@@ -172,6 +188,9 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	})
 	if err != nil {
 		return Result{}, err
+	}
+	if !reflect.DeepEqual(manifest, prospective) {
+		return Result{}, fmt.Errorf("installed App graph differs from guarded prospective manifest")
 	}
 	if err := nginx.VerifyTailnetRoutes(manifest); err != nil {
 		return Result{}, err
@@ -182,8 +201,10 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	if err := host.run(ctx, child.ProfileNginxTest); err != nil {
 		return Result{}, err
 	}
-	if err := host.run(ctx, child.ProfileNginxReloadSignal); err != nil {
-		return Result{}, err
+	if err := signalAuthorizedReload(host.Paths, host.Owner, manifest, reloadAuthority, func() error {
+		return host.run(ctx, child.ProfileNginxReloadSignal)
+	}); err != nil {
+		return Result{}, fmt.Errorf("app activation reload rejected at signal: %w", err)
 	}
 	currentObserver := host.observer(manifest)
 	snapshot, err := closure.WaitPriorWorkers(ctx, currentObserver, prior.Workers, nginx.DefaultWorkerTimeout)
@@ -200,6 +221,34 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 		return Result{}, err
 	}
 	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: runtimeDigest}, nil
+}
+
+func prepareApplicationExpansion(paths nginx.Paths, owner filetxn.Owner, entry nginx.Entry, authority ReloadAuthority) (nginx.ActivationSnapshot, nginx.Manifest, error) {
+	snapshot, err := nginx.SnapshotActivation(paths, owner, entry)
+	if err != nil {
+		return nginx.ActivationSnapshot{}, nginx.Manifest{}, err
+	}
+	prospective, err := nginx.ProspectiveManifest(snapshot.Manifest, entry)
+	if err != nil {
+		return nginx.ActivationSnapshot{}, nginx.Manifest{}, err
+	}
+	if err := guardReload(prospective, authority); err != nil {
+		return nginx.ActivationSnapshot{}, nginx.Manifest{}, fmt.Errorf("app activation rejected before disk mutation: %w", err)
+	}
+	return snapshot, prospective, nil
+}
+
+func reloadAuthorizedOrStop(authorize, reload, stop func() error) error {
+	if authorize == nil || reload == nil || stop == nil {
+		return fmt.Errorf("app activation rollback runtime authority is incomplete")
+	}
+	if err := authorize(); err != nil {
+		return errors.Join(fmt.Errorf("app activation rollback reload rejected: %w", err), stop())
+	}
+	if err := reload(); err != nil {
+		return errors.Join(fmt.Errorf("app activation rollback reload failed: %w", err), stop())
+	}
+	return nil
 }
 
 func installActivationEntry(activeManifest *nginx.Manifest, install func() (nginx.Manifest, []string, error)) (nginx.Manifest, []string, error) {
@@ -351,10 +400,19 @@ func (host Host) Reload(ctx context.Context) error {
 	return host.run(ctx, child.ProfileNginxReloadSignal)
 }
 
+func (host Host) AcknowledgeContraction(ctx context.Context, resourceID string) error {
+	return nginx.AcknowledgeContraction(ctx, host.Paths, host.Owner, []string{resourceID})
+}
+
 func (host Host) ContractResource(ctx context.Context, resourceID string) (Result, error) {
 	priorManifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
-		return Result{}, err
+		auditErr := err
+		var pending bool
+		priorManifest, pending, err = nginx.PendingContraction(host.Paths, host.Owner)
+		if err != nil || !pending {
+			return Result{}, errors.Join(auditErr, err)
+		}
 	}
 	prior, err := host.observer(priorManifest).Observe(ctx)
 	if err != nil {

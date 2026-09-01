@@ -50,6 +50,7 @@ type Manager struct {
 	entries     map[string]*entry
 	generation  uint64
 	fingerprint string
+	closed      bool
 	now         func() time.Time
 	random      io.Reader
 	stop        chan struct{}
@@ -84,7 +85,7 @@ func New(fingerprint string, options Options) (*Manager, error) {
 func (m *Manager) Issue(origin, fingerprint string) (Credentials, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if origin == "" || fingerprint != m.fingerprint {
+	if m.closed || origin == "" || fingerprint != m.fingerprint {
 		return Credentials{}, fmt.Errorf("session authority changed")
 	}
 	selector, err := randomHex(m.random)
@@ -109,7 +110,7 @@ func (m *Manager) Authenticate(selector, proof, csrf, origin, fingerprint string
 	defer m.mu.Unlock()
 	value, ok := m.entries[selector]
 	now := m.now().UTC()
-	if !ok || expired(value, now) || value.generation != m.generation || value.fingerprint != m.fingerprint || fingerprint != m.fingerprint || value.origin != origin || !digestEqual(value.proof, proof) || mutation && !digestEqual(value.csrf, csrf) {
+	if m.closed || !ok || expired(value, now) || value.generation != m.generation || value.fingerprint != m.fingerprint || fingerprint != m.fingerprint || value.origin != origin || !digestEqual(value.proof, proof) || mutation && !digestEqual(value.csrf, csrf) {
 		return Principal{}, fmt.Errorf("session authentication failed")
 	}
 	value.last = now
@@ -122,7 +123,7 @@ func (m *Manager) AuthenticateSocket(selector, proof, origin, fingerprint string
 	defer m.mu.Unlock()
 	value, ok := m.entries[selector]
 	now := m.now().UTC()
-	if !ok || expired(value, now) || value.generation != m.generation || value.fingerprint != m.fingerprint || fingerprint != m.fingerprint || value.origin != origin || !digestEqual(value.proof, proof) {
+	if m.closed || !ok || expired(value, now) || value.generation != m.generation || value.fingerprint != m.fingerprint || fingerprint != m.fingerprint || value.origin != origin || !digestEqual(value.proof, proof) {
 		return Principal{}, fmt.Errorf("socket authentication failed")
 	}
 	return Principal{selector, m.generation}, nil
@@ -132,14 +133,14 @@ func (m *Manager) Valid(principal Principal) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	value, ok := m.entries[principal.Selector]
-	return ok && !expired(value, m.now().UTC()) && principal.Generation == m.generation && value.generation == m.generation && value.fingerprint == m.fingerprint
+	return !m.closed && ok && !expired(value, m.now().UTC()) && principal.Generation == m.generation && value.generation == m.generation && value.fingerprint == m.fingerprint
 }
 
 func (m *Manager) Attach(principal Principal, socket Socket) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	value, ok := m.entries[principal.Selector]
-	if !ok || principal.Generation != m.generation || socket == nil {
+	if m.closed || !ok || principal.Generation != m.generation || socket == nil {
 		return fmt.Errorf("socket session is invalid")
 	}
 	value.sockets[socket] = struct{}{}
@@ -158,7 +159,7 @@ func (m *Manager) Send(principal Principal, fingerprint string, send SocketSende
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	value, ok := m.entries[principal.Selector]
-	if !ok || expired(value, m.now().UTC()) || principal.Generation != m.generation || value.generation != m.generation || fingerprint != m.fingerprint || send == nil {
+	if m.closed || !ok || expired(value, m.now().UTC()) || principal.Generation != m.generation || value.generation != m.generation || fingerprint != m.fingerprint || send == nil {
 		return fmt.Errorf("socket session expired")
 	}
 	return send()
@@ -173,6 +174,10 @@ func (m *Manager) Logout(principal Principal) {
 func (m *Manager) CommitTokenRotation(fingerprint string) { m.InvalidateFingerprint(fingerprint) }
 func (m *Manager) InvalidateFingerprint(fingerprint string) {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
 	sockets := m.invalidateLocked(fingerprint)
 	m.mu.Unlock()
 	closeSockets(sockets)
@@ -180,6 +185,10 @@ func (m *Manager) InvalidateFingerprint(fingerprint string) {
 
 func (m *Manager) RequireFingerprint(fingerprint string) bool {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return false
+	}
 	if fingerprint != "" && fingerprint == m.fingerprint {
 		m.mu.Unlock()
 		return true
@@ -201,7 +210,15 @@ func (m *Manager) invalidateLocked(fingerprint string) []Socket {
 }
 
 func (m *Manager) Close() {
-	m.closeOnce.Do(func() { close(m.stop); <-m.done; m.InvalidateFingerprint("closed") })
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		sockets := m.invalidateLocked("closed")
+		m.mu.Unlock()
+		close(m.stop)
+		closeSockets(sockets)
+		<-m.done
+	})
 }
 
 func (m *Manager) sweep(interval time.Duration) {

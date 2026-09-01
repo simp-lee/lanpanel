@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
@@ -135,7 +136,7 @@ func targetStaging(path string) (string, error) {
 	return staging, err
 }
 
-func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32, mode os.FileMode) error {
+func putRootGroupFileWithOptions(ctx context.Context, path string, data []byte, gid uint32, mode os.FileMode, options filetxn.Options) error {
 	parent := filepath.Dir(path)
 	staging := filepath.Join(parent, ".lanpanel-filetxn")
 	if _, err := ensureDirectory(staging, filetxn.Owner{UID: 0, GID: 0}, 0o700); err != nil {
@@ -143,7 +144,7 @@ func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32,
 	}
 	root := filetxn.Owner{UID: 0, GID: 0}
 	parents := filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{root, {UID: 0, GID: gid}}, AllowedMode: 0o755}
-	store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: root, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: root, Mode: 0o700}, StagingParents: parents}, filetxn.Options{})
+	store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: root, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: root, Mode: 0o700}, StagingParents: parents}, options)
 	if err != nil {
 		return err
 	}
@@ -151,6 +152,72 @@ func putRootGroupFile(ctx context.Context, path string, data []byte, gid uint32,
 	metadata := filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: gid}, Mode: mode}
 	_, err = store.Put(ctx, filetxn.Request{Path: path, Parents: parents, Existing: &metadata, New: metadata, MaxBytes: int64(len(data))}, data, filetxn.CreateOnly)
 	return err
+}
+
+func putOrVerifyStartupAuthority(ctx context.Context, path string, expected StartupAuthority, gid uint32) error {
+	return putOrVerifyStartupAuthorityWithOptions(ctx, path, expected, gid, filetxn.Options{})
+}
+
+func putOrVerifyStartupAuthorityWithOptions(ctx context.Context, path string, expected StartupAuthority, gid uint32, options filetxn.Options) error {
+	data, err := encodeCanonical(expected)
+	if err != nil {
+		return err
+	}
+	if err := putRootGroupFileWithOptions(ctx, path, data, gid, 0o640, options); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return finalizeStartupAuthorityFile(path, expected, 0, gid)
+}
+
+func finalizeStartupAuthorityFile(path string, expected StartupAuthority, uid, gid uint32) error {
+	if err := verifyStartupAuthorityFile(path, expected, uid, gid); err != nil {
+		return err
+	}
+	return syncParentDirectory(path)
+}
+
+func verifyStartupAuthorityFile(path string, expected StartupAuthority, uid, gid uint32) error {
+	if expected.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(expected.AttemptID) || !identity.ValidateInstallationID(expected.InstallationID) || !identity.ValidateGenerationID(expected.GenerationID) || identity.ValidateManagementAuthority(expected.Management) != nil || !release.ValidDigest(expected.CommitDigest) {
+		return fmt.Errorf("expected startup authority binding is invalid")
+	}
+	data, err := encodeCanonical(expected)
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("startup authority descriptor is invalid")
+	}
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
+	var before, after unix.Stat_t
+	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != uid || before.Gid != gid || before.Mode&0o777 != 0o640 || before.Size != int64(len(data)) {
+		return fmt.Errorf("existing startup authority metadata is foreign")
+	}
+	actual, readErr := io.ReadAll(io.LimitReader(file, int64(len(data))+1))
+	if readErr != nil || !bytes.Equal(actual, data) || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Mode != after.Mode || before.Nlink != after.Nlink || before.Uid != after.Uid || before.Gid != after.Gid {
+		return fmt.Errorf("existing startup authority bytes or metadata are foreign or changed")
+	}
+	var decoded StartupAuthority
+	if decodeCanonical(actual, &decoded) != nil || !reflect.DeepEqual(decoded, expected) {
+		return fmt.Errorf("existing startup authority binding is foreign")
+	}
+	return nil
+}
+
+func syncParentDirectory(path string) error {
+	parent := filepath.Dir(path)
+	fd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	syncErr := unix.Fsync(fd)
+	closeErr := unix.Close(fd)
+	return errors.Join(syncErr, closeErr)
 }
 
 func putOrVerifyTargetFile(ctx context.Context, path string, data []byte, mode os.FileMode) error {
@@ -211,11 +278,23 @@ func copyOrVerifyBinaryBytes(data []byte, paths Paths, expected releaseBinary) e
 }
 
 func removeBootstrapPolicy(expected release.AssetIdentity, paths Paths) error {
+	return removeBootstrapPolicyWithSync(expected, paths, unix.Fsync, syncParentDirectory)
+}
+
+func removeBootstrapPolicyWithSync(expected release.AssetIdentity, paths Paths, syncOpen func(int) error, syncAbsent func(string) error) error {
+	if syncOpen == nil || syncAbsent == nil {
+		return fmt.Errorf("package no-autostart policy sync authority is unavailable")
+	}
 	path := "/usr/sbin/policy-rc.d"
+	uid, gid := uint32(0), uint32(0)
 	if paths != FixedPaths() {
 		path = filepath.Join(paths.PersistentRoot, "sbin", "policy-rc.d")
+		uid, gid = uint32(os.Geteuid()), uint32(os.Getegid())
 	}
-	data, err := readCommittedArtifact(path, int64(expected.Bytes), 0o755)
+	data, identity, err := readExactRegularFile(path, int64(expected.Bytes), uid, gid, 0o755)
+	if errors.Is(err, os.ErrNotExist) {
+		return syncAbsent(path)
+	}
 	if err != nil || uint64(len(data)) != expected.Bytes || digestBytes(data) != expected.Digest {
 		return fmt.Errorf("package no-autostart policy changed before cleanup")
 	}
@@ -225,10 +304,36 @@ func removeBootstrapPolicy(expected release.AssetIdentity, paths Paths) error {
 		return err
 	}
 	defer func() { _ = unix.Close(fd) }()
+	var current unix.Stat_t
+	if err := unix.Fstatat(fd, filepath.Base(path), &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || current.Dev != identity.Dev || current.Ino != identity.Ino || current.Ctim != identity.Ctim || current.Mode != identity.Mode || current.Nlink != identity.Nlink || current.Uid != identity.Uid || current.Gid != identity.Gid || current.Size != identity.Size {
+		return fmt.Errorf("package no-autostart policy identity changed before cleanup")
+	}
 	if err := unix.Unlinkat(fd, filepath.Base(path), 0); err != nil {
 		return err
 	}
-	return unix.Fsync(fd)
+	return syncOpen(fd)
+}
+
+func readExactRegularFile(path string, maximum int64, uid, gid uint32, mode uint32) ([]byte, unix.Stat_t, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, unix.Stat_t{}, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, unix.Stat_t{}, fmt.Errorf("exact regular file descriptor is invalid")
+	}
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
+	var before, after unix.Stat_t
+	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != uid || before.Gid != gid || before.Mode&0o777 != mode || before.Size <= 0 || before.Size > maximum {
+		return nil, unix.Stat_t{}, fmt.Errorf("exact regular file metadata is foreign")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maximum+1))
+	if readErr != nil || int64(len(data)) != before.Size || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Mode != after.Mode || before.Nlink != after.Nlink || before.Uid != after.Uid || before.Gid != after.Gid {
+		return nil, unix.Stat_t{}, fmt.Errorf("exact regular file changed while reading")
+	}
+	return data, after, nil
 }
 
 type releaseBinary struct {

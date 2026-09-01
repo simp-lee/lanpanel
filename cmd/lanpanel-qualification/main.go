@@ -6,6 +6,8 @@ import (
 	"lanpanel/internal/qualification"
 	"lanpanel/internal/release"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -61,7 +63,7 @@ func main() {
 		return
 	}
 	if os.Args[1] == "run" {
-		prepared, report, err := qualification.RunLive(context.Background(), os.Args[2])
+		prepared, report, err := runLiveWithSignals(os.Args[2], qualification.RunLive)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -91,6 +93,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+type liveRun func(context.Context, string) (qualification.Prepared, release.LiveCleanupReport, error)
+
+func runLiveWithSignals(inputPath string, execute liveRun) (qualification.Prepared, release.LiveCleanupReport, error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return execute(ctx, inputPath)
 }
 
 func run(mode, inputPath string) (qualification.Prepared, bool, string, error) {

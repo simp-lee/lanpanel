@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"lanpanel/internal/application"
 	"lanpanel/internal/domain"
+	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/release"
 	"lanpanel/internal/resource"
 	"net"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -36,12 +38,37 @@ type TailnetPeerAuthority struct {
 	Port          uint16 `json:"port"`
 }
 
-func (executor *LiveExecutor) ensureManagement(ctx context.Context) error {
-	if executor.management != nil {
+func (executor *LiveExecutor) ensureTarget(ctx context.Context) error {
+	if executor.target.usable() {
 		return nil
 	}
-	if executor.target == nil {
-		return fmt.Errorf("management target is unavailable")
+	if executor.management != nil {
+		executor.management.Close()
+		executor.management = nil
+	}
+	if executor.target != nil {
+		_ = executor.target.Close()
+		executor.target = nil
+	}
+	target, err := OpenSSH(ctx, executor.prepared.Input.SSH)
+	if err != nil {
+		return err
+	}
+	fingerprint, _, observeErr := target.ObserveQualificationHost(ctx, executor.prepared.Install.Identity().Profile)
+	if observeErr != nil || fingerprint != executor.prepared.Input.SSH.MachineFingerprint {
+		_ = target.Close()
+		return errors.Join(observeErr, fmt.Errorf("replacement cleanup target identity differs"))
+	}
+	executor.target = target
+	return nil
+}
+
+func (executor *LiveExecutor) ensureManagement(ctx context.Context) error {
+	if executor.management != nil && executor.target.usable() {
+		return nil
+	}
+	if err := executor.ensureTarget(ctx); err != nil {
+		return err
 	}
 	client, err := OpenManagementClient(ctx, executor.target)
 	if err != nil {
@@ -101,7 +128,7 @@ func (executor *LiveExecutor) stepUISession(ctx context.Context) ([]byte, error)
 	if err := executor.ensureManagement(ctx); err != nil {
 		return nil, err
 	}
-	before, err := executor.target.readRemoteRegular("/var/lib/lanpanel/installation/admin-token", 4096)
+	before, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/installation/admin-token", 4096)
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +152,11 @@ func (executor *LiveExecutor) stepUISession(ctx context.Context) ([]byte, error)
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("management UI did not return after restart")
 		}
-		time.Sleep(2 * time.Second)
+		if err := sleepContext(ctx, 2*time.Second); err != nil {
+			return nil, err
+		}
 	}
-	after, err := executor.target.readRemoteRegular("/var/lib/lanpanel/installation/admin-token", 4096)
+	after, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/installation/admin-token", 4096)
 	if err != nil || release.DigestBytes(after) != beforeDigest {
 		clearBytes(after)
 		return nil, fmt.Errorf("admin token changed across UI restart: %w", err)
@@ -367,7 +396,7 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 
 func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte, error) {
 	var created application.HeadscaleUserResult
-	if _, err := executor.management.Post(ctx, "/api/actions/headscale_user_create", application.HeadscaleUserPayload{Name: "qualification"}, &created); err != nil || created.User.ID == 0 {
+	if _, err := executor.management.Post(ctx, "/api/actions/headscale_user_create", application.HeadscaleUserPayload{Name: "qualification"}, &created); err != nil || created.User.ID == 0 || created.User.Name != "qualification" {
 		return nil, fmt.Errorf("create qualification Headscale user: %w", err)
 	}
 	executor.state.HeadscaleUserID = strconv.FormatUint(created.User.ID, 10)
@@ -381,7 +410,7 @@ func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte
 		return nil, err
 	}
 	var key application.HeadscaleKeyResult
-	if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_create"+query, application.HeadscaleLifecyclePayload{PlanID: planID, Confirmation: "create", ExpirationSeconds: 3600}, &key); err != nil || key.Key.ID == 0 || len(key.Secret) == 0 {
+	if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_create"+query, application.HeadscaleLifecyclePayload{PlanID: planID, Confirmation: "create", ExpirationSeconds: 3600}, &key); err != nil || key.Key.ID == 0 || key.Key.UserID != created.User.ID || len(key.Secret) == 0 {
 		return nil, fmt.Errorf("create qualification Headscale preauth key: %w", err)
 	}
 	executor.preauthKey = append([]byte(nil), key.Secret...)
@@ -401,12 +430,141 @@ func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte
 	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices); err != nil {
 		return nil, err
 	}
+	if err := confirmCreatedHeadscaleEntities(users.Users, keys.Keys, created.User, key.Key); err != nil {
+		return nil, err
+	}
 	return evidence("headscale-entities", map[string]string{"user_id": executor.state.HeadscaleUserID, "key_id": executor.state.PreauthKeyID, "device_count_before_connector": strconv.Itoa(len(devices.Devices))})
+}
+
+func confirmCreatedHeadscaleEntities(users []managedheadscale.User, keys []managedheadscale.PreauthKey, createdUser managedheadscale.User, createdKey managedheadscale.PreauthKey) error {
+	userMatches := 0
+	for _, user := range users {
+		if user.ID == createdUser.ID {
+			userMatches++
+			if user.Name != createdUser.Name {
+				return fmt.Errorf("created Headscale user list identity changed")
+			}
+		}
+	}
+	keyMatches := 0
+	for _, key := range keys {
+		if key.ID == createdKey.ID {
+			keyMatches++
+			if key.UserID != createdUser.ID || createdKey.UserID != createdUser.ID {
+				return fmt.Errorf("created Headscale preauth key user binding changed")
+			}
+		}
+	}
+	if userMatches != 1 || keyMatches != 1 {
+		return fmt.Errorf("created Headscale entity IDs were not listed exactly once")
+	}
+	return nil
+}
+
+func selectConnectorDevice(before, after []managedheadscale.Device, userID uint64, localIPs []netip.Addr) (managedheadscale.Device, error) {
+	if userID == 0 || len(localIPs) == 0 {
+		return managedheadscale.Device{}, fmt.Errorf("connector device matching authority is incomplete")
+	}
+	beforeIDs := make(map[uint64]bool, len(before))
+	for _, device := range before {
+		if device.ID == 0 || beforeIDs[device.ID] {
+			return managedheadscale.Device{}, fmt.Errorf("connector pre-login device inventory is ambiguous")
+		}
+		beforeIDs[device.ID] = true
+	}
+	localSet := make(map[netip.Addr]bool, len(localIPs))
+	for _, address := range localIPs {
+		if !address.IsValid() || localSet[address] {
+			return managedheadscale.Device{}, fmt.Errorf("connector verification local IP identity is ambiguous")
+		}
+		localSet[address] = true
+	}
+	seenAfter := make(map[uint64]bool, len(after))
+	matches := make([]managedheadscale.Device, 0, 1)
+	for _, device := range after {
+		if device.ID == 0 || seenAfter[device.ID] {
+			return managedheadscale.Device{}, fmt.Errorf("connector post-login device inventory is ambiguous")
+		}
+		seenAfter[device.ID] = true
+		if beforeIDs[device.ID] || device.UserID != userID {
+			continue
+		}
+		deviceIPs := make(map[netip.Addr]bool, len(device.IPAddresses))
+		for _, text := range device.IPAddresses {
+			address, err := netip.ParseAddr(text)
+			if err != nil || address.String() != text || deviceIPs[address] {
+				return managedheadscale.Device{}, fmt.Errorf("headscale connector device IP identity is invalid")
+			}
+			deviceIPs[address] = true
+		}
+		if len(deviceIPs) != len(localSet) {
+			continue
+		}
+		exact := true
+		for address := range localSet {
+			if !deviceIPs[address] {
+				exact = false
+				break
+			}
+		}
+		if exact {
+			matches = append(matches, device)
+		}
+	}
+	if len(matches) != 1 {
+		return managedheadscale.Device{}, fmt.Errorf("connector login did not create exactly one device matching its user and verified local IPs")
+	}
+	return matches[0], nil
+}
+
+func confirmConnectorDevice(devices []managedheadscale.Device, deviceID, userID uint64, localIPs []netip.Addr) error {
+	matches := 0
+	for _, device := range devices {
+		if device.ID != deviceID {
+			continue
+		}
+		matches++
+		if device.UserID != userID {
+			return fmt.Errorf("connector device user binding changed")
+		}
+		if _, err := selectConnectorDevice(nil, []managedheadscale.Device{device}, userID, localIPs); err != nil {
+			return fmt.Errorf("connector device no longer matches verified local IPs: %w", err)
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("connector device ID was not listed exactly once")
+	}
+	return nil
+}
+
+func confirmExpiredConnectorDevice(devices []managedheadscale.Device, deviceID, userID uint64, now time.Time) error {
+	matches := 0
+	for _, device := range devices {
+		if device.ID != deviceID {
+			continue
+		}
+		matches++
+		if device.UserID != userID || device.Expiry.IsZero() || device.Expiry.After(now) {
+			return fmt.Errorf("connector device expiry was not effective for the exact user-bound ID")
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("expired connector device ID was not listed exactly once")
+	}
+	return nil
 }
 
 func (executor *LiveExecutor) stepConnector(ctx context.Context) ([]byte, error) {
 	if len(executor.preauthKey) == 0 {
 		return nil, fmt.Errorf("one-time connector key is unavailable")
+	}
+	userID, err := strconv.ParseUint(executor.state.HeadscaleUserID, 10, 64)
+	if err != nil || userID == 0 {
+		return nil, fmt.Errorf("qualification Headscale user identity is unavailable")
+	}
+	var devicesBefore application.HeadscaleDevicesResult
+	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devicesBefore); err != nil {
+		return nil, fmt.Errorf("record connector pre-login device inventory: %w", err)
 	}
 	if _, err := executor.management.Post(ctx, "/api/actions/connector_verify", struct{}{}, &helperproto.ConnectorResult{}); err == nil {
 		return nil, fmt.Errorf("connector unexpectedly verified before binding/login")
@@ -433,10 +591,13 @@ func (executor *LiveExecutor) stepConnector(ctx context.Context) ([]byte, error)
 		return nil, fmt.Errorf("connector post-login verification failed: %w", err)
 	}
 	var devices application.HeadscaleDevicesResult
-	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices); err != nil || len(devices.Devices) == 0 {
+	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices); err != nil {
 		return nil, fmt.Errorf("connector device was not visible in Headscale: %w", err)
 	}
-	device := devices.Devices[len(devices.Devices)-1]
+	device, err := selectConnectorDevice(devicesBefore.Devices, devices.Devices, userID, verified.Observation.LocalIPs)
+	if err != nil {
+		return nil, err
+	}
 	executor.state.ConnectorDeviceID = strconv.FormatUint(device.ID, 10)
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
@@ -550,13 +711,13 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if err != nil {
 		return nil, fmt.Errorf("close-all did not reject App ingress: %w", err)
 	}
-	tokenBefore, err := executor.target.readRemoteRegular("/var/lib/lanpanel/installation/admin-token", 4096)
+	tokenBefore, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/installation/admin-token", 4096)
 	if err != nil {
 		return nil, err
 	}
 	tokenDigest := release.DigestBytes(tokenBefore)
 	clearBytes(tokenBefore)
-	bootBefore, err := executor.target.readRemoteVirtual("/proc/sys/kernel/random/boot_id", 4096)
+	bootBefore, err := executor.target.readRemoteVirtual(ctx, "/proc/sys/kernel/random/boot_id", 4096)
 	if err != nil {
 		return nil, err
 	}
@@ -575,22 +736,26 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	for time.Now().Before(deadline) {
 		target, err := OpenSSH(ctx, executor.prepared.Input.SSH)
 		if err != nil {
-			time.Sleep(5 * time.Second)
+			if sleepErr := sleepContext(ctx, 5*time.Second); sleepErr != nil {
+				return nil, errors.Join(err, sleepErr)
+			}
 			continue
 		}
 		fingerprint, _, observeErr := target.ObserveQualificationHost(ctx, executor.prepared.Install.Identity().Profile)
-		bootAfter, bootErr := target.readRemoteVirtual("/proc/sys/kernel/random/boot_id", 4096)
+		bootAfter, bootErr := target.readRemoteVirtual(ctx, "/proc/sys/kernel/random/boot_id", 4096)
 		if observeErr == nil && bootErr == nil && fingerprint == executor.prepared.Input.SSH.MachineFingerprint && strings.TrimSpace(string(bootAfter)) != strings.TrimSpace(string(bootBefore)) {
 			executor.target = target
 			break
 		}
 		_ = target.Close()
-		time.Sleep(5 * time.Second)
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return nil, err
+		}
 	}
 	if executor.target == nil {
 		return nil, fmt.Errorf("target did not complete an observed reboot")
 	}
-	tokenAfter, err := executor.target.readRemoteRegular("/var/lib/lanpanel/installation/admin-token", 4096)
+	tokenAfter, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/installation/admin-token", 4096)
 	if err != nil || release.DigestBytes(tokenAfter) != tokenDigest {
 		clearBytes(tokenAfter)
 		return nil, errors.Join(err, fmt.Errorf("admin token changed across reboot"))
@@ -610,15 +775,33 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if _, err := executor.management.Post(ctx, "/api/actions/connector_verify", struct{}{}, &connectorAfterReboot); err != nil || connectorAfterReboot.Observation.ControlURL != "https://"+executor.journey.HeadscaleDomain || len(connectorAfterReboot.Observation.LocalIPs) == 0 {
 		return nil, errors.Join(err, fmt.Errorf("connector did not survive reboot"))
 	}
-	if executor.state.ConnectorDeviceID != "" {
-		query := "?device_id=" + url.QueryEscape(executor.state.ConnectorDeviceID)
-		planID, err := executor.management.Plan(ctx, "/api/actions/device_expire", query, application.HeadscaleLifecyclePayload{})
-		if err != nil {
-			return nil, err
-		}
-		if _, err := executor.management.Post(ctx, "/api/actions/device_expire"+query, application.HeadscaleLifecyclePayload{PlanID: planID, Confirmation: "expire"}, &application.HeadscaleDeviceResult{}); err != nil {
-			return nil, err
-		}
+	deviceID, deviceIDErr := strconv.ParseUint(executor.state.ConnectorDeviceID, 10, 64)
+	userID, userIDErr := strconv.ParseUint(executor.state.HeadscaleUserID, 10, 64)
+	if deviceIDErr != nil || userIDErr != nil || deviceID == 0 || userID == 0 {
+		return nil, fmt.Errorf("connector device expiry identity is unavailable")
+	}
+	var devicesBeforeExpiry application.HeadscaleDevicesResult
+	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devicesBeforeExpiry); err != nil {
+		return nil, err
+	}
+	if err := confirmConnectorDevice(devicesBeforeExpiry.Devices, deviceID, userID, connectorAfterReboot.Observation.LocalIPs); err != nil {
+		return nil, err
+	}
+	query := "?device_id=" + url.QueryEscape(executor.state.ConnectorDeviceID)
+	planID, err = executor.management.Plan(ctx, "/api/actions/device_expire", query, application.HeadscaleLifecyclePayload{})
+	if err != nil {
+		return nil, err
+	}
+	var expired application.HeadscaleDeviceResult
+	if _, err := executor.management.Post(ctx, "/api/actions/device_expire"+query, application.HeadscaleLifecyclePayload{PlanID: planID, Confirmation: "expire"}, &expired); err != nil || expired.Device.ID != deviceID || expired.Device.UserID != userID {
+		return nil, errors.Join(err, fmt.Errorf("connector device expiry action identity changed"))
+	}
+	var devicesAfterExpiry application.HeadscaleDevicesResult
+	if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devicesAfterExpiry); err != nil {
+		return nil, err
+	}
+	if err := confirmExpiredConnectorDevice(devicesAfterExpiry.Devices, deviceID, userID, time.Now().UTC()); err != nil {
+		return nil, err
 	}
 	if err := executor.cleanupLiveEffects(ctx); err != nil {
 		return nil, err
@@ -944,7 +1127,9 @@ func waitAuthoritativeDNS(ctx context.Context, zone string, names []string, expe
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authoritative DNS did not converge to one exact qualification A record")
 		}
-		time.Sleep(5 * time.Second)
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1018,7 +1203,9 @@ func waitAuthoritativeAbsent(ctx context.Context, zone, name string) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authoritative A/AAAA/CNAME cleanup did not converge")
 		}
-		time.Sleep(5 * time.Second)
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1050,7 +1237,9 @@ func waitAuthoritativeNoTXT(ctx context.Context, zone, owner string) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("authoritative TXT cleanup did not converge")
 		}
-		time.Sleep(5 * time.Second)
+		if err := sleepContext(ctx, 5*time.Second); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1066,7 +1255,20 @@ func retryPublicProbe(ctx context.Context, vantage VantageAuthority, probe Publi
 		if time.Now().After(deadline) {
 			return nil, last
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepContext(ctx, 3*time.Second); err != nil {
+			return nil, errors.Join(last, err)
+		}
+	}
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

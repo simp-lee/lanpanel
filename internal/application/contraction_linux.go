@@ -212,12 +212,26 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 		if !cleanupComplete && !result.AccessClosed {
 			return result, errors.Join(runErr, execution.Close())
 		}
+		recoveryCtx, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		recoveredPaths, recoveryErr := fallback.ContractDisk(recoveryCtx, uncertain)
+		cancelRecovery()
+		if recoveryErr != nil {
+			return result, errors.Join(runErr, recoveryErr, execution.Close())
+		}
+		result.ModifiedPaths = append(result.ModifiedPaths, recoveredPaths...)
 		_, completeErr := contraction.CompleteNormal(ctx, execution.Authority, result)
+		var acknowledgeErr, convergeErr error
+		if completeErr == nil {
+			acknowledgeErr = fallback.AcknowledgeDiskContraction(context.WithoutCancel(ctx), uncertain)
+		}
+		if completeErr == nil && acknowledgeErr == nil {
+			convergeErr = execution.Authority.ConvergeClosure(context.WithoutCancel(ctx), uncertain, result.ClosureDigest)
+		}
 		closeErr := execution.Close()
-		if completeErr == nil && closeErr == nil && (result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown) {
+		if completeErr == nil && acknowledgeErr == nil && convergeErr == nil && closeErr == nil && (result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown) {
 			return result, nil
 		}
-		return result, errors.Join(err, runErr, completeErr, closeErr)
+		return result, errors.Join(err, runErr, completeErr, acknowledgeErr, convergeErr, closeErr)
 	}
 	host.Guard = func(manifest nginx.Manifest) error {
 		decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: execution.SafetyState, Installation: &execution.Installation, Ownership: execution.OwnershipAuthority, Now: time.Now().UTC()})
@@ -231,10 +245,24 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 	if !cleanupComplete && !result.AccessClosed {
 		return result, errors.Join(runErr, execution.Close())
 	}
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	recoveredPaths, recoveryErr := host.ContractDisk(recoveryCtx, execution.Inventory)
+	cancelRecovery()
+	if recoveryErr != nil {
+		return result, errors.Join(runErr, recoveryErr, execution.Close())
+	}
+	result.ModifiedPaths = append(result.ModifiedPaths, recoveredPaths...)
 	_, completeErr := contraction.CompleteNormal(ctx, execution.Authority, result)
+	var acknowledgeErr, convergeErr error
+	if completeErr == nil {
+		acknowledgeErr = host.AcknowledgeDiskContraction(context.WithoutCancel(ctx), execution.Inventory)
+	}
+	if completeErr == nil && acknowledgeErr == nil {
+		convergeErr = execution.Authority.ConvergeClosure(context.WithoutCancel(ctx), execution.Inventory, result.ClosureDigest)
+	}
 	closeErr := execution.Close()
-	if completeErr != nil || closeErr != nil {
-		return result, errors.Join(runErr, completeErr, closeErr)
+	if completeErr != nil || acknowledgeErr != nil || convergeErr != nil || closeErr != nil {
+		return result, errors.Join(runErr, completeErr, acknowledgeErr, convergeErr, closeErr)
 	}
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 		return result, nil

@@ -22,6 +22,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/safety"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -161,7 +162,33 @@ func projectedFenceSafetyGenerations(scope safety.FenceScope, state safety.State
 	return result
 }
 
+func (service *EmergencyService) recoverPendingNginxContraction(ctx context.Context, snapshot EmergencySnapshot) error {
+	scope, present, err := nginx.ContractionScope(service.paths, filetxn.Owner{UID: 0, GID: 0})
+	if err != nil || !present {
+		return err
+	}
+	_, modifiedPaths, recovered, err := nginx.RecoverContraction(ctx, service.paths, filetxn.Owner{UID: 0, GID: 0})
+	if err != nil || !recovered {
+		return errors.Join(err, fmt.Errorf("pending nginx contraction was not recovered"))
+	}
+	if service.normal == nil {
+		return fmt.Errorf("pending nginx contraction normal store is unavailable")
+	}
+	if err := operations.TerminalizeContractionReceipt(ctx, service.normal, service.exposure, scope, modifiedPaths, snapshot.Inventory.Digest, time.Now().UTC()); err != nil {
+		fullScope := appResourceIDs(snapshot.Inventory)
+		slices.Sort(fullScope)
+		if errors.Is(err, operations.ErrContractionReceiptUnbound) && slices.Equal(scope, fullScope) {
+			return nil
+		}
+		return err
+	}
+	return nginx.AcknowledgeContraction(context.WithoutCancel(ctx), service.paths, filetxn.Owner{UID: 0, GID: 0}, scope)
+}
+
 func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, snapshot EmergencySnapshot, authority safety.EmergencyState, state safety.State) error {
+	if err := service.recoverPendingNginxContraction(ctx, snapshot); err != nil {
+		return err
+	}
 	if state.GlobalClose.Phase == safety.GlobalCloseNone || authority.GlobalClose.Generation != state.GlobalClose.Generation || service.normal == nil {
 		return fmt.Errorf("fence-cleared global recovery authority is incomplete")
 	}
@@ -169,7 +196,8 @@ func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if _, err := host.ContractDisk(ctx, snapshot.Inventory); err != nil {
+	modifiedPaths, err := host.ContractDisk(ctx, snapshot.Inventory)
+	if err != nil {
 		return err
 	}
 	if err := host.TestClosedGraph(ctx); err != nil {
@@ -192,6 +220,21 @@ func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, 
 	closureDigest := snapshot.Inventory.Digest
 	globalProof := &safety.GlobalConvergenceProof{Generation: state.GlobalClose.Generation, InventoryDigest: safety.OwnershipInventoryDigest(ownership), OwnedGraphDigest: snapshot.Inventory.Digest, RuntimeClosureDigest: closureDigest, UnpublishedGenerations: unpublished, NginxTestPassed: true, RuntimeClosed: true}
 	current := authority
+	if authority.GlobalClose.Phase == safety.GlobalCloseNone {
+		proof := authority.ClearProof
+		if proof == nil || proof.Generation != globalProof.Generation || proof.InventoryDigest != globalProof.InventoryDigest || proof.OwnedGraphDigest != snapshot.Inventory.Digest || proof.RuntimeClosureDigest != snapshot.Inventory.Digest || !proof.NginxTestPassed || !proof.RuntimeClosed {
+			return fmt.Errorf("fence-cleared emergency global proof changed")
+		}
+		globalProof.OwnedGraphDigest = proof.OwnedGraphDigest
+		globalProof.RuntimeClosureDigest = proof.RuntimeClosureDigest
+		closureDigest = proof.RuntimeClosureDigest
+	}
+	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, unpublished, modifiedPaths, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
+		return err
+	}
+	if err := host.AcknowledgeDiskContraction(context.WithoutCancel(ctx), snapshot.Inventory); err != nil {
+		return err
+	}
 	if authority.GlobalClose.Phase != safety.GlobalCloseNone {
 		cleared := authority
 		cleared.Sequence++
@@ -201,17 +244,6 @@ func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, 
 			return err
 		}
 		current = cleared
-	} else {
-		proof := authority.ClearProof
-		if proof == nil || proof.Generation != globalProof.Generation || proof.InventoryDigest != globalProof.InventoryDigest || proof.OwnedGraphDigest != snapshot.Inventory.Digest || proof.RuntimeClosureDigest != snapshot.Inventory.Digest || !proof.NginxTestPassed || !proof.RuntimeClosed {
-			return fmt.Errorf("fence-cleared emergency global proof changed")
-		}
-		globalProof.OwnedGraphDigest = proof.OwnedGraphDigest
-		globalProof.RuntimeClosureDigest = proof.RuntimeClosureDigest
-		closureDigest = proof.RuntimeClosureDigest
-	}
-	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, unpublished, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
-		return err
 	}
 	next := state
 	next.Revision++
@@ -273,6 +305,9 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		state = projectedState
 		service.safetyState = &state
 	}
+	if err := service.recoverPendingNginxContraction(ctx, snapshot); err != nil {
+		return err
+	}
 	host, err := FixedHost(snapshot.Inventory)
 	if err != nil {
 		return err
@@ -300,7 +335,10 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	if service.normal == nil {
 		return fmt.Errorf("normal recovery store is unavailable")
 	}
-	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, generations, snapshot.Inventory.Digest, state.Checksum, time.Now().UTC(), nil); err != nil {
+	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, generations, paths, snapshot.Inventory.Digest, state.Checksum, time.Now().UTC(), nil); err != nil {
+		return err
+	}
+	if err := host.AcknowledgeDiskContraction(context.WithoutCancel(ctx), snapshot.Inventory); err != nil {
 		return err
 	}
 	unpublished := make(map[string]uint64, len(generations))
@@ -624,7 +662,7 @@ func (service *EmergencyService) stopGoAccess(ctx context.Context, inventory clo
 	return err
 }
 
-func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory closure.Inventory, closureDigest string) error {
+func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory closure.Inventory, closureDigest string, modifiedPaths []string) error {
 	if err := service.stopGoAccess(ctx, inventory); err != nil {
 		return err
 	}
@@ -643,7 +681,11 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 	for _, resource := range state.Resources {
 		generations[resource.ResourceID] = resource.GenerationSequence + 1
 	}
-	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, generations, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
+	if err := operations.RecoverClosedInstallation(ctx, service.normal, service.exposure, generations, modifiedPaths, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
+		return err
+	}
+	host := Host{Paths: service.paths, Owner: filetxn.Owner{UID: 0, GID: 0}}
+	if err := host.AcknowledgeDiskContraction(context.WithoutCancel(ctx), inventory); err != nil {
 		return err
 	}
 	state.Revision++

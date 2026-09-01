@@ -42,7 +42,9 @@ type Config struct {
 	StagingParents DirectoryPolicy
 }
 
-const MaximumContentBytes int64 = 16 << 20
+// MaximumContentBytes is the single-file installation contract shared by
+// release identities, bootstrap assets, and the underlying file transaction.
+const MaximumContentBytes int64 = 256 << 20
 
 type Request struct {
 	Path     string

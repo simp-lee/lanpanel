@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/child"
+	"lanpanel/internal/filetxn"
 	"os"
 	"path/filepath"
 	"slices"
@@ -542,7 +543,7 @@ func (auditor *LinuxAuditor) noAutostartPolicy(expectedDigest string) (NoAutosta
 	if err != nil {
 		return NoAutostartPolicy{}, err
 	}
-	binary, _, err := auditor.readFileAndStat(auditor.binaryPath, 256<<20)
+	binary, _, err := auditor.readFileAndStat(auditor.binaryPath, filetxn.MaximumContentBytes)
 	if err != nil {
 		return NoAutostartPolicy{}, err
 	}

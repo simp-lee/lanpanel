@@ -51,15 +51,15 @@ func Prepare(ctx context.Context, store *Store, host CandidateHost, request Stag
 	if err := host.ValidateFreshCandidate(ctx, request.Rendered); err != nil {
 		return nil, err
 	}
+	if err := host.CommitFreshBoundary(ctx, request.Rendered); err != nil {
+		return nil, errors.Join(err, host.StopPrivateService(context.WithoutCancel(ctx), request.Rendered.Candidate))
+	}
 	journal, err := NewJournal(request.InstallationID, request.JobID, request.PlanID, request.IntentGeneration, request.Rendered.Candidate, request.Preflight)
 	if err != nil {
 		return nil, err
 	}
 	if err := store.Create(ctx, journal); err != nil {
 		return nil, err
-	}
-	if err := host.CommitFreshBoundary(ctx, request.Rendered); err != nil {
-		return nil, errors.Join(err, host.StopPrivateService(context.WithoutCancel(ctx), request.Rendered.Candidate))
 	}
 	execution := &Execution{store: store, host: host, journal: journal, rendered: request.Rendered}
 	if err := execution.advanceLocal(ctx); err != nil {

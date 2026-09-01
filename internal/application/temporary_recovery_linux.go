@@ -51,6 +51,7 @@ type temporaryPublicationRecoveryHost interface {
 	VerifyTemporary(context.Context, publication.Candidate, domain.AppTarget) (string, error)
 	AuditManifest(context.Context) (nginx.Manifest, error)
 	ContractResource(context.Context, string) (activation.Result, error)
+	AcknowledgeContraction(context.Context, string) error
 	ProbeTemporaryClosure(context.Context, closure.Inventory) (string, error)
 	StopAndVerify(context.Context) (closure.RuntimeSnapshot, error)
 }
@@ -674,6 +675,9 @@ func contractTemporaryPublicationLocked(ctx context.Context, service *FixedServi
 	default:
 		return fmt.Errorf("temporary publication contraction normal state changed")
 	}
+	if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), recovery.Resource.ID); err != nil {
+		return err
+	}
 	return convergeInterruptedDomainClosing(ctx, service, exposure, recovery.Resource.ID, generation, result.RuntimeDigest, reason)
 }
 
@@ -1058,6 +1062,9 @@ func resumeTemporaryPublicationContraction(ctx context.Context, service *FixedSe
 		}
 	default:
 		return fmt.Errorf("temporary publication closing normal state changed")
+	}
+	if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), resourceID); err != nil {
+		return err
 	}
 	return convergeInterruptedDomainClosing(ctx, service, exposure, resourceID, closing.Generation, result.RuntimeDigest, closing.Reason)
 }

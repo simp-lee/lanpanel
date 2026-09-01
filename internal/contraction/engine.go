@@ -34,7 +34,7 @@ type Authority interface {
 	CommitUnpublished(context.Context, closure.Inventory) error
 	PersistStopFence(context.Context, closure.Inventory) error
 	UpdateStopObservation(context.Context, closure.RuntimeSnapshot, bool) error
-	FinalizeClosure(context.Context, closure.Inventory, string) error
+	FinalizeClosure(context.Context, closure.Inventory, string, []string) error
 }
 
 type Runtime interface {
@@ -56,39 +56,39 @@ func (engine Engine) Run(ctx context.Context, inventory closure.Inventory) (Resu
 		return Result{}, fmt.Errorf("contraction engine authority is incomplete")
 	}
 	if err := engine.Authority.PersistClosing(ctx, inventory); err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "contraction_authority_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "contraction_authority_failed", nil)
 		return result, errors.Join(err, fallbackErr)
 	}
 	if err := engine.Authority.CommitUnpublished(ctx, inventory); err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "unpublished_commit_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "unpublished_commit_failed", nil)
 		return result, errors.Join(err, fallbackErr)
 	}
 	if !inventory.Complete {
-		return engine.fallback(ctx, inventory, "closure_inventory_incomplete")
+		return engine.fallback(ctx, inventory, "closure_inventory_incomplete", nil)
 	}
 	paths, err := engine.Runtime.ContractDisk(ctx, inventory)
 	if err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "disk_contraction_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "disk_contraction_failed", paths)
 		return result, errors.Join(err, fallbackErr)
 	}
 	if err := engine.Runtime.TestClosedGraph(ctx); err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "nginx_test_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "nginx_test_failed", paths)
 		result.ModifiedPaths = paths
 		return result, errors.Join(err, fallbackErr)
 	}
 	if err := engine.Runtime.ReloadAndDrain(ctx); err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "worker_drain_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "worker_drain_failed", paths)
 		result.ModifiedPaths = paths
 		return result, errors.Join(err, fallbackErr)
 	}
 	closureDigest, err := engine.Runtime.ProbeSelectiveClosure(ctx, inventory)
 	if err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "runtime_probe_failed")
+		result, fallbackErr := engine.fallback(ctx, inventory, "runtime_probe_failed", paths)
 		result.ModifiedPaths = paths
 		return result, errors.Join(err, fallbackErr)
 	}
-	if err := engine.Authority.FinalizeClosure(ctx, inventory, closureDigest); err != nil {
-		result, fallbackErr := engine.fallback(ctx, inventory, "closure_commit_failed")
+	if err := engine.Authority.FinalizeClosure(ctx, inventory, closureDigest, paths); err != nil {
+		result, fallbackErr := engine.fallback(ctx, inventory, "closure_commit_failed", paths)
 		result.ModifiedPaths = paths
 		return result, errors.Join(err, fallbackErr)
 	}
@@ -99,7 +99,7 @@ type authorityCommittedError struct{ err error }
 
 func (err authorityCommittedError) Error() string { return err.err.Error() }
 func (err authorityCommittedError) Unwrap() error { return err.err }
-func (engine Engine) fallback(_ context.Context, inventory closure.Inventory, code string) (Result, error) {
+func (engine Engine) fallback(_ context.Context, inventory closure.Inventory, code string, modifiedPaths []string) (Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	result := Result{Outcome: OutcomeUnknown, AccessMayRemain: true, ErrorCode: code}
@@ -114,10 +114,11 @@ func (engine Engine) fallback(_ context.Context, inventory closure.Inventory, co
 	}
 	if verified && fenceErr == nil && updateErr == nil {
 		closureDigest := inventory.Digest
-		if finalizeErr := engine.Authority.FinalizeClosure(ctx, inventory, closureDigest); finalizeErr != nil {
+		if finalizeErr := engine.Authority.FinalizeClosure(ctx, inventory, closureDigest, modifiedPaths); finalizeErr != nil {
 			return result, finalizeErr
 		}
 		result.Outcome = OutcomePartial
+		result.ModifiedPaths = append([]string(nil), modifiedPaths...)
 		result.ClosureDigest = closureDigest
 		result.AccessClosed = true
 		result.SharedIngressDown = true

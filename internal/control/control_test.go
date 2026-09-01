@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/certificates"
@@ -76,6 +77,25 @@ func TestCandidateJournalStopsBeforeRemoteAndRejectsPublicSTUN(t *testing.T) {
 	publicHost := &fakeCandidateHost{public: true}
 	if _, err := Prepare(context.Background(), publicStore, publicHost, StageRequest{InstallationID: "ins_00000000000000000000000000000001", JobID: "job_public_candidate", PlanID: "plan_public_candidate", IntentGeneration: 10, Rendered: rendered, Preflight: request, PreflightResult: result}); err == nil || publicHost.stopCalls != 1 {
 		t.Fatal("premature public STUN did not fail closed and stop candidate")
+	}
+}
+
+func TestFreshnessFailureLeavesNoPreparedJournalAndCanRetry(t *testing.T) {
+	rendered := testRendered(t)
+	request, result := testPreflight(t, rendered.Candidate)
+	store := testStore(t)
+	host := &fakeCandidateHost{freshErr: errors.New("freshness changed")}
+	stage := StageRequest{InstallationID: "ins_00000000000000000000000000000001", JobID: "job_fresh_retry", PlanID: "plan_fresh_retry", IntentGeneration: 11, Rendered: rendered, Preflight: request, PreflightResult: result}
+	if _, err := Prepare(context.Background(), store, host, stage); err == nil {
+		t.Fatal("freshness failure was accepted")
+	}
+	if _, err := store.Read(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("freshness failure left a prepared journal: %v", err)
+	}
+	host.freshErr = nil
+	execution, err := Prepare(context.Background(), store, host, stage)
+	if err != nil || execution.Journal().Phase != PhaseCertificatePending || host.boundaryCalls != 2 {
+		t.Fatalf("freshness retry execution=%#v calls=%d err=%v", execution, host.boundaryCalls, err)
 	}
 }
 
@@ -201,11 +221,17 @@ type fakeCandidateHost struct {
 	databaseCalls int
 	serviceCalls  int
 	stopCalls     int
+	boundaryCalls int
 	public        bool
+	freshErr      error
 }
 
 func (host *fakeCandidateHost) ValidateFreshCandidate(context.Context, Rendered) error { return nil }
-func (host *fakeCandidateHost) CommitFreshBoundary(context.Context, Rendered) error    { return nil }
+func (host *fakeCandidateHost) CommitFreshBoundary(context.Context, Rendered) error {
+	host.boundaryCalls++
+	return host.freshErr
+}
+
 func (host *fakeCandidateHost) InitializeDatabase(_ context.Context, rendered Rendered) (DatabaseEvidence, error) {
 	host.databaseCalls++
 	return DatabaseEvidence{UUID: rendered.Candidate.DatabaseUUID, Generation: rendered.Candidate.DatabaseGeneration, MainDigest: testDigest("database-main"), InitializedDigest: testDigest("database")}, nil

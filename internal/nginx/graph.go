@@ -327,20 +327,8 @@ func ValidateManifest(manifest Manifest) error {
 }
 
 func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
-	if err := validatePaths(paths); err != nil {
+	if err := validateGraphBoundary(paths, owner); err != nil {
 		return Manifest{}, err
-	}
-	if paths == FixedPaths() {
-		for _, root := range []string{paths.ConfigRoot, paths.StateRoot, paths.CertificatePath, paths.PrivateKeyPath, paths.AuditPath, paths.PIDPath} {
-			if err := validateParentChain(root); err != nil {
-				return Manifest{}, err
-			}
-		}
-	}
-	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory), paths.StateRoot} {
-		if err := validateDirectory(directory, owner); err != nil {
-			return Manifest{}, err
-		}
 	}
 	manifestBytes, err := readRegular(paths.ManifestPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil {
@@ -350,65 +338,103 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
+	if err := auditManifestGraph(paths, owner, manifest, nil); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+// auditManifestGraph verifies an exact manifest graph. During a durable
+// contraction only, allowedMissing may name journal-bound entries whose exact
+// files have already been removed while the prior manifest is still current.
+func auditManifestGraph(paths Paths, owner filetxn.Owner, manifest Manifest, allowedMissing map[string]bool) error {
+	if err := validateGraphBoundary(paths, owner); err != nil {
+		return err
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		return err
+	}
 	main, err := readRegular(paths.MainPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil || digest(main) != manifest.MainDigest || string(main) != renderMain(paths) {
-		return Manifest{}, fmt.Errorf("nginx main config differs from the closed graph")
+		return fmt.Errorf("nginx main config differs from the closed graph")
 	}
 	sanitizer, err := readRegular(paths.SanitizerPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil || digest(sanitizer) != manifest.SanitizerDigest || string(sanitizer) != renderSanitizer() {
-		return Manifest{}, fmt.Errorf("nginx sanitizer differs from the closed graph")
+		return fmt.Errorf("nginx sanitizer differs from the closed graph")
 	}
 	certificatePEM, err := readRegular(paths.CertificatePath, owner, 0o644, MaximumGraphFileSize)
 	if err != nil {
-		return Manifest{}, err
+		return err
 	}
 	privateKeyPEM, err := readRegular(paths.PrivateKeyPath, owner, 0o600, MaximumGraphFileSize)
 	if err != nil {
-		return Manifest{}, err
+		return err
 	}
 	certificate, err := ParseDefaultCertificate(certificatePEM, privateKeyPEM)
 	expectedDNS, dnsErr := ExpectedDefaultDNSName(manifest.InstallationID)
 	if err != nil || dnsErr != nil || certificate.Fingerprint != manifest.DefaultCertFingerprint || certificate.DNSName != expectedDNS {
-		return Manifest{}, fmt.Errorf("nginx default rejection certificate fingerprint differs")
+		return fmt.Errorf("nginx default rejection certificate fingerprint differs")
 	}
 	if err := validateAuditSink(paths.AuditPath, owner); err != nil {
-		return Manifest{}, err
+		return err
 	}
 	rootEntries, err := os.ReadDir(paths.ConfigRoot)
 	if err != nil {
-		return Manifest{}, err
+		return err
 	}
 	allowedRoot := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, TemporaryDirectory: true}
 	for _, item := range rootEntries {
 		if !allowedRoot[item.Name()] {
-			return Manifest{}, fmt.Errorf("foreign Nginx root graph entry %q", item.Name())
+			return fmt.Errorf("foreign Nginx root graph entry %q", item.Name())
 		}
 	}
 	want := map[string]Entry{}
 	for _, entry := range manifest.Entries {
 		want[entry.Relative] = entry
-		data, err := readRegular(filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative)), owner, 0o600, MaximumGraphFileSize)
-		if err != nil || digest(data) != entry.Digest || validateEntryConfig(entry, data) != nil {
-			return Manifest{}, fmt.Errorf("nginx graph entry %q differs from its manifest", entry.Relative)
+		data, readErr := readRegular(filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative)), owner, 0o600, MaximumGraphFileSize)
+		if readErr != nil && errors.Is(readErr, os.ErrNotExist) && allowedMissing[entry.Relative] {
+			continue
+		}
+		if readErr != nil || digest(data) != entry.Digest || validateEntryConfig(entry, data) != nil {
+			return fmt.Errorf("nginx graph entry %q differs from its manifest", entry.Relative)
 		}
 	}
 	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
-		entries, err := os.ReadDir(filepath.Join(paths.ConfigRoot, directory))
-		if err != nil {
-			return Manifest{}, err
+		entries, readErr := os.ReadDir(filepath.Join(paths.ConfigRoot, directory))
+		if readErr != nil {
+			return readErr
 		}
 		for _, item := range entries {
 			relative := filepath.ToSlash(filepath.Join(directory, item.Name()))
 			if item.IsDir() || !want[relative].valid() {
-				return Manifest{}, fmt.Errorf("foreign Nginx include graph entry %q", relative)
+				return fmt.Errorf("foreign Nginx include graph entry %q", relative)
 			}
 		}
 	}
 	staging, err := os.ReadDir(paths.StagingPath())
 	if err != nil || len(staging) != 0 {
-		return Manifest{}, fmt.Errorf("nginx graph staging is not empty")
+		return fmt.Errorf("nginx graph staging is not empty")
 	}
-	return manifest, nil
+	return nil
+}
+
+func validateGraphBoundary(paths Paths, owner filetxn.Owner) error {
+	if err := validatePaths(paths); err != nil {
+		return err
+	}
+	if paths == FixedPaths() {
+		for _, root := range []string{paths.ConfigRoot, paths.StateRoot, paths.CertificatePath, paths.PrivateKeyPath, paths.AuditPath, paths.PIDPath} {
+			if err := validateParentChain(root); err != nil {
+				return err
+			}
+		}
+	}
+	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory), paths.StateRoot} {
+		if err := validateDirectory(directory, owner); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Contract removes only manifest-bound App/challenge/temporary entries. It
@@ -453,6 +479,9 @@ func prospectiveManifestEntry(manifest Manifest, entry Entry) (Manifest, bool, [
 }
 
 func InstallEntry(ctx context.Context, paths Paths, owner filetxn.Owner, entry Entry) (Manifest, []string, error) {
+	if err := requireNoPendingContraction(paths, owner); err != nil {
+		return Manifest{}, nil, err
+	}
 	manifest, err := Audit(paths, owner)
 	if err != nil {
 		return Manifest{}, nil, err
@@ -515,6 +544,9 @@ func prospectiveManifestRemoval(manifest Manifest, expected Entry) (Manifest, bo
 }
 
 func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected Entry) (Manifest, []string, error) {
+	if err := requireNoPendingContraction(paths, owner); err != nil {
+		return Manifest{}, nil, err
+	}
 	manifest, err := Audit(paths, owner)
 	if err != nil {
 		return Manifest{}, nil, err
@@ -550,51 +582,7 @@ func RemoveEntry(ctx context.Context, paths Paths, owner filetxn.Owner, expected
 }
 
 func Contract(ctx context.Context, paths Paths, owner filetxn.Owner, resourceIDs []string) (Manifest, []string, error) {
-	manifest, err := Audit(paths, owner)
-	if err != nil {
-		return Manifest{}, nil, err
-	}
-	selected := map[string]bool{}
-	for _, id := range resourceIDs {
-		if !resourcePattern.MatchString(id) || selected[id] {
-			return Manifest{}, nil, fmt.Errorf("nginx contraction resource inventory is invalid")
-		}
-		selected[id] = true
-	}
-	if len(selected) == 0 {
-		return manifest, []string{}, nil
-	}
-	txn, err := filetxn.Open(filetxn.Config{RootPath: paths.ConfigRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingPath: paths.StagingPath(), Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}}, filetxn.Options{})
-	if err != nil {
-		return Manifest{}, nil, err
-	}
-	defer func(ignore func() error) { _ = ignore() }(txn.Close)
-	kept := make([]Entry, 0, len(manifest.Entries))
-	removed := []string{}
-	metadata := filetxn.Metadata{Owner: owner, Mode: 0o600}
-	for _, entry := range manifest.Entries {
-		if !selected[entry.ResourceID] || entry.Kind == EntryControl {
-			kept = append(kept, entry)
-			continue
-		}
-		path := filepath.Join(paths.ConfigRoot, filepath.FromSlash(entry.Relative))
-		result, removeErr := txn.Remove(ctx, filetxn.Request{Path: path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize})
-		if removeErr != nil || result.State != filetxn.StateDurable {
-			return Manifest{}, removed, fmt.Errorf("remove Nginx graph entry %q without rollback: %w", entry.Relative, removeErr)
-		}
-		removed = append(removed, path)
-	}
-	manifest.Entries = kept
-	data, err := EncodeManifest(manifest)
-	if err != nil {
-		return Manifest{}, removed, err
-	}
-	result, err := txn.Put(ctx, filetxn.Request{Path: paths.ManifestPath(), Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o700}, Existing: &metadata, New: metadata, MaxBytes: MaximumGraphFileSize}, data, filetxn.ReplaceOnly)
-	if err != nil || result.State != filetxn.StateDurable {
-		return Manifest{}, removed, fmt.Errorf("commit contracted Nginx graph manifest: %w", err)
-	}
-	contracted, err := Audit(paths, owner)
-	return contracted, removed, err
+	return contract(ctx, paths, owner, resourceIDs, contractionOptions{})
 }
 
 func renderMain(paths Paths) string {

@@ -30,7 +30,7 @@ type ManagementClient struct {
 }
 
 func OpenManagementClient(ctx context.Context, target *SSHClient) (*ManagementClient, error) {
-	startupBytes, err := target.readRemoteRegular("/etc/lanpanel/startup-authority.json", 4<<20)
+	startupBytes, err := target.readRemoteRegular(ctx, "/etc/lanpanel/startup-authority.json", 4<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -49,18 +49,7 @@ func OpenManagementClient(ctx context.Context, target *SSHClient) (*ManagementCl
 			if network != "tcp" && network != "tcp4" || requested != address {
 				return nil, fmt.Errorf("management tunnel destination escaped exact authority")
 			}
-			type result struct {
-				connection net.Conn
-				err        error
-			}
-			done := make(chan result, 1)
-			go func() { connection, dialErr := target.client.Dial("tcp", address); done <- result{connection, dialErr} }()
-			select {
-			case value := <-done:
-				return value.connection, value.err
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+			return target.dialContext(ctx, "tcp", address)
 		},
 		DisableKeepAlives: false, MaxIdleConns: 2, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second,
 		ResponseHeaderTimeout: 0, ExpectContinueTimeout: time.Second,
@@ -82,7 +71,7 @@ func (client *ManagementClient) Close() {
 }
 
 func (client *ManagementClient) login(ctx context.Context) error {
-	token, err := client.ssh.readRemoteRegular("/var/lib/lanpanel/installation/admin-token", 4096)
+	token, err := client.ssh.readRemoteRegular(ctx, "/var/lib/lanpanel/installation/admin-token", 4096)
 	if err != nil {
 		return err
 	}

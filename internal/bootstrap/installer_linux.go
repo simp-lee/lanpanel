@@ -219,6 +219,23 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	return planDigest, nil
 }
 
+func reconcilePackageCommit(journal *Journal, packageJournal packages.Journal) error {
+	if journal == nil || journal.Phase != PhaseNginxMasked || journal.PackageJournalDigest != "" || release.ValidateInstallIdentity(journal.Release) != nil || journal.ArtifactDigests["/usr/sbin/policy-rc.d"] != journal.Release.Binary.Digest || packageJournal.TransactionID != journal.PackageTransactionID || packageJournal.PlanDigest != journal.PackagePlanDigest || packageJournal.Phase != packages.JournalCleaned {
+		return fmt.Errorf("package transaction did not reach the exact release-bound cleaned postcondition")
+	}
+	packageDigest, err := packages.JournalDigest(packageJournal)
+	if err != nil {
+		return err
+	}
+	journal.PackageJournalDigest = packageDigest
+	journal.ArtifactDigests["package_transaction"] = packageDigest
+	if err := removeBootstrapPolicy(journal.Release.Binary, journal.Paths); err != nil {
+		return err
+	}
+	delete(journal.ArtifactDigests, "/usr/sbin/policy-rc.d")
+	return nil
+}
+
 func resume(ctx context.Context, store *journalStore, journal Journal, request Request, token []byte, strict bool) error {
 	if len(token) != 0 {
 		defer clear(token)
@@ -261,19 +278,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err != nil {
 			return err
 		}
-		if packageJournal.TransactionID != journal.PackageTransactionID || packageJournal.Phase != packages.JournalCleaned {
-			return fmt.Errorf("package transaction did not reach exact cleaned postcondition")
-		}
-		packageDigest, err := packages.JournalDigest(packageJournal)
-		if err != nil {
+		if err := reconcilePackageCommit(&journal, packageJournal); err != nil {
 			return err
 		}
-		journal.PackageJournalDigest = packageDigest
-		journal.ArtifactDigests["package_transaction"] = packageDigest
-		if err := removeBootstrapPolicy(journal.Release.Binary, journal.Paths); err != nil {
-			return err
-		}
-		delete(journal.ArtifactDigests, "/usr/sbin/policy-rc.d")
 		if err := advance(PhasePackagesCommitted); err != nil {
 			return err
 		}
@@ -511,17 +518,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			}
 		}
 		journal.FinalCommitDigest = digestBytes(commitBytes)
-		startup := struct {
-			SchemaVersion  string                       `json:"schema_version"`
-			AttemptID      string                       `json:"attempt_id"`
-			InstallationID string                       `json:"installation_id"`
-			GenerationID   string                       `json:"generation_id"`
-			Management     identity.ManagementAuthority `json:"management_authority"`
-			CommitDigest   string                       `json:"commit_digest"`
-		}{"lanpanel.startup-authority.v1", journal.AttemptID, journal.InstallationID, journal.GenerationID, journal.Authority, journal.FinalCommitDigest}
-		startupBytes, _ := encodeCanonical(startup)
+		startup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: journal.FinalCommitDigest}
 		uiIdentity, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
-		if err := putRootGroupFile(ctx, journal.Paths.StartupAuthority, startupBytes, uiIdentity.GID, 0o640); err != nil {
+		if err := putOrVerifyStartupAuthority(ctx, journal.Paths.StartupAuthority, startup, uiIdentity.GID); err != nil {
 			return err
 		}
 		if err := advance(PhaseCommitted); err != nil {
@@ -914,7 +913,7 @@ func verifyPrecommitArtifacts(journal Journal) error {
 			}
 			continue
 		}
-		maximum := int64(256 << 20)
+		maximum := filetxn.MaximumContentBytes
 		mode := bootstrapArtifactMode(journal, path)
 		data, err := readCommittedArtifact(path, maximum, mode)
 		if err != nil || digestBytes(data) != digest {
@@ -985,7 +984,7 @@ func verifyCommittedBundle(paths Paths, journal Journal, commit Commit) error {
 			continue
 		}
 		mode := bootstrapArtifactMode(journal, path)
-		data, err := readCommittedArtifact(path, 256<<20, mode)
+		data, err := readCommittedArtifact(path, filetxn.MaximumContentBytes, mode)
 		if err != nil || digestBytes(data) != digest {
 			return fmt.Errorf("committed bootstrap artifact %q differs from final inventory", path)
 		}

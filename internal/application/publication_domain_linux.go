@@ -107,10 +107,6 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 		result.CredentialID = credential.ID
 		result.CredentialFingerprint = observed.Fingerprint
 		result.CredentialChanged = observed.Fingerprint != credential.Fingerprint && credential.Kind == "external_htpasswd"
-		expectedReference := shaDigest([]byte(credential.ID + "\x00" + path))
-		if bundle.Auth.ReferenceIdentity != expectedReference {
-			return degradedDomainStatus(result, "applied credential reference changed"), nil
-		}
 		if credential.Kind == "managed_basic" && observed.Fingerprint != credential.Fingerprint {
 			return degradedDomainStatus(result, "managed Basic drift"), nil
 		}
@@ -133,9 +129,6 @@ func ObserveDomainLiveSources(resourceID string) (result DomainSourceStatus, res
 		observed, observeErr := htpasswdref.Validate(credential.ExternalPath, gid)
 		if observeErr != nil {
 			return degradedDomainStatus(result, "applied GoAccess htpasswd unsafe"), nil
-		}
-		if shaDigest([]byte(credential.ID+"\x00"+credential.ExternalPath)) != bundle.GoAccess.ReferenceIdentity {
-			return degradedDomainStatus(result, "applied GoAccess credential reference changed"), nil
 		}
 		result.GoAccessCredentialID = credential.ID
 		result.GoAccessCredentialFingerprint = observed.Fingerprint

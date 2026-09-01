@@ -107,8 +107,9 @@ func Guard(input GuardInput) GuardDecision {
 			}
 			published := exactPublishedApp(*app, *resource, entry, input.Now)
 			activating := exactActivatingApp(*app, *resource, entry, input.Now)
-			if !published && !activating {
-				return GuardDecision{Reason: "App graph lacks exact published or activating authority"}
+			prior := exactActivationPriorApp(*app, *resource, entry, input.Now)
+			if !published && !activating && !prior {
+				return GuardDecision{Reason: "App graph lacks exact published, activating, or rollback authority"}
 			}
 		default:
 			return GuardDecision{Reason: "disk graph kind is unsupported"}
@@ -143,17 +144,27 @@ func exactPublishedApp(app domain.AppResource, resource safety.ResourceSafety, e
 func exactActivatingApp(app domain.AppResource, resource safety.ResourceSafety, entry Entry, now time.Time) bool {
 	intent := app.PublicationRecord.ActivationIntent
 	active := resource.Reactivating
-	if app.PublicationRecord.State != domain.PublicationActivating || intent == nil || active == nil || resource.ChallengePending != nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || intent.Candidate.Generation != entry.Generation || intent.Candidate.SiteIdentity != entry.Digest || intent.Candidate.Kind != app.Publication.Kind || active.Generation != entry.Generation || active.PlanID != intent.PlanID || active.CandidateDigest != intent.Candidate.ConfigDigest || !challengeSnapshotMatches(active.BaseMarkers, resource) {
+	if !exactReactivationAuthority(app, resource, intent, active) || intent.Candidate.Generation != entry.Generation || intent.Candidate.SiteIdentity != entry.Digest || active.Generation != entry.Generation {
+		return false
+	}
+	return exactEntryBundle(entry, intent.Candidate, nil, now)
+}
+
+func exactActivationPriorApp(app domain.AppResource, resource safety.ResourceSafety, entry Entry, now time.Time) bool {
+	intent := app.PublicationRecord.ActivationIntent
+	active := resource.Reactivating
+	if !exactReactivationAuthority(app, resource, intent, active) || intent.PriorState != domain.PublicationPublished || intent.Prior == nil || intent.Prior.Generation > active.PriorGeneration || intent.Prior.Generation != entry.Generation || intent.Prior.SiteIdentity != entry.Digest {
+		return false
+	}
+	return exactEntryBundle(entry, *intent.Prior, resource.ActiveCertificate, now)
+}
+
+func exactReactivationAuthority(app domain.AppResource, resource safety.ResourceSafety, intent *domain.ActivationIntent, active *safety.Reactivating) bool {
+	if app.PublicationRecord.State != domain.PublicationActivating || intent == nil || active == nil || resource.ChallengePending != nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || intent.Generation != active.Generation || intent.Candidate.Kind != app.Publication.Kind || active.Generation != intent.Candidate.Generation || active.PlanID != intent.PlanID || active.CandidateDigest != intent.Candidate.ConfigDigest || !challengeSnapshotMatches(active.BaseMarkers, resource) {
 		return false
 	}
 	digest, err := publicationBundleDigest(intent.Candidate)
-	if err != nil || digest != active.CandidateBundle || active.TemporaryHTTP != (entry.Kind == EntryTemporary) {
-		return false
-	}
-	if entry.Kind == EntryTemporary {
-		return exactEntryBundle(entry, intent.Candidate, nil, now)
-	}
-	return exactEntryBundle(entry, intent.Candidate, nil, now)
+	return err == nil && digest == active.CandidateBundle && active.TemporaryHTTP == (intent.Candidate.Kind == domain.PublicationTemporaryHTTP)
 }
 
 func exactEntryBundle(entry Entry, bundle domain.PublicationBundle, authority *safety.ActiveCertificateAuthority, now time.Time) bool {

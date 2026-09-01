@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/domain"
@@ -10,13 +11,43 @@ import (
 	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
+	"slices"
 	"time"
 )
+
+func validateClosedRecoveryGenerations(document persist.Document, generations map[string]uint64) error {
+	installation, err := loadInstallationEntries(document.Entries)
+	if err != nil {
+		return err
+	}
+	if len(generations) != len(installation.Resources) {
+		return fmt.Errorf("closed recovery generation inventory does not exactly cover installation Apps")
+	}
+	expected := make(map[string]struct{}, len(installation.Resources))
+	for _, resource := range installation.Resources {
+		if !validIdentityRef(resource.ID) {
+			return fmt.Errorf("closed recovery installation App identity is invalid")
+		}
+		if _, duplicate := expected[resource.ID]; duplicate {
+			return fmt.Errorf("closed recovery installation App identity is duplicated")
+		}
+		expected[resource.ID] = struct{}{}
+	}
+	for id, generation := range generations {
+		if !validIdentityRef(id) || generation == 0 {
+			return fmt.Errorf("closed recovery generation is invalid")
+		}
+		if _, present := expected[id]; !present {
+			return fmt.Errorf("closed recovery generation has an extra App identity")
+		}
+	}
+	return nil
+}
 
 // RecoverClosedInstallation durably projects already-proven closed runtime
 // into normal state. It is resumable at each normal transaction and grants no
 // authority to start a process or reopen ingress.
-func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, exposure *locks.Lease, generations map[string]uint64, closureDigest, safetyDigest string, now time.Time, random io.Reader) error {
+func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, exposure *locks.Lease, generations map[string]uint64, modifiedPaths []string, closureDigest, safetyDigest string, now time.Time, random io.Reader) error {
 	if normal == nil || exposure == nil || exposure.Authority() != normal.LockAuthority() || !exposure.Holds(locks.Exposure) || len(generations) > maximumJournalResources || !exactDigest(closureDigest) || !exactDigest(safetyDigest) || now.IsZero() {
 		return fmt.Errorf("closed recovery authority is incomplete")
 	}
@@ -27,7 +58,10 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 	if err != nil {
 		return err
 	}
-	if changed, err := terminalizeInterruptedContractions(ctx, normal, exposure, document, closureDigest, now); err != nil {
+	if err := validateClosedRecoveryGenerations(document, generations); err != nil {
+		return err
+	}
+	if changed, err := terminalizeInterruptedContractions(ctx, normal, exposure, document, nil, closureDigest, now); err != nil {
 		return err
 	} else if changed {
 		document, err = normal.Read()
@@ -35,7 +69,7 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 			return err
 		}
 	}
-	intent, found, err := pendingClosedRecovery(document)
+	intent, found, err := pendingClosedRecovery(document, closureDigest, safetyDigest)
 	if err != nil {
 		return err
 	}
@@ -94,7 +128,7 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 		if err != nil {
 			return err
 		}
-		intent, _, err = pendingClosedRecovery(document)
+		intent, _, err = pendingClosedRecovery(document, closureDigest, safetyDigest)
 		if err != nil {
 			return err
 		}
@@ -132,7 +166,7 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 		if err != nil {
 			return err
 		}
-		intent, _, err = pendingClosedRecovery(document)
+		intent, _, err = pendingClosedRecovery(document, closureDigest, safetyDigest)
 		if err != nil {
 			return err
 		}
@@ -221,7 +255,7 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 		if err != nil {
 			return err
 		}
-		intent, _, err = pendingClosedRecovery(document)
+		intent, _, err = pendingClosedRecovery(document, closureDigest, safetyDigest)
 		if err != nil {
 			return err
 		}
@@ -266,7 +300,7 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 			if err != nil {
 				return err
 			}
-			record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, Postconditions: []jobs.Postcondition{{Kind: "access_closed", Status: jobs.PostconditionVerified, Identity: closureDigest}}}, now)
+			record, err = jobs.Finish(record, jobs.Completion{Result: jobs.ResultSucceeded, ModifiedPaths: append([]string(nil), modifiedPaths...), Postconditions: []jobs.Postcondition{{Kind: "access_closed", Status: jobs.PostconditionVerified, Identity: closureDigest}}}, now)
 			if err != nil {
 				return err
 			}
@@ -283,12 +317,103 @@ func RecoverClosedInstallation(ctx context.Context, normal *persist.Store, expos
 		return err
 	}
 	if intent.Phase == PhaseTerminal {
+		record, err := jobs.LoadEntries(document.Entries, intent.JobID)
+		if err != nil {
+			return err
+		}
+		expectedPaths := append([]string(nil), modifiedPaths...)
+		slices.Sort(expectedPaths)
+		expectedPaths = slices.Compact(expectedPaths)
+		if len(expectedPaths) == 0 {
+			expectedPaths = append([]string(nil), record.ModifiedPaths...)
+		}
+		if record.Status != jobs.StatusTerminal || record.Result != jobs.ResultSucceeded || len(record.Postconditions) != 1 || record.Postconditions[0].Kind != "access_closed" || record.Postconditions[0].Status != jobs.PostconditionVerified || record.Postconditions[0].Identity != closureDigest || !slices.Equal(record.ModifiedPaths, expectedPaths) {
+			return fmt.Errorf("closed recovery terminal evidence changed")
+		}
 		return nil
 	}
 	return fmt.Errorf("closed recovery is in an unsupported phase")
 }
 
-func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Store, exposure *locks.Lease, document persist.Document, closureDigest string, now time.Time) (bool, error) {
+// ErrContractionReceiptUnbound means a full startup contraction must own the receipt.
+var ErrContractionReceiptUnbound = errors.New("contraction receipt has no exact normal job binding")
+
+func TerminalizeContractionReceipt(ctx context.Context, normal *persist.Store, exposure *locks.Lease, resourceIDs, modifiedPaths []string, closureDigest string, now time.Time) error {
+	if normal == nil || exposure == nil || exposure.Authority() != normal.LockAuthority() || !exposure.Holds(locks.Exposure) || len(resourceIDs) == 0 || len(resourceIDs) > maximumJournalResources || !slices.IsSorted(resourceIDs) || !exactDigest(closureDigest) || now.IsZero() {
+		return fmt.Errorf("contraction receipt terminal authority is incomplete")
+	}
+	document, err := normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := loadInstallationEntries(document.Entries)
+	if err != nil {
+		return err
+	}
+	remaining := make(map[string]bool, len(resourceIDs))
+	for _, resourceID := range resourceIDs {
+		if !validIdentityRef(resourceID) || remaining[resourceID] {
+			return fmt.Errorf("contraction receipt resource scope is invalid")
+		}
+		remaining[resourceID] = true
+	}
+	jobID := ""
+	for _, resource := range installation.Resources {
+		if !remaining[resource.ID] {
+			continue
+		}
+		candidateJobID := ""
+		if resource.PublicationRecord.ContractionIntent != nil {
+			candidateJobID = resource.PublicationRecord.ContractionIntent.JobID
+		} else if resource.PublicationRecord.ActivationIntent != nil {
+			candidateJobID = resource.PublicationRecord.ActivationIntent.JobID
+		}
+		if candidateJobID == "" {
+			return ErrContractionReceiptUnbound
+		}
+		if jobID != "" && jobID != candidateJobID {
+			return fmt.Errorf("contraction receipt binds multiple normal jobs")
+		}
+		jobID = candidateJobID
+		delete(remaining, resource.ID)
+	}
+	if len(remaining) != 0 || jobID == "" {
+		return ErrContractionReceiptUnbound
+	}
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil {
+		return err
+	}
+	switch intent.Operation {
+	case CloseAll:
+		if intent.Target != "installation" {
+			return fmt.Errorf("close-all receipt target changed")
+		}
+	case Unpublish, CertificateExpiry, Publish:
+		if len(resourceIDs) != 1 || intent.Target != "resource/"+resourceIDs[0] {
+			return fmt.Errorf("selective contraction receipt target changed")
+		}
+	default:
+		return fmt.Errorf("contraction receipt operation is unsupported")
+	}
+	expectedPaths := append([]string(nil), modifiedPaths...)
+	slices.Sort(expectedPaths)
+	expectedPaths = slices.Compact(expectedPaths)
+	if intent.Phase == PhaseTerminal {
+		record, err := jobs.LoadEntries(document.Entries, jobID)
+		if err != nil || record.Status != jobs.StatusTerminal || !slices.Equal(record.ModifiedPaths, expectedPaths) {
+			return errors.Join(err, fmt.Errorf("terminal contraction receipt job evidence changed"))
+		}
+		return nil
+	}
+	changed, err := terminalizeInterruptedContractions(ctx, normal, exposure, document, map[string][]string{jobID: expectedPaths}, closureDigest, now)
+	if err != nil || !changed {
+		return errors.Join(err, fmt.Errorf("contraction receipt did not terminalize its exact job"))
+	}
+	return nil
+}
+
+func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Store, exposure *locks.Lease, document persist.Document, modifiedByJob map[string][]string, closureDigest string, now time.Time) (bool, error) {
 	pending := map[string]Reservation{}
 	for _, key := range persist.EntryKeys(document, "intents") {
 		intent, err := loadReservationEntries(document.Entries, key[len("intents/"):])
@@ -296,6 +421,11 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 			return false, err
 		}
 		if (intent.Operation == Unpublish || intent.Operation == CloseAll || intent.Operation == Publish || intent.Operation == CertificateExpiry) && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			if modifiedByJob != nil {
+				if _, selected := modifiedByJob[intent.JobID]; !selected {
+					continue
+				}
+			}
 			pending[intent.JobID] = intent
 		}
 	}
@@ -373,7 +503,7 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 			} else if record.Status != jobs.StatusRunning {
 				return fmt.Errorf("interrupted contraction job state changed")
 			}
-			record, err = jobs.Finish(record, jobs.Completion{Result: result, Postconditions: []jobs.Postcondition{{Kind: conditionKind, Status: jobs.PostconditionKnown, Identity: closureDigest}}, ErrorCode: errorCode}, now)
+			record, err = jobs.Finish(record, jobs.Completion{Result: result, ModifiedPaths: append([]string(nil), modifiedByJob[jobID]...), Postconditions: []jobs.Postcondition{{Kind: conditionKind, Status: jobs.PostconditionKnown, Identity: closureDigest}}, ErrorCode: errorCode}, now)
 			if err != nil {
 				return err
 			}
@@ -446,7 +576,7 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 	return err == nil, err
 }
 
-func pendingClosedRecovery(document persist.Document) (Reservation, bool, error) {
+func pendingClosedRecovery(document persist.Document, closureDigest, safetyDigest string) (Reservation, bool, error) {
 	var result Reservation
 	found := false
 	for _, key := range persist.EntryKeys(document, "intents") {
@@ -454,8 +584,15 @@ func pendingClosedRecovery(document persist.Document) (Reservation, bool, error)
 		if err != nil {
 			return Reservation{}, false, err
 		}
-		if intent.Operation != StartupContraction || intent.Target != "installation" || intent.Phase == PhaseRejected || intent.Phase == PhaseTerminal {
+		if intent.Operation != StartupContraction || intent.Target != "installation" || intent.Phase == PhaseRejected {
 			continue
+		}
+		if intent.Phase == PhaseTerminal {
+			if intent.SafetyDigest != safetyDigest || intent.ContractionDigest != closureDigest || intent.Consumption == nil || intent.Consumption.ConfirmationDigest != closureDigest || intent.Consumption.SafetyDigest != safetyDigest {
+				continue
+			}
+		} else if intent.SafetyDigest != safetyDigest || intent.Consumption != nil && (intent.Consumption.ConfirmationDigest != closureDigest || intent.Consumption.SafetyDigest != safetyDigest) {
+			return Reservation{}, false, fmt.Errorf("active startup closed-recovery authority changed")
 		}
 		if found {
 			return Reservation{}, false, fmt.Errorf("multiple startup closed-recovery intents")

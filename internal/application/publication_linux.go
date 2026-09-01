@@ -411,7 +411,11 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 			return jobs.Record{}, execution.failClosed(ctx, bindingErr)
 		}
 	}
-	result, err := host.Activate(activationCtx, execution.Candidate, execution.Resource.Target)
+	reloadAuthority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+	result := activation.Result{}
+	if err == nil {
+		result, err = host.Activate(activationCtx, execution.Candidate, execution.Resource.Target, reloadAuthority)
+	}
 	if err != nil {
 		if stagedGoAccess != nil {
 			if cleanupErr := goaccessHost.CleanupCandidate(activationCtx, *stagedGoAccess); cleanupErr != nil {
@@ -680,10 +684,7 @@ func (execution *PublicationExecution) failClosed(_ context.Context, cause error
 	contractCtx, cancelContract := context.WithTimeout(context.Background(), time.Minute)
 	defer cancelContract()
 	paths := nginx.FixedPaths()
-	_, auditErr := nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
-	if auditErr == nil {
-		_, _, auditErr = nginx.Contract(contractCtx, paths, filetxn.Owner{UID: 0, GID: 0}, []string{execution.Resource.ID})
-	}
+	_, _, auditErr := nginx.Contract(contractCtx, paths, filetxn.Owner{UID: 0, GID: 0}, []string{execution.Resource.ID})
 	host, hostErr := activation.NewFixedHost()
 	snapshot := closure.RuntimeSnapshot{}
 	reloadErr, stopErr := error(nil), hostErr

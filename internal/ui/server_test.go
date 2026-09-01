@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"lanpanel/internal/application"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/session"
@@ -14,17 +15,38 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 type (
 	verifier      struct{ fp string }
 	normalProfile struct{}
+	gatedVerifier struct {
+		fp                     string
+		entered, release       chan struct{}
+		enterOnce, releaseOnce sync.Once
+	}
 )
 
 func (normalProfile) Current(context.Context) (Profile, error) { return ProfileNormal, nil }
 
 func (v verifier) Verify(context.Context, []byte) (string, error) { return v.fp, nil }
 func (v verifier) Source(context.Context) (string, error)         { return v.fp, nil }
+
+func (v *gatedVerifier) Verify(ctx context.Context, _ []byte) (string, error) {
+	v.enterOnce.Do(func() { close(v.entered) })
+	select {
+	case <-v.release:
+		return v.fp, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+func (v *gatedVerifier) Source(context.Context) (string, error) { return v.fp, nil }
+func (v *gatedVerifier) releaseVerify() {
+	v.releaseOnce.Do(func() { close(v.release) })
+}
 
 type dummyListener struct{}
 
@@ -181,21 +203,23 @@ func TestActionDispatchRejectsRotationAfterRequestValidation(t *testing.T) {
 		close(body.release)
 		t.Fatal("action did not reach post-validation request decoding")
 	}
+	server.actionMu.Lock()
+	var action *actionLease
+	for candidate := range server.actions {
+		action = candidate
+	}
+	server.actionMu.Unlock()
+	if action == nil {
+		close(body.release)
+		t.Fatal("in-flight action lease was not registered")
+	}
 	rotation := make(chan *actionLease, 1)
 	go func() { rotation <- server.beginAction(context.Background(), principal, true) }()
-	deadline := time.Now().Add(time.Second)
-	for {
-		server.actionMu.Lock()
-		pending := server.rotationPending
-		server.actionMu.Unlock()
-		if pending {
-			break
-		}
-		if time.Now().After(deadline) {
-			close(body.release)
-			t.Fatal("exclusive rotation did not select the in-flight action")
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-action.ctx.Done():
+	case <-time.After(time.Second):
+		close(body.release)
+		t.Fatal("exclusive rotation did not select the in-flight action")
 	}
 	close(body.release)
 	select {
@@ -217,6 +241,295 @@ func TestActionDispatchRejectsRotationAfterRequestValidation(t *testing.T) {
 		server.endAction(rotationLease)
 	case <-time.After(time.Second):
 		t.Fatal("exclusive rotation did not acquire after canceled HTTP action exited")
+	}
+}
+
+func TestShutdownFenceRejectsActionAuthenticatedBeforeLeaseRegistration(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := server.config.Sessions.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, server.origin(), "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.stopActions()
+	if !server.config.Sessions.Valid(principal) {
+		t.Fatal("test principal became invalid before the shutdown session boundary")
+	}
+	if lease := server.beginAction(context.Background(), principal, false); lease != nil {
+		server.endAction(lease)
+		t.Fatal("action authenticated before shutdown registered after the terminal action fence")
+	}
+}
+
+func TestRotationPlanDoesNotCancelConcurrentAction(t *testing.T) {
+	server := testServer(t)
+	planInvoked := make(chan struct{})
+	connectorInvoked := make(chan struct{})
+	plan, err := application.RegisterAction(domain.OperationPlan, application.PlanPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		close(planInvoked)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: map[string]string{"plan_id": "plan-fixture"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		close(connectorInvoked)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ConnectorMutationResult{JobID: "job-fixture"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{plan, connector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &gatedRequestBody{entered: make(chan struct{}), release: make(chan struct{}), reader: bytes.NewReader([]byte(`{"control_url":"https://control.example.test"}`))}
+	actionRequest := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/connector_binding_set", body)
+	actionRequest.Header.Set("Origin", server.origin())
+	actionRequest.Header.Set(session.ProofHeader, credentials.Proof)
+	actionRequest.Header.Set(session.CSRFHeader, credentials.CSRF)
+	actionRequest.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	actionWriter := httptest.NewRecorder()
+	actionDone := make(chan struct{})
+	go func() {
+		server.action(actionWriter, actionRequest)
+		close(actionDone)
+	}()
+	select {
+	case <-body.entered:
+	case <-time.After(time.Second):
+		close(body.release)
+		t.Fatal("concurrent action did not reach its synchronization barrier")
+	}
+
+	planRequest := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/admin_token_rotate/plan", strings.NewReader("{}"))
+	planRequest.Header.Set("Origin", server.origin())
+	planRequest.Header.Set(session.ProofHeader, credentials.Proof)
+	planRequest.Header.Set(session.CSRFHeader, credentials.CSRF)
+	planRequest.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	planWriter := httptest.NewRecorder()
+	planDone := make(chan struct{})
+	go func() {
+		server.action(planWriter, planRequest)
+		close(planDone)
+	}()
+	select {
+	case <-planInvoked:
+	case <-time.After(time.Second):
+		close(body.release)
+		<-actionDone
+		t.Fatal("rotation Plan blocked behind the concurrent action")
+	}
+	select {
+	case <-planDone:
+	case <-time.After(time.Second):
+		close(body.release)
+		<-actionDone
+		t.Fatal("rotation Plan did not complete while the concurrent action was active")
+	}
+	if planWriter.Code != http.StatusOK {
+		close(body.release)
+		<-actionDone
+		t.Fatalf("rotation Plan status=%d", planWriter.Code)
+	}
+
+	server.actionMu.Lock()
+	for lease := range server.actions {
+		if lease.ctx.Err() != nil {
+			server.actionMu.Unlock()
+			close(body.release)
+			<-actionDone
+			t.Fatal("rotation Plan canceled the concurrent action")
+		}
+	}
+	server.actionMu.Unlock()
+	close(body.release)
+	select {
+	case <-connectorInvoked:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent action was not dispatched after Plan review")
+	}
+	select {
+	case <-actionDone:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent action did not complete")
+	}
+	if actionWriter.Code != http.StatusOK {
+		t.Fatalf("concurrent action status=%d", actionWriter.Code)
+	}
+}
+
+func TestShutdownTerminatesConcurrentLoginActionAndSocketAuthentication(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := "fp"
+	manager, err := session.New(fingerprint, session.Options{Random: bytes.NewReader(make([]byte, 192))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	credentials, err := manager.Issue("http://"+listener.Addr().String(), fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := manager.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, "http://"+listener.Addr().String(), fingerprint, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actionEntered := make(chan struct{})
+	actionCanceled := make(chan struct{})
+	registration, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(ctx context.Context, _ application.Actor, _ application.Call) (application.Result, error) {
+		close(actionEntered)
+		<-ctx.Done()
+		close(actionCanceled)
+		return application.Result{}, ctx.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := application.New([]application.Registration{registration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyGate := &gatedVerifier{fp: fingerprint, entered: make(chan struct{}), release: make(chan struct{})}
+	defer verifyGate.releaseVerify()
+	server, err := New(Config{Listener: listener, Authority: listener.Addr().String(), InstallationFingerprint: "abcdef", Verifier: verifyGate, Sessions: manager, Profile: normalProfile{}, Actions: actions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve() }()
+
+	requestContext, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	client := &http.Client{}
+	actionRequest, err := http.NewRequestWithContext(requestContext, http.MethodPost, server.origin()+"/api/actions/connector_binding_set", strings.NewReader(`{"control_url":"https://control.example.test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actionRequest.Header.Set("Origin", server.origin())
+	actionRequest.Header.Set(session.ProofHeader, credentials.Proof)
+	actionRequest.Header.Set(session.CSRFHeader, credentials.CSRF)
+	actionRequest.Header.Set("Content-Type", "application/json")
+	actionRequest.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	actionDone := make(chan int, 1)
+	go func() {
+		response, requestErr := client.Do(actionRequest)
+		if requestErr != nil {
+			actionDone <- 0
+			return
+		}
+		defer func() { _ = response.Body.Close() }()
+		actionDone <- response.StatusCode
+	}()
+	select {
+	case <-actionEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("action did not reach its handler")
+	}
+
+	socketHeader := http.Header{}
+	socketHeader.Set("Origin", server.origin())
+	socketHeader.Set("Cookie", session.SelectorCookie+"="+credentials.Selector)
+	dialContext, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+	delayedSocket, _, err := websocket.Dial(dialContext, server.origin()+"/api/events", &websocket.DialOptions{HTTPHeader: socketHeader, Subprotocols: []string{WebSocketSubprotocol}})
+	cancelDial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = delayedSocket.CloseNow() }()
+
+	loginRequest, err := http.NewRequestWithContext(requestContext, http.MethodPost, server.origin()+"/login", strings.NewReader("token=admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginRequest.Header.Set("Origin", server.origin())
+	loginRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginDone := make(chan int, 1)
+	go func() {
+		response, requestErr := client.Do(loginRequest)
+		if requestErr != nil {
+			loginDone <- 0
+			return
+		}
+		defer func() { _ = response.Body.Close() }()
+		loginDone <- response.StatusCode
+	}()
+	select {
+	case <-verifyGate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("login did not reach its verifier barrier")
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- server.Shutdown(shutdownContext) }()
+	select {
+	case <-actionCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not cancel the concurrent action")
+	}
+	if manager.Valid(principal) {
+		t.Fatal("Shutdown left the preexisting principal valid")
+	}
+
+	authContext, cancelAuth := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelAuth()
+	authFrame := []byte(`{"type":"auth","proof":"` + credentials.Proof + `"}`)
+	if err := delayedSocket.Write(authContext, websocket.MessageText, authFrame); err != nil {
+		verifyGate.releaseVerify()
+		t.Fatalf("delayed WebSocket authentication write failed: %v", err)
+	}
+	verifyGate.releaseVerify()
+	_, payload, readErr := delayedSocket.Read(authContext)
+	if readErr == nil {
+		t.Fatalf("WebSocket attached after session closure: %s", payload)
+	}
+	select {
+	case status := <-loginDone:
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("concurrent login status=%d", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent login did not exit after its verifier was released")
+	}
+	select {
+	case status := <-actionDone:
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("canceled action status=%d", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled action request did not exit")
+	}
+	select {
+	case shutdownErr := <-shutdownDone:
+		if shutdownErr != nil {
+			t.Fatal(shutdownErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not complete")
+	}
+	if _, err := manager.Issue(server.origin(), fingerprint); err == nil {
+		t.Fatal("Shutdown permitted a new session")
+	}
+	select {
+	case serveErr := <-serveDone:
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Fatalf("Serve returned %v", serveErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not exit after Shutdown")
 	}
 }
 

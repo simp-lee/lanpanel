@@ -143,7 +143,7 @@ func (executor *LiveExecutor) Observe(ctx context.Context, step string) (PriorOb
 			return PriorObservation{}, fmt.Errorf("clean installation prior state differs from immutable authority")
 		}
 		stagingRoot := remoteStagingRoot(executor.prepared.Input.RunID)
-		if _, err := executor.target.sftp.Lstat(stagingRoot); err == nil || !os.IsNotExist(err) {
+		if _, err := executor.target.sftpLstat(ctx, stagingRoot); err == nil || !os.IsNotExist(err) {
 			return PriorObservation{}, fmt.Errorf("qualification staging prior state is not absent")
 		}
 	} else {
@@ -152,7 +152,7 @@ func (executor *LiveExecutor) Observe(ctx context.Context, step string) (PriorOb
 		}
 		switch step {
 		case "ui_startup_session_restart":
-			if _, err := executor.target.readRemoteRegular("/var/lib/lanpanel/bootstrap-commit.json", 4<<20); err != nil {
+			if _, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/bootstrap-commit.json", 4<<20); err != nil {
 				return PriorObservation{}, err
 			}
 		case "local_http_websocket":
@@ -165,7 +165,7 @@ func (executor *LiveExecutor) Observe(ctx context.Context, step string) (PriorOb
 			}
 		case "domain_https_controls":
 			for _, base := range []string{"/srv/lanpanel-qualification", "/etc/lanpanel-qualification"} {
-				if _, err := executor.target.sftp.Lstat(base); err == nil || !os.IsNotExist(err) {
+				if _, err := executor.target.sftpLstat(ctx, base); err == nil || !os.IsNotExist(err) {
 					return PriorObservation{}, fmt.Errorf("qualification fixture base prior state is not absent")
 				}
 			}
@@ -231,18 +231,21 @@ func (executor *LiveExecutor) Execute(ctx context.Context, step string) (Mutatio
 	return executor.executeStep(ctx, step)
 }
 
-func (executor *LiveExecutor) Recover(_ context.Context, step string) (MutationObservation, error) {
+func (executor *LiveExecutor) Recover(ctx context.Context, step string) (MutationObservation, error) {
 	if step != "clean_install" {
 		if executor.state.RunID == executor.prepared.Input.RunID && executor.recoverableStepState(step) {
 			return MutationObservation{Identity: "step/" + step + "/" + executor.prepared.Input.RunID, Evidence: []byte("recovered exact live step state")}, nil
 		}
 		return MutationObservation{}, fmt.Errorf("live executor cannot recover an exact identity for submitted step %q", step)
 	}
-	if _, err := executor.target.sftp.Lstat("/var/lib/lanpanel/bootstrap-commit.json"); err == nil {
+	if err := executor.ensureTarget(ctx); err != nil {
+		return MutationObservation{}, err
+	}
+	if _, err := executor.target.sftpLstat(ctx, "/var/lib/lanpanel/bootstrap-commit.json"); err == nil {
 		return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: []byte("recovered committed qualification installation")}, nil
 	}
 	root := remoteStagingRoot(executor.prepared.Input.RunID)
-	if _, err := executor.target.sftp.Lstat(root); err == nil {
+	if _, err := executor.target.sftpLstat(ctx, root); err == nil {
 		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: []byte("recovered qualification staging")}, nil
 	}
 	return MutationObservation{}, fmt.Errorf("clean installation submitted state has no exact recoverable identity")
@@ -253,22 +256,25 @@ func (executor *LiveExecutor) Cleanup(ctx context.Context, step string, observat
 		if policy != "retain_authorized" {
 			return "", fmt.Errorf("clean installation cleanup policy changed")
 		}
+		if err := executor.ensureTarget(ctx); err != nil {
+			return "", err
+		}
 		files, err := executor.remoteStagingFiles()
 		if err != nil {
 			return "", err
 		}
 		root := remoteStagingRoot(executor.prepared.Input.RunID)
-		if _, err := executor.target.sftp.Lstat(root); err == nil {
-			if err := executor.target.RemoveStaging(root, files); err != nil {
+		if _, err := executor.target.sftpLstat(ctx, root); err == nil {
+			if err := executor.target.RemoveStaging(ctx, root, files); err != nil {
 				return "", err
 			}
 		} else if !os.IsNotExist(err) {
 			return "", err
 		}
-		if _, err := executor.target.sftp.Lstat("/var/lib/lanpanel-qualification"); err == nil || !os.IsNotExist(err) {
+		if _, err := executor.target.sftpLstat(ctx, "/var/lib/lanpanel-qualification"); err == nil || !os.IsNotExist(err) {
 			return "", fmt.Errorf("qualification staging base remains after cleanup")
 		}
-		if _, err := executor.target.readRemoteRegular("/var/lib/lanpanel/bootstrap-commit.json", 4<<20); err != nil {
+		if _, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/bootstrap-commit.json", 4<<20); err != nil {
 			return "", fmt.Errorf("authorized qualification installation is not durably retained: %w", err)
 		}
 		return release.CleanupRetained, ctx.Err()
@@ -314,11 +320,11 @@ func (executor *LiveExecutor) Attest(_ context.Context, report release.LiveClean
 }
 
 func (executor *LiveExecutor) executeCleanInstall(ctx context.Context) (MutationObservation, error) {
-	root, err := executor.target.PrepareStaging(executor.prepared.Input.RunID)
+	root, err := executor.target.PrepareStaging(ctx, executor.prepared.Input.RunID)
 	if err != nil {
 		return MutationObservation{}, err
 	}
-	candidatePath, err := executor.target.UploadStagingFile(root, "lanpanel", executor.prepared.CandidateBytes, 0o500)
+	candidatePath, err := executor.target.UploadStagingFile(ctx, root, "lanpanel", executor.prepared.CandidateBytes, 0o500)
 	if err != nil {
 		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID}, err
 	}
@@ -328,7 +334,7 @@ func (executor *LiveExecutor) executeCleanInstall(ctx context.Context) (Mutation
 	}
 	remoteAssets := map[string]string{"lanpanel": candidatePath}
 	for name, data := range assetBytes {
-		path, uploadErr := executor.target.UploadStagingFile(root, "assets/"+name, data, 0o400)
+		path, uploadErr := executor.target.UploadStagingFile(ctx, root, "assets/"+name, data, 0o400)
 		if uploadErr != nil {
 			return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID}, uploadErr
 		}

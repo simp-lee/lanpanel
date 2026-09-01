@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"lanpanel/internal/basic"
@@ -48,6 +49,13 @@ func (value *basicExecution) Close() error {
 		err = errors.Join(err, value.service.Close())
 	}
 	return err
+}
+
+func finalizeManagedBasic(resultErr *error, password []byte, closeExecution func() error) {
+	*resultErr = errors.Join(*resultErr, closeExecution())
+	if *resultErr != nil {
+		clear(password)
+	}
 }
 
 func (value *basicExecution) completeNoEffect(ctx context.Context, condition jobs.Postcondition, code string, cause error) (jobs.Record, error) {
@@ -220,6 +228,14 @@ func newCredentialID() (string, error) {
 	return "cred_" + hex.EncodeToString(raw), nil
 }
 
+func managedBasicCredentialBinding(credential domain.Credential) (string, error) {
+	raw, err := json.Marshal(credential)
+	if err != nil {
+		return "", err
+	}
+	return shaDigest(raw), nil
+}
+
 func basicCredential(installation domain.Installation, credentialID string) (domain.Credential, error) {
 	for _, credential := range installation.Credentials {
 		if credential.ID == credentialID && credential.Kind == "managed_basic" {
@@ -253,18 +269,14 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	if err != nil {
 		return result, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
-	password, err := basic.NewPassword()
+	var password []byte
+	defer func() { finalizeManagedBasic(&resultErr, password, execution.Close) }()
+	password, err = basic.NewPassword()
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_created", Status: jobs.PostconditionVerified, Identity: credentialID}, "managed_basic_generation_failed", err)
 		result.Job = completed
 		return result, terminalErr
 	}
-	defer func() {
-		if resultErr != nil {
-			clear(password)
-		}
-	}()
 	if err := execution.reserveHTPasswdChild(ctx, username, password); err != nil {
 		return result, err
 	}
@@ -284,6 +296,15 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	}
 	defer clear(generated.Record)
 	path := basic.Path(credentialID)
+	credential := domain.Credential{ID: credentialID, Kind: "managed_basic", OwnerResourceID: resourceID, Username: username, ManagedPath: path, Fingerprint: generated.Fingerprint}
+	candidateBinding, err := managedBasicCredentialBinding(credential)
+	if err != nil {
+		return result, err
+	}
+	if err := execution.admitter.BindOperationIdentity(ctx, execution.mutation, execution.exposure, execution.revision, execution.job.ID, candidateBinding); err != nil {
+		return result, err
+	}
+	execution.revision++
 	journal := BasicJournal{SchemaVersion: basicJournalSchema, JobID: execution.job.ID, Operation: "create", CredentialID: credentialID, ResourceID: resourceID, Username: username, Path: path, CandidateFingerprint: generated.Fingerprint}
 	if err := writeBasicJournal(ctx, journal); err != nil {
 		return result, err
@@ -296,7 +317,6 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	if err != nil || stored != path {
 		return result, fmt.Errorf("managed Basic path changed: %w", err)
 	}
-	credential := domain.Credential{ID: credentialID, Kind: "managed_basic", OwnerResourceID: resourceID, Username: username, ManagedPath: path, Fingerprint: generated.Fingerprint}
 	if err := execution.admitter.CommitManagedBasicCreate(ctx, execution.mutation, execution.exposure, execution.revision, execution.job.ID, credential); err != nil {
 		return result, err
 	}
@@ -331,7 +351,8 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 	if err != nil {
 		return result, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
+	var password []byte
+	defer func() { finalizeManagedBasic(&resultErr, password, execution.Close) }()
 	lockedInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_rotated", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "managed_basic_revalidation_failed", err)
@@ -345,17 +366,12 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 		return result, terminalErr
 	}
 	credential = lockedCredential
-	password, err := basic.NewPassword()
+	password, err = basic.NewPassword()
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_rotated", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "managed_basic_generation_failed", err)
 		result = ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: credential.Fingerprint}
 		return result, terminalErr
 	}
-	defer func() {
-		if resultErr != nil {
-			clear(password)
-		}
-	}()
 	if err := execution.reserveHTPasswdChild(ctx, credential.Username, password); err != nil {
 		return result, err
 	}
@@ -374,6 +390,16 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 		return result, errors.Join(hashErr, completeErr)
 	}
 	defer clear(generated.Record)
+	candidateCredential := credential
+	candidateCredential.Fingerprint = generated.Fingerprint
+	candidateBinding, err := managedBasicCredentialBinding(candidateCredential)
+	if err != nil {
+		return result, err
+	}
+	if err := execution.admitter.BindOperationIdentity(ctx, execution.mutation, execution.exposure, execution.revision, execution.job.ID, candidateBinding); err != nil {
+		return result, err
+	}
+	execution.revision++
 	journal := BasicJournal{SchemaVersion: basicJournalSchema, JobID: execution.job.ID, Operation: "rotate", CredentialID: credentialID, ResourceID: credential.OwnerResourceID, Username: credential.Username, Path: credential.ManagedPath, PriorFingerprint: credential.Fingerprint, CandidateFingerprint: generated.Fingerprint}
 	if err := writeBasicJournal(ctx, journal); err != nil {
 		return result, err

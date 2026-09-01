@@ -93,6 +93,7 @@ func RunRole(args []string) error {
 		recordRecovery(hostErr)
 	}
 	recordRecovery(reconcileStartupContraction(context.Background()))
+	recordRecovery(application.ReconcileTerminalNginxContraction(context.Background()))
 	var tokenMu sync.Mutex
 	contractionPlans := newEmergencyPlanStore()
 	applicationHandler := ApplicationPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {

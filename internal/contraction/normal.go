@@ -290,7 +290,14 @@ func (authority *NormalAuthority) UpdateStopObservation(ctx context.Context, sna
 	return nil
 }
 
-func (authority *NormalAuthority) FinalizeClosure(ctx context.Context, inventory closure.Inventory, closureDigest string) error {
+func (authority *NormalAuthority) FinalizeClosure(_ context.Context, inventory closure.Inventory, _ string, _ []string) error {
+	if inventory.Digest != authority.InventoryDigest {
+		return fmt.Errorf("normal closure inventory changed")
+	}
+	return nil
+}
+
+func (authority *NormalAuthority) ConvergeClosure(ctx context.Context, inventory closure.Inventory, closureDigest string) error {
 	if inventory.Digest != authority.InventoryDigest {
 		return fmt.Errorf("normal closure inventory changed")
 	}

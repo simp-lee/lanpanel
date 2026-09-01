@@ -61,6 +61,7 @@ type Server struct {
 	actionMu        sync.Mutex
 	actions         map[*actionLease]struct{}
 	rotationPending bool
+	shuttingDown    bool
 }
 type actionLease struct {
 	principal session.Principal
@@ -74,7 +75,7 @@ type socket struct {
 }
 
 func (s *socket) Close() error {
-	return s.connection.Close(websocket.StatusPolicyViolation, "session invalidated")
+	return s.connection.CloseNow()
 }
 
 func (s *socket) Write(ctx context.Context, payload []byte) error {
@@ -96,7 +97,7 @@ func (s *Server) beginAction(parent context.Context, principal session.Principal
 	ctx, cancel := context.WithCancel(parent)
 	lease := &actionLease{principal: principal, ctx: ctx, cancel: cancel, exclusive: exclusive}
 	s.actionMu.Lock()
-	if s.rotationPending {
+	if s.shuttingDown || s.rotationPending {
 		s.actionMu.Unlock()
 		cancel()
 		return nil
@@ -166,6 +167,15 @@ func (s *Server) cancelActions(principal *session.Principal, except *actionLease
 	}
 }
 
+func (s *Server) stopActions() {
+	s.actionMu.Lock()
+	defer s.actionMu.Unlock()
+	s.shuttingDown = true
+	for lease := range s.actions {
+		lease.cancel()
+	}
+}
+
 func (s *Server) sessionJSON(writer http.ResponseWriter, principal session.Principal, payload any) bool {
 	s.barrier.RLock()
 	defer s.barrier.RUnlock()
@@ -190,6 +200,7 @@ func (s *Server) sessionStatusJSON(writer http.ResponseWriter, principal session
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopActions()
 	s.config.Sessions.Close()
 	return s.http.Shutdown(ctx)
 }
@@ -515,7 +526,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
-	lease := s.beginAction(request.Context(), principal, operation == domain.OperationAdminTokenRotate)
+	lease := s.beginAction(request.Context(), principal, operation == domain.OperationAdminTokenRotate && !planRoute)
 	if lease == nil {
 		s.barrier.RLock()
 		valid := s.config.Sessions.Valid(principal)

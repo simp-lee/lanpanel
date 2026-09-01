@@ -288,7 +288,7 @@ func (service *Service) verifyCurrentAuthority(plan Plan) error {
 	if service.auditor == nil {
 		return fmt.Errorf("package release authority verifier is unavailable")
 	}
-	binary, _, err := service.auditor.readFileAndStat(child.FixedLanPanelExecutable, 256<<20)
+	binary, _, err := service.auditor.readFileAndStat(child.FixedLanPanelExecutable, filetxn.MaximumContentBytes)
 	if err != nil {
 		return err
 	}

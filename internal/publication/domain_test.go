@@ -90,6 +90,20 @@ func TestGoAccessCandidateUsesIndependentBasicAndCredentialCleanWebSocket(t *tes
 	if candidate.Bundle.DomainHTTPS.GoAccess.DatabasePath == candidate.Bundle.DomainHTTPS.GoAccess.ReportPath {
 		t.Fatal("GoAccess state identities collapsed")
 	}
+	changedFingerprint := "sha256:" + strings.Repeat("b", 64)
+	changedCandidate, err := PrepareDomain(resource, 2, certificate, "", "", "/srv/goaccess.htpasswd", changedFingerprint, nil, &goaccessCandidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Bundle.DomainHTTPS.GoAccess.ReferenceIdentity == changedCandidate.Bundle.DomainHTTPS.GoAccess.ReferenceIdentity {
+		t.Fatal("GoAccess credential fingerprint did not change reference identity")
+	}
+	if candidate.Bundle.DomainHTTPS.GoAccess.RouteIdentity == changedCandidate.Bundle.DomainHTTPS.GoAccess.RouteIdentity || candidate.Entry.Domain.GoAccess.Identity == changedCandidate.Entry.Domain.GoAccess.Identity {
+		t.Fatal("GoAccess credential fingerprint did not change route identity")
+	}
+	if candidate.BundleDigest == changedCandidate.BundleDigest {
+		t.Fatal("GoAccess credential fingerprint did not change bundle digest")
+	}
 }
 
 func TestGoAccessReenableReusesRetainedStateWhileRetiringOldUnits(t *testing.T) {
@@ -137,10 +151,21 @@ func TestDomainCandidateBindsTLSAuthStaticAndWebSocket(t *testing.T) {
 			t.Fatalf("render missing %q", required)
 		}
 	}
-	referenceSum := sha256.Sum256([]byte(resource.Publication.DomainHTTPS.CredentialID + "\x00/var/lib/lanpanel/credentials/basic/app.htpasswd"))
+	referenceSum := sha256.Sum256([]byte(resource.Publication.DomainHTTPS.CredentialID + "\x00/var/lib/lanpanel/credentials/basic/app.htpasswd\x00" + digest))
 	expectedReference := "sha256:" + hex.EncodeToString(referenceSum[:])
 	if candidate.Bundle.DomainHTTPS.Auth.ReferenceIdentity != expectedReference {
 		t.Fatal("credential content fingerprint was not bound")
+	}
+	changedFingerprint := "sha256:" + strings.Repeat("b", 64)
+	changedCandidate, err := PrepareDomain(resource, 2, certificate, "/var/lib/lanpanel/credentials/basic/app.htpasswd", changedFingerprint, "", "", []nginx.StaticRoute{{URLPath: "/robots.txt", RelativePath: "robots.txt", SourcePath: "/srv/static/robots.txt", Identity: digest}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Bundle.DomainHTTPS.Auth.ReferenceIdentity == changedCandidate.Bundle.DomainHTTPS.Auth.ReferenceIdentity {
+		t.Fatal("Basic credential fingerprint did not change reference identity")
+	}
+	if candidate.BundleDigest == changedCandidate.BundleDigest {
+		t.Fatal("Basic credential fingerprint did not change bundle digest")
 	}
 	if candidate.CertificatePointer == nil || candidate.CertificatePointer.CandidateIdentity != certificatePointerBundleIdentity(certificate) || len(candidate.OwnershipListeners) != 0 {
 		t.Fatalf("candidate authority incomplete")

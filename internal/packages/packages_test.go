@@ -192,7 +192,7 @@ func TestPackageTransactionJournalsMasksMonitorsAndUsesTypedChild(t *testing.T) 
 	if !reflect.DeepEqual(monitor.units, []string{"nginx.service"}) || !reflect.DeepEqual(monitor.listeners, []string{"tcp/443", "tcp/80"}) {
 		t.Fatalf("monitor units=%v listeners=%v", monitor.units, monitor.listeners)
 	}
-	wantPhases := []JournalPhase{JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasking, JournalMasksApplied, JournalChildSubmitted, JournalChildTerminal, JournalVerified, JournalCommitted, JournalCleaned}
+	wantPhases := []JournalPhase{JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasking, JournalMasking, JournalMasksApplied, JournalChildSubmitted, JournalChildTerminal, JournalVerified, JournalCommitted, JournalCleaned}
 	if !slices.Equal(journals.phases, wantPhases) {
 		t.Fatalf("journal phases=%v want=%v", journals.phases, wantPhases)
 	}
@@ -399,6 +399,23 @@ func TestPackageResumeMaskingAllowsOnlyPersistedMaskRuntimeDifference(t *testing
 		}
 	})
 
+	t.Run("durable created-mask intent", func(t *testing.T) {
+		executor := newFakeExecutor(plan)
+		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, nil)
+		journal.MaskIntent = "nginx.service"
+		if err := ValidateJournal(journal); err != nil {
+			t.Fatal(err)
+		}
+		executor.audit.Before.Units[0].Masked = true
+		current := journal
+		journals := &memoryJournals{current: &current}
+		engine, result := testEngine(journals, executor, &fakeMonitor{})
+		resumed, err := engine.Resume(context.Background(), plan, result, journal)
+		if err == nil || resumed.Phase != JournalMasking || len(resumed.Masks) != 0 || resumed.MaskIntent != "nginx.service" {
+			t.Fatalf("ambiguous durable mask intent did not fail closed: journal=%#v err=%v", resumed, err)
+		}
+	})
+
 	t.Run("missing persisted effect", func(t *testing.T) {
 		executor := newFakeExecutor(plan)
 		journal := testJournal(t, plan, executor.audit.Before, JournalMasking, []MaskIdentity{identity})
@@ -471,10 +488,15 @@ func TestPackageMaskCallbackRequiresExactUnitPrefix(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			executor := newFakeExecutor(plan)
-			executor.maskFunc = func(_ []string, persist func(MaskIdentity) error) (MaskResult, error) {
+			executor.maskFunc = func(_ []string, _ string, persistIntent func(string) error, persistIdentity func(MaskIdentity) error) (MaskResult, error) {
 				persisted := []MaskIdentity{}
 				for _, identity := range test.callbacks {
-					if err := persist(identity); err != nil {
+					if !identity.Preexisting {
+						if err := persistIntent(identity.Unit); err != nil {
+							return MaskResult{Masks: persisted}, err
+						}
+					}
+					if err := persistIdentity(identity); err != nil {
 						return MaskResult{Masks: persisted}, err
 					}
 					persisted = append(persisted, identity)
@@ -514,9 +536,12 @@ func TestPackageMaskResultMustEqualPersistedIdentities(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			executor := newFakeExecutor(plan)
-			executor.maskFunc = func(_ []string, persist func(MaskIdentity) error) (MaskResult, error) {
+			executor.maskFunc = func(_ []string, _ string, persistIntent func(string) error, persistIdentity func(MaskIdentity) error) (MaskResult, error) {
 				for _, identity := range recorded {
-					if err := persist(identity); err != nil {
+					if err := persistIntent(identity.Unit); err != nil {
+						return MaskResult{}, err
+					}
+					if err := persistIdentity(identity); err != nil {
 						return MaskResult{}, err
 					}
 				}
@@ -533,6 +558,30 @@ func TestPackageMaskResultMustEqualPersistedIdentities(t *testing.T) {
 				t.Fatalf("exact persisted mask journal was not retained: %#v", journals.current)
 			}
 		})
+	}
+}
+
+func TestCreatedMaskJournalRequiresDurableIntentBeforeIdentity(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	before := testJournal(t, plan, executor.audit.Before, JournalMasking, nil)
+	identity := MaskIdentity{Unit: "nginx.service", Device: 1, Inode: 1, CTimeSec: 1}
+
+	direct := before
+	direct.Masks = []MaskIdentity{identity}
+	if err := ValidateJournalTransition(before, direct); err == nil {
+		t.Fatal("created mask identity was journaled without prior durable intent")
+	}
+	intended := before
+	intended.MaskIntent = identity.Unit
+	if err := ValidateJournalTransition(before, intended); err != nil {
+		t.Fatalf("exact created mask intent transition failed: %v", err)
+	}
+	completed := intended
+	completed.MaskIntent = ""
+	completed.Masks = []MaskIdentity{identity}
+	if err := ValidateJournalTransition(intended, completed); err != nil {
+		t.Fatalf("exact intended mask identity transition failed: %v", err)
 	}
 }
 
@@ -765,7 +814,7 @@ type fakeExecutor struct {
 	unmasked     []string
 	unmaskCalls  [][]MaskIdentity
 	verifyCalls  [][]MaskIdentity
-	maskFunc     func([]string, func(MaskIdentity) error) (MaskResult, error)
+	maskFunc     func([]string, string, func(string) error, func(MaskIdentity) error) (MaskResult, error)
 	runErr       error
 	prepareCount int
 	stageCount   int
@@ -821,23 +870,36 @@ func (executor *fakeExecutor) Resolve(_ context.Context, plan Plan) ([]Package, 
 	return clonePackages(plan.Packages), nil
 }
 
-func (executor *fakeExecutor) Mask(_ context.Context, units []string, persist func(MaskIdentity) error) (MaskResult, error) {
+func (executor *fakeExecutor) Mask(_ context.Context, units []string, pendingIntent string, persistIntent func(string) error, persistIdentity func(MaskIdentity) error) (MaskResult, error) {
 	executor.maskCount++
 	if executor.maskFunc != nil {
-		return executor.maskFunc(units, persist)
+		return executor.maskFunc(units, pendingIntent, persistIntent, persistIdentity)
 	}
 	identities := make([]MaskIdentity, 0, len(units))
+	if pendingIntent != "" {
+		index := slices.IndexFunc(executor.audit.Before.Units, func(unit UnitState) bool { return unit.Name == pendingIntent })
+		if index >= 0 && executor.audit.Before.Units[index].Masked {
+			return MaskResult{}, fmt.Errorf("package mask intent lacks an exact created-inode identity")
+		}
+	}
 	for _, unit := range units {
 		index := slices.IndexFunc(executor.audit.Before.Units, func(state UnitState) bool { return state.Name == unit })
 		if index < 0 {
 			return MaskResult{Masks: identities}, fmt.Errorf("unknown fake unit %q", unit)
 		}
-		identity := MaskIdentity{Unit: unit, Preexisting: executor.audit.Before.Units[index].Masked, Device: 1, Inode: uint64(index + 1), CTimeSec: 1}
+		preexisting := executor.audit.Before.Units[index].Masked && pendingIntent == ""
+		if !preexisting && pendingIntent == "" {
+			if err := persistIntent(unit); err != nil {
+				return MaskResult{Masks: identities}, err
+			}
+		}
+		identity := MaskIdentity{Unit: unit, Preexisting: preexisting, Device: 1, Inode: uint64(index + 1), CTimeSec: 1}
 		executor.audit.Before.Units[index].Masked = true
-		if err := persist(identity); err != nil {
+		if err := persistIdentity(identity); err != nil {
 			return MaskResult{Masks: identities}, err
 		}
 		identities = append(identities, identity)
+		pendingIntent = ""
 	}
 	return MaskResult{Masks: identities}, nil
 }

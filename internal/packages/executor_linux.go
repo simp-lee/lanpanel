@@ -69,11 +69,11 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 	return resolved, nil
 }
 
-func (executor *HostExecutor) Mask(ctx context.Context, units []string, persist func(MaskIdentity) error) (MaskResult, error) {
+func (executor *HostExecutor) Mask(ctx context.Context, units []string, pendingIntent string, persistIntent func(string) error, persistIdentity func(MaskIdentity) error) (MaskResult, error) {
 	if executor == nil || executor.Masks == nil || executor.Auditor == nil {
 		return MaskResult{}, fmt.Errorf("package mask controller or PID 1 verifier is unavailable")
 	}
-	result, err := executor.Masks.Mask(ctx, units, persist)
+	result, err := executor.Masks.Mask(ctx, units, pendingIntent, persistIntent, persistIdentity)
 	if err != nil {
 		return result, err
 	}

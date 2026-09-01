@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestClosedGraphRejectsForeignFilesAndContractsWithoutRestore(t *testing.T) 
 		t.Fatal(err)
 	}
 	contracted, removed, err := Contract(context.Background(), paths, owner, []string{"app-one"})
-	if err != nil || len(contracted.Entries) != 0 || len(removed) != 1 {
+	if err != nil || len(contracted.Entries) != 0 || len(removed) != 2 || !slices.Contains(removed, paths.ManifestPath()) {
 		t.Fatalf("Contract()=%#v,%v,%v", contracted, removed, err)
 	}
 	if _, err := os.Lstat(filepath.Join(paths.ConfigRoot, manifest.Entries[0].Relative)); !errors.Is(err, os.ErrNotExist) {

@@ -249,6 +249,17 @@ func reconcileManagedBasicJournal(ctx context.Context, path string) error {
 	if intent.Operation != expectedOperation || intent.Target != target || journal.Operation != "create" && intent.SafetyBinding.PriorFingerprint != journal.PriorFingerprint || journal.Operation == "create" && intent.SafetyBinding.PriorFingerprint != "" {
 		return fmt.Errorf("managed Basic recovery intent changed")
 	}
+	if journal.Operation == "delete" {
+		if intent.OperationBinding != "" {
+			return fmt.Errorf("managed Basic delete carried candidate binding")
+		}
+	} else {
+		candidate := managedBasicJournalCredential(journal, journal.CandidateFingerprint)
+		binding, bindingErr := managedBasicCredentialBinding(candidate)
+		if bindingErr != nil || intent.OperationBinding != binding {
+			return errors.Join(bindingErr, fmt.Errorf("managed Basic recovery candidate binding changed"))
+		}
+	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		return err

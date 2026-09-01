@@ -785,7 +785,7 @@ func certificateExpirySafetyClosed(state safety.State, resourceID string, genera
 	return false
 }
 
-func finishExpiredCertificateContraction(ctx context.Context, service *FixedService, exposure *locks.Lease, authority *contraction.NormalAuthority, installation domain.Installation, resourceID, jobID string, result contraction.Result, runErr error) error {
+func finishExpiredCertificateContraction(ctx context.Context, service *FixedService, exposure *locks.Lease, authority *contraction.NormalAuthority, inventory closure.Inventory, installation domain.Installation, resourceID, jobID string, result contraction.Result, runErr error) error {
 	goaccessGenerations := goAccessContractionInventory(installation, []string{resourceID})
 	result, runErr, cleanupComplete := stopGoAccessAfterClosure(ctx, goaccessGenerations, result, runErr)
 	if cleanupComplete {
@@ -801,9 +801,22 @@ func finishExpiredCertificateContraction(ctx context.Context, service *FixedServ
 	if !cleanupComplete && !result.AccessClosed {
 		return runErr
 	}
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	_, recoveredPaths, recoveryErr := nginx.Contract(recoveryCtx, nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, []string{resourceID})
+	cancelRecovery()
+	if recoveryErr != nil {
+		return errors.Join(runErr, recoveryErr)
+	}
+	result.ModifiedPaths = append(result.ModifiedPaths, recoveredPaths...)
 	_, completeErr := contraction.CompleteNormal(ctx, authority, result)
 	if completeErr != nil {
 		return errors.Join(runErr, completeErr)
+	}
+	if acknowledgeErr := nginx.AcknowledgeContraction(context.WithoutCancel(ctx), nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, []string{resourceID}); acknowledgeErr != nil {
+		return errors.Join(runErr, acknowledgeErr)
+	}
+	if convergeErr := authority.ConvergeClosure(context.WithoutCancel(ctx), inventory, result.ClosureDigest); convergeErr != nil {
+		return errors.Join(runErr, convergeErr)
 	}
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 		return nil
@@ -1088,7 +1101,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 			authority.InventoryDigest = closureDigest
 		}
 		closed := contraction.Result{Outcome: contraction.OutcomeSucceeded, AccessClosed: true, ClosureDigest: closureDigest}
-		return finishExpiredCertificateContraction(ctx, service, exposure, authority, installation, resourceID, job.ID, closed, nil)
+		return finishExpiredCertificateContraction(ctx, service, exposure, authority, inventory, installation, resourceID, job.ID, closed, nil)
 	}
 	runtime, err := contraction.FixedHost(inventory)
 	if err != nil {
@@ -1098,7 +1111,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 		}
 	}
 	contractionResult, runErr := (contraction.Engine{Authority: authority, Runtime: runtime}).Run(ctx, inventory)
-	return finishExpiredCertificateContraction(ctx, service, exposure, authority, installation, resourceID, job.ID, contractionResult, runErr)
+	return finishExpiredCertificateContraction(ctx, service, exposure, authority, inventory, installation, resourceID, job.ID, contractionResult, runErr)
 }
 
 func cleanupCertificateSetup(ctx context.Context, service *FixedService, admitter *operations.Admitter, jobID, resourceID string, prepared challenge.Prepared, childRecords []operations.ChildRecord) error {
