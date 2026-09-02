@@ -40,7 +40,31 @@ func FixedHost(inventory closure.Inventory) (Host, error) {
 		}
 	}
 	observer := closure.ProcObserver{UnitCgroup: "/system.slice/lanpanel-nginx.service", Executable: "/usr/sbin/nginx", ExpectedArgv: "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;", PIDPath: paths.PIDPath, Generation: manifest.GenerationID, OwnedListeners: inventoryListeners(inventory)}
-	return Host{Launcher: launcher, Paths: paths, Owner: filetxn.Owner{UID: 0, GID: 0}, Observer: observer, Probe: closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: paths.AuditPath}}, nil
+	return Host{Launcher: launcher, Paths: paths, Owner: filetxn.Owner{UID: 0, GID: 0}, Observer: observer, Probe: closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: paths.AuditPath, TargetObserved: targetClosureObserver(paths, owner)}}, nil
+}
+
+// targetClosureObserver conservatively treats any remaining App graph entry
+// for the probed domain as possible target access. The fixed rejection
+// response is only sufficient after the fresh graph audit also shows that no
+// release-owned App route can forward the correlation request.
+func targetClosureObserver(paths nginx.Paths, owner filetxn.Owner) func(context.Context, closure.Inventory, string, string) (bool, error) {
+	return func(_ context.Context, _ closure.Inventory, domainName, _ string) (bool, error) {
+		manifest, err := nginx.Audit(paths, owner)
+		if err != nil {
+			return false, err
+		}
+		for _, entry := range manifest.Entries {
+			if entry.Kind != nginx.EntryApp {
+				continue
+			}
+			for _, value := range entry.Domains {
+				if value == domainName {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
 }
 
 type Host struct {

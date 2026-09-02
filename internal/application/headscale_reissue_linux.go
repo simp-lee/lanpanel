@@ -477,7 +477,7 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 					return fenceRollback(err)
 				}
 				inventory := closure.Inventory{Complete: true, Digest: priorActivation.Digest, Identities: []closure.Identity{{ResourceID: "headscale", Kind: closure.IdentityDomain, Value: controlJournal.Candidate.ControlDomain, Digest: priorActivation.Entry.Digest}}}
-				probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: nginx.FixedPaths().AuditPath}
+				probe := closure.NegativeProbe{TLSAddress: "127.0.0.1:443", DefaultCertFingerprint: manifest.DefaultCertFingerprint, AuditPath: nginx.FixedPaths().AuditPath, TargetObserved: func(context.Context, closure.Inventory, string, string) (bool, error) { return false, nil }}
 				if _, err := probe.Run(ctx, inventory); err != nil {
 					return fenceRollback(err)
 				}
