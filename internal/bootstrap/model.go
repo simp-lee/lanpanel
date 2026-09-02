@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	JournalSchemaVersion = "lanpanel.bootstrap.journal.v2"
-	BundleSchemaVersion  = "lanpanel.installation.bundle.v2"
-	CommitSchemaVersion  = "lanpanel.bootstrap.commit.v1"
-	MaximumJournalBytes  = 4 << 20
+	JournalSchemaVersion             = "lanpanel.bootstrap.journal.v3"
+	BundleSchemaVersion              = "lanpanel.installation.bundle.v2"
+	CommitSchemaVersion              = "lanpanel.bootstrap.commit.v1"
+	MaximumJournalBytes              = 4 << 20
+	maximumPublicInstallerInputBytes = 1 << 20
 )
 
 type Phase string
@@ -88,6 +89,9 @@ type Journal struct {
 	ACMEAccountContact     string                       `json:"acme_account_contact"`
 	PackageTransactionID   string                       `json:"package_transaction_id"`
 	PackagePlanDigest      string                       `json:"package_plan_digest"`
+	PackageInputPlanDigest string                       `json:"package_input_plan_digest"`
+	PackagePlan            packages.Plan                `json:"package_plan"`
+	PackagePreflight       preflight.Result             `json:"package_preflight"`
 	PackageJournalDigest   string                       `json:"package_journal_digest,omitempty"`
 	Accounts               identity.AccountSet          `json:"accounts"`
 	Paths                  Paths                        `json:"paths"`
@@ -95,6 +99,7 @@ type Journal struct {
 	PlannedPaths           []string                     `json:"planned_paths"`
 	TokenDeliveryAttempted bool                         `json:"token_delivery_attempted"`
 	FinalCommitDigest      string                       `json:"final_commit_digest,omitempty"`
+	InstallerInput         []byte                       `json:"installer_input,omitempty"`
 }
 
 type Bundle struct {
@@ -145,7 +150,13 @@ type PreflightEvaluator func(context.Context, identity.ManagementAuthority, uint
 type PackageTransaction func(context.Context, packages.Plan, preflight.Result) (packages.Journal, error)
 
 type Request struct {
-	ReleaseAuthority   *release.InstallAuthority
+	ReleaseAuthority *release.InstallAuthority
+	// Material is supplied only by the public installer authority builder so
+	// its package Plan can bind the same installation generation used by Install.
+	Material *identity.Material
+	// InstallerInput is persisted in the preinstall journal for public resume;
+	// qualification authorities are intentionally not copied into the journal.
+	InstallerInput     []byte
 	Preflight          PreflightEvaluator
 	PackagePlan        packages.Plan
 	PackagePreflight   preflight.Result
@@ -167,7 +178,7 @@ type TTY interface {
 }
 
 func validateJournal(value Journal) error {
-	if value.SchemaVersion != JournalSchemaVersion || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
+	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
 		return fmt.Errorf("bootstrap journal is incomplete or invalid")
 	}
 	beforePackages := value.Phase == PhasePrepared || value.Phase == PhaseNginxMasked

@@ -59,7 +59,7 @@ func RunQualificationInstallerAuthority(data []byte, stdout io.Writer) error {
 	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("qualification installer requires root")
 	}
-	return runInstallerAuthority(data, stdout)
+	return runInstallerAuthorityWithMaterial(data, stdout, nil)
 }
 
 type installerInput struct {
@@ -79,11 +79,14 @@ type installerInput struct {
 	PackagePreflight                           preflight.Result    `json:"package_preflight"`
 }
 
-// RunInstallerRole accepts no mutable argv. Release tooling supplies one
-// bounded canonical authority document on inherited fd 3.
+// RunInstallerRole accepts either the release tooling's inherited fd 3 or
+// the public bundle launcher. Both paths remain root-only and canonical.
 func RunInstallerRole(args []string, stdout io.Writer) error {
-	if len(args) != 0 || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
+	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("installer requires its fixed root invocation")
+	}
+	if len(args) != 0 {
+		return runPublicInstaller(args, stdout)
 	}
 	file := os.NewFile(3, "installer-authority")
 	if file == nil {
@@ -98,6 +101,10 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 }
 
 func runInstallerAuthority(data []byte, stdout io.Writer) error {
+	return runInstallerAuthorityWithMaterial(data, stdout, nil)
+}
+
+func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *identity.Material) error {
 	var input installerInput
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -128,6 +135,12 @@ func runInstallerAuthority(data []byte, stdout io.Writer) error {
 			return fmt.Errorf("public installer input carries qualification authority")
 		}
 		authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now})
+		if err == nil {
+			current, currentErr := readCurrentExecutable(authority.Identity().Binary.Bytes)
+			if currentErr != nil || uint64(len(current)) != authority.Identity().Binary.Bytes || release.DigestBytes(current) != authority.Identity().Binary.Digest {
+				err = fmt.Errorf("running installer binary differs from the selected release")
+			}
+		}
 	case release.InstallQualification:
 		if len(input.ReleaseManifest) != 0 || len(input.Checksums) != 0 || input.ExpectedReleaseManifestDigest != "" {
 			return fmt.Errorf("qualification installer input carries public release authority")
@@ -212,7 +225,38 @@ func runInstallerAuthority(data []byte, stdout io.Writer) error {
 	if !present || release.DigestBytes(tailscaleBytes) != identityValue.Tailscale.Digest || uint64(len(tailscaleBytes)) != identityValue.Tailscale.Bytes {
 		return fmt.Errorf("selected Tailscale asset missing or mismatched")
 	}
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], ACMEAccountContact: input.ACMEAccountContact, LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	installerInput := []byte(nil)
+	if input.Kind == release.InstallPublicRelease {
+		installerInput = append([]byte(nil), data...)
+	}
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], ACMEAccountContact: input.ACMEAccountContact, LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+}
+
+func rebindPublicInstallerInput(data []byte, plan packages.Plan, result preflight.Result) ([]byte, error) {
+	if len(data) == 0 || len(data) > maximumPublicInstallerInputBytes {
+		return nil, fmt.Errorf("public installer authority is missing or unbounded")
+	}
+	var input installerInput
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		return nil, fmt.Errorf("public installer authority is invalid")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) || input.Kind != release.InstallPublicRelease {
+		return nil, fmt.Errorf("public installer authority is not a public release")
+	}
+	canonical, _ := json.Marshal(input)
+	if !bytes.Equal(canonical, data) {
+		return nil, fmt.Errorf("public installer authority is noncanonical")
+	}
+	input.PackagePlan = plan
+	input.PackagePreflight = result
+	bound, err := json.Marshal(input)
+	if err != nil || len(bound) == 0 || len(bound) > maximumPublicInstallerInputBytes {
+		return nil, fmt.Errorf("public installer authority rebinding is invalid or unbounded")
+	}
+	return bound, nil
 }
 
 func readInstallerAssets(paths map[string]string) (map[string][]byte, error) {

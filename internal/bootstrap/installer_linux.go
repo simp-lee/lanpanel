@@ -55,6 +55,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if releaseIdentity.Kind == release.InstallQualification && releaseIdentity.ACMEAccountContact != request.ACMEAccountContact {
 		return fmt.Errorf("managed ACME account contact differs from qualification authority")
 	}
+	if len(request.InstallerInput) > maximumPublicInstallerInputBytes || len(request.InstallerInput) != 0 && releaseIdentity.Kind != release.InstallPublicRelease {
+		return fmt.Errorf("installer resume authority is invalid for the selected install kind")
+	}
 	paths := request.Paths
 	if paths.PersistentRoot == "" {
 		paths = FixedPaths()
@@ -86,6 +89,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err != nil {
 		return err
 	}
+	inputPackagePlanDigest := packagePlanDigest
 	journalPresent, err := journalExists(paths.Journal)
 	if err != nil {
 		return err
@@ -96,38 +100,67 @@ func install(ctx context.Context, request Request, strict bool) error {
 			return err
 		}
 		defer func(ignore func() error) { _ = ignore() }(store.close)
-		if journal.Phase == PhasePrepared && !request.PackagePlan.Deadline.After(now()) {
-			return fmt.Errorf("new package transaction deadline elapsed")
+		if err := validateJournalPackageAuthority(journal); err != nil {
+			return err
+		}
+		if journal.PackageInputPlanDigest != packagePlanDigest {
+			return fmt.Errorf("existing bootstrap attempt package input authority changed")
 		}
 		preflightRequest := journal.PreflightRequest
-		preflightResult := preflight.Result{}
 		if journal.Phase == PhasePrepared {
-			preflightRequest, preflightResult, err = request.Preflight(ctx, journal.Authority, journal.SafetyGeneration)
+			preflightRequest, preflightResult, preflightErr := request.Preflight(ctx, journal.Authority, journal.SafetyGeneration)
+			if preflightErr != nil {
+				return preflightErr
+			}
+			resumeNow := now().UTC()
+			if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, resumeNow); err != nil {
+				return err
+			}
+			request.PackagePlan, packagePlanDigest, err = refreshPackagePlanForResume(releaseIdentity, request.PackagePlan, preflightRequest, preflightResult, resumeNow)
+			if err != nil {
+				return err
+			}
+			request.PackagePreflight = preflightResult
+			journal.PackagePlan = request.PackagePlan
+			journal.PackagePreflight = request.PackagePreflight
+			if len(journal.InstallerInput) != 0 {
+				journal.InstallerInput, err = rebindPublicInstallerInput(journal.InstallerInput, request.PackagePlan, request.PackagePreflight)
+				if err != nil {
+					return err
+				}
+				inputPackagePlanDigest = packagePlanDigest
+			}
+			preflightDigest, digestErr := preflight.ExpansionRequestDigest(preflightRequest)
+			if digestErr != nil {
+				return digestErr
+			}
+			journal.Sequence++
+			journal.PreflightRequest = preflightRequest
+			journal.PreflightDigest = preflightDigest
+			journal.PackagePlanDigest = packagePlanDigest
+			journal.PackageInputPlanDigest = inputPackagePlanDigest
+			if err := store.update(journal); err != nil {
+				return err
+			}
+		} else {
+			request.PackagePlan = journal.PackagePlan
+			request.PackagePreflight = journal.PackagePreflight
+			packagePlanDigest = journal.PackagePlanDigest
 		}
-		if journal.Phase != PhasePrepared {
-			preflightRequest = journal.PreflightRequest
-			nowValue := time.Now().UTC()
-			preflightResult = preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: journal.SafetyGeneration, RequestDigest: journal.PreflightDigest, Allowed: true, ObservedAt: nowValue, ValidUntil: nowValue.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "resume", Disposition: preflight.FindingPassed, Summary: "exact journal continuation", Identity: journal.AttemptID}}}
-		}
+		preflightDigest, err := preflight.ExpansionRequestDigest(preflightRequest)
 		if err != nil {
 			return err
 		}
-		if journal.Phase == PhasePrepared {
-			if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, now()); err != nil {
-				return err
-			}
-		}
-		preflightDigest, _ := preflight.ExpansionRequestDigest(preflightRequest)
 		if err := verifyResumeInventory(journal); err != nil {
 			return err
 		}
 		if !reflect.DeepEqual(journal.Release, releaseIdentity) || journal.Paths != paths || journal.SafetyGeneration != preflightRequest.Generation || journal.PreflightDigest != preflightDigest || !reflect.DeepEqual(journal.PreflightRequest, preflightRequest) || journal.PackageTransactionID != request.PackagePlan.TransactionID || journal.PackagePlanDigest != packagePlanDigest || journal.ACMEAccountContact != request.ACMEAccountContact {
 			return fmt.Errorf("existing bootstrap attempt belongs to different exact authority")
 		}
+		if journal.PackageInputPlanDigest != inputPackagePlanDigest {
+			return fmt.Errorf("existing bootstrap package input authority changed")
+		}
 		return resume(ctx, store, journal, request, nil, strict)
-	}
-	if !request.PackagePlan.Deadline.After(now()) {
-		return fmt.Errorf("new package transaction deadline elapsed")
 	}
 	if evidence, err := scanExistingEvidence(paths); err != nil {
 		return err
@@ -139,9 +172,14 @@ func install(ctx context.Context, request Request, strict bool) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	material, err := identity.Generate(random)
-	if err != nil {
-		return err
+	var material identity.Material
+	if request.Material != nil {
+		material = *request.Material
+	} else {
+		material, err = identity.Generate(random)
+		if err != nil {
+			return err
+		}
 	}
 	defer material.Destroy()
 	accounts, err := identity.InstallationAccounts(material.InstallationID)
@@ -156,15 +194,28 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err != nil {
 		return err
 	}
-	if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, now()); err != nil {
+	preflightNow := now().UTC()
+	if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, preflightNow); err != nil {
 		return err
+	}
+	request.PackagePlan, packagePlanDigest, err = refreshPackagePlanForResume(releaseIdentity, request.PackagePlan, preflightRequest, preflightResult, preflightNow)
+	if err != nil {
+		return err
+	}
+	request.PackagePreflight = preflightResult
+	if len(request.InstallerInput) != 0 {
+		request.InstallerInput, err = rebindPublicInstallerInput(request.InstallerInput, request.PackagePlan, request.PackagePreflight)
+		if err != nil {
+			return err
+		}
+		inputPackagePlanDigest = packagePlanDigest
 	}
 	preflightDigest, _ := preflight.ExpansionRequestDigest(preflightRequest)
 	plannedPaths, err := plannedBootstrapPaths(paths)
 	if err != nil {
 		return err
 	}
-	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, ACMEAccountContact: request.ACMEAccountContact, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths}
+	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, ACMEAccountContact: request.ACMEAccountContact, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
 	if err := validateJournal(journal); err != nil {
 		return err
 	}
@@ -175,6 +226,40 @@ func install(ctx context.Context, request Request, strict bool) error {
 	defer func(ignore func() error) { _ = ignore() }(store.close)
 	token := material.TakeAdminToken()
 	return resume(ctx, store, journal, request, token, strict)
+}
+
+func validateJournalPackageAuthority(journal Journal) error {
+	planDigest, err := validateInstallerPackageAuthority(journal.Release, journal.PackagePlan, journal.PackagePreflight)
+	if err != nil || planDigest != journal.PackagePlanDigest || !release.ValidDigest(journal.PackageInputPlanDigest) {
+		return fmt.Errorf("bootstrap journal package authority is invalid")
+	}
+	return nil
+}
+
+func refreshPackagePlanForResume(installed release.InstallIdentity, plan packages.Plan, request preflight.ExpansionRequest, result preflight.Result, now time.Time) (packages.Plan, string, error) {
+	if err := preflight.RequireExpansionResultForRequest(result, request, now.UTC()); err != nil {
+		return packages.Plan{}, "", err
+	}
+	requestDigest, err := preflight.ExpansionRequestDigest(request)
+	if err != nil {
+		return packages.Plan{}, "", err
+	}
+	resultDigest, err := result.Digest()
+	if err != nil {
+		return packages.Plan{}, "", err
+	}
+	plan.IntentGeneration = result.Generation
+	plan.Deadline = now.UTC().Add(plan.TotalTimeout)
+	plan.PreflightDigest = resultDigest
+	plan.PreflightRequestDigest = requestDigest
+	if !plan.Deadline.After(now.UTC()) {
+		return packages.Plan{}, "", fmt.Errorf("resumed package transaction deadline is invalid")
+	}
+	planDigest, err := validateInstallerPackageAuthority(installed, plan, result)
+	if err != nil {
+		return packages.Plan{}, "", err
+	}
+	return plan, planDigest, nil
 }
 
 func validateInstallerPackageAuthority(installed release.InstallIdentity, plan packages.Plan, result preflight.Result) (string, error) {
@@ -211,6 +296,10 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	}
 	if len(plan.Repositories) != 1 || plan.Repositories[0].URI != installed.Profile.RepositorySource || plan.Repositories[0].KeyringDigest != installed.Profile.RepositoryKeyFingerprint || plan.Repositories[0].MetadataDigest != installed.Profile.RepositoryMetadataDigest || plan.Repositories[0].CutoffDigest != installed.Profile.RepositoryCutoffDigest {
 		return "", fmt.Errorf("package Plan repository snapshot differs from qualification target profile")
+	}
+	repositoryDigest, err := release.RepositoryAuthorityDigest(plan.Repositories[0])
+	if err != nil || repositoryDigest != installed.Profile.RepositoryAuthorityDigest {
+		return "", fmt.Errorf("package Plan repository authority differs from qualification target profile")
 	}
 	resultDigest, err := result.Digest()
 	if err != nil || resultDigest != plan.PreflightDigest || result.RequestDigest != plan.PreflightRequestDigest || result.Generation != plan.IntentGeneration || !result.Allowed {
@@ -569,6 +658,13 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 		if err := verifyCommittedBundle(journal.Paths, journal, commit); err != nil {
 			return err
+		}
+		if len(journal.InstallerInput) != 0 {
+			journal.Sequence++
+			journal.InstallerInput = nil
+			if err := store.update(journal); err != nil {
+				return err
+			}
 		}
 		return deliverToken(store, &journal, request, token)
 	}

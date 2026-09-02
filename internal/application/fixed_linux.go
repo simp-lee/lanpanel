@@ -735,7 +735,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 	if err := domain.ValidateOperationTarget(payload.Operation, payload.Target); err != nil {
 		return plans.Plan{}, err
 	}
-	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish && payload.Operation != domain.OperationManagedBasicDelete && payload.Operation != domain.OperationResourceDelete {
+	if payload.Operation != domain.OperationAdminTokenRotate && payload.Operation != domain.OperationCloseAll && payload.Operation != domain.OperationUnpublish && payload.Operation != domain.OperationPublish && payload.Operation != domain.OperationManagedBasicDelete && payload.Operation != domain.OperationManagedBasicRotate && payload.Operation != domain.OperationResourceDelete {
 		return plans.Plan{}, ErrUnavailable
 	}
 	document, err := s.normal.Read()
@@ -780,7 +780,7 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 		defer func(ignore func() error) { _ = ignore() }(admission.Release)
 		return s.plans.Create(ctx, admission, document.Revision, plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: plans.DigestBinding{Applicable: true, Digest: owned.Checksum}, ExposureSummary: "deletes only LanPanel-managed inventory for resource " + resource.ID, Prerequisites: "fresh unpublished closure and stopped local cgroup", Lifetime: 10 * time.Minute})
 	}
-	if payload.Operation == domain.OperationManagedBasicDelete {
+	if payload.Operation == domain.OperationManagedBasicDelete || payload.Operation == domain.OperationManagedBasicRotate {
 		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
 		if err != nil {
 			return plans.Plan{}, err
@@ -797,9 +797,11 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 		if err := requireNoDegradedAppliedSource(credential.OwnerResourceID); err != nil {
 			return plans.Plan{}, err
 		}
-		for _, resource := range installation.Resources {
-			if applicationCredentialReferenced(resource, credential.ID) {
-				return plans.Plan{}, fmt.Errorf("active resource reference blocks credential delete")
+		if payload.Operation == domain.OperationManagedBasicDelete {
+			for _, resource := range installation.Resources {
+				if applicationCredentialReferenced(resource, credential.ID) {
+					return plans.Plan{}, fmt.Errorf("active resource reference blocks credential delete")
+				}
 			}
 		}
 		admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
@@ -807,7 +809,14 @@ func (s *FixedService) CreatePlan(ctx context.Context, actor Actor, payload Plan
 			return plans.Plan{}, err
 		}
 		defer func(ignore func() error) { _ = ignore() }(admission.Release)
-		spec := plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetCredential, ID: credential.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: credential.Fingerprint}, ExposureSummary: "deletes_managed_basic_credential_" + credential.ID, Prerequisites: "credential_has_no_current_applied_or_activating_reference", Lifetime: 10 * time.Minute}
+		spec := plans.Spec{Operation: string(payload.Operation), Target: plans.Target{Kind: plans.TargetCredential, ID: credential.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: credential.Fingerprint}, ExposureSummary: "", Prerequisites: "", Lifetime: 10 * time.Minute}
+		if payload.Operation == domain.OperationManagedBasicDelete {
+			spec.ExposureSummary = "deletes_managed_basic_credential_" + credential.ID
+			spec.Prerequisites = "credential_has_no_current_applied_or_activating_reference"
+		} else {
+			spec.ExposureSummary = "rotates_managed_basic_credential_" + credential.ID
+			spec.Prerequisites = "credential_fingerprint_unchanged; old_password_becomes_invalid"
+		}
 		return s.plans.Create(ctx, admission, document.Revision, spec)
 	}
 	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)

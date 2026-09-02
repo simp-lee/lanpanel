@@ -448,13 +448,17 @@ func writeRootExact(path string, data []byte, mode uint32, gid int) error {
 }
 
 func runSecretSentinel(secrets [][]byte) error {
+	return runSecretSentinelRoots(secrets, []string{"/var/lib/lanpanel", "/etc/lanpanel", "/run/lanpanel", "/etc/systemd/system"})
+}
+
+func runSecretSentinelRoots(secrets [][]byte, roots []string) error {
 	for _, secret := range secrets {
 		if len(secret) < 8 || len(secret) > 4096 || bytes.IndexByte(secret, 0) >= 0 {
 			return fmt.Errorf("secret sentinel value is invalid")
 		}
 	}
 	visited := 0
-	for _, root := range []string{"/var/lib/lanpanel", "/etc/lanpanel", "/run/lanpanel", "/etc/systemd/system"} {
+	for _, root := range roots {
 		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 			if os.IsNotExist(err) {
 				return nil

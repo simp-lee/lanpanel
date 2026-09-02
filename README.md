@@ -14,7 +14,13 @@ The UI process is non-root. Root mutations cross a peer-authenticated, typed Uni
 
 The code targets Debian and Ubuntu Linux amd64 with systemd, apt/dpkg, and the release-qualified Nginx profile. A release names exactly one **supported OS profile** only after the same exact release binary completes live qualification on it. Other Debian/Ubuntu profiles are code targets or “not live tested,” not supported claims.
 
-Only clean installation is supported. Before service bootstrap, the installer verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, exact repository/key/metadata snapshot, package closure, package tuple, host architecture, systemd, apt/dpkg health, clock, disk, paths, and listeners. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
+Only clean installation is supported. From an extracted release bundle, run the fixed installer as root and provide the bundle directory, the independently selected `release.json` SHA-256 digest, and ACME account contact:
+
+```text
+sudo ./lanpanel installer --bundle-dir /absolute/path/to/lanpanel-release --release-digest <release.json-sha256> --acme-account-contact admin@example.com
+```
+
+The installer constructs the host-bound package Plan and fresh bootstrap preflight from the checksum-bound release assets before any mutation. Before service bootstrap, it verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, exact repository/key/metadata snapshot, package closure, package tuple, host architecture, systemd, apt/dpkg health, clock, disk, paths, and listeners. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
 
 Dependency sources are:
 
@@ -87,4 +93,4 @@ Host administrators may read their own configuration, SQLite, and data outside L
 
 ## Security and release
 
-See [SECURITY.md](SECURITY.md). A release includes one Linux amd64 binary, source tag/archive, LICENSE, NOTICE, SBOM, dependency manifest, `SHA256SUMS`, one canonical `release.json`, exactly one live-qualified supported profile, provider live-test notes, and known limitations. Final publication reuses the exact binary bytes that passed deterministic and live gates. Release operators should follow the [protected qualification tooling guide](docs/qualification.md).
+See [SECURITY.md](SECURITY.md). A release includes one Linux amd64 binary, source tag/archive, LICENSE, NOTICE, SBOM, dependency manifest, public `package-template.json`, `SHA256SUMS`, one canonical `release.json`, exactly one live-qualified supported profile, provider live-test notes, and known limitations. Final publication reuses the exact binary bytes that passed deterministic and live gates. Release operators should follow the [protected qualification tooling guide](docs/qualification.md).

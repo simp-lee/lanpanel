@@ -71,11 +71,36 @@ func TestManagedBasicAndStaticRequestsAreClosed(t *testing.T) {
 	if ValidateRequest(unsafe, now) == nil {
 		t.Fatal("unsafe static path accepted")
 	}
+
+	rotate := Request{SchemaVersion: SchemaVersion, RequestID: "basic-rotate", Operation: OperationManagedBasicGenerate, Target: "credential/cred_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "managed_basic_rotate", TargetKind: "credential", TargetID: "cred_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1, PlanID: "plan_" + strings.Repeat("a", 64), Confirmation: "rotate"}}
+	rotate.InputDigest, _ = ApplicationInputDigest(rotate)
+	if err := ValidateRequest(rotate, now); err != nil {
+		t.Fatalf("valid planned rotate rejected: %v", err)
+	}
+	rotate.Action.PlanID = ""
+	rotate.Action.Confirmation = "generate"
+	rotate.InputDigest, _ = ApplicationInputDigest(rotate)
+	if ValidateRequest(rotate, now) == nil {
+		t.Fatal("planless rotate accepted")
+	}
+
+	planResponse := Response{SchemaVersion: SchemaVersion, RequestID: "rotate-plan", Code: ResponseSucceeded, ResultDigest: digest("rotate-plan-result"), Action: &ActionResult{Operation: "managed_basic_rotate", TargetKind: "credential", TargetID: "cred_00000000000000000000000000000001", PlanID: "plan_" + strings.Repeat("b", 64), Confirmation: digest("rotate-nonce"), ExposureSummary: "rotates_managed_basic_credential", Prerequisites: "credential_fingerprint_unchanged", ExpiresAt: now.Add(time.Minute)}}
+	if err := ValidateResponse(OperationApplicationPlan, planResponse); err != nil {
+		t.Fatalf("planned rotate response rejected: %v", err)
+	}
+	var wire bytes.Buffer
+	if err := WriteResponse(&wire, OperationApplicationPlan, planResponse, nil); err != nil {
+		t.Fatal(err)
+	}
+	decoded, output, err := ReadResponse(&wire, OperationApplicationPlan)
+	if err != nil || output != nil || !reflect.DeepEqual(decoded, planResponse) {
+		t.Fatalf("planned rotate response round trip=%#v,%#v,%v", decoded, output, err)
+	}
 }
 
 func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	now := time.Now().UTC()
-	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","source_kind":"official_canonical_artifact","confirmation":"initialize"}`)
+	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","source_kind":"official/canonical_artifact","confirmation":"initialize"}`)
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "headscale-initialize", Operation: OperationHeadscaleInitialize, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "headscale_initialize", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "initialize", Resource: payload}}
 	request.InputDigest, _ = ApplicationInputDigest(request)
 	if err := ValidateRequest(request, now); err != nil {

@@ -7906,7 +7906,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("plan admission requires a Plan identity")
 		}
 		switch operation {
-		case Publish, Unpublish, CloseAll, AdminTokenRotate, ManagedBasicDelete, HeadscaleDeploy, ResourceDelete, CertificateRenew, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorLogin:
+		case Publish, Unpublish, CloseAll, AdminTokenRotate, ManagedBasicRotate, ManagedBasicDelete, HeadscaleDeploy, ResourceDelete, CertificateRenew, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorLogin:
 		default:
 			return fmt.Errorf("operation is not valid for Plan admission")
 		}
@@ -7919,7 +7919,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("startup admission is not authorized for operation")
 		}
 	case AdmissionUI:
-		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != ManagedBasicRotate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
+		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
 			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:

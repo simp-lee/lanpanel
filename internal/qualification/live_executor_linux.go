@@ -233,8 +233,16 @@ func (executor *LiveExecutor) Execute(ctx context.Context, step string) (Mutatio
 
 func (executor *LiveExecutor) Recover(ctx context.Context, step string) (MutationObservation, error) {
 	if step != "clean_install" {
-		if executor.state.RunID == executor.prepared.Input.RunID && executor.recoverableStepState(step) {
-			return MutationObservation{Identity: "step/" + step + "/" + executor.prepared.Input.RunID, Evidence: []byte("recovered exact live step state")}, nil
+		if executor.state.RunID == executor.prepared.Input.RunID {
+			if err := executor.ensureManagement(ctx); err != nil {
+				return MutationObservation{}, err
+			}
+			if err := executor.reconcilePendingState(ctx); err != nil {
+				return MutationObservation{}, err
+			}
+			if executor.recoverableStepState(step) {
+				return MutationObservation{Identity: "step/" + step + "/" + executor.prepared.Input.RunID, Evidence: []byte("recovered exact live step state")}, nil
+			}
 		}
 		return MutationObservation{}, fmt.Errorf("live executor cannot recover an exact identity for submitted step %q", step)
 	}
@@ -419,19 +427,19 @@ func (executor *LiveExecutor) recoverableStepState(step string) bool {
 	}
 	switch step {
 	case "local_http_websocket":
-		return executor.state.ResourceID != ""
+		return executor.state.ResourceID != "" || executor.state.PendingResourceCreate != nil
 	case "temporary_public_http":
-		return executor.state.TemporaryResourceID != ""
+		return executor.state.TemporaryResourceID != "" || executor.state.PendingResourceCreate != nil
 	case "domain_https_controls":
-		return executor.state.FixtureCreated || executor.state.BasicCredentialID != "" || len(executor.state.CloudflareRecords) != 0 || len(executor.state.DNSCreateIntents) != 0
+		return executor.state.FixtureCreated || executor.state.BasicCredentialID != "" || executor.state.PendingRegistration != nil || len(executor.state.CloudflareRecords) != 0 || len(executor.state.DNSCreateIntents) != 0
 	case "headscale_initialize_http01":
 		return len(executor.state.CloudflareRecords) != 0
 	case "headscale_entities":
-		return executor.state.HeadscaleUserID != "" || executor.state.PreauthKeyID != ""
+		return executor.state.HeadscaleUserID != "" || executor.state.PreauthKeyID != "" || executor.state.PendingHeadscaleUserCreate != nil || executor.state.PendingPreauthKeyCreate != nil
 	case "connector_assisted_login":
-		return executor.state.ConnectorBound || executor.state.ConnectorDeviceID != ""
+		return executor.state.ConnectorBound || executor.state.ConnectorDeviceID != "" || executor.state.PendingConnectorDevice != nil
 	case "tailnet_http_websocket":
-		return executor.state.TailnetResourceID != "" || !executor.journey.TailnetLiveEnabled
+		return executor.state.TailnetResourceID != "" || executor.state.PendingResourceCreate != nil || !executor.journey.TailnetLiveEnabled
 	case "dns01":
 		return executor.state.DNSProfileCreated || len(executor.state.DNSCreateIntents) != 0
 	case "delete_diagnostics_export_close_reboot":

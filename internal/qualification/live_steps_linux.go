@@ -170,11 +170,28 @@ func (executor *LiveExecutor) stepLocalApp(ctx context.Context) ([]byte, error) 
 		return nil, err
 	}
 	spec := resource.LocalSpec{TargetKind: domain.AppTargetLocalHTTP, Name: "qualification-local-" + executor.prepared.Input.RunID[4:16], EndpointKind: domain.LocalEndpointUnixSocketActivation, ReadinessPath: "/ready", WebSocket: domain.WebSocketReadiness{Enabled: true, Path: "/ws"}, AllowedHTTPStatuses: []uint16{204}, Service: domain.ManagedService{Executable: "/usr/lib/lanpanel/lanpanel", Arguments: []string{"qualification-fixture"}, WorkingDirectory: "/usr/lib/lanpanel", WritePaths: []string{}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: executor.journey.AppDomain, Aliases: []string{executor.journey.AppAlias}, AccessMode: domain.AppAccessPublic, Certificate: &domain.CertificateRequest{ChallengeMethod: "http-01", DirectoryURL: executor.prepared.Input.ACME.DirectoryURL, TermsAccepted: true}, GoAccess: domain.GoAccessPublication{}}}, CredentialIDs: []string{}}
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorResourceIDs, err := resourceIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	specDigest, err := resourceSpecDigest(spec)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingResourceCreate = &resourceCreateIntent{Slot: "local", Name: spec.Name, TargetKind: string(spec.TargetKind), SpecDigest: specDigest, PriorIDs: priorResourceIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var created helperproto.ResourceResult
 	if _, err := executor.management.Post(ctx, "/api/actions/resource_create", spec, &created); err != nil || created.ResourceID == "" {
 		return nil, fmt.Errorf("create local qualification resource: %w", err)
 	}
 	executor.state.ResourceID = created.ResourceID
+	executor.state.PendingResourceCreate = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -186,12 +203,32 @@ func (executor *LiveExecutor) stepLocalApp(ctx context.Context) ([]byte, error) 
 }
 
 func (executor *LiveExecutor) stepTemporaryHTTP(ctx context.Context) ([]byte, error) {
+	if err := executor.ensureManagement(ctx); err != nil {
+		return nil, err
+	}
 	spec := resource.LocalSpec{TargetKind: domain.AppTargetLocalHTTP, Name: "qualification-temporary-" + executor.prepared.Input.RunID[4:16], EndpointKind: domain.LocalEndpointUnixSocketActivation, ReadinessPath: "/ready", WebSocket: domain.WebSocketReadiness{}, AllowedHTTPStatuses: []uint16{204}, Service: domain.ManagedService{Executable: "/usr/lib/lanpanel/lanpanel", Arguments: []string{"qualification-fixture"}, WorkingDirectory: "/usr/lib/lanpanel", WritePaths: []string{}}, Publication: domain.AppPublication{Kind: domain.PublicationTemporaryHTTP, TemporaryHTTP: &domain.TemporaryIPPublication{PublicIPv4: executor.journey.PublicIPv4, Port: executor.journey.TemporaryHTTPPort}}, CredentialIDs: []string{}}
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorResourceIDs, err := resourceIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	specDigest, err := resourceSpecDigest(spec)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingResourceCreate = &resourceCreateIntent{Slot: "temporary", Name: spec.Name, TargetKind: string(spec.TargetKind), SpecDigest: specDigest, PriorIDs: priorResourceIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var created helperproto.ResourceResult
 	if _, err := executor.management.Post(ctx, "/api/actions/resource_create", spec, &created); err != nil || created.ResourceID == "" {
 		return nil, fmt.Errorf("create temporary qualification resource: %w", err)
 	}
 	executor.state.TemporaryResourceID = created.ResourceID
+	executor.state.PendingResourceCreate = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -248,22 +285,67 @@ func (executor *LiveExecutor) stepDomainHTTPS(ctx context.Context) ([]byte, erro
 	}
 	executor.state.FixtureCreated = true
 	paths, _ := FixedQualificationFixturePaths(executor.prepared.Input.RunID)
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorCredentialIDs, err := credentialIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingRegistration = &registrationIntent{Kind: "managed_basic", ResourceID: resourceID, Selector: "ga-user", PriorIDs: priorCredentialIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var basic application.ManagedBasicActionResult
 	if _, err := executor.management.Post(ctx, "/api/actions/managed_basic_create?resource_id="+url.QueryEscape(resourceID), application.ManagedBasicPayload{Username: "ga-user", Confirmation: "generate"}, &basic); err != nil || basic.CredentialID == "" || len(basic.Password) == 0 {
 		return nil, fmt.Errorf("create Managed Basic qualification credential: %w", err)
 	}
 	executor.basicPassword = append([]byte(nil), basic.Password...)
 	executor.state.BasicCredentialID = basic.CredentialID
+	executor.state.PendingRegistration = nil
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
+	configuration, err = executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorStaticRootIDs, err := staticRootIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingRegistration = &registrationIntent{Kind: "static_root", ResourceID: resourceID, Selector: paths.StaticRoot, PriorIDs: priorStaticRootIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var staticResult helperproto.ActionResult
 	if _, err := executor.management.Post(ctx, "/api/actions/static_root_register?resource_id="+url.QueryEscape(resourceID), application.StaticRootPayload{Path: paths.StaticRoot, Confirmation: "register"}, &staticResult); err != nil || staticResult.TargetID == "" {
 		return nil, fmt.Errorf("register qualification static root: %w", err)
 	}
 	executor.state.StaticRootID = staticResult.TargetID
+	executor.state.PendingRegistration = nil
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
+	configuration, err = executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorCredentialIDs, err = credentialIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingRegistration = &registrationIntent{Kind: "external_htpasswd", ResourceID: resourceID, Selector: paths.HTPasswd, PriorIDs: priorCredentialIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var externalResult helperproto.ActionResult
 	if _, err := executor.management.Post(ctx, "/api/actions/external_htpasswd_register?resource_id="+url.QueryEscape(resourceID), application.StaticRootPayload{Path: paths.HTPasswd, Confirmation: "register"}, &externalResult); err != nil || externalResult.TargetID == "" {
 		return nil, fmt.Errorf("register qualification external htpasswd: %w", err)
 	}
 	executor.state.ExternalCredentialID = externalResult.TargetID
+	executor.state.PendingRegistration = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -353,7 +435,437 @@ func (executor *LiveExecutor) stepAppHTTP01(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return evidence("app-http01", map[string]string{"served_certificate_and_cleanup": release.DigestBytes(probe)})
+	if _, err := executor.closeAll(ctx); err != nil {
+		return nil, fmt.Errorf("app-only close-all before Headscale did not prove exact access closure: %w", err)
+	}
+	return evidence("app-http01", map[string]string{"served_certificate": release.DigestBytes(probe), "app_only_close_all": "verified"})
+}
+
+func (executor *LiveExecutor) closeAll(ctx context.Context) (contractionResult, error) {
+	planID, err := executor.management.Plan(ctx, "/api/actions/close_all", "", struct{}{})
+	if err != nil {
+		return contractionResult{}, err
+	}
+	var contraction contractionResult
+	if _, err := executor.management.Post(ctx, "/api/actions/close_all", application.ConfirmationPayload{PlanID: planID, Confirmation: "close"}, &contraction); err != nil {
+		return contraction, err
+	}
+	if contraction.Outcome == "" || !contraction.AccessClosed || contraction.AccessMayRemain {
+		return contraction, fmt.Errorf("close-all did not prove exact access closure")
+	}
+	return contraction, nil
+}
+
+func (executor *LiveExecutor) configurationInventory(ctx context.Context) (application.ConfigurationExport, error) {
+	var exported application.ConfigurationExport
+	if _, err := executor.management.Post(ctx, "/api/actions/configuration_export", struct{}{}, &exported); err != nil {
+		return application.ConfigurationExport{}, err
+	}
+	if exported.SchemaVersion != "lanpanel.configuration-export.v1" {
+		return application.ConfigurationExport{}, fmt.Errorf("configuration export schema is not exact")
+	}
+	return exported, nil
+}
+
+func credentialIDs(installation domain.Installation) ([]string, error) {
+	values := make([]string, 0, len(installation.Credentials))
+	for _, credential := range installation.Credentials {
+		values = append(values, credential.ID)
+	}
+	return sortedStringIDs(values)
+}
+
+func staticRootIDs(installation domain.Installation) ([]string, error) {
+	values := make([]string, 0, len(installation.StaticRoots))
+	for _, root := range installation.StaticRoots {
+		values = append(values, root.ID)
+	}
+	return sortedStringIDs(values)
+}
+
+func resourceIDs(installation domain.Installation) ([]string, error) {
+	values := make([]string, 0, len(installation.Resources))
+	for _, resource := range installation.Resources {
+		values = append(values, resource.ID)
+	}
+	return sortedStringIDs(values)
+}
+
+func sortedStringIDs(values []string) ([]string, error) {
+	result := append([]string(nil), values...)
+	slices.Sort(result)
+	for index, value := range result {
+		if value == "" || index > 0 && result[index-1] == value {
+			return nil, fmt.Errorf("configuration identity inventory is ambiguous")
+		}
+	}
+	return result, nil
+}
+
+func userIDs(users []managedheadscale.User) ([]uint64, error) {
+	values := make([]uint64, 0, len(users))
+	for _, user := range users {
+		values = append(values, user.ID)
+	}
+	return sortedUintIDs(values)
+}
+
+func preauthKeyIDs(keys []managedheadscale.PreauthKey) ([]uint64, error) {
+	values := make([]uint64, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, key.ID)
+	}
+	return sortedUintIDs(values)
+}
+
+func deviceIDs(devices []managedheadscale.Device) ([]uint64, error) {
+	values := make([]uint64, 0, len(devices))
+	for _, device := range devices {
+		values = append(values, device.ID)
+	}
+	return sortedUintIDs(values)
+}
+
+func sortedUintIDs(values []uint64) ([]uint64, error) {
+	result := append([]uint64(nil), values...)
+	slices.Sort(result)
+	for index, value := range result {
+		if value == 0 || index > 0 && result[index-1] == value {
+			return nil, fmt.Errorf("headscale identity inventory is ambiguous")
+		}
+	}
+	return result, nil
+}
+
+func (executor *LiveExecutor) reconcilePendingState(ctx context.Context) error {
+	if intent := executor.state.PendingResourceCreate; intent != nil {
+		configuration, err := executor.configurationInventory(ctx)
+		if err != nil {
+			return err
+		}
+		id, found, err := resourceCandidate(configuration.Installation, intent)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("pending %s resource creation has no exact new identity", intent.Slot)
+		}
+		switch intent.Slot {
+		case "local":
+			executor.state.ResourceID = id
+		case "temporary":
+			executor.state.TemporaryResourceID = id
+		case "tailnet":
+			executor.state.TailnetResourceID = id
+		}
+		executor.state.PendingResourceCreate = nil
+		if err := executor.states.Write(executor.state); err != nil {
+			return err
+		}
+	}
+	if intent := executor.state.PendingRegistration; intent != nil {
+		configuration, err := executor.configurationInventory(ctx)
+		if err != nil {
+			return err
+		}
+		id, found, err := registrationCandidate(configuration.Installation, intent)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("pending %s registration has no exact new identity", intent.Kind)
+		}
+		switch intent.Kind {
+		case "managed_basic":
+			executor.state.BasicCredentialID = id
+		case "static_root":
+			executor.state.StaticRootID = id
+		case "external_htpasswd":
+			executor.state.ExternalCredentialID = id
+		}
+		executor.state.PendingRegistration = nil
+		if err := executor.states.Write(executor.state); err != nil {
+			return err
+		}
+	}
+	if intent := executor.state.PendingHeadscaleUserCreate; intent != nil {
+		var users application.HeadscaleUsersResult
+		if _, err := executor.management.Post(ctx, "/api/actions/headscale_user_list", struct{}{}, &users); err != nil {
+			return err
+		}
+		id, found, err := headscaleUserCandidate(users.Users, intent)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("pending Headscale user creation has no exact new identity")
+		}
+		executor.state.HeadscaleUserID = strconv.FormatUint(id, 10)
+		executor.state.PendingHeadscaleUserCreate = nil
+		if err := executor.states.Write(executor.state); err != nil {
+			return err
+		}
+	}
+	if intent := executor.state.PendingPreauthKeyCreate; intent != nil {
+		var keys application.HeadscaleKeysResult
+		if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keys); err != nil {
+			return err
+		}
+		id, found, err := preauthKeyCandidate(keys.Keys, intent)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("pending preauth key creation has no exact new identity")
+		}
+		executor.state.PreauthKeyID = strconv.FormatUint(id, 10)
+		executor.state.PendingPreauthKeyCreate = nil
+		if err := executor.states.Write(executor.state); err != nil {
+			return err
+		}
+	}
+	if intent := executor.state.PendingConnectorDevice; intent != nil {
+		var verified application.ConnectorVerifyResult
+		if _, err := executor.management.Post(ctx, "/api/actions/connector_verify", struct{}{}, &verified); err != nil || verified.Observation.ControlURL != intent.ControlURL || len(verified.Observation.LocalIPs) == 0 {
+			return errors.Join(err, fmt.Errorf("pending connector login verification is incomplete"))
+		}
+		var devices application.HeadscaleDevicesResult
+		if _, err := executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices); err != nil {
+			return err
+		}
+		id, found, err := connectorDeviceCandidate(devices.Devices, intent, verified.Observation.LocalIPs)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("pending connector login has no exact new device identity")
+		}
+		executor.state.ConnectorDeviceID = strconv.FormatUint(id, 10)
+		executor.state.PendingConnectorDevice = nil
+		if err := executor.states.Write(executor.state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func resourceCandidate(installation domain.Installation, intent *resourceCreateIntent) (string, bool, error) {
+	currentIDs, err := resourceIDs(installation)
+	if err != nil {
+		return "", false, err
+	}
+	for _, id := range intent.PriorIDs {
+		if !slices.Contains(currentIDs, id) {
+			return "", false, fmt.Errorf("pending %s resource prior identity disappeared", intent.Slot)
+		}
+	}
+	prior := make(map[string]bool, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		prior[id] = true
+	}
+	candidates := []string{}
+	for _, resource := range installation.Resources {
+		if resource.Name == intent.Name && string(resource.Target.Kind) == intent.TargetKind && !prior[resource.ID] {
+			digest, digestErr := resourceSpecDigest(resource)
+			if digestErr != nil {
+				return "", false, digestErr
+			}
+			if digest == intent.SpecDigest {
+				candidates = append(candidates, resource.ID)
+			}
+		}
+	}
+	if len(candidates) > 1 {
+		return "", false, fmt.Errorf("pending %s resource creation has ambiguous new identities", intent.Slot)
+	}
+	if len(candidates) == 0 {
+		return "", false, nil
+	}
+	return candidates[0], true, nil
+}
+
+func resourceSpecDigest(value any) (string, error) {
+	switch candidate := value.(type) {
+	case resource.LocalSpec:
+		candidate.CredentialIDs = slices.Clone(candidate.CredentialIDs)
+		if len(candidate.CredentialIDs) == 0 {
+			candidate.CredentialIDs = nil
+		}
+		data, err := release.MarshalCanonical(candidate)
+		if err != nil {
+			return "", err
+		}
+		return release.DigestBytes(data), nil
+	case resource.TailnetSpec:
+		candidate.CredentialIDs = slices.Clone(candidate.CredentialIDs)
+		if len(candidate.CredentialIDs) == 0 {
+			candidate.CredentialIDs = nil
+		}
+		data, err := release.MarshalCanonical(candidate)
+		if err != nil {
+			return "", err
+		}
+		return release.DigestBytes(data), nil
+	case domain.AppResource:
+		if candidate.Target.Kind == domain.AppTargetLocalHTTP {
+			if candidate.Target.LocalHTTP == nil || candidate.ManagedProcess == nil {
+				return "", fmt.Errorf("local resource spec identity is incomplete")
+			}
+			return resourceSpecDigest(resource.LocalSpec{TargetKind: candidate.Target.Kind, Name: candidate.Name, EndpointKind: candidate.Target.LocalHTTP.EndpointKind, TCPAddress: candidate.Target.LocalHTTP.TCPAddress, TCPPort: candidate.Target.LocalHTTP.TCPPort, ReadinessPath: candidate.Target.ReadinessPath, WebSocket: candidate.Target.WebSocket, AllowedHTTPStatuses: slices.Clone(candidate.Target.AllowedHTTPStatuses), Service: candidate.ManagedProcess.Service, Publication: candidate.Publication, CredentialIDs: slices.Clone(candidate.CredentialIDs)})
+		}
+		if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
+			if candidate.Target.TailnetHTTP == nil {
+				return "", fmt.Errorf("tailnet resource spec identity is incomplete")
+			}
+			return resourceSpecDigest(resource.TailnetSpec{TargetKind: candidate.Target.Kind, Name: candidate.Name, PeerIP: candidate.Target.TailnetHTTP.IP, SourceIP: candidate.Target.TailnetHTTP.SourceIP, Port: candidate.Target.TailnetHTTP.Port, ReadinessPath: candidate.Target.ReadinessPath, WebSocket: candidate.Target.WebSocket, AllowedHTTPStatuses: slices.Clone(candidate.Target.AllowedHTTPStatuses), Publication: candidate.Publication, CredentialIDs: slices.Clone(candidate.CredentialIDs)})
+		}
+	}
+	return "", fmt.Errorf("resource spec identity is unsupported")
+}
+
+func registrationCandidate(installation domain.Installation, intent *registrationIntent) (string, bool, error) {
+	prior := make(map[string]bool, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		prior[id] = true
+	}
+	currentIDs := []string{}
+	if intent.Kind == "static_root" {
+		for _, root := range installation.StaticRoots {
+			currentIDs = append(currentIDs, root.ID)
+		}
+	} else {
+		for _, credential := range installation.Credentials {
+			currentIDs = append(currentIDs, credential.ID)
+		}
+	}
+	if _, err := sortedStringIDs(currentIDs); err != nil {
+		return "", false, err
+	}
+	for _, id := range intent.PriorIDs {
+		if !slices.Contains(currentIDs, id) {
+			return "", false, fmt.Errorf("pending %s registration prior identity disappeared", intent.Kind)
+		}
+	}
+	candidates := []string{}
+	if intent.Kind == "static_root" {
+		for _, root := range installation.StaticRoots {
+			if root.OwnerResourceID == intent.ResourceID && root.Path == intent.Selector && !prior[root.ID] {
+				candidates = append(candidates, root.ID)
+			}
+		}
+	} else {
+		for _, credential := range installation.Credentials {
+			matches := credential.Kind == intent.Kind && credential.OwnerResourceID == intent.ResourceID
+			if intent.Kind == "managed_basic" {
+				matches = matches && credential.Username == intent.Selector
+			} else {
+				matches = matches && credential.ExternalPath == intent.Selector
+			}
+			if matches && !prior[credential.ID] {
+				candidates = append(candidates, credential.ID)
+			}
+		}
+	}
+	if len(candidates) > 1 {
+		return "", false, fmt.Errorf("pending %s registration has ambiguous new identities", intent.Kind)
+	}
+	if len(candidates) == 0 {
+		return "", false, nil
+	}
+	return candidates[0], true, nil
+}
+
+func headscaleUserCandidate(users []managedheadscale.User, intent *headscaleUserCreateIntent) (uint64, bool, error) {
+	prior := make(map[uint64]bool, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		prior[id] = true
+	}
+	currentIDs, err := userIDs(users)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, id := range intent.PriorIDs {
+		if !slices.Contains(currentIDs, id) {
+			return 0, false, fmt.Errorf("pending Headscale user prior identity disappeared")
+		}
+	}
+	candidates := []uint64{}
+	for _, user := range users {
+		if user.Name == intent.Name && !prior[user.ID] {
+			candidates = append(candidates, user.ID)
+		}
+	}
+	if len(candidates) > 1 {
+		return 0, false, fmt.Errorf("pending Headscale user creation has ambiguous new identities")
+	}
+	if len(candidates) == 0 {
+		return 0, false, nil
+	}
+	return candidates[0], true, nil
+}
+
+func preauthKeyCandidate(keys []managedheadscale.PreauthKey, intent *preauthKeyCreateIntent) (uint64, bool, error) {
+	prior := make(map[uint64]bool, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		prior[id] = true
+	}
+	currentIDs, err := preauthKeyIDs(keys)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, id := range intent.PriorIDs {
+		if !slices.Contains(currentIDs, id) {
+			return 0, false, fmt.Errorf("pending preauth key prior identity disappeared")
+		}
+	}
+	requested := time.Duration(intent.ExpirationSeconds) * time.Second
+	candidates := []uint64{}
+	for _, key := range keys {
+		lifetime := key.Expiration.Sub(key.CreatedAt)
+		freshCreation := !key.CreatedAt.IsZero() && !key.CreatedAt.Before(intent.CreatedAt.Add(-time.Second)) && !key.CreatedAt.After(intent.Deadline)
+		matchingLifetime := lifetime > 0 && lifetime <= requested && requested-lifetime < time.Second
+		if key.UserID == intent.UserID && !key.Reusable && !key.Ephemeral && !key.Used && !prior[key.ID] && freshCreation && matchingLifetime {
+			candidates = append(candidates, key.ID)
+		}
+	}
+	if len(candidates) > 1 {
+		return 0, false, fmt.Errorf("pending preauth key creation has ambiguous new identities")
+	}
+	if len(candidates) == 0 {
+		return 0, false, nil
+	}
+	return candidates[0], true, nil
+}
+
+func connectorDeviceCandidate(devices []managedheadscale.Device, intent *connectorDeviceIntent, localIPs []netip.Addr) (uint64, bool, error) {
+	prior := make(map[uint64]bool, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		prior[id] = true
+	}
+	currentIDs, err := deviceIDs(devices)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, id := range intent.PriorIDs {
+		if !slices.Contains(currentIDs, id) {
+			return 0, false, fmt.Errorf("pending connector prior identity disappeared")
+		}
+	}
+	before := make([]managedheadscale.Device, 0, len(intent.PriorIDs))
+	for _, id := range intent.PriorIDs {
+		before = append(before, managedheadscale.Device{ID: id})
+	}
+	selected, err := selectConnectorDevice(before, devices, intent.UserID, localIPs)
+	if err != nil {
+		return 0, false, err
+	}
+	if selected.CreatedAt.Before(intent.CreatedAt.Add(-time.Second)) || selected.CreatedAt.After(intent.Deadline) {
+		return 0, false, fmt.Errorf("pending connector device creation is outside its operation window")
+	}
+	if _, ok := prior[selected.ID]; ok {
+		return 0, false, fmt.Errorf("pending connector device selected a prior identity")
+	}
+	return selected.ID, true, nil
 }
 
 func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error) {
@@ -365,7 +877,7 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 		return nil, err
 	}
 	var initialized helperproto.ActionResult
-	payload := application.HeadscaleInitializePayload{ControlDomain: executor.journey.HeadscaleDomain, MagicDNSNamespace: executor.journey.MagicDNSNamespace, SourceKind: "official_canonical_artifact", Confirmation: "initialize"}
+	payload := application.HeadscaleInitializePayload{ControlDomain: executor.journey.HeadscaleDomain, MagicDNSNamespace: executor.journey.MagicDNSNamespace, SourceKind: "official/canonical_artifact", Confirmation: "initialize"}
 	if _, err := executor.management.Post(ctx, "/api/actions/headscale_initialize", payload, &initialized); err != nil {
 		return nil, err
 	}
@@ -395,18 +907,44 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 }
 
 func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte, error) {
+	var usersBefore application.HeadscaleUsersResult
+	if _, err := executor.management.Post(ctx, "/api/actions/headscale_user_list", struct{}{}, &usersBefore); err != nil {
+		return nil, err
+	}
+	priorUserIDs, err := userIDs(usersBefore.Users)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingHeadscaleUserCreate = &headscaleUserCreateIntent{Name: "qualification", PriorIDs: priorUserIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var created application.HeadscaleUserResult
 	if _, err := executor.management.Post(ctx, "/api/actions/headscale_user_create", application.HeadscaleUserPayload{Name: "qualification"}, &created); err != nil || created.User.ID == 0 || created.User.Name != "qualification" {
 		return nil, fmt.Errorf("create qualification Headscale user: %w", err)
 	}
 	executor.state.HeadscaleUserID = strconv.FormatUint(created.User.ID, 10)
+	executor.state.PendingHeadscaleUserCreate = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
 	query := "?user_id=" + url.QueryEscape(executor.state.HeadscaleUserID)
 	planBody := application.HeadscaleLifecyclePayload{ExpirationSeconds: 3600}
+	var keysBefore application.HeadscaleKeysResult
+	if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keysBefore); err != nil {
+		return nil, err
+	}
+	priorPreauthKeyIDs, err := preauthKeyIDs(keysBefore.Keys)
+	if err != nil {
+		return nil, err
+	}
 	planID, err := executor.management.Plan(ctx, "/api/actions/preauth_key_create", query, planBody)
 	if err != nil {
+		return nil, err
+	}
+	preauthIntentCreatedAt := time.Now().UTC()
+	executor.state.PendingPreauthKeyCreate = &preauthKeyCreateIntent{UserID: created.User.ID, ExpirationSeconds: 3600, CreatedAt: preauthIntentCreatedAt, Deadline: preauthIntentCreatedAt.Add(10 * time.Minute), PriorIDs: priorPreauthKeyIDs}
+	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
 	var key application.HeadscaleKeyResult
@@ -415,6 +953,7 @@ func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte
 	}
 	executor.preauthKey = append([]byte(nil), key.Secret...)
 	executor.state.PreauthKeyID = strconv.FormatUint(key.Key.ID, 10)
+	executor.state.PendingPreauthKeyCreate = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -537,6 +1076,23 @@ func confirmConnectorDevice(devices []managedheadscale.Device, deviceID, userID 
 	return nil
 }
 
+func confirmRevokedPreauthKey(keys []managedheadscale.PreauthKey, keyID uint64, now time.Time) error {
+	matches := 0
+	for _, key := range keys {
+		if key.ID != keyID {
+			continue
+		}
+		matches++
+		if key.Expiration.After(now) && !key.Used {
+			return fmt.Errorf("preauth key remains active after revocation")
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("revoked preauth key ID was not listed exactly once")
+	}
+	return nil
+}
+
 func confirmExpiredConnectorDevice(devices []managedheadscale.Device, deviceID, userID uint64, now time.Time) error {
 	matches := 0
 	for _, device := range devices {
@@ -582,6 +1138,15 @@ func (executor *LiveExecutor) stepConnector(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	priorDeviceIDs, err := deviceIDs(devicesBefore.Devices)
+	if err != nil {
+		return nil, err
+	}
+	connectorIntentCreatedAt := time.Now().UTC()
+	executor.state.PendingConnectorDevice = &connectorDeviceIntent{UserID: userID, ControlURL: controlURL, CreatedAt: connectorIntentCreatedAt, Deadline: connectorIntentCreatedAt.Add(10 * time.Minute), PriorIDs: priorDeviceIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var loggedIn application.ConnectorMutationResult
 	if _, err := executor.management.Post(ctx, "/api/actions/connector_login", application.ConnectorLoginActionPayload{PlanID: planID, Confirmation: "login", AuthKey: executor.preauthKey}, &loggedIn); err != nil || loggedIn.JobID == "" {
 		return nil, err
@@ -599,6 +1164,7 @@ func (executor *LiveExecutor) stepConnector(ctx context.Context) ([]byte, error)
 		return nil, err
 	}
 	executor.state.ConnectorDeviceID = strconv.FormatUint(device.ID, 10)
+	executor.state.PendingConnectorDevice = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -627,11 +1193,28 @@ func (executor *LiveExecutor) stepTailnet(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	spec := resource.TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: "qualification-tailnet-" + executor.prepared.Input.RunID[4:16], PeerIP: peer.PeerIP, SourceIP: peer.SourceIP, Port: peer.Port, ReadinessPath: "/ready", WebSocket: domain.WebSocketReadiness{Enabled: true, Path: "/ws"}, AllowedHTTPStatuses: []uint16{204}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: executor.journey.TailnetDomain, AccessMode: domain.AppAccessPublic, Certificate: &domain.CertificateRequest{ChallengeMethod: "http-01", DirectoryURL: executor.prepared.Input.ACME.DirectoryURL, TermsAccepted: true}}}, CredentialIDs: []string{}}
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	priorResourceIDs, err := resourceIDs(configuration.Installation)
+	if err != nil {
+		return nil, err
+	}
+	specDigest, err := resourceSpecDigest(spec)
+	if err != nil {
+		return nil, err
+	}
+	executor.state.PendingResourceCreate = &resourceCreateIntent{Slot: "tailnet", Name: spec.Name, TargetKind: string(spec.TargetKind), SpecDigest: specDigest, PriorIDs: priorResourceIDs}
+	if err := executor.states.Write(executor.state); err != nil {
+		return nil, err
+	}
 	var created helperproto.ResourceResult
 	if _, err := executor.management.Post(ctx, "/api/actions/resource_create", spec, &created); err != nil || created.ResourceID == "" {
 		return nil, fmt.Errorf("create tailnet qualification resource: %w", err)
 	}
 	executor.state.TailnetResourceID = created.ResourceID
+	executor.state.PendingResourceCreate = nil
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
@@ -695,13 +1278,8 @@ func (executor *LiveExecutor) stepDNS01(ctx context.Context) ([]byte, error) {
 }
 
 func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) ([]byte, error) {
-	planID, err := executor.management.Plan(ctx, "/api/actions/close_all", "", struct{}{})
-	if err != nil {
+	if _, err := executor.closeAll(ctx); err != nil {
 		return nil, err
-	}
-	var contraction contractionResult
-	if _, err := executor.management.Post(ctx, "/api/actions/close_all", application.ConfirmationPayload{PlanID: planID, Confirmation: "close"}, &contraction); err != nil || contraction.Outcome == "" || !contraction.AccessClosed || contraction.AccessMayRemain {
-		return nil, errors.Join(err, fmt.Errorf("close-all did not prove exact access closure"))
 	}
 	executor.state.CloseAllCommitted = true
 	if err := executor.states.Write(executor.state); err != nil {
@@ -788,7 +1366,7 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 		return nil, err
 	}
 	query := "?device_id=" + url.QueryEscape(executor.state.ConnectorDeviceID)
-	planID, err = executor.management.Plan(ctx, "/api/actions/device_expire", query, application.HeadscaleLifecyclePayload{})
+	planID, err := executor.management.Plan(ctx, "/api/actions/device_expire", query, application.HeadscaleLifecyclePayload{})
 	if err != nil {
 		return nil, err
 	}
@@ -801,6 +1379,30 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 		return nil, err
 	}
 	if err := confirmExpiredConnectorDevice(devicesAfterExpiry.Devices, deviceID, userID, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	keyID, keyIDErr := strconv.ParseUint(executor.state.PreauthKeyID, 10, 64)
+	if keyIDErr != nil || keyID == 0 {
+		return nil, fmt.Errorf("connector preauth key identity is unavailable")
+	}
+	keyQuery := "?key_id=" + url.QueryEscape(executor.state.PreauthKeyID)
+	keyPlan, err := executor.management.Plan(ctx, "/api/actions/preauth_key_revoke", keyQuery, application.HeadscaleLifecyclePayload{})
+	if err != nil {
+		return nil, err
+	}
+	var revoked application.HeadscaleKeyResult
+	if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_revoke"+keyQuery, application.HeadscaleLifecyclePayload{PlanID: keyPlan, Confirmation: "revoke"}, &revoked); err != nil || revoked.Key.ID != keyID || revoked.Key.UserID != userID {
+		return nil, errors.Join(err, fmt.Errorf("preauth key revocation action identity changed"))
+	}
+	var keysAfterRevoke application.HeadscaleKeysResult
+	if _, err := executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keysAfterRevoke); err != nil {
+		return nil, err
+	}
+	if err := confirmRevokedPreauthKey(keysAfterRevoke.Keys, keyID, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	executor.state.PreauthKeyID = ""
+	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
 	if err := executor.cleanupLiveEffects(ctx); err != nil {
@@ -818,7 +1420,7 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if _, err := executor.management.Post(ctx, "/api/actions/job_list", struct{}{}, &jobs); err != nil || len(jobs.Jobs) == 0 {
 		return nil, errors.Join(err, fmt.Errorf("job inventory is incomplete"))
 	}
-	return evidence("management-cleanup-reboot", map[string]string{"close_before": release.DigestBytes(closedBefore), "close_after": release.DigestBytes(closedAfter), "token_digest": tokenDigest, "diagnostics": "read", "configuration_export": "read", "jobs": "read", "reboot": "verified"})
+	return evidence("management-cleanup-reboot", map[string]string{"close_before": release.DigestBytes(closedBefore), "close_after": release.DigestBytes(closedAfter), "token_digest": tokenDigest, "device_expiry": "verified", "preauth_key_revoke": "verified", "diagnostics": "read", "configuration_export": "read", "jobs": "read", "reboot": "verified"})
 }
 
 func (executor *LiveExecutor) stepFinalInventory(ctx context.Context) ([]byte, error) {
@@ -920,7 +1522,85 @@ func (executor *LiveExecutor) cleanupLiveEffects(ctx context.Context) error {
 	if err := executor.ensureManagement(ctx); err != nil {
 		return err
 	}
+	if err := executor.reconcilePendingState(ctx); err != nil {
+		return err
+	}
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return err
+	}
+	resourceInventory, err := resourceIDs(configuration.Installation)
+	if err != nil {
+		return err
+	}
+	credentialInventory, err := credentialIDs(configuration.Installation)
+	if err != nil {
+		return err
+	}
 	var cleanupErr error
+	if executor.state.BasicCredentialID != "" {
+		if !slices.Contains(credentialInventory, executor.state.BasicCredentialID) {
+			executor.state.BasicCredentialID = ""
+			if err := executor.states.Write(executor.state); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		} else {
+			credentialQuery := "?credential_id=" + url.QueryEscape(executor.state.BasicCredentialID)
+			credentialPlan, err := executor.management.Plan(ctx, "/api/actions/managed_basic_delete", credentialQuery, struct{}{})
+			if err == nil {
+				_, err = executor.management.Post(ctx, "/api/actions/managed_basic_delete"+credentialQuery, application.ManagedBasicPayload{PlanID: credentialPlan, Confirmation: "delete"}, &application.ManagedBasicActionResult{})
+			}
+			if err != nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup managed Basic credential: %w", err))
+			} else {
+				executor.state.BasicCredentialID = ""
+				if err := executor.states.Write(executor.state); err != nil {
+					cleanupErr = errors.Join(cleanupErr, err)
+				}
+			}
+		}
+	}
+	if executor.state.PreauthKeyID != "" {
+		keyID, keyIDErr := strconv.ParseUint(executor.state.PreauthKeyID, 10, 64)
+		var err error
+		if keyIDErr != nil || keyID == 0 {
+			err = fmt.Errorf("preauth key cleanup identity is invalid")
+		} else {
+			var keys application.HeadscaleKeysResult
+			_, err = executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keys)
+			if err == nil {
+				present := false
+				for _, key := range keys.Keys {
+					if key.ID == keyID {
+						present = true
+						break
+					}
+				}
+				if !present {
+					err = fmt.Errorf("preauth key cleanup identity is absent; inactive state is unproven")
+				} else {
+					keyQuery := "?key_id=" + url.QueryEscape(executor.state.PreauthKeyID)
+					keyPlan, planErr := executor.management.Plan(ctx, "/api/actions/preauth_key_revoke", keyQuery, application.HeadscaleLifecyclePayload{})
+					err = planErr
+					if err == nil {
+						var revoked application.HeadscaleKeyResult
+						_, err = executor.management.Post(ctx, "/api/actions/preauth_key_revoke"+keyQuery, application.HeadscaleLifecyclePayload{PlanID: keyPlan, Confirmation: "revoke"}, &revoked)
+						if err == nil && revoked.Key.ID != keyID {
+							err = fmt.Errorf("preauth key cleanup identity changed")
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup preauth key: %w", err))
+		} else {
+			executor.state.PreauthKeyID = ""
+			if err := executor.states.Write(executor.state); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
+	}
 	for _, resourceID := range []string{executor.state.TemporaryResourceID, executor.state.TailnetResourceID, executor.state.ResourceID} {
 		if resourceID == "" || executor.state.ResourceDeleted && resourceID == executor.state.ResourceID {
 			continue
@@ -929,21 +1609,25 @@ func (executor *LiveExecutor) cleanupLiveEffects(ctx context.Context) error {
 		if resourceID == executor.state.ResourceID || resourceID == executor.state.TemporaryResourceID {
 			_, _ = executor.management.Post(ctx, "/api/actions/process_stop?resource_id="+url.QueryEscape(resourceID), nil, &helperproto.ActionResult{})
 		}
-		if resourceID == executor.state.ResourceID && executor.state.BasicCredentialID != "" {
-			credentialQuery := "?credential_id=" + url.QueryEscape(executor.state.BasicCredentialID)
-			credentialPlan, err := executor.management.Plan(ctx, "/api/actions/managed_basic_delete", credentialQuery, struct{}{})
-			if err == nil {
-				_, err = executor.management.Post(ctx, "/api/actions/managed_basic_delete"+credentialQuery, application.ManagedBasicPayload{PlanID: credentialPlan, Confirmation: "delete"}, &application.ManagedBasicActionResult{})
+		if !slices.Contains(resourceInventory, resourceID) {
+			changed := false
+			switch resourceID {
+			case executor.state.ResourceID:
+				executor.state.ResourceDeleted = true
+				changed = true
+			case executor.state.TemporaryResourceID:
+				executor.state.TemporaryResourceID = ""
+				changed = true
+			case executor.state.TailnetResourceID:
+				executor.state.TailnetResourceID = ""
+				changed = true
 			}
-			if err != nil {
-				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup managed Basic credential: %w", err))
-				continue
+			if changed {
+				if err := executor.states.Write(executor.state); err != nil {
+					cleanupErr = errors.Join(cleanupErr, err)
+				}
 			}
-			executor.state.BasicCredentialID = ""
-			if err := executor.states.Write(executor.state); err != nil {
-				cleanupErr = errors.Join(cleanupErr, err)
-				continue
-			}
+			continue
 		}
 		if err := executor.planConfirmation(ctx, "resource_delete", resourceID, "delete", &application.ResourceDeleteResult{}); err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)

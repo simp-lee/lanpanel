@@ -533,6 +533,62 @@ func TestShutdownTerminatesConcurrentLoginActionAndSocketAuthentication(t *testi
 	}
 }
 
+func TestLocalManagementWalkthrough(t *testing.T) {
+	server := testServer(t)
+	var planned, rotated bool
+	plan, err := application.RegisterAction(domain.OperationPlan, application.PlanPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		if call.Operation != domain.OperationPlan || call.Target != (domain.OperationTarget{Kind: domain.OperationTargetCredential, ID: "cred_00000000000000000000000000000001"}) {
+			t.Fatalf("unexpected rotate Plan call: %#v", call)
+		}
+		planned = true
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: map[string]any{"plan_id": "plan_fixture", "exposure_summary": "rotates_managed_basic_credential", "prerequisites": "credential_fingerprint_unchanged", "expires_at": time.Now().Add(time.Minute)}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotate, err := application.RegisterAction(domain.OperationManagedBasicRotate, application.ManagedBasicPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		payload := call.Payload.(application.ManagedBasicPayload)
+		if payload.PlanID != "plan_fixture" || payload.Confirmation != "rotate" {
+			t.Fatalf("rotate action was not Plan-bound: %#v", payload)
+		}
+		rotated = true
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ManagedBasicActionResult{CredentialID: call.Target.ID, Fingerprint: "sha256:" + strings.Repeat("a", 64), JobID: "job_fixture", Password: []byte("one-time-password")}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{plan, rotate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, server.origin()+path, strings.NewReader(body))
+		request.Header.Set("Origin", server.origin())
+		request.Header.Set(session.ProofHeader, credentials.Proof)
+		request.Header.Set(session.CSRFHeader, credentials.CSRF)
+		request.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		return response
+	}
+	planResponse := request("/api/actions/managed_basic_rotate/plan?credential_id=cred_00000000000000000000000000000001", "{}")
+	if planResponse.Code != http.StatusOK || !planned || !strings.Contains(planResponse.Body.String(), "plan_fixture") {
+		t.Fatalf("rotate Plan walkthrough failed: status=%d planned=%v body=%s", planResponse.Code, planned, planResponse.Body.String())
+	}
+	actionResponse := request("/api/actions/managed_basic_rotate?credential_id=cred_00000000000000000000000000000001", `{"plan_id":"plan_fixture","confirmation":"rotate"}`)
+	if actionResponse.Code != http.StatusOK || !rotated || !strings.Contains(actionResponse.Body.String(), "b25lLXRpbWUtcGFzc3dvcmQ=") {
+		t.Fatalf("rotate action walkthrough failed: status=%d rotated=%v body=%s", actionResponse.Code, rotated, actionResponse.Body.String())
+	}
+	planlessResponse := request("/api/actions/managed_basic_rotate?credential_id=cred_00000000000000000000000000000001", `{"confirmation":"generate"}`)
+	if planlessResponse.Code != http.StatusBadRequest {
+		t.Fatalf("planless rotate status=%d, want %d", planlessResponse.Code, http.StatusBadRequest)
+	}
+}
+
 func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *testing.T) {
 	server := testServer(t)
 	request := httptest.NewRequest(http.MethodGet, "http://127.1.2.3:52345/", nil)
@@ -549,6 +605,9 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	}
 	if strings.Count(appJS, `JSON.stringify({plan_id:"",confirmation:"",certificate})`) != 2 {
 		t.Fatal("Headscale Plan requests are not canonical")
+	}
+	if !strings.Contains(appJS, `/api/actions/managed_basic_rotate/plan`) || !strings.Contains(appJS, `confirmation:"rotate"`) {
+		t.Fatal("Managed Basic rotate does not use a Plan")
 	}
 	if strings.Contains(response.Body.String(), `name="account_key_path"`) || strings.Contains(appJS, "account_key_path") || strings.Contains(response.Body.String(), `name="account_email"`) || strings.Contains(appJS, "account_email") || strings.Count(response.Body.String(), "installation-managed ACME account key") != 2 {
 		t.Fatal("ACME account key is still caller-selected or its managed authority is not disclosed")

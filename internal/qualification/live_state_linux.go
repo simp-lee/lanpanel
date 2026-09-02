@@ -9,39 +9,82 @@ import (
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const liveStateSchemaVersion = "lanpanel.qualification.live-state.v2"
+const liveStateSchemaVersion = "lanpanel.qualification.live-state.v3"
 
 type dnsCreateIntent struct {
 	Name    string `json:"name"`
 	Address string `json:"address"`
 }
 
+type registrationIntent struct {
+	Kind       string   `json:"kind"`
+	ResourceID string   `json:"resource_id"`
+	Selector   string   `json:"selector"`
+	PriorIDs   []string `json:"prior_ids"`
+}
+
+type resourceCreateIntent struct {
+	Slot       string   `json:"slot"`
+	Name       string   `json:"name"`
+	TargetKind string   `json:"target_kind"`
+	SpecDigest string   `json:"spec_digest"`
+	PriorIDs   []string `json:"prior_ids"`
+}
+
+type headscaleUserCreateIntent struct {
+	Name     string   `json:"name"`
+	PriorIDs []uint64 `json:"prior_ids"`
+}
+
+type preauthKeyCreateIntent struct {
+	UserID            uint64    `json:"user_id"`
+	ExpirationSeconds uint32    `json:"expiration_seconds"`
+	CreatedAt         time.Time `json:"created_at"`
+	Deadline          time.Time `json:"deadline"`
+	PriorIDs          []uint64  `json:"prior_ids"`
+}
+
+type connectorDeviceIntent struct {
+	UserID     uint64    `json:"user_id"`
+	ControlURL string    `json:"control_url"`
+	CreatedAt  time.Time `json:"created_at"`
+	Deadline   time.Time `json:"deadline"`
+	PriorIDs   []uint64  `json:"prior_ids"`
+}
+
 type liveState struct {
-	SchemaVersion        string             `json:"schema_version"`
-	RunID                string             `json:"run_id"`
-	ProtectedInputDigest string             `json:"protected_input_digest"`
-	ResourceID           string             `json:"resource_id,omitempty"`
-	TemporaryResourceID  string             `json:"temporary_resource_id,omitempty"`
-	TailnetResourceID    string             `json:"tailnet_resource_id,omitempty"`
-	BasicCredentialID    string             `json:"basic_credential_id,omitempty"`
-	StaticRootID         string             `json:"static_root_id,omitempty"`
-	ExternalCredentialID string             `json:"external_credential_id,omitempty"`
-	HeadscaleUserID      string             `json:"headscale_user_id,omitempty"`
-	PreauthKeyID         string             `json:"preauth_key_id,omitempty"`
-	ConnectorDeviceID    string             `json:"connector_device_id,omitempty"`
-	ConnectorBound       bool               `json:"connector_bound"`
-	DNSCreateIntents     []dnsCreateIntent  `json:"dns_create_intents"`
-	CloudflareRecords    []cloudflareRecord `json:"cloudflare_records"`
-	FixtureCreated       bool               `json:"fixture_created"`
-	DNSProfileCreated    bool               `json:"dns_profile_created"`
-	ResourceDeleted      bool               `json:"resource_deleted"`
-	CloseAllCommitted    bool               `json:"close_all_committed"`
-	CompletedSteps       []string           `json:"completed_steps"`
-	FinalCleanupComplete bool               `json:"final_cleanup_complete"`
+	SchemaVersion              string                     `json:"schema_version"`
+	RunID                      string                     `json:"run_id"`
+	ProtectedInputDigest       string                     `json:"protected_input_digest"`
+	ResourceID                 string                     `json:"resource_id,omitempty"`
+	TemporaryResourceID        string                     `json:"temporary_resource_id,omitempty"`
+	TailnetResourceID          string                     `json:"tailnet_resource_id,omitempty"`
+	BasicCredentialID          string                     `json:"basic_credential_id,omitempty"`
+	StaticRootID               string                     `json:"static_root_id,omitempty"`
+	ExternalCredentialID       string                     `json:"external_credential_id,omitempty"`
+	HeadscaleUserID            string                     `json:"headscale_user_id,omitempty"`
+	PreauthKeyID               string                     `json:"preauth_key_id,omitempty"`
+	ConnectorDeviceID          string                     `json:"connector_device_id,omitempty"`
+	ConnectorBound             bool                       `json:"connector_bound"`
+	DNSCreateIntents           []dnsCreateIntent          `json:"dns_create_intents"`
+	CloudflareRecords          []cloudflareRecord         `json:"cloudflare_records"`
+	FixtureCreated             bool                       `json:"fixture_created"`
+	DNSProfileCreated          bool                       `json:"dns_profile_created"`
+	ResourceDeleted            bool                       `json:"resource_deleted"`
+	CloseAllCommitted          bool                       `json:"close_all_committed"`
+	CompletedSteps             []string                   `json:"completed_steps"`
+	FinalCleanupComplete       bool                       `json:"final_cleanup_complete"`
+	PendingRegistration        *registrationIntent        `json:"pending_registration,omitempty"`
+	PendingResourceCreate      *resourceCreateIntent      `json:"pending_resource_create,omitempty"`
+	PendingHeadscaleUserCreate *headscaleUserCreateIntent `json:"pending_headscale_user_create,omitempty"`
+	PendingPreauthKeyCreate    *preauthKeyCreateIntent    `json:"pending_preauth_key_create,omitempty"`
+	PendingConnectorDevice     *connectorDeviceIntent     `json:"pending_connector_device,omitempty"`
 }
 
 type liveStateStore struct{ path string }
@@ -124,6 +167,21 @@ func validateLiveState(state liveState, runID, inputDigest string) error {
 			return fmt.Errorf("live executor state identity is invalid")
 		}
 	}
+	if err := validateRegistrationIntent(state.PendingRegistration); err != nil {
+		return err
+	}
+	if err := validateResourceCreateIntent(state.PendingResourceCreate); err != nil {
+		return err
+	}
+	if err := validateHeadscaleUserIntent(state.PendingHeadscaleUserCreate); err != nil {
+		return err
+	}
+	if err := validatePreauthKeyIntent(state.PendingPreauthKeyCreate); err != nil {
+		return err
+	}
+	if err := validateConnectorDeviceIntent(state.PendingConnectorDevice); err != nil {
+		return err
+	}
 	previousStep := ""
 	for _, step := range state.CompletedSteps {
 		if !containsString(orderedJourney, step) || previousStep != "" && previousStep >= step {
@@ -144,6 +202,85 @@ func validateLiveState(state liveState, runID, inputDigest string) error {
 			return fmt.Errorf("live executor Cloudflare state is invalid")
 		}
 		seen[record.ID] = true
+	}
+	return nil
+}
+
+func validateRegistrationIntent(intent *registrationIntent) error {
+	if intent == nil {
+		return nil
+	}
+	if (intent.Kind != "managed_basic" && intent.Kind != "static_root" && intent.Kind != "external_htpasswd") || intent.ResourceID == "" || intent.ResourceID != filepath.Base(intent.ResourceID) || intent.Selector == "" || len(intent.Selector) > 4096 || strings.ContainsRune(intent.Selector, '\x00') || len(intent.PriorIDs) > 1024 {
+		return fmt.Errorf("live executor registration intent is invalid")
+	}
+	return validateStringIDs(intent.PriorIDs)
+}
+
+func validateResourceCreateIntent(intent *resourceCreateIntent) error {
+	if intent == nil {
+		return nil
+	}
+	if (intent.Slot != "local" && intent.Slot != "temporary" && intent.Slot != "tailnet") || intent.Name == "" || len(intent.Name) > 256 || strings.ContainsAny(intent.Name, "\x00\r\n") || intent.TargetKind == "" || len(intent.TargetKind) > 256 || strings.ContainsAny(intent.TargetKind, "\x00\r\n") || !release.ValidDigest(intent.SpecDigest) || len(intent.PriorIDs) > 1024 {
+		return fmt.Errorf("live executor resource creation intent is invalid")
+	}
+	wantKind := "local_http"
+	if intent.Slot == "tailnet" {
+		wantKind = "tailnet_http"
+	}
+	if intent.TargetKind != wantKind {
+		return fmt.Errorf("live executor resource creation target kind is invalid")
+	}
+	return validateStringIDs(intent.PriorIDs)
+}
+
+func validateHeadscaleUserIntent(intent *headscaleUserCreateIntent) error {
+	if intent == nil {
+		return nil
+	}
+	if intent.Name == "" || len(intent.Name) > 256 || strings.ContainsRune(intent.Name, '\x00') || len(intent.PriorIDs) > 1024 {
+		return fmt.Errorf("live executor Headscale user intent is invalid")
+	}
+	return validateUintIDs(intent.PriorIDs)
+}
+
+func validatePreauthKeyIntent(intent *preauthKeyCreateIntent) error {
+	if intent == nil {
+		return nil
+	}
+	if intent.UserID == 0 || intent.ExpirationSeconds == 0 || intent.ExpirationSeconds > 24*60*60 || intent.CreatedAt.IsZero() || intent.Deadline.IsZero() || !intent.Deadline.After(intent.CreatedAt) || intent.Deadline.Sub(intent.CreatedAt) > 10*time.Minute || len(intent.PriorIDs) > 1024 {
+		return fmt.Errorf("live executor preauth key intent is invalid")
+	}
+	return validateUintIDs(intent.PriorIDs)
+}
+
+func validateConnectorDeviceIntent(intent *connectorDeviceIntent) error {
+	if intent == nil {
+		return nil
+	}
+	if intent.UserID == 0 || intent.ControlURL == "" || len(intent.ControlURL) > 512 || strings.ContainsAny(intent.ControlURL, "\x00\r\n") || intent.CreatedAt.IsZero() || intent.Deadline.IsZero() || !intent.Deadline.After(intent.CreatedAt) || intent.Deadline.Sub(intent.CreatedAt) > 10*time.Minute || len(intent.PriorIDs) > 1024 {
+		return fmt.Errorf("live executor connector device intent is invalid")
+	}
+	return validateUintIDs(intent.PriorIDs)
+}
+
+func validateStringIDs(values []string) error {
+	previous := ""
+	for _, value := range values {
+		if value == "" || len(value) > 256 || value != filepath.Base(value) || previous != "" && previous >= value {
+			return fmt.Errorf("live executor string identity inventory is invalid")
+		}
+		previous = value
+	}
+	return nil
+}
+
+func validateUintIDs(values []uint64) error {
+	previous := uint64(0)
+	for _, value := range values {
+		if value == 0 || previous >= value {
+			return fmt.Errorf("live executor numeric identity inventory is invalid")
+		}
+		previous = value
 	}
 	return nil
 }

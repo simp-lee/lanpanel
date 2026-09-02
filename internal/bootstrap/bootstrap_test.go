@@ -155,11 +155,15 @@ func TestInstallerPackagePhaseBindsReleaseRepositoryClosureAndPreflight(t *testi
 	installed.Profile.Packages = []release.PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}
 	installed.Profile.PackageClosureDigest = closure
 	installed.Profile.NginxVersion = "1.26.0-1"
+	repository := packages.Repository{ID: "debian", URI: installed.Profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: installed.Profile.RepositoryKeyFingerprint, MetadataDigest: installed.Profile.RepositoryMetadataDigest, CutoffDigest: installed.Profile.RepositoryCutoffDigest}
+	installed.Profile.RepositoryAuthorityDigest, err = release.RepositoryAuthorityDigest(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
 	installed.ProfileDigest, err = release.ProfileDigest(installed.Profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	repository := packages.Repository{ID: "debian", URI: installed.Profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: installed.Profile.RepositoryKeyFingerprint, MetadataDigest: installed.Profile.RepositoryMetadataDigest, CutoffDigest: installed.Profile.RepositoryCutoffDigest}
 	plan := packages.Plan{TransactionID: "pkg_" + strings.Repeat("1", 64), JobID: "job_" + strings.Repeat("2", 64), IntentGeneration: 1, Deadline: now.Add(time.Minute), OSProfileDigest: installed.ProfileDigest, Mode: packages.DistroRepository, Packages: packageValues, Repositories: []packages.Repository{repository}, FirstNginxInstall: true, LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: time.Minute, NoAutostartPolicyDigest: strings.Repeat("9", 64), Authority: packages.QualificationAuthority{Kind: packages.FinalSupportedProfile, ReleaseAuthorityDigest: installed.ReleaseManifestDigest, BinaryDigest: installed.Binary.Digest, HostFingerprint: installed.HostFingerprint, Operation: "package_transaction", TargetOSProfileDigest: installed.ProfileDigest, FrozenClosureDigest: closure}}
 	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + strings.Repeat("6", 64), Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "package_ready", Disposition: preflight.FindingPassed, Summary: "package preflight", Identity: "fixture"}}}
 	plan.PreflightDigest, err = result.Digest()
@@ -173,6 +177,60 @@ func TestInstallerPackagePhaseBindsReleaseRepositoryClosureAndPreflight(t *testi
 	plan.Repositories[0].MetadataDigest = strings.Repeat("0", 64)
 	if _, err := validateInstallerPackageAuthority(installed, plan, result); err == nil {
 		t.Fatal("repository metadata drift retained installer package authority")
+	}
+}
+
+func TestBootstrapJournalPackageAuthorityUsesExactPersistedPlan(t *testing.T) {
+	journal := testJournal(t.TempDir())
+	profile := journal.Release.Profile
+	packageValue := packages.Package{Name: "nginx", Version: profile.NginxVersion, Architecture: "amd64", ArtifactDigest: strings.Repeat("a", 64), ArtifactBytes: 1, MaximumInstalledFileBytes: 1 << 20, AffectedUnits: []string{}, PossibleListeners: []string{}, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: "nginx", Version: profile.NginxVersion, OperatingOS: "linux", Architecture: "amd64", Digest: strings.Repeat("a", 64)}}}
+	closure, err := packages.ClosureDigest([]packages.Package{packageValue})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.PackageClosureDigest = closure
+	repository := packages.Repository{ID: "debian", URI: profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: profile.RepositoryKeyFingerprint, MetadataDigest: profile.RepositoryMetadataDigest, CutoffDigest: profile.RepositoryCutoffDigest}
+	profile.RepositoryAuthorityDigest, err = release.RepositoryAuthorityDigest(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileDigest, err := release.ProfileDigest(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.Release.Profile = profile
+	journal.Release.ProfileDigest = profileDigest
+	request := journal.PreflightRequest
+	requestDigest, err := preflight.ExpansionRequestDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: requestDigest, Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "package_ready", Disposition: preflight.FindingPassed, Summary: "package preflight", Identity: "fixture"}}}
+	plan := packages.Plan{TransactionID: journal.PackageTransactionID, JobID: "job_" + strings.Repeat("1", 64), IntentGeneration: 1, Deadline: now.Add(time.Minute), OSProfileDigest: profileDigest, Mode: packages.DistroRepository, Packages: []packages.Package{packageValue}, Repositories: []packages.Repository{repository}, FirstNginxInstall: false, LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: time.Minute, NoAutostartPolicyDigest: journal.Release.Binary.Digest, PreflightRequestDigest: requestDigest, Authority: packages.QualificationAuthority{Kind: packages.FinalSupportedProfile, ReleaseAuthorityDigest: journal.Release.ReleaseManifestDigest, BinaryDigest: journal.Release.Binary.Digest, HostFingerprint: journal.Release.HostFingerprint, Operation: "package_transaction", TargetOSProfileDigest: profileDigest, FrozenClosureDigest: closure}}
+	plan.PreflightDigest, err = result.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.PackagePlan = plan
+	journal.PackagePreflight = result
+	journal.PackagePlanDigest, err = packages.PlanDigest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.PackageInputPlanDigest = journal.PackagePlanDigest
+	if err := validateJournalPackageAuthority(journal); err != nil {
+		t.Fatal(err)
+	}
+	fresh := result
+	fresh.ObservedAt = now.Add(time.Second)
+	fresh.ValidUntil = fresh.ObservedAt.Add(preflight.MaximumAge)
+	refreshed, refreshedDigest, err := refreshPackagePlanForResume(journal.Release, plan, request, fresh, fresh.ObservedAt.Add(time.Second))
+	if err != nil || refreshedDigest == journal.PackagePlanDigest || refreshed.PreflightDigest == plan.PreflightDigest {
+		t.Fatalf("fresh package authority did not produce a distinct plan: plan=%#v digest=%q err=%v", refreshed, refreshedDigest, err)
+	}
+	if journal.PackagePlanDigest != journal.PackageInputPlanDigest {
+		t.Fatal("persisted exact package authority was unexpectedly substituted")
 	}
 }
 
@@ -278,7 +336,7 @@ func TestStartupAuthorityRecoversAfterCreateBeforeJournalAdvance(t *testing.T) {
 
 func TestLegacyBootstrapJournalSchemaIsRejected(t *testing.T) {
 	journal := testJournal(t.TempDir())
-	journal.SchemaVersion = "lanpanel.bootstrap.journal.v1"
+	journal.SchemaVersion = "lanpanel.bootstrap.journal.v2"
 	if err := validateJournal(journal); err == nil {
 		t.Fatal("legacy bootstrap journal wire was accepted as current schema")
 	}
@@ -438,7 +496,7 @@ func TestTokenDeliveryMarksAttemptBeforeOutputAndNeverRedirectsSecret(t *testing
 
 func testJournal(root string) Journal {
 	digest := func(value byte) string { return strings.Repeat(string(value), 64) }
-	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest('1'), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest('2'), RepositoryMetadataDigest: digest('3'), RepositoryCutoffDigest: digest('4'), PackageClosureDigest: digest('5'), Packages: []release.PackageTuple{{Name: "nginx", Version: "1.26.0", Architecture: "amd64"}}, ManagedConfinement: release.ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest('8')}}
+	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest('1'), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest('2'), RepositoryMetadataDigest: digest('3'), RepositoryCutoffDigest: digest('4'), RepositoryAuthorityDigest: digest('6'), PackageClosureDigest: digest('5'), Packages: []release.PackageTuple{{Name: "nginx", Version: "1.26.0", Architecture: "amd64"}}, ManagedConfinement: release.ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest('8')}}
 	profileDigest, _ := release.ProfileDigest(profile)
 	paths := testPaths(root)
 	request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: profile.ManagedConfinement.SchemaVersion, KernelRelease: profile.ManagedConfinement.KernelRelease, CgroupMode: profile.ManagedConfinement.CgroupMode, BindListenPolicy: profile.ManagedConfinement.BindListenPolicy, ConnectPolicy: profile.ManagedConfinement.ConnectPolicy, FilesystemPolicy: profile.ManagedConfinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), profile.ManagedConfinement.ProtectedDestinations...), QualificationDigest: "sha256:" + profile.ManagedConfinement.QualificationDigest}, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + profileDigest, LiveQualified: true}}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: "127.41.42.43", Port: 52345, Purpose: "management"}}, Disks: []preflight.DiskRequirement{{Path: root, MinimumAvailableBytes: 1}}, LastTrustedWall: time.Unix(1700000000, 0).UTC()}

@@ -69,7 +69,7 @@ func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor strin
 	}
 	credential := domain.Credential{ID: credentialID, Kind: "external_htpasswd", OwnerResourceID: resourceID, ExternalPath: path, Fingerprint: identity.Fingerprint}
 	encoded, _ := json.Marshal(credential)
-	execution, err := beginBasic(ctx, operations.ExternalHTPasswdRegister, "resource/"+resourceID, actor, operations.SafetyBinding{ResourceID: resourceID, CandidateDigest: identity.Fingerprint, CandidateBundle: shaDigest(encoded), Deadline: time.Now().UTC().Add(time.Minute)})
+	execution, err := beginBasic(ctx, operations.ExternalHTPasswdRegister, "resource/"+resourceID, actor, operations.SafetyBinding{ResourceID: resourceID, CandidateDigest: identity.Fingerprint, CandidateBundle: shaDigest(encoded), Deadline: time.Now().UTC().Add(time.Minute)}, "")
 	if err != nil {
 		return ExternalHTPasswdResult{}, err
 	}

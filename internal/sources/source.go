@@ -15,8 +15,8 @@ import (
 type Kind string
 
 const (
-	OfficialCanonical Kind = "official_canonical_artifact"
-	OfficialDistro    Kind = "official_distro_repository"
+	OfficialCanonical Kind = "official/canonical_artifact"
+	OfficialDistro    Kind = "official/distro_repository"
 	Mirror            Kind = "mirror"
 	Offline           Kind = "offline"
 )

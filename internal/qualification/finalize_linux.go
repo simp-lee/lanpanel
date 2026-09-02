@@ -5,6 +5,7 @@ package qualification
 import (
 	"errors"
 	"fmt"
+	"lanpanel/internal/packages"
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
@@ -96,6 +97,18 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 	if err := release.DecodeCanonical(dependencyBytes, &dependency); err != nil {
 		return FinalizedRelease{}, err
 	}
+	packageTemplateBytes, _, err := readProtectedFile(prepared.Input.Artifacts.PackageTemplate, 4<<20, true)
+	if err != nil {
+		return FinalizedRelease{}, err
+	}
+	var packageTemplate packages.Plan
+	if err := release.DecodeCanonical(packageTemplateBytes, &packageTemplate); err != nil {
+		return FinalizedRelease{}, err
+	}
+	publicPackageTemplate, err := buildPublicPackageTemplate(packageTemplate, identity.Profile, identity.CandidateDigest)
+	if err != nil {
+		return FinalizedRelease{}, err
+	}
 	createdAt := now().UTC().Truncate(time.Second)
 	if createdAt.Before(summary.CompletedAt) || security.ScannedAt.After(createdAt) || createdAt.Sub(security.ScannedAt) > 7*24*time.Hour {
 		return FinalizedRelease{}, fmt.Errorf("release finalization clock regressed or security report is outside its seven-day validity")
@@ -124,6 +137,7 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 		"LICENSE": licenseBytes, "NOTICE": noticeBytes, "lanpanel.spdx.json": sbomBytes,
 		"dependency-manifest.json": dependencyBytes, "security-report.json": securityBytes,
 		"qualification-summary.json": summaryBytes, "known-limitations.md": limitationsBytes,
+		"package-template.json": publicPackageTemplate,
 	}
 	additional := []release.AssetIdentity{}
 	for name, path := range prepared.Input.Artifacts.DependencyAssets {
@@ -137,6 +151,7 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 		}
 		additional = append(additional, assetIdentity(name, asset))
 	}
+	additional = append(additional, assetIdentity("package-template.json", publicPackageTemplate))
 	slices.SortFunc(additional, func(left, right release.AssetIdentity) int { return strings.Compare(left.Path, right.Path) })
 	manifest := release.ReleaseManifest{
 		SchemaVersion: release.ReleaseManifestSchemaVersion, ReleaseTag: input.ExpectedReleaseTag,
@@ -204,6 +219,46 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 	assetNames = append(assetNames, "SHA256SUMS", "release.json")
 	slices.Sort(assetNames)
 	return FinalizedRelease{ReleaseTag: input.ExpectedReleaseTag, ManifestDigest: release.DigestBytes(manifestBytes), CandidateDigest: identity.CandidateDigest, SourceTreeDigest: prepared.SourceDigest, OutputDirectory: input.OutputDirectory, Assets: assetNames}, nil
+}
+
+func buildPublicPackageTemplate(template packages.Plan, profile release.OSProfile, binaryDigest string) ([]byte, error) {
+	if err := validateQualificationPackageTemplate(template, profile); err != nil {
+		return nil, err
+	}
+	profileDigest, err := release.ProfileDigest(profile)
+	if err != nil {
+		return nil, err
+	}
+	closureDigest, err := packages.ClosureDigest(template.Packages)
+	if err != nil || closureDigest != profile.PackageClosureDigest || len(template.Packages) != len(profile.Packages) {
+		return nil, fmt.Errorf("public package template closure differs from supported profile")
+	}
+	for index, pkg := range template.Packages {
+		want := profile.Packages[index]
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture {
+			return nil, fmt.Errorf("public package template tuple differs from supported profile")
+		}
+	}
+	if len(template.Repositories) != 1 || template.Repositories[0].URI != profile.RepositorySource || template.Repositories[0].KeyringDigest != profile.RepositoryKeyFingerprint || template.Repositories[0].MetadataDigest != profile.RepositoryMetadataDigest || template.Repositories[0].CutoffDigest != profile.RepositoryCutoffDigest {
+		return nil, fmt.Errorf("public package template repository differs from supported profile")
+	}
+	repositoryDigest, err := release.RepositoryAuthorityDigest(template.Repositories[0])
+	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+		return nil, fmt.Errorf("public package template repository authority differs from supported profile")
+	}
+	template.TransactionID = "pkg_" + strings.Repeat("0", 64)
+	template.JobID = "job_" + strings.Repeat("1", 64)
+	template.IntentGeneration = 1
+	template.Deadline = time.Unix(4102444800, 0).UTC()
+	template.OSProfileDigest = profileDigest
+	template.NoAutostartPolicyDigest = binaryDigest
+	template.PreflightDigest = "sha256:" + strings.Repeat("0", 64)
+	template.PreflightRequestDigest = "sha256:" + strings.Repeat("1", 64)
+	template.Authority = packages.QualificationAuthority{Kind: packages.FinalSupportedProfile, ReleaseAuthorityDigest: strings.Repeat("0", 64), BinaryDigest: binaryDigest, HostFingerprint: "host-template", Operation: "package_transaction", TargetOSProfileDigest: profileDigest, FrozenClosureDigest: profile.PackageClosureDigest}
+	if err := packages.ValidatePlan(template); err != nil {
+		return nil, fmt.Errorf("public package template is invalid: %w", err)
+	}
+	return release.MarshalCanonical(template)
 }
 
 func providerClaimsMatch(values []release.ProviderLiveTest, live string) bool {

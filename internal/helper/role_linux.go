@@ -1124,7 +1124,7 @@ func RunRole(args []string) error {
 		if request.Action.Operation == "managed_basic_create" {
 			result, err = application.CreateManagedBasic(ctx, request.Action.TargetID, request.Action.Username, actor)
 		} else {
-			result, err = application.RotateManagedBasic(ctx, request.Action.TargetID, actor)
+			result, err = application.RotateManagedBasic(ctx, request.Action.TargetID, actor, request.Action.PlanID)
 		}
 		if err != nil {
 			return ExecutionResult{}, err

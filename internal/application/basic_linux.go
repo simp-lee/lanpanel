@@ -16,6 +16,7 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
+	"strings"
 	"time"
 )
 
@@ -86,12 +87,15 @@ func basicReservationRejectionCode(operation operations.Type) string {
 	}
 }
 
-func beginBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding) (*basicExecution, error) {
+func beginBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding, planID string) (*basicExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err
 	}
 	fail := func(cause error) (*basicExecution, error) { _ = service.Close(); return nil, cause }
+	if operation == operations.ManagedBasicRotate && planID == "" {
+		return fail(fmt.Errorf("managed Basic rotation requires a Plan"))
+	}
 	document, err := service.normal.Read()
 	if err != nil {
 		return fail(err)
@@ -100,11 +104,26 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	if err != nil {
 		return fail(err)
 	}
+	source := operations.AdmissionUI
+	var confirmationProof string
+	if planID != "" {
+		plan, planErr := service.ReadPlan(planID)
+		if planErr != nil || plan.Operation != string(operation) || plan.Target.Kind != "credential" || plan.Target.ID != strings.TrimPrefix(target, "credential/") || plan.ActorIdentity != actor || !plan.Config.Applicable || plan.Config.Digest != binding.PriorFingerprint {
+			return fail(fmt.Errorf("managed Basic Plan changed"))
+		}
+		admitter, err = service.Admitter(plan)
+		if err != nil {
+			return fail(err)
+		}
+		binding.Deadline = plan.ExpiresAt
+		source = operations.AdmissionPlan
+		confirmationProof = plan.NonceDigest
+	}
 	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {
 		return fail(err)
 	}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operation, Target: target, ActorIdentity: actor, Source: operations.AdmissionUI, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operation, Target: target, ActorIdentity: actor, PlanID: planID, Source: source, SafetyBinding: binding, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
@@ -131,7 +150,12 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	if err != nil {
 		return cleanupReserved(err)
 	}
-	intent, err := admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
+	var intent operations.Reservation
+	if source == operations.AdmissionPlan {
+		intent, err = admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: confirmationProof})
+	} else {
+		intent, err = admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
+	}
 	if err != nil {
 		return cleanupReserved(err)
 	}
@@ -265,7 +289,7 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	if err != nil {
 		return result, err
 	}
-	execution, err := beginBasic(ctx, operations.ManagedBasicCreate, "resource/"+resourceID, actor, operations.SafetyBinding{ResourceID: resourceID, Deadline: time.Now().UTC().Add(time.Minute)})
+	execution, err := beginBasic(ctx, operations.ManagedBasicCreate, "resource/"+resourceID, actor, operations.SafetyBinding{ResourceID: resourceID, Deadline: time.Now().UTC().Add(time.Minute)}, "")
 	if err != nil {
 		return result, err
 	}
@@ -330,7 +354,7 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 	return ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: generated.Fingerprint, Password: password}, nil
 }
 
-func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result ManagedBasicResult, resultErr error) {
+func RotateManagedBasic(ctx context.Context, credentialID, actor, planID string) (result ManagedBasicResult, resultErr error) {
 	service, err := OpenFixed()
 	if err != nil {
 		return result, err
@@ -347,7 +371,7 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor string) (result
 	if err := requireNoDegradedAppliedSource(credential.OwnerResourceID); err != nil {
 		return result, err
 	}
-	execution, err := beginBasic(ctx, operations.ManagedBasicRotate, "credential/"+credentialID, actor, operations.SafetyBinding{ResourceID: credential.OwnerResourceID, PriorFingerprint: credential.Fingerprint, Deadline: time.Now().UTC().Add(time.Minute)})
+	execution, err := beginBasic(ctx, operations.ManagedBasicRotate, "credential/"+credentialID, actor, operations.SafetyBinding{ResourceID: credential.OwnerResourceID, PriorFingerprint: credential.Fingerprint, Deadline: time.Now().UTC().Add(time.Minute)}, planID)
 	if err != nil {
 		return result, err
 	}

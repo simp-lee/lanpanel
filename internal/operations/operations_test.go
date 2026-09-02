@@ -166,13 +166,15 @@ func TestAuthenticatedResourceUpdateBindsPriorAndCandidateDigests(t *testing.T) 
 }
 
 func TestBasicFamilyReservationsRejectAndKnownNoEffectPermitSameProcessRetry(t *testing.T) {
+	if err := validateAdmissionSource(ManagedBasicRotate, AdmissionUI, ""); err == nil {
+		t.Fatal("planless Managed Basic rotation admission was accepted")
+	}
 	cases := []struct {
 		operation Type
 		target    string
 		binding   SafetyBinding
 	}{
 		{ManagedBasicCreate, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
-		{ManagedBasicRotate, "credential/cred_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PriorFingerprint: testDigest("prior")}},
 		{StaticRootRegister, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
 		{ExternalHTPasswdRegister, "resource/res_00000000000000000000000000000001", SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}},
 	}
@@ -284,34 +286,49 @@ func TestManagedBasicRotateCommitRejectsCredentialChangedBeforeTargetLock(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{10}, 64)), Bindings: trustedBindings{}, Confirmation: testConfirmation{}, Registry: registry})
+	actor := "ui/session/generation/1"
+	target := "credential/" + prior.ID
+	binding := SafetyBinding{ResourceID: prior.OwnerResourceID, PriorFingerprint: prior.Fingerprint, Deadline: now.Add(time.Minute)}
+	planBinding := plans.Binding{Operation: string(ManagedBasicRotate), Target: plans.Target{Kind: plans.TargetCredential, ID: prior.ID}, ActorIdentity: actor, Config: plans.DigestBinding{Applicable: true, Digest: prior.Fingerprint}}
+	admitter, err := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{10}, 64)), Bindings: trustedBindings{binding: planBinding}, Confirmation: testConfirmation{}, Registry: registry})
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding := SafetyBinding{ResourceID: prior.OwnerResourceID, PriorFingerprint: prior.Fingerprint, Deadline: now.Add(time.Minute)}
-	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: ManagedBasicRotate, Target: "credential/" + prior.ID, ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: binding, ExpectedRevision: 2})
+	planStore, err := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{11}, 64))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planStore.Create(context.Background(), admission, 2, plans.Spec{Operation: string(ManagedBasicRotate), Target: planBinding.Target, ActorIdentity: actor, Config: planBinding.Config, ExposureSummary: "managed_basic_rotation", Prerequisites: "authenticated_confirmation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: ManagedBasicRotate, Target: target, ActorIdentity: actor, PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: binding, ExpectedRevision: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := admission.Release(); err != nil {
 		t.Fatal(err)
 	}
-	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), "credential/"+prior.ID, manager)
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), target, manager)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ReleaseExposure(mutation, exposure) }()
-	intent, err := admitter.BeginUI(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: 3, IntentGeneration: 4})
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := admitter.ConsumePlan(context.Background(), mutation, exposure, ConsumeRequest{JobID: job.ID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1, ConfirmationProof: plan.NonceDigest})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if intent.SafetyBinding.PriorFingerprint != prior.Fingerprint {
 		t.Fatalf("prior fingerprint was not durable: %#v", intent.SafetyBinding)
 	}
-	if err := admitter.CommitManagedBasicFingerprint(context.Background(), mutation, exposure, 4, job.ID, prior, testDigest("candidate")); err == nil {
+	if err := admitter.CommitManagedBasicFingerprint(context.Background(), mutation, exposure, intent.IntentGeneration, job.ID, prior, testDigest("candidate")); err == nil {
 		t.Fatal("stale managed Basic rotation overwrote the locked credential")
 	}
-	document, err := normal.Read()
+	document, err = normal.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,9 +433,9 @@ func TestCredentialAndStaticRootTransitionsRequireExactTypedRunningIntent(t *tes
 			}
 			source := AdmissionUI
 			planID := ""
-			if test.operation == ManagedBasicDelete {
+			if test.operation == ManagedBasicDelete || test.operation == ManagedBasicRotate {
 				source = AdmissionPlan
-				planID = "plan_managed_basic_delete"
+				planID = "plan_managed_basic_" + strings.TrimPrefix(string(test.operation), "managed_basic_")
 			}
 			intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: planID, AdmissionSource: source, Operation: test.operation, Target: test.target, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: test.binding, CreatedAt: now, IntentGeneration: 2, Consumption: &ConsumptionSnapshot{Source: source, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
 			beforeEntries := map[string]json.RawMessage{"installations/current": encode(t, beforeInstallation), reservationKey(record.ID): encode(t, intent), "jobs/" + record.ID: encode(t, running)}

@@ -1,11 +1,13 @@
 package release
 
 import (
+	"encoding/json"
 	"fmt"
 	"lanpanel/internal/acmeaccount"
 	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/dependencies"
 	"lanpanel/internal/filetxn"
+	"lanpanel/internal/packages"
 	"net/url"
 	"os"
 	"reflect"
@@ -16,7 +18,7 @@ import (
 )
 
 const (
-	ReleaseManifestSchemaVersion              = "lanpanel.release.v2"
+	ReleaseManifestSchemaVersion              = "lanpanel.release.v3"
 	QualificationTargetProfileSchemaVersion   = "lanpanel.qualification.target-profile.v1"
 	QualificationInstallManifestSchemaVersion = "lanpanel.qualification.install-manifest.v4"
 	LiveSideEffectPlanSchemaVersion           = "lanpanel.qualification.side-effect-plan.v2"
@@ -89,20 +91,21 @@ type PackageTuple struct {
 }
 
 type OSProfile struct {
-	ID                       string             `json:"id"`
-	Family                   string             `json:"family"`
-	Release                  string             `json:"release"`
-	Architecture             string             `json:"architecture"`
-	SystemdVersion           string             `json:"systemd_version"`
-	NginxVersion             string             `json:"nginx_version"`
-	PackageSnapshotDigest    string             `json:"package_snapshot_digest"`
-	RepositorySource         string             `json:"repository_source"`
-	RepositoryKeyFingerprint string             `json:"repository_key_fingerprint"`
-	RepositoryMetadataDigest string             `json:"repository_metadata_digest"`
-	RepositoryCutoffDigest   string             `json:"repository_cutoff_digest"`
-	PackageClosureDigest     string             `json:"package_closure_digest"`
-	Packages                 []PackageTuple     `json:"packages"`
-	ManagedConfinement       ConfinementProfile `json:"managed_confinement"`
+	ID                        string             `json:"id"`
+	Family                    string             `json:"family"`
+	Release                   string             `json:"release"`
+	Architecture              string             `json:"architecture"`
+	SystemdVersion            string             `json:"systemd_version"`
+	NginxVersion              string             `json:"nginx_version"`
+	PackageSnapshotDigest     string             `json:"package_snapshot_digest"`
+	RepositorySource          string             `json:"repository_source"`
+	RepositoryKeyFingerprint  string             `json:"repository_key_fingerprint"`
+	RepositoryMetadataDigest  string             `json:"repository_metadata_digest"`
+	RepositoryCutoffDigest    string             `json:"repository_cutoff_digest"`
+	RepositoryAuthorityDigest string             `json:"repository_authority_digest"`
+	PackageClosureDigest      string             `json:"package_closure_digest"`
+	Packages                  []PackageTuple     `json:"packages"`
+	ManagedConfinement        ConfinementProfile `json:"managed_confinement"`
 }
 
 type ConfinementProfile struct {
@@ -257,6 +260,10 @@ func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes [
 	summary, summaryErr := DecodeQualificationSummary(summaryBytes)
 	profile := verified.value.SupportedProfiles[0]
 	profileDigest, _ := ProfileDigest(profile.Profile)
+	packageTemplate, present := assets["package-template.json"]
+	if !present || validatePublicPackageTemplate(packageTemplate, verified.value.Binary, profile.Profile, profileDigest) != nil {
+		return nil, fmt.Errorf("public package template is missing, invalid, or not installable")
+	}
 	if summaryErr != nil || summary.RunID != profile.QualificationRunID || summary.CandidateDigest != verified.value.Binary.Digest || summary.SourceTreeDigest != verified.value.SourceTreeDigest || summary.TargetProfileDigest != profileDigest || !reflect.DeepEqual(summary.ProviderLiveTests, verified.value.ProviderLiveTests) {
 		return nil, fmt.Errorf("qualification summary does not bind the supported release")
 	}
@@ -332,6 +339,63 @@ func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets 
 	return verifyDependencyAuthority(dependency, manifest.SupportedProfiles[0].Profile, dependencyAssets, baseline)
 }
 
+func validatePublicPackageTemplate(data []byte, binary AssetIdentity, profile OSProfile, profileDigest string) error {
+	var plan packages.Plan
+	if err := DecodeCanonical(data, &plan); err != nil || packages.ValidatePlan(plan) != nil {
+		return fmt.Errorf("public package template is not canonical")
+	}
+	zeroDigest := strings.Repeat("0", 64)
+	oneDigest := strings.Repeat("1", 64)
+	if plan.Mode != packages.DistroRepository || plan.Proxy != nil || !plan.FirstNginxInstall || plan.TransactionID != "pkg_"+zeroDigest || plan.JobID != "job_"+oneDigest || plan.IntentGeneration != 1 || !plan.Deadline.Equal(time.Unix(4102444800, 0).UTC()) || plan.OSProfileDigest != profileDigest || plan.NoAutostartPolicyDigest != binary.Digest || plan.PreflightDigest != "sha256:"+zeroDigest || plan.PreflightRequestDigest != "sha256:"+oneDigest || plan.Authority.Kind != packages.FinalSupportedProfile || plan.Authority.ReleaseAuthorityDigest != zeroDigest || plan.Authority.BinaryDigest != binary.Digest || plan.Authority.HostFingerprint != "host-template" || plan.Authority.Operation != "package_transaction" || plan.Authority.TargetOSProfileDigest != profileDigest || plan.Authority.FrozenClosureDigest != profile.PackageClosureDigest {
+		return fmt.Errorf("public package template carries non-template authority")
+	}
+	if len(plan.Packages) != len(profile.Packages) {
+		return fmt.Errorf("public package template closure differs from supported profile")
+	}
+	for index, pkg := range plan.Packages {
+		want := profile.Packages[index]
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture {
+			return fmt.Errorf("public package template tuple differs from supported profile")
+		}
+	}
+	if len(plan.Repositories) != 1 || plan.Repositories[0].URI != profile.RepositorySource || plan.Repositories[0].KeyringDigest != profile.RepositoryKeyFingerprint || plan.Repositories[0].MetadataDigest != profile.RepositoryMetadataDigest || plan.Repositories[0].CutoffDigest != profile.RepositoryCutoffDigest {
+		return fmt.Errorf("public package template repository differs from supported profile")
+	}
+	repositoryDigest, err := RepositoryAuthorityDigest(plan.Repositories[0])
+	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+		return fmt.Errorf("public package template repository authority differs from supported profile")
+	}
+	return nil
+}
+
+// RepositoryAuthorityDigest binds every field of the exact apt repository
+// authority, including its identity, suite, components, keyring path, and
+// metadata snapshots.
+func RepositoryAuthorityDigest(repository packages.Repository) (string, error) {
+	data, err := json.Marshal(repository)
+	if err != nil {
+		return "", err
+	}
+	return DigestBytes(data), nil
+}
+
+// InstallAssetPaths returns the complete public release asset inventory,
+// including the checksum and manifest files supplied separately to the
+// installer authority document.
+func InstallAssetPaths(manifest ReleaseManifest) ([]string, error) {
+	identities, err := releaseAssetInventory(manifest)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(identities)+2)
+	for _, identity := range identities {
+		paths = append(paths, identity.Path)
+	}
+	paths = append(paths, manifest.Checksums.Path, "release.json")
+	slices.Sort(paths)
+	return paths, nil
+}
+
 func releaseAssetInventory(manifest ReleaseManifest) ([]AssetIdentity, error) {
 	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.SBOM, manifest.DependencyManifest, manifest.Headscale.Archive, manifest.SecurityReport, manifest.QualificationSummary, manifest.KnownLimitations}
 	for _, member := range manifest.Headscale.Members {
@@ -358,6 +422,13 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	}
 	if _, err := releaseAssetInventory(manifest); err != nil {
 		return err
+	}
+	hasPackageTemplate := false
+	for _, asset := range manifest.AdditionalAssets {
+		hasPackageTemplate = hasPackageTemplate || asset.Path == "package-template.json"
+	}
+	if !hasPackageTemplate {
+		return fmt.Errorf("release public package template is missing")
 	}
 	if manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.License.Path != "LICENSE" || manifest.Notice.Path != "NOTICE" || manifest.SBOM.Path == "" || manifest.DependencyManifest.Path == "" || manifest.SecurityReport.Path == "" || manifest.QualificationSummary.Path == "" || manifest.KnownLimitations.Path == "" {
 		return fmt.Errorf("release mandatory asset paths are invalid")
@@ -455,7 +526,7 @@ func QualificationDependencyAssetPaths(authority QualificationDependencyAuthorit
 
 func reservedReleaseAssetPath(path string) bool {
 	switch path {
-	case "lanpanel", "LICENSE", "NOTICE", "lanpanel.spdx.json", "dependency-manifest.json", "security-report.json", "qualification-summary.json", "known-limitations.md", "SHA256SUMS", "release.json":
+	case "lanpanel", "LICENSE", "NOTICE", "lanpanel.spdx.json", "dependency-manifest.json", "security-report.json", "qualification-summary.json", "known-limitations.md", "package-template.json", "SHA256SUMS", "release.json":
 		return true
 	}
 	return strings.HasPrefix(path, "lanpanel-") && strings.HasSuffix(path, ".tar.gz")
@@ -564,7 +635,7 @@ func validateOSProfile(profile OSProfile) error {
 	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) {
 		return fmt.Errorf("OS profile platform identity is invalid")
 	}
-	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryKeyFingerprint) || !ValidDigest(profile.RepositoryMetadataDigest) || !ValidDigest(profile.RepositoryCutoffDigest) || !ValidDigest(profile.PackageClosureDigest) {
+	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryKeyFingerprint) || !ValidDigest(profile.RepositoryMetadataDigest) || !ValidDigest(profile.RepositoryCutoffDigest) || !ValidDigest(profile.RepositoryAuthorityDigest) || !ValidDigest(profile.PackageClosureDigest) {
 		return fmt.Errorf("OS profile repository digest authority is invalid")
 	}
 	if len(profile.Packages) == 0 || len(profile.Packages) > 4096 {

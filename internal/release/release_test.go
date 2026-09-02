@@ -6,6 +6,8 @@ import (
 	"compress/gzip"
 	"lanpanel/internal/dependencies"
 	"lanpanel/internal/filetxn"
+	"lanpanel/internal/packages"
+	"lanpanel/internal/sources"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +94,14 @@ func TestSingleReleaseManifestVerifiesExactAssetsAndSecurityGate(t *testing.T) {
 	if verified.Manifest().Binary != manifest.Binary || verified.Digest() != DigestBytes(manifestBytes) {
 		t.Fatal("verified release view changed identity")
 	}
+	paths, err := InstallAssetPaths(manifest)
+	hasTemplate := false
+	for _, path := range paths {
+		hasTemplate = hasTemplate || path == "package-template.json"
+	}
+	if err != nil || !hasTemplate {
+		t.Fatalf("public install asset inventory omits package template: %v", err)
+	}
 	if err := AuthorizePublication(verified); err != nil {
 		t.Fatal(err)
 	}
@@ -100,6 +110,49 @@ func TestSingleReleaseManifestVerifiesExactAssetsAndSecurityGate(t *testing.T) {
 	if _, err := VerifyRelease(DigestBytes(manifestBytes), manifestBytes, checksums, tampered); err == nil {
 		t.Fatal("tampered binary passed release verification")
 	}
+	tampered = cloneBytesMap(assets)
+	tampered["package-template.json"] = []byte("not-json")
+	if _, err := VerifyRelease(DigestBytes(manifestBytes), manifestBytes, checksums, tampered); err == nil {
+		t.Fatal("unusable package template passed release verification")
+	}
+	var template packages.Plan
+	if err := DecodeCanonical(assets["package-template.json"], &template); err != nil {
+		t.Fatal(err)
+	}
+	validTemplate := template
+	template.Proxy = &sources.Proxy{URL: "https://proxy.example.test"}
+	invalidTemplate, err := MarshalCanonical(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := manifest.SupportedProfiles[0]
+	profileDigest, err := ProfileDigest(profile.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePublicPackageTemplate(invalidTemplate, manifest.Binary, profile.Profile, profileDigest); err == nil {
+		t.Fatal("package template with an ambient proxy passed semantic validation")
+	}
+	for name, mutate := range map[string]func(*packages.Repository){
+		"id":        func(repository *packages.Repository) { repository.ID = "other" },
+		"suite":     func(repository *packages.Repository) { repository.Suite = "testing" },
+		"component": func(repository *packages.Repository) { repository.Components = []string{"contrib"} },
+		"keyring":   func(repository *packages.Repository) { repository.KeyringPath = "/etc/apt/keyrings/other.gpg" },
+	} {
+		t.Run("package_repository_"+name, func(t *testing.T) {
+			candidate := validTemplate
+			candidate.Repositories = append([]packages.Repository(nil), validTemplate.Repositories...)
+			candidate.Repositories[0].Components = append([]string(nil), validTemplate.Repositories[0].Components...)
+			mutate(&candidate.Repositories[0])
+			data, err := MarshalCanonical(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validatePublicPackageTemplate(data, manifest.Binary, profile.Profile, profileDigest); err == nil {
+				t.Fatalf("changed repository %s passed semantic validation", name)
+			}
+		})
+	}
 	if _, err := VerifyRelease(digest("wrong-root"), manifestBytes, checksums, assets); err == nil {
 		t.Fatal("wrong selected release.json digest was accepted")
 	}
@@ -107,6 +160,10 @@ func TestSingleReleaseManifestVerifiesExactAssetsAndSecurityGate(t *testing.T) {
 
 func TestReleaseSchemaHasNoDualEnvelopeEdgeOneOrEvidenceGraph(t *testing.T) {
 	_, manifestBytes, _, _ := releaseFixture(t, ResolutionNotAffected)
+	legacy := bytes.Replace(manifestBytes, []byte(`"schema_version":"lanpanel.release.v3"`), []byte(`"schema_version":"lanpanel.release.v2"`), 1)
+	if _, err := DecodeReleaseManifest(legacy); err == nil {
+		t.Fatal("legacy release manifest schema was accepted")
+	}
 	for _, field := range []string{`"kind":"qualification_candidate"`, `"edgeone":{}`, `"qualification_candidate_digest":"` + digest("candidate") + `"`, `"checklist_digest":"` + digest("checklist") + `"`, `"envelope_digest":"` + digest("envelope") + `"`} {
 		hostile := append([]byte(nil), manifestBytes[:len(manifestBytes)-1]...)
 		hostile = append(hostile, []byte(","+field+"}")...)
@@ -219,7 +276,7 @@ func TestSecurityGateRejectsUnresolvedMaterialFinding(t *testing.T) {
 
 func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest, []byte, []byte, map[string][]byte) {
 	t.Helper()
-	profile := testProfile()
+	profile := profileWithPackageClosure(testProfile())
 	binaryPath, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -245,6 +302,10 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 	if summaryErr != nil {
 		t.Fatal(summaryErr)
 	}
+	packageTemplate, packageTemplateErr := publicPackageTemplateFixture(profile, DigestBytes(binary))
+	if packageTemplateErr != nil {
+		t.Fatal(packageTemplateErr)
+	}
 	assets := map[string][]byte{
 		"lanpanel":                   binary,
 		"lanpanel-v1.0.0.tar.gz":     sourceArchive,
@@ -261,6 +322,7 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 		"tailscale":                  dependencyAssets["tailscale"],
 		"qualification-summary.json": summaryBytes,
 		"known-limitations.md":       []byte("Clean installation only.\nNo supported product backup/restore.\nNo generic Repair.\nNo EdgeOne integration.\nNo connector disconnect, logout, reset, rejoin, or rebind automation.\nConnector mismatches must be resolved outside LanPanel.\nTailnet is not live tested.\nTemporary public HTTP is plaintext and does not expire automatically.\nFail-closed Nginx stop can interrupt Headscale control ingress.\n"),
+		"package-template.json":      packageTemplate,
 	}
 	reportBytes, err := MarshalCanonical(testSecurityReport(DigestBytes(binary), DigestBytes(sbomBytes), DigestBytes(dependencyBytes), profileDigest, resolution))
 	if err != nil {
@@ -271,7 +333,7 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 		SchemaVersion: ReleaseManifestSchemaVersion, ReleaseTag: "v1.0.0", Binary: identity("lanpanel", binary), SourceArchive: identity("lanpanel-v1.0.0.tar.gz", assets["lanpanel-v1.0.0.tar.gz"]),
 		License: identity("LICENSE", assets["LICENSE"]), Notice: identity("NOTICE", assets["NOTICE"]), SBOM: identity("lanpanel.spdx.json", assets["lanpanel.spdx.json"]), DependencyManifest: identity("dependency-manifest.json", dependencyBytes), Headscale: dependency.Headscale,
 		SecurityReport: identity("security-report.json", reportBytes), QualificationSummary: identity("qualification-summary.json", assets["qualification-summary.json"]), KnownLimitations: identity("known-limitations.md", assets["known-limitations.md"]),
-		AdditionalAssets: []AssetIdentity{identity("dependency-baseline.json", baseline), identity("lego.tar.gz", assets["lego.tar.gz"]), identity("lego", assets["lego"]), identity("tailscale.tar.gz", assets["tailscale.tar.gz"]), identity("tailscale", assets["tailscale"])}, SourceTreeDigest: sourceTreeDigest,
+		AdditionalAssets: []AssetIdentity{identity("dependency-baseline.json", baseline), identity("lego.tar.gz", assets["lego.tar.gz"]), identity("lego", assets["lego"]), identity("package-template.json", assets["package-template.json"]), identity("tailscale.tar.gz", assets["tailscale.tar.gz"]), identity("tailscale", assets["tailscale"])}, SourceTreeDigest: sourceTreeDigest,
 		SupportedProfiles: []SupportedOSProfile{{Profile: profile, QualifiedBinaryDigest: DigestBytes(binary), QualificationRunID: "run-one", QualificationSummaryDigest: DigestBytes(assets["qualification-summary.json"])}},
 		ProviderLiveTests: providers,
 	}
@@ -305,7 +367,41 @@ func dependencyAuthorityFixture(t *testing.T, profile OSProfile) ([]byte, Qualif
 }
 
 func testProfile() OSProfile {
-	return OSProfile{ID: "debian-13-amd64", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0-1", PackageSnapshotDigest: digest("packages"), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest("repo-key"), RepositoryMetadataDigest: digest("repo-metadata"), RepositoryCutoffDigest: digest("repo-cutoff"), PackageClosureDigest: digest("closure"), Packages: []PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}, ManagedConfinement: ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest("confinement")}}
+	profile := OSProfile{ID: "debian-13-amd64", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0-1", PackageSnapshotDigest: digest("packages"), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest("repo-key"), RepositoryMetadataDigest: digest("repo-metadata"), RepositoryCutoffDigest: digest("repo-cutoff"), PackageClosureDigest: digest("closure"), Packages: []PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}, ManagedConfinement: ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest("confinement")}}
+	profile.RepositoryAuthorityDigest, _ = RepositoryAuthorityDigest(testRepository(profile))
+	return profile
+}
+
+func testRepository(profile OSProfile) packages.Repository {
+	return packages.Repository{ID: "debian-main", URI: profile.RepositorySource, Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/release.gpg", KeyringDigest: profile.RepositoryKeyFingerprint, MetadataDigest: profile.RepositoryMetadataDigest, CutoffDigest: profile.RepositoryCutoffDigest}
+}
+
+func profileWithPackageClosure(profile OSProfile) OSProfile {
+	values := packageValuesFixture(profile)
+	profile.PackageClosureDigest, _ = packages.ClosureDigest(values)
+	return profile
+}
+
+func packageValuesFixture(profile OSProfile) []packages.Package {
+	values := make([]packages.Package, len(profile.Packages))
+	for index, tuple := range profile.Packages {
+		values[index] = packages.Package{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture, ArtifactDigest: digest("package-artifact-" + tuple.Name), ArtifactBytes: 1, MaximumInstalledFileBytes: 1, AffectedUnits: []string{}, PossibleListeners: []string{}, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: tuple.Name, Version: tuple.Version, OperatingOS: "linux", Architecture: tuple.Architecture, Digest: digest("package-artifact-" + tuple.Name)}}}
+	}
+	return values
+}
+
+func publicPackageTemplateFixture(profile OSProfile, binaryDigest string) ([]byte, error) {
+	profileDigest, err := ProfileDigest(profile)
+	if err != nil {
+		return nil, err
+	}
+	zeroDigest := strings.Repeat("0", 64)
+	oneDigest := strings.Repeat("1", 64)
+	plan := packages.Plan{TransactionID: "pkg_" + zeroDigest, JobID: "job_" + oneDigest, IntentGeneration: 1, Deadline: time.Unix(4102444800, 0).UTC(), OSProfileDigest: profileDigest, Mode: packages.DistroRepository, Packages: packageValuesFixture(profile), Repositories: []packages.Repository{testRepository(profile)}, FirstNginxInstall: true, LockWait: time.Second, ConnectTimeout: time.Minute, ReadTimeout: time.Minute, TotalTimeout: 5 * time.Minute, NoAutostartPolicyDigest: binaryDigest, PreflightDigest: "sha256:" + zeroDigest, PreflightRequestDigest: "sha256:" + oneDigest, Authority: packages.QualificationAuthority{Kind: packages.FinalSupportedProfile, ReleaseAuthorityDigest: zeroDigest, BinaryDigest: binaryDigest, HostFingerprint: "host-template", Operation: "package_transaction", TargetOSProfileDigest: profileDigest, FrozenClosureDigest: profile.PackageClosureDigest}}
+	if err := packages.ValidatePlan(plan); err != nil {
+		return nil, err
+	}
+	return MarshalCanonical(plan)
 }
 
 func validDependencyBaseline(t *testing.T, profile OSProfile, headscaleDigest, legoDigest, tailscaleDigest string) []byte {

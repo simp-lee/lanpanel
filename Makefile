@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := ga-local-gate
 
-.PHONY: build test vet lint race check tidy docs-build go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
+.PHONY: build test vet lint race check tidy docs-build go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-secret-sentinel ga-local-walkthrough ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
@@ -102,6 +102,13 @@ ga-release-tooling-selftest: ga-release-identity-selftest ga-qualification-tooli
 ga-final-asset-selftest:
 	$(GO) test -count=1 -run 'TestSingleReleaseManifest|TestGenerateSPDX|TestSourceArchiveMustMatchCleanTrackedTree' ./internal/release
 
+ga-secret-sentinel:
+	$(GO) test -count=1 -run '^TestSecretSentinel' ./internal/qualification
+
+ga-local-walkthrough:
+	$(GO) test -count=1 -run '^TestLocalManagementWalkthrough$$' ./internal/ui
+
+
 ga-qualification-tooling-selftest:
 	$(GO) test -count=1 ./internal/qualification ./cmd/lanpanel-qualification
 	@grep -Fq 'Executor.Observe(observeCtx, step)' internal/qualification/journey.go
@@ -133,7 +140,7 @@ ga-finalize-release:
 	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'final release source worktree must be clean' >&2; exit 1; }
 	$(GO) run ./cmd/lanpanel-qualification release "$(RELEASE_FINALIZE_INPUT)"
 
-ga-local-gate: test vet lint race go-vulnerability-scan check node-vulnerability-scan ga-release-tooling-selftest ga-final-asset-selftest
+ga-local-gate: test vet lint race go-vulnerability-scan check node-vulnerability-scan ga-secret-sentinel ga-local-walkthrough ga-release-tooling-selftest ga-final-asset-selftest
 
 
 ga-release-identity-selftest:

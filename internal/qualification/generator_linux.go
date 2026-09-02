@@ -307,6 +307,9 @@ func validateGenerationInput(input GenerationInput, createdAt time.Time) error {
 	if _, err := release.ProfileDigest(input.Profile); err != nil {
 		return err
 	}
+	if err := validateQualificationPackageTemplate(input.PackageTemplate, input.Profile); err != nil {
+		return err
+	}
 	if err := validateJourneySpec(input.Journey, input.DNS.BaseDomain); err != nil {
 		return err
 	}
