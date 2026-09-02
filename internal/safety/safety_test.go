@@ -117,6 +117,134 @@ func TestStopFenceClearRequiresExactOriginAndCompleteClosureProof(t *testing.T) 
 	}
 }
 
+func TestActivationFenceClearMayConsumeOneEmergencyGeneration(t *testing.T) {
+	for _, kind := range []StopFenceKind{StopFenceIngressActivation, StopFenceCertificateActivation} {
+		t.Run(string(kind), func(t *testing.T) {
+			current, fence := stateForFence(kind)
+			current.StopFenceSequence = fence.FenceGeneration
+			current.StopFence = &fence
+			current.GlobalClose = GlobalClose{Phase: GlobalCloseNone, Generation: 1}
+			next := current
+			next.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
+			next.StopFenceSequence++
+			next.StopFence = nil
+			next.Resources = append([]ResourceSafety(nil), current.Resources...)
+			next.Resources[0].GenerationSequence++
+			next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: next.Resources[0].GenerationSequence, Reason: "closed"}
+			next.Resources[0].Reactivating = nil
+			proof := &StopFenceConvergenceProof{
+				Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, FenceDigest: StopFenceDigest(fence),
+				JournalRef: func() string {
+					if fence.IngressActivation != nil {
+						return fence.IngressActivation.IntentRef
+					}
+					return fence.CertificateActivation.JournalRef
+				}(), InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest,
+				RuntimeClosureDigest: digest("closure"), AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true,
+				WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true,
+				UnpublishedGenerations: map[string]uint64{"app-one": next.Resources[0].GenerationSequence},
+			}
+			if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: proof}); err != nil {
+				t.Fatalf("exact activation reconciliation did not consume emergency high-water: %v", err)
+			}
+			wrong := *proof
+			wrong.JournalRef = "other-origin"
+			if err := validateTransition(RoleJournalConvergence, current, next, TransitionProof{StopFence: &wrong}); err == nil {
+				t.Fatal("activation fence was cleared with a different origin")
+			}
+		})
+	}
+}
+
+func TestStoreClearsSupersededActivationFenceAgainstEmergencyProof(t *testing.T) {
+	for _, kind := range []StopFenceKind{StopFenceIngressActivation, StopFenceCertificateActivation} {
+		t.Run(string(kind), func(t *testing.T) {
+			store, emergency, manager, lease := newSafetyStore(t)
+			defer closeSafetyStore(t, store, emergency, manager, lease)
+			if _, err := store.Initialize(context.Background(), lease); err != nil {
+				t.Fatal(err)
+			}
+			ownership := testOwnershipAuthority{"app-one": digest("owner")}
+			store.config.Ownership = ownership
+			current, fence := stateForFence(kind)
+			current.Revision = 1
+			current.GlobalClose = GlobalClose{Phase: GlobalCloseNone}
+			fence.SafetyGenerations = fence.SafetyGenerations[1:]
+			fence.InventoryDigest = OwnershipInventoryDigest(map[string]string(ownership))
+			current.StopFenceSequence = fence.FenceGeneration
+			current.StopFence = &fence
+			role := RoleIngressActivation
+			if kind == StopFenceCertificateActivation {
+				role = RoleCertificateActivation
+			}
+			reserved, err := ReserveEmergencyStopFenceGeneration(lease, emergency, role, kind, StopFenceDigest(fence), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.AuthoritySequence = reserved.Sequence
+			current.StopFenceSequence = reserved.StopFenceSequence
+			if _, err := store.persist(context.Background(), current, filetxn.ReplaceOnly); err != nil {
+				t.Fatal(err)
+			}
+			current, err = store.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			authority := reserved
+			authority.Sequence++
+			authority.GlobalClose = GlobalClose{Phase: GlobalCloseClosing, Generation: 1}
+			if err := emergency.Commit(lease, RoleContraction, reserved.Sequence, authority); err != nil {
+				t.Fatal(err)
+			}
+			emergencyFence := EmergencyStopFence{Kind: StopFenceContraction, OriginOperation: "emergency_close_all", ScopeKind: "installation", Generation: 2, GlobalGeneration: 1, SafetyIntentID: "emergency_close_all", SafetyIntentGeneration: 1, OwnershipDigest: digest("emergency-owner"), OwnedGraphDigest: digest("emergency-graph"), InventoryDigest: digest("emergency-inventory"), MasterStopped: true, WorkersStopped: true, ListenersStopped: true, ObservedUnix: time.Now().Unix()}
+			authority.Sequence++
+			authority.StopFenceSequence = 2
+			authority.ReservedStopFenceKind = StopFenceContraction
+			authority.ReservedStopFenceDigest = ""
+			authority.StopFence = &emergencyFence
+			if err := emergency.Commit(lease, RoleContraction, authority.Sequence-1, authority); err != nil {
+				t.Fatal(err)
+			}
+			cleared := authority
+			cleared.Sequence++
+			cleared.StopFence = nil
+			cleared.ClearProof = &EmergencyClearProof{Generation: 1, StopFenceGeneration: 2, StopFenceDigest: EmergencyFenceDigest(emergencyFence), InventoryDigest: emergencyFence.InventoryDigest, OwnedGraphDigest: emergencyFence.OwnedGraphDigest, RuntimeClosureDigest: digest("closure"), NginxTestPassed: true, RuntimeClosed: true}
+			if err := emergency.Commit(lease, RoleJournalConvergence, authority.Sequence, cleared); err != nil {
+				t.Fatal(err)
+			}
+
+			next := current
+			next.Revision++
+			next.AuthoritySequence = cleared.Sequence
+			next.GlobalClose = cleared.GlobalClose
+			next.StopFenceSequence = cleared.StopFenceSequence
+			next.StopFence = nil
+			next.Resources = append([]ResourceSafety(nil), current.Resources...)
+			next.Resources[0].GenerationSequence++
+			next.Resources[0].StickyUnpublished = &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: next.Resources[0].GenerationSequence, Reason: "closed"}
+			next.Resources[0].Reactivating = nil
+			journalRef := fence.CertificateActivation
+			proof := &StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, FenceDigest: StopFenceDigest(fence), InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: digest("closure"), AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: map[string]uint64{"app-one": next.Resources[0].GenerationSequence}}
+			if fence.IngressActivation != nil {
+				proof.JournalRef = fence.IngressActivation.IntentRef
+			} else {
+				proof.JournalRef = journalRef.JournalRef
+			}
+			if _, err := store.Commit(context.Background(), lease, RoleJournalConvergence, current.Revision, next, TransitionProof{StopFence: proof}); err != nil {
+				t.Fatalf("store rejected exact activation recovery: %v", err)
+			}
+			persisted, err := store.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.StopFence != nil || persisted.StopFenceSequence != 2 || persisted.GlobalClose != cleared.GlobalClose {
+				t.Fatalf("activation recovery did not converge: %#v", persisted)
+			}
+		})
+	}
+}
+
 func TestCertificateHandoffAndHeadscaleConvergenceAreExact(t *testing.T) {
 	current := stateWithResource()
 	next := current

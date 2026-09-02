@@ -351,6 +351,18 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	} else if authority.StopFence != nil {
 		return filetxn.Result{}, fmt.Errorf("normal safety state omits current emergency stop authority")
 	}
+	if current.StopFence != nil && next.StopFence == nil && next.StopFenceSequence != current.StopFenceSequence {
+		// A fallback emergency contraction can advance the emergency high-water
+		// while an ingress/certificate fence remains in normal safety. That
+		// original fence may still be cleared, but only with its exact
+		// reconciliation proof and the matching emergency clear proof.
+		if current.StopFence.Kind == StopFenceContraction || next.StopFenceSequence != current.StopFenceSequence+1 || authority.StopFence != nil || authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != next.StopFenceSequence {
+			return filetxn.Result{}, fmt.Errorf("stop fence clear cannot consume an unrelated emergency generation")
+		}
+	}
+	if current.GlobalClose.Phase == GlobalCloseNone && next.GlobalClose.Phase != GlobalCloseNone && current.StopFence != nil && next.StopFence == nil && current.StopFence.Kind != StopFenceContraction && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != next.StopFenceSequence) {
+		return filetxn.Result{}, fmt.Errorf("activation fence clear cannot project global close without emergency convergence")
+	}
 	if current.GlobalClose.Phase != GlobalCloseNone && next.GlobalClose.Phase == GlobalCloseNone {
 		inventoryDigest, err := readOwnershipInventoryDigest(store.config.Ownership)
 		if err != nil {
@@ -533,7 +545,14 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 				return fmt.Errorf("global close clear lacks exact convergence proof")
 			}
 		} else if role != RoleContraction {
-			return fmt.Errorf("only contraction owns global close creation")
+			// Recovery may atomically project an emergency global close while
+			// clearing a superseded activation fence. The activation fence still
+			// has to be cleared with its exact origin proof; no other journal
+			// transition may create global close authority.
+			activationProjection := role == RoleJournalConvergence && current.StopFence != nil && next.StopFence == nil && current.StopFence.Kind != StopFenceContraction && validStopClearProof(*current.StopFence, next, proof.StopFence)
+			if !activationProjection {
+				return fmt.Errorf("only contraction owns global close creation")
+			}
 		}
 	}
 	if err := validateStopFenceTransition(role, current, next, proof.StopFence); err != nil {
@@ -589,7 +608,7 @@ func validateStopFenceTransition(role ClearRole, current, next State, proof *Sto
 		return nil
 	}
 	if after == nil {
-		if next.StopFenceSequence != current.StopFenceSequence {
+		if next.StopFenceSequence != current.StopFenceSequence && (before.Kind == StopFenceContraction || next.StopFenceSequence != current.StopFenceSequence+1) {
 			return fmt.Errorf("stop fence clear rewrote its retained generation sequence")
 		}
 		if err := AuthorizeClear(role, ClearStopFence, before.Kind); err != nil {

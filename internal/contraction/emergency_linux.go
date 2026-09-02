@@ -256,6 +256,16 @@ func (service *EmergencyService) recoverFenceClearedGlobal(ctx context.Context, 
 	return nil
 }
 
+func emergencyClearMatchesNormalFence(authority safety.EmergencyState, fence *safety.StopFence) bool {
+	if authority.StopFence != nil || fence == nil || authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence || !authority.ClearProof.NginxTestPassed || !authority.ClearProof.RuntimeClosed {
+		return false
+	}
+	if fence.Kind != safety.StopFenceContraction {
+		return true
+	}
+	return authority.ClearProof.InventoryDigest == fence.InventoryDigest && authority.ClearProof.OwnedGraphDigest == fence.OwnedGraphDigest && authority.ClearProof.StopFenceGeneration == fence.FenceGeneration
+}
+
 func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlobal uint64, expectedInventory string) error {
 	snapshot, err := service.Snapshot()
 	if err != nil || snapshot.GlobalGeneration != expectedGlobal || snapshot.Inventory.Digest != expectedInventory || !snapshot.Inventory.Complete || service.safetyStore == nil || service.safetyState == nil {
@@ -270,7 +280,7 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		return service.recoverFenceClearedGlobal(ctx, snapshot, authority, state)
 	}
 	emergencyFenceActive := authority.StopFence != nil && !authority.StopFence.AccessMayRemain && authority.StopFence.MasterStopped && authority.StopFence.WorkersStopped && authority.StopFence.ListenersStopped
-	emergencyFenceCleared := authority.StopFence == nil && state.StopFence != nil && authority.ClearProof != nil && authority.ClearProof.StopFenceGeneration == state.StopFence.FenceGeneration && authority.ClearProof.InventoryDigest == state.StopFence.InventoryDigest && authority.ClearProof.OwnedGraphDigest == state.StopFence.OwnedGraphDigest && authority.ClearProof.NginxTestPassed && authority.ClearProof.RuntimeClosed
+	emergencyFenceCleared := emergencyClearMatchesNormalFence(authority, state.StopFence)
 	if !emergencyFenceActive && !emergencyFenceCleared {
 		return fmt.Errorf("verified stopped emergency fence is unavailable")
 	}
@@ -279,7 +289,12 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 			return err
 		}
 	}
-	if emergencyFenceActive && !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
+	// An emergency contraction may supersede an activation fence when the
+	// activation writer was unavailable while the emergency authority was
+	// being established. Keep the activation fence intact: its payload is the
+	// exact origin identity required to clear it. Only a contraction fence may
+	// be projected from the fixed-format emergency authority.
+	if emergencyFenceActive && (state.StopFence == nil || state.StopFence.Kind == safety.StopFenceContraction) && !safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence) {
 		emergencyFence := authority.StopFence
 		authorities := []safety.MarkerGeneration{}
 		if emergencyFence.GlobalGeneration != 0 {
@@ -365,6 +380,8 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 	nextState := state
 	nextState.Revision++
 	nextState.AuthoritySequence = withoutFence.Sequence
+	nextState.GlobalClose = withoutFence.GlobalClose
+	nextState.StopFenceSequence = withoutFence.StopFenceSequence
 	nextState.StopFence = nil
 	nextState.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 	closingProofs := map[string]safety.ClosingConvergenceProof{}
