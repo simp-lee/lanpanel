@@ -663,6 +663,13 @@ func (s *FixedService) OwnershipWrite(ctx context.Context, lease *locks.Lease, e
 	return s.ownership.Read(record.ResourceID)
 }
 
+func (s *FixedService) OwnershipContractPublication(ctx context.Context, lease *locks.Lease, expected uint64, record ownership.Record) (ownership.Record, error) {
+	if _, err := s.ownership.Write(ctx, lease, ownership.ContractionWriter, expected, record); err != nil {
+		return ownership.Record{}, err
+	}
+	return s.ownership.Read(record.ResourceID)
+}
+
 func (s *FixedService) OwnershipRetireGoAccess(ctx context.Context, lease *locks.Lease, expected uint64, record ownership.Record, removeShared bool) (ownership.Record, error) {
 	role := ownership.GoAccessRetirementWriter
 	if removeShared {

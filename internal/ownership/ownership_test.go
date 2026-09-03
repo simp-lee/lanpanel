@@ -61,6 +61,30 @@ func TestGoAccessRetirementWriterAcceptsOnlyExactGenerationClosure(t *testing.T)
 	}
 }
 
+func TestPublicationContractionWriterRemovesOnlyIngressOwnership(t *testing.T) {
+	store, manager, lease, record := newTestStore(t)
+	defer closeTestStore(t, store, manager, lease)
+	servicePath := filepath.Join(store.config.Policy.ManagedRoots[0], "service")
+	record.Paths = append(record.Paths, OwnedPath{Kind: PathService, Path: servicePath, IdentityDigest: PathIdentity(record.ResourceID, PathService, servicePath)})
+	if _, err := store.Write(context.Background(), lease, ActivationWriter, 0, record); err != nil {
+		t.Fatal(err)
+	}
+	next := record
+	next.Revision = 2
+	next.Paths = []OwnedPath{record.Paths[1]}
+	next.Listeners = nil
+	if _, err := store.Write(context.Background(), lease, ContractionWriter, 1, next); err != nil {
+		t.Fatalf("publication contraction: %v", err)
+	}
+	persisted, err := store.Read(record.ResourceID)
+	if err != nil || len(persisted.Paths) != 1 || persisted.Paths[0].Kind != PathService || len(persisted.Listeners) != 0 {
+		t.Fatalf("contracted ownership = %#v, %v", persisted, err)
+	}
+	if _, err := store.Write(context.Background(), lease, ContractionWriter, 0, next); err == nil {
+		t.Fatal("publication contraction created an ownership record")
+	}
+}
+
 func TestOwnershipEvidenceContract(t *testing.T) {
 	t.Run("atomic_record_inventory_and_orphan_classification", func(t *testing.T) {
 		store, manager, lease, record := newTestStore(t)

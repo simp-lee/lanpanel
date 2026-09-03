@@ -753,9 +753,10 @@ func validateResourceTransition(role ClearRole, before, after ResourceSafety, pr
 	}
 	if before.Ownership != after.Ownership || before.OwnershipDigest != after.OwnershipDigest {
 		orphanContraction := role == RoleOwnershipContraction && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOrphan && before.OwnershipDigest == after.OwnershipDigest
+		publicationContraction := role == RoleOwnershipContraction && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipContractionProof(before, after, proof.Ownership)
 		activationRebind := role == RoleOwnershipActivation && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipConvergenceProof(before, after, proof.Ownership)
 		retirementRebind := role == RoleOwnershipRetirement && before.Ownership == OwnershipOwned && after.Ownership == OwnershipOwned && validOwnershipRetirementProof(before, after, proof.Ownership)
-		if !orphanContraction && !activationRebind && !retirementRebind {
+		if !orphanContraction && !publicationContraction && !activationRebind && !retirementRebind {
 			return fmt.Errorf("ownership authority transition lacks exact contraction or activation proof")
 		}
 	}
@@ -933,6 +934,16 @@ func reactivationTransition(role ClearRole, priorGeneration uint64, before, afte
 
 func baseMarkersRemoved(before, after ResourceSafety) bool {
 	return before.StickyUnpublished != nil && after.StickyUnpublished == nil || before.Contraction != nil && after.Contraction == nil || before.CertificateExpiry != nil && after.CertificateExpiry == nil
+}
+
+func validOwnershipContractionProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {
+	generation := uint64(0)
+	if before.Closing != nil {
+		generation = before.Closing.Generation
+	} else if before.StickyUnpublished != nil {
+		generation = before.StickyUnpublished.Generation
+	}
+	return proof != nil && before.ResourceID == after.ResourceID && proof.ResourceID == before.ResourceID && validRef(proof.IntentRef) && proof.Generation == generation && generation != 0 && proof.BeforeDigest == before.OwnershipDigest && proof.AfterDigest == after.OwnershipDigest && isDigest(proof.BeforeDigest) && isDigest(proof.AfterDigest)
 }
 
 func validOwnershipRetirementProof(before, after ResourceSafety, proof *OwnershipConvergenceProof) bool {

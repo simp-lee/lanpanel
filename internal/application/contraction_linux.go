@@ -225,6 +225,9 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 			acknowledgeErr = fallback.AcknowledgeDiskContraction(context.WithoutCancel(ctx), uncertain)
 		}
 		if completeErr == nil && acknowledgeErr == nil {
+			completeErr = execution.contractPublicationOwnership(ctx)
+		}
+		if completeErr == nil && acknowledgeErr == nil {
 			convergeErr = execution.Authority.ConvergeClosure(context.WithoutCancel(ctx), uncertain, result.ClosureDigest)
 		}
 		closeErr := execution.Close()
@@ -256,6 +259,9 @@ func (execution *CloseAllExecution) Run(ctx context.Context) (contraction.Result
 	var acknowledgeErr, convergeErr error
 	if completeErr == nil {
 		acknowledgeErr = host.AcknowledgeDiskContraction(context.WithoutCancel(ctx), execution.Inventory)
+	}
+	if completeErr == nil && acknowledgeErr == nil {
+		completeErr = execution.contractPublicationOwnership(ctx)
 	}
 	if completeErr == nil && acknowledgeErr == nil {
 		convergeErr = execution.Authority.ConvergeClosure(context.WithoutCancel(ctx), execution.Inventory, result.ClosureDigest)
@@ -450,6 +456,24 @@ func (execution *CloseAllExecution) stopGoAccessAfterClosure(ctx context.Context
 		}
 	}
 	return result, runErr, cleanupComplete
+}
+
+func (execution *CloseAllExecution) contractPublicationOwnership(ctx context.Context) error {
+	if execution == nil || execution.Authority == nil {
+		return fmt.Errorf("publication ownership contraction execution is inactive")
+	}
+	for _, resource := range execution.Installation.Resources {
+		generation, selected := execution.Authority.Generations[resource.ID]
+		if !selected {
+			continue
+		}
+		nextState, err := contractClosedPublicationOwnership(ctx, execution.Service, execution.Exposure, resource.ID, execution.Authority.JobID, generation)
+		if err != nil {
+			return err
+		}
+		execution.Authority.SafetyState = nextState
+	}
+	return nil
 }
 
 func (execution *CloseAllExecution) Close() error {

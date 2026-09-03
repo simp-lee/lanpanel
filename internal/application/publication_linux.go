@@ -342,6 +342,94 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	return &PublicationExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: revision, Resource: *freshResource, Candidate: candidate, SafetyState: ownershipNext, Reactivating: reactivating, Ownership: persisted, PlanID: plan.ID, InstallationID: installation.InstallationID, ActivationDeadline: activationDeadline}, nil
 }
 
+func emergencyStopFenceOutstanding(state safety.State, emergency safety.EmergencyState) bool {
+	return state.StopFence != nil || emergency.StopFence != nil || emergency.StopFenceSequence > state.StopFenceSequence
+}
+
+func contractClosedPublicationOwnership(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID, sourceJobID string, generation uint64) (safety.State, error) {
+	if service == nil || service.emergency == nil || exposure == nil || resourceID == "" || sourceJobID == "" || generation == 0 {
+		return safety.State{}, fmt.Errorf("publication ownership contraction authority is incomplete")
+	}
+	owned, err := service.ownership.Read(resourceID)
+	if err != nil {
+		return safety.State{}, err
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return safety.State{}, err
+	}
+	emergency, err := service.emergency.Authority()
+	if err != nil {
+		return safety.State{}, err
+	}
+	if emergencyStopFenceOutstanding(state, emergency) {
+		return state, nil
+	}
+	var safetyResource *safety.ResourceSafety
+	for index := range state.Resources {
+		if state.Resources[index].ResourceID == resourceID {
+			safetyResource = &state.Resources[index]
+			break
+		}
+	}
+	if safetyResource == nil {
+		return safety.State{}, fmt.Errorf("publication ownership contraction safety resource missing")
+	}
+	markerGeneration := uint64(0)
+	if safetyResource.Closing != nil {
+		markerGeneration = safetyResource.Closing.Generation
+	} else if safetyResource.StickyUnpublished != nil {
+		markerGeneration = safetyResource.StickyUnpublished.Generation
+	}
+	if markerGeneration != generation {
+		return safety.State{}, fmt.Errorf("publication ownership contraction generation changed")
+	}
+	next := owned
+	next.Paths = append([]ownership.OwnedPath(nil), owned.Paths...)
+	next.Paths = slices.DeleteFunc(next.Paths, func(path ownership.OwnedPath) bool {
+		return path.Kind == ownership.PathSite || path.Kind == ownership.PathListener
+	})
+	next.Listeners = nil
+	changed := len(next.Paths) != len(owned.Paths) || len(owned.Listeners) != 0
+	if changed {
+		if safetyResource.OwnershipDigest != owned.Checksum {
+			return safety.State{}, fmt.Errorf("publication ownership contraction authority changed")
+		}
+		next.Revision = owned.Revision + 1
+		owned, err = service.OwnershipContractPublication(ctx, exposure, owned.Revision, next)
+		if err != nil {
+			return safety.State{}, err
+		}
+	}
+	if safetyResource.OwnershipDigest == owned.Checksum {
+		return state, nil
+	}
+	nextState := state
+	nextState.Revision++
+	nextState.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	found := false
+	for index := range nextState.Resources {
+		item := &nextState.Resources[index]
+		if item.ResourceID != resourceID {
+			continue
+		}
+		if item.Closing == nil && item.StickyUnpublished == nil || item.Closing != nil && item.Closing.Generation != generation || item.Closing == nil && item.StickyUnpublished.Generation != generation {
+			return safety.State{}, fmt.Errorf("publication ownership contraction marker changed")
+		}
+		beforeDigest := item.OwnershipDigest
+		item.OwnershipDigest = owned.Checksum
+		proof := &safety.OwnershipConvergenceProof{ResourceID: resourceID, IntentRef: sourceJobID, Generation: generation, BeforeDigest: beforeDigest, AfterDigest: owned.Checksum}
+		if _, err := service.safety.Commit(ctx, exposure, safety.RoleOwnershipContraction, state.Revision, nextState, safety.TransitionProof{Ownership: proof}); err != nil {
+			return safety.State{}, err
+		}
+		found = true
+	}
+	if !found {
+		return safety.State{}, fmt.Errorf("publication ownership contraction safety resource missing")
+	}
+	return service.safety.ReadForRecovery(exposure)
+}
+
 func goAccessSharedRetained(resource domain.AppResource) bool {
 	if bundle := resource.PublicationRecord.LastAppliedBundle; bundle != nil && bundle.DomainHTTPS != nil {
 		return bundle.DomainHTTPS.GoAccess.Enabled || bundle.DomainHTTPS.GoAccess.RetiredGeneration != 0

@@ -341,6 +341,12 @@ func RunRole(args []string) error {
 		if runErr != nil {
 			return ExecutionResult{}, runErr
 		}
+		if closeErr := service.Close(); closeErr != nil {
+			return ExecutionResult{}, closeErr
+		}
+		if reconcileErr := application.ReconcileTerminalNginxContraction(ctx); reconcileErr != nil {
+			return ExecutionResult{}, reconcileErr
+		}
 		return ExecutionResult{ResultDigest: result.ClosureDigest, Action: action}, nil
 	})
 	startupHandler := StartupContractionHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
@@ -373,6 +379,12 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		if recoverErr := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); recoverErr == nil {
+			if closeErr := service.Close(); closeErr != nil {
+				return ExecutionResult{}, closeErr
+			}
+			if reconcileErr := application.ReconcileTerminalNginxContraction(ctx); reconcileErr != nil {
+				return ExecutionResult{}, reconcileErr
+			}
 			return ExecutionResult{ResultDigest: snapshot.Inventory.Digest}, nil
 		}
 		result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
@@ -381,6 +393,12 @@ func RunRole(args []string) error {
 		}
 		if runErr != nil {
 			return ExecutionResult{}, runErr
+		}
+		if closeErr := service.Close(); closeErr != nil {
+			return ExecutionResult{}, closeErr
+		}
+		if reconcileErr := application.ReconcileTerminalNginxContraction(ctx); reconcileErr != nil {
+			return ExecutionResult{}, reconcileErr
 		}
 		return ExecutionResult{ResultDigest: result.ClosureDigest}, nil
 	})
@@ -1265,18 +1283,27 @@ func reconcileStartupContraction(ctx context.Context) error {
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(service.Close)
+	reconcileOwnership := func(recoveryErr error) error {
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		if err := service.Close(); err != nil {
+			return err
+		}
+		return application.ReconcileTerminalNginxContraction(ctx)
+	}
 	snapshot, err := service.Snapshot()
 	if err != nil {
 		return err
 	}
 	if err := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); err == nil {
-		return nil
+		return reconcileOwnership(nil)
 	}
 	result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 		return errors.Join(runErr, fmt.Errorf("startup contraction did not converge: %s", result.Outcome))
 	}
-	return runErr
+	return reconcileOwnership(runErr)
 }
 
 func lookupGroupGID(name string) (uint32, error) {

@@ -83,6 +83,7 @@ const (
 	ActivationWriter                WriterRole = "activation_writer"
 	GoAccessRetirementWriter        WriterRole = "goaccess_retirement_writer"
 	GoAccessCandidateRollbackWriter WriterRole = "goaccess_candidate_rollback_writer"
+	ContractionWriter               WriterRole = "contraction_writer"
 	DeleteWriter                    WriterRole = "delete_writer"
 )
 
@@ -143,7 +144,7 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 	if lease == nil || lease.Authority() != store.config.LockAuthority || lease.Kind() != locks.Exposure || lease.Validate() != nil {
 		return filetxn.Result{}, fmt.Errorf("ownership write requires the shared exposure lock")
 	}
-	if role != ActivationWriter && role != GoAccessRetirementWriter && role != GoAccessCandidateRollbackWriter {
+	if role != ActivationWriter && role != GoAccessRetirementWriter && role != GoAccessCandidateRollbackWriter && role != ContractionWriter {
 		return filetxn.Result{}, fmt.Errorf("ownership writer role %q is not authorized", role)
 	}
 	if record.State != Owned {
@@ -170,6 +171,9 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 	}
 	var disposition filetxn.Disposition
 	if expectedRevision == 0 {
+		if role == ContractionWriter {
+			return filetxn.Result{}, fmt.Errorf("publication contraction cannot create ownership")
+		}
 		disposition = filetxn.CreateOnly
 	} else {
 		current, err := store.Read(record.ResourceID)
@@ -187,6 +191,9 @@ func (store *Store) Write(ctx context.Context, lease *locks.Lease, role WriterRo
 		}
 		if role == GoAccessCandidateRollbackWriter && !exactGoAccessCandidateRollback(current, record) {
 			return filetxn.Result{}, fmt.Errorf("GoAccess candidate rollback ownership delta is not exact")
+		}
+		if role == ContractionWriter && !exactPublicationContraction(current, record) {
+			return filetxn.Result{}, fmt.Errorf("publication contraction ownership delta is not exact")
 		}
 		disposition = filetxn.ReplaceOnly
 	}
@@ -549,6 +556,32 @@ func preservesInventory(current, next Record) bool {
 		}
 	}
 	return true
+}
+
+func exactPublicationContraction(current, next Record) bool {
+	if current.ResourceID != next.ResourceID || current.State != next.State || len(next.Listeners) != 0 {
+		return false
+	}
+	retained := map[string]OwnedPath{}
+	servicePath := false
+	for _, path := range current.Paths {
+		if path.Kind == PathSite || path.Kind == PathListener {
+			continue
+		}
+		servicePath = servicePath || path.Kind == PathService
+		retained[string(path.Kind)+"\x00"+path.Path+"\x00"+path.IdentityDigest] = path
+	}
+	for _, path := range next.Paths {
+		if path.Kind == PathSite || path.Kind == PathListener {
+			return false
+		}
+		key := string(path.Kind) + "\x00" + path.Path + "\x00" + path.IdentityDigest
+		if _, ok := retained[key]; !ok {
+			return false
+		}
+		delete(retained, key)
+	}
+	return len(retained) == 0 && servicePath
 }
 
 func exactGoAccessRetirement(current, next Record) bool {

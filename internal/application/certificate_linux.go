@@ -815,6 +815,11 @@ func finishExpiredCertificateContraction(ctx context.Context, service *FixedServ
 	if acknowledgeErr := nginx.AcknowledgeContraction(context.WithoutCancel(ctx), nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}, []string{resourceID}); acknowledgeErr != nil {
 		return errors.Join(runErr, acknowledgeErr)
 	}
+	if nextState, ownershipErr := contractClosedPublicationOwnership(ctx, service, exposure, resourceID, jobID, authority.Generations[resourceID]); ownershipErr != nil {
+		return errors.Join(runErr, ownershipErr)
+	} else {
+		authority.SafetyState = nextState
+	}
 	if convergeErr := authority.ConvergeClosure(context.WithoutCancel(ctx), inventory, result.ClosureDigest); convergeErr != nil {
 		return errors.Join(runErr, convergeErr)
 	}
@@ -2363,7 +2368,13 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 		return nil
 	}
-	return runErr
+	if runErr != nil {
+		return runErr
+	}
+	if err := emergency.Close(); err != nil {
+		return err
+	}
+	return ReconcileTerminalNginxContraction(ctx)
 }
 
 func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, now time.Time) error {

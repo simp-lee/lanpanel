@@ -155,10 +155,16 @@ func reconcileTerminalContractionClosings(ctx context.Context, service *FixedSer
 		inventoryDigest string
 		runtimeDigest   string
 		generations     map[string]uint64
+		hasClosing      bool
 	}
 	groups := map[string]*terminalGroup{}
 	for _, independent := range state.Resources {
-		if independent.Closing == nil {
+		generation := uint64(0)
+		if independent.Closing != nil {
+			generation = independent.Closing.Generation
+		} else if independent.StickyUnpublished != nil {
+			generation = independent.StickyUnpublished.Generation
+		} else {
 			continue
 		}
 		var normal *domain.AppResource
@@ -167,7 +173,7 @@ func reconcileTerminalContractionClosings(ctx context.Context, service *FixedSer
 				normal = &installation.Resources[index]
 			}
 		}
-		if normal == nil || normal.PublicationRecord.State != domain.PublicationUnpublished || normal.PublicationRecord.UnpublishedGeneration != independent.Closing.Generation || normal.PublicationRecord.ContractionIntent != nil || normal.PublicationRecord.LastJobID == "" {
+		if normal == nil || normal.PublicationRecord.State != domain.PublicationUnpublished || normal.PublicationRecord.UnpublishedGeneration != generation || normal.PublicationRecord.ContractionIntent != nil || normal.PublicationRecord.LastJobID == "" {
 			continue
 		}
 		intent, err := admitter.OperationIntent(normal.PublicationRecord.LastJobID)
@@ -220,14 +226,33 @@ func reconcileTerminalContractionClosings(ctx context.Context, service *FixedSer
 		if group.operation != intent.Operation || group.inventoryDigest != inventoryDigest || group.runtimeDigest != runtimeDigest {
 			return fmt.Errorf("terminal contraction closing job evidence changed")
 		}
-		group.generations[independent.ResourceID] = independent.Closing.Generation
+		group.generations[independent.ResourceID] = generation
+		group.hasClosing = group.hasClosing || independent.Closing != nil
 	}
-	for _, group := range groups {
-		authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Exposure: exposure, SafetyState: state, Generations: group.generations, Global: group.operation == operations.CloseAll || group.operation == operations.StartupContraction, InventoryDigest: group.inventoryDigest}
-		if err := authority.ConvergeClosure(context.WithoutCancel(ctx), closure.Inventory{Digest: group.inventoryDigest}, group.runtimeDigest); err != nil {
+	if state.StopFence != nil {
+		return nil
+	}
+	for jobID, group := range groups {
+		for _, resource := range installation.Resources {
+			generation, selected := group.generations[resource.ID]
+			if !selected {
+				continue
+			}
+			if _, err := contractClosedPublicationOwnership(ctx, service, exposure, resource.ID, jobID, generation); err != nil {
+				return err
+			}
+		}
+		state, err = service.safety.ReadForRecovery(exposure)
+		if err != nil {
 			return err
 		}
-		state = authority.SafetyState
+		if group.hasClosing || state.GlobalClose.Phase != safety.GlobalCloseNone {
+			authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Exposure: exposure, SafetyState: state, Generations: group.generations, Global: group.operation == operations.CloseAll || group.operation == operations.StartupContraction, InventoryDigest: group.inventoryDigest}
+			if err := authority.ConvergeClosure(context.WithoutCancel(ctx), closure.Inventory{Digest: group.inventoryDigest}, group.runtimeDigest); err != nil {
+				return err
+			}
+			state = authority.SafetyState
+		}
 	}
 	return nil
 }
@@ -478,6 +503,34 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	return reconcileTerminalContractionClosings(ctx, service)
 }
 
+func reconcilePendingContractionOwnership(ctx context.Context, service *FixedService, resourceID, sourceJobID string, generation uint64) (bool, error) {
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = mutationSet.Close() }()
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	mutation, exposure, err := mutationSet.AcquireExposure(cleanupCtx, "resource/"+resourceID, service.manager)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return false, err
+	}
+	emergency, err := service.emergency.Authority()
+	if err != nil {
+		return false, err
+	}
+	if emergencyStopFenceOutstanding(state, emergency) {
+		return true, nil
+	}
+	_, err = contractClosedPublicationOwnership(cleanupCtx, service, exposure, resourceID, sourceJobID, generation)
+	return false, err
+}
+
 func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedService) error {
 	document, err := service.normal.Read()
 	if err != nil {
@@ -515,6 +568,17 @@ func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedServ
 		oldRecord, loadErr := jobs.LoadEntries(document.Entries, sourceJobID)
 		if loadErr != nil || oldRecord.Status != jobs.StatusTerminal || oldRecord.Result != jobs.ResultPartial || oldRecord.ErrorCode != "goaccess_stop_failed" {
 			return fmt.Errorf("pending GoAccess contraction job authority changed")
+		}
+		deferred, ownershipErr := reconcilePendingContractionOwnership(ctx, service, resource.ID, sourceJobID, resource.PublicationRecord.UnpublishedGeneration)
+		if ownershipErr != nil {
+			return ownershipErr
+		}
+		if deferred {
+			return nil
+		}
+		document, err = service.normal.Read()
+		if err != nil {
+			return err
 		}
 		retirementIntent, runningRetirement, resume, authorityErr := operations.FindRunningGoAccessRetirement(document, "resource/"+resource.ID)
 		if authorityErr != nil {
@@ -556,6 +620,19 @@ func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedServ
 			cancelCleanup()
 			_ = mutationSet.Close()
 			return err
+		}
+		freshSafety, safetyErr := service.safety.ReadForRecovery(exposure)
+		if safetyErr != nil {
+			cancelCleanup()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return safetyErr
+		}
+		if freshSafety.StopFence != nil {
+			cancelCleanup()
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return nil
 		}
 		if needsBegin {
 			_, err = admitter.BeginPlanless(cleanupCtx, mutation, exposure, operations.ConsumeRequest{JobID: jobID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
@@ -599,6 +676,22 @@ func reconcilePendingContractionGoAccess(ctx context.Context, service *FixedServ
 					err = errors.Join(err, pruneErr)
 				}
 			}
+		}
+		if err == nil {
+			runtimeDigest := ""
+			for _, condition := range oldRecord.Postconditions {
+				if condition.Kind == "goaccess_retirement_pending" && condition.Status == jobs.PostconditionKnown {
+					runtimeDigest = condition.Identity
+				}
+			}
+			if runtimeDigest == "" {
+				err = fmt.Errorf("pending GoAccess contraction lacks closure evidence")
+			} else {
+				err = convergeInterruptedDomainClosing(cleanupCtx, service, exposure, resource.ID, resource.PublicationRecord.UnpublishedGeneration, runtimeDigest, "contraction")
+			}
+		}
+		if err == nil {
+			document, err = service.normal.Read()
 		}
 		if err == nil {
 			_, err = admitter.CompleteGoAccessContractionReconciliation(cleanupCtx, mutation, exposure, document.Revision, jobID, resource.ID, retirements)
@@ -923,9 +1016,54 @@ func stopRecoveredGoAccess(ctx context.Context, service *FixedService, exposure 
 }
 
 func convergeInterruptedDomainClosing(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID string, generation uint64, runtimeDigest, reason string) error {
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	var sourceJobID string
+	for _, resource := range installation.Resources {
+		if resource.ID == resourceID {
+			sourceJobID = resource.PublicationRecord.LastJobID
+			break
+		}
+	}
 	fresh, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
+	}
+	if fresh.StopFence != nil {
+		return fmt.Errorf("interrupted closing stop fence is still active")
+	}
+	markerFound := false
+	for _, item := range fresh.Resources {
+		if item.ResourceID != resourceID {
+			continue
+		}
+		if item.Closing != nil {
+			if item.Closing.Generation != generation || item.Closing.Reason != reason {
+				return fmt.Errorf("interrupted closing authority changed")
+			}
+			markerFound = true
+		} else if item.StickyUnpublished != nil && item.StickyUnpublished.Generation == generation {
+			markerFound = true
+		}
+	}
+	if !markerFound {
+		return fmt.Errorf("interrupted closing authority changed")
+	}
+	if _, err := contractClosedPublicationOwnership(ctx, service, exposure, resourceID, sourceJobID, generation); err != nil {
+		return err
+	}
+	fresh, err = service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if fresh.StopFence != nil {
+		return fmt.Errorf("interrupted closing stop fence is still active")
 	}
 	next := fresh
 	next.Revision++
@@ -936,7 +1074,13 @@ func convergeInterruptedDomainClosing(ctx context.Context, service *FixedService
 		if item.ResourceID != resourceID {
 			continue
 		}
-		if item.Closing == nil || item.Closing.Generation != generation || item.Closing.Reason != reason {
+		if item.Closing == nil {
+			if item.StickyUnpublished != nil && item.StickyUnpublished.Generation == generation {
+				return nil
+			}
+			return fmt.Errorf("interrupted closing authority changed")
+		}
+		if item.Closing.Generation != generation || item.Closing.Reason != reason {
 			return fmt.Errorf("interrupted closing authority changed")
 		}
 		proof = &safety.ClosingConvergenceProof{ResourceID: resourceID, ClosingGeneration: generation, UnpublishedGeneration: generation, OwnershipDigest: item.OwnershipDigest, RuntimeClosureDigest: runtimeDigest}
