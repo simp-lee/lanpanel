@@ -25,12 +25,24 @@ type ReloadAuthoritySnapshot struct {
 }
 
 type ReloadAuthority struct {
-	refresh func() (ReloadAuthoritySnapshot, error)
+	refresh      func() (ReloadAuthoritySnapshot, error)
+	runtimeCheck func() error
 }
 
 type ChallengeReloadAuthority = ReloadAuthority
 
 func NewReloadAuthority(refresh func() (ReloadAuthoritySnapshot, error)) (ReloadAuthority, error) {
+	return newReloadAuthority(refresh, nil)
+}
+
+func NewReloadAuthorityWithRuntimeCheck(refresh func() (ReloadAuthoritySnapshot, error), runtimeCheck func() error) (ReloadAuthority, error) {
+	if runtimeCheck == nil {
+		return ReloadAuthority{}, fmt.Errorf("nginx reload runtime identity check is unavailable")
+	}
+	return newReloadAuthority(refresh, runtimeCheck)
+}
+
+func newReloadAuthority(refresh func() (ReloadAuthoritySnapshot, error), runtimeCheck func() error) (ReloadAuthority, error) {
 	if refresh == nil {
 		return ReloadAuthority{}, fmt.Errorf("nginx reload authority refresh is unavailable")
 	}
@@ -41,7 +53,26 @@ func NewReloadAuthority(refresh func() (ReloadAuthoritySnapshot, error)) (Reload
 	if snapshot.ObservedAt.IsZero() {
 		return ReloadAuthority{}, fmt.Errorf("nginx reload authority time is unavailable")
 	}
-	return ReloadAuthority{refresh: refresh}, nil
+	return ReloadAuthority{refresh: refresh, runtimeCheck: runtimeCheck}, nil
+}
+
+func (authority ReloadAuthority) RuntimeCheck() func() error {
+	return authority.runtimeCheck
+}
+
+func (authority ReloadAuthority) CheckRuntime() error {
+	if authority.runtimeCheck == nil {
+		return nil
+	}
+	return authority.runtimeCheck()
+}
+
+// ForContraction returns an authority for removing an already-owned graph.
+// Runtime package drift must not prevent closure; callers still retain the
+// durable graph/safety checks and fall back to stopping Nginx if reload fails.
+func (authority ReloadAuthority) ForContraction() ReloadAuthority {
+	authority.runtimeCheck = nil
+	return authority
 }
 
 func (authority ReloadAuthority) Current() (ReloadAuthoritySnapshot, error) {
@@ -63,6 +94,9 @@ func (authority ReloadAuthority) Guard(manifest nginx.Manifest) error {
 	current, err := authority.Current()
 	if err != nil {
 		return err
+	}
+	if err := authority.CheckRuntime(); err != nil {
+		return fmt.Errorf("nginx reload runtime package/profile identity changed: %w", err)
 	}
 	if current.Installation.InstallationID == "" || manifest.InstallationID != current.Installation.InstallationID {
 		return fmt.Errorf("nginx reload installation authority changed")
@@ -245,6 +279,7 @@ func (host Host) RemoveChallenge(ctx context.Context, candidate challenge.Prepar
 	if candidate.Entry == nil {
 		return Result{}, nil
 	}
+	authority = authority.ForContraction()
 	snapshot, err := nginx.SnapshotActivation(host.Paths, host.Owner, *candidate.Entry)
 	if err != nil {
 		return Result{}, err

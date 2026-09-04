@@ -666,6 +666,9 @@ func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if err := VerifyInstalledPackageProfile(context.Background()); err != nil {
+		return false, err
+	}
 	manifest, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	if err != nil {
 		return false, err

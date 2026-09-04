@@ -45,6 +45,9 @@ func reloadCertificateRuntime(ctx context.Context, authority ReloadAuthority, ru
 	if prior.Master == nil {
 		return closure.RuntimeSnapshot{}, fmt.Errorf("nginx unavailable for certificate reload")
 	}
+	if err := authority.CheckRuntime(); err != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate reload runtime package/profile identity changed: %w", err)
+	}
 	if err := runtime.Test(ctx); err != nil {
 		return closure.RuntimeSnapshot{}, err
 	}
@@ -113,6 +116,9 @@ func (host Host) ActivateCertificate(ctx context.Context, pointer certificates.P
 	prior, err := host.observer(manifest).Observe(ctx)
 	if err != nil || prior.Master == nil {
 		return result, fmt.Errorf("nginx unavailable for certificate activation")
+	}
+	if err := authority.CheckRuntime(); err != nil {
+		return result, fmt.Errorf("certificate activation runtime package/profile identity changed: %w", err)
 	}
 	pointerResult, err := certificates.ActivatePointer(ctx, pointer)
 	result.Pointer = pointerResult

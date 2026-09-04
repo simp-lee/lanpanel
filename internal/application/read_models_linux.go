@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/preflight"
 	managedprocess "lanpanel/internal/process"
 	"slices"
 	"sort"
@@ -80,10 +81,18 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 	if err != nil {
 		return SystemStatus{}, err
 	}
+	installed, releaseErr := loadInstalledReleaseIdentity()
+	profileErr := releaseErr
+	if releaseErr == nil {
+		profileErr = verifyInstalledPackageProfile(ctx, installed.Profile)
+	}
 	manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 	nginxStatus := "unknown"
+	if preflight.IsProfileDrift(profileErr) {
+		nginxStatus = "package_identity_drift"
+	}
 	runtimeHealthy := false
-	if auditErr == nil {
+	if profileErr == nil && auditErr == nil {
 		listeners := []string{}
 		for _, entry := range manifest.Entries {
 			listeners = append(listeners, entry.Listeners...)

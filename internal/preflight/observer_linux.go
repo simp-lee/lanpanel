@@ -45,6 +45,29 @@ type LinuxObserver struct {
 	strictRoot  bool
 }
 
+type InstalledProfileObservation struct {
+	Architecture  string
+	Platform      PlatformInfo
+	KernelRelease string
+	CgroupMode    string
+	Packages      PackageObservation
+}
+
+type ProfileDriftError struct {
+	Component string
+	Expected  string
+	Observed  string
+}
+
+func (err *ProfileDriftError) Error() string {
+	return fmt.Sprintf("package/profile identity drift: %s expected %q, observed %q", err.Component, err.Expected, err.Observed)
+}
+
+func IsProfileDrift(err error) bool {
+	var drift *ProfileDriftError
+	return errors.As(err, &drift)
+}
+
 func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, error)) (*LinuxObserver, error) {
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
@@ -54,6 +77,70 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
 	return &LinuxObserver{paths: paths, packageRead: packageRead, now: now}
+}
+
+func ObserveInstalledProfile(ctx context.Context) (InstalledProfileObservation, error) {
+	observer, err := NewLinuxObserver(func(ctx context.Context) (PackageObservation, error) {
+		return ObserveBootstrapReadiness(ctx)
+	})
+	if err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	return observer.ObserveInstalledProfile(ctx)
+}
+
+func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (InstalledProfileObservation, error) {
+	if observer == nil || observer.packageRead == nil {
+		return InstalledProfileObservation{}, fmt.Errorf("linux profile observer is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	platform, err := observer.readPlatform()
+	if err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	kernelRelease, err := observer.readKernelRelease()
+	if err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	cgroupMode, err := observer.readCgroupMode()
+	if err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	packages, err := observer.packageRead(ctx)
+	if err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return InstalledProfileObservation{}, err
+	}
+	return InstalledProfileObservation{Architecture: runtime.GOARCH, Platform: platform, KernelRelease: kernelRelease, CgroupMode: cgroupMode, Packages: packages}, nil
+}
+
+func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileObservation) error {
+	checks := []struct {
+		component string
+		expected  string
+		observed  string
+	}{
+		{"architecture", expected.Architecture, observed.Architecture},
+		{"os_profile", expected.ID + "/" + expected.VersionID, observed.Platform.ID + "/" + observed.Platform.VersionID},
+		{"kernel_release", expected.ManagedConfinement.KernelRelease, observed.KernelRelease},
+		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
+		{"systemd_package", expected.SystemdVersion, observed.Packages.SystemdVersion},
+		{"nginx_package", expected.NginxVersion, observed.Packages.NginxVersion},
+		{"package_snapshot", expected.PackageSnapshotDigest, observed.Packages.PackageSnapshotDigest},
+	}
+	for _, check := range checks {
+		if check.expected != check.observed {
+			return &ProfileDriftError{Component: check.component, Expected: check.expected, Observed: check.observed}
+		}
+	}
+	if !observed.Packages.Ready || observed.Packages.Identity == "" {
+		return &ProfileDriftError{Component: "package_state", Expected: "ready", Observed: observed.Packages.Reason}
+	}
+	return nil
 }
 
 // ObserveBootstrapReadiness provides the installer's fixed read-only package

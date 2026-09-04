@@ -18,7 +18,9 @@ type Issue struct{ Code, Responsibility, Summary, Guidance string }
 
 func Build(observation Observation) []Issue {
 	issues := []Issue{}
-	if observation.Nginx != "healthy" {
+	if observation.Nginx == "package_identity_drift" {
+		issues = append(issues, Issue{"package_identity_drift", "lanpanel_or_host_administrator", "installed package or OS profile identity differs from the supported release", "keep ingress closed; restore the supported clean-host profile and rebuild on a clean supported host"})
+	} else if observation.Nginx != "healthy" {
 		issues = append(issues, Issue{"nginx_unknown", "lanpanel_or_host_administrator", "Nginx disk graph cannot be freshly verified", "keep ingress closed; export configuration and rebuild on a clean supported host"})
 	}
 	if observation.Connector == "unknown" {

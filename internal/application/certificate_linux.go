@@ -2032,11 +2032,13 @@ func challengeReloadAuthorityForExposure(service *FixedService, exposure *locks.
 		}
 		return activation.ReloadAuthoritySnapshot{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
 	}
-	return activation.NewReloadAuthority(refresh)
+	return activation.NewReloadAuthorityWithRuntimeCheck(refresh, func() error {
+		return VerifyInstalledPackageProfile(context.Background())
+	})
 }
 
 func headscalePriorCertificateReloadAuthority(authority activation.ReloadAuthority, prior domain.CertificateBundleIdentity, expected safety.HeadscaleReactivating) (activation.ReloadAuthority, error) {
-	return activation.NewReloadAuthority(func() (activation.ReloadAuthoritySnapshot, error) {
+	refresh := func() (activation.ReloadAuthoritySnapshot, error) {
 		current, err := authority.Current()
 		if err != nil {
 			return activation.ReloadAuthoritySnapshot{}, err
@@ -2050,7 +2052,11 @@ func headscalePriorCertificateReloadAuthority(authority activation.ReloadAuthori
 		}
 		current.Safety.Headscale.Reactivating = nil
 		return current, nil
-	})
+	}
+	if runtimeCheck := authority.RuntimeCheck(); runtimeCheck != nil {
+		return activation.NewReloadAuthorityWithRuntimeCheck(refresh, runtimeCheck)
+	}
+	return activation.NewReloadAuthority(refresh)
 }
 
 func (execution *CertificateExecution) challengeReloadAuthority() (activation.ChallengeReloadAuthority, error) {

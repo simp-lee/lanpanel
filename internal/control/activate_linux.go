@@ -90,6 +90,9 @@ func (host *ActivationHost) Activate(ctx context.Context, bundle ActivationBundl
 	if _, err := reloadAuthority.Current(); err != nil {
 		return result, fmt.Errorf("headscale activation reload authority invalid: %w", err)
 	}
+	if err := reloadAuthority.CheckRuntime(); err != nil {
+		return result, fmt.Errorf("headscale activation runtime package/profile identity changed: %w", err)
+	}
 	if host == nil || host.launcher == nil {
 		return result, fmt.Errorf("headscale activation host authority unavailable")
 	}
@@ -359,6 +362,7 @@ func prospectiveCertificateChallengeRemoval(snapshot nginx.ActivationSnapshot, b
 }
 
 func (host *ActivationHost) RemoveCertificateChallenge(ctx context.Context, bundle ActivationBundle, prepared challenge.Prepared, authority nginxactivation.ChallengeReloadAuthority) error {
+	authority = authority.ForContraction()
 	entry, err := headscaleChallengeEntry(bundle, prepared)
 	if err != nil {
 		return err
@@ -432,6 +436,7 @@ func (host *ActivationHost) CloseControlCertificateRecovery(ctx context.Context,
 	if host == nil || ValidateActivation(bundle) != nil {
 		return fmt.Errorf("headscale control certificate recovery authority invalid")
 	}
+	authority = authority.ForContraction()
 	runtimeHost, err := nginxactivation.NewFixedHost()
 	if err != nil {
 		return err

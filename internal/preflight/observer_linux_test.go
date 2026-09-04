@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,48 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	}
 	if before != after {
 		t.Fatalf("read-only observer mutated fixture tree\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("9", 64)
+	expected := ExpectedProfile{
+		ID: "debian", VersionID: "13", Architecture: runtime.GOARCH,
+		SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest,
+		ManagedConfinement: ManagedConfinementProfile{KernelRelease: "6.12.1", CgroupMode: "unified_v2"},
+	}
+	observed := InstalledProfileObservation{
+		Architecture: runtime.GOARCH, Platform: PlatformInfo{ID: "debian", VersionID: "13"},
+		KernelRelease: "6.12.1", CgroupMode: "unified_v2",
+		Packages: PackageObservation{Ready: true, Identity: "package-observation", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest},
+	}
+	if err := VerifyInstalledProfile(expected, observed); err != nil {
+		t.Fatalf("matching installed profile rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		change func(*InstalledProfileObservation)
+	}{
+		{name: "os_profile", change: func(value *InstalledProfileObservation) { value.Platform.VersionID = "14" }},
+		{name: "kernel", change: func(value *InstalledProfileObservation) { value.KernelRelease = "6.12.2" }},
+		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "257.2" }},
+		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "1.26.1" }},
+		{name: "package_snapshot", change: func(value *InstalledProfileObservation) {
+			value.Packages.PackageSnapshotDigest = "sha256:" + strings.Repeat("8", 64)
+		}},
+		{name: "package_not_ready", change: func(value *InstalledProfileObservation) {
+			value.Packages.Ready = false
+			value.Packages.Reason = "dpkg_partial_state"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := observed
+			test.change(&candidate)
+			err := VerifyInstalledProfile(expected, candidate)
+			if err == nil || !IsProfileDrift(err) {
+				t.Fatalf("drift was not classified: %v", err)
+			}
+		})
 	}
 }
 

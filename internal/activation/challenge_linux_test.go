@@ -119,6 +119,21 @@ func challengeReloadAuthorityFromSnapshot(snapshot *ReloadAuthoritySnapshot, now
 	return authority
 }
 
+func TestReloadAuthorityChecksRuntimeIdentityAtGuard(t *testing.T) {
+	runtimeErr := errors.New("package profile drift")
+	authority, err := NewReloadAuthorityWithRuntimeCheck(func() (ReloadAuthoritySnapshot, error) {
+		return ReloadAuthoritySnapshot{ObservedAt: time.Now().UTC()}, nil
+	}, func() error {
+		return runtimeErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.Guard(nginx.Manifest{}); !errors.Is(err, runtimeErr) {
+		t.Fatalf("runtime identity error was not enforced: %v", err)
+	}
+}
+
 func challengeReloadTestSnapshot(prepared challenge.Prepared) ReloadAuthoritySnapshot {
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prepared.Entry.ResourceID, GenerationSequence: prepared.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &prepared.Safety}}

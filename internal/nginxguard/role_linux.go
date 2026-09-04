@@ -48,6 +48,9 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	}
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	paths := nginx.FixedPaths()
+	if err := application.VerifyInstalledPackageProfile(context.Background()); err != nil {
+		return err
+	}
 	if err := auditFixedUnitGraph(); err != nil {
 		return err
 	}
@@ -131,6 +134,9 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 	if !decision.Allowed {
 		return fmt.Errorf("nginx guard rejected: %s", decision.Reason)
 	}
+	if err := application.VerifyInstalledPackageProfile(context.Background()); err != nil {
+		return err
+	}
 	if err := runProfile(context.Background(), launcher, child.ProfileNginxTest); err != nil {
 		return err
 	}
@@ -144,6 +150,9 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 		if observeErr != nil || prior.Master == nil {
 			return fmt.Errorf("observe guarded reload prior runtime: %w", observeErr)
 		}
+		if err := application.VerifyInstalledPackageProfile(context.Background()); err != nil {
+			return err
+		}
 		if err := runProfile(context.Background(), launcher, child.ProfileNginxReloadSignal); err != nil {
 			return err
 		}
@@ -151,6 +160,9 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 			return err
 		}
 		return nil
+	}
+	if err := application.VerifyInstalledPackageProfile(context.Background()); err != nil {
+		return err
 	}
 	return child.ExecutePersistentProfile(child.ProfileNginxStart)
 }
