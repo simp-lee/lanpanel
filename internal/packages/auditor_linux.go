@@ -8,46 +8,104 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/pierrec/lz4/v4"
+	"golang.org/x/crypto/openpgp"
+	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/sys/unix"
 )
 
 type LinuxAuditor struct {
-	launcher   ChildLauncher
-	aptRoot    string
-	dpkgRoot   string
-	cgroupRoot string
-	procRoot   string
-	policyPath string
-	binaryPath string
-	maskRoot   string
-	strict     bool
+	launcher     ChildLauncher
+	aptRoot      string
+	aptListsRoot string
+	dpkgRoot     string
+	cgroupRoot   string
+	procRoot     string
+	policyPath   string
+	binaryPath   string
+	maskRoot     string
+	strict       bool
 }
 
 func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 	if launcher == nil {
 		return nil, fmt.Errorf("package auditor requires the typed child launcher")
 	}
-	paths := []string{"/etc/apt", "/etc/dpkg", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", "/proc/net", "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
+	paths := []string{"/etc/apt", "/etc/dpkg", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", "/proc/net", "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
 	for _, path := range paths {
 		if err := validateAuditorParent(path); err != nil {
 			return nil, err
 		}
 	}
-	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", dpkgRoot: "/var/lib/dpkg", cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
+	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
 }
 
 func newTestLinuxAuditor(launcher ChildLauncher, root string) *LinuxAuditor {
-	return &LinuxAuditor{launcher: launcher, aptRoot: filepath.Join(root, "etc/apt"), dpkgRoot: filepath.Join(root, "var/lib/dpkg"), cgroupRoot: filepath.Join(root, "cgroup"), procRoot: filepath.Join(root, "proc"), policyPath: filepath.Join(root, "usr/sbin/policy-rc.d"), binaryPath: filepath.Join(root, "usr/lib/lanpanel/lanpanel"), maskRoot: filepath.Join(root, "etc/systemd/system")}
+	return &LinuxAuditor{launcher: launcher, aptRoot: filepath.Join(root, "etc/apt"), aptListsRoot: filepath.Join(root, "var/lib/apt/lists"), dpkgRoot: filepath.Join(root, "var/lib/dpkg"), cgroupRoot: filepath.Join(root, "cgroup"), procRoot: filepath.Join(root, "proc"), policyPath: filepath.Join(root, "usr/sbin/policy-rc.d"), binaryPath: filepath.Join(root, "usr/lib/lanpanel/lanpanel"), maskRoot: filepath.Join(root, "etc/systemd/system")}
+}
+
+func (auditor *LinuxAuditor) LockRepositoryMetadata(ctx context.Context, wait time.Duration) (func(), error) {
+	if auditor == nil || auditor.aptListsRoot == "" || wait <= 0 {
+		return nil, fmt.Errorf("APT repository metadata lock authority is invalid")
+	}
+	directory, err := openSafeDirectory(auditor.aptListsRoot, auditor.strict)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Openat(directory, "lock", unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	_ = unix.Close(directory)
+	if err != nil {
+		return nil, fmt.Errorf("open APT repository metadata lock: %w", err)
+	}
+	owner, group := uint32(0), uint32(0)
+	if !auditor.strict {
+		owner, group = uint32(os.Geteuid()), uint32(os.Getegid())
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != owner || stat.Gid != group || stat.Mode&0o022 != 0 {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("APT repository metadata lock identity is unsafe")
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	for {
+		lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: int16(io.SeekStart)}
+		err := unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &lock)
+		if err == nil {
+			return func() {
+				unlock := unix.Flock_t{Type: unix.F_UNLCK, Whence: int16(io.SeekStart)}
+				_ = unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &unlock)
+				_ = unix.Close(fd)
+			}, nil
+		}
+		if !errors.Is(err, unix.EACCES) && !errors.Is(err, unix.EAGAIN) {
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("lock APT repository metadata: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = unix.Close(fd)
+			return nil, ctx.Err()
+		case <-deadline.C:
+			_ = unix.Close(fd)
+			return nil, fmt.Errorf("APT repository metadata lock wait elapsed")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (auditor *LinuxAuditor) AuditPackages(ctx context.Context, plan Plan) (Audit, error) {
@@ -106,6 +164,10 @@ func (auditor *LinuxAuditor) PreflightReadiness(ctx context.Context, repositorie
 }
 
 func (auditor *LinuxAuditor) ObservePackages(ctx context.Context, plan Plan) (Postcondition, error) {
+	repositories, err := auditor.observeAPTAuthority(ctx, plan)
+	if err != nil {
+		return Postcondition{}, err
+	}
 	_, installed, systemPackages, err := auditor.readDPKG(ctx, plan.Packages)
 	if err != nil {
 		return Postcondition{}, err
@@ -117,7 +179,7 @@ func (auditor *LinuxAuditor) ObservePackages(ctx context.Context, plan Plan) (Po
 	if err != nil {
 		return Postcondition{}, err
 	}
-	postcondition := Postcondition{Installed: installed, SystemPackages: runtime.SystemPackages, Units: runtime.Units, Listeners: runtime.Listeners}
+	postcondition := Postcondition{Repositories: repositories, Installed: installed, SystemPackages: runtime.SystemPackages, Units: runtime.Units, Listeners: runtime.Listeners}
 	if hasPackage(plan.Packages, "apache2-utils") {
 		identity, err := auditor.fileIdentity("/usr/bin/htpasswd")
 		if err != nil {
@@ -125,7 +187,23 @@ func (auditor *LinuxAuditor) ObservePackages(ctx context.Context, plan Plan) (Po
 		}
 		postcondition.HTPasswd = &identity
 	}
+	finalRepositories, err := auditor.observeAPTAuthority(ctx, plan)
+	if err != nil {
+		return Postcondition{}, err
+	}
+	postcondition.Repositories = finalRepositories
 	return postcondition, nil
+}
+
+func (auditor *LinuxAuditor) observeAPTAuthority(ctx context.Context, plan Plan) ([]ObservedRepository, error) {
+	configuration, repositories, err := auditor.readConfiguration(ctx, plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateAPTConfiguration(configuration, repositories, plan.Repositories); err != nil {
+		return nil, fmt.Errorf("post-transaction APT authority changed: %w", err)
+	}
+	return repositories, nil
 }
 
 func (auditor *LinuxAuditor) VerifyPackageMasks(ctx context.Context, identities []MaskIdentity, present bool) error {
@@ -157,6 +235,295 @@ func (auditor *LinuxAuditor) VerifyPackageMasks(ctx context.Context, identities 
 		}
 	}
 	return nil
+}
+
+type repositoryMetadataFile struct {
+	Name   string `json:"name"`
+	Bytes  int64  `json:"bytes"`
+	Digest string `json:"digest"`
+}
+
+type repositoryReleaseFile struct {
+	Bytes  int64
+	Digest string
+}
+
+const maximumRepositoryMetadataFileBytes = 128 << 20
+
+// observeRepositoryMetadata derives repository authority from the signed APT
+// metadata actually present in the local lists directory. The Plan is never
+// used as a source for either digest: it is only compared later by
+// ValidateAPTConfiguration.
+func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repositories []ObservedRepository, keyrings map[string][]byte) error {
+	if len(repositories) == 0 {
+		return nil
+	}
+	if auditor == nil || auditor.aptListsRoot == "" {
+		return fmt.Errorf("APT repository metadata observer is unavailable")
+	}
+	listsFD, err := openSafeDirectory(auditor.aptListsRoot, auditor.strict)
+	if err != nil {
+		return fmt.Errorf("open APT repository metadata directory: %w", err)
+	}
+	defer func() { _ = unix.Close(listsFD) }()
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", listsFD))
+	if err != nil {
+		return fmt.Errorf("enumerate APT repository metadata: %w", err)
+	}
+	for index := range repositories {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		prefix, err := aptListRepositoryPrefix(repositories[index].URI, repositories[index].Suite)
+		if err != nil {
+			return err
+		}
+		metadata := []repositoryMetadataFile{}
+		var release []byte
+		for _, entry := range entries {
+			if entry.Name() == "lock" || entry.Name() == "partial" || entry.Name() == "auxfiles" && entry.IsDir() {
+				continue
+			}
+			if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+				continue
+			}
+			path := filepath.Join(auditor.aptListsRoot, entry.Name())
+			data, _, err := auditor.readFileAndStat(path, maximumRepositoryMetadataFileBytes)
+			if err != nil {
+				return fmt.Errorf("read exact APT repository metadata %q: %w", entry.Name(), err)
+			}
+			metadata = append(metadata, repositoryMetadataFile{Name: entry.Name(), Bytes: int64(len(data)), Digest: digestBytes(data)})
+			if entry.Name() == prefix+"InRelease" {
+				release = data
+			}
+		}
+		if len(metadata) == 0 || len(release) == 0 {
+			return fmt.Errorf("APT repository %q lacks exact signed InRelease metadata", repositories[index].ID)
+		}
+		plaintext, err := verifyInRelease(release, keyrings[repositories[index].KeyringPath])
+		if err != nil {
+			return fmt.Errorf("APT repository %q InRelease signature is invalid: %w", repositories[index].ID, err)
+		}
+		releaseFiles, err := releaseSHA256Files(plaintext)
+		if err != nil {
+			return fmt.Errorf("read exact APT repository metadata checksums for %q: %w", repositories[index].ID, err)
+		}
+		if !releaseFieldContainsToken(plaintext, "Architectures", "amd64") {
+			return fmt.Errorf("APT repository %q InRelease does not authorize amd64", repositories[index].ID)
+		}
+		allArchitectureRequired := releaseFieldContainsToken(plaintext, "Architectures", "all") && !releaseFieldContainsToken(plaintext, "No-Support-for-Architecture-all", "Packages")
+		for _, component := range repositories[index].Components {
+			for _, architecture := range []string{"amd64", "all"} {
+				packagePrefix := prefix + aptListPart(component) + "_binary-" + architecture + "_Packages"
+				found := false
+				for _, packageFile := range metadata {
+					if !aptPackageIndexName(packageFile.Name, packagePrefix) {
+						continue
+					}
+					found = true
+					suffix := strings.TrimPrefix(packageFile.Name, packagePrefix)
+					releasePath := component + "/binary-" + architecture + "/Packages"
+					if err := auditor.validateRepositoryPackageIndex(packageFile, suffix, releasePath, releaseFiles); err != nil {
+						return fmt.Errorf("APT repository %q package index is not bound by its InRelease metadata: %w", repositories[index].ID, err)
+					}
+				}
+				if !found && (architecture == "amd64" || allArchitectureRequired) {
+					return fmt.Errorf("APT repository %q lacks the exact %s package index for component %q", repositories[index].ID, architecture, component)
+				}
+			}
+		}
+		metadataDigest := digestBytes(release)
+		cutoffDigest, err := repositoryCutoffDigest(plaintext)
+		if err != nil {
+			return fmt.Errorf("read exact APT repository cutoff for %q: %w", repositories[index].ID, err)
+		}
+		repositories[index].MetadataDigest = metadataDigest
+		repositories[index].CutoffDigest = cutoffDigest
+	}
+	return nil
+}
+
+func verifyInRelease(data, keyring []byte) ([]byte, error) {
+	if len(keyring) == 0 {
+		return nil, fmt.Errorf("repository keyring is missing")
+	}
+	if !bytes.HasPrefix(data, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return nil, fmt.Errorf("InRelease is not an exact clear-signed message")
+	}
+	block, rest := clearsign.Decode(data)
+	if block == nil || block.ArmoredSignature == nil || len(bytes.TrimSpace(rest)) != 0 {
+		return nil, fmt.Errorf("InRelease is not one exact clear-signed message")
+	}
+	entities, err := openpgp.ReadKeyRing(bytes.NewReader(keyring))
+	if err != nil {
+		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(keyring))
+	}
+	if err != nil || len(entities) == 0 {
+		return nil, fmt.Errorf("repository keyring cannot verify OpenPGP metadata")
+	}
+	if _, err := openpgp.CheckDetachedSignature(entities, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body); err != nil {
+		return nil, fmt.Errorf("InRelease was not signed by the exact repository keyring")
+	}
+	return append([]byte(nil), block.Plaintext...), nil
+}
+
+func aptListRepositoryPrefix(uri, suite string) (string, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil || parsed.Host == "" || parsed.Path == "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.String() != uri {
+		return "", fmt.Errorf("APT repository URI cannot identify local metadata")
+	}
+	host := parsed.Host
+	// APT's URI parser stores an IPv6 host without brackets; URItoFileName
+	// clears the access scheme before serialization, so brackets are not added.
+	if strings.HasPrefix(host, "[") {
+		closing := strings.IndexByte(host, ']')
+		if closing < 0 {
+			return "", fmt.Errorf("APT repository IPv6 host is malformed")
+		}
+		host = host[1:closing] + host[closing+1:]
+	}
+	path := strings.TrimSuffix(parsed.EscapedPath(), "/")
+	return aptListPart(host+path) + "_dists_" + aptListPart(suite) + "_", nil
+}
+
+func aptPackageIndexName(name, prefix string) bool {
+	for _, suffix := range []string{"", ".gz", ".xz", ".bz2", ".lz4", ".zst", ".lzma"} {
+		if name == prefix+suffix {
+			return true
+		}
+	}
+	return false
+}
+
+func (auditor *LinuxAuditor) validateRepositoryPackageIndex(file repositoryMetadataFile, suffix, releasePath string, releaseFiles map[string]repositoryReleaseFile) error {
+	if suffix != ".lz4" {
+		releaseFile, found := releaseFiles[releasePath+suffix]
+		if !found {
+			return fmt.Errorf("stored package index representation is absent from InRelease")
+		}
+		if file.Bytes != releaseFile.Bytes || file.Digest != releaseFile.Digest {
+			return fmt.Errorf("stored package index differs from its signed compressed identity")
+		}
+		return nil
+	}
+	if compressed, found := releaseFiles[releasePath+suffix]; found && (file.Bytes != compressed.Bytes || file.Digest != compressed.Digest) {
+		return fmt.Errorf("stored LZ4 package index differs from its signed compressed identity")
+	}
+	releaseFile, found := releaseFiles[releasePath]
+	if !found || releaseFile.Bytes < 0 || releaseFile.Bytes > maximumRepositoryMetadataFileBytes {
+		return fmt.Errorf("LZ4 package index lacks a bounded signed uncompressed identity")
+	}
+	data, _, err := auditor.readFileAndStat(filepath.Join(auditor.aptListsRoot, file.Name), maximumRepositoryMetadataFileBytes)
+	if err != nil || int64(len(data)) != file.Bytes || digestBytes(data) != file.Digest {
+		return fmt.Errorf("LZ4 package index changed before verification")
+	}
+	hasher := sha256.New()
+	read, err := io.Copy(hasher, io.LimitReader(lz4.NewReader(bytes.NewReader(data)), releaseFile.Bytes+1))
+	if err != nil || read != releaseFile.Bytes || hex.EncodeToString(hasher.Sum(nil)) != releaseFile.Digest {
+		return fmt.Errorf("LZ4 package index content differs from its signed uncompressed identity")
+	}
+	return nil
+}
+
+func releaseFieldContainsToken(release []byte, field, expected string) bool {
+	for line := range strings.SplitSeq(string(release), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if found && key == field {
+			return slices.Contains(strings.Fields(value), expected)
+		}
+	}
+	return false
+}
+
+func releaseSHA256Files(release []byte) (map[string]repositoryReleaseFile, error) {
+	files := map[string]repositoryReleaseFile{}
+	inSHA256 := false
+	for line := range strings.SplitSeq(string(release), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "SHA256:" {
+			inSHA256 = true
+			continue
+		}
+		if !inSHA256 || trimmed == "" {
+			continue
+		}
+		if trimmed == "SHA512:" || trimmed == "MD5Sum:" || strings.HasPrefix(trimmed, "-----BEGIN PGP ") {
+			break
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) != 3 || !digestPattern.MatchString(fields[0]) {
+			return nil, fmt.Errorf("signed Release SHA256 entry is malformed")
+		}
+		bytes, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil || bytes < 0 || fields[2] == "" || strings.ContainsAny(fields[2], "\u0000\r\n") {
+			return nil, fmt.Errorf("signed Release SHA256 entry has invalid size or path")
+		}
+		if _, exists := files[fields[2]]; exists {
+			return nil, fmt.Errorf("signed Release SHA256 entry is duplicated")
+		}
+		files[fields[2]] = repositoryReleaseFile{Bytes: bytes, Digest: fields[0]}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("signed Release metadata omits its SHA256 index")
+	}
+	return files, nil
+}
+
+func aptListPart(value string) string {
+	const quoteCharacters = `\|{}[]<>"^~_=!@#$%^&*`
+	var result strings.Builder
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character == '/':
+			result.WriteByte('_')
+		case character < 0x21 || character >= 0x7f || strings.ContainsRune(quoteCharacters, rune(character)):
+			_, _ = fmt.Fprintf(&result, "%%%02x", character)
+		default:
+			result.WriteByte(character)
+		}
+	}
+	return result.String()
+}
+
+func repositoryCutoffDigest(release []byte) (string, error) {
+	dateText, found := "", false
+	for line := range strings.SplitSeq(string(release), "\n") {
+		key, value, hasValue := strings.Cut(line, ":")
+		if !hasValue || key != "Date" {
+			continue
+		}
+		if found || strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("signed Release metadata has an invalid Date field")
+		}
+		dateText, found = strings.TrimSpace(value), true
+	}
+	if !found {
+		return "", fmt.Errorf("signed Release metadata omits its Date cutoff")
+	}
+	var date time.Time
+	var err error
+	for _, layout := range []string{time.RFC1123Z, time.RFC1123, time.RFC822Z, time.RFC822} {
+		date, err = time.Parse(layout, dateText)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("signed Release Date is not an RFC timestamp")
+	}
+	canonical, err := json.Marshal(struct {
+		Date string `json:"date"`
+	}{Date: date.UTC().Format(time.RFC3339)})
+	if err != nil {
+		return "", err
+	}
+	return digestBytes(canonical), nil
+}
+
+func digestBytes(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
 }
 
 func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) ([]ObservedConfig, []ObservedRepository, error) {
@@ -192,6 +559,18 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 	slices.SortFunc(files, func(left, right ObservedConfig) int { return strings.Compare(left.Path, right.Path) })
 	repositories, err := parseObservedRepositories(files, plan.Repositories)
 	if err != nil {
+		return nil, nil, err
+	}
+	keyrings := map[string][]byte{}
+	for _, file := range files {
+		if file.Kind == APTKeyring {
+			keyrings[file.Path] = file.Bytes
+		}
+	}
+	for index := range repositories {
+		repositories[index].KeyringDigest = digestBytes(keyrings[repositories[index].KeyringPath])
+	}
+	if err := auditor.observeRepositoryMetadata(ctx, repositories, keyrings); err != nil {
 		return nil, nil, err
 	}
 	return files, repositories, nil
@@ -312,7 +691,7 @@ func parseObservedRepositories(files []ObservedConfig, expected []Repository) ([
 		matched := false
 		for _, want := range expected {
 			if observed.URI == want.URI && observed.Suite == want.Suite && slices.Equal(observed.Components, want.Components) && observed.KeyringPath == want.KeyringPath {
-				observed.ID, observed.KeyringDigest, observed.Enabled = want.ID, want.KeyringDigest, true
+				observed.ID, observed.Enabled = want.ID, true
 				result = append(result, observed)
 				matched = true
 				break

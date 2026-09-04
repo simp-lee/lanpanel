@@ -36,6 +36,7 @@ func RenderAPTConfiguration(plan Plan) ([]byte, []byte, error) {
 		`Acquire::http::Timeout "` + seconds + `";`,
 		`Acquire::https::Timeout "` + seconds + `";`,
 		`Dir::Cache::archives "` + root + `archives/";`,
+		`Dir::State::lists "/var/lib/apt/lists/";`,
 		`Dir::Etc::netrc "` + root + `auth.conf";`,
 		`Dir::Etc::netrcparts "-";`,
 		`Dir::Etc::preferences "` + root + `preferences";`,

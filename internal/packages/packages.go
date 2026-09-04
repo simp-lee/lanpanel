@@ -58,14 +58,16 @@ type Package struct {
 }
 
 type Repository struct {
-	ID             string   `json:"id"`
-	URI            string   `json:"uri"`
-	Suite          string   `json:"suite"`
-	Components     []string `json:"components"`
-	KeyringPath    string   `json:"keyring_path"`
-	KeyringDigest  string   `json:"keyring_digest"`
-	MetadataDigest string   `json:"metadata_digest"`
-	CutoffDigest   string   `json:"cutoff_digest"`
+	ID            string   `json:"id"`
+	URI           string   `json:"uri"`
+	Suite         string   `json:"suite"`
+	Components    []string `json:"components"`
+	KeyringPath   string   `json:"keyring_path"`
+	KeyringDigest string   `json:"keyring_digest"`
+	// MetadataDigest identifies the exact repository InRelease metadata bytes.
+	MetadataDigest string `json:"metadata_digest"`
+	// CutoffDigest identifies the canonical Date in the repository InRelease.
+	CutoffDigest string `json:"cutoff_digest"`
 }
 
 type Plan struct {
@@ -112,13 +114,15 @@ type ObservedConfig struct {
 }
 
 type ObservedRepository struct {
-	ID            string
-	URI           string
-	Suite         string
-	Components    []string
-	KeyringPath   string
-	KeyringDigest string
-	Enabled       bool
+	ID             string
+	URI            string
+	Suite          string
+	Components     []string
+	KeyringPath    string
+	KeyringDigest  string
+	MetadataDigest string
+	CutoffDigest   string
+	Enabled        bool
 }
 
 type DPKGState struct {
@@ -165,6 +169,7 @@ type FileIdentity struct {
 }
 
 type Postcondition struct {
+	Repositories   []ObservedRepository
 	Installed      []Package
 	SystemPackages []InstalledPackage
 	Units          []UnitState
@@ -292,13 +297,26 @@ func ValidateAPTConfiguration(files []ObservedConfig, repositories []ObservedRep
 		}
 		previous = file.Path
 	}
-	if len(repositories) != len(expected) {
+	if err := validateRepositoryObservations(repositories, expected); err != nil {
+		return err
+	}
+	for index := range repositories {
+		want := expected[index]
+		if observedKeyrings[want.KeyringPath] != want.KeyringDigest {
+			return fmt.Errorf("active repository keyring bytes differ from the package Plan")
+		}
+	}
+	return nil
+}
+
+func validateRepositoryObservations(observed []ObservedRepository, expected []Repository) error {
+	if len(observed) != len(expected) {
 		return fmt.Errorf("active repository closure differs from the package Plan")
 	}
-	for index, repository := range repositories {
+	for index, repository := range observed {
 		want := expected[index]
-		if !repository.Enabled || repository.ID != want.ID || repository.URI != want.URI || repository.Suite != want.Suite || !slices.Equal(repository.Components, want.Components) || repository.KeyringPath != want.KeyringPath || repository.KeyringDigest != want.KeyringDigest || observedKeyrings[want.KeyringPath] != want.KeyringDigest {
-			return fmt.Errorf("active repository or keyring identity differs from the package Plan")
+		if !repository.Enabled || repository.ID != want.ID || repository.URI != want.URI || repository.Suite != want.Suite || !slices.Equal(repository.Components, want.Components) || repository.KeyringPath != want.KeyringPath || repository.KeyringDigest != want.KeyringDigest || repository.MetadataDigest != want.MetadataDigest || repository.CutoffDigest != want.CutoffDigest || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) {
+			return fmt.Errorf("active repository, keyring, metadata, or cutoff identity differs from the package Plan")
 		}
 	}
 	return nil
@@ -312,7 +330,13 @@ func ValidateDPKGReady(state DPKGState) error {
 }
 
 func ValidatePostcondition(plan Plan, before RuntimeSnapshot, observed Postcondition, createdMasks []string) error {
-	if err := ValidatePlan(plan); err != nil || !reflectPackages(observed.Installed, plan.Packages) {
+	if err := ValidatePlan(plan); err != nil {
+		return fmt.Errorf("package postcondition plan authority is invalid")
+	}
+	if err := validateRepositoryObservations(observed.Repositories, plan.Repositories); err != nil {
+		return fmt.Errorf("package postcondition repository authority is invalid: %w", err)
+	}
+	if !reflectPackages(observed.Installed, plan.Packages) {
 		return fmt.Errorf("package postcondition has unexpected package closure")
 	}
 	if err := validateRuntime(before); err != nil || errRuntime(observed.Units, observed.Listeners) != nil {

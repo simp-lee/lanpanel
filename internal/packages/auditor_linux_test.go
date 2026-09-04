@@ -3,6 +3,7 @@
 package packages
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -12,14 +13,36 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pierrec/lz4/v4"
+	"golang.org/x/crypto/openpgp"
+	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/sys/unix"
 )
+
+func TestAPTListRepositoryPrefixUsesAPTCanonicalPath(t *testing.T) {
+	for _, test := range []struct {
+		uri, suite, want string
+	}{
+		{uri: "https://deb.example.test/debian", suite: "stable", want: "deb.example.test_debian_dists_stable_"},
+		{uri: "https://deb.example.test/debian/", suite: "stable", want: "deb.example.test_debian_dists_stable_"},
+		{uri: "https://deb.example.test/debian//", suite: "stable", want: "deb.example.test_debian__dists_stable_"},
+		{uri: "https://deb.example.test/", suite: "stable", want: "deb.example.test_dists_stable_"},
+		{uri: "https://deb.example.test:8080/repo_with+plus/", suite: "stable+updates", want: "deb.example.test:8080_repo%5fwith+plus_dists_stable+updates_"},
+		{uri: "https://[2001:db8::1]/debian", suite: "stable", want: "2001:db8::1_debian_dists_stable_"},
+		{uri: "https://deb.example.test/repo%20name", suite: "stable", want: "deb.example.test_repo%2520name_dists_stable_"},
+	} {
+		got, err := aptListRepositoryPrefix(test.uri, test.suite)
+		if err != nil || got != test.want {
+			t.Fatalf("aptListRepositoryPrefix(%q, %q) = %q, %v; want %q", test.uri, test.suite, got, err, test.want)
+		}
+	}
+}
 
 func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testing.T) {
 	root := t.TempDir()
 	for _, directory := range []string{
 		"etc/apt/apt.conf.d", "etc/apt/keyrings", "etc/apt/sources.list.d", "etc/apt/trusted.gpg.d", "etc/dpkg/dpkg.cfg.d",
-		"var/lib/dpkg", "cgroup/nginx.service", "proc", "usr/sbin", "usr/lib/lanpanel", "etc/systemd/system",
+		"var/lib/apt/lists", "var/lib/dpkg", "cgroup/nginx.service", "proc", "usr/sbin", "usr/lib/lanpanel", "etc/systemd/system",
 	} {
 		if err := os.MkdirAll(filepath.Join(root, directory), 0o755); err != nil {
 			t.Fatal(err)
@@ -29,11 +52,48 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	binary := []byte("same lanpanel policy binary")
 	binaryDigest := fmt.Sprintf("%x", sha256.Sum256(binary))
 	plan.NoAutostartPolicyDigest = binaryDigest
-	keyring := []byte("exact distro keyring")
+	signer, err := openpgp.NewEntity("APT Fixture", "", "apt@example.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keyringBuffer bytes.Buffer
+	if err := signer.Serialize(&keyringBuffer); err != nil {
+		t.Fatal(err)
+	}
+	keyring := keyringBuffer.Bytes()
 	plan.Repositories[0].KeyringDigest = fmt.Sprintf("%x", sha256.Sum256(keyring))
 	writeFixture(t, root, "etc/apt/apt.conf", []byte("// no hooks\n"), 0o644)
 	writeFixture(t, root, "etc/apt/keyrings/lanpanel.gpg", keyring, 0o644)
 	writeFixture(t, root, "etc/apt/sources.list", []byte("deb [arch=amd64 signed-by=/etc/apt/keyrings/lanpanel.gpg] https://deb.example.test/debian stable main\n"), 0o644)
+	packageIndex := []byte("Package: base-files\nVersion: 1\nArchitecture: amd64\n")
+	packageDigest := fmt.Sprintf("%x", sha256.Sum256(packageIndex))
+	signRelease := func(plaintext string) []byte {
+		t.Helper()
+		var signed bytes.Buffer
+		writer, err := clearsign.Encode(&signed, signer.PrivateKey, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte(plaintext)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return signed.Bytes()
+	}
+	releasePlaintext := fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))
+	release := signRelease(releasePlaintext)
+	var compressedPackageIndex bytes.Buffer
+	compressor := lz4.NewWriter(&compressedPackageIndex)
+	if _, err := compressor.Write(packageIndex); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", release, 0o644)
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_main_binary-amd64_Packages.lz4", compressedPackageIndex.Bytes(), 0o644)
 	writeFixture(t, root, "etc/dpkg/dpkg.cfg", []byte("# safe\n"), 0o644)
 	writeFixture(t, root, "var/lib/dpkg/status", []byte("Package: base-files\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n"), 0o644)
 	writeFixture(t, root, "cgroup/nginx.service/cgroup.procs", nil, 0o644)
@@ -44,12 +104,47 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	writeFixture(t, root, "usr/sbin/policy-rc.d", binary, 0o755)
 	launcher := &auditLauncher{}
 	auditor := newTestLinuxAuditor(launcher, root)
+	observedRepositories := []ObservedRepository{{URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: plan.Repositories[0].Components, KeyringPath: plan.Repositories[0].KeyringPath}}
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", []byte(releasePlaintext), 0o644)
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}); err == nil {
+		t.Fatal("unsigned InRelease metadata was accepted")
+	}
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", release, 0o644)
+	wrongSigner, err := openpgp.NewEntity("Wrong APT Fixture", "", "wrong@example.test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrongKeyring bytes.Buffer
+	if err := wrongSigner.Serialize(&wrongKeyring); err != nil {
+		t.Fatal(err)
+	}
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: wrongKeyring.Bytes()}); err == nil {
+		t.Fatal("InRelease signed by a different key was accepted")
+	}
 	audit, err := auditor.AuditPackages(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err == nil {
+		t.Fatal("host repository metadata was not compared with the Plan")
+	}
+	plan.Repositories[0].MetadataDigest = observedRepositories[0].MetadataDigest
+	plan.Repositories[0].CutoffDigest = observedRepositories[0].CutoffDigest
+	audit, err = auditor.AuditPackages(context.Background(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err != nil {
 		t.Fatal(err)
+	}
+	if audit.Repositories[0].MetadataDigest != observedRepositories[0].MetadataDigest || audit.Repositories[0].CutoffDigest != observedRepositories[0].CutoffDigest {
+		t.Fatalf("audit did not return host-derived repository authority: %#v", audit.Repositories[0])
+	}
+	if observedRepositories[0].CutoffDigest != "a919e3552f73479b629bd4a340d863e33f49ea0ce2e2d143473fd20d33e7056c" {
+		t.Fatalf("unexpected canonical cutoff digest: %s", observedRepositories[0].CutoffDigest)
 	}
 	if err := ValidateDPKGReady(audit.DPKG); err != nil {
 		t.Fatal(err)
@@ -70,6 +165,11 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	}
 	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err == nil {
 		t.Fatal("malicious active APT hook was accepted")
+	}
+	writeFixture(t, root, "etc/apt/apt.conf", []byte("// no hooks\n"), 0o644)
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", signRelease(fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nDescription: changed\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))), 0o644)
+	if _, err := auditor.ObservePackages(context.Background(), plan); err == nil {
+		t.Fatal("post-transaction repository metadata drift was accepted")
 	}
 }
 

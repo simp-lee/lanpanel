@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"lanpanel/internal/child"
+	"time"
 )
 
 type AuditProvider interface {
+	LockRepositoryMetadata(context.Context, time.Duration) (func(), error)
 	AuditPackages(context.Context, Plan) (Audit, error)
 	ObservePackages(context.Context, Plan) (Postcondition, error)
 	VerifyPackageMasks(context.Context, []MaskIdentity, bool) error
@@ -24,6 +26,16 @@ type HostExecutor struct {
 	Files    *TransactionFiles
 	Masks    *UnitMasks
 	Launcher ChildLauncher
+}
+
+func (executor *HostExecutor) LockRepositories(ctx context.Context, plan Plan) (func(), error) {
+	if plan.Mode != DistroRepository {
+		return func() {}, nil
+	}
+	if executor == nil || executor.Auditor == nil {
+		return nil, fmt.Errorf("package repository metadata lock is unavailable")
+	}
+	return executor.Auditor.LockRepositoryMetadata(ctx, plan.LockWait)
 }
 
 func (executor *HostExecutor) Audit(ctx context.Context, plan Plan) (Audit, error) {

@@ -102,6 +102,7 @@ type MaskResult struct {
 }
 
 type Executor interface {
+	LockRepositories(context.Context, Plan) (func(), error)
 	Audit(context.Context, Plan) (Audit, error)
 	Stage(context.Context, Plan) error
 	Prepare(context.Context, Plan, []byte, []byte) error
@@ -149,6 +150,11 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	unlockRepositories, err := engine.Executor.LockRepositories(ctx, plan)
+	if err != nil || unlockRepositories == nil {
+		return Journal{}, errors.Join(err, fmt.Errorf("lock exact package repository metadata"))
+	}
+	defer unlockRepositories()
 
 	audit, err := engine.Executor.Audit(ctx, plan)
 	if err != nil {
@@ -257,6 +263,26 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist package mask authority: %w", err)
 	}
 	journal = next
+
+	finalAudit, err := engine.Executor.Audit(ctx, plan)
+	if err != nil {
+		return journal, fmt.Errorf("final pre-child package audit: %w", err)
+	}
+	if err := ValidateAPTConfiguration(finalAudit.Configuration, finalAudit.Repositories, plan.Repositories); err != nil {
+		return journal, fmt.Errorf("final pre-child APT authority audit: %w", err)
+	}
+	if err := ValidateDPKGReady(finalAudit.DPKG); err != nil {
+		return journal, fmt.Errorf("final pre-child dpkg audit: %w", err)
+	}
+	if err := validateNoAutostartPolicy(plan, finalAudit.NoAutostart); err != nil {
+		return journal, fmt.Errorf("final pre-child no-autostart authority audit: %w", err)
+	}
+	if err := validateResumeRuntime(JournalMasksApplied, audit.Before, finalAudit.Before, journal.Masks, ""); err != nil {
+		return journal, fmt.Errorf("final pre-child runtime audit: %w", err)
+	}
+	if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
+		return journal, fmt.Errorf("final pre-child package mask audit: %w", err)
+	}
 
 	monitoredCtx := ctx
 	stopMonitor := func() error { return nil }
@@ -409,6 +435,19 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 	}
 	defer cancel()
+	unlockRepositories := func() {}
+	switch journal.Phase {
+	case JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasksApplied:
+		unlockRepositories, err = engine.Executor.LockRepositories(ctx, plan)
+	case JournalChildTerminal:
+		if journal.ChildSucceeded {
+			unlockRepositories, err = engine.Executor.LockRepositories(ctx, plan)
+		}
+	}
+	if err != nil || unlockRepositories == nil {
+		return journal, errors.Join(err, fmt.Errorf("lock exact package repository metadata for resume"))
+	}
+	defer unlockRepositories()
 	advance := func(next Journal) error {
 		if err := engine.Journals.Advance(context.WithoutCancel(ctx), journal, next); err != nil {
 			return err

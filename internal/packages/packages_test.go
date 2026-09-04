@@ -87,7 +87,7 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 		{Path: "/etc/apt/keyrings/lanpanel.gpg", Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: keyring},
 		{Path: "/etc/apt/sources.list", Kind: APTSource, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte("deb [signed-by=/etc/apt/keyrings/lanpanel.gpg] https://deb.example.test/debian stable main\n")},
 	}
-	repositories := []ObservedRepository{{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: []string{"main"}, KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: keyringDigest, Enabled: true}}
+	repositories := []ObservedRepository{{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: []string{"main"}, KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: keyringDigest, MetadataDigest: plan.Repositories[0].MetadataDigest, CutoffDigest: plan.Repositories[0].CutoffDigest, Enabled: true}}
 	if err := ValidateAPTConfiguration(files, repositories, plan.Repositories); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +108,38 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 	if err := ValidateAPTConfiguration(files, drifted, plan.Repositories); err == nil {
 		t.Fatal("unexpected repository was accepted")
 	}
+	for _, change := range []func(*ObservedRepository){
+		func(repository *ObservedRepository) { repository.MetadataDigest = strings.Repeat("0", 64) },
+		func(repository *ObservedRepository) { repository.CutoffDigest = strings.Repeat("0", 64) },
+	} {
+		changed := append([]ObservedRepository(nil), repositories...)
+		change(&changed[0])
+		if err := ValidateAPTConfiguration(files, changed, plan.Repositories); err == nil {
+			t.Fatal("repository snapshot drift was accepted")
+		}
+	}
 	if err := ValidateDPKGReady(DPKGState{HalfConfigured: []string{"nginx"}}); err == nil {
 		t.Fatal("half-configured dpkg state was accepted")
+	}
+}
+
+func TestPostconditionRejectsRepositorySnapshotDrift(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	executor := newFakeExecutor(plan)
+	executor.observed.RetainedMasks = []string{"nginx.service"}
+	if err := ValidatePostcondition(plan, executor.audit.Before, executor.observed, []string{"nginx.service"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*ObservedRepository){
+		func(repository *ObservedRepository) { repository.MetadataDigest = strings.Repeat("0", 64) },
+		func(repository *ObservedRepository) { repository.CutoffDigest = strings.Repeat("0", 64) },
+	} {
+		observed := executor.observed
+		observed.Repositories = append([]ObservedRepository(nil), executor.observed.Repositories...)
+		change(&observed.Repositories[0])
+		if err := ValidatePostcondition(plan, executor.audit.Before, observed, []string{"nginx.service"}); err == nil {
+			t.Fatal("post-transaction repository snapshot drift was accepted")
+		}
 	}
 }
 
@@ -173,6 +203,19 @@ func TestPackageResumePreflightErrorsReturnFencedJournal(t *testing.T) {
 				t.Fatalf("preflight error lost fenced journal: resumed=%#v durable=%#v calls=%d err=%v", resumed, journals.current, executor.mutationCount(), err)
 			}
 		})
+	}
+}
+
+func TestPackageTransactionRevalidatesRepositoryAuthorityBeforeChild(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	executor := newFakeExecutor(plan)
+	executor.afterStage = func() {
+		executor.audit.Repositories[0].MetadataDigest = strings.Repeat("0", 64)
+	}
+	engine, result := testEngine(&memoryJournals{}, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalMasksApplied || executor.runCount != 0 {
+		t.Fatalf("repository drift reached package child: journal=%#v runs=%d err=%v", journal, executor.runCount, err)
 	}
 }
 
@@ -815,6 +858,7 @@ type fakeExecutor struct {
 	unmaskCalls  [][]MaskIdentity
 	verifyCalls  [][]MaskIdentity
 	maskFunc     func([]string, string, func(string) error, func(MaskIdentity) error) (MaskResult, error)
+	afterStage   func()
 	runErr       error
 	prepareCount int
 	stageCount   int
@@ -837,13 +881,17 @@ func newFakeExecutor(plan Plan) *fakeExecutor {
 		keyring := []byte("keyring")
 		digest := fmt.Sprintf("%x", sha256.Sum256(keyring))
 		configuration = append(configuration, ObservedConfig{Path: "/etc/apt/keyrings/lanpanel.gpg", Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: keyring})
-		repositories = append(repositories, ObservedRepository{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: append([]string(nil), plan.Repositories[0].Components...), KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digest, Enabled: true})
+		repositories = append(repositories, ObservedRepository{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: append([]string(nil), plan.Repositories[0].Components...), KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digest, MetadataDigest: plan.Repositories[0].MetadataDigest, CutoffDigest: plan.Repositories[0].CutoffDigest, Enabled: true})
 	}
 	policy := NoAutostartPolicy{Path: "/usr/sbin/policy-rc.d", Digest: plan.NoAutostartPolicyDigest, UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, SameLanPanelBinary: true}
 	htpasswd := &FileIdentity{Path: "/usr/bin/htpasswd", UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, Digest: strings.Repeat("8", 64)}
 	systemPackages := append(append([]InstalledPackage(nil), before.SystemPackages...), InstalledPackage{Name: "apache2-utils", Version: plan.Packages[0].Version, Architecture: "amd64"}, InstalledPackage{Name: "nginx", Version: plan.Packages[1].Version, Architecture: "amd64"})
 	slices.SortFunc(systemPackages, func(left, right InstalledPackage) int { return strings.Compare(left.Name, right.Name) })
-	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: maskedUnits, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
+	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Repositories: append([]ObservedRepository(nil), repositories...), Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: maskedUnits, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
+}
+
+func (executor *fakeExecutor) LockRepositories(_ context.Context, _ Plan) (func(), error) {
+	return func() {}, nil
 }
 
 func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
@@ -854,6 +902,9 @@ func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
 
 func (executor *fakeExecutor) Stage(_ context.Context, _ Plan) error {
 	executor.stageCount++
+	if executor.afterStage != nil {
+		executor.afterStage()
+	}
 	return nil
 }
 
