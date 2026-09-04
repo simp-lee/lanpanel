@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
+	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"os"
 	"reflect"
@@ -25,6 +26,13 @@ func (s *FixedService) PendingHeadscaleRecovery() error {
 	if err != nil {
 		return err
 	}
+	return ValidateHeadscaleRecovery(document)
+}
+
+// ValidateHeadscaleRecovery checks the external Headscale initialization
+// journal against the supplied normal-state snapshot. Startup guards use this
+// form so normal, safety, and external journal decisions share one snapshot.
+func ValidateHeadscaleRecovery(document persist.Document) error {
 	raw, present := document.Entries["installations/current"]
 	if !present {
 		return fmt.Errorf("normal installation authority is missing")

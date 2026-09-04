@@ -2292,6 +2292,179 @@ func HasPendingContraction(document persist.Document) (bool, error) {
 	return false, nil
 }
 
+// PendingCertificateRecovery reports certificate work that has not reached a
+// terminal operation phase. The guard uses the document it already read so a
+// certificate journal cannot be checked against a different normal-state
+// snapshot.
+func PendingCertificateRecovery(document persist.Document) error {
+	certificateJobs := map[string]bool{}
+	for _, key := range persist.EntryKeys(document, "journals") {
+		var journal JournalRecord
+		if err := decodeStrict(document.Entries[key], &journal); err != nil {
+			return fmt.Errorf("certificate journal authority is invalid: %w", err)
+		}
+		if journal.Kind == JournalCertificateActivation && journal.Phase != JournalTerminal {
+			certificateJobs[journal.JobID] = true
+		}
+	}
+	ids := []string{}
+	for _, key := range persist.EntryKeys(document, "intents") {
+		var intent Reservation
+		if err := decodeStrict(document.Entries[key], &intent); err != nil {
+			return fmt.Errorf("certificate intent authority is invalid: %w", err)
+		}
+		if certificateJobs[intent.JobID] && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			ids = append(ids, intent.JobID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return fmt.Errorf("interrupted certificate operation requires contraction: %s", strings.Join(ids, ","))
+}
+
+// PendingPublicationRecovery reports publication work that must be recovered
+// or contracted before Nginx is allowed to start or reload. It deliberately
+// checks both normal operation intent and independent safety reactivation
+// state; either side alone is enough to block the data plane.
+func PendingPublicationRecovery(document persist.Document, state safety.State) error {
+	pending := map[string]bool{}
+	for _, key := range persist.EntryKeys(document, "intents") {
+		var intent Reservation
+		if err := decodeStrict(document.Entries[key], &intent); err != nil {
+			return fmt.Errorf("publication intent authority is invalid: %w", err)
+		}
+		if intent.Operation == Publish && intent.Phase != PhaseTerminal && intent.Phase != PhaseRejected {
+			pending[intent.SafetyBinding.ResourceID] = true
+		}
+	}
+	for _, resource := range state.Resources {
+		if resource.Reactivating != nil {
+			pending[resource.ResourceID] = true
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(pending))
+	for id := range pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return fmt.Errorf("interrupted publication requires contraction: %s", strings.Join(ids, ","))
+}
+
+// PendingJournalRecovery is the final journal-side fence for the Nginx data
+// plane. A graph may look valid while a prior operation still owns an
+// in-flight physical transition, so every registered journal must be terminal
+// before startup or reload. Validation is repeated here intentionally: this is
+// the guard's independent decision boundary, not merely an incidental store
+// read side effect.
+func PendingJournalRecovery(document persist.Document) error {
+	type journalEntry struct {
+		key     string
+		journal JournalRecord
+	}
+	entries := []journalEntry{}
+	journalsByJob := map[string][]JournalRecord{}
+	for _, key := range persist.EntryKeys(document, "journals") {
+		raw := document.Entries[key]
+		if err := validateJournalEntry(key, raw); err != nil {
+			return fmt.Errorf("Nginx guard journal authority is invalid: %w", err)
+		}
+		var journal JournalRecord
+		if err := decodeStrict(raw, &journal); err != nil {
+			return fmt.Errorf("Nginx guard journal authority is invalid: %w", err)
+		}
+		entries = append(entries, journalEntry{key: key, journal: journal})
+		journalsByJob[journal.JobID] = append(journalsByJob[journal.JobID], journal)
+	}
+	for _, entry := range entries {
+		key, journal := entry.key, entry.journal
+		if journal.Phase != JournalTerminal {
+			return fmt.Errorf("Nginx guard requires terminal operation journal: %s", key)
+		}
+		intent, err := loadReservationEntries(document.Entries, journal.JobID)
+		if err != nil {
+			return fmt.Errorf("Nginx guard journal intent authority is invalid: %w", err)
+		}
+		children := map[string]ChildRecord{}
+		childIDs := []string{}
+		for _, childKey := range persist.EntryKeys(document, "children") {
+			childRaw := document.Entries[childKey]
+			if err := validateChildEntry(childKey, childRaw); err != nil {
+				return fmt.Errorf("Nginx guard child authority is invalid: %w", err)
+			}
+			var child ChildRecord
+			if err := decodeStrict(childRaw, &child); err != nil {
+				return fmt.Errorf("Nginx guard child authority is invalid: %w", err)
+			}
+			if child.JobID == journal.JobID {
+				children[child.ID] = child
+				childIDs = append(childIDs, child.ID)
+			}
+		}
+		sort.Strings(childIDs)
+		if len(journalsByJob[journal.JobID]) > 1 && intent.CertificateHandoff == nil {
+			return fmt.Errorf("Nginx guard operation has incompatible journal authorities: %s", key)
+		}
+		handoff := exactCertificatePublicationHandoff(intent, journalsByJob[journal.JobID], childIDs)
+		if intent.CertificateHandoff != nil && !handoff {
+			return fmt.Errorf("Nginx guard certificate publication handoff is incomplete: %s", key)
+		}
+		if !slices.Equal(childIDs, journal.ChildIDs) {
+			terminalNeverSubmitted := intent.CertificateHandoff == nil && journal.Kind == JournalCertificateActivation && intent.Phase == PhaseTerminal && len(childIDs) < len(journal.ChildIDs) && slices.Equal(childIDs, journal.ChildIDs[:len(childIDs)])
+			if !terminalNeverSubmitted && !handoff {
+				return fmt.Errorf("Nginx guard journal child inventory is incomplete or mismatched: %s", key)
+			}
+		}
+		for _, child := range children {
+			if child.State != ChildTerminal {
+				return fmt.Errorf("Nginx guard requires terminal journal child: %s", child.ID)
+			}
+		}
+	}
+	for _, intentKey := range persist.EntryKeys(document, "intents") {
+		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(intentKey, "intents/"))
+		if err != nil {
+			return fmt.Errorf("Nginx guard operation intent authority is invalid: %w", err)
+		}
+		if intent.CertificateHandoff != nil && len(journalsByJob[intent.JobID]) != 2 {
+			return fmt.Errorf("Nginx guard certificate publication handoff lacks its exact journal pair: %s", intentKey)
+		}
+	}
+	return nil
+}
+
+func exactCertificatePublicationHandoff(intent Reservation, journals []JournalRecord, childIDs []string) bool {
+	if intent.CertificateHandoff == nil || len(journals) != 2 {
+		return false
+	}
+	var appJournal, certificateJournal *JournalRecord
+	for index := range journals {
+		journal := &journals[index]
+		switch journal.Kind {
+		case JournalAppActivation:
+			if appJournal != nil {
+				return false
+			}
+			appJournal = journal
+		case JournalCertificateActivation:
+			if certificateJournal != nil {
+				return false
+			}
+			certificateJournal = journal
+		default:
+			return false
+		}
+	}
+	if appJournal == nil || certificateJournal == nil || appJournal.Phase != JournalTerminal || appJournal.SafetyMarkerDigest != intent.JournalSafetyDigest || len(appJournal.ChildIDs) != 0 || certificateJournal.Phase != JournalTerminal || certificateJournal.SafetyMarkerDigest != intent.CertificateHandoff.ChallengeSafetyDigest || !slices.Equal(childIDs, certificateJournal.ChildIDs) {
+		return false
+	}
+	certificate := certificateJournal.Certificate
+	return certificate != nil && certificate.CertificateID == intent.CertificateHandoff.CertificateID && certificate.CandidateFingerprint == intent.CertificateHandoff.Fingerprint
+}
+
 func InventoryEmpty(document persist.Document, exceptJob string) (bool, error) {
 	for _, key := range persist.EntryKeys(document, "jobs") {
 		record, err := jobs.LoadEntries(document.Entries, strings.TrimPrefix(key, "jobs/"))

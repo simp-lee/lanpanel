@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lanpanel/internal/application"
 	"lanpanel/internal/bootstrap"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
@@ -94,12 +95,30 @@ func runGuardRole(args []string, action nginx.GuardAction) (returnErr error) {
 			normalErr = registerErr
 		}
 		document, readErr := normal.Read()
-		pending, pendingErr := operations.HasPendingContraction(document)
-		if readErr == nil && pendingErr == nil && !pending {
-			if raw, present := document.Entries["installations/current"]; present {
-				value, decodeErr := domain.DecodeInstallation(raw)
-				if decodeErr == nil {
-					installation = &value
+		if readErr != nil {
+			normalErr = errors.Join(normalErr, readErr)
+		} else {
+			pending, pendingErr := operations.HasPendingContraction(document)
+			if pending {
+				pendingErr = errors.Join(pendingErr, fmt.Errorf("pending contraction blocks Nginx guard"))
+			}
+			journalErr := errors.Join(
+				operations.PendingPublicationRecovery(document, state),
+				operations.PendingCertificateRecovery(document),
+				operations.PendingJournalRecovery(document),
+				application.ValidateHeadscaleRecovery(document),
+			)
+			normalErr = errors.Join(normalErr, pendingErr, journalErr)
+			if normalErr == nil {
+				if raw, present := document.Entries["installations/current"]; present {
+					value, decodeErr := domain.DecodeInstallation(raw)
+					if decodeErr == nil {
+						installation = &value
+					} else {
+						normalErr = decodeErr
+					}
+				} else {
+					normalErr = fmt.Errorf("normal installation authority is missing")
 				}
 			}
 		}

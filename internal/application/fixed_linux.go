@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"lanpanel/internal/closure"
@@ -590,31 +589,7 @@ func (s *FixedService) PendingCertificateRecovery() error {
 	if err != nil {
 		return err
 	}
-	certificateJobs := map[string]bool{}
-	for key, raw := range document.Entries {
-		if !strings.HasPrefix(key, "journals/") {
-			continue
-		}
-		var journal operations.JournalRecord
-		if json.Unmarshal(raw, &journal) == nil && journal.Kind == operations.JournalCertificateActivation && journal.Phase != operations.JournalTerminal {
-			certificateJobs[journal.JobID] = true
-		}
-	}
-	ids := []string{}
-	for key, raw := range document.Entries {
-		if !strings.HasPrefix(key, "intents/") {
-			continue
-		}
-		var intent operations.Reservation
-		if json.Unmarshal(raw, &intent) == nil && certificateJobs[intent.JobID] && intent.Phase != operations.PhaseTerminal && intent.Phase != operations.PhaseRejected {
-			ids = append(ids, intent.JobID)
-		}
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	sort.Strings(ids)
-	return fmt.Errorf("interrupted certificate operation requires contraction: %s", strings.Join(ids, ","))
+	return operations.PendingCertificateRecovery(document)
 }
 
 func (s *FixedService) PendingPublicationRecovery() error {
@@ -626,30 +601,7 @@ func (s *FixedService) PendingPublicationRecovery() error {
 	if err != nil {
 		return err
 	}
-	pending := map[string]bool{}
-	for _, key := range persist.EntryKeys(document, "intents") {
-		var intent operations.Reservation
-		if err := json.Unmarshal(document.Entries[key], &intent); err != nil {
-			return err
-		}
-		if intent.Operation == operations.Publish && intent.Phase != operations.PhaseTerminal && intent.Phase != operations.PhaseRejected {
-			pending[intent.SafetyBinding.ResourceID] = true
-		}
-	}
-	for _, resource := range state.Resources {
-		if resource.Reactivating != nil {
-			pending[resource.ResourceID] = true
-		}
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	ids := make([]string, 0, len(pending))
-	for id := range pending {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return fmt.Errorf("interrupted publication requires contraction: %s", strings.Join(ids, ","))
+	return operations.PendingPublicationRecovery(document, state)
 }
 
 func (s *FixedService) OwnershipRead(resourceID string) (ownership.Record, error) {
@@ -694,13 +646,16 @@ func (s *FixedService) NginxStartAllowed(now time.Time) (bool, error) {
 	if err != nil || pending {
 		return false, err
 	}
-	if err := s.PendingPublicationRecovery(); err != nil {
+	if err := operations.PendingPublicationRecovery(document, state); err != nil {
 		return false, err
 	}
-	if err := s.PendingCertificateRecovery(); err != nil {
+	if err := operations.PendingCertificateRecovery(document); err != nil {
 		return false, err
 	}
-	if err := s.PendingHeadscaleRecovery(); err != nil {
+	if err := operations.PendingJournalRecovery(document); err != nil {
+		return false, err
+	}
+	if err := ValidateHeadscaleRecovery(document); err != nil {
 		return false, err
 	}
 	raw, present := document.Entries["installations/current"]
