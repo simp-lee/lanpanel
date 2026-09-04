@@ -202,11 +202,11 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	if _, err := service.safety.Commit(ctx, exposure, safety.RoleDelete, current.Revision, after, safety.TransitionProof{Delete: proof}); err != nil {
 		return ResourceDeleteResult{}, err
 	}
-	if err := service.ownership.Delete(ctx, exposure, owned); err != nil {
-		return ResourceDeleteResult{}, err
-	}
 	fresh, _ = service.normal.Read()
 	if err := admitter.CommitResourceDeleteRemoval(ctx, mutation, exposure, fresh.Revision, job.ID, target.ID); err != nil {
+		return ResourceDeleteResult{}, err
+	}
+	if err := service.ownership.Delete(ctx, exposure, owned); err != nil {
 		return ResourceDeleteResult{}, err
 	}
 	fresh, _ = service.normal.Read()
@@ -250,31 +250,63 @@ func ReconcileResourceDeletes(ctx context.Context) error {
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(set.Close)
-	var result error
-	for _, intent := range pending {
-		if intent.Phase == operations.PhaseReserved {
-			lease, acquireErr := service.manager.Acquire(ctx, locks.MutationAdmission)
-			if acquireErr != nil {
-				result = errors.Join(result, acquireErr)
+	remaining := pending
+	for len(remaining) != 0 {
+		deferred := make([]operations.Reservation, 0, len(remaining))
+		var passErr error
+		progressed := false
+		for _, intent := range remaining {
+			if intent.Phase == operations.PhaseReserved {
+				lease, acquireErr := service.manager.Acquire(ctx, locks.MutationAdmission)
+				if acquireErr != nil {
+					deferred = append(deferred, intent)
+					passErr = errors.Join(passErr, acquireErr)
+					continue
+				}
+				fresh, readErr := service.normal.Read()
+				if readErr == nil {
+					readErr = admitter.RejectReservation(ctx, lease, fresh.Revision, intent.JobID, "plan_consumption_rejected")
+				}
+				releaseErr := lease.Release()
+				if releaseErr != nil {
+					return errors.Join(passErr, readErr, releaseErr)
+				}
+				if readErr != nil {
+					deferred = append(deferred, intent)
+					passErr = errors.Join(passErr, readErr)
+				} else {
+					progressed = true
+				}
 				continue
 			}
-			fresh, readErr := service.normal.Read()
-			if readErr == nil {
-				readErr = admitter.RejectReservation(ctx, lease, fresh.Revision, intent.JobID, "plan_consumption_rejected")
+			resourceID := intent.SafetyBinding.ResourceID
+			mutation, exposure, acquireErr := set.AcquireExposure(ctx, "resource/"+resourceID, service.manager)
+			if acquireErr != nil {
+				deferred = append(deferred, intent)
+				passErr = errors.Join(passErr, acquireErr)
+				continue
 			}
-			result = errors.Join(result, readErr, lease.Release())
-			continue
+			reconcileErr := reconcileResourceDelete(ctx, service, admitter, mutation, exposure, intent)
+			releaseErr := operations.ReleaseExposure(mutation, exposure)
+			if releaseErr != nil {
+				return errors.Join(passErr, reconcileErr, releaseErr)
+			}
+			if reconcileErr != nil {
+				deferred = append(deferred, intent)
+				passErr = errors.Join(passErr, reconcileErr)
+			} else {
+				progressed = true
+			}
 		}
-		resourceID := intent.SafetyBinding.ResourceID
-		mutation, exposure, acquireErr := set.AcquireExposure(ctx, "resource/"+resourceID, service.manager)
-		if acquireErr != nil {
-			result = errors.Join(result, acquireErr)
-			continue
+		if len(deferred) == 0 {
+			return nil
 		}
-		reconcileErr := reconcileResourceDelete(ctx, service, admitter, mutation, exposure, intent)
-		result = errors.Join(result, reconcileErr, operations.ReleaseExposure(mutation, exposure))
+		if !progressed {
+			return passErr
+		}
+		remaining = deferred
 	}
-	return result
+	return nil
 }
 
 func reconcileResourceDelete(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, intent operations.Reservation) error {
@@ -297,7 +329,7 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 	if err := operations.RequireNoActiveCertificateExpiry(document, intent.SafetyBinding.ResourceID); err != nil {
 		return err
 	}
-	state, err := service.safety.ReadForRecovery(exposure)
+	state, err := service.safety.ReadForDeleteRecovery(exposure, intent.SafetyBinding.ResourceID, intent.SafetyBinding.CandidateBundle)
 	if err != nil {
 		return err
 	}
@@ -317,6 +349,9 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 	}
 	if ownershipPresent && (owned.Checksum != intent.SafetyBinding.CandidateBundle || !exactDeleteOwnershipID(intent.SafetyBinding.ResourceID, owned)) {
 		return fmt.Errorf("recovered resource delete ownership changed")
+	}
+	if resource != nil && !ownershipPresent {
+		return fmt.Errorf("recovered resource delete lost ownership before normal removal")
 	}
 	if safetyResource != nil {
 		if safetyResource.DeletionTombstone != "delete/"+intent.JobID || !ownershipPresent {
@@ -365,11 +400,6 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 			return err
 		}
 	}
-	if ownershipPresent {
-		if err := service.ownership.Delete(ctx, exposure, owned); err != nil {
-			return err
-		}
-	}
 	document, err = service.normal.Read()
 	if err != nil {
 		return err
@@ -396,6 +426,11 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 			return err
 		}
 		if err := admitter.CommitResourceDeleteRemoval(ctx, mutation, exposure, document.Revision, intent.JobID, resource.ID); err != nil {
+			return err
+		}
+	}
+	if ownershipPresent {
+		if err := service.ownership.Delete(ctx, exposure, owned); err != nil {
 			return err
 		}
 	}

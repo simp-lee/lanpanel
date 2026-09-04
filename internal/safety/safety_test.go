@@ -330,6 +330,66 @@ func TestUniqueClearersRemainClosed(t *testing.T) {
 	}
 }
 
+func TestDeleteCommitAllowsOnlyExactOwnershipOverhang(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		extraOwner bool
+		wantErr    bool
+	}{
+		{name: "exact delete authority"},
+		{name: "unrelated ownership remains", extraOwner: true, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, emergency, manager, lease := newSafetyStore(t)
+			defer closeSafetyStore(t, store, emergency, manager, lease)
+			if _, err := store.Initialize(context.Background(), lease); err != nil {
+				t.Fatal(err)
+			}
+			current, err := store.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownerDigest := digest("owner")
+			authority := testOwnershipAuthority{"app-one": ownerDigest}
+			if test.extraOwner {
+				authority["app-two"] = digest("other-owner")
+			}
+			store.config.Ownership = authority
+			current.Resources = []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceDeleting, Ownership: OwnershipOwned, OwnershipDigest: ownerDigest, StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "closed"}, DeletionTombstone: "delete/job-one"}}
+			if _, err := store.persist(context.Background(), current, filetxn.ReplaceOnly); err != nil {
+				t.Fatal(err)
+			}
+			next := current
+			next.Revision++
+			next.Resources = nil
+			proof := &DeleteConvergenceProof{ResourceID: "app-one", TombstoneRef: "delete/job-one", OwnershipDigest: ownerDigest, RuntimeClosureDigest: digest("closure")}
+			_, err = store.Commit(context.Background(), lease, RoleDelete, current.Revision, next, TransitionProof{Delete: proof})
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("delete accepted an unrelated ownership overhang")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Read(); err == nil {
+				t.Fatal("ordinary safety read accepted the transitional ownership overhang")
+			}
+			if _, err := store.ReadForDeleteRecovery(lease, "app-one", ownerDigest); err != nil {
+				t.Fatalf("delete recovery rejected its exact ownership overhang: %v", err)
+			}
+			if _, err := store.ReadForDeleteRecovery(lease, "app-one", digest("changed-owner")); err == nil {
+				t.Fatal("delete recovery accepted a changed ownership overhang")
+			}
+			delete(authority, "app-one")
+			if _, err := store.Read(); err != nil {
+				t.Fatalf("safety authority did not converge after ownership-last removal: %v", err)
+			}
+		})
+	}
+}
+
 func TestSafetyStoreBindsEmergencyHighWaterAndOwnership(t *testing.T) {
 	store, emergency, manager, lease := newSafetyStore(t)
 	defer closeSafetyStore(t, store, emergency, manager, lease)

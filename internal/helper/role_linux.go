@@ -66,9 +66,11 @@ func RunRole(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
+	deleteRecoveryErr := application.ReconcileResourceDeletes(context.Background())
 	adminRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
 	var otherRecoveryErr error
 	recordRecovery := func(err error) { otherRecoveryErr = errors.Join(otherRecoveryErr, err) }
+	recordRecovery(deleteRecoveryErr)
 	recordRecovery(cleanupConnectorLoginSecrets())
 	recordRecovery(application.ReconcileStaticRootRegistrations(context.Background()))
 	childClosure, childErr := child.ObserveExclusiveCurrentCgroup()
@@ -85,7 +87,6 @@ func RunRole(args []string) error {
 	recordRecovery(application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))
 	recordRecovery(application.ReconcileResourceCreates(context.Background()))
 	recordRecovery(application.ReconcileResourceUpdates(context.Background()))
-	recordRecovery(application.ReconcileResourceDeletes(context.Background()))
 	recordRecovery(application.ReconcileJournalLessProcesses(context.Background()))
 	if host, hostErr := managedprocess.NewFixedHost(); hostErr == nil {
 		recordRecovery(managedprocess.ReconcileJournals(context.Background(), host, application.ReconcileInterruptedProcess))

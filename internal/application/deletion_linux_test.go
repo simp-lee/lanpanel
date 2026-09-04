@@ -3,13 +3,146 @@
 package application
 
 import (
+	"context"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/locks"
+	"lanpanel/internal/operations"
+	"lanpanel/internal/plans"
 	managedresource "lanpanel/internal/resource"
+	"lanpanel/internal/safety"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestRecoveredDeleteKeepsOwnershipUntilNormalRemovalCommits(t *testing.T) {
+	ctx := context.Background()
+	resource := recoveryTailnetResource()
+	fixture := newResourceRecoveryFixture(t, recoveryResourceInstallation(&resource))
+	service := fixture.open(t)
+	defer func() { _ = service.Close() }()
+
+	setupSet, setupMutation, setupExposure := fixture.acquire(t, service, "resource/"+resource.ID)
+	owned := writeRecoveryOwnershipAndSafety(t, service, setupExposure, resource.ID)
+	if err := operations.ReleaseExposure(setupMutation, setupExposure); err != nil {
+		t.Fatal(err)
+	}
+	if err := setupSet.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	planStore, err := plans.NewStore(service.normal, plans.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := "ui/session/generation/1"
+	plan, err := planStore.Create(ctx, admission, document.Revision, plans.Spec{Operation: string(domain.OperationResourceDelete), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: actor, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: plans.DigestBinding{Applicable: true, Digest: owned.Checksum}, ExposureSummary: "delete_managed_resource_inventory", Prerequisites: "resource_unpublished_and_stopped"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := service.Admitter(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := operations.SafetyBinding{ResourceID: resource.ID, CandidateDigest: resource.CurrentConfigDigest, CandidateBundle: owned.Checksum, PlanID: plan.ID}
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + resource.ID, ActorIdentity: actor, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+
+	set, mutation, exposure := fixture.acquire(t, service, "resource/"+resource.ID)
+	mutationReleased := false
+	defer func() {
+		_ = exposure.Release()
+		if !mutationReleased {
+			_ = mutation.Release()
+		}
+		_ = set.Close()
+	}()
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1, ConfirmationProof: plan.NonceDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := state
+	next.Revision++
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	for index := range next.Resources {
+		if next.Resources[index].ResourceID == resource.ID {
+			next.Resources[index].State = safety.ResourceDeleting
+			next.Resources[index].DeletionTombstone = "delete/" + job.ID
+		}
+	}
+	if _, err := service.safety.Commit(ctx, exposure, safety.RoleDelete, state.Revision, next, safety.TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admitter.CommitResourceDeleteBegin(ctx, mutation, exposure, document.Revision, job.ID, resource.ID); err != nil {
+		t.Fatal(err)
+	}
+	state, err = service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next = state
+	next.Revision++
+	next.Resources = nil
+	closureDigest := digestLifecycle(struct{ ResourceID, ConfigDigest string }{resource.ID, resource.CurrentConfigDigest})
+	proof := &safety.DeleteConvergenceProof{ResourceID: resource.ID, TombstoneRef: "delete/" + job.ID, OwnershipDigest: owned.Checksum, RuntimeClosureDigest: closureDigest}
+	if _, err := service.safety.Commit(ctx, exposure, safety.RoleDelete, state.Revision, next, safety.TransitionProof{Delete: proof}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mutation.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutationReleased = true
+	if err := reconcileResourceDelete(ctx, service, admitter, mutation, exposure, intent); err == nil {
+		t.Fatal("recovery unexpectedly committed without its mutation authority")
+	}
+	persisted, err := service.ownership.Read(resource.ID)
+	if err != nil || persisted.Checksum != owned.Checksum {
+		t.Fatalf("ownership was removed before normal deletion committed: ownership=%#v err=%v", persisted, err)
+	}
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := findNormalResource(installation, resource.ID)
+	if remaining == nil || remaining.Lifecycle != domain.LifecycleDeleting {
+		t.Fatalf("normal deletion unexpectedly committed: resource=%#v", remaining)
+	}
+}
 
 func TestCleanupDeleteInventoryAccountErrorsFailBeforeMutation(t *testing.T) {
 	installation := domain.Installation{InstallationID: "ins_00000000000000000000000000000001"}

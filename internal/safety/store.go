@@ -203,6 +203,26 @@ func (store *Store) ReadForRecovery(exposure *locks.Lease) (State, error) {
 	return state, nil
 }
 
+// ReadForDeleteRecovery accepts either exact safety/ownership authority or the
+// one ownership record retained after its proven safety tombstone converged.
+func (store *Store) ReadForDeleteRecovery(exposure *locks.Lease, resourceID, ownershipDigest string) (State, error) {
+	if !validRef(resourceID) || !isDigest(ownershipDigest) {
+		return State{}, fmt.Errorf("delete recovery ownership identity is invalid")
+	}
+	state, err := store.ReadForRecovery(exposure)
+	if err != nil {
+		return State{}, err
+	}
+	if err := validateOwnershipAuthority(state, store.config.Ownership); err == nil {
+		return state, nil
+	}
+	overhang := map[string]string{resourceID: ownershipDigest}
+	if err := validateOwnershipAuthorityWithOverhang(state, store.config.Ownership, overhang); err != nil {
+		return State{}, fmt.Errorf("delete recovery ownership authority invalid: %w", err)
+	}
+	return state, nil
+}
+
 func (store *Store) ReadForContraction(exposure *locks.Lease) (State, error) {
 	if exposure == nil || exposure.Authority() != store.config.LockAuthority || !exposure.Holds(locks.Exposure) {
 		return State{}, fmt.Errorf("degraded safety read requires the shared exposure lock")
@@ -381,7 +401,11 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err := validateTransition(role, current, next, proof); err != nil {
 		return filetxn.Result{}, err
 	}
-	if err := validateOwnershipAuthority(next, store.config.Ownership); err != nil {
+	deleteOverhang := map[string]string(nil)
+	if role == RoleDelete && proof.Delete != nil {
+		deleteOverhang = map[string]string{proof.Delete.ResourceID: proof.Delete.OwnershipDigest}
+	}
+	if err := validateOwnershipAuthorityWithOverhang(next, store.config.Ownership, deleteOverhang); err != nil {
 		return filetxn.Result{}, err
 	}
 	return store.persist(ctx, next, filetxn.ReplaceOnly)
@@ -426,6 +450,10 @@ func readOwnershipInventoryDigest(authority OwnershipAuthority) (string, error) 
 }
 
 func validateOwnershipAuthority(state State, authority OwnershipAuthority) error {
+	return validateOwnershipAuthorityWithOverhang(state, authority, nil)
+}
+
+func validateOwnershipAuthorityWithOverhang(state State, authority OwnershipAuthority, overhang map[string]string) error {
 	if authority == nil {
 		return fmt.Errorf("independent ownership authority is missing")
 	}
@@ -450,6 +478,13 @@ func validateOwnershipAuthority(state State, authority OwnershipAuthority) error
 			continue
 		}
 		return fmt.Errorf("resource %q has no complete ownership record", resource.ResourceID)
+	}
+	for resourceID, digest := range overhang {
+		current, present := records[resourceID]
+		if !present || current != digest {
+			return fmt.Errorf("resource %q deletion ownership overhang changed", resourceID)
+		}
+		delete(records, resourceID)
 	}
 	if len(records) != 0 {
 		return fmt.Errorf("ownership record inventory has no matching closed safety identity")
