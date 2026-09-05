@@ -468,13 +468,25 @@ func TestGoAccessRequiresIndependentOwnedExternalCredential(t *testing.T) {
 	}
 }
 
-func TestInstallationRejectsResourcesBeyondRecoveryCapacity(t *testing.T) {
+func TestInstallationAllowsMoreThan256Resources(t *testing.T) {
 	installation := validGAInstallation()
-	for len(installation.Resources) <= MaximumResources {
-		installation.Resources = append(installation.Resources, installation.Resources[0])
+	base := installation.Resources[0]
+	for index := 2; index <= 257; index++ {
+		resource := base
+		resource.ID = fmt.Sprintf("res_%032x", index)
+		resource.Name = fmt.Sprintf("Application %d", index)
+		resource.CredentialIDs = nil
+		publication := *base.Publication.DomainHTTPS
+		publication.CanonicalDomain = fmt.Sprintf("app-%d.example.com", index)
+		publication.Aliases = []string{fmt.Sprintf("alias-%d.example.com", index)}
+		resource.Publication.DomainHTTPS = &publication
+		process := *base.ManagedProcess
+		process.ID = fmt.Sprintf("proc_%032x", index)
+		resource.ManagedProcess = &process
+		installation.Resources = append(installation.Resources, resource)
 	}
-	if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "resource limit") {
-		t.Fatalf("oversized resource inventory accepted: %v", err)
+	if err := ValidateInstallation(installation); err != nil {
+		t.Fatalf("installation with 257 resources rejected: %v", err)
 	}
 }
 

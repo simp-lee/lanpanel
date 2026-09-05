@@ -19,10 +19,7 @@ import (
 	"unicode"
 )
 
-const (
-	InstallationSchemaVersion = "lanpanel.installation.ga.v2"
-	MaximumResources          = 256
-)
+const InstallationSchemaVersion = "lanpanel.installation.ga.v2"
 
 var ErrHeadscaleDomainConflict = errors.New("headscale control and MagicDNS domains conflict")
 
@@ -989,9 +986,6 @@ func ValidateInstallation(installation Installation) error {
 		}
 		staticRootIDs[root.ID] = struct{}{}
 		staticRootOwners[root.ID] = root.OwnerResourceID
-	}
-	if len(installation.Resources) > MaximumResources {
-		return fmt.Errorf("installation resource limit exceeds %d", MaximumResources)
 	}
 	resourceIDs := make(map[string]struct{}, len(installation.Resources))
 	for index := range installation.Resources {
