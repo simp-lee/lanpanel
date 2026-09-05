@@ -124,6 +124,30 @@ func TestLocalUpdateJournalRecoveryPreservesProcessState(t *testing.T) {
 		})
 	})
 
+	t.Run("reference_bound_reapply", func(t *testing.T) {
+		prior := recoveryLocalResource(t)
+		runResourceUpdateJournalRecovery(t, prior, func(installation domain.Installation, prior domain.AppResource) (domain.AppResource, error) {
+			candidate := prior
+			process := *prior.ManagedProcess
+			candidate.ManagedProcess = &process
+			candidate.Name = "Reference-bound Local App"
+			candidate, err := resource.PrepareUpdate(installation, candidate)
+			if err != nil {
+				return domain.AppResource{}, err
+			}
+			applied := prior.ManagedProcess.Applied
+			binding := domain.ProcessReferenceBinding{ExecutableDigest: applied.ExecutableDigest, WorkingDirectoryIdentity: applied.WorkingDirectoryIdentity, EnvironmentFingerprint: applied.EnvironmentFingerprint, WritePathIdentities: append([]string(nil), applied.WritePathIdentities...)}
+			candidate.ManagedProcess.ReferenceBinding = &binding
+			candidate.CurrentConfigDigest = ""
+			candidate.CurrentConfigDigest, err = resource.ConfigDigest(candidate)
+			return candidate, err
+		}, func(t *testing.T, _, candidate, normal domain.AppResource) {
+			if normal.ManagedProcess == nil || normal.ManagedProcess.ReferenceBinding == nil || !reflect.DeepEqual(normal.ManagedProcess.ReferenceBinding, candidate.ManagedProcess.ReferenceBinding) {
+				t.Fatalf("reference binding was not recovered: candidate=%#v normal=%#v", candidate.ManagedProcess, normal.ManagedProcess)
+			}
+		})
+	})
+
 	t.Run("publication_only_with_applied_process", func(t *testing.T) {
 		prior := recoveryLocalResource(t)
 		runResourceUpdateJournalRecovery(t, prior, func(installation domain.Installation, prior domain.AppResource) (domain.AppResource, error) {
@@ -472,7 +496,9 @@ func recoveryResourceInstallation(value *domain.AppResource) domain.Installation
 }
 
 func recoveryTailnetResource() domain.AppResource {
-	return domain.AppResource{ID: "res_00000000000000000000000000000001", Name: "Peer App", Lifecycle: domain.LifecycleActive, CurrentConfigDigest: recoveryDigest("config"), Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}}
+	value := domain.AppResource{ID: "res_00000000000000000000000000000001", Name: "Peer App", Lifecycle: domain.LifecycleActive, Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, TailnetHTTP: &domain.TailnetHTTPTarget{IP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080}}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}}
+	value.CurrentConfigDigest, _ = resource.ConfigDigest(value)
+	return value
 }
 
 func recoveryLocalResource(t *testing.T) domain.AppResource {

@@ -346,8 +346,15 @@ func ReconcileInterruptedProcess(ctx context.Context, journal process.Journal, c
 	if err != nil {
 		return false, false, err
 	}
+	terminal, running, err = classifyCommittedProcess(document, journal)
+	if err != nil || terminal {
+		return terminal, running, err
+	}
+	if err := validatePendingProcessRecovery(document, journal); err != nil {
+		return false, false, err
+	}
 	if !contracted {
-		return classifyCommittedProcess(document, journal)
+		return false, false, nil
 	}
 	raw, present := document.Entries["installations/current"]
 	if !present {
@@ -401,6 +408,53 @@ func ReconcileInterruptedProcess(ctx context.Context, journal process.Journal, c
 		return operations.CompleteInterruptedLifecycle(transaction, journal.JobID, time.Now().UTC())
 	})
 	return err == nil, false, err
+}
+
+func validatePendingProcessRecovery(document persist.Document, journal process.Journal) error {
+	intent, err := operations.FindProcessLifecycleAuthority(document, journal.JobID, journal.ResourceID)
+	if err != nil || intent.Phase != operations.PhaseLocalIntent || string(intent.Operation) != journal.Operation {
+		return fmt.Errorf("pending process recovery authority differs from journal")
+	}
+	record, err := jobs.LoadEntries(document.Entries, journal.JobID)
+	if err != nil || record.Status != jobs.StatusRunning || record.Operation != journal.Operation || record.Target != "resource/"+journal.ResourceID {
+		return fmt.Errorf("pending process recovery job differs from journal")
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return fmt.Errorf("installation authority missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return err
+	}
+	for _, item := range installation.Resources {
+		if item.ID != journal.ResourceID || item.ManagedProcess == nil || item.Lifecycle != domain.LifecycleActive || item.Target.LocalHTTP == nil {
+			continue
+		}
+		managed := item.ManagedProcess
+		if journal.Operation == "process_stop" {
+			preCommit := managed.Requested == domain.ProcessRequestedRunning && item.PublicationRecord.State == domain.PublicationUnpublished && reflect.DeepEqual(journal.Applied, managed.Applied)
+			postCommit := journal.Phase == "host_mutated" && managed.Requested == domain.ProcessRequestedStopped && item.PublicationRecord.State == domain.PublicationUnpublished && reflect.DeepEqual(journal.Applied, managed.Applied) && managed.RuntimeObservation != nil && managed.RuntimeObservation.Status == domain.RuntimeDegraded && managed.RuntimeObservation.Reason == "stopped" && managed.LastOperation == domain.OperationProcessStop && managed.LastJobID == journal.JobID
+			if !preCommit && !postCommit {
+				return fmt.Errorf("pending process stop authority differs from journal")
+			}
+			return nil
+		}
+		relayRequired := item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix
+		if journal.RelayRequired != relayRequired {
+			return fmt.Errorf("pending process start relay authority differs from journal")
+		}
+		preCommit := managed.Requested == domain.ProcessRequestedStopped && (journal.Phase != "prepared" || reflect.DeepEqual(journal.Applied, managed.Applied))
+		postCommit := journal.Phase == "host_mutated" && managed.Requested == domain.ProcessRequestedRunning && journal.Applied != nil && reflect.DeepEqual(journal.Applied, managed.Applied) && managed.RuntimeObservation != nil && managed.RuntimeObservation.Status == domain.RuntimeHealthy && managed.RuntimeObservation.Reason == "running" && managed.LastOperation == domain.OperationProcessStart && managed.LastJobID == journal.JobID
+		if !preCommit && !postCommit {
+			return fmt.Errorf("pending process start authority differs from journal")
+		}
+		if journal.Phase != "prepared" && (journal.Applied == nil || journal.Applied.ConfigDigest != item.CurrentConfigDigest) {
+			return fmt.Errorf("pending process start candidate bundle differs from resource")
+		}
+		return nil
+	}
+	return fmt.Errorf("pending process recovery target missing")
 }
 
 func (execution *ProcessExecution) CommitSucceeded(journal process.Journal) (bool, error) {

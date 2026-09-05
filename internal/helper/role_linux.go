@@ -1017,6 +1017,7 @@ func RunRole(args []string) error {
 			journal.RelayUID = units.RelayUID
 			journal.RelayGID = units.RelayGID
 			if err := managedprocess.WriteJournal(ctx, journal); err != nil {
+				outcomeUncertain = true
 				return ExecutionResult{}, err
 			}
 			contractFailure := func(cause error) (ExecutionResult, error) { return ExecutionResult{}, cause }
@@ -1025,6 +1026,7 @@ func RunRole(args []string) error {
 			}
 			journal.Phase = "host_mutated"
 			if err := managedprocess.WriteJournal(ctx, journal); err != nil {
+				outcomeUncertain = true
 				return contractFailure(err)
 			}
 			observation, err := managedprocess.Observe(ctx, "/sys/fs/cgroup", units.Bundle, execution.Resource.Target.LocalHTTP.EndpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
@@ -1064,6 +1066,7 @@ func RunRole(args []string) error {
 		journal.BundleDigest = bundle.PolicyDigest
 		journal.RelayRequired = bundle.RelayRequired
 		if err := managedprocess.WriteJournal(ctx, journal); err != nil {
+			outcomeUncertain = true
 			return finishStoppedFailure(err)
 		}
 		observation, err := managedprocess.ObserveStopped(ctx, "/sys/fs/cgroup", *bundle)

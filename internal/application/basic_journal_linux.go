@@ -45,7 +45,7 @@ func writeBasicJournal(ctx context.Context, value BasicJournal) error {
 	if err != nil {
 		return err
 	}
-	return writeBoundedJournal(ctx, basicJournalPath(value.CredentialID), raw)
+	return writeBoundedJournal(ctx, basicJournalPath(value.CredentialID), raw, 4096)
 }
 
 func readBasicJournal(path string) (BasicJournal, error) {

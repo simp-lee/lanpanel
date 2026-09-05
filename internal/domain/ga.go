@@ -1479,6 +1479,10 @@ func validateExternalAbsolute(value, label string) error {
 	return nil
 }
 
+func ValidateProcessBundle(bundle ProcessBundle) error {
+	return validateProcessBundle(bundle)
+}
+
 func validateProcessBundle(bundle ProcessBundle) error {
 	if bundle.Generation == 0 || !validSHA256Digest(bundle.ConfigDigest) || !validSHA256Digest(bundle.UnitDigest) || !validSHA256Digest(bundle.SocketUnitDigest) || !validSHA256Digest(bundle.PolicyDigest) || !validSHA256Digest(bundle.AccountDigest) || !validSHA256Digest(bundle.ExecutableDigest) || !validSHA256Digest(bundle.WorkingDirectoryIdentity) || bundle.EnvironmentFingerprint != "" && !validSHA256Digest(bundle.EnvironmentFingerprint) || bundle.Cgroup == "" || bundle.FrontendEndpoint == "" || len(bundle.EndpointSocketUnits) > 2 || bundle.ApplicationUID == 0 || bundle.ApplicationGID == 0 || bundle.RelayRequired && (bundle.RelayUID == 0 || bundle.RelayGID == 0) || !bundle.RelayRequired && (bundle.RelayUID != 0 || bundle.RelayGID != 0) {
 		return fmt.Errorf("process bundle identity is incomplete")

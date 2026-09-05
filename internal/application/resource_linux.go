@@ -47,23 +47,20 @@ func resourceUpdateJournalPath(resourceID string) string {
 }
 
 func writeResourceUpdateJournal(ctx context.Context, value ResourceUpdateJournal) error {
-	if value.SchemaVersion != resourceUpdateJournalSchema || value.JobID == "" || value.ResourceID == "" || value.Prior.ID != value.ResourceID || value.Candidate.ID != value.ResourceID {
-		return fmt.Errorf("resource update journal invalid")
+	if err := validateResourceUpdateJournal(value); err != nil {
+		return err
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	return writeBoundedJournal(ctx, resourceUpdateJournalPath(value.ResourceID), raw)
+	return writeBoundedJournal(ctx, resourceUpdateJournalPath(value.ResourceID), raw, maximumCreateJournalBytes)
 }
 
-func readResourceUpdateJournal(path string) (ResourceUpdateJournal, error) {
-	data, err := os.ReadFile(path)
+func readResourceUpdateJournal(path string, owner filetxn.Owner) (ResourceUpdateJournal, error) {
+	data, err := readBoundedJournal(path, owner, maximumCreateJournalBytes)
 	if err != nil {
 		return ResourceUpdateJournal{}, err
-	}
-	if len(data) == 0 || len(data) > maximumCreateJournalBytes {
-		return ResourceUpdateJournal{}, fmt.Errorf("resource update journal size invalid")
 	}
 	var value ResourceUpdateJournal
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -72,13 +69,60 @@ func readResourceUpdateJournal(path string) (ResourceUpdateJournal, error) {
 		return ResourceUpdateJournal{}, fmt.Errorf("resource update journal malformed")
 	}
 	canonical, _ := json.Marshal(value)
-	if !bytes.Equal(canonical, data) || value.SchemaVersion != resourceUpdateJournalSchema || value.JobID == "" || value.ResourceID == "" || value.Prior.ID != value.ResourceID || value.Candidate.ID != value.ResourceID {
+	if !bytes.Equal(canonical, data) || filepath.Base(path) != value.ResourceID+".json" {
 		return ResourceUpdateJournal{}, fmt.Errorf("resource update journal noncanonical")
+	}
+	if err := validateResourceUpdateJournal(value); err != nil {
+		return ResourceUpdateJournal{}, err
 	}
 	return value, nil
 }
 
-func writeBoundedJournal(ctx context.Context, path string, raw []byte) error {
+func validateResourceUpdateJournal(value ResourceUpdateJournal) error {
+	if value.SchemaVersion != resourceUpdateJournalSchema || !validJournalJobID(value.JobID) || value.ResourceID == "" || strings.ToLower(value.ResourceID) != value.ResourceID || value.Prior.ID != value.ResourceID || value.Candidate.ID != value.ResourceID {
+		return fmt.Errorf("resource update journal invalid")
+	}
+	if _, err := resource.DerivePaths(value.ResourceID); err != nil {
+		return fmt.Errorf("resource update journal invalid")
+	}
+	priorDigest, err := resource.ConfigDigest(value.Prior)
+	if err != nil || priorDigest != value.Prior.CurrentConfigDigest {
+		return fmt.Errorf("resource update journal prior config identity is invalid")
+	}
+	candidateDigest, err := resource.ConfigDigest(value.Candidate)
+	if err != nil || candidateDigest != value.Candidate.CurrentConfigDigest {
+		return fmt.Errorf("resource update journal candidate config identity is invalid")
+	}
+	return nil
+}
+
+func readBoundedJournal(path string, owner filetxn.Owner, maximum int64) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("journal descriptor invalid")
+	}
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
+	var before unix.Stat_t
+	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Mode&0o7777 != 0o600 || before.Uid != owner.UID || before.Gid != owner.GID || before.Nlink != 1 || before.Size <= 0 || before.Size > maximum {
+		return nil, fmt.Errorf("journal file identity is unsafe")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	var after unix.Stat_t
+	if err != nil || int64(len(data)) != before.Size || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Mode != after.Mode || before.Nlink != after.Nlink || before.Uid != after.Uid || before.Gid != after.Gid || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim {
+		return nil, fmt.Errorf("journal file changed during read")
+	}
+	return data, nil
+}
+
+func writeBoundedJournal(ctx context.Context, path string, raw []byte, maximum int64) error {
+	if len(raw) == 0 || int64(len(raw)) > maximum {
+		return fmt.Errorf("journal size invalid")
+	}
 	if err := ensureDurableJournalDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
@@ -110,29 +154,27 @@ func ensureDurableJournalDirectory(path string) error {
 	} else if !errors.Is(err, os.ErrExist) {
 		return err
 	}
-	info, err := os.Lstat(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
-	if !ok || !info.IsDir() || info.Mode().Perm() != 0o700 || stat.Uid != 0 || stat.Gid != 0 {
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != 0 || stat.Gid != 0 {
 		return fmt.Errorf("journal directory identity is unsafe")
 	}
-	directory, err := os.Open(path)
+	if err := unix.Fsync(fd); err != nil {
+		return err
+	}
+	if !created {
+		return nil
+	}
+	parent, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if created {
-		parent, openErr := os.Open(filepath.Dir(path))
-		if openErr != nil {
-			return errors.Join(syncErr, closeErr, openErr)
-		}
-		syncErr = errors.Join(syncErr, parent.Sync())
-		closeErr = errors.Join(closeErr, parent.Close())
-	}
-	return errors.Join(syncErr, closeErr)
+	defer func() { _ = unix.Close(parent) }()
+	return unix.Fsync(parent)
 }
 
 func removeJournal(path string) error {
@@ -156,19 +198,19 @@ type ResourceCreateJournal struct {
 	OwnershipDigest string             `json:"ownership_digest,omitempty"`
 }
 
-const maximumCreateJournalBytes = 64 << 10
+const (
+	resourceCreateJournalSchema = "lanpanel.resource.create.v1"
+	maximumCreateJournalBytes   = 64 << 10
+)
 
 func resourceCreateJournalPath(resourceID string) string {
 	return fixedRoot + "/safety/resource-create/" + resourceID + ".json"
 }
 
-func readCreateJournal(path string) (ResourceCreateJournal, error) {
-	data, err := os.ReadFile(path)
+func readCreateJournal(path string, owner filetxn.Owner) (ResourceCreateJournal, error) {
+	data, err := readBoundedJournal(path, owner, maximumCreateJournalBytes)
 	if err != nil {
 		return ResourceCreateJournal{}, err
-	}
-	if len(data) == 0 || len(data) > maximumCreateJournalBytes {
-		return ResourceCreateJournal{}, fmt.Errorf("resource create journal size invalid")
 	}
 	var value ResourceCreateJournal
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -177,27 +219,50 @@ func readCreateJournal(path string) (ResourceCreateJournal, error) {
 		return ResourceCreateJournal{}, fmt.Errorf("resource create journal malformed")
 	}
 	canonical, _ := json.Marshal(value)
-	if !bytes.Equal(canonical, data) || value.SchemaVersion != "lanpanel.resource.create.v1" || value.JobID == "" || value.ResourceID == "" || value.Resource.ID != value.ResourceID {
+	if !bytes.Equal(canonical, data) || filepath.Base(path) != value.ResourceID+".json" {
 		return ResourceCreateJournal{}, fmt.Errorf("resource create journal noncanonical")
 	}
-	if value.Phase != "prepared" && value.Phase != "ownership_committed" && value.Phase != "safety_committed" {
-		return ResourceCreateJournal{}, fmt.Errorf("resource create journal phase is unsupported")
-	}
-	if value.Phase == "prepared" && value.OwnershipDigest != "" || value.Phase != "prepared" && !validCreateDigest(value.OwnershipDigest) {
-		return ResourceCreateJournal{}, fmt.Errorf("resource create journal ownership binding is invalid")
+	if err := validateResourceCreateJournal(value); err != nil {
+		return ResourceCreateJournal{}, err
 	}
 	return value, nil
 }
 
+func validateResourceCreateJournal(value ResourceCreateJournal) error {
+	if value.SchemaVersion != resourceCreateJournalSchema || !validJournalJobID(value.JobID) || value.ResourceID == "" || strings.ToLower(value.ResourceID) != value.ResourceID || value.Resource.ID != value.ResourceID {
+		return fmt.Errorf("resource create journal invalid")
+	}
+	if _, err := resource.DerivePaths(value.ResourceID); err != nil {
+		return fmt.Errorf("resource create journal invalid")
+	}
+	digest, err := resource.ConfigDigest(value.Resource)
+	if err != nil || digest != value.Resource.CurrentConfigDigest {
+		return fmt.Errorf("resource create journal config identity is invalid")
+	}
+	if value.Phase != "prepared" && value.Phase != "ownership_committed" && value.Phase != "safety_committed" {
+		return fmt.Errorf("resource create journal phase is unsupported")
+	}
+	if value.Phase == "prepared" && value.OwnershipDigest != "" || value.Phase != "prepared" && !validCreateDigest(value.OwnershipDigest) {
+		return fmt.Errorf("resource create journal ownership binding is invalid")
+	}
+	return nil
+}
+
 func writeCreateJournal(ctx context.Context, journal ResourceCreateJournal) error {
+	if err := validateResourceCreateJournal(journal); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(journal)
 	if err != nil {
 		return err
 	}
-	return writeBoundedJournal(ctx, resourceCreateJournalPath(journal.ResourceID), raw)
+	return writeBoundedJournal(ctx, resourceCreateJournalPath(journal.ResourceID), raw, maximumCreateJournalBytes)
 }
 
 func ReconcileResourceUpdates(ctx context.Context) error {
+	if err := filetxn.CleanPrivateStaging(fixedRoot+"/safety/resource-update/.filetxn", filetxn.Owner{UID: 0, GID: 0}, maximumCreateJournalBytes); err != nil {
+		return err
+	}
 	if err := reconcileJournalLessResourceUpdates(ctx); err != nil {
 		return err
 	}
@@ -342,7 +407,7 @@ func reconcileResourceUpdateWithRuntime(ctx context.Context, path string, runtim
 	if runtime.openService == nil || runtime.lockRoot == "" {
 		return fmt.Errorf("resource update recovery runtime is invalid")
 	}
-	journal, err := readResourceUpdateJournal(path)
+	journal, err := readResourceUpdateJournal(path, filetxn.Owner{UID: runtime.owner, GID: runtime.group})
 	if err != nil {
 		return err
 	}
@@ -386,6 +451,9 @@ func reconcileResourceUpdateWithRuntime(ctx context.Context, path string, runtim
 	}
 	installation, err := installationFromDocument(document)
 	if err != nil {
+		return err
+	}
+	if err := validateRecoveryResourceUpdate(installation, journal); err != nil {
 		return err
 	}
 	current := findNormalResource(installation, journal.ResourceID)
@@ -434,6 +502,68 @@ func reconcileResourceUpdateWithRuntime(ctx context.Context, path string, runtim
 	return nil
 }
 
+func validateRecoveryResourceUpdate(installation domain.Installation, journal ResourceUpdateJournal) error {
+	priorInstallation := installation
+	priorInstallation.Resources = append([]domain.AppResource(nil), installation.Resources...)
+	found := false
+	for index := range priorInstallation.Resources {
+		if priorInstallation.Resources[index].ID == journal.ResourceID {
+			priorInstallation.Resources[index] = journal.Prior
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("resource update recovery target missing")
+	}
+	if err := domain.ValidateInstallation(priorInstallation); err != nil {
+		return fmt.Errorf("resource update journal prior authority is invalid: %w", err)
+	}
+	candidateInput := journal.Candidate
+	var referenceBinding *domain.ProcessReferenceBinding
+	if journal.Candidate.ManagedProcess != nil {
+		process := *journal.Candidate.ManagedProcess
+		candidateInput.ManagedProcess = &process
+		if process.ReferenceBinding != nil {
+			binding := *process.ReferenceBinding
+			binding.WritePathIdentities = append([]string(nil), binding.WritePathIdentities...)
+			referenceBinding = &binding
+		}
+	}
+	candidate, err := resource.PrepareUpdate(priorInstallation, candidateInput)
+	if err != nil {
+		return fmt.Errorf("resource update journal candidate authority is invalid: %w", err)
+	}
+	if referenceBinding != nil {
+		if journal.Prior.ManagedProcess == nil || journal.Prior.ManagedProcess.Applied == nil || candidate.ManagedProcess == nil {
+			return fmt.Errorf("resource update journal reference binding lacks prior applied authority")
+		}
+		candidate.ManagedProcess.ReferenceBinding = referenceBinding
+		candidate.CurrentConfigDigest = ""
+		candidate.CurrentConfigDigest, err = resource.ConfigDigest(candidate)
+		if err != nil {
+			return fmt.Errorf("resource update journal reference-bound config identity is invalid: %w", err)
+		}
+		candidateInstallation := priorInstallation
+		candidateInstallation.Resources = append([]domain.AppResource(nil), priorInstallation.Resources...)
+		for index := range candidateInstallation.Resources {
+			if candidateInstallation.Resources[index].ID == journal.ResourceID {
+				candidateInstallation.Resources[index] = candidate
+				break
+			}
+		}
+		if err := domain.ValidateInstallation(candidateInstallation); err != nil {
+			return fmt.Errorf("resource update journal reference-bound candidate is invalid: %w", err)
+		}
+	}
+	prepared, _ := json.Marshal(candidate)
+	persisted, _ := json.Marshal(journal.Candidate)
+	if !bytes.Equal(prepared, persisted) {
+		return fmt.Errorf("resource update journal candidate authority is invalid")
+	}
+	return nil
+}
+
 func exactSuccessfulResourceUpdate(job jobs.Record, current *domain.AppResource, journal ResourceUpdateJournal) bool {
 	if job.Status != jobs.StatusTerminal || job.Result != jobs.ResultSucceeded || current == nil || len(job.Postconditions) != 1 || job.Postconditions[0] != (jobs.Postcondition{Kind: "resource_config_saved", Status: jobs.PostconditionVerified, Identity: journal.Candidate.CurrentConfigDigest}) {
 		return false
@@ -446,6 +576,9 @@ func exactSuccessfulResourceUpdate(job jobs.Record, current *domain.AppResource,
 }
 
 func ReconcileResourceCreates(ctx context.Context) error {
+	if err := filetxn.CleanPrivateStaging(fixedRoot+"/safety/resource-create/.filetxn", filetxn.Owner{UID: 0, GID: 0}, maximumCreateJournalBytes); err != nil {
+		return err
+	}
 	if err := reconcileJournalLessResourceCreates(ctx); err != nil {
 		return err
 	}
@@ -571,7 +704,7 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 		return fmt.Errorf("resource create recovery runtime is invalid")
 	}
 	removeJournal := false
-	journal, err := readCreateJournal(path)
+	journal, err := readCreateJournal(path, filetxn.Owner{UID: runtime.owner, GID: runtime.group})
 	if err != nil {
 		return err
 	}
@@ -619,6 +752,9 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 	}
 	installation, err := installationFromDocument(document)
 	if err != nil {
+		return err
+	}
+	if err := validateRecoveryResourceCreate(installation, journal); err != nil {
 		return err
 	}
 	normalResource := findNormalResource(installation, journal.ResourceID)
@@ -739,8 +875,16 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 	return nil
 }
 
+func validJournalJobID(value string) bool {
+	if len(value) != len("job_")+64 || !strings.HasPrefix(value, "job_") || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "job_"))
+	return err == nil
+}
+
 func validCreateDigest(value string) bool {
-	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
@@ -775,6 +919,20 @@ func findSafetyResource(state safety.State, resourceID string) *safety.ResourceS
 
 func initialResourceSafety(resourceID, ownershipDigest string) safety.ResourceSafety {
 	return safety.ResourceSafety{ResourceID: resourceID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownershipDigest, StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}
+}
+
+func validateRecoveryResourceCreate(installation domain.Installation, journal ResourceCreateJournal) error {
+	base := installation
+	base.Resources = make([]domain.AppResource, 0, len(installation.Resources))
+	for _, existing := range installation.Resources {
+		if existing.ID != journal.ResourceID {
+			base.Resources = append(base.Resources, existing)
+		}
+	}
+	if err := resource.ValidateCreate(base, journal.Resource); err != nil {
+		return fmt.Errorf("resource create journal authority is invalid: %w", err)
+	}
+	return nil
 }
 
 func exactCreateOwnership(owned ownership.Record, created domain.AppResource) bool {
@@ -1057,9 +1215,7 @@ func (execution *ResourceExecution) CommitUpdate(ctx context.Context) (jobs.Reco
 	}
 	journal := ResourceUpdateJournal{SchemaVersion: resourceUpdateJournalSchema, JobID: execution.JobID, ResourceID: execution.Resource.ID, Prior: *execution.Prior, Candidate: execution.Resource}
 	if err := writeResourceUpdateJournal(ctx, journal); err != nil {
-		_, terminalErr := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "resource_update_not_committed", Status: jobs.PostconditionVerified, Identity: execution.Resource.ID}}, "resource_update_not_started")
-		closeErr := execution.Close()
-		return jobs.Record{}, errors.Join(err, terminalErr, closeErr)
+		return jobs.Record{}, errors.Join(err, execution.Close())
 	}
 	if err := execution.Admitter.CommitResourceUpdate(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource); err != nil {
 		return jobs.Record{}, err
@@ -1080,7 +1236,7 @@ func (execution *ResourceExecution) CommitCreate(ctx context.Context) (jobs.Reco
 	if err := execution.Admitter.ValidateActive(ctx, execution.Mutation, execution.Exposure, execution.JobID); err != nil {
 		return jobs.Record{}, err
 	}
-	journal := ResourceCreateJournal{SchemaVersion: "lanpanel.resource.create.v1", JobID: execution.JobID, ResourceID: execution.Resource.ID, Resource: execution.Resource, Phase: "prepared"}
+	journal := ResourceCreateJournal{SchemaVersion: resourceCreateJournalSchema, JobID: execution.JobID, ResourceID: execution.Resource.ID, Resource: execution.Resource, Phase: "prepared"}
 	if err := writeCreateJournal(ctx, journal); err != nil {
 		return jobs.Record{}, err
 	}

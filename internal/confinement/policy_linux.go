@@ -40,6 +40,20 @@ type UnitPolicy struct {
 	Digest           string
 }
 
+func ValidateUnitPolicy(policy UnitPolicy) error {
+	short := strings.TrimPrefix(policy.ResourceID, "res_")
+	if len(policy.ResourceID) != 36 || len(short) != 32 || !lowerHex(short) || policy.Cgroup != "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-"+short[:20]+".slice/lanpanel-app-"+short[:20]+".service" || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || !validDigest(policy.Digest) || strings.ToLower(policy.Digest) != policy.Digest || len(policy.Directives) == 0 {
+		return fmt.Errorf("managed-process unit policy is invalid")
+	}
+	for index, directive := range policy.Directives {
+		name, _, found := strings.Cut(directive, "=")
+		if !found || name == "" || strings.ContainsAny(directive, "\x00\r\n") || index > 0 && policy.Directives[index-1] >= directive {
+			return fmt.Errorf("managed-process unit policy directives are invalid")
+		}
+	}
+	return nil
+}
+
 func ValidateProfile(profile Profile) error {
 	if profile.SchemaVersion != SchemaVersion || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
 		return fmt.Errorf("managed-process confinement profile is incomplete or unqualified")
