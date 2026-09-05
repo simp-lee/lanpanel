@@ -6,7 +6,7 @@ LanPanel 是面向个人和相互信任小团队的 MIT License、自托管 Linu
 
 仅 loopback 监听的 Management UI 是唯一受支持的日常管理入口。LanPanel 不提供管理 CLI、JSON CLI、YAML workflow、shell、terminal 或文件管理器。远程管理时，使用 SSH tunnel 连接 installer 显示的 installation-specific exact `127/8` IPv4 与 high port；不得用 `localhost` 替代。
 
-安装生成 CSPRNG admin token。连接 TTY 时可以显示一次；无 TTY 时只报告 root-protected source path。登录使用带 CSRF、exact Origin/Host 的短期 selector/proof session。token rotation 会使现有 session 失效。secret 不进入 URL、argv、unit、Plan、job、audit、diagnostics、WebSocket 或 release asset。
+安装生成 CSPRNG admin token。连接 TTY 时可以显示一次；无 TTY 时只报告 root-protected source path。登录使用带 CSRF、exact Origin/Host 的短期 selector/proof session。token rotation 会使现有 session 失效。secret 不进入 URL、argv、unit、Plan、job、audit、diagnostics、后续 WebSocket event 或业务消息、或 release asset。短期 session proof 由 login 返回并用于 authenticated HTTP header；在 WebSocket traffic 中只在首帧认证中传输，绝不进入后续 event 或业务消息。
 
 UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix-socket helper。关闭或重启 UI 不会停止已提交的 Headscale、managed process、GoAccess、certificate timer 或 App ingress。
 
@@ -39,7 +39,8 @@ Headscale lifecycle 刻意保持精简：
 
 - user：仅 create/list；
 - pre-auth key：仅 create/list/revoke；新 key 为 one-use、untagged，默认一小时、最长 24 小时，并且只显示一次；
-- device：仅 list/expire。
+- device：仅 list/expire；
+- Headscale control certificate 可通过 `headscale_certificate_reissue` reissue：仅在进入 30 天 renewal window 或 expiry 已收缩 control ingress 后运行；要求 fresh、10 分钟的 Plan 与明确的 `reissue` confirmation，保持 control identity 不变。expiry recovery 只接受匹配的本地持久化 control/certificate authority，并在证书验证及原子激活后才恢复 control ingress；失败时保持 closed/fenced，不 adopt foreign 或 ambiguous state。
 
 Key revoke 不会 expire 已注册 device。Device expire 不保证终止既有 TCP/UDP flow。
 
@@ -86,7 +87,7 @@ Plan-bound resource delete 要求 fresh unpublished closure；本机 App 还要�
 - 不支持原地 upgrade、same-version reinstall、dependency maintenance、updater、rollback engine 或 state/schema migration。
 - 不支持产品级 backup/restore、restore cutover 或跨主机 migration。手工 host copy 或 VM snapshot 不自动构成受支持、可恢复的 backup。
 - 不提供 Repair、fix-host、orphan adoption 或 normalization action。
-- 首版无 EdgeOne integration；保留的 `internal/realip*` 算法是不可达二期资产。
+- 首版无 EdgeOne integration。
 - 不声明 ARM64 GA；不提供公网 TCP/UDP、SSH/RDP/VNC、容器、Kubernetes、数据库、application template、remote API、OIDC 或 RBAC。
 
 主机管理员可以在产品外读取自己的配置、SQLite 和数据。Configuration export 是产品支持的数据迁出能力。

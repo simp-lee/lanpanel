@@ -6,7 +6,7 @@ LanPanel is an MIT-licensed, self-hosted Linux host manager for individuals and 
 
 The loopback-only Management UI is the only supported day-to-day management interface. LanPanel has no management CLI, JSON CLI, YAML workflow, shell, terminal, or file manager. To administer remotely, use an SSH tunnel to the installation-specific exact `127/8` IPv4 address and high port shown by the installer; do not substitute `localhost`.
 
-Installation creates a CSPRNG admin token. An attached TTY may display it once. Non-TTY installation reports only its root-protected source path. Login creates short-lived selector/proof sessions with CSRF and exact Origin/Host checks. Token rotation invalidates existing sessions. Secrets are never placed in URLs, argv, units, plans, jobs, audit, diagnostics, WebSockets, or release assets.
+Installation creates a CSPRNG admin token. An attached TTY may display it once. Non-TTY installation reports only its root-protected source path. Login creates short-lived selector/proof sessions with CSRF and exact Origin/Host checks. Token rotation invalidates existing sessions. Secrets are never placed in URLs, argv, units, plans, jobs, audit, diagnostics, subsequent WebSocket events or business messages, or release assets. The short-lived session proof is returned by login and used in authenticated HTTP headers; within WebSocket traffic, it is sent only in the authentication first frame and never in later event or business messages.
 
 The UI process is non-root. Root mutations cross a peer-authenticated, typed Unix-socket helper boundary. Closing or restarting the UI does not stop committed Headscale, managed processes, GoAccess, certificate timers, or application ingress.
 
@@ -39,7 +39,8 @@ Headscale lifecycle is intentionally small:
 
 - users: create and list only;
 - pre-auth keys: create, list, and revoke only; new keys are one-use, untagged, default one hour, maximum 24 hours, and displayed once;
-- devices: list and expire only.
+- devices: list and expire only;
+- the Headscale control certificate can be reissued through `headscale_certificate_reissue` when renewal is due within the 30-day window or after expiry contraction. Reissue requires a fresh 10-minute Plan and explicit `reissue` confirmation, and preserves the control identity. After expiry contraction, recovery accepts only the matching persisted local control/certificate authority and reactivates control ingress after validated atomic activation; failures leave it closed/fenced, and foreign or ambiguous state is not adopted.
 
 Key revoke does not expire a registered device. Device expire does not guarantee termination of an existing TCP or UDP flow.
 
@@ -86,7 +87,7 @@ Plan-bound resource deletion requires fresh unpublished closure and, for local A
 - No in-place upgrade, same-version reinstall, dependency maintenance, updater, rollback engine, or state/schema migration.
 - No supported product backup/restore, restore cutover, or cross-host migration. A manual host copy or VM snapshot is not automatically a supported recoverable backup.
 - No Repair, fix-host, orphan adoption, or normalization action.
-- No EdgeOne integration; retained `internal/realip*` algorithms are unreachable second-phase assets.
+- No EdgeOne integration.
 - No ARM64 GA claim, public TCP/UDP publication, SSH/RDP/VNC, containers, Kubernetes, databases, application templates, remote API, OIDC, or RBAC.
 
 Host administrators may read their own configuration, SQLite, and data outside LanPanel. Configuration export is the supported product data-exit capability.

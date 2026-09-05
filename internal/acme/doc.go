@@ -1,5 +1,4 @@
-// Package acme retains provider-metadata parsing algorithms pending the S14 GA
-// rewrite. It exposes no issuance, deploy, child-process, or management path.
-//
-// GA rewrite owner: S14.
+// Package acme provides the production ACME binding, provider/profile
+// validation, challenge staging and cleanup, and constrained lego issuance
+// used by the application certificate flows.
 package acme

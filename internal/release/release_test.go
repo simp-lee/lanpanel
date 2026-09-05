@@ -43,6 +43,22 @@ func TestInstallAssetSizeContractBoundariesAndCurrentBinary(t *testing.T) {
 	}
 }
 
+func TestKnownLimitationsRequireExplicitBackupAndRevocationBoundaries(t *testing.T) {
+	data := []byte("Clean installation only.\nNo supported product backup/restore.\nA manual host copy or VM snapshot is not automatically a supported recoverable backup.\nNo generic Repair.\nNo EdgeOne integration.\nNo connector disconnect, logout, reset, rejoin, or rebind automation.\nKey revoke does not expire a registered device.\nConnector mismatches must be resolved outside LanPanel.\nTailnet is not live tested.\nTemporary public HTTP is plaintext and does not expire automatically.\nFail-closed Nginx stop can interrupt Headscale control ingress.\n")
+	if err := ValidateKnownLimitations(data); err != nil {
+		t.Fatalf("complete known limitations were rejected: %v", err)
+	}
+	for _, statement := range [][]byte{
+		[]byte("A manual host copy or VM snapshot is not automatically a supported recoverable backup."),
+		[]byte("Key revoke does not expire a registered device."),
+	} {
+		withoutStatement := bytes.Replace(data, statement, nil, 1)
+		if err := ValidateKnownLimitations(withoutStatement); err == nil {
+			t.Fatalf("known limitations without %q were accepted", statement)
+		}
+	}
+}
+
 func TestLiveCleanupMustCoverImmutablePlanExactly(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	plan := LiveSideEffectPlan{SchemaVersion: LiveSideEffectPlanSchemaVersion, RunID: "run-one", AuthorizedHostFingerprint: "host-one", CreatedAt: now, Mutations: []PlannedMutation{plannedMutation("delete", "scope", "prior", "mutation", "selector", "delete_exact"), plannedMutation("retained", "scope-2", "prior-2", "mutation-2", "selector-2", "retain_authorized")}}
@@ -321,7 +337,7 @@ func releaseFixture(t *testing.T, resolution FindingResolution) (ReleaseManifest
 		"tailscale.tar.gz":           dependencyAssets["tailscale.tar.gz"],
 		"tailscale":                  dependencyAssets["tailscale"],
 		"qualification-summary.json": summaryBytes,
-		"known-limitations.md":       []byte("Clean installation only.\nNo supported product backup/restore.\nNo generic Repair.\nNo EdgeOne integration.\nNo connector disconnect, logout, reset, rejoin, or rebind automation.\nConnector mismatches must be resolved outside LanPanel.\nTailnet is not live tested.\nTemporary public HTTP is plaintext and does not expire automatically.\nFail-closed Nginx stop can interrupt Headscale control ingress.\n"),
+		"known-limitations.md":       []byte("Clean installation only.\nNo supported product backup/restore. A manual host copy or VM snapshot is not automatically a supported recoverable backup.\nNo generic Repair.\nNo EdgeOne integration.\nNo connector disconnect, logout, reset, rejoin, or rebind automation.\nKey revoke does not expire a registered device.\nConnector mismatches must be resolved outside LanPanel.\nTailnet is not live tested.\nTemporary public HTTP is plaintext and does not expire automatically.\nFail-closed Nginx stop can interrupt Headscale control ingress.\n"),
 		"package-template.json":      packageTemplate,
 	}
 	reportBytes, err := MarshalCanonical(testSecurityReport(DigestBytes(binary), DigestBytes(sbomBytes), DigestBytes(dependencyBytes), profileDigest, resolution))
