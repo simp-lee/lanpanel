@@ -110,6 +110,17 @@ func (runtime *SystemdRuntime) ObserveActive(ctx context.Context, rendered Rende
 	return ServiceEvidence{Identity: rendered.Candidate.ServiceIdentity, PrivateProbe: hashBytes(append([]byte(rendered.Candidate.ServiceIdentity+"\x00"), show...)), PublicSTUNOpen: false}, nil
 }
 
+func (runtime *SystemdRuntime) ProbePrivate(ctx context.Context, candidate Candidate) error {
+	if runtime == nil || runtime.launcher == nil || Validate(candidate) != nil {
+		return fmt.Errorf("headscale private probe authority invalid")
+	}
+	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: candidate.HeadscaleID}}
+	if err := runtime.run(ctx, child.ProfileHeadscalePrivateProbe, invocation); err != nil {
+		return fmt.Errorf("fresh Headscale private probe failed: %w", err)
+	}
+	return nil
+}
+
 func (runtime *SystemdRuntime) StopAndVerify(ctx context.Context, candidate Candidate, account identity.AccountIdentity) error {
 	var unitStat unix.Stat_t
 	if err := unix.Lstat(candidate.Paths.Unit, &unitStat); errors.Is(err, unix.ENOENT) {

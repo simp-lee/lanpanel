@@ -19,9 +19,11 @@ const (
 	CandidateSchema = "lanpanel.headscale.control-candidate.v1"
 	ConfigContract  = "headscale-trusted-mesh-v1"
 	ControlBackend  = "127.0.0.1:8080"
-	AdminBackend    = "127.0.0.1:50443"
-	MetricsBackend  = "127.0.0.1:9090"
-	STUNBackend     = "0.0.0.0:3478"
+	// Headscale's privileged gRPC and metrics listeners are intentionally disabled.
+	// The protected Unix admin socket is the only privileged control endpoint.
+	AdminBackend   = ""
+	MetricsBackend = ""
+	STUNBackend    = "0.0.0.0:3478"
 )
 
 var certificatePattern = regexp.MustCompile(`^cert_[0-9a-f]{32}$`)
@@ -191,7 +193,7 @@ func Build(request BuildRequest) (Rendered, error) {
 		ListenAddr:           ControlBackend,
 		MetricsListenAddr:    MetricsBackend,
 		GRPCListenAddr:       AdminBackend,
-		GRPCAllowInsecure:    true,
+		GRPCAllowInsecure:    false,
 		UnixSocket:           paths.AdminSocket,
 		UnixSocketPermission: "0700",
 		Noise:                noiseConfig{PrivateKeyPath: paths.NoiseKey},

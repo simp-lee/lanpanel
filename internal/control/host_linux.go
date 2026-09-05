@@ -52,7 +52,7 @@ func (host *LinuxCandidateHost) ValidateFreshCandidate(_ context.Context, render
 		return err
 	}
 	activation := FixedActivationPaths()
-	for _, path := range []string{rendered.Candidate.Paths.ConfigRoot, rendered.Candidate.Paths.Unit, rendered.Candidate.Paths.RuntimeRoot, rendered.Candidate.Paths.JournalRoot, activation.ControlRuntime, activation.ControlSocketUnit, activation.ControlRelayUnit, activation.STUNSocketUnit, activation.STUNRelayUnit, filepath.Join(nginx.FixedPaths().ConfigRoot, nginx.ControlDirectory, "headscale.conf"), bundle, pointer, filepath.Join("/var/lib/lanpanel/certificates/chroot", rendered.Candidate.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", rendered.Candidate.CertificateID)} {
+	for _, path := range []string{rendered.Candidate.Paths.ConfigRoot, rendered.Candidate.Paths.Unit, rendered.Candidate.Paths.RuntimeRoot, rendered.Candidate.Paths.JournalRoot, activation.ControlRuntime, activation.ControlSocketUnit, activation.ControlRelayUnit, activation.STUNSocketUnit, activation.STUNRelayUnit, activation.PrivateProbeUnit, filepath.Join(nginx.FixedPaths().ConfigRoot, nginx.ControlDirectory, "headscale.conf"), bundle, pointer, filepath.Join("/var/lib/lanpanel/certificates/chroot", rendered.Candidate.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", rendered.Candidate.CertificateID)} {
 		var stat unix.Stat_t
 		if err := unix.Lstat(path, &stat); errors.Is(err, unix.ENOENT) {
 			continue

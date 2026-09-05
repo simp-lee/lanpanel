@@ -19,6 +19,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
+	"lanpanel/internal/release"
 	"lanpanel/internal/reservations"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/target"
@@ -102,6 +103,15 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	}
 	if resource == nil {
 		return fail(fmt.Errorf("publication resource missing"))
+	}
+	if resource.Publication.Kind == domain.PublicationTemporaryHTTP {
+		installed, identityErr := loadInstalledReleaseIdentity()
+		if identityErr != nil {
+			return fail(fmt.Errorf("temporary publication requires an installed qualification identity: %w", identityErr))
+		}
+		if installed.Kind != release.InstallQualification {
+			return fail(fmt.Errorf("temporary_ip_http is available only for qualification installs"))
+		}
 	}
 	if _, err := reservations.BuildClaims(installation); err != nil {
 		return fail(err)

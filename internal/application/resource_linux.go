@@ -1032,6 +1032,11 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err := resource.ValidateCreate(installation, candidate); err != nil {
 		return fail(err)
 	}
+	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
+		if err := verifyFreshTailnetTarget(ctx, candidate); err != nil {
+			return fail(fmt.Errorf("tailnet target requires fresh connector peer and route authority: %w", err))
+		}
+	}
 	if _, err := service.SafetyState(); err != nil {
 		return fail(err)
 	}
@@ -1131,6 +1136,11 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	candidate, err = resource.PrepareUpdate(installation, candidate)
 	if err != nil {
 		return fail(err)
+	}
+	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
+		if err := verifyFreshTailnetTarget(ctx, candidate); err != nil {
+			return fail(fmt.Errorf("tailnet target requires fresh connector peer and route authority: %w", err))
+		}
 	}
 	if prior.ManagedProcess != nil && prior.ManagedProcess.Applied != nil {
 		relay := candidate.Target.LocalHTTP != nil && candidate.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix

@@ -24,10 +24,11 @@ type ActivationPaths struct {
 	ControlRelayUnit  string `json:"control_relay_unit"`
 	STUNSocketUnit    string `json:"stun_socket_unit"`
 	STUNRelayUnit     string `json:"stun_relay_unit"`
+	PrivateProbeUnit  string `json:"private_probe_unit"`
 }
 
 func FixedActivationPaths() ActivationPaths {
-	return ActivationPaths{"/run/lanpanel-headscale-control", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service"}
+	return ActivationPaths{ControlRuntime: "/run/lanpanel-headscale-control", ControlSocketUnit: "/etc/systemd/system/lanpanel-headscale-control.socket", ControlRelayUnit: "/etc/systemd/system/lanpanel-headscale-control-relay.service", STUNSocketUnit: "/etc/systemd/system/lanpanel-headscale-stun.socket", STUNRelayUnit: "/etc/systemd/system/lanpanel-headscale-stun-relay.service", PrivateProbeUnit: "/etc/systemd/system/lanpanel-headscale-private-probe.service"}
 }
 
 type ActivationBundle struct {
@@ -44,6 +45,7 @@ type ActivationBundle struct {
 	ControlRelay     []byte                           `json:"control_relay"`
 	STUNSocket       []byte                           `json:"stun_socket"`
 	STUNRelay        []byte                           `json:"stun_relay"`
+	PrivateProbe     []byte                           `json:"private_probe"`
 	Entry            nginx.Entry                      `json:"entry"`
 	Digest           string                           `json:"digest"`
 }
@@ -128,7 +130,8 @@ func renderActivation(installationID string, candidate Candidate, certificate ce
 		return ActivationBundle{}, err
 	}
 	entry.Digest = entryDigest
-	bundle := ActivationBundle{SchemaVersion: ActivationSchema, InstallationID: installationID, Candidate: candidate, Certificate: certificate, Paths: paths, ServiceUser: user, ServiceGroup: group, ControlSocket: controlSocket, ControlRelay: controlRelay, STUNSocket: stunSocket, STUNRelay: stunRelay, Entry: entry}
+	privateProbe := []byte("[Unit]\nDescription=LanPanel Headscale fresh private probe\nAfter=lanpanel-headscale.service\nJoinsNamespaceOf=lanpanel-headscale.service\n\n[Service]\nType=oneshot\nUser=" + user + "\nGroup=" + group + "\nExecCondition=/usr/bin/systemctl is-active --quiet lanpanel-headscale.service\nExecStart=/usr/lib/lanpanel/lanpanel headscale-private-probe\nEnvironment=LANPANEL_HEADSCALE_CANDIDATE=private-v1\nEnvironment=LANPANEL_HEADSCALE_CONTROL_DOMAIN=" + candidate.ControlDomain + "\nPrivateNetwork=yes\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nProtectProc=invisible\nProcSubset=pid\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nSystemCallArchitectures=native\nRestrictSUIDSGID=yes\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nUMask=0077\n")
+	bundle := ActivationBundle{SchemaVersion: ActivationSchema, InstallationID: installationID, Candidate: candidate, Certificate: certificate, Paths: paths, ServiceUser: user, ServiceGroup: group, ControlSocket: controlSocket, ControlRelay: controlRelay, STUNSocket: stunSocket, STUNRelay: stunRelay, PrivateProbe: privateProbe, Entry: entry}
 	digest, err := ActivationDigest(bundle)
 	if err != nil {
 		return ActivationBundle{}, err

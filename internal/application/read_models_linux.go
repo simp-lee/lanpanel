@@ -3,17 +3,24 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/control"
 	manageddiagnostics "lanpanel/internal/diagnostics"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/preflight"
 	managedprocess "lanpanel/internal/process"
+	"lanpanel/internal/safety"
+	"os"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -61,6 +68,94 @@ type JobsResult struct {
 }
 type JobResult struct {
 	Job jobs.Record `json:"job"`
+}
+
+func observeHeadscaleStatus(ctx context.Context, installation domain.Installation, state safety.State) error {
+	if installation.Headscale == nil || !installation.Headscale.Enabled || installation.Headscale.Applied == nil || installation.Headscale.Certificate == nil {
+		return fmt.Errorf("Headscale lifecycle authority is incomplete")
+	}
+	journal, err := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
+	if err != nil {
+		return fmt.Errorf("committed Headscale control journal is unavailable: %w", err)
+	}
+	if journal.Phase != control.PhaseCommitted || journal.InstallationID != installation.InstallationID || journal.Certificate == nil {
+		return fmt.Errorf("committed Headscale control journal is incomplete")
+	}
+	candidate := journal.Candidate
+	expectedApplied, err := control.AppliedIdentity(candidate)
+	if err != nil || !reflect.DeepEqual(*installation.Headscale.Applied, expectedApplied) || candidate.HeadscaleID != installation.Headscale.ID || journal.Certificate.ID != candidate.CertificateID || !certificateBundleMatches(*installation.Headscale.Certificate, journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)) {
+		return fmt.Errorf("Headscale durable identity differs from the committed control journal")
+	}
+	if err := certificates.VerifyBundleIdentity(journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)); err != nil {
+		return err
+	}
+	bundlePath, err := certificates.BundlePath(journal.Certificate.ID, journal.Certificate.Generation)
+	if err != nil {
+		return err
+	}
+	pointer, err := certificates.ObservePointer(journal.Certificate.ID)
+	if err != nil {
+		return fmt.Errorf("Headscale served certificate pointer is unavailable: %w", err)
+	}
+	if pointer != bundlePath {
+		return fmt.Errorf("Headscale served certificate pointer is not current")
+	}
+	accounts, err := identity.HeadscaleAccounts(installation.InstallationID, installation.Headscale.ID)
+	if err != nil {
+		return err
+	}
+	present, identities, err := identity.InspectAccounts(accounts)
+	if err != nil {
+		return fmt.Errorf("Headscale service account observation failed: %w", err)
+	}
+	if !present || len(identities) != 1 {
+		return fmt.Errorf("Headscale service account observation is incomplete")
+	}
+	account := identities[0]
+	config, err := os.ReadFile(candidate.Paths.Config)
+	if err != nil {
+		return err
+	}
+	policy, err := os.ReadFile(candidate.Paths.Policy)
+	if err != nil {
+		return err
+	}
+	unit, err := os.ReadFile(candidate.Paths.Unit)
+	if err != nil {
+		return err
+	}
+	rendered := control.Rendered{Candidate: candidate, Config: config, Policy: policy, Unit: unit}
+	if err := control.VerifyRendered(rendered); err != nil {
+		return err
+	}
+	activationBundle, err := control.BuildActivation(installation.InstallationID, candidate, *journal.Certificate)
+	if err != nil {
+		return err
+	}
+	privateProbe, err := os.ReadFile(activationBundle.Paths.PrivateProbeUnit)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(privateProbe, activationBundle.PrivateProbe) {
+		return fmt.Errorf("Headscale private probe unit differs from activation authority")
+	}
+	runtime, err := control.NewSystemdRuntime()
+	if err != nil {
+		return err
+	}
+	if _, err := runtime.ObserveActive(ctx, rendered, account); err != nil {
+		return err
+	}
+	if err := runtime.ProbePrivate(ctx, candidate); err != nil {
+		return err
+	}
+	if err := verifyLiveHeadscaleCertificate(ctx, installation.InstallationID, candidate, *journal.Certificate); err != nil {
+		return err
+	}
+	if !activeCertificateMatchesExpected(state.Headscale.ActiveCertificate, &safety.ActiveCertificateAuthority{Generation: journal.Certificate.Generation, Fingerprint: journal.Certificate.Fingerprint, Binding: journal.Certificate.BindingIdentity, NotAfter: journal.Certificate.NotAfter, LastTrustedWall: journal.Certificate.LastTrustedWall}) {
+		return fmt.Errorf("Headscale active certificate safety authority differs")
+	}
+	return nil
 }
 
 func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
@@ -117,7 +212,11 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 		if state.Headscale.CertificateExpiry != nil {
 			result.Headscale = "closed_certificate_expired"
 		} else if installation.Headscale.Enabled && state.Headscale.ActiveCertificate != nil {
-			result.Headscale = "configured_runtime_unknown"
+			if err := observeHeadscaleStatus(ctx, installation, state); err == nil {
+				result.Headscale = "healthy"
+			} else {
+				result.Headscale = "configured_runtime_unknown"
+			}
 		} else {
 			result.Headscale = "inactive_or_unknown"
 		}

@@ -20,6 +20,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
+	"lanpanel/internal/release"
 	"lanpanel/internal/reservations"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
@@ -851,6 +852,13 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	}
 	if resource.Publication.Kind != domain.PublicationTemporaryHTTP {
 		return plans.Plan{}, fmt.Errorf("publication type unsupported")
+	}
+	installed, err := loadInstalledReleaseIdentity()
+	if err != nil {
+		return plans.Plan{}, fmt.Errorf("temporary publication requires an installed qualification identity: %w", err)
+	}
+	if installed.Kind != release.InstallQualification {
+		return plans.Plan{}, fmt.Errorf("temporary_ip_http is available only for qualification installs")
 	}
 	if resource.Target.WebSocket.Enabled || !publishTargetConfigured(installation, *resource) {
 		return plans.Plan{}, fmt.Errorf("temporary publication requires exact running local target without WebSocket")

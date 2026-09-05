@@ -46,6 +46,7 @@ const (
 	ProfileHeadscaleActivateStart ProfileID = "headscale_activate_start"
 	ProfileHeadscaleActivateStop  ProfileID = "headscale_activate_stop"
 	ProfileHeadscaleActivateShow  ProfileID = "headscale_activate_show"
+	ProfileHeadscalePrivateProbe  ProfileID = "headscale_private_probe"
 	ProfileHeadscaleFallbackStop  ProfileID = "headscale_fallback_stop"
 	ProfileHeadscaleAdmin         ProfileID = "headscale_admin"
 	ProfileGoAccessProbe          ProfileID = "goaccess_probe"
@@ -243,8 +244,9 @@ var catalog = map[ProfileID]Profile{
 	ProfileHeadscaleShow:          {ID: ProfileHeadscaleShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleActivateStart: {ID: ProfileHeadscaleActivateStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleActivateStop:  {ID: ProfileHeadscaleActivateStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
-	ProfileHeadscaleFallbackStop:  {ID: ProfileHeadscaleFallbackStop, Executable: "/usr/bin/systemctl", Arguments: []string{"mask", "--runtime", "--now", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
+	ProfileHeadscaleFallbackStop:  {ID: ProfileHeadscaleFallbackStop, Executable: "/usr/bin/systemctl", Arguments: []string{"mask", "--runtime", "--now", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale-private-probe.service", "lanpanel-headscale.service", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleActivateShow:  {ID: ProfileHeadscaleActivateShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 128 << 10, RootTCB: true},
+	ProfileHeadscalePrivateProbe:  {ID: ProfileHeadscalePrivateProbe, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleAdmin:         {ID: ProfileHeadscaleAdmin, Executable: "/usr/lib/lanpanel/dependencies/headscale", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityHeadscale, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 1 << 20},
 	ProfileGoAccessProbe:          {ID: ProfileGoAccessProbe, Executable: "/usr/bin/goaccess", IdentityKind: IdentityGoAccess, Network: NetworkNone},
 	ProfileGoAccessAccounts:       {ID: ProfileGoAccessAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -323,7 +325,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	if err != nil {
 		return Profile{}, err
 	}
-	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow || id == ProfileHeadscaleActivateStart || id == ProfileHeadscaleActivateStop || id == ProfileHeadscaleActivateShow || id == ProfileHeadscaleAdmin
+	headscaleProfile := id == ProfileHeadscaleAccounts || id == ProfileHeadscaleStart || id == ProfileHeadscaleStop || id == ProfileHeadscaleShow || id == ProfileHeadscaleActivateStart || id == ProfileHeadscaleActivateStop || id == ProfileHeadscaleActivateShow || id == ProfileHeadscalePrivateProbe || id == ProfileHeadscaleAdmin
 	if headscaleProfile {
 		if invocation.Headscale == nil || !regexp.MustCompile(`^hds_[0-9a-f]{32}$`).MatchString(invocation.Headscale.HeadscaleID) || invocation.Package != nil || invocation.Resource != nil || invocation.Lego != nil || invocation.HTPasswd != nil || invocation.Tailscale != nil {
 			return Profile{}, fmt.Errorf("headscale child invocation authority is invalid")
@@ -346,6 +348,8 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			profile.Arguments = []string{"stop", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service"}
 		case ProfileHeadscaleActivateShow:
 			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,PrivateNetwork,JoinsNamespaceOf,RestrictAddressFamilies,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictSUIDSGID,KillMode,Restart,ExecStart,Sockets,Listen,SocketMode,SocketUser,SocketGroup,RemoveOnStop,FreeBind,ReusePort,FragmentPath,DropInPaths", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service"}
+		case ProfileHeadscalePrivateProbe:
+			profile.Arguments = []string{"start", "lanpanel-headscale-private-probe.service"}
 		case ProfileHeadscaleAdmin:
 			profile.Arguments, err = headscaleAdminArguments(*invocation.Headscale)
 			if err != nil {

@@ -44,9 +44,8 @@ func probePrivateEndpoints(ctx context.Context, controlDomain string) error {
 	if err := probeHTTP(ctx, ControlBackend, "/health", controlDomain, false); err != nil {
 		return err
 	}
-	if err := probeHTTP(ctx, MetricsBackend, "/metrics", "metrics.invalid", true); err != nil {
-		return err
-	}
+	// Metrics and privileged gRPC have no TCP listener. Admin access is
+	// deliberately exercised only through the protected Unix socket.
 	if err := probeAdminSocket(); err != nil {
 		return err
 	}

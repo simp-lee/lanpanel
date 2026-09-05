@@ -154,6 +154,28 @@ func loadInstalledReleaseIdentity() (release.InstallIdentity, error) {
 	return readCommittedReleaseIdentity()
 }
 
+func verifyFreshTailnetTarget(ctx context.Context, resource domain.AppResource) error {
+	if resource.Target.Kind != domain.AppTargetTailnetHTTP || resource.Target.TailnetHTTP == nil {
+		return fmt.Errorf("tailnet target authority is missing")
+	}
+	verified, err := VerifyConnector(ctx, nil, nil)
+	if err != nil {
+		return err
+	}
+	address, err := netip.ParseAddr(resource.Target.TailnetHTTP.IP)
+	if err != nil {
+		return err
+	}
+	if err := managedconnector.VerifyPeer(verified.Observation, address, time.Now().UTC()); err != nil {
+		return err
+	}
+	source, err := netip.ParseAddr(resource.Target.TailnetHTTP.SourceIP)
+	if err != nil || !slices.Contains(verified.Observation.LocalIPs, source) {
+		return fmt.Errorf("tailnet source IP is not a fresh local connector identity")
+	}
+	return nil
+}
+
 func probeResourceTarget(ctx context.Context, resource domain.AppResource) (target.Evidence, error) {
 	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
 		verified, err := VerifyConnector(ctx, nil, nil)

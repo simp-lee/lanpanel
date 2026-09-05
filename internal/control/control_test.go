@@ -25,8 +25,8 @@ func TestTrustedMeshCandidateIsPrivateAndDeterministic(t *testing.T) {
 	if err := VerifyRendered(rendered); err != nil {
 		t.Fatal(err)
 	}
-	if rendered.Candidate.PublicSTUN || !strings.Contains(string(rendered.Unit), "PrivateNetwork=yes") || !strings.Contains(string(rendered.Unit), "CapabilityBoundingSet=\n") || strings.Contains(string(rendered.Config), "derpmap") {
-		t.Fatal("candidate service lost its private, empty-capability, no-external-DERP contract")
+	if rendered.Candidate.PublicSTUN || rendered.Candidate.AdminBackend != "" || rendered.Candidate.MetricsBackend != "" || !strings.Contains(string(rendered.Unit), "PrivateNetwork=yes") || !strings.Contains(string(rendered.Unit), "CapabilityBoundingSet=\n") || strings.Contains(string(rendered.Config), "derpmap") || !strings.Contains(string(rendered.Config), `"grpc_allow_insecure":false`) {
+		t.Fatal("candidate service lost its private, Unix-only privileged endpoint contract")
 	}
 	if !strings.Contains(string(rendered.Policy), `"src":["*"]`) || !strings.Contains(string(rendered.Policy), `"dst":["*:*"`) {
 		t.Fatal("trusted-mesh all-member allow policy missing")

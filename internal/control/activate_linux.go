@@ -64,7 +64,7 @@ func (host *ActivationHost) Stage(ctx context.Context, bundle ActivationBundle) 
 	for _, value := range []struct {
 		path string
 		data []byte
-	}{{bundle.Paths.ControlSocketUnit, bundle.ControlSocket}, {bundle.Paths.ControlRelayUnit, bundle.ControlRelay}, {bundle.Paths.STUNSocketUnit, bundle.STUNSocket}, {bundle.Paths.STUNRelayUnit, bundle.STUNRelay}} {
+	}{{bundle.Paths.ControlSocketUnit, bundle.ControlSocket}, {bundle.Paths.ControlRelayUnit, bundle.ControlRelay}, {bundle.Paths.STUNSocketUnit, bundle.STUNSocket}, {bundle.Paths.STUNRelayUnit, bundle.STUNRelay}, {bundle.Paths.PrivateProbeUnit, bundle.PrivateProbe}} {
 		req := filetxn.Request{Path: value.path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{root}, AllowedMode: 0o755}, New: filetxn.Metadata{Owner: root, Mode: 0o644}, MaxBytes: int64(len(value.data))}
 		if _, err := store.Put(ctx, req, value.data, filetxn.CreateOnly); err != nil {
 			if !errors.Is(err, os.ErrExist) {

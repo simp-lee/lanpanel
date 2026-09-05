@@ -259,7 +259,7 @@ type TailnetConnector struct {
 func ConnectorManagedPaths() []string { return []string{"/var/lib/lanpanel/connector"} }
 
 func HeadscaleManagedPaths() []string {
-	return []string{"/etc/lanpanel-headscale", "/etc/lanpanel/nginx/control-enabled/headscale.conf", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/run/lanpanel-headscale-control", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
+	return []string{"/etc/lanpanel-headscale", "/etc/lanpanel/nginx/control-enabled/headscale.conf", "/etc/systemd/system/lanpanel-headscale-control-relay.service", "/etc/systemd/system/lanpanel-headscale-control.socket", "/etc/systemd/system/lanpanel-headscale-stun-relay.service", "/etc/systemd/system/lanpanel-headscale-stun.socket", "/etc/systemd/system/lanpanel-headscale-private-probe.service", "/etc/systemd/system/lanpanel-headscale.service", "/etc/sysusers.d/lanpanel-headscale.conf", "/run/lanpanel-headscale-control", "/usr/lib/lanpanel/dependencies/headscale", "/var/lib/lanpanel/headscale", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale-initialize.json", "/var/lib/lanpanel/headscale-runtime"}
 }
 
 type Credential struct {
