@@ -71,12 +71,13 @@ func RunRole(args []string) error {
 	var otherRecoveryErr error
 	recordRecovery := func(err error) { otherRecoveryErr = errors.Join(otherRecoveryErr, err) }
 	recordRecovery(deleteRecoveryErr)
-	recordRecovery(cleanupConnectorLoginSecrets())
 	recordRecovery(application.ReconcileStaticRootRegistrations(context.Background()))
+	connectorCleanupErr := cleanupConnectorLoginSecrets()
+	recordRecovery(connectorCleanupErr)
 	childClosure, childErr := child.ObserveExclusiveCurrentCgroup()
 	recordRecovery(childErr)
 	if childErr == nil {
-		recordRecovery(application.ReconcileInterruptedEntityMutations(context.Background(), childClosure))
+		recordRecovery(application.ReconcileInterruptedEntityMutations(context.Background(), childClosure, connectorCleanupErr))
 		recordRecovery(application.ReconcileManagedBasic(context.Background(), childClosure))
 		recordRecovery(application.ReconcileCertificateChallenges(context.Background(), childClosure))
 		recordRecovery(application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))

@@ -5201,8 +5201,10 @@ func cloneBundle(value *domain.PublicationBundle) *domain.PublicationBundle {
 // CompleteInterruptedEntity is a startup-only terminalizer for non-retryable
 // Headscale entity and connector mutations. It relies on independently
 // observed old-helper child closure and the already-consumed intent snapshot;
-// it deliberately does not refresh or re-authorize an expired Plan.
-func (admitter *Admitter) CompleteInterruptedEntity(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, childClosureDigest, errorCode string) (jobs.Record, error) {
+// it deliberately does not refresh or re-authorize an expired Plan. Connector
+// login also requires the result of fresh read-only verification after secret
+// cleanup; this observation does not establish the old remote mutation's result.
+func (admitter *Admitter) CompleteInterruptedEntity(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID, childClosureDigest, errorCode string, connectorVerification *jobs.Postcondition) (jobs.Record, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || !exactDigest(childClosureDigest) {
 		return jobs.Record{}, fmt.Errorf("interrupted entity completion lacks authoritative closure locks")
 	}
@@ -5242,8 +5244,18 @@ func (admitter *Admitter) CompleteInterruptedEntity(ctx context.Context, mutatio
 		if loadErr != nil || record.Status != jobs.StatusRunning {
 			return fmt.Errorf("interrupted entity job is not running")
 		}
-		condition := jobs.Postcondition{Kind: "interrupted_remote_mutation", Status: jobs.PostconditionUnobserved, Identity: childClosureDigest}
-		record, loadErr = jobs.Finish(record, jobs.Completion{Result: branch.Result, Postconditions: []jobs.Postcondition{condition}, ErrorCode: errorCode}, observedNow)
+		conditions := []jobs.Postcondition{{Kind: "interrupted_remote_mutation", Status: jobs.PostconditionUnobserved, Identity: childClosureDigest}}
+		if intent.Operation == ConnectorLogin {
+			if connectorVerification == nil || connectorVerification.Kind != "connector_recovery_verification" ||
+				!(connectorVerification.Status == jobs.PostconditionVerified && exactDigest(connectorVerification.Identity) ||
+					connectorVerification.Status == jobs.PostconditionUnobserved && connectorVerification.Identity == jobID) {
+				return fmt.Errorf("interrupted connector login lacks fresh verification result")
+			}
+			conditions = append(conditions, *connectorVerification)
+		} else if connectorVerification != nil {
+			return fmt.Errorf("interrupted entity has unrelated connector verification")
+		}
+		record, loadErr = jobs.Finish(record, jobs.Completion{Result: branch.Result, Postconditions: conditions, ErrorCode: errorCode}, observedNow)
 		if loadErr != nil {
 			return loadErr
 		}
