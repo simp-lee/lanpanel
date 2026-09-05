@@ -13,6 +13,7 @@ import (
 	"lanpanel/internal/identity"
 	"lanpanel/internal/resource"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -36,7 +37,7 @@ type UnitSet struct {
 
 func (units UnitSet) BundlePolicy() confinement.UnitPolicy { return units.Confinement }
 
-func Render(installationID string, app domain.AppResource, accounts identity.ResourceAccountSet, policyProfile confinement.Profile, evidence resource.ReferenceEvidence, frontendGID uint32) (UnitSet, error) {
+func Render(installationID string, app domain.AppResource, accounts identity.ResourceAccountSet, policyProfile confinement.Profile, evidence resource.ReferenceEvidence, frontendGID uint32, inventory map[string]struct{}) (UnitSet, error) {
 	if installationID == "" || accounts.InstallationID != installationID || app.Target.Kind != domain.AppTargetLocalHTTP || app.Target.LocalHTTP == nil || app.ManagedProcess == nil || app.ManagedProcess.Requested != domain.ProcessRequestedStopped && app.ManagedProcess.Requested != domain.ProcessRequestedRunning {
 		return UnitSet{}, fmt.Errorf("managed-process unit authority is invalid")
 	}
@@ -97,7 +98,18 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 	if err != nil {
 		return UnitSet{}, err
 	}
-	execAuthority, err := json.Marshal(ExecAuthority{SchemaVersion: managedExecSchema, ResourceID: app.ID, UID: applicationIdentity.UID, GID: applicationIdentity.GID, Service: app.ManagedProcess.Service, Endpoint: processEndpoint(app.Target.LocalHTTP.EndpointKind, paths), Policy: policy, Evidence: evidence})
+	if inventory == nil {
+		return UnitSet{}, fmt.Errorf("managed-process secret inventory is unavailable")
+	}
+	secretDigests := make([]string, 0, len(inventory))
+	for value := range inventory {
+		if !validSecretDigest(value) {
+			return UnitSet{}, fmt.Errorf("managed-process secret inventory is invalid")
+		}
+		secretDigests = append(secretDigests, value)
+	}
+	slices.Sort(secretDigests)
+	execAuthority, err := json.Marshal(ExecAuthority{SchemaVersion: managedExecSchema, ResourceID: app.ID, UID: applicationIdentity.UID, GID: applicationIdentity.GID, Service: app.ManagedProcess.Service, Endpoint: processEndpoint(app.Target.LocalHTTP.EndpointKind, paths), Policy: policy, Evidence: evidence, SecretDigests: secretDigests})
 	if err != nil {
 		return UnitSet{}, err
 	}

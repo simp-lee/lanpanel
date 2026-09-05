@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	managedconnector "lanpanel/internal/connector"
@@ -428,7 +429,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				target = "resource/" + call.Target.ID
 			}
 			reply, err := resourceClient(ctx, helperproto.OperationResourceMutation, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Resource: raw}, target)
-			if err != nil || reply.Resource == nil || reply.Resource.ResourceID == "" {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("resource mutation failed")
+			}
+			if reply.Resource == nil || reply.Resource.ResourceID == "" {
 				return Result{}, fmt.Errorf("resource mutation failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Resource}, nil

@@ -3,8 +3,10 @@ package ui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"lanpanel/internal/application"
+	"lanpanel/internal/audit"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/session"
 	"net"
@@ -20,9 +22,10 @@ import (
 )
 
 type (
-	verifier      struct{ fp string }
-	normalProfile struct{}
-	gatedVerifier struct {
+	verifier        struct{ fp string }
+	failingVerifier struct{}
+	normalProfile   struct{}
+	gatedVerifier   struct {
 		fp                     string
 		entered, release       chan struct{}
 		enterOnce, releaseOnce sync.Once
@@ -33,6 +36,10 @@ func (normalProfile) Current(context.Context) (Profile, error) { return ProfileN
 
 func (v verifier) Verify(context.Context, []byte) (string, error) { return v.fp, nil }
 func (v verifier) Source(context.Context) (string, error)         { return v.fp, nil }
+func (failingVerifier) Verify(context.Context, []byte) (string, error) {
+	return "", errors.New("invalid token")
+}
+func (failingVerifier) Source(context.Context) (string, error) { return "fp", nil }
 
 func (v *gatedVerifier) Verify(ctx context.Context, _ []byte) (string, error) {
 	v.enterOnce.Do(func() { close(v.entered) })
@@ -77,11 +84,66 @@ func testServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(manager.Close)
-	server, err := New(Config{Listener: dummyListener{}, Authority: "127.1.2.3:52345", InstallationFingerprint: "abcdef", Verifier: verifier{"fp"}, Sessions: manager, Profile: normalProfile{}})
+	server, err := New(Config{Listener: dummyListener{}, Authority: "127.1.2.3:52345", InstallationFingerprint: "abcdef", Verifier: verifier{"fp"}, Sessions: manager, Profile: normalProfile{}, Audit: audit.NewMemorySink()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return server
+}
+
+func TestLoginLogoutAreAuditedWithoutCredentials(t *testing.T) {
+	server := testServer(t)
+	sink, ok := server.config.Audit.(*audit.MemorySink)
+	if !ok {
+		t.Fatal("test server did not install memory audit sink")
+	}
+	login := httptest.NewRequest(http.MethodPost, server.origin()+"/login", strings.NewReader("token=admin"))
+	login.Header.Set("Origin", server.origin())
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginWriter := httptest.NewRecorder()
+	server.ServeHTTP(loginWriter, login)
+	if loginWriter.Code != http.StatusOK {
+		t.Fatalf("login status=%d", loginWriter.Code)
+	}
+	cookie := loginWriter.Result().Cookies()[0]
+	var response struct{ Proof, CSRF string }
+	if err := json.NewDecoder(loginWriter.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	logout := httptest.NewRequest(http.MethodPost, server.origin()+"/api/logout", nil)
+	logout.Header.Set("Origin", server.origin())
+	logout.Header.Set(session.ProofHeader, response.Proof)
+	logout.Header.Set(session.CSRFHeader, response.CSRF)
+	logout.AddCookie(cookie)
+	logoutWriter := httptest.NewRecorder()
+	server.ServeHTTP(logoutWriter, logout)
+	if logoutWriter.Code != http.StatusNoContent {
+		t.Fatalf("logout status=%d", logoutWriter.Code)
+	}
+	records := sink.Records()
+	if len(records) != 2 || records[0].Operation != "login" || records[1].Operation != "logout" || records[0].Result != "succeeded" || records[1].Result != "succeeded" {
+		t.Fatalf("audit records=%#v", records)
+	}
+	if strings.Contains(loginWriter.Body.String()+logoutWriter.Body.String(), "admin") {
+		t.Fatal("audit response exposed credential")
+	}
+}
+
+func TestFailedLoginIsAuditedWithoutToken(t *testing.T) {
+	server := testServer(t)
+	server.config.Verifier = failingVerifier{}
+	sink := server.config.Audit.(*audit.MemorySink)
+	request := httptest.NewRequest(http.MethodPost, server.origin()+"/login", strings.NewReader("token=not-a-token"))
+	request.Header.Set("Origin", server.origin())
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	writer := httptest.NewRecorder()
+	server.ServeHTTP(writer, request)
+	if writer.Code != http.StatusUnauthorized || len(sink.Records()) != 1 || sink.Records()[0].Result != "failed" {
+		t.Fatalf("status=%d records=%#v", writer.Code, sink.Records())
+	}
+	if strings.Contains(writer.Body.String(), "not-a-token") {
+		t.Fatal("failed login response exposed token")
+	}
 }
 
 func TestActionLeaseCancelsOnSessionInvalidation(t *testing.T) {
@@ -403,7 +465,7 @@ func TestShutdownTerminatesConcurrentLoginActionAndSocketAuthentication(t *testi
 	}
 	verifyGate := &gatedVerifier{fp: fingerprint, entered: make(chan struct{}), release: make(chan struct{})}
 	defer verifyGate.releaseVerify()
-	server, err := New(Config{Listener: listener, Authority: listener.Addr().String(), InstallationFingerprint: "abcdef", Verifier: verifyGate, Sessions: manager, Profile: normalProfile{}, Actions: actions})
+	server, err := New(Config{Listener: listener, Authority: listener.Addr().String(), InstallationFingerprint: "abcdef", Verifier: verifyGate, Sessions: manager, Profile: normalProfile{}, Actions: actions, Audit: audit.NewMemorySink()})
 	if err != nil {
 		t.Fatal(err)
 	}

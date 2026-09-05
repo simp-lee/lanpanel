@@ -785,10 +785,6 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, fmt.Errorf("resource mutation carried secret or omitted payload")
 		}
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
-		secretDigests, err := secrets.KnownHostSecretDigests()
-		if err != nil {
-			return ExecutionResult{}, err
-		}
 		var candidate domain.AppResource
 		var execution *application.ResourceExecution
 		switch request.Resource.Operation {
@@ -817,12 +813,6 @@ func RunRole(args []string) error {
 				}
 				candidate, err = resource.NewLocal(spec, nil)
 			}
-			if err == nil && candidate.ManagedProcess != nil {
-				err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
-			}
-			if err == nil {
-				execution, err = application.BeginResourceCreate(ctx, actor, candidate)
-			}
 		case "resource_update":
 			var marker struct {
 				SchemaVersion string `json:"schema_version"`
@@ -849,14 +839,26 @@ func RunRole(args []string) error {
 			if request.Target != "resource/"+candidate.ID {
 				return ExecutionResult{}, fmt.Errorf("resource update target is invalid")
 			}
-			if candidate.ManagedProcess != nil {
-				err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
-			}
-			if err == nil {
-				execution, err = application.BeginResourceUpdate(ctx, actor, candidate, secretDigests)
-			}
 		default:
 			return ExecutionResult{}, fmt.Errorf("resource mutation operation is invalid")
+		}
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		secretDigests, err := application.KnownSecretDigestsForResource(candidate)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		if candidate.ManagedProcess != nil {
+			err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
+			if err != nil {
+				return ExecutionResult{}, err
+			}
+		}
+		if request.Resource.Operation == "resource_create" {
+			execution, err = application.BeginResourceCreate(ctx, actor, candidate)
+		} else {
+			execution, err = application.BeginResourceUpdate(ctx, actor, candidate, secretDigests)
 		}
 		if err != nil {
 			return ExecutionResult{}, err
@@ -977,7 +979,7 @@ func RunRole(args []string) error {
 			if err != nil {
 				return ExecutionResult{}, err
 			}
-			secretDigests, err := secrets.KnownHostSecretDigests()
+			secretDigests, err := application.KnownSecretDigests()
 			if err != nil {
 				return ExecutionResult{}, err
 			}
@@ -1001,7 +1003,7 @@ func RunRole(args []string) error {
 			if groupErr != nil {
 				return ExecutionResult{}, groupErr
 			}
-			units, err := managedprocess.Render(installationID, startResource, accounts, profile, evidence, nginxGID)
+			units, err := managedprocess.Render(installationID, startResource, accounts, profile, evidence, nginxGID, secretDigests)
 			if err != nil {
 				return ExecutionResult{}, err
 			}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"lanpanel/internal/domain"
 	"strings"
 	"testing"
@@ -40,6 +41,19 @@ func TestTailnetResourceHasNoLocalProcessAndRequiresConnectorBinding(t *testing.
 	installation.Connector = nil
 	if err := ValidateCreate(installation, value); err == nil {
 		t.Fatal("tailnet resource accepted without connector binding")
+	} else {
+		var prerequisite domain.PrerequisiteError
+		if !errors.As(err, &prerequisite) || prerequisite.Code != domain.PrerequisiteConnectorRequired {
+			t.Fatalf("create prerequisite error=%v", err)
+		}
+	}
+	if _, err := PrepareUpdate(installation, value); err == nil {
+		t.Fatal("tailnet update accepted without connector binding")
+	} else {
+		var prerequisite domain.PrerequisiteError
+		if !errors.As(err, &prerequisite) || prerequisite.Code != domain.PrerequisiteConnectorRequired {
+			t.Fatalf("update prerequisite error=%v", err)
+		}
 	}
 }
 

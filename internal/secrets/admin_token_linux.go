@@ -288,8 +288,12 @@ func RequireNoAdminTokenCandidate() error {
 	return fmt.Errorf("orphan admin token recovery candidate exists")
 }
 
-func KnownHostSecretDigests() (map[string]struct{}, error) {
-	parentFD, oldFD, _, err := openAdminToken(filepath.Dir(AdminTokenPath))
+// KnownHostSecretDigests returns the current admin-token digest together with
+// digests of other protected sources already recorded by the authoritative
+// installation state. Callers supply those non-admin fingerprints because the
+// secret package deliberately does not decode application state.
+func KnownHostSecretDigests(additional ...string) (map[string]struct{}, error) {
+	parentFD, oldFD, before, err := openAdminToken(filepath.Dir(AdminTokenPath))
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +304,21 @@ func KnownHostSecretDigests() (map[string]struct{}, error) {
 		return nil, err
 	}
 	defer clear(data)
-	return map[string]struct{}{digest(data): {}}, nil
+	var after unix.Stat_t
+	if unix.Fstat(oldFD, &after) != nil || after.Dev != before.Dev || after.Ino != before.Ino || after.Size != before.Size || after.Mode != before.Mode || after.Uid != before.Uid || after.Gid != before.Gid || after.Nlink != before.Nlink || after.Mtim != before.Mtim || after.Ctim != before.Ctim {
+		return nil, fmt.Errorf("admin token source changed while reading")
+	}
+	result := map[string]struct{}{digest(data): {}}
+	for _, value := range additional {
+		if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+			return nil, fmt.Errorf("known protected secret fingerprint is invalid")
+		}
+		if _, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:")); err != nil {
+			return nil, fmt.Errorf("known protected secret fingerprint is invalid")
+		}
+		result[value] = struct{}{}
+	}
+	return result, nil
 }
 
 func CurrentAdminTokenFingerprint() (string, error) {
@@ -331,7 +349,7 @@ func openAdminToken(parent string) (int, int, unix.Stat_t, error) {
 		_ = unix.Close(parentFD)
 		return -1, -1, unix.Stat_t{}, fmt.Errorf("admin token parent is unsafe")
 	}
-	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		_ = unix.Close(parentFD)
 		return -1, -1, unix.Stat_t{}, err
@@ -346,7 +364,7 @@ func openAdminToken(parent string) (int, int, unix.Stat_t, error) {
 }
 
 func readAdminToken(parentFD int) ([]byte, error) {
-	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Openat(parentFD, filepath.Base(AdminTokenPath), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

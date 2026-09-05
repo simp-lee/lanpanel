@@ -75,7 +75,7 @@ func serviceUnit(description string, account identity.AccountIdentity, command, 
 		output.WriteString("Environment=" + environment + "\n")
 	}
 	if socket != "" {
-		output.WriteString("Sockets=lanpanel-management.socket\n")
+		output.WriteString("Sockets=lanpanel-management.socket\nStateDirectory=lanpanel-management-audit\nStateDirectoryMode=0700\n")
 	}
 	output.WriteString("NoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nLockPersonality=yes\nRestrictRealtime=yes\nUMask=0077\n")
 	if socket != "" {

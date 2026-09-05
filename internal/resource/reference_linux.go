@@ -102,7 +102,7 @@ func openExternal(path string, directory bool) (*os.File, error) {
 		last := index == len(components)-1
 		flags := unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_DIRECTORY
 		if last {
-			flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+			flags = unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
 			if directory {
 				flags |= unix.O_DIRECTORY
 			}
@@ -127,21 +127,37 @@ func openExternal(path string, directory bool) (*os.File, error) {
 }
 
 func ReadEnvironmentFile(path string) ([]string, error) {
+	values, _, err := ReadEnvironmentFileWithFingerprint(path)
+	return values, err
+}
+
+func ReadEnvironmentFileWithFingerprint(path string) ([]string, string, error) {
 	file, err := openExternal(path, false)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
 	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Mode&0o077 != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumEnvironmentBytes {
-		return nil, fmt.Errorf("environment file is unsafe")
+		return nil, "", fmt.Errorf("environment file is unsafe")
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maximumEnvironmentBytes+1))
-	if err != nil || int64(len(data)) != stat.Size {
+	var after unix.Stat_t
+	afterErr := unix.Fstat(int(file.Fd()), &after)
+	if err != nil || afterErr != nil || int64(len(data)) != stat.Size || after.Dev != stat.Dev || after.Ino != stat.Ino || after.Mode != stat.Mode || after.Uid != stat.Uid || after.Gid != stat.Gid || after.Nlink != stat.Nlink || after.Size != stat.Size || after.Mtim != stat.Mtim || after.Ctim != stat.Ctim {
 		clear(data)
-		return nil, fmt.Errorf("environment file changed")
+		return nil, "", fmt.Errorf("environment file changed")
 	}
 	defer clear(data)
+	values, err := parseEnvironmentData(data)
+	if err != nil {
+		return nil, "", err
+	}
+	digest := sha256.Sum256(data)
+	return values, "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func parseEnvironmentData(data []byte) ([]string, error) {
 	values := []string{}
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	seen := map[string]bool{}
@@ -166,26 +182,11 @@ func ReadEnvironmentFile(path string) ([]string, error) {
 }
 
 func validateEnvironmentFile(path string) (string, error) {
-	file, err := openExternal(path, false)
+	_, fingerprint, err := ReadEnvironmentFileWithFingerprint(path)
 	if err != nil {
 		return "", fmt.Errorf("environment file: %w", err)
 	}
-	defer func(ignore func() error) { _ = ignore() }(file.Close)
-	var stat unix.Stat_t
-	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Mode&0o077 != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumEnvironmentBytes {
-		return "", fmt.Errorf("environment file type, owner, mode, link, or size is unsafe")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maximumEnvironmentBytes+1))
-	if err != nil || int64(len(data)) != stat.Size {
-		clear(data)
-		return "", fmt.Errorf("environment file changed or exceeded its bound")
-	}
-	defer clear(data)
-	if _, err := ReadEnvironmentFile(path); err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(digest[:]), nil
+	return fingerprint, nil
 }
 
 func validEnvironmentName(value string) bool {

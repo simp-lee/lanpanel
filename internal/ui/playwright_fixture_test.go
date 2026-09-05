@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/application"
+	"lanpanel/internal/audit"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/session"
@@ -122,7 +123,7 @@ func TestPlaywrightFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: verifier, Sessions: manager, Profile: playwrightProfile{}, Actions: actions})
+	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: verifier, Sessions: manager, Profile: playwrightProfile{}, Actions: actions, Audit: audit.NewMemorySink()})
 	if err != nil {
 		t.Fatal(err)
 	}

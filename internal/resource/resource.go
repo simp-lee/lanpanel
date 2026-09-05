@@ -130,6 +130,11 @@ func ConfigDigest(resource domain.AppResource) (string, error) {
 }
 
 func ValidateCreate(current domain.Installation, candidate domain.AppResource) error {
+	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
+		if err := domain.RequireConnector(current); err != nil {
+			return err
+		}
+	}
 	if candidate.Lifecycle != domain.LifecycleActive || candidate.PublicationRecord.State != domain.PublicationUnpublished || candidate.PublicationRecord.UnpublishedGeneration != 1 || candidate.PublicationRecord.LastAppliedDigest != nil || candidate.PublicationRecord.LastAppliedBundle != nil || candidate.PublicationRecord.ActivationIntent != nil || candidate.PublicationRecord.ContractionIntent != nil || candidate.PublicationRecord.RuntimeObservation != nil || candidate.Target.Kind == domain.AppTargetLocalHTTP && (candidate.ManagedProcess == nil || candidate.ManagedProcess.Requested != domain.ProcessRequestedStopped || candidate.ManagedProcess.RuntimeObservation != nil || candidate.ManagedProcess.Applied != nil || candidate.ManagedProcess.LastJobID != "") || candidate.Target.Kind == domain.AppTargetTailnetHTTP && candidate.ManagedProcess != nil {
 		return fmt.Errorf("fresh resource must be active, sticky-unpublished, unapplied, and stopped")
 	}
@@ -152,6 +157,11 @@ func ValidateCreate(current domain.Installation, candidate domain.AppResource) e
 }
 
 func PrepareUpdate(current domain.Installation, candidate domain.AppResource) (domain.AppResource, error) {
+	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
+		if err := domain.RequireConnector(current); err != nil {
+			return domain.AppResource{}, err
+		}
+	}
 	var prior *domain.AppResource
 	for index := range current.Resources {
 		if current.Resources[index].ID == candidate.ID {

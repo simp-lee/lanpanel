@@ -165,6 +165,17 @@ func (m *Manager) Send(principal Principal, fingerprint string, send SocketSende
 	return send()
 }
 
+// Identity returns the non-secret token-source fingerprint for an authenticated actor.
+func (m *Manager) Identity(principal Principal) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	value := m.entries[principal.Selector]
+	if value == nil || principal.Generation != value.generation {
+		return "unknown"
+	}
+	return value.fingerprint
+}
+
 func (m *Manager) Logout(principal Principal) {
 	m.mu.Lock()
 	sockets := m.removeLocked(principal.Selector, m.entries[principal.Selector])

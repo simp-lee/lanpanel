@@ -4,6 +4,7 @@ package process
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	managedExecSchema       = "lanpanel.managed.exec.v1"
+	managedExecSchema       = "lanpanel.managed.exec.v2"
 	maximumManagedExecBytes = 32 << 10
 )
 
@@ -34,6 +35,7 @@ type ExecAuthority struct {
 	Endpoint      string                     `json:"endpoint"`
 	Policy        confinement.UnitPolicy     `json:"policy"`
 	Evidence      resource.ReferenceEvidence `json:"evidence"`
+	SecretDigests []string                   `json:"secret_digests"`
 }
 
 func LoadExecAuthority(resourceID string) (ExecAuthority, error) {
@@ -60,6 +62,9 @@ func LoadExecAuthority(resourceID string) (ExecAuthority, error) {
 	canonical, _ := json.Marshal(authority)
 	if !bytes.Equal(canonical, payload) || authority.SchemaVersion != managedExecSchema || authority.ResourceID != resourceID {
 		return ExecAuthority{}, fmt.Errorf("managed execution authority noncanonical")
+	}
+	if _, err := secretInventory(authority.SecretDigests); err != nil {
+		return ExecAuthority{}, err
 	}
 	return authority, nil
 }
@@ -102,7 +107,11 @@ func Execute(args []string) error {
 			return err
 		}
 	}
-	evidence, err := resource.ValidateServiceReferences(authority.Service, authority.UID, map[string]struct{}{})
+	knownSecrets, err := secretInventory(authority.SecretDigests)
+	if err != nil {
+		return err
+	}
+	evidence, err := resource.ValidateServiceReferences(authority.Service, authority.UID, knownSecrets)
 	if err != nil {
 		return err
 	}
@@ -111,9 +120,12 @@ func Execute(args []string) error {
 	}
 	environment := []string{"LANG=C", "LC_ALL=C"}
 	if authority.Service.EnvironmentFile != "" {
-		values, err := resource.ReadEnvironmentFile(authority.Service.EnvironmentFile)
+		values, fingerprint, err := resource.ReadEnvironmentFileWithFingerprint(authority.Service.EnvironmentFile)
 		if err != nil {
 			return err
+		}
+		if fingerprint != authority.Evidence.EnvironmentFingerprint {
+			return fmt.Errorf("managed environment reference changed")
 		}
 		environment = append(environment, values...)
 	}
@@ -159,6 +171,31 @@ func Execute(args []string) error {
 	}
 	argv := append([]string{authority.Service.Executable}, authority.Service.Arguments...)
 	return unix.Exec(authority.Service.Executable, argv, environment)
+}
+
+func secretInventory(values []string) (map[string]struct{}, error) {
+	if values == nil || !slices.IsSorted(values) {
+		return nil, fmt.Errorf("managed execution secret inventory is not canonical")
+	}
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !validSecretDigest(value) {
+			return nil, fmt.Errorf("managed execution secret inventory is not canonical")
+		}
+		if _, duplicate := result[value]; duplicate {
+			return nil, fmt.Errorf("managed execution secret inventory is not canonical")
+		}
+		result[value] = struct{}{}
+	}
+	return result, nil
+}
+
+func validSecretDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil && strings.ToLower(value) == value
 }
 
 func removeStaleBackend(path string, uid uint32) error {
