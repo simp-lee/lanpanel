@@ -19,6 +19,7 @@ import (
 	managedresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"os"
+	"reflect"
 )
 
 type ResourceDeleteResult struct {
@@ -87,7 +88,8 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	if err != nil {
 		return ResourceDeleteResult{}, err
 	}
-	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + target.ID, ActorIdentity: actorID, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: target.ID, CandidateDigest: resource.CurrentConfigDigest, CandidateBundle: owned.Checksum, PlanID: plan.ID}, ExpectedRevision: document.Revision})
+	deleteBinding := operations.ResourceDeleteBinding{InstallationID: installation.InstallationID, Resource: *resource, Ownership: owned}
+	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + target.ID, ActorIdentity: actorID, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: target.ID, CandidateDigest: resource.CurrentConfigDigest, CandidateBundle: owned.Checksum, PlanID: plan.ID}, ResourceDelete: &deleteBinding, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if admitErr != nil || releaseErr != nil {
 		return ResourceDeleteResult{}, errors.Join(admitErr, releaseErr)
@@ -127,25 +129,25 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 		}
 	}
 	freshOwned, ownershipErr := service.ownership.Read(target.ID)
-	deleteClosureDigest := digestLifecycle(struct{ ResourceID, ConfigDigest string }{target.ID, resource.CurrentConfigDigest})
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return ResourceDeleteResult{}, err
+	}
+	runtime := fixedResourceDeleteRuntime()
 	closedErr := error(nil)
-	if freshResource == nil || freshResource.Lifecycle != domain.LifecycleActive || freshResource.PublicationRecord.State != domain.PublicationUnpublished || freshResource.CurrentConfigDigest != resource.CurrentConfigDigest || resourceHasManagedCredential(freshInstallation, target.ID) || ownershipErr != nil || freshOwned.Checksum != owned.Checksum || freshResource != nil && !exactDeleteOwnership(*freshResource, freshOwned) {
+	if freshResource == nil || freshResource.Lifecycle != domain.LifecycleActive || freshResource.PublicationRecord.State != domain.PublicationUnpublished || !reflect.DeepEqual(*freshResource, deleteBinding.Resource) || resourceHasManagedCredential(freshInstallation, target.ID) || ownershipErr != nil || freshOwned.Checksum != owned.Checksum || freshResource != nil && !exactDeleteOwnership(*freshResource, freshOwned) {
 		closedErr = fmt.Errorf("resource delete authority changed under lock: %w", ownershipErr)
 	} else {
-		closedErr = verifyDeleteRuntimeClosed(ctx, *freshResource)
+		_, closedErr = runtime.closed(ctx, deleteBinding, state)
 	}
 	if closedErr != nil {
-		_, terminalErr := admitter.CompleteRecoveredResourceDelete(context.WithoutCancel(ctx), mutation, exposure, fresh.Revision, job.ID, target.ID, deleteClosureDigest, false)
+		_, terminalErr := admitter.CompleteRecoveredResourceDelete(context.WithoutCancel(ctx), mutation, exposure, fresh.Revision, job.ID, target.ID, digestLifecycle(deleteBinding), false)
 		return ResourceDeleteResult{}, errors.Join(closedErr, terminalErr)
 	}
 	resource = freshResource
 	installation = freshInstallation
 	owned = freshOwned
 	if err := operations.RequireNoActiveCertificateExpiry(fresh, target.ID); err != nil {
-		return ResourceDeleteResult{}, err
-	}
-	state, err := service.safety.ReadForRecovery(exposure)
-	if err != nil {
 		return ResourceDeleteResult{}, err
 	}
 	next := state
@@ -155,7 +157,7 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	tombstone := "delete/" + job.ID
 	for index := range next.Resources {
 		if next.Resources[index].ResourceID == target.ID {
-			if next.Resources[index].StickyUnpublished == nil || next.Resources[index].Ownership != safety.OwnershipOwned {
+			if next.Resources[index].StickyUnpublished == nil || next.Resources[index].Ownership != safety.OwnershipOwned || next.Resources[index].Closing != nil || next.Resources[index].Contraction != nil || next.Resources[index].ChallengePending != nil || next.Resources[index].Reactivating != nil {
 				return ResourceDeleteResult{}, fmt.Errorf("resource delete safety closure changed")
 			}
 			next.Resources[index].State = safety.ResourceDeleting
@@ -178,11 +180,14 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	if err := verifyDeleteRuntimeClosed(ctx, *resource); err != nil {
 		return ResourceDeleteResult{}, errors.Join(err, fmt.Errorf("resource cgroup or listener is not stopped"))
 	}
-	removed, err := cleanupDeleteInventory(*resource, installation)
+	removed, err := runtime.cleanup(ctx, *resource, installation)
 	if err != nil {
 		return ResourceDeleteResult{}, err
 	}
-	closureDigest := digestLifecycle(struct{ ResourceID, ConfigDigest string }{resource.ID, resource.CurrentConfigDigest})
+	closureDigest, err := runtime.closed(ctx, deleteBinding, state)
+	if err != nil {
+		return ResourceDeleteResult{}, err
+	}
 	current, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return ResourceDeleteResult{}, err
@@ -307,6 +312,18 @@ func ReconcileResourceDeletes(ctx context.Context) error {
 }
 
 func reconcileResourceDelete(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, intent operations.Reservation) error {
+	return reconcileResourceDeleteWithRuntime(ctx, service, admitter, mutation, exposure, intent, fixedResourceDeleteRuntime())
+}
+
+func reconcileResourceDeleteWithRuntime(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, intent operations.Reservation, runtime resourceDeleteRuntime) error {
+	if mutation == nil || !mutation.Active() || mutation.Authority() != service.manager.Authority() || exposure == nil || exposure.Validate() != nil || exposure.Authority() != service.manager.Authority() || exposure.Kind() != locks.Exposure || mutation.Target() != intent.Target || intent.ResourceDelete == nil {
+		return fmt.Errorf("resource deletion recovery requires exact frozen authority and locks")
+	}
+	currentIntent, err := admitter.OperationIntent(intent.JobID)
+	if err != nil || currentIntent.Phase != operations.PhaseLocalIntent || !reflect.DeepEqual(currentIntent.ResourceDelete, intent.ResourceDelete) {
+		return fmt.Errorf("resource deletion recovery intent changed: %w", err)
+	}
+	binding := *intent.ResourceDelete
 	document, err := service.normal.Read()
 	if err != nil {
 		return err
@@ -322,7 +339,20 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 			resource = &copy
 		}
 	}
-	closureDigest := digestLifecycle(struct{ ResourceID, ConfigDigest string }{intent.SafetyBinding.ResourceID, intent.SafetyBinding.CandidateDigest})
+	if installation.InstallationID != binding.InstallationID {
+		return fmt.Errorf("resource deletion installation changed")
+	}
+	expected := binding.Resource
+	if resource != nil && resource.Lifecycle == domain.LifecycleDeleting {
+		expected.Lifecycle = domain.LifecycleDeleting
+		expected.PublicationRecord.LastOperation = domain.OperationResourceDelete
+		expected.PublicationRecord.LastOperationResult = ""
+		expected.PublicationRecord.LastJobID = intent.JobID
+	}
+	if resource != nil && !reflect.DeepEqual(*resource, expected) {
+		return fmt.Errorf("resource deletion frozen inventory changed")
+	}
+	closureDigest := digestLifecycle(binding)
 	if err := operations.RequireNoActiveCertificateExpiry(document, intent.SafetyBinding.ResourceID); err != nil {
 		return err
 	}
@@ -367,12 +397,23 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 		} else if resource.Lifecycle != domain.LifecycleDeleting {
 			return fmt.Errorf("recovered resource delete lifecycle changed")
 		}
-		if err := verifyDeleteRuntimeClosed(ctx, *resource); err != nil {
-			return err
-		}
-		if _, err := cleanupDeleteInventory(*resource, installation); err != nil {
-			return err
-		}
+	}
+	if safetyResource == nil && resource != nil && resource.Lifecycle != domain.LifecycleDeleting {
+		return fmt.Errorf("recovered resource delete is not deleting")
+	}
+	if _, err := runtime.closed(ctx, binding, state); err != nil {
+		return err
+	}
+	cleanupResource := binding.Resource
+	cleanupResource.Lifecycle = domain.LifecycleDeleting
+	if _, err := runtime.cleanup(ctx, cleanupResource, installation); err != nil {
+		return err
+	}
+	closureDigest, err = runtime.closed(ctx, binding, state)
+	if err != nil {
+		return err
+	}
+	if safetyResource != nil {
 		after := state
 		after.Revision++
 		after.Resources = []safety.ResourceSafety{}
@@ -383,17 +424,6 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 		}
 		proof := &safety.DeleteConvergenceProof{ResourceID: resource.ID, TombstoneRef: "delete/" + intent.JobID, OwnershipDigest: owned.Checksum, RuntimeClosureDigest: closureDigest}
 		if _, err := service.safety.Commit(ctx, exposure, safety.RoleDelete, state.Revision, after, safety.TransitionProof{Delete: proof}); err != nil {
-			return err
-		}
-	}
-	if safetyResource == nil && resource != nil {
-		if resource.Lifecycle != domain.LifecycleDeleting {
-			return fmt.Errorf("recovered resource delete is not deleting")
-		}
-		if err := verifyDeleteRuntimeClosed(ctx, *resource); err != nil {
-			return err
-		}
-		if _, err := cleanupDeleteInventory(*resource, installation); err != nil {
 			return err
 		}
 	}
@@ -415,12 +445,6 @@ func reconcileResourceDelete(ctx context.Context, service *FixedService, admitte
 	if present {
 		if resource.Lifecycle != domain.LifecycleDeleting {
 			return fmt.Errorf("recovered resource delete is not deleting")
-		}
-		if err := verifyDeleteRuntimeClosed(ctx, *resource); err != nil {
-			return err
-		}
-		if _, err := cleanupDeleteInventory(*resource, installation); err != nil {
-			return err
 		}
 		if err := admitter.CommitResourceDeleteRemoval(ctx, mutation, exposure, document.Revision, intent.JobID, resource.ID); err != nil {
 			return err
@@ -467,10 +491,19 @@ func verifyDeleteRuntimeClosedWithCgroupRoot(ctx context.Context, cgroupRoot str
 	if resource.ManagedProcess.Requested != domain.ProcessRequestedStopped {
 		return fmt.Errorf("resource process is not requested stopped")
 	}
-	if resource.ManagedProcess.Applied == nil {
-		return nil
+	bundle := resource.ManagedProcess.Applied
+	if bundle == nil {
+		// Even a never-committed start must leave the resource's fixed cgroup
+		// and endpoints absent. These are observation targets, not an applied
+		// process identity and never authorize starting or adopting a process.
+		paths, err := managedresource.DerivePaths(resource.ID)
+		if err != nil || resource.Target.LocalHTTP == nil {
+			return fmt.Errorf("local process observation authority missing: %w", err)
+		}
+		local := resource.Target.LocalHTTP
+		bundle = &domain.ProcessBundle{Cgroup: "/lanpanel.slice/lanpanel-app.slice/" + paths.PolicyUnit + "/" + paths.ServiceUnit, FrontendEndpoint: paths.FrontendSocket, BackendEndpoint: paths.BackendSocket, EndpointSocketUnits: []string{paths.SocketUnit}, RelayRequired: local.EndpointKind == domain.LocalEndpointRelayUnix, TCPAddress: local.TCPAddress, TCPPort: local.TCPPort}
 	}
-	observation, err := managedprocess.ObserveStopped(ctx, cgroupRoot, *resource.ManagedProcess.Applied)
+	observation, err := managedprocess.ObserveStopped(ctx, cgroupRoot, *bundle)
 	if err != nil {
 		return err
 	}

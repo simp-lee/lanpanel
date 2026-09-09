@@ -34,6 +34,7 @@ GA_ROOT_REQUIRED_TESTS := TestLegoOrchestrationUsesEveryTypedProviderFrameAndRej
 	TestObserveIdentityAndPointerRejectModifiedBundleMaterial \
 	TestCertificatePointerBindsCandidateAndRestoresExactPriorIdentity \
 	TestInactiveCertificateCleanupResumesWithExactStageOwnership \
+	TestResourceCertificateInventoryCleanup \
 	TestNginxWorkerCanTraverseResourceLogDirectoryOnReopen
 
 build:

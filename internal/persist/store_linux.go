@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -648,7 +649,7 @@ func (store *Store) validateEntryTransitions(before, after map[string]json.RawMe
 		if err := validator(key, oldValue, newValue); err != nil {
 			return err
 		}
-		if namespace == "installations" && len(store.documentTransitionValidators) == 0 {
+		if namespace == "installations" && !slices.Contains(store.documentTransitionValidatorOwners, "operations.resource_transitions.v1") {
 			if err := rejectUnownedInstallationStateChange(oldValue, newValue); err != nil {
 				return err
 			}
@@ -703,8 +704,12 @@ func validateInstallationTransition(_ string, before, after json.RawMessage) err
 			return fmt.Errorf("new resource must start active, unpublished, unapplied, and stopped with a generation")
 		}
 	}
-	for id := range oldResources {
-		return fmt.Errorf("resource %q cannot disappear without its typed deletion transaction", id)
+	for id, resource := range oldResources {
+		if resource.Lifecycle != domain.LifecycleDeleting {
+			return fmt.Errorf("resource %q cannot disappear before its deleting tombstone", id)
+		}
+		// The canonical operation document validator verifies the matching
+		// running delete intent/job; this namespace check cannot inspect them.
 	}
 	return nil
 }
@@ -727,6 +732,10 @@ func rejectUnownedInstallationStateChange(before, after json.RawMessage) error {
 		if exists && (old.Lifecycle != resource.Lifecycle || !reflect.DeepEqual(old.PublicationRecord, resource.PublicationRecord) || !reflect.DeepEqual(old.ManagedProcess, resource.ManagedProcess)) {
 			return fmt.Errorf("resource %q lifecycle, applied publication, and process state require an operation intent", resource.ID)
 		}
+		delete(oldResources, resource.ID)
+	}
+	if len(oldResources) != 0 {
+		return fmt.Errorf("resource removal requires the canonical operation authority")
 	}
 	return nil
 }

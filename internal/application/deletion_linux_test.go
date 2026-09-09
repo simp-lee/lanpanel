@@ -58,7 +58,7 @@ func TestRecoveredDeleteKeepsOwnershipUntilNormalRemovalCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	binding := operations.SafetyBinding{ResourceID: resource.ID, CandidateDigest: resource.CurrentConfigDigest, CandidateBundle: owned.Checksum, PlanID: plan.ID}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + resource.ID, ActorIdentity: actor, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + resource.ID, ActorIdentity: actor, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ResourceDelete: &operations.ResourceDeleteBinding{InstallationID: recoveryResourceInstallation(&resource).InstallationID, Resource: resource, Ownership: owned}, ExpectedRevision: document.Revision})
 	if err != nil {
 		t.Fatal(err)
 	}

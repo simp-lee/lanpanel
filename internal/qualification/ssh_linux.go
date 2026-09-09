@@ -494,12 +494,13 @@ func (client *SSHClient) verifyPlatform(ctx context.Context, expected release.OS
 	if err != nil || strings.TrimSpace(string(stdout)) != "x86_64" {
 		return fmt.Errorf("remote architecture differs from amd64: %w", err)
 	}
-	stdout, _, err = client.runFixed(ctx, "/usr/bin/systemd --version")
+	// Profiles and bootstrap preflight bind the complete distro package version,
+	// not the abbreviated upstream version printed by systemd --version.
+	stdout, _, err = client.runFixed(ctx, "/usr/bin/dpkg-query --show --showformat='${Version}\\n' systemd")
 	if err != nil {
-		return fmt.Errorf("remote systemd identity is unavailable: %w", err)
+		return fmt.Errorf("remote systemd package identity is unavailable: %w", err)
 	}
-	fields := strings.Fields(strings.SplitN(string(stdout), "\n", 2)[0])
-	if len(fields) < 2 || fields[0] != "systemd" || fields[1] != expected.SystemdVersion {
+	if strings.TrimSpace(string(stdout)) != expected.SystemdVersion {
 		return fmt.Errorf("remote systemd version differs from qualification target profile")
 	}
 	return nil

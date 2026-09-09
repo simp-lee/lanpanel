@@ -280,9 +280,10 @@ type ContractionObservations struct {
 }
 
 var (
-	digestPattern = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{64}$`)
-	refPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
-	domainPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	digestPattern  = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{64}$`)
+	refPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	versionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+	domainPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
 )
 
 func ExpansionRequestDigest(request ExpansionRequest) (string, error) {

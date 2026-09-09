@@ -19,6 +19,7 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
@@ -150,6 +151,14 @@ type HeadscaleDeployBinding struct {
 	PreflightResult  preflight.Result           `json:"preflight_result"`
 }
 
+// ResourceDeleteBinding survives normal/safety removal so a resumed delete
+// can freshly verify the same endpoints and finish only its frozen inventory.
+type ResourceDeleteBinding struct {
+	InstallationID string             `json:"installation_id"`
+	Resource       domain.AppResource `json:"resource"`
+	Ownership      ownership.Record   `json:"ownership"`
+}
+
 type ExpiryGenerationRecord struct {
 	SchemaVersion    string    `json:"schema_version"`
 	ResourceID       string    `json:"resource_id"`
@@ -167,6 +176,7 @@ type Reservation struct {
 	CertificateHandoff  *CertificatePublicationHandoff  `json:"certificate_handoff,omitempty"`
 	HeadscaleBinding    *HeadscaleInitializationBinding `json:"headscale_initialization,omitempty"`
 	HeadscaleDeploy     *HeadscaleDeployBinding         `json:"headscale_deploy,omitempty"`
+	ResourceDelete      *ResourceDeleteBinding          `json:"resource_delete,omitempty"`
 	AdmissionSource     AdmissionSource                 `json:"admission_source"`
 	Operation           Type                            `json:"operation"`
 	Target              string                          `json:"target"`
@@ -325,6 +335,7 @@ type AdmitRequest struct {
 	SafetyBinding    SafetyBinding
 	HeadscaleBinding *HeadscaleInitializationBinding
 	HeadscaleDeploy  *HeadscaleDeployBinding
+	ResourceDelete   *ResourceDeleteBinding
 	ExpectedRevision uint64
 }
 type ConsumeRequest struct {
@@ -562,6 +573,9 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err := validateHeadscaleDeployBinding(request.Operation, request.SafetyBinding, request.HeadscaleDeploy); err != nil {
 		return jobs.Record{}, err
 	}
+	if err := validateResourceDeleteBinding(request.Operation, request.SafetyBinding, request.ResourceDelete); err != nil {
+		return jobs.Record{}, err
+	}
 	if request.Operation == HeadscaleInitialize {
 		if err := preflight.RequireExpansionResultForRequest(request.HeadscaleBinding.PreflightResult, request.HeadscaleBinding.PreflightRequest, observedNow); err != nil {
 			return jobs.Record{}, err
@@ -587,8 +601,23 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, CreatedAt: observedNow}
+	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, ResourceDelete: request.ResourceDelete, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
+		switch request.Operation {
+		case ResourceCreate, ResourceUpdate, Publish, ProcessStart, HeadscaleInitialize, HeadscaleDeploy:
+			if err := requireCompletedRemovedResourceDeletes(transaction); err != nil {
+				return err
+			}
+		}
+		if request.Operation == ResourceDelete {
+			installation, err := loadInstallation(transaction)
+			if err != nil {
+				return err
+			}
+			if err := matchResourceDeleteAdmission(installation, request.ResourceDelete); err != nil {
+				return err
+			}
+		}
 		if request.Operation == Publish {
 			installation, err := loadInstallation(transaction)
 			if err != nil {
@@ -2346,6 +2375,9 @@ func (admitter *Admitter) PutJournal(ctx context.Context, mutation *MutationLeas
 				}
 			}
 		}
+		if err := retainResourceCertificateArtifact(transaction, journal); err != nil {
+			return err
+		}
 		raw, err := persist.EncodeEntry(journal)
 		if err != nil {
 			return err
@@ -4021,8 +4053,8 @@ func (admitter *Admitter) CommitResourceDeleteBegin(ctx context.Context, mutatio
 			if resource.ID != resourceID {
 				continue
 			}
-			if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished {
-				return fmt.Errorf("resource delete requires unpublished active resource")
+			if resource.Lifecycle != domain.LifecycleActive || resource.PublicationRecord.State != domain.PublicationUnpublished || intent.ResourceDelete == nil || intent.ResourceDelete.InstallationID != installation.InstallationID || !reflect.DeepEqual(*resource, intent.ResourceDelete.Resource) {
+				return fmt.Errorf("resource delete requires exact frozen unpublished resource")
 			}
 			resource.Lifecycle = domain.LifecycleDeleting
 			resource.PublicationRecord.LastOperation = domain.OperationResourceDelete
@@ -7456,6 +7488,13 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 			}
 			continue
 		}
+		if !slices.Equal(oldResource.PublicationRecord.CertificateInventory, resource.PublicationRecord.CertificateInventory) {
+			if err := validateCertificateInventoryTransition(before, after, oldResource, resource); err != nil {
+				return err
+			}
+			delete(oldResources, resource.ID)
+			continue
+		}
 		if !resourceConfigurationEqual(oldResource, resource) {
 			if err := validateResourceUpdateConfigurationTransition(before, after, oldResource, resource); err != nil {
 				return fmt.Errorf("resource %q: %w", resource.ID, err)
@@ -7667,6 +7706,9 @@ func validateNewResourceAuthority(document persist.Document, resource domain.App
 			copy := intent
 			match = &copy
 		}
+	}
+	if len(resource.PublicationRecord.CertificateInventory) != 0 {
+		return fmt.Errorf("new resource cannot supply certificate inventory")
 	}
 	if match == nil || match.Target != string(plans.TargetInstallation) || match.AdmissionSource != AdmissionUI || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.UnpublishedGeneration != 1 {
 		return fmt.Errorf("new resource lacks exact authenticated durable creation authority")
@@ -8081,6 +8123,9 @@ func validateReservation(value Reservation) error {
 		return err
 	}
 	if err := validateHeadscaleDeployBinding(value.Operation, value.SafetyBinding, value.HeadscaleDeploy); err != nil {
+		return err
+	}
+	if err := validateResourceDeleteBinding(value.Operation, value.SafetyBinding, value.ResourceDelete); err != nil {
 		return err
 	}
 	if value.SchemaVersion != "lanpanel.operation.reservation.v1" || value.JobID == "" || !validType(value.Operation) || value.Target == "" || value.CreatedAt.IsZero() || !digest(value.SafetyDigest) || value.JournalSafetyDigest != "" && !exactDigest(value.JournalSafetyDigest) || value.ContractionDigest != "" && (!exactDigest(value.ContractionDigest) || !isContraction(value.Operation)) || value.SecretFingerprint != "" && (!exactDigest(value.SecretFingerprint) || value.Operation != AdminTokenRotate) || value.OperationBinding != "" && !exactDigest(value.OperationBinding) || validateAdmissionSource(value.Operation, value.AdmissionSource, value.PlanID) != nil {

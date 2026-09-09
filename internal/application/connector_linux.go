@@ -243,12 +243,7 @@ func ExecuteConnectorLogin(ctx context.Context, actor Actor, payload ConnectorLo
 	defer func(ignore func() error) { _ = ignore() }(set.Close)
 	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	terminalNoEffect := func(cause error) error {
-		current, readErr := service.normal.Read()
-		if readErr != nil {
-			return errors.Join(cause, readErr)
-		}
-		_, completeErr := admitter.Complete(context.WithoutCancel(ctx), mutation, exposure, current.Revision, job.ID, "no_effect", nil, []jobs.Postcondition{{Kind: "connector_login_not_started", Status: jobs.PostconditionKnown, Identity: job.ID}}, "connector_login_failed")
-		return errors.Join(cause, completeErr)
+		return completeConnectorLoginNotStarted(ctx, service, admitter, mutation, exposure, job.ID, cause)
 	}
 	installed, err := readCommittedReleaseIdentity()
 	if err != nil {
@@ -314,6 +309,15 @@ func ExecuteConnectorLogin(ctx context.Context, actor Actor, payload ConnectorLo
 		return ConnectorMutationResult{}, err
 	}
 	return ConnectorMutationResult{JobID: job.ID}, nil
+}
+
+func completeConnectorLoginNotStarted(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, jobID string, cause error) error {
+	current, err := service.normal.Read()
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	_, err = admitter.Complete(context.WithoutCancel(ctx), mutation, exposure, current.Revision, jobID, "no_effect", nil, []jobs.Postcondition{{Kind: "connector_login_not_started", Status: jobs.PostconditionVerified, Identity: jobID}}, "connector_login_failed")
+	return errors.Join(cause, err)
 }
 
 func ConnectorLoginTempAuthorities() (map[string]bool, error) {

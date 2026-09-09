@@ -79,13 +79,13 @@ func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("9", 64)
 	expected := ExpectedProfile{
 		ID: "debian", VersionID: "13", Architecture: runtime.GOARCH,
-		SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest,
+		SystemdVersion: "1:257.8-1~deb13u1", NginxVersion: "1.26.3-3+deb13u1", PackageSnapshotDigest: digest,
 		ManagedConfinement: ManagedConfinementProfile{KernelRelease: "6.12.1", CgroupMode: "unified_v2"},
 	}
 	observed := InstalledProfileObservation{
 		Architecture: runtime.GOARCH, Platform: PlatformInfo{ID: "debian", VersionID: "13"},
 		KernelRelease: "6.12.1", CgroupMode: "unified_v2",
-		Packages: PackageObservation{Ready: true, Identity: "package-observation", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest},
+		Packages: PackageObservation{Ready: true, Identity: "package-observation", SystemdVersion: "1:257.8-1~deb13u1", NginxVersion: "1.26.3-3+deb13u1", PackageSnapshotDigest: digest},
 	}
 	if err := VerifyInstalledProfile(expected, observed); err != nil {
 		t.Fatalf("matching installed profile rejected: %v", err)
@@ -96,8 +96,8 @@ func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
 	}{
 		{name: "os_profile", change: func(value *InstalledProfileObservation) { value.Platform.VersionID = "14" }},
 		{name: "kernel", change: func(value *InstalledProfileObservation) { value.KernelRelease = "6.12.2" }},
-		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "257.2" }},
-		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "1.26.1" }},
+		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "1:257.8-1~deb13u2" }},
+		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "1.26.3-3+deb13u2" }},
 		{name: "package_snapshot", change: func(value *InstalledProfileObservation) {
 			value.Packages.PackageSnapshotDigest = "sha256:" + strings.Repeat("8", 64)
 		}},
@@ -120,9 +120,9 @@ func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
 func TestParseBootstrapDPKGStatusClassifiesHeldPackages(t *testing.T) {
 	for _, status := range []string{"install ok installed", "hold ok installed"} {
 		t.Run(status, func(t *testing.T) {
-			fixture := []byte("Package: systemd\nStatus: " + status + "\nVersion: 257.1\nArchitecture: amd64\nDescription: fixture\n\ttab continuation\n")
+			fixture := []byte("Package: systemd\nStatus: " + status + "\nVersion: 1:257.8-1~deb13u1\nArchitecture: amd64\nDescription: fixture\n\ttab continuation\n")
 			installed, partial, err := parseBootstrapDPKGStatus(fixture)
-			if err != nil || partial || len(installed) != 1 || installed[0].Name != "systemd" || installed[0].Version != "257.1" || installed[0].Architecture != "amd64" {
+			if err != nil || partial || len(installed) != 1 || installed[0].Name != "systemd" || installed[0].Version != "1:257.8-1~deb13u1" || installed[0].Architecture != "amd64" {
 				t.Fatalf("installed=%#v partial=%t err=%v", installed, partial, err)
 			}
 		})

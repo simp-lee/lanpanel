@@ -104,6 +104,13 @@ func probeDomain(ctx context.Context, probe NegativeProbe, sni, host, correlatio
 		return err
 	}
 	defer func(ignore func() error) { _ = ignore() }(raw.Close)
+	deadline := time.Now().Add(3 * time.Second)
+	if requestDeadline, present := ctx.Deadline(); present && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	if err := raw.SetDeadline(deadline); err != nil {
+		return err
+	}
 	connection := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	if err := connection.HandshakeContext(ctx); err != nil {
 		return err

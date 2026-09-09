@@ -96,6 +96,75 @@ func interruptedConnectorLogin(t *testing.T, phase operations.Phase) (resourceRe
 	return fixture, job.ID
 }
 
+func TestConnectorLoginPreflightFailureTerminalizesAndAllowsSameProcessRetry(t *testing.T) {
+	ctx := context.Background()
+	fixture, jobID := interruptedConnectorLogin(t, operations.PhaseLocalIntent)
+	service := fixture.open(t)
+	defer func() { _ = service.Close() }()
+	document, err := service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original operations.Reservation
+	if err := json.Unmarshal(document.Entries["intents/"+jobID], &original); err != nil {
+		t.Fatal(err)
+	}
+	originalPlan, err := plans.LoadEntries(document.Entries, original.PlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err := service.Admitter(originalPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, mutation, exposure := fixture.acquire(t, service, "connector")
+	cause := errors.New("connector already logged in")
+	completionErr := completeConnectorLoginNotStarted(ctx, service, admitter, mutation, exposure, jobID, cause)
+	if !errors.Is(completionErr, cause) {
+		t.Fatalf("lost preflight error: %v", completionErr)
+	}
+	if err := errors.Join(operations.ReleaseExposure(mutation, exposure), set.Close()); err != nil {
+		t.Fatal(err)
+	}
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobs.LoadEntries(document.Entries, jobID)
+	if err != nil || job.Status != jobs.StatusTerminal || job.Result != jobs.ResultFailed {
+		t.Fatalf("preflight left running job: %+v %v completion=%v", job, err, completionErr)
+	}
+	intent, err := admitter.OperationIntent(jobID)
+	if err != nil || intent.Phase != operations.PhaseTerminal {
+		t.Fatalf("preflight left active intent: %+v %v", intent, err)
+	}
+	admission, err := service.manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admission.Release() }()
+	store, err := plans.NewStore(service.normal, plans.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := store.Create(ctx, admission, document.Revision, plans.Spec{Operation: string(operations.ConnectorLogin), Target: plans.Target{Kind: plans.TargetConnector}, ActorIdentity: "ui/test/generation/1", Config: plans.DigestBinding{Applicable: true, Digest: intent.SafetyBinding.CandidateDigest}, ExposureSummary: "connector_login", Prerequisites: "one_time_key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter, err = service.Admitter(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err = service.normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ConnectorLogin, Target: "connector", ActorIdentity: plan.ActorIdentity, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{CandidateDigest: plan.Config.Digest, CandidateBundle: plan.Config.Digest, PlanID: plan.ID}, ExpectedRevision: document.Revision})
+	if err != nil {
+		t.Fatalf("fresh login blocked until restart: %v", err)
+	}
+}
+
 type recoveryConnectorRunner struct {
 	t       *testing.T
 	keyPath string

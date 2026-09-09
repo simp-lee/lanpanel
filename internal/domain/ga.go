@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"lanpanel/internal/acme"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/certificates"
 	"net/netip"
 	"net/url"
 	"path/filepath"
@@ -415,6 +416,7 @@ type ProcessBundle struct {
 }
 
 type PublicationRecord struct {
+	CertificateInventory              []certificates.Artifact      `json:"certificate_inventory,omitempty"`
 	State                             PublicationState             `json:"state"`
 	UnpublishedGeneration             uint64                       `json:"unpublished_generation"`
 	LastAppliedDigest                 *string                      `json:"last_applied_digest,omitempty"`
@@ -987,6 +989,10 @@ func ValidateInstallation(installation Installation) error {
 		staticRootIDs[root.ID] = struct{}{}
 		staticRootOwners[root.ID] = root.OwnerResourceID
 	}
+	certificateOwners := map[string]string{}
+	if installation.Headscale != nil && installation.Headscale.Certificate != nil && installation.Headscale.Certificate.Authority != nil {
+		certificateOwners[installation.Headscale.Certificate.Authority.CertificateID] = "headscale"
+	}
 	resourceIDs := make(map[string]struct{}, len(installation.Resources))
 	for index := range installation.Resources {
 		resource := &installation.Resources[index]
@@ -994,6 +1000,12 @@ func ValidateInstallation(installation Installation) error {
 			return fmt.Errorf("resource id %q is duplicated", resource.ID)
 		}
 		resourceIDs[resource.ID] = struct{}{}
+		for _, artifact := range resource.PublicationRecord.CertificateInventory {
+			if owner, exists := certificateOwners[artifact.CertificateID]; exists && owner != resource.ID {
+				return fmt.Errorf("certificate inventory belongs to another resource")
+			}
+			certificateOwners[artifact.CertificateID] = resource.ID
+		}
 		if err := validateResource(*resource, credentialIDs, credentialOwners, staticRootIDs); err != nil {
 			return fmt.Errorf("resources[%d]: %w", index, err)
 		}
@@ -1526,6 +1538,9 @@ func validateProcessBundle(bundle ProcessBundle) error {
 }
 
 func validatePublicationRecord(record PublicationRecord, publication AppPublication, currentConfigDigest string) error {
+	if err := certificates.ValidateArtifacts(record.CertificateInventory); err != nil {
+		return err
+	}
 	kind := publication.Kind
 	if record.UnpublishedGeneration == 0 {
 		return fmt.Errorf("publication_record.unpublished_generation must be nonzero")

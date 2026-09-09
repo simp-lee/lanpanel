@@ -60,7 +60,7 @@ func RemoveInactiveBundle(certificateIdentity string, generation uint64, expecte
 		return fmt.Errorf("active certificate bundle cannot be removed")
 	}
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return syncCertificateDirectory(FixedBundlesRoot)
 	} else if err != nil {
 		return err
 	}

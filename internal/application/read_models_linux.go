@@ -5,7 +5,6 @@ package application
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/closure"
@@ -17,7 +16,6 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/preflight"
-	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/safety"
 	"os"
 	"reflect"
@@ -255,60 +253,7 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 			result.Resources = append(result.Resources, item)
 			continue
 		}
-		if resource.PublicationRecord.State == domain.PublicationUnpublished {
-			item.ObservedStatus = "runtime_unknown"
-			item.Reason = "unpublished configuration has no fresh runtime closure proof"
-			if runtimeHealthy && !manifestContainsResource(manifest, resource.ID) {
-				item.ObservedStatus = "closed"
-				item.Reason = "fresh Nginx graph and runtime exclude the unpublished resource"
-			}
-			result.Resources = append(result.Resources, item)
-			continue
-		}
-		_, targetErr := probeResourceTarget(ctx, resource)
-		processErr := error(nil)
-		if resource.ManagedProcess != nil && resource.ManagedProcess.Requested == domain.ProcessRequestedRunning {
-			if resource.ManagedProcess.Applied == nil {
-				processErr = fmt.Errorf("managed process applied identity missing")
-			} else {
-				endpointKind := domain.LocalEndpointKind("")
-				if resource.Target.LocalHTTP != nil {
-					endpointKind = resource.Target.LocalHTTP.EndpointKind
-				}
-				observation, observeErr := managedprocess.Observe(ctx, "/sys/fs/cgroup", *resource.ManagedProcess.Applied, endpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
-				processErr = errors.Join(observeErr, managedprocess.VerifyRunning(observation))
-			}
-		}
-		bundle := resource.PublicationRecord.LastAppliedBundle
-		switch {
-		case bundle == nil:
-			item.Reason = "published resource has no applied bundle"
-		case bundle.Kind == domain.PublicationTemporaryHTTP:
-			if runtimeHealthy && manifestContainsResource(manifest, resource.ID) && targetErr == nil && processErr == nil {
-				item.ObservedStatus = "healthy"
-				item.Reason = "fresh target, process, Nginx graph, and runtime evidence match"
-			} else if targetErr != nil || processErr != nil {
-				item.Reason = errors.Join(targetErr, processErr).Error()
-			} else {
-				item.Reason = "temporary publication runtime evidence is incomplete"
-			}
-		case bundle.Kind == domain.PublicationDomainHTTPS:
-			status, statusErr := ObserveDomainLiveSources(resource.ID)
-			if statusErr != nil {
-				item.Reason = statusErr.Error()
-				break
-			}
-			item.ObservedStatus = status.Status
-			item.Reason = status.Reason
-			if status.Status == "source_verified_runtime_unknown" && runtimeHealthy && manifestContainsResource(manifest, resource.ID) && targetErr == nil && processErr == nil {
-				item.ObservedStatus = "healthy"
-				item.Reason = "fresh source, target, process, Nginx graph, and runtime evidence match"
-			} else if targetErr != nil || processErr != nil {
-				item.Reason = errors.Join(targetErr, processErr).Error()
-			}
-		default:
-			item.Reason = "applied publication kind is unsupported"
-		}
+		item = observeResourceRuntimeStatus(ctx, resource, item, runtimeHealthy, manifest, fixedResourceStatusObservers())
 		result.Resources = append(result.Resources, item)
 	}
 	for _, independent := range state.Resources {
