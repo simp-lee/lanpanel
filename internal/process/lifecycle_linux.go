@@ -32,6 +32,48 @@ const (
 	unixOwnerRelay       = "relay-cgroup"
 )
 
+type RuntimeViolationKind string
+
+const (
+	RuntimeViolationPolicyInvalid RuntimeViolationKind = "policy_invalid"
+	RuntimeViolationExtraListener RuntimeViolationKind = "extra_listener"
+)
+
+type RuntimeViolation struct {
+	Kind  RuntimeViolationKind
+	Cause error
+}
+
+func (violation *RuntimeViolation) Error() string {
+	if violation == nil || violation.Cause == nil {
+		return "managed process runtime violation"
+	}
+	return "managed process runtime violation (" + string(violation.Kind) + "): " + violation.Cause.Error()
+}
+
+func (violation *RuntimeViolation) Unwrap() error {
+	if violation == nil {
+		return nil
+	}
+	return violation.Cause
+}
+
+func NewRuntimeViolation(kind RuntimeViolationKind, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("runtime authority differs")
+	}
+	return &RuntimeViolation{Kind: kind, Cause: cause}
+}
+
+func RuntimeViolationReason(kind RuntimeViolationKind) (string, error) {
+	switch kind {
+	case RuntimeViolationPolicyInvalid, RuntimeViolationExtraListener:
+		return string(kind) + "_contracted", nil
+	default:
+		return "", fmt.Errorf("managed process runtime violation kind is invalid")
+	}
+}
+
 type RuntimeObservation struct {
 	Cgroup         confinement.CgroupObservation
 	SocketPresent  bool
@@ -95,7 +137,7 @@ func Observe(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle
 				continue
 			}
 			if endpointKind == domain.LocalEndpointTCPSocketActivation && (listener.Address != wantAddress || listener.Port != bundle.TCPPort) {
-				return RuntimeObservation{}, fmt.Errorf("inherited TCP listener differs from declared address or port")
+				return RuntimeObservation{}, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("inherited TCP listener differs from declared address or port"))
 			}
 			inetInodes = append(inetInodes, listener.Inode)
 		}
@@ -111,7 +153,7 @@ func Observe(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle
 			return RuntimeObservation{}, err
 		}
 		if len(inetInodes) != 0 {
-			return RuntimeObservation{}, fmt.Errorf("managed process cgroup owns forbidden INET listener")
+			return RuntimeObservation{}, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("managed process cgroup owns forbidden INET listener"))
 		}
 		if err := requireSocket(bundle.FrontendEndpoint); err != nil {
 			return RuntimeObservation{}, err
@@ -140,7 +182,7 @@ func Observe(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle
 			return RuntimeObservation{}, err
 		}
 		if len(inetInodes) != 0 {
-			return RuntimeObservation{}, fmt.Errorf("managed process cgroup owns forbidden INET listener")
+			return RuntimeObservation{}, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("managed process cgroup owns forbidden INET listener"))
 		}
 		if err := requireSocket(bundle.FrontendEndpoint); err != nil {
 			return RuntimeObservation{}, err
@@ -182,7 +224,10 @@ func Observe(ctx context.Context, cgroupRoot string, bundle domain.ProcessBundle
 		relayCgroupDigest = relay.Digest
 		result.SocketPresent = true
 	case domain.LocalEndpointTCPSocketActivation:
-		if len(inetInodes) != 1 {
+		if len(inetInodes) > 1 {
+			return RuntimeObservation{}, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("managed process cgroup owns multiple INET listeners"))
+		}
+		if len(inetInodes) == 0 {
 			return RuntimeObservation{}, fmt.Errorf("exact inherited TCP listener not observed")
 		}
 		listeners, err := readUnixListeners("/proc/net/unix")
@@ -504,11 +549,14 @@ func verifyUnixListeners(listeners []unixListener, expected []unixEndpointExpect
 		seenRoles[expectation.Role] = struct{}{}
 		seenPaths[expectation.Path] = struct{}{}
 		matches := byPath[expectation.Path]
-		if len(matches) != 1 {
+		if len(matches) > 1 {
+			return nil, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("listening Unix endpoint %q is duplicated", expectation.Role))
+		}
+		if len(matches) == 0 {
 			return nil, fmt.Errorf("exact listening Unix endpoint %q not observed", expectation.Role)
 		}
 		if matches[0].Type != unix.SOCK_STREAM {
-			return nil, fmt.Errorf("unix listener %q is not SOCK_STREAM", expectation.Role)
+			return nil, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("unix listener %q is not SOCK_STREAM", expectation.Role))
 		}
 		ownerNames := append([]string(nil), expectation.Owners...)
 		slices.Sort(ownerNames)
@@ -541,7 +589,7 @@ func verifyUnixListeners(listeners []unixListener, expected []unixEndpointExpect
 				continue
 			}
 			if _, expected := allowed[owner][listener.Inode]; !expected {
-				return nil, fmt.Errorf("%s owns an undeclared Unix listener", owner)
+				return nil, NewRuntimeViolation(RuntimeViolationExtraListener, fmt.Errorf("%s owns an undeclared Unix listener", owner))
 			}
 		}
 	}

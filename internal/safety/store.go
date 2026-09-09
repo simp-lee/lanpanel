@@ -942,10 +942,28 @@ func challengeTransition(role ClearRole, before, after *ChallengePending) error 
 	if role != RoleChallenge {
 		return fmt.Errorf("wrong challenge writer")
 	}
+	if before != nil && after != nil && sameHTTPChallengeOperation(*before, *after) {
+		beforeActive := before.Token != ""
+		afterActive := after.Token != ""
+		if beforeActive != afterActive {
+			return nil
+		}
+	}
 	if before != nil && after != nil && after.Generation <= before.Generation {
 		return fmt.Errorf("challenge replacement requires a fresh generation")
 	}
 	return nil
+}
+
+func sameHTTPChallengeOperation(left, right ChallengePending) bool {
+	if left.Method != "http-01" || right.Method != "http-01" || len(left.Hosts) == 0 || len(right.Hosts) == 0 {
+		return false
+	}
+	left.Host, right.Host = left.Hosts[0], right.Hosts[0]
+	left.Token, right.Token = "", ""
+	left.TokenPath, right.TokenPath = "", ""
+	left.KeyAuthorizationDigest, right.KeyAuthorizationDigest = "", ""
+	return reflect.DeepEqual(left, right)
 }
 
 func reactivationTransition(role ClearRole, priorGeneration uint64, before, after *Reactivating) error {

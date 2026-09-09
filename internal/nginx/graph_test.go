@@ -117,27 +117,83 @@ func TestStartupReloadGuardNeverCrossesContraction(t *testing.T) {
 	_, manifest := installTestGraph(t)
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: "app-one", State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner")}}
-	installation := &domain.Installation{Resources: []domain.AppResource{{ID: "app-one", PublicationRecord: domain.PublicationRecord{State: domain.PublicationPublished, LastAppliedDigest: &manifest.Entries[0].Digest, LastAppliedBundle: &domain.PublicationBundle{ConfigDigest: manifest.Entries[0].Digest, Kind: domain.PublicationDomainHTTPS, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.test"}}}}}}}
-	decision := Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Now: time.Now().UTC()})
+	installation := &domain.Installation{InstallationID: manifest.InstallationID, Resources: []domain.AppResource{{ID: "app-one", PublicationRecord: domain.PublicationRecord{State: domain.PublicationPublished, LastAppliedDigest: &manifest.Entries[0].Digest, LastAppliedBundle: &domain.PublicationBundle{ConfigDigest: manifest.Entries[0].Digest, Kind: domain.PublicationDomainHTTPS, Listeners: []domain.BundleListenerIdentity{{Network: "tcp", Port: 443}}, DomainHTTPS: &domain.DomainHTTPSBundleIdentity{ExactDomains: []string{"app.example.test"}}}}}}}
+	ownership := map[string]string{"app-one": testDigest("owner")}
+	decision := Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Ownership: ownership, Now: time.Now().UTC()})
 	if decision.Allowed {
 		t.Fatalf("pre-S13 App graph was allowed: %#v", decision)
 	}
 	manifest.Entries = nil
-	decision = Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Now: time.Now().UTC()})
+	decision = Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Ownership: ownership, Now: time.Now().UTC()})
 	if !decision.Allowed {
 		t.Fatalf("closed baseline rejected: %#v", decision)
 	}
 	state.Resources[0].GenerationSequence = 1
 	state.Resources[0].StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "closed"}
 	manifest.Entries = []Entry{{Kind: EntryApp, ResourceID: "app-one", Relative: "apps-enabled/app-one.conf", Digest: testDigest("site"), Domains: []string{"app.example.test"}, Generation: 1}}
-	if decision = Guard(GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: time.Now().UTC()}); decision.Allowed {
+	if decision = Guard(GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: installation, Ownership: ownership, Now: time.Now().UTC()}); decision.Allowed {
 		t.Fatalf("sticky App graph allowed: %#v", decision)
 	}
 	state.StopFenceSequence = 1
 	state.StopFence = nil
 	state.GlobalClose = safety.GlobalClose{Phase: safety.GlobalCloseClosing, Generation: 1}
-	if decision = Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Now: time.Now().UTC()}); decision.Allowed {
+	if decision = Guard(GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Ownership: ownership, Now: time.Now().UTC()}); decision.Allowed {
 		t.Fatalf("global close crossed: %#v", decision)
+	}
+}
+
+func TestReloadGuardRequiresExactHTTP01HostTokenWebrootAndGeneration(t *testing.T) {
+	_, manifest := installTestGraph(t)
+	resourceID := "app-one"
+	ownerDigest := testDigest("owner")
+	pending := safety.ChallengePending{
+		Generation:             2,
+		PlanID:                 "plan-one",
+		Method:                 "http-01",
+		ConfigDigest:           testDigest("config"),
+		SANIdentity:            testDigest("san"),
+		ACMEBinding:            testDigest("acme"),
+		CertificateIdentity:    "cert_00000000000000000000000000000001",
+		Host:                   "app.example.test",
+		Hosts:                  []string{"app.example.test", "www.example.test"},
+		Token:                  "abcdefghijklmnopqrstuv",
+		TokenPath:              "/.well-known/acme-challenge/abcdefghijklmnopqrstuv",
+		KeyAuthorizationDigest: testDigest("key-authorization"),
+		Webroot:                "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001",
+		BootstrapIdentity:      testDigest("bootstrap"),
+		BaseMarkers:            []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}},
+	}
+	entry := Entry{Kind: EntryChallenge, ResourceID: resourceID, Relative: ChallengesDirectory + "/" + resourceID + ".conf", Digest: testDigest("entry"), Domains: []string{pending.Host}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: pending.Generation, Challenge: &ChallengeSite{Generation: pending.Generation, Host: pending.Host, Token: pending.Token, TokenPath: pending.TokenPath, KeyAuthorizationDigest: pending.KeyAuthorizationDigest, Webroot: pending.Webroot}}
+	manifest.Entries = []Entry{entry}
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: resourceID, GenerationSequence: 2, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownerDigest, ChallengePending: &pending}}
+	installation := &domain.Installation{InstallationID: manifest.InstallationID, Resources: []domain.AppResource{{ID: resourceID}}}
+	input := GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: installation, Ownership: map[string]string{resourceID: ownerDigest}, Now: time.Now().UTC()}
+	if decision := Guard(input); !decision.Allowed {
+		t.Fatalf("exact HTTP-01 authority rejected: %#v", decision)
+	}
+
+	crossHost := *entry.Challenge
+	crossHost.Host = "www.example.test"
+	input.Manifest.Entries[0].Challenge = &crossHost
+	input.Manifest.Entries[0].Domains = []string{"www.example.test"}
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("cross-Host HTTP-01 route was allowed")
+	}
+	input.Manifest.Entries[0] = entry
+	input.Manifest.Entries[0].Challenge = &ChallengeSite{Generation: pending.Generation, Host: pending.Host, Token: "differentabcdefghijkl", TokenPath: "/.well-known/acme-challenge/differentabcdefghijkl", KeyAuthorizationDigest: pending.KeyAuthorizationDigest, Webroot: pending.Webroot}
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("cross-token HTTP-01 route was allowed")
+	}
+	input.Manifest.Entries[0] = entry
+	input.Manifest.Entries[0].Challenge = &ChallengeSite{Generation: pending.Generation, Host: pending.Host, Token: pending.Token, TokenPath: pending.TokenPath, KeyAuthorizationDigest: pending.KeyAuthorizationDigest, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000002"}
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("cross-webroot HTTP-01 route was allowed")
+	}
+	input.Manifest.Entries[0] = entry
+	input.Manifest.Entries[0].Generation++
+	if decision := Guard(input); decision.Allowed {
+		t.Fatal("cross-generation HTTP-01 route was allowed")
 	}
 }
 
@@ -151,13 +207,27 @@ func TestStartupReloadGuardAllowsOnlyExactDurableDomainAuthority(t *testing.T) {
 	entry := Entry{Kind: EntryApp, ResourceID: resourceID, Relative: AppsDirectory + "/app-one.conf", Digest: bundle.SiteIdentity, Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: bundle.Generation, Domain: &DomainSite{Hosts: []string{"app.example.test"}, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", AuthMode: "public", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel/app-one.sock"}}
 	manifest.Entries = []Entry{entry}
 	app := domain.AppResource{ID: resourceID, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: domain.AppAccessPublic}}, PublicationRecord: domain.PublicationRecord{State: domain.PublicationPublished, UnpublishedGeneration: 1, LastAppliedDigest: &bundle.ConfigDigest, LastAppliedBundle: &bundle}}
-	installation := &domain.Installation{Resources: []domain.AppResource{app}}
+	installation := &domain.Installation{InstallationID: manifest.InstallationID, Resources: []domain.AppResource{app}}
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: resourceID, GenerationSequence: 2, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownershipDigest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, LastTrustedWall: now.Add(-time.Minute), NotAfter: now.Add(time.Hour)}}}
 	input := GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Ownership: map[string]string{resourceID: ownershipDigest}, Now: now}
 	if decision := Guard(input); !decision.Allowed {
 		t.Fatalf("exact committed domain App rejected: %#v", decision)
 	}
+	input.Manifest.InstallationID = "ins_other"
+	if decision := Guard(input); decision.Allowed || !strings.Contains(decision.Reason, "installation identity") {
+		t.Fatalf("cross-installation disk graph was not diagnosed: %#v", decision)
+	}
+	input.Manifest.InstallationID = installation.InstallationID
+	orphanID := "orphan-one"
+	orphanDigest := testDigest("orphan")
+	input.Safety.Resources = append(input.Safety.Resources, safety.ResourceSafety{ResourceID: orphanID, State: safety.ResourceActive, Ownership: safety.OwnershipOrphan, OwnershipDigest: orphanDigest})
+	input.Ownership[orphanID] = orphanDigest
+	if decision := Guard(input); decision.Allowed || !strings.Contains(decision.Reason, "clean-host rebuild") {
+		t.Fatalf("one-sided ownership orphan did not block the complete graph: %#v", decision)
+	}
+	input.Safety.Resources = input.Safety.Resources[:1]
+	delete(input.Ownership, orphanID)
 	input.Ownership[resourceID] = testDigest("foreign")
 	if decision := Guard(input); decision.Allowed {
 		t.Fatal("ownership-mismatched domain App was allowed")
@@ -187,7 +257,7 @@ func TestReloadGuardAllowsExactActivatingDomainAndRejectsStalePlan(t *testing.T)
 	candidateDigest, _ := publicationBundleDigest(bundle)
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: resourceID, GenerationSequence: 2, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("owner"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, Reactivating: &safety.Reactivating{Generation: 2, PriorGeneration: 1, PlanID: intent.PlanID, CandidateDigest: bundle.ConfigDigest, CandidateBundle: candidateDigest, BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotPresent, Generation: 1}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}, CertificateUntil: now.Add(time.Hour)}}}
-	input := GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: &domain.Installation{Resources: []domain.AppResource{app}}, Ownership: map[string]string{resourceID: testDigest("owner")}, Now: now}
+	input := GuardInput{Action: GuardReload, Manifest: manifest, Safety: state, Installation: &domain.Installation{InstallationID: manifest.InstallationID, Resources: []domain.AppResource{app}}, Ownership: map[string]string{resourceID: testDigest("owner")}, Now: now}
 	if decision := Guard(input); !decision.Allowed {
 		t.Fatalf("exact activating domain candidate rejected: %#v", decision)
 	}

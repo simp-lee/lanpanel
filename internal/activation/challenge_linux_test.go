@@ -52,13 +52,17 @@ func challengeTransactionFixture(t *testing.T) (nginx.Paths, filetxn.Owner, chal
 	}
 
 	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/root/account.key", AccountKeyFingerprint: challengeTestDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
-	prepared, err := challenge.Prepare(challenge.Request{ResourceID: "res_challenge", PlanID: "plan_challenge", Generation: 2, ConfigDigest: challengeTestDigest, Domains: []string{"app.example.test"}, Binding: binding, CertificateIdentity: "cert_challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_challenge", BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}})
+	base, err := challenge.Prepare(challenge.Request{ResourceID: "res_challenge", PlanID: "plan_challenge", Generation: 2, ConfigDigest: challengeTestDigest, Domains: []string{"app.example.test"}, Binding: binding, CertificateIdentity: "cert_challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_challenge", BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := challenge.PresentHTTPForResource("res_challenge", base, "app.example.test", "abcdefghijklmnopqrstuv", challengeTestDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	prior := *prepared.Entry
 	prior.Generation = 1
-	prior.Challenge = &nginx.ChallengeSite{Hosts: append([]string(nil), prior.Domains...), Webroot: "/var/lib/lanpanel/certificates/webroot/cert_prior"}
+	prior.Challenge = &nginx.ChallengeSite{Generation: 1, Host: "app.example.test", Token: "priorabcdefghijklmnopq", TokenPath: "/.well-known/acme-challenge/priorabcdefghijklmnopq", KeyAuthorizationDigest: challengeTestDigest, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_challenge"}
 	prior.Digest = "sha256:" + strings.Repeat("0", 64)
 	prior.Digest, err = nginx.DigestEntry(prior)
 	if err != nil {
@@ -137,7 +141,7 @@ func TestReloadAuthorityChecksRuntimeIdentityAtGuard(t *testing.T) {
 func challengeReloadTestSnapshot(prepared challenge.Prepared) ReloadAuthoritySnapshot {
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prepared.Entry.ResourceID, GenerationSequence: prepared.Safety.Generation, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: challengeTestDigest, ChallengePending: &prepared.Safety}}
-	return ReloadAuthoritySnapshot{Safety: state, Installation: domain.Installation{InstallationID: "ins_challenge"}, Ownership: map[string]string{prepared.Entry.ResourceID: challengeTestDigest}}
+	return ReloadAuthoritySnapshot{Safety: state, Installation: domain.Installation{InstallationID: "ins_challenge", Resources: []domain.AppResource{{ID: prepared.Entry.ResourceID}}}, Ownership: map[string]string{prepared.Entry.ResourceID: challengeTestDigest}}
 }
 
 func challengeReloadTestAuthority(prepared challenge.Prepared) ChallengeReloadAuthority {
@@ -148,8 +152,11 @@ func challengeReloadTestAuthority(prepared challenge.Prepared) ChallengeReloadAu
 func challengePreparedForEntry(prepared challenge.Prepared, entry nginx.Entry) challenge.Prepared {
 	prepared.Entry = &entry
 	prepared.Safety.Generation = entry.Generation
-	prepared.Safety.Host = entry.Domains[0]
-	prepared.Safety.Hosts = append([]string(nil), entry.Domains...)
+	prepared.Safety.Host = entry.Challenge.Host
+	prepared.Safety.Hosts = []string{entry.Challenge.Host}
+	prepared.Safety.Token = entry.Challenge.Token
+	prepared.Safety.TokenPath = entry.Challenge.TokenPath
+	prepared.Safety.KeyAuthorizationDigest = entry.Challenge.KeyAuthorizationDigest
 	prepared.Safety.Webroot = entry.Challenge.Webroot
 	return prepared
 }
@@ -168,6 +175,47 @@ func TestChallengeExpansionGuardRejectsBeforeDiskMutation(t *testing.T) {
 		t.Fatal("ownership-mismatched challenge expansion was allowed")
 	}
 	assertChallengeSnapshotRestored(t, paths, owner, *prepared.Entry, before)
+}
+
+func TestAbsentChallengeDiskGraphStillRequiresRuntimeContraction(t *testing.T) {
+	paths, owner, prepared, prior := challengeTransactionFixture(t)
+	if _, _, err := nginx.RemoveEntry(context.Background(), paths, owner, prior); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := nginx.SnapshotActivation(paths, owner, *prepared.Entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workersRemain := errors.New("challenge workers survived rollback reload")
+	attempts := 0
+	runtime := ChallengeGraphRuntime{
+		Activate: func(_ context.Context, _ nginx.Manifest, authorize func() error) error {
+			attempts++
+			if err := authorize(); err != nil {
+				return err
+			}
+			return workersRemain
+		},
+		Observe: func(context.Context, nginx.Manifest) ([]closure.ProcessIdentity, error) {
+			return nil, workersRemain
+		},
+		Restore: func(context.Context, nginx.Manifest, []closure.ProcessIdentity, func() error) error {
+			return workersRemain
+		},
+	}
+	remove := func(ctx context.Context) (nginx.Manifest, []string, error) {
+		return nginx.RemoveEntry(ctx, paths, owner, *prepared.Entry)
+	}
+	_, err = CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, snapshot.Manifest, challengeReloadTestAuthority(prepared), remove, runtime)
+	var failure *Failure
+	if !errors.As(err, &failure) || failure.PriorRestored || attempts != 1 {
+		t.Fatalf("disk absence was accepted without runtime closure: attempts=%d err=%v", attempts, err)
+	}
+	assertChallengeSnapshotRestored(t, paths, owner, *prepared.Entry, snapshot)
+	workersRemain = nil
+	if _, err := CommitChallengeGraph(context.Background(), paths, owner, *prepared.Entry, snapshot, snapshot.Manifest, challengeReloadTestAuthority(prepared), remove, runtime); err != nil || attempts != 2 {
+		t.Fatalf("verified runtime contraction did not converge: attempts=%d err=%v", attempts, err)
+	}
 }
 
 func TestChallengeInstallFaultsRestoreExactPriorGraph(t *testing.T) {
@@ -398,7 +446,11 @@ func TestChallengeRemovalGuardRejectsChangedOwnershipBeforeMutationOrReload(t *t
 	paths, owner, prepared, prior := challengeTransactionFixture(t)
 	expected := challengePreparedForEntry(prepared, prior)
 	binding := acme.Binding{DirectoryURL: "https://acme.example.test/directory", AccountKeyPath: "/root/account.key", AccountKeyFingerprint: challengeTestDigest, AccountEmail: "admin@example.test", TermsAccepted: true, Method: acme.ChallengeHTTP01, CredentialFiles: []acme.CredentialFile{}}
-	retained, err := challenge.Prepare(challenge.Request{ResourceID: "res_retained", PlanID: "plan_retained", Generation: 1, ConfigDigest: challengeTestDigest, Domains: []string{"retained.example.test"}, Binding: binding, CertificateIdentity: "cert_retained", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_retained", BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}})
+	retainedBase, err := challenge.Prepare(challenge.Request{ResourceID: "res_retained", PlanID: "plan_retained", Generation: 1, ConfigDigest: challengeTestDigest, Domains: []string{"retained.example.test"}, Binding: binding, CertificateIdentity: "cert_retained", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_retained", BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := challenge.PresentHTTPForResource("res_retained", retainedBase, "retained.example.test", "retainedabcdefghijklmn", challengeTestDigest)
 	if err != nil {
 		t.Fatal(err)
 	}

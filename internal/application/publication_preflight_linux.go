@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"lanpanel/internal/activation"
+	"lanpanel/internal/closure"
 	managedconnector "lanpanel/internal/connector"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/ownership"
@@ -15,10 +16,7 @@ import (
 	"lanpanel/internal/safety"
 	"lanpanel/internal/target"
 	"net/netip"
-	"os"
 	"slices"
-	"strconv"
-	"strings"
 	"time"
 )
 
@@ -35,16 +33,20 @@ func evaluateTemporaryPreflight(ctx context.Context, installation domain.Install
 	authority := installedProfileAuthority(identity)
 	confinement := profile.ManagedConfinement
 	ownedListeners := []preflight.OwnedListenerAuthority{}
-	if owned != nil {
-		for _, listener := range owned.Listeners {
-			if listener.Protocol == "tcp" && listener.Address == "0.0.0.0" && listener.Port == publication.Port {
-				inode, err := nginxListenerInode("/proc/net/tcp", publication.Port)
-				if err != nil {
-					return preflight.ExpansionRequest{}, preflight.Result{}, err
-				}
-				ownedListeners = append(ownedListeners, preflight.OwnedListenerAuthority{Protocol: "tcp", Address: "0.0.0.0", Port: publication.Port, SocketInode: inode, IdentityDigest: preflight.OwnedListenerDigest("tcp", "0.0.0.0", publication.Port, inode)})
-			}
+	if ownsTemporaryListener(owned, resource.ID, publication.Port) {
+		host, err := activation.NewFixedHost()
+		if err != nil {
+			return preflight.ExpansionRequest{}, preflight.Result{}, err
 		}
+		runtime, err := host.ObserveCurrent(ctx)
+		if err != nil {
+			return preflight.ExpansionRequest{}, preflight.Result{}, fmt.Errorf("temporary Nginx listener ownership invalid: %w", err)
+		}
+		listener, err := temporaryListenerAuthorityFromRuntime(runtime, publication.Port)
+		if err != nil {
+			return preflight.ExpansionRequest{}, preflight.Result{}, err
+		}
+		ownedListeners = append(ownedListeners, listener)
 	}
 	request := preflight.ExpansionRequest{
 		Scope: preflight.ExpansionTemporaryHTTP, Target: "resource/" + resource.ID, Generation: resource.PublicationRecord.UnpublishedGeneration, OwnedListeners: ownedListeners,
@@ -127,27 +129,30 @@ func evaluateDomainPreflight(ctx context.Context, installation domain.Installati
 	return request, result, err
 }
 
-func nginxListenerInode(path string, port uint16) (uint64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
+func ownsTemporaryListener(record *ownership.Record, resourceID string, port uint16) bool {
+	if record == nil || record.ResourceID != resourceID || record.State != ownership.Owned {
+		return false
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines[1:] {
-		fields := strings.Fields(line)
-		if len(fields) < 10 || fields[3] != "0A" {
-			continue
-		}
-		parts := strings.Split(fields[1], ":")
-		if len(parts) != 2 {
-			continue
-		}
-		value, err := strconv.ParseUint(parts[1], 16, 16)
-		if err == nil && uint16(value) == port {
-			return strconv.ParseUint(fields[9], 10, 64)
+	identity := ownership.ListenerIdentity(resourceID, "tcp", "0.0.0.0", port)
+	for _, listener := range record.Listeners {
+		if listener.Protocol == "tcp" && listener.Address == "0.0.0.0" && listener.Port == port && listener.IdentityDigest == identity {
+			return true
 		}
 	}
-	return 0, fmt.Errorf("owned Nginx listener not observed")
+	return false
+}
+
+func temporaryListenerAuthorityFromRuntime(runtime closure.RuntimeSnapshot, port uint16) (preflight.OwnedListenerAuthority, error) {
+	expected := fmt.Sprintf("tcp:0.0.0.0:%d", port)
+	if err := closure.VerifyServing(runtime, runtime.Generation, []string{expected}); err != nil {
+		return preflight.OwnedListenerAuthority{}, fmt.Errorf("owned temporary Nginx listener is not in the verified runtime generation: %w", err)
+	}
+	for _, listener := range runtime.Listeners {
+		if listener.Protocol == "tcp" && listener.Address == "0.0.0.0" && listener.Port == port && listener.Inode != 0 {
+			return preflight.OwnedListenerAuthority{Protocol: listener.Protocol, Address: listener.Address, Port: listener.Port, SocketInode: listener.Inode, IdentityDigest: preflight.OwnedListenerDigest(listener.Protocol, listener.Address, listener.Port, listener.Inode)}, nil
+		}
+	}
+	return preflight.OwnedListenerAuthority{}, fmt.Errorf("owned temporary Nginx listener is not in the verified runtime generation")
 }
 
 func loadInstalledReleaseIdentity() (release.InstallIdentity, error) {
@@ -193,11 +198,7 @@ func probeResourceTarget(ctx context.Context, resource domain.AppResource) (targ
 		if sourceErr != nil || !slices.Contains(verified.Observation.LocalIPs, source) {
 			return target.Evidence{}, fmt.Errorf("tailnet source IP is not a fresh local connector identity")
 		}
-		endpointIdentity := digestLifecycle(struct {
-			ControlURL, IP string
-			Port           uint16
-			ValidUntil     time.Time
-		}{verified.Observation.ControlURL, address.String(), resource.Target.TailnetHTTP.Port, verified.Observation.ValidUntil})
+		endpointIdentity := tailnetEndpointIdentity(verified.Observation, source, address, resource.Target.TailnetHTTP.Port)
 		accessMode := domain.AppAccessPublic
 		hostName := "lanpanel-target.invalid"
 		if resource.Publication.DomainHTTPS != nil {
@@ -220,26 +221,27 @@ func probeResourceTarget(ctx context.Context, resource domain.AppResource) (targ
 	}
 	authority, err := process.LoadExecAuthority(resource.ID)
 	if err != nil {
-		return target.Evidence{}, err
+		return target.Evidence{}, bindProcessRuntimeViolation(resource, err)
 	}
 	if authority.Policy.Digest != bundle.PolicyDigest || authority.Evidence.ExecutableDigest != bundle.ExecutableDigest || authority.UID != bundle.ApplicationUID || authority.GID != bundle.ApplicationGID {
-		return target.Evidence{}, fmt.Errorf("managed process authority changed")
+		violation := process.NewRuntimeViolation(process.RuntimeViolationPolicyInvalid, fmt.Errorf("managed process authority changed"))
+		return target.Evidence{}, bindProcessRuntimeViolation(resource, violation)
 	}
 	host, err := process.NewFixedHost()
 	if err != nil {
 		return target.Evidence{}, err
 	}
 	if err := host.VerifyApplied(ctx, resource.ID, *bundle, authority.Policy); err != nil {
-		return target.Evidence{}, err
+		return target.Evidence{}, bindProcessRuntimeViolation(resource, err)
 	}
 	runtime, err := process.Observe(ctx, "/sys/fs/cgroup", *bundle, resource.Target.LocalHTTP.EndpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
 	if err != nil {
-		return target.Evidence{}, err
+		return target.Evidence{}, bindProcessRuntimeViolation(resource, err)
 	}
 	if err := process.VerifyRunning(runtime); err != nil {
 		return target.Evidence{}, err
 	}
-	endpointIdentity := bundle.PolicyDigest + "/" + runtime.Digest
+	endpointIdentity := managedProcessEndpointIdentity(bundle.PolicyDigest, runtime.Digest)
 	accessMode := domain.AppAccessPublic
 	hostName := "lanpanel-target.invalid"
 	if resource.Publication.DomainHTTPS != nil {
@@ -259,6 +261,31 @@ func probeResourceTarget(ctx context.Context, resource domain.AppResource) (targ
 		return target.Evidence{}, err
 	}
 	return target.Probe(ctx, request, transport)
+}
+
+func tailnetEndpointIdentity(observation managedconnector.Observation, source, peer netip.Addr, port uint16) string {
+	return digestLifecycle(struct {
+		ClientVersion  string `json:"client_version"`
+		ControlURL     string `json:"control_url"`
+		SourceIP       string `json:"source_ip"`
+		PeerIP         string `json:"peer_ip"`
+		Port           uint16 `json:"port"`
+		RouteInterface string `json:"route_interface"`
+	}{
+		ClientVersion:  observation.ClientVersion,
+		ControlURL:     observation.ControlURL,
+		SourceIP:       source.String(),
+		PeerIP:         peer.String(),
+		Port:           port,
+		RouteInterface: "tailscale0",
+	})
+}
+
+func managedProcessEndpointIdentity(policyDigest, runtimeDigest string) string {
+	return digestLifecycle(struct {
+		PolicyDigest  string `json:"policy_digest"`
+		RuntimeDigest string `json:"runtime_digest"`
+	}{PolicyDigest: policyDigest, RuntimeDigest: runtimeDigest})
 }
 
 func targetEvidenceGeneration(resource domain.AppResource) uint64 {

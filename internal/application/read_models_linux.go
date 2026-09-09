@@ -72,7 +72,7 @@ type JobResult struct {
 
 func observeHeadscaleStatus(ctx context.Context, installation domain.Installation, state safety.State) error {
 	if installation.Headscale == nil || !installation.Headscale.Enabled || installation.Headscale.Applied == nil || installation.Headscale.Certificate == nil {
-		return fmt.Errorf("Headscale lifecycle authority is incomplete")
+		return fmt.Errorf("headscale lifecycle authority is incomplete")
 	}
 	journal, err := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0}).Read()
 	if err != nil {
@@ -84,7 +84,7 @@ func observeHeadscaleStatus(ctx context.Context, installation domain.Installatio
 	candidate := journal.Candidate
 	expectedApplied, err := control.AppliedIdentity(candidate)
 	if err != nil || !reflect.DeepEqual(*installation.Headscale.Applied, expectedApplied) || candidate.HeadscaleID != installation.Headscale.ID || journal.Certificate.ID != candidate.CertificateID || !certificateBundleMatches(*installation.Headscale.Certificate, journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)) {
-		return fmt.Errorf("Headscale durable identity differs from the committed control journal")
+		return fmt.Errorf("headscale durable identity differs from the committed control journal")
 	}
 	if err := certificates.VerifyBundleIdentity(journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)); err != nil {
 		return err
@@ -95,10 +95,10 @@ func observeHeadscaleStatus(ctx context.Context, installation domain.Installatio
 	}
 	pointer, err := certificates.ObservePointer(journal.Certificate.ID)
 	if err != nil {
-		return fmt.Errorf("Headscale served certificate pointer is unavailable: %w", err)
+		return fmt.Errorf("headscale served certificate pointer is unavailable: %w", err)
 	}
 	if pointer != bundlePath {
-		return fmt.Errorf("Headscale served certificate pointer is not current")
+		return fmt.Errorf("headscale served certificate pointer is not current")
 	}
 	accounts, err := identity.HeadscaleAccounts(installation.InstallationID, installation.Headscale.ID)
 	if err != nil {
@@ -106,10 +106,10 @@ func observeHeadscaleStatus(ctx context.Context, installation domain.Installatio
 	}
 	present, identities, err := identity.InspectAccounts(accounts)
 	if err != nil {
-		return fmt.Errorf("Headscale service account observation failed: %w", err)
+		return fmt.Errorf("headscale service account observation failed: %w", err)
 	}
 	if !present || len(identities) != 1 {
-		return fmt.Errorf("Headscale service account observation is incomplete")
+		return fmt.Errorf("headscale service account observation is incomplete")
 	}
 	account := identities[0]
 	config, err := os.ReadFile(candidate.Paths.Config)
@@ -137,13 +137,20 @@ func observeHeadscaleStatus(ctx context.Context, installation domain.Installatio
 		return err
 	}
 	if !bytes.Equal(privateProbe, activationBundle.PrivateProbe) {
-		return fmt.Errorf("Headscale private probe unit differs from activation authority")
+		return fmt.Errorf("headscale private probe unit differs from activation authority")
 	}
 	runtime, err := control.NewSystemdRuntime()
 	if err != nil {
 		return err
 	}
-	if _, err := runtime.ObserveActive(ctx, rendered, account); err != nil {
+	if _, err := runtime.ObserveCommitted(ctx, rendered, account); err != nil {
+		return err
+	}
+	activationHost, err := control.NewActivationHost()
+	if err != nil {
+		return err
+	}
+	if err := activationHost.ObserveCommittedActivation(ctx, activationBundle); err != nil {
 		return err
 	}
 	if err := runtime.ProbePrivate(ctx, candidate); err != nil {
@@ -153,7 +160,7 @@ func observeHeadscaleStatus(ctx context.Context, installation domain.Installatio
 		return err
 	}
 	if !activeCertificateMatchesExpected(state.Headscale.ActiveCertificate, &safety.ActiveCertificateAuthority{Generation: journal.Certificate.Generation, Fingerprint: journal.Certificate.Fingerprint, Binding: journal.Certificate.BindingIdentity, NotAfter: journal.Certificate.NotAfter, LastTrustedWall: journal.Certificate.LastTrustedWall}) {
-		return fmt.Errorf("Headscale active certificate safety authority differs")
+		return fmt.Errorf("headscale active certificate safety authority differs")
 	}
 	return nil
 }
@@ -188,14 +195,9 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 	}
 	runtimeHealthy := false
 	if profileErr == nil && auditErr == nil {
-		listeners := []string{}
-		for _, entry := range manifest.Entries {
-			listeners = append(listeners, entry.Listeners...)
-		}
-		sort.Strings(listeners)
-		listeners = slices.Compact(listeners)
+		listeners := expectedNginxRuntimeListeners(manifest)
 		snapshot, observeErr := (closure.ProcObserver{UnitCgroup: "/system.slice/lanpanel-nginx.service", Executable: "/usr/sbin/nginx", ExpectedArgv: "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;", PIDPath: nginx.FixedPaths().PIDPath, Generation: manifest.GenerationID, OwnedListeners: listeners}).Observe(ctx)
-		runtimeHealthy = observeErr == nil && snapshot.Complete && snapshot.Master != nil
+		runtimeHealthy = observeErr == nil && closure.VerifyServing(snapshot, manifest.GenerationID, listeners) == nil
 		if runtimeHealthy {
 			ownershipAuthority, ownershipErr := fixedOwnershipAuthority(service.ownership)
 			runtimeHealthy = ownershipErr == nil && nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Ownership: ownershipAuthority, Now: time.Now().UTC()}).Allowed
@@ -227,10 +229,31 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 			result.Connector = "verified"
 		}
 	}
+	normalResources := make(map[string]bool, len(installation.Resources))
+	safetyResources := make(map[string]safety.ResourceSafety, len(state.Resources))
+	for _, resource := range installation.Resources {
+		normalResources[resource.ID] = true
+	}
+	for _, resource := range state.Resources {
+		safetyResources[resource.ResourceID] = resource
+	}
 	for _, resource := range installation.Resources {
 		item := ResourceStatus{ResourceID: resource.ID, Name: resource.Name, TargetKind: resource.Target.Kind, Publication: resource.PublicationRecord.State, ObservedStatus: "unknown"}
 		if resource.ManagedProcess != nil {
 			item.ProcessRequested = resource.ManagedProcess.Requested
+		}
+		independent, present := safetyResources[resource.ID]
+		if !present {
+			item.ObservedStatus = "one_sided_authority"
+			item.Reason = "normal resource lacks independent safety/ownership authority; keep ingress closed and use configuration export and clean-host rebuild"
+			result.Resources = append(result.Resources, item)
+			continue
+		}
+		if independent.Ownership == safety.OwnershipOrphan {
+			item.ObservedStatus = "ownership_orphan"
+			item.Reason = "independent ownership orphan blocks publication; do not adopt or delete it; use configuration export and clean-host rebuild"
+			result.Resources = append(result.Resources, item)
+			continue
 		}
 		if resource.PublicationRecord.State == domain.PublicationUnpublished {
 			item.ObservedStatus = "runtime_unknown"
@@ -288,7 +311,31 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 		}
 		result.Resources = append(result.Resources, item)
 	}
+	for _, independent := range state.Resources {
+		if normalResources[independent.ResourceID] {
+			continue
+		}
+		status := "one_sided_authority"
+		reason := "resource exists only in independent safety/ownership inventory; publication is blocked; keep ingress closed and use configuration export and clean-host rebuild"
+		if independent.Ownership == safety.OwnershipOrphan {
+			status = "ownership_orphan"
+			reason = "independent ownership orphan has no normal resource authority; publication is blocked; do not adopt or delete it; use configuration export and clean-host rebuild"
+		}
+		result.Resources = append(result.Resources, ResourceStatus{ResourceID: independent.ResourceID, ObservedStatus: status, Reason: reason})
+	}
+	sort.Slice(result.Resources, func(i, j int) bool { return result.Resources[i].ResourceID < result.Resources[j].ResourceID })
 	return result, nil
+}
+
+func expectedNginxRuntimeListeners(manifest nginx.Manifest) []string {
+	listeners := []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp::::80", "tcp::::443"}
+	for _, entry := range manifest.Entries {
+		for _, listener := range entry.Listeners {
+			listeners = append(listeners, strings.Replace(listener, "tcp:[::]:", "tcp::::", 1))
+		}
+	}
+	sort.Strings(listeners)
+	return slices.Compact(listeners)
 }
 
 func manifestContainsResource(manifest nginx.Manifest, resourceID string) bool {

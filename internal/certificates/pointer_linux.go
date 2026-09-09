@@ -40,6 +40,10 @@ func RemoveInactiveBundle(certificateIdentity string, generation uint64, expecte
 	if err != nil || uid == 0 || gid == 0 {
 		return fmt.Errorf("inactive certificate cleanup identity invalid")
 	}
+	stage, err := identity.CertificateStageIdentityFor(certificateIdentity)
+	if err != nil || stage.UID != uid || stage.GID != gid {
+		return fmt.Errorf("inactive certificate cleanup owner differs")
+	}
 	activeRoot, err := unix.Open(FixedActiveRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
@@ -63,41 +67,10 @@ func RemoveInactiveBundle(certificateIdentity string, generation uint64, expecte
 	if ValidateBundleIdentity(expected) != nil {
 		return fmt.Errorf("inactive certificate cleanup bundle authority invalid")
 	}
-	if err := verifyBundleTarget(path, expected); err != nil {
+	if err := VerifyBundleCleanupIdentity(certificateIdentity, generation, expected); err != nil {
 		return err
 	}
-	remaining := 16
-	var remove func(string) error
-	remove = func(current string) error {
-		remaining--
-		if remaining < 0 {
-			return fmt.Errorf("certificate cleanup inventory unbounded")
-		}
-		info, err := os.Lstat(current)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("certificate cleanup path unsafe")
-		}
-		stat, ok := info.Sys().(*unix.Stat_t)
-		if !ok || stat.Uid != uid || stat.Gid != gid {
-			return fmt.Errorf("certificate cleanup owner changed")
-		}
-		if info.IsDir() {
-			entries, err := os.ReadDir(current)
-			if err != nil {
-				return err
-			}
-			for _, entry := range entries {
-				if err := remove(filepath.Join(current, entry.Name())); err != nil {
-					return err
-				}
-			}
-		}
-		return os.Remove(current)
-	}
-	if err := remove(path); err != nil {
+	if err := removeVerifiedBundle(path, nil); err != nil {
 		return err
 	}
 	parent, err := os.Open(filepath.Dir(path))

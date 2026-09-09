@@ -20,7 +20,6 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
-	"lanpanel/internal/release"
 	"lanpanel/internal/reservations"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
@@ -853,12 +852,8 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 	if resource.Publication.Kind != domain.PublicationTemporaryHTTP {
 		return plans.Plan{}, fmt.Errorf("publication type unsupported")
 	}
-	installed, err := loadInstalledReleaseIdentity()
-	if err != nil {
-		return plans.Plan{}, fmt.Errorf("temporary publication requires an installed qualification identity: %w", err)
-	}
-	if installed.Kind != release.InstallQualification {
-		return plans.Plan{}, fmt.Errorf("temporary_ip_http is available only for qualification installs")
+	if _, err := loadInstalledReleaseIdentity(); err != nil {
+		return plans.Plan{}, fmt.Errorf("temporary publication requires an installed release identity: %w", err)
 	}
 	if resource.Target.WebSocket.Enabled || !publishTargetConfigured(installation, *resource) {
 		return plans.Plan{}, fmt.Errorf("temporary publication requires exact running local target without WebSocket")
@@ -900,7 +895,7 @@ func (s *FixedService) createPublishPlan(ctx context.Context, authority string, 
 		applied = plans.DigestBinding{Applicable: true, Digest: *resource.PublicationRecord.LastAppliedDigest}
 	}
 	temporary := resource.Publication.TemporaryHTTP
-	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence}, ExposureSummary: fmt.Sprintf("url=http://%s:%d/ listener=0.0.0.0:%d target=resource/%s", temporary.PublicIPv4, temporary.Port, temporary.Port, resource.ID), Prerequisites: publication.PlaintextWarning, Lifetime: 10 * time.Minute}
+	spec := plans.Spec{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: authority, Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Applied: applied, Evidence: []plans.Evidence{preflightEvidence, readinessEvidence}, ExposureSummary: fmt.Sprintf("url=http://%s:%d/ listener=0.0.0.0:%d auth=none cidrs=none static=disabled goaccess=disabled certificate=none target=resource/%s", temporary.PublicIPv4, temporary.Port, temporary.Port, resource.ID), Prerequisites: publication.PlaintextWarning, Lifetime: 10 * time.Minute}
 	_ = request
 	admission, err := s.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {

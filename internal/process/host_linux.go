@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -219,6 +220,13 @@ func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) er
 }
 
 func (host Host) VerifyApplied(ctx context.Context, resourceID string, bundle domain.ProcessBundle, policy confinement.UnitPolicy) error {
+	if err := verifyListenGuard(resourceID, bundle.ApplicationUID, policy); err != nil {
+		var violation *RuntimeViolation
+		if errors.As(err, &violation) {
+			return fmt.Errorf("managed listen guard invalid: %w", err)
+		}
+		return fmt.Errorf("managed listen guard observation failed: %w", err)
+	}
 	if err := host.verifyEffectiveUnit(ctx, resourceID, false, policy); err != nil {
 		return err
 	}
@@ -375,14 +383,20 @@ func (host Host) verifyEffectiveUnit(ctx context.Context, resourceID string, rel
 	if parseErr != nil {
 		return parseErr
 	}
-	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") || !singleProperty(effective, "ControlGroup", policy.Cgroup) {
-		return fmt.Errorf("effective managed service state or cgroup differs")
+	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") {
+		return fmt.Errorf("effective managed service state differs")
+	}
+	if !singleProperty(effective, "ControlGroup", policy.Cgroup) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("effective managed service cgroup differs"))
 	}
 	observed, err := confinement.ObserveCgroup("/sys/fs/cgroup", policy.Cgroup)
 	if err != nil || !observed.Populated || len(observed.PIDs) == 0 {
 		return fmt.Errorf("effective confinement cgroup unavailable: %w", err)
 	}
-	return confinement.VerifyEffective(policy, effective)
+	if err := confinement.VerifyEffective(policy, effective); err != nil {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, err)
+	}
+	return nil
 }
 
 func (host Host) waitApplicationIdentity(ctx context.Context, resourceID string, units UnitSet) error {
@@ -421,26 +435,38 @@ func (host Host) showResource(ctx context.Context, resourceID string, relay bool
 }
 
 func verifyApplicationIdentity(effective map[string][]string, units UnitSet) error {
-	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") || !singleProperty(effective, "ControlGroup", units.Confinement.Cgroup) {
-		return fmt.Errorf("managed application unit is not active in exact cgroup")
+	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") {
+		return fmt.Errorf("managed application unit is not active")
+	}
+	if !singleProperty(effective, "ControlGroup", units.Confinement.Cgroup) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed application unit cgroup differs"))
 	}
 	pid64, err := strconv.ParseInt(singleValue(effective, "MainPID"), 10, 32)
 	if err != nil || pid64 <= 1 {
 		return fmt.Errorf("managed application MainPID is invalid")
 	}
 	observation, err := confinement.ObserveCgroup("/sys/fs/cgroup", units.Confinement.Cgroup)
-	if err != nil || !observation.Populated || !slices.Contains(observation.PIDs, int(pid64)) {
-		return fmt.Errorf("managed application MainPID is outside exact cgroup: %w", err)
+	if err != nil {
+		return fmt.Errorf("observe managed application cgroup: %w", err)
+	}
+	if !observation.Populated || !slices.Contains(observation.PIDs, int(pid64)) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed application MainPID is outside exact cgroup"))
 	}
 	for _, pid := range observation.PIDs {
 		uid, gid, identityErr := processIdentity(pid)
-		if identityErr != nil || uid != units.ApplicationUID || gid != units.ApplicationGID {
-			return fmt.Errorf("managed application cgroup identity differs: %w", identityErr)
+		if identityErr != nil {
+			return fmt.Errorf("observe managed application cgroup identity: %w", identityErr)
+		}
+		if uid != units.ApplicationUID || gid != units.ApplicationGID {
+			return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed application cgroup identity differs"))
 		}
 	}
 	digest, err := processExecutableDigest(int(pid64))
-	if err != nil || digest != units.Bundle.ExecutableDigest {
-		return fmt.Errorf("managed application executable identity differs: %w", err)
+	if err != nil {
+		return fmt.Errorf("observe managed application executable identity: %w", err)
+	}
+	if digest != units.Bundle.ExecutableDigest {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed application executable identity differs"))
 	}
 	return nil
 }
@@ -507,20 +533,28 @@ func processExecutableDigest(pid int) (string, error) {
 }
 
 func (host Host) verifyEffectiveRelay(ctx context.Context, resourceID string, units UnitSet) error {
-	short := strings.TrimPrefix(resourceID, "res_")[:20]
-	cgroup := "/system.slice/lanpanel-relay-" + short + ".service"
-	directives := []string{"ActiveState=active", "SubState=running", "User=" + fmt.Sprint(units.RelayUID), "Group=" + fmt.Sprint(units.RelayGID), "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid", "RestrictAddressFamilies=AF_UNIX", "TemporaryFileSystem=/run:ro", "BindReadOnlyPaths=" + filepath.Dir(units.Paths.BackendSocket) + ":/backend", "InaccessiblePaths=/proc", "UMask=0007"}
-	policy, err := confinement.RelayPolicy(resourceID, cgroup, directives)
-	if err != nil {
-		return err
-	}
 	if units.RelayUID == 0 || units.RelayGID == 0 {
 		return fmt.Errorf("relay identity unavailable")
+	}
+	policy, err := expectedRelayPolicy(resourceID, units.RelayUID, units.RelayGID)
+	if err != nil {
+		return err
 	}
 	if err := host.verifyEffectiveRelayUnit(ctx, resourceID, policy); err != nil {
 		return fmt.Errorf("effective relay confinement: %w", err)
 	}
 	return nil
+}
+
+func expectedRelayPolicy(resourceID string, relayUID, relayGID uint32) (confinement.UnitPolicy, error) {
+	paths, err := resource.DerivePaths(resourceID)
+	if err != nil {
+		return confinement.UnitPolicy{}, err
+	}
+	short := strings.TrimPrefix(resourceID, "res_")[:20]
+	cgroup := "/system.slice/lanpanel-relay-" + short + ".service"
+	directives := []string{"ActiveState=active", "SubState=running", "User=" + fmt.Sprint(relayUID), "Group=" + fmt.Sprint(relayGID), "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid", "RestrictAddressFamilies=AF_UNIX", "TemporaryFileSystem=/run:ro", "BindReadOnlyPaths=" + filepath.Dir(paths.BackendSocket) + ":/backend", "InaccessiblePaths=/proc", "UMask=0007"}
+	return confinement.RelayPolicy(resourceID, cgroup, directives)
 }
 
 func (host Host) verifyEffectiveRelayUnit(ctx context.Context, resourceID string, policy confinement.UnitPolicy) error {
@@ -533,14 +567,20 @@ func (host Host) verifyEffectiveRelayUnit(ctx context.Context, resourceID string
 	if err != nil {
 		return err
 	}
-	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") || !singleProperty(effective, "ControlGroup", policy.Cgroup) {
-		return fmt.Errorf("effective relay service state or cgroup differs")
+	if !singleProperty(effective, "ActiveState", "active") || !singleProperty(effective, "SubState", "running") {
+		return fmt.Errorf("effective relay service state differs")
+	}
+	if !singleProperty(effective, "ControlGroup", policy.Cgroup) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("effective relay service cgroup differs"))
 	}
 	observed, err := confinement.ObserveCgroup("/sys/fs/cgroup", policy.Cgroup)
 	if err != nil || !observed.Populated || len(observed.PIDs) == 0 {
 		return fmt.Errorf("effective relay cgroup unavailable: %w", err)
 	}
-	return confinement.VerifyEffectiveRelay(policy, effective)
+	if err := confinement.VerifyEffectiveRelay(policy, effective); err != nil {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, err)
+	}
+	return nil
 }
 
 func singleProperty(values map[string][]string, name, want string) bool {
@@ -640,8 +680,8 @@ func validateOwnedDirectory(path string, mode uint32, owner, group int) error {
 	if err != nil {
 		return err
 	}
-	stat := info.Sys().(*unix.Stat_t)
-	if !info.IsDir() || stat.Mode&0o7777 != mode || int(stat.Uid) != owner || int(stat.Gid) != group {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || stat.Mode&0o7777 != mode || int(stat.Uid) != owner || int(stat.Gid) != group {
 		return fmt.Errorf("managed directory identity differs")
 	}
 	return nil

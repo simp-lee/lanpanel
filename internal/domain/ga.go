@@ -1160,8 +1160,9 @@ func validateTarget(target AppTarget) error {
 		return fmt.Errorf("target.allowed_http_statuses must be a bounded nonempty set")
 	}
 	for index, status := range target.AllowedHTTPStatuses {
-		if status < 200 || status > 399 || index > 0 && target.AllowedHTTPStatuses[index-1] >= status {
-			return fmt.Errorf("target.allowed_http_statuses must contain sorted unique 2xx/3xx values")
+		allowed := status >= 200 && status <= 399 || status == 401 || status == 403
+		if !allowed || index > 0 && target.AllowedHTTPStatuses[index-1] >= status {
+			return fmt.Errorf("target.allowed_http_statuses must contain sorted unique 2xx/3xx values or 401/403")
 		}
 	}
 	if target.WebSocket.Enabled {

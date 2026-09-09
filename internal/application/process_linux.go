@@ -13,19 +13,21 @@ import (
 	"lanpanel/internal/persist"
 	"lanpanel/internal/process"
 	"reflect"
+	"strings"
 	"time"
 )
 
 type ProcessExecution struct {
-	Service     *FixedService
-	Admitter    *operations.Admitter
-	MutationSet *operations.MutationSet
-	Mutation    *operations.MutationLease
-	Exposure    *locks.Lease
-	JobID       string
-	Revision    uint64
-	Resource    domain.AppResource
-	Operation   operations.Type
+	Service         *FixedService
+	Admitter        *operations.Admitter
+	MutationSet     *operations.MutationSet
+	Mutation        *operations.MutationLease
+	Exposure        *locks.Lease
+	JobID           string
+	Revision        uint64
+	Resource        domain.AppResource
+	Operation       operations.Type
+	ContractionKind process.RuntimeViolationKind
 }
 
 func BeginProcess(ctx context.Context, actor Actor, resourceID string, start bool) (*ProcessExecution, error) {
@@ -119,6 +121,13 @@ func (execution *ProcessExecution) Commit(ctx context.Context, bundle *domain.Pr
 	requested := domain.ProcessRequestedStopped
 	status := domain.RuntimeDegraded
 	reason := "stopped"
+	if execution.ContractionKind != "" {
+		var err error
+		reason, err = process.RuntimeViolationReason(execution.ContractionKind)
+		if err != nil {
+			return jobs.Record{}, err
+		}
+	}
 	if execution.Operation == operations.ProcessStart {
 		requested = domain.ProcessRequestedRunning
 		status = domain.RuntimeHealthy
@@ -184,7 +193,14 @@ func (execution *ProcessExecution) CommitInterrupted(ctx context.Context, bundle
 		}
 		item.ManagedProcess.Requested = domain.ProcessRequestedStopped
 		item.ManagedProcess.Applied = cloneBundleForProcess(bundle)
-		item.ManagedProcess.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: "interrupted_lifecycle_contracted"}
+		reason := "interrupted_lifecycle_contracted"
+		if execution.ContractionKind != "" {
+			reason, err = process.RuntimeViolationReason(execution.ContractionKind)
+			if err != nil {
+				return err
+			}
+		}
+		item.ManagedProcess.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: reason}
 		item.ManagedProcess.LastOperation = domain.OperationProcessStart
 		if execution.Operation == operations.ProcessStop {
 			item.ManagedProcess.LastOperation = domain.OperationProcessStop
@@ -265,7 +281,7 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 			_ = service.Close()
 			return err
 		}
-		if fresh.Phase == operations.PhaseReserved {
+		if fresh.Phase == operations.PhaseReserved && fresh.AdmissionSource != operations.AdmissionRuntimeGuard {
 			admission, lockErr := service.manager.Acquire(ctx, locks.MutationAdmission)
 			if lockErr != nil {
 				_ = service.Close()
@@ -300,9 +316,20 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 		if err == nil {
 			fresh, err = operations.FindProcessLifecycleAuthority(document, fresh.JobID, fresh.SafetyBinding.ResourceID)
 		}
+		if err == nil && fresh.Phase == operations.PhaseReserved {
+			if fresh.AdmissionSource != operations.AdmissionRuntimeGuard || fresh.Operation != operations.ProcessStop {
+				err = fmt.Errorf("reserved process contraction authority is invalid")
+			} else {
+				fresh, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: fresh.JobID, ExpectedRevision: document.Revision, IntentGeneration: document.Revision + 1})
+				if err == nil {
+					document, err = service.normal.Read()
+				}
+			}
+		}
 		if err == nil && fresh.Phase != operations.PhaseLocalIntent {
 			err = fmt.Errorf("process lifecycle no-effect phase changed")
 		}
+		var recoveredContraction *process.Journal
 		if err == nil {
 			raw := document.Entries["installations/current"]
 			var installation domain.Installation
@@ -318,6 +345,28 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 						if fresh.Operation == operations.ProcessStop && (item.ManagedProcess.Requested != domain.ProcessRequestedRunning || item.PublicationRecord.State != domain.PublicationUnpublished) {
 							err = fmt.Errorf("journal-less stop changed lifecycle state")
 						}
+						if err == nil && fresh.AdmissionSource == operations.AdmissionRuntimeGuard {
+							var record jobs.Record
+							record, err = jobs.LoadEntries(document.Entries, fresh.JobID)
+							if err == nil && (record.Status != jobs.StatusRunning || record.Operation != string(operations.ProcessStop) || record.Target != "resource/"+item.ID) {
+								err = fmt.Errorf("journal-less process contraction job is invalid")
+							}
+							prefix := "runtime-policy-guard/"
+							kind := process.RuntimeViolationKind(strings.TrimPrefix(record.ActorIdentity, prefix))
+							if err == nil && !strings.HasPrefix(record.ActorIdentity, prefix) {
+								err = fmt.Errorf("journal-less process contraction actor is invalid")
+							}
+							if err == nil {
+								_, err = process.RuntimeViolationReason(kind)
+							}
+							if err == nil && item.ManagedProcess.Applied == nil {
+								err = fmt.Errorf("journal-less process contraction lacks applied bundle")
+							}
+							if err == nil {
+								bundle := item.ManagedProcess.Applied
+								recoveredContraction = &process.Journal{SchemaVersion: "lanpanel.process.lifecycle.v1", JobID: fresh.JobID, ResourceID: item.ID, Operation: string(operations.ProcessStop), Phase: "prepared", BundleDigest: bundle.PolicyDigest, RelayRequired: bundle.RelayRequired, ContractionKind: kind, Applied: cloneBundleForProcess(bundle), ApplicationUID: bundle.ApplicationUID, ApplicationGID: bundle.ApplicationGID, RelayUID: bundle.RelayUID, RelayGID: bundle.RelayGID}
+							}
+						}
 					}
 				}
 				if !found && err == nil {
@@ -325,7 +374,9 @@ func ReconcileJournalLessProcesses(ctx context.Context) error {
 				}
 			}
 		}
-		if err == nil {
+		if err == nil && recoveredContraction != nil {
+			err = process.WriteJournal(ctx, *recoveredContraction)
+		} else if err == nil {
 			_, err = admitter.Complete(ctx, mutation, exposure, document.Revision, fresh.JobID, "no_effect", nil, []jobs.Postcondition{{Kind: "managed_process_not_started", Status: jobs.PostconditionVerified, Identity: fresh.SafetyBinding.ResourceID}}, "process_lifecycle_not_started")
 		}
 		err = errors.Join(err, operations.ReleaseExposure(mutation, exposure), mutationSet.Close(), service.Close())
@@ -373,7 +424,14 @@ func ReconcileInterruptedProcess(ctx context.Context, journal process.Journal, c
 				copy := *journal.Applied
 				managed.Applied = &copy
 			}
-			managed.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: "interrupted_lifecycle_contracted"}
+			reason := "interrupted_lifecycle_contracted"
+			if journal.ContractionKind != "" {
+				reason, err = process.RuntimeViolationReason(journal.ContractionKind)
+				if err != nil {
+					return false, false, err
+				}
+			}
+			managed.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: time.Now().UTC().Format(time.RFC3339), Reason: reason}
 			managed.LastOperation = domain.OperationProcessStart
 			if journal.Operation == "process_stop" {
 				managed.LastOperation = domain.OperationProcessStop
@@ -415,6 +473,10 @@ func validatePendingProcessRecovery(document persist.Document, journal process.J
 	if err != nil || intent.Phase != operations.PhaseLocalIntent || string(intent.Operation) != journal.Operation {
 		return fmt.Errorf("pending process recovery authority differs from journal")
 	}
+	violationContraction := journal.ContractionKind != ""
+	if violationContraction != (intent.AdmissionSource == operations.AdmissionRuntimeGuard) {
+		return fmt.Errorf("pending process contraction kind differs from admission source")
+	}
 	record, err := jobs.LoadEntries(document.Entries, journal.JobID)
 	if err != nil || record.Status != jobs.StatusRunning || record.Operation != journal.Operation || record.Target != "resource/"+journal.ResourceID {
 		return fmt.Errorf("pending process recovery job differs from journal")
@@ -434,7 +496,14 @@ func validatePendingProcessRecovery(document persist.Document, journal process.J
 		managed := item.ManagedProcess
 		if journal.Operation == "process_stop" {
 			preCommit := managed.Requested == domain.ProcessRequestedRunning && item.PublicationRecord.State == domain.PublicationUnpublished && reflect.DeepEqual(journal.Applied, managed.Applied)
-			postCommit := journal.Phase == "host_mutated" && managed.Requested == domain.ProcessRequestedStopped && item.PublicationRecord.State == domain.PublicationUnpublished && reflect.DeepEqual(journal.Applied, managed.Applied) && managed.RuntimeObservation != nil && managed.RuntimeObservation.Status == domain.RuntimeDegraded && managed.RuntimeObservation.Reason == "stopped" && managed.LastOperation == domain.OperationProcessStop && managed.LastJobID == journal.JobID
+			reason := "stopped"
+			if journal.ContractionKind != "" {
+				reason, err = process.RuntimeViolationReason(journal.ContractionKind)
+				if err != nil {
+					return err
+				}
+			}
+			postCommit := journal.Phase == "host_mutated" && managed.Requested == domain.ProcessRequestedStopped && item.PublicationRecord.State == domain.PublicationUnpublished && reflect.DeepEqual(journal.Applied, managed.Applied) && managed.RuntimeObservation != nil && managed.RuntimeObservation.Status == domain.RuntimeDegraded && managed.RuntimeObservation.Reason == reason && managed.LastOperation == domain.OperationProcessStop && managed.LastJobID == journal.JobID
 			if !preCommit && !postCommit {
 				return fmt.Errorf("pending process stop authority differs from journal")
 			}
@@ -499,7 +568,14 @@ func classifyCommittedProcess(document persist.Document, journal process.Journal
 		}
 		condition := record.Postconditions[0]
 		if record.Result == jobs.ResultInterrupted {
-			if managed.Requested != domain.ProcessRequestedStopped || managed.RuntimeObservation == nil || managed.RuntimeObservation.Status != domain.RuntimeDegraded || managed.RuntimeObservation.Reason != "interrupted_lifecycle_contracted" || managed.LastOperation != wantOperation || managed.LastOperationResult != domain.OperationInterrupted || managed.LastJobID != journal.JobID || !reflect.DeepEqual(managed.Applied, journal.Applied) || record.ErrorCode != "interrupted_lifecycle_contracted" || condition != (jobs.Postcondition{Kind: "interrupted_lifecycle_contracted", Status: jobs.PostconditionKnown, Identity: journal.JobID}) {
+			reason := "interrupted_lifecycle_contracted"
+			if journal.ContractionKind != "" {
+				reason, err = process.RuntimeViolationReason(journal.ContractionKind)
+				if err != nil {
+					return false, false, err
+				}
+			}
+			if managed.Requested != domain.ProcessRequestedStopped || managed.RuntimeObservation == nil || managed.RuntimeObservation.Status != domain.RuntimeDegraded || managed.RuntimeObservation.Reason != reason || managed.LastOperation != wantOperation || managed.LastOperationResult != domain.OperationInterrupted || managed.LastJobID != journal.JobID || !reflect.DeepEqual(managed.Applied, journal.Applied) || record.ErrorCode != "interrupted_lifecycle_contracted" || condition != (jobs.Postcondition{Kind: "interrupted_lifecycle_contracted", Status: jobs.PostconditionKnown, Identity: journal.JobID}) {
 				return false, false, fmt.Errorf("interrupted process state differs from recovery journal")
 			}
 			return true, false, nil
@@ -507,15 +583,22 @@ func classifyCommittedProcess(document persist.Document, journal process.Journal
 		if record.Result != jobs.ResultSucceeded || journal.Phase != "host_mutated" || journal.Applied == nil {
 			return false, false, fmt.Errorf("terminal process result is unsupported")
 		}
-		wantRequested, wantStatus, wantKind := domain.ProcessRequestedRunning, domain.RuntimeHealthy, "managed_process_running"
+		wantRequested, wantStatus, wantKind, wantReason := domain.ProcessRequestedRunning, domain.RuntimeHealthy, "managed_process_running", "running"
 		running = true
 		if journal.Operation == "process_stop" {
 			wantRequested = domain.ProcessRequestedStopped
 			wantStatus = domain.RuntimeDegraded
-			wantKind = "managed_process_stopped"
+			wantReason = "stopped"
+			if journal.ContractionKind != "" {
+				wantReason, err = process.RuntimeViolationReason(journal.ContractionKind)
+				if err != nil {
+					return false, false, err
+				}
+			}
+			wantKind = "managed_process_" + wantReason
 			running = false
 		}
-		if managed.Requested != wantRequested || managed.RuntimeObservation == nil || managed.RuntimeObservation.Status != wantStatus || managed.LastOperation != wantOperation || managed.LastOperationResult != domain.OperationSucceeded || managed.LastJobID != journal.JobID || !reflect.DeepEqual(managed.Applied, journal.Applied) || condition != (jobs.Postcondition{Kind: wantKind, Status: jobs.PostconditionVerified, Identity: journal.BundleDigest}) {
+		if managed.Requested != wantRequested || managed.RuntimeObservation == nil || managed.RuntimeObservation.Status != wantStatus || managed.RuntimeObservation.Reason != wantReason || managed.LastOperation != wantOperation || managed.LastOperationResult != domain.OperationSucceeded || managed.LastJobID != journal.JobID || !reflect.DeepEqual(managed.Applied, journal.Applied) || condition != (jobs.Postcondition{Kind: wantKind, Status: jobs.PostconditionVerified, Identity: journal.BundleDigest}) {
 			return false, false, fmt.Errorf("terminal process state differs from lifecycle journal")
 		}
 		return true, running, nil

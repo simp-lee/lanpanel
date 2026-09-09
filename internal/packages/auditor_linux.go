@@ -22,9 +22,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/pierrec/lz4/v4"
-	"golang.org/x/crypto/openpgp"
-	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/sys/unix"
 )
 
@@ -361,7 +361,7 @@ func verifyInRelease(data, keyring []byte) ([]byte, error) {
 	if err != nil || len(entities) == 0 {
 		return nil, fmt.Errorf("repository keyring cannot verify OpenPGP metadata")
 	}
-	if _, err := openpgp.CheckDetachedSignature(entities, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body); err != nil {
+	if _, err := openpgp.CheckDetachedSignature(entities, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
 		return nil, fmt.Errorf("InRelease was not signed by the exact repository keyring")
 	}
 	return append([]byte(nil), block.Plaintext...), nil

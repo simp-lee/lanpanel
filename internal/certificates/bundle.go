@@ -265,6 +265,10 @@ func ObserveIdentity(parent, id string, generation uint64, owner filetxn.Owner) 
 }
 
 func readCertificateBundle(parent, name string, owner filetxn.Owner) (map[string][]byte, error) {
+	return readCertificateBundleMembers(parent, name, owner, false)
+}
+
+func readCertificateBundleMembers(parent, name string, owner filetxn.Owner, deleting bool) (map[string][]byte, error) {
 	current, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
@@ -296,7 +300,7 @@ func readCertificateBundle(parent, name string, owner filetxn.Owner) (map[string
 		return nil, err
 	}
 	expected := map[string]int64{"certificate.pem": 1 << 20, "identity.json": 64 << 10, "private-key.pem": 1 << 20}
-	if len(entries) != len(expected) {
+	if len(entries) > len(expected) || !deleting && len(entries) != len(expected) {
 		return nil, fmt.Errorf("certificate bundle inventory is incomplete or contains foreign members")
 	}
 	for _, entry := range entries {
@@ -308,6 +312,9 @@ func readCertificateBundle(parent, name string, owner filetxn.Owner) (map[string
 	for _, name := range []string{"certificate.pem", "identity.json", "private-key.pem"} {
 		maximum := expected[name]
 		fd, openErr := unix.Openat(directory, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if deleting && errors.Is(openErr, unix.ENOENT) {
+			continue
+		}
 		if openErr != nil {
 			return nil, openErr
 		}
@@ -369,6 +376,10 @@ func verifyBundleMaterial(base string, identity Identity, certificatePEM, privat
 	if err != nil {
 		return fmt.Errorf("certificate bundle material invalid: %w", err)
 	}
+	return verifyCertificateIdentity(identity, material)
+}
+
+func verifyCertificateIdentity(identity Identity, material inspectedBundleMaterial) error {
 	if !slices.Equal(material.domains, identity.Domains) || identity.SANIdentity != sum([]byte(strings.Join(material.domains, "\x00"))) || identity.Fingerprint != material.fingerprint || identity.ChainIdentity != material.chainIdentity || identity.IssuerIdentity != material.issuerIdentity || !identity.NotBefore.Equal(material.notBefore) || !identity.NotAfter.Equal(material.notAfter) {
 		return fmt.Errorf("certificate bundle material differs from identity")
 	}
@@ -376,6 +387,22 @@ func verifyBundleMaterial(base string, identity Identity, certificatePEM, privat
 }
 
 func inspectBundleMaterial(certificatePEM, privateKeyPEM []byte) (inspectedBundleMaterial, error) {
+	material, err := inspectCertificateMaterial(certificatePEM)
+	if err != nil {
+		return inspectedBundleMaterial{}, err
+	}
+	privateKey, err := parsePrivateKey(privateKeyPEM)
+	if err != nil {
+		return inspectedBundleMaterial{}, err
+	}
+	if !publicKeysEqual(material.certificates[0].PublicKey, privateKey.Public()) {
+		return inspectedBundleMaterial{}, fmt.Errorf("certificate private key mismatch")
+	}
+	material.privateKey = privateKey
+	return material, nil
+}
+
+func inspectCertificateMaterial(certificatePEM []byte) (inspectedBundleMaterial, error) {
 	certificates, err := parseCertificateChain(certificatePEM)
 	if err != nil || len(certificates) < 2 {
 		return inspectedBundleMaterial{}, fmt.Errorf("certificate chain invalid")
@@ -399,20 +426,12 @@ func inspectBundleMaterial(certificatePEM, privateKeyPEM []byte) (inspectedBundl
 	if err != nil || len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 || len(leaf.URIs) != 0 {
 		return inspectedBundleMaterial{}, fmt.Errorf("certificate SAN material invalid")
 	}
-	privateKey, err := parsePrivateKey(privateKeyPEM)
-	if err != nil {
-		return inspectedBundleMaterial{}, err
-	}
-	if !publicKeysEqual(leaf.PublicKey, privateKey.Public()) {
-		return inspectedBundleMaterial{}, fmt.Errorf("certificate private key mismatch")
-	}
 	issuerFingerprints := make([]string, 0, len(certificates)-1)
 	for _, certificate := range certificates[1:] {
 		issuerFingerprints = append(issuerFingerprints, sum(certificate.Raw))
 	}
 	return inspectedBundleMaterial{
 		certificates:   certificates,
-		privateKey:     privateKey,
 		domains:        domains,
 		fingerprint:    sum(leaf.Raw),
 		chainIdentity:  sum(certificatePEM),

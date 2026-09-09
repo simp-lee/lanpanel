@@ -34,7 +34,7 @@ func NewFileSink(path string) (*FileSink, error) {
 	return &FileSink{path: path}, nil
 }
 
-func (sink *FileSink) Append(record Record) error {
+func (sink *FileSink) Append(record Record) (returnErr error) {
 	if sink == nil {
 		return fmt.Errorf("audit sink is unavailable")
 	}
@@ -50,7 +50,9 @@ func (sink *FileSink) Append(record Record) error {
 	if err != nil {
 		return err
 	}
-	defer unix.Close(directory)
+	defer func() {
+		returnErr = errors.Join(returnErr, unix.Close(directory))
+	}()
 	base := filepath.Base(sink.path)
 	records, err := readAuditRecords(directory, base)
 	if err != nil {

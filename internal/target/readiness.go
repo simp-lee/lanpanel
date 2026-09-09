@@ -116,7 +116,7 @@ func probeHTTP(ctx context.Context, request ProbeRequest, transport Transport) (
 	}
 	defer func(ignore func() error) { _ = ignore() }(response.Body.Close)
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, MaximumBody))
-	if !allowedHTTPStatus(response.StatusCode, request.Target.AllowedHTTPStatuses, request.AccessMode) {
+	if !allowedHTTPStatus(response.StatusCode, request.Target.AllowedHTTPStatuses) {
 		return response.StatusCode, fmt.Errorf("target HTTP readiness returned disallowed status %d", response.StatusCode)
 	}
 	return response.StatusCode, nil
@@ -165,13 +165,13 @@ func probeWebSocket(ctx context.Context, request ProbeRequest, transport Transpo
 	return response.StatusCode, fmt.Errorf("target WebSocket readiness returned disallowed status %d", response.StatusCode)
 }
 
-func allowedHTTPStatus(status int, configured []uint16, access domain.AppAccessMode) bool {
+func allowedHTTPStatus(status int, configured []uint16) bool {
 	for _, allowed := range configured {
 		if status == int(allowed) {
 			return true
 		}
 	}
-	return access == domain.AppAccessApplicationManaged && (status == http.StatusUnauthorized || status == http.StatusForbidden)
+	return false
 }
 
 func websocketAccept(key string) string {

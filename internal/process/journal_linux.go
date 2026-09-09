@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,19 +29,20 @@ const (
 )
 
 type Journal struct {
-	SchemaVersion  string                 `json:"schema_version"`
-	JobID          string                 `json:"job_id"`
-	ResourceID     string                 `json:"resource_id"`
-	Operation      string                 `json:"operation"`
-	Phase          string                 `json:"phase"`
-	BundleDigest   string                 `json:"bundle_digest"`
-	RelayRequired  bool                   `json:"relay_required"`
-	Applied        *domain.ProcessBundle  `json:"applied,omitempty"`
-	Policy         confinement.UnitPolicy `json:"policy"`
-	ApplicationUID uint32                 `json:"application_uid,omitempty"`
-	ApplicationGID uint32                 `json:"application_gid,omitempty"`
-	RelayUID       uint32                 `json:"relay_uid,omitempty"`
-	RelayGID       uint32                 `json:"relay_gid,omitempty"`
+	SchemaVersion   string                 `json:"schema_version"`
+	JobID           string                 `json:"job_id"`
+	ResourceID      string                 `json:"resource_id"`
+	Operation       string                 `json:"operation"`
+	Phase           string                 `json:"phase"`
+	BundleDigest    string                 `json:"bundle_digest"`
+	RelayRequired   bool                   `json:"relay_required"`
+	ContractionKind RuntimeViolationKind   `json:"contraction_kind,omitempty"`
+	Applied         *domain.ProcessBundle  `json:"applied,omitempty"`
+	Policy          confinement.UnitPolicy `json:"policy"`
+	ApplicationUID  uint32                 `json:"application_uid,omitempty"`
+	ApplicationGID  uint32                 `json:"application_gid,omitempty"`
+	RelayUID        uint32                 `json:"relay_uid,omitempty"`
+	RelayGID        uint32                 `json:"relay_gid,omitempty"`
 }
 
 func journalPath(resourceID string) string {
@@ -59,7 +61,7 @@ func JournalPresent(resourceID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumProcessJournalBytes {
 		return false, fmt.Errorf("process journal identity is unsafe")
 	}
@@ -105,6 +107,14 @@ func WriteJournal(ctx context.Context, value Journal) error {
 func validateProcessJournal(value Journal) error {
 	if value.SchemaVersion != processJournalSchema || !validProcessJournalID(value.JobID, "job_", 64) || !validProcessJournalID(value.ResourceID, "res_", 32) || (value.Operation != "process_start" && value.Operation != "process_stop") || (value.Phase != "prepared" && value.Phase != "activating" && value.Phase != "host_mutated") || value.Operation == "process_stop" && value.Phase == "activating" {
 		return fmt.Errorf("process journal invalid")
+	}
+	if value.ContractionKind != "" {
+		if value.Operation != "process_stop" || value.Applied == nil {
+			return fmt.Errorf("process runtime violation journal must stop an exact applied process")
+		}
+		if _, err := RuntimeViolationReason(value.ContractionKind); err != nil {
+			return err
+		}
 	}
 	if value.Applied == nil {
 		preparedRelayStart := value.Operation == "process_start" && value.Phase == "prepared" && value.RelayRequired

@@ -28,15 +28,16 @@ type SPDXCreation struct {
 	Creators []string `json:"creators"`
 }
 type SPDXPackage struct {
-	Name             string         `json:"name"`
-	SPDXID           string         `json:"SPDXID"`
-	VersionInfo      string         `json:"versionInfo"`
-	DownloadLocation string         `json:"downloadLocation"`
-	FilesAnalyzed    bool           `json:"filesAnalyzed"`
-	LicenseConcluded string         `json:"licenseConcluded"`
-	LicenseDeclared  string         `json:"licenseDeclared"`
-	CopyrightText    string         `json:"copyrightText"`
-	Checksums        []SPDXChecksum `json:"checksums,omitempty"`
+	Name             string            `json:"name"`
+	SPDXID           string            `json:"SPDXID"`
+	VersionInfo      string            `json:"versionInfo"`
+	DownloadLocation string            `json:"downloadLocation"`
+	FilesAnalyzed    bool              `json:"filesAnalyzed"`
+	LicenseConcluded string            `json:"licenseConcluded"`
+	LicenseDeclared  string            `json:"licenseDeclared"`
+	CopyrightText    string            `json:"copyrightText"`
+	Checksums        []SPDXChecksum    `json:"checksums,omitempty"`
+	ExternalRefs     []SPDXExternalRef `json:"externalRefs,omitempty"`
 }
 type (
 	SPDXRelationship struct {
@@ -47,6 +48,11 @@ type (
 	SPDXChecksum struct {
 		Algorithm     string `json:"algorithm"`
 		ChecksumValue string `json:"checksumValue"`
+	}
+	SPDXExternalRef struct {
+		ReferenceCategory string `json:"referenceCategory"`
+		ReferenceType     string `json:"referenceType"`
+		ReferenceLocator  string `json:"referenceLocator"`
 	}
 )
 
@@ -71,15 +77,18 @@ func ValidateSPDX(data []byte, candidateDigest string) error {
 		if pkg.Name == "" || pkg.SPDXID == "" || pkg.VersionInfo == "" || pkg.DownloadLocation == "" || pkg.LicenseConcluded == "" || pkg.LicenseDeclared == "" || pkg.CopyrightText == "" || previous != "" && previous >= pkg.SPDXID {
 			return fmt.Errorf("SBOM package inventory is invalid")
 		}
-		if pkg.Name == "lanpanel" && pkg.SPDXID == "SPDXRef-Package-lanpanel" {
-			if bound {
-				return fmt.Errorf("SBOM duplicates candidate package")
+		candidatePackage := pkg.Name == "lanpanel" && pkg.SPDXID == "SPDXRef-Package-lanpanel"
+		if candidatePackage {
+			if bound || len(pkg.ExternalRefs) != 0 {
+				return fmt.Errorf("SBOM duplicates candidate package or gives it an external package identity")
 			}
 			for _, checksum := range pkg.Checksums {
 				if checksum.Algorithm == "SHA256" && checksum.ChecksumValue == candidateDigest {
 					bound = true
 				}
 			}
+		} else if len(pkg.ExternalRefs) != 1 || !validSPDXPURL(pkg.ExternalRefs[0]) {
+			return fmt.Errorf("SBOM component lacks one scanner-compatible package URL")
 		}
 		previous = pkg.SPDXID
 	}
@@ -120,7 +129,7 @@ func GenerateReleaseSPDX(binaryPath string, dependency QualificationDependencyAu
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	}
 	for _, tuple := range profile.Packages {
-		native = append(native, spdxOSPackage(tuple, profile.RepositorySource))
+		native = append(native, spdxOSPackage(tuple, profile.Family, profile.RepositorySource))
 	}
 	document.Packages = append(document.Packages, native...)
 	sort.Slice(document.Packages, func(i, j int) bool { return document.Packages[i].SPDXID < document.Packages[j].SPDXID })
@@ -223,7 +232,7 @@ func expectedReleaseSPDXPackages(candidate []byte, candidateDigest, releaseTag s
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	)
 	for _, tuple := range profile.Packages {
-		packages = append(packages, spdxOSPackage(tuple, profile.RepositorySource))
+		packages = append(packages, spdxOSPackage(tuple, profile.Family, profile.RepositorySource))
 	}
 	expected := make(map[string]SPDXPackage, len(packages))
 	for _, pkg := range packages {
@@ -236,11 +245,16 @@ func expectedReleaseSPDXPackages(candidate []byte, candidateDigest, releaseTag s
 }
 
 func spdxPackagesEqual(left, right SPDXPackage) bool {
-	if left.Name != right.Name || left.SPDXID != right.SPDXID || left.VersionInfo != right.VersionInfo || left.DownloadLocation != right.DownloadLocation || left.FilesAnalyzed != right.FilesAnalyzed || left.LicenseConcluded != right.LicenseConcluded || left.LicenseDeclared != right.LicenseDeclared || left.CopyrightText != right.CopyrightText || len(left.Checksums) != len(right.Checksums) {
+	if left.Name != right.Name || left.SPDXID != right.SPDXID || left.VersionInfo != right.VersionInfo || left.DownloadLocation != right.DownloadLocation || left.FilesAnalyzed != right.FilesAnalyzed || left.LicenseConcluded != right.LicenseConcluded || left.LicenseDeclared != right.LicenseDeclared || left.CopyrightText != right.CopyrightText || len(left.Checksums) != len(right.Checksums) || len(left.ExternalRefs) != len(right.ExternalRefs) {
 		return false
 	}
 	for index := range left.Checksums {
 		if left.Checksums[index] != right.Checksums[index] {
+			return false
+		}
+	}
+	for index := range left.ExternalRefs {
+		if left.ExternalRefs[index] != right.ExternalRefs[index] {
 			return false
 		}
 	}
@@ -258,17 +272,42 @@ func spdxCandidatePackage(version, digest string) SPDXPackage {
 }
 
 func spdxGoPackage(name, version string) SPDXPackage {
-	return spdxPackage(name, spdxID(name), version, "NOASSERTION")
+	pkg := spdxPackage(name, spdxID(name), version, "NOASSERTION")
+	pkg.ExternalRefs = []SPDXExternalRef{spdxPURL("pkg:golang/" + name + "@" + version)}
+	return pkg
 }
 
 func spdxNativePackage(name, version, location, digest string) SPDXPackage {
 	pkg := spdxPackage(name, spdxID("native-"+name), version, location)
 	pkg.Checksums = []SPDXChecksum{{Algorithm: "SHA256", ChecksumValue: digest}}
+	module := map[string]string{"headscale": "github.com/juanfont/headscale", "lego": "github.com/go-acme/lego/v4", "tailscale-client": "tailscale.com"}[name]
+	pkg.ExternalRefs = []SPDXExternalRef{spdxPURL("pkg:golang/" + module + "@v" + strings.TrimPrefix(version, "v"))}
 	return pkg
 }
 
-func spdxOSPackage(tuple PackageTuple, repositorySource string) SPDXPackage {
-	return spdxPackage(tuple.Name, spdxID("os-"+tuple.Name+"-"+tuple.Architecture), tuple.Version, repositorySource)
+func spdxOSPackage(tuple PackageTuple, family, repositorySource string) SPDXPackage {
+	pkg := spdxPackage(tuple.Name, spdxID("os-"+tuple.Name+"-"+tuple.Architecture), tuple.Version, repositorySource)
+	pkg.ExternalRefs = []SPDXExternalRef{spdxPURL("pkg:deb/" + family + "/" + tuple.Name + "@" + tuple.Version)}
+	return pkg
+}
+
+func spdxPURL(locator string) SPDXExternalRef {
+	return SPDXExternalRef{ReferenceCategory: "PACKAGE-MANAGER", ReferenceType: "purl", ReferenceLocator: locator}
+}
+
+func validSPDXPURL(reference SPDXExternalRef) bool {
+	if reference.ReferenceCategory != "PACKAGE-MANAGER" || reference.ReferenceType != "purl" || strings.ContainsAny(reference.ReferenceLocator, "\x00\r\n\t ") {
+		return false
+	}
+	value := strings.TrimPrefix(reference.ReferenceLocator, "pkg:golang/")
+	if value == reference.ReferenceLocator {
+		value = strings.TrimPrefix(reference.ReferenceLocator, "pkg:deb/debian/")
+		if value == reference.ReferenceLocator {
+			value = strings.TrimPrefix(reference.ReferenceLocator, "pkg:deb/ubuntu/")
+		}
+	}
+	separator := strings.LastIndexByte(value, '@')
+	return value != reference.ReferenceLocator && separator > 0 && separator < len(value)-1
 }
 
 func spdxID(value string) string {

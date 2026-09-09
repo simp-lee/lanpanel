@@ -55,6 +55,9 @@ func TestObserveIdentityRejectsUnsafeMembersBeforeReading(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			parent := t.TempDir()
+			if err := os.Chmod(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			id := "cert_00000000000000000000000000000001"
 			identity, err := StageIssued(context.Background(), parent, id, 1, sum([]byte("binding")), material, owner, now)
 			if err != nil {

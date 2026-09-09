@@ -245,6 +245,38 @@ func TestStoreClearsSupersededActivationFenceAgainstEmergencyProof(t *testing.T)
 	}
 }
 
+func TestHTTP01PresentationMayOnlyToggleExactTokenAuthorityWithinGeneration(t *testing.T) {
+	base := stateWithResource()
+	active := base
+	active.Revision++
+	active.Resources = append([]ResourceSafety(nil), base.Resources...)
+	pending := *base.Resources[0].ChallengePending
+	pending.Token = "abcdefghijklmnopqrstuv"
+	pending.TokenPath = "/.well-known/acme-challenge/" + pending.Token
+	pending.KeyAuthorizationDigest = digest("key-authorization")
+	active.Resources[0].ChallengePending = &pending
+	if err := validateTransition(RoleChallenge, base, active, TransitionProof{}); err != nil {
+		t.Fatalf("tokenless-to-active HTTP-01 transition rejected: %v", err)
+	}
+	cleared := active
+	cleared.Revision++
+	cleared.Resources = append([]ResourceSafety(nil), active.Resources...)
+	cleared.Resources[0].ChallengePending = base.Resources[0].ChallengePending
+	if err := validateTransition(RoleChallenge, active, cleared, TransitionProof{}); err != nil {
+		t.Fatalf("active-to-tokenless HTTP-01 transition rejected: %v", err)
+	}
+	changed := active
+	changed.Revision++
+	changed.Resources = append([]ResourceSafety(nil), active.Resources...)
+	other := pending
+	other.Token = "differentabcdefghijkl"
+	other.TokenPath = "/.well-known/acme-challenge/" + other.Token
+	changed.Resources[0].ChallengePending = &other
+	if err := validateTransition(RoleChallenge, active, changed, TransitionProof{}); err == nil {
+		t.Fatal("same-generation HTTP-01 token replacement was accepted")
+	}
+}
+
 func TestCertificateHandoffAndHeadscaleConvergenceAreExact(t *testing.T) {
 	current := stateWithResource()
 	next := current
@@ -299,6 +331,11 @@ func TestGuardKeepsContractionMonotonicAndExpansionExact(t *testing.T) {
 	if decision := Check(GuardInput{State: state, Action: ActionPublish, ResourceID: resource.ResourceID, Now: now}); decision.Allowed {
 		t.Fatal("ordinary publish bypassed challenge")
 	}
+	state.Resources = append(state.Resources, ResourceSafety{ResourceID: "resource-orphan", State: ResourceActive, Ownership: OwnershipOrphan, OwnershipDigest: digest("orphan")})
+	if decision := Check(GuardInput{State: state, Action: ActionAppChallenge, ResourceID: resource.ResourceID, CandidateDigest: resource.ChallengePending.BootstrapIdentity, PlanID: resource.ChallengePending.PlanID, Generation: resource.ChallengePending.Generation, Now: now}); decision.Allowed || !strings.Contains(decision.Reason, "clean-host rebuild") {
+		t.Fatalf("unrelated ownership orphan did not block App expansion: %#v", decision)
+	}
+	state.Resources = state.Resources[:1]
 	state.GlobalClose = GlobalClose{Phase: GlobalCloseEmergency, Generation: 2}
 	if decision := Check(GuardInput{State: state, Action: ActionAppChallenge, ResourceID: resource.ResourceID, CandidateDigest: resource.ChallengePending.BootstrapIdentity, PlanID: resource.ChallengePending.PlanID, Generation: resource.ChallengePending.Generation, Now: now}); decision.Allowed {
 		t.Fatal("App challenge crossed global close")
@@ -500,7 +537,7 @@ func absentBaseSnapshot() []MarkerSnapshot {
 
 func stateWithResource() State {
 	snapshots := []MarkerSnapshot{{Kind: MarkerStickyUnpublished, State: SnapshotPresent, Generation: 1}, {Kind: MarkerContraction, State: SnapshotAbsent}, {Kind: MarkerCertificateExpiry, State: SnapshotAbsent}}
-	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Method: "http-01", ConfigDigest: digest("config"), SANIdentity: digest("san"), ACMEBinding: digest("acme"), CertificateIdentity: "cert-one", Host: "app.example.com", Hosts: []string{"app.example.com"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert-one", BootstrapIdentity: digest("bootstrap"), BaseMarkers: snapshots}}}}
+	return State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: 1, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 1, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, ChallengePending: &ChallengePending{Generation: 1, PlanID: "plan", Method: "http-01", ConfigDigest: digest("config"), SANIdentity: digest("san"), ACMEBinding: digest("acme"), CertificateIdentity: "cert-one", Host: "app.example.com", Hosts: []string{"app.example.com"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert-one", BootstrapIdentity: digest("bootstrap"), BaseMarkers: snapshots}}}}
 }
 
 func digest(seed string) string {

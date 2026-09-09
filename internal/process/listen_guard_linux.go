@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -21,6 +22,7 @@ import (
 
 const (
 	bpfCommandMapCreate     = 0
+	bpfMapLookup            = 1
 	bpfMapUpdate            = 2
 	bpfMapDelete            = 3
 	bpfProgLoad             = 5
@@ -217,6 +219,52 @@ func ensureListenGuard(resourceID string, uid uint32, policy confinement.UnitPol
 	return updateListenGuardUID(mapFD, uid, true)
 }
 
+func verifyListenGuard(resourceID string, uid uint32, policy confinement.UnitPolicy) error {
+	listenGuardMu.Lock()
+	defer listenGuardMu.Unlock()
+	if uid == 0 || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || len(resourceID) != 36 || !strings.HasPrefix(resourceID, "res_") || len(policy.Digest) != 71 {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen guard authority is invalid"))
+	}
+	layout, err := readKernelBTFLayout("/sys/kernel/btf/vmlinux")
+	if err != nil {
+		return err
+	}
+	mapPath, linkPath := listenGuardPaths(listenGuardVersion(listenGuardInstructions(0, layout), layout))
+	if err := rejectStaleListenGuardPins(mapPath, linkPath); err != nil {
+		return err
+	}
+	mapFD, err := getPinnedBPF(mapPath)
+	if errors.Is(err, unix.ENOENT) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen guard map is absent"))
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(mapFD) }()
+	if err := verifyListenGuardMap(mapFD); err != nil {
+		return err
+	}
+	linkFD, err := getPinnedBPF(linkPath)
+	if errors.Is(err, unix.ENOENT) {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen guard link is absent"))
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(linkFD) }()
+	if err := verifyListenGuardLink(linkFD, mapFD, layout); err != nil {
+		return err
+	}
+	present, err := listenGuardUIDPresent(mapFD, uid)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen guard omits application UID"))
+	}
+	return nil
+}
+
 func InitializeListenGuards(running []domain.ProcessBundle) error {
 	listenGuardMu.Lock()
 	defer listenGuardMu.Unlock()
@@ -287,7 +335,7 @@ func rejectStaleListenGuardPins(mapPath, linkPath string) error {
 	for _, entry := range entries {
 		name := entry.Name()
 		if strings.HasPrefix(name, "listen-") && name != filepath.Base(mapPath) && name != filepath.Base(linkPath) {
-			return fmt.Errorf("stale managed listen guard pin requires diagnostics, export, and clean-host rebuild")
+			return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("stale managed listen guard pin requires diagnostics, export, and clean-host rebuild"))
 		}
 	}
 	return nil
@@ -328,7 +376,7 @@ func verifyListenGuardMap(fd int) error {
 		return fmt.Errorf("inspect managed listen UID map: %w", errno)
 	}
 	if info.MapType != bpfMapTypeHash || info.KeySize != 4 || info.ValueSize != 1 || info.MaxEntries != 4096 || info.MapFlags != 0 || strings.TrimRight(string(info.Name[:]), "\x00") != "lp_listen_uids" {
-		return fmt.Errorf("managed listen UID map identity differs")
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen UID map identity differs"))
 	}
 	return nil
 }
@@ -375,7 +423,7 @@ func verifyListenGuardLink(linkFD, mapFD int, layout kernelBTFLayout) error {
 		return fmt.Errorf("inspect managed listen BPF link: %w", errno)
 	}
 	if link.LinkType != bpfLinkTypeTracing || link.AttachType != bpfAttachLSMMAC || link.TargetBTFID != layout.ListenFunctionID || link.ProgramID == 0 {
-		return fmt.Errorf("managed listen BPF link identity differs")
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen BPF link identity differs"))
 	}
 	programFD, _, errno := unix.Syscall(unix.SYS_BPF, bpfCommandProgramFDByID, uintptr(unsafe.Pointer(&bpfIDOpen{ID: link.ProgramID})), unsafe.Sizeof(bpfIDOpen{}))
 	if errno != 0 {
@@ -398,9 +446,26 @@ func verifyListenGuardLink(linkFD, mapFD int, layout kernelBTFLayout) error {
 		return fmt.Errorf("inspect expected managed listen map: %w", errno)
 	}
 	if program.ProgramType != bpfProgramTypeLSM || program.AttachBTFID != layout.ListenFunctionID || program.CreatedUID != 0 || program.MapCount != 1 || mapIDs[0] == 0 || mapIDs[0] != mapInfo.ID || strings.TrimRight(string(program.Name[:]), "\x00") != "lp_listen_map" {
-		return fmt.Errorf("managed listen BPF program identity differs")
+		return NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen BPF program identity differs"))
 	}
 	return nil
+}
+
+func listenGuardUIDPresent(mapFD int, uid uint32) (bool, error) {
+	key := uid
+	value := byte(0)
+	attribute := bpfMapElement{MapFD: uint32(mapFD), Key: uint64(uintptr(unsafe.Pointer(&key))), Value: uint64(uintptr(unsafe.Pointer(&value)))}
+	_, _, errno := unix.Syscall(unix.SYS_BPF, bpfMapLookup, uintptr(unsafe.Pointer(&attribute)), unsafe.Sizeof(attribute))
+	if errors.Is(errno, unix.ENOENT) {
+		return false, nil
+	}
+	if errno != 0 {
+		return false, fmt.Errorf("read managed listen UID authority: %w", errno)
+	}
+	if value != 1 {
+		return false, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed listen UID authority value is invalid"))
+	}
+	return true, nil
 }
 
 func updateListenGuardUID(mapFD int, uid uint32, present bool) error {
@@ -440,7 +505,7 @@ func ensureBPFDirectory() error {
 	if err != nil {
 		return err
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.IsDir() || info.Mode().Perm() != 0o700 || stat.Uid != 0 || stat.Gid != 0 {
 		return fmt.Errorf("managed BPF pin directory is unsafe")
 	}

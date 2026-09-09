@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/bootstrap"
-	"lanpanel/internal/helperproto"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/release"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -106,6 +104,11 @@ func RunLive(ctx context.Context, inputPath string) (Prepared, release.LiveClean
 		Attestations: ProtectedAttestationStore{Path: prepared.Input.Artifacts.ExecutorAttestation}, Now: func() time.Time { return time.Now().UTC() }, ExecutionTimeout: 20 * time.Minute, CleanupTimeout: 5 * time.Minute,
 	}
 	report, runErr := runner.Run(ctx)
+	if runErr == nil && report.JourneySucceeded {
+		if err := sealProtectedFile(prepared.Input.Artifacts.CleanupReport); err != nil {
+			return prepared, report, fmt.Errorf("seal terminal live cleanup report: %w", err)
+		}
+	}
 	return prepared, report, runErr
 }
 
@@ -126,102 +129,6 @@ func (executor *LiveExecutor) Close() error {
 		return nil
 	}
 	return executor.target.Close()
-}
-
-func (executor *LiveExecutor) Observe(ctx context.Context, step string) (PriorObservation, error) {
-	planned, present := executor.planned(step)
-	if !present {
-		return PriorObservation{}, fmt.Errorf("live executor step is not in immutable plan")
-	}
-	if step == "clean_install" {
-		fingerprint, inventory, err := executor.target.ObserveQualificationHost(ctx, executor.prepared.Install.Identity().Profile)
-		if err != nil {
-			return PriorObservation{}, err
-		}
-		expectedPrior := "bootstrap-inventory/" + inventory
-		if fingerprint != executor.prepared.Input.SSH.MachineFingerprint || planned.PriorState != expectedPrior {
-			return PriorObservation{}, fmt.Errorf("clean installation prior state differs from immutable authority")
-		}
-		stagingRoot := remoteStagingRoot(executor.prepared.Input.RunID)
-		if _, err := executor.target.sftpLstat(ctx, stagingRoot); err == nil || !os.IsNotExist(err) {
-			return PriorObservation{}, fmt.Errorf("qualification staging prior state is not absent")
-		}
-	} else {
-		if err := executor.ensureManagement(ctx); err != nil {
-			return PriorObservation{}, err
-		}
-		switch step {
-		case "ui_startup_session_restart":
-			if _, err := executor.target.readRemoteRegular(ctx, "/var/lib/lanpanel/bootstrap-commit.json", 4<<20); err != nil {
-				return PriorObservation{}, err
-			}
-		case "local_http_websocket":
-			if executor.state.ResourceID != "" {
-				return PriorObservation{}, fmt.Errorf("local qualification resource prior state is not empty")
-			}
-		case "temporary_public_http":
-			if executor.state.TemporaryResourceID != "" || executor.state.ResourceID == "" {
-				return PriorObservation{}, fmt.Errorf("temporary HTTP prior state is not exact")
-			}
-		case "domain_https_controls":
-			for _, base := range []string{"/srv/lanpanel-qualification", "/etc/lanpanel-qualification"} {
-				if _, err := executor.target.sftpLstat(ctx, base); err == nil || !os.IsNotExist(err) {
-					return PriorObservation{}, fmt.Errorf("qualification fixture base prior state is not absent")
-				}
-			}
-			for _, name := range []string{executor.journey.AppDomain, executor.journey.AppAlias} {
-				for _, kind := range []string{"A", "AAAA", "CNAME"} {
-					if records, err := executor.cloudflare.List(ctx, name, kind); err != nil || len(records) != 0 {
-						return PriorObservation{}, fmt.Errorf("domain publication DNS prior state is not empty: %w", err)
-					}
-				}
-			}
-			if _, err := executor.management.Post(ctx, "/api/actions/status?resource_id="+url.QueryEscape(executor.state.ResourceID), struct{}{}, &helperproto.ResourceResult{}); err != nil {
-				return PriorObservation{}, err
-			}
-		case "app_http01":
-			if executor.state.ResourceID == "" {
-				return PriorObservation{}, fmt.Errorf("app HTTP-01 prior resource is absent")
-			}
-		case "headscale_initialize_http01":
-			if records, err := executor.cloudflare.List(ctx, executor.journey.HeadscaleDomain, "A"); err != nil || len(records) != 0 {
-				return PriorObservation{}, fmt.Errorf("headscale DNS prior state is not empty: %w", err)
-			}
-			if executor.state.HeadscaleUserID != "" {
-				return PriorObservation{}, fmt.Errorf("headscale entity prior state is not empty")
-			}
-		case "headscale_entities":
-			if executor.state.HeadscaleUserID != "" || executor.state.PreauthKeyID != "" {
-				return PriorObservation{}, fmt.Errorf("headscale entity prior state is not empty")
-			}
-		case "connector_assisted_login":
-			if executor.state.PreauthKeyID == "" || executor.state.ConnectorBound || executor.state.ConnectorDeviceID != "" {
-				return PriorObservation{}, fmt.Errorf("connector prior state is not exact")
-			}
-		case "dns01":
-			if err := executor.cloudflare.RequireNoTXT(ctx, "_acme-challenge."+executor.journey.DNS01Domain); err != nil {
-				return PriorObservation{}, err
-			}
-		case "tailnet_http_websocket":
-			if executor.state.TailnetResourceID != "" {
-				return PriorObservation{}, fmt.Errorf("tailnet resource prior state is not empty")
-			}
-			if executor.journey.TailnetLiveEnabled {
-				if records, err := executor.cloudflare.List(ctx, executor.journey.TailnetDomain, "A"); err != nil || len(records) != 0 {
-					return PriorObservation{}, fmt.Errorf("tailnet DNS prior state is not empty: %w", err)
-				}
-			}
-		case "delete_diagnostics_export_close_reboot":
-			if executor.state.ResourceID == "" || executor.state.FinalCleanupComplete {
-				return PriorObservation{}, fmt.Errorf("management cleanup prior state is not exact")
-			}
-		case "final_cleanup_inventory":
-			if !executor.state.ResourceDeleted || executor.state.TemporaryResourceID != "" || executor.state.TailnetResourceID != "" {
-				return PriorObservation{}, fmt.Errorf("final cleanup prior state is incomplete")
-			}
-		}
-	}
-	return PriorObservation{Scope: []byte(planned.Scope), PriorState: []byte(planned.PriorState), PlannedMutation: []byte(planned.PlannedMutation), Selector: []byte(planned.Selector)}, nil
 }
 
 func (executor *LiveExecutor) Execute(ctx context.Context, step string) (MutationObservation, error) {
@@ -291,6 +198,10 @@ func (executor *LiveExecutor) Cleanup(ctx context.Context, step string, observat
 		if err := executor.cleanupLiveEffects(ctx); err != nil {
 			return "", err
 		}
+		// An interrupted prefix may never have created App certificates or
+		// Headscale. Cleanup proves the effects actually recorded, not effects
+		// from unattempted steps. Successful final inventory and attestation
+		// still require the complete retained/deleted certificate authority.
 		executor.state.FinalCleanupComplete = true
 		if err := executor.states.Write(executor.state); err != nil {
 			return "", err
@@ -305,7 +216,11 @@ func (executor *LiveExecutor) Cleanup(ctx context.Context, step string, observat
 	return "", fmt.Errorf("trusted live executor cleanup policy for %q is invalid", step)
 }
 
-func (executor *LiveExecutor) Attest(_ context.Context, report release.LiveCleanupReport) ([]byte, error) {
+func (executor *LiveExecutor) Attest(ctx context.Context, report release.LiveCleanupReport) ([]byte, error) {
+	terminalEvidence, err := executor.observeTerminalCleanup(ctx)
+	if err != nil {
+		return nil, err
+	}
 	steps := make([]release.AttestedJourneyStep, 0, len(report.Steps))
 	for _, step := range report.Steps {
 		if step.Outcome != release.StepPassed || !release.ValidDigest(step.EvidenceDigest) {
@@ -323,8 +238,65 @@ func (executor *LiveExecutor) Attest(_ context.Context, report release.LiveClean
 		CandidateDigest: identity.CandidateDigest, TargetProfileDigest: identity.ProfileDigest, SideEffectPlanDigest: executor.prepared.PlanDigest,
 		QualificationInstallManifestDigest: executor.prepared.InstallManifestDigest, ProtectedInputDigest: executor.prepared.InputDigest, TargetHostFingerprint: executor.prepared.Input.SSH.MachineFingerprint,
 		ExternalVantageDigest: executor.prepared.ExternalVantageDigest, DNSProvider: executor.prepared.Input.DNS.Provider, DNSLiveTested: true,
-		TailnetLiveStatus: tailnetStatus, Steps: steps, Cleanup: append([]release.CleanupItem(nil), report.Items...), CompletedAt: report.UpdatedAt,
+		TailnetLiveStatus: tailnetStatus, Steps: steps, Cleanup: append([]release.CleanupItem(nil), report.Items...), TerminalEvidence: terminalEvidence, CompletedAt: time.Now().UTC().Truncate(time.Second),
 	})
+}
+
+func (executor *LiveExecutor) observeTerminalCleanup(ctx context.Context) ([]byte, error) {
+	if err := executor.ensureTarget(ctx); err != nil {
+		return nil, err
+	}
+	if _, err := executor.target.sftpLstat(ctx, "/var/lib/lanpanel-qualification"); err == nil || !os.IsNotExist(err) {
+		return nil, fmt.Errorf("terminal qualification staging is not absent")
+	}
+	identity := executor.prepared.Install.Identity()
+	installedPath := bootstrap.FixedPaths().BinaryPath
+	installedBytes, err := executor.target.readRemoteRegular(ctx, installedPath, 256<<20)
+	if err != nil || release.DigestBytes(installedBytes) != identity.CandidateDigest {
+		return nil, errors.Join(err, fmt.Errorf("terminal installed binary differs from exact candidate"))
+	}
+	if executor.state.RetainedCertificate == nil || !executor.state.CertificateCleanupComplete || len(executor.state.CertificateCleanup) == 0 {
+		return nil, fmt.Errorf("terminal certificate cleanup inventory is incomplete")
+	}
+	final, err := executor.target.RunAgent(ctx, installedPath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentFinalInventory, CandidateDigest: identity.CandidateDigest, Certificates: []qualificationCertificateArtifact{*executor.state.RetainedCertificate}})
+	if err != nil || !final.Succeeded || !sameObservedPackageTuple(final.ObservedPackageTuple, identity.Profile.Packages) {
+		return nil, errors.Join(err, fmt.Errorf("terminal host/package inventory failed: %s", final.ErrorCode))
+	}
+	nonRetained := []string{executor.journey.AppDomain, executor.journey.AppAlias, executor.journey.DNS01Domain}
+	if executor.journey.TailnetLiveEnabled {
+		nonRetained = append(nonRetained, executor.journey.TailnetDomain)
+	}
+	for _, name := range nonRetained {
+		for _, kind := range []string{"A", "AAAA", "CNAME"} {
+			if records, err := executor.cloudflare.List(ctx, name, kind); err != nil || len(records) != 0 {
+				return nil, fmt.Errorf("terminal provider DNS residue remains for %s %s: %w", kind, name, err)
+			}
+		}
+		if err := waitAuthoritativeAbsent(ctx, executor.journey.AuthoritativeZone, name); err != nil {
+			return nil, err
+		}
+	}
+	for _, domainName := range []string{executor.journey.AppDomain, executor.journey.DNS01Domain} {
+		owner := "_acme-challenge." + domainName
+		if err := executor.cloudflare.RequireNoTXT(ctx, owner); err != nil {
+			return nil, err
+		}
+		if err := waitAuthoritativeNoTXT(ctx, executor.journey.AuthoritativeZone, owner); err != nil {
+			return nil, err
+		}
+	}
+	if err := exactAuthoritativeA(ctx, executor.journey.AuthoritativeZone, []string{executor.journey.HeadscaleDomain}, executor.journey.PublicIPv4); err != nil {
+		return nil, err
+	}
+	records, err := executor.cloudflare.List(ctx, executor.journey.HeadscaleDomain, "A")
+	if err != nil || len(records) != 1 || records[0].Content != executor.journey.PublicIPv4 || records[0].Proxied {
+		return nil, fmt.Errorf("terminal retained Headscale DNS differs: %w", err)
+	}
+	certificateEvidence, err := certificateInventoryEvidence(executor.state)
+	if err != nil {
+		return nil, err
+	}
+	return evidenceWithObservations("terminal-cleanup", map[string]string{"acme_txt": "provider-and-authoritative-absent", "candidate_digest": identity.CandidateDigest, "host_fingerprint": executor.prepared.Input.SSH.MachineFingerprint, "installed_binary": installedPath, "nonretained_certificates": "absent", "nonretained_dns": "provider-and-authoritative-absent", "profile_digest": identity.ProfileDigest, "provider": executor.prepared.Input.DNS.Provider, "retained_certificate": "exact", "retained_certificate_id": executor.state.RetainedCertificate.CertificateID, "retained_headscale_domain": executor.journey.HeadscaleDomain, "staging": "absent"}, map[string][]byte{"certificate_inventory": certificateEvidence}, final.ObservedPackageTuple)
 }
 
 func (executor *LiveExecutor) executeCleanInstall(ctx context.Context) (MutationObservation, error) {
@@ -349,28 +321,26 @@ func (executor *LiveExecutor) executeCleanInstall(ctx context.Context) (Mutation
 		remoteAssets[name] = path
 	}
 	preflightResponse, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentPackagePreflight, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), TargetProfile: targetBytes, InstallManifest: manifestBytes, SideEffectPlan: executor.prepared.PlanBytes})
+	profileDigest := executor.prepared.Install.Identity().ProfileDigest
+	preflightEvidence, _ := evidence("clean-install", map[string]string{"candidate_digest": release.DigestBytes(executor.prepared.CandidateBytes), "package_preflight": preflightResponse.Evidence, "target_profile_digest": profileDigest})
 	if err != nil || !preflightResponse.Succeeded {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: []byte(preflightResponse.Evidence)}, errors.Join(err, fmt.Errorf("remote package preflight did not pass: %s", preflightResponse.ErrorCode))
+		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, errors.Join(err, fmt.Errorf("remote package preflight did not pass: %s", preflightResponse.ErrorCode))
 	}
 	manifest, _ := release.DecodeQualificationInstallManifest(manifestBytes)
 	packagePlan, err := BindQualificationPackagePlan(packageTemplate, manifest, executor.plan, executor.prepared.Install.Identity().Profile, preflightResponse.Preflight, time.Now().UTC())
 	if err != nil {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: []byte(preflightResponse.Evidence)}, err
+		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, err
 	}
 	installerBytes, err := bootstrap.BuildQualificationInstallerAuthority(bootstrap.QualificationInstallerAuthority{ACMEAccountContact: executor.prepared.Input.ACME.Contact, InstallManifest: manifestBytes, TargetProfile: targetBytes, SideEffectPlan: executor.prepared.PlanBytes, DependencyAuthority: dependencyBytes, ExpectedInstallManifestDigest: executor.prepared.InstallManifestDigest, RemoteAssetPaths: remoteAssets, PackagePlan: packagePlan, PackagePreflight: preflightResponse.Preflight})
 	if err != nil {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: []byte(preflightResponse.Evidence)}, err
+		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, err
 	}
 	response, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentInstall, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), InstallerAuthority: installerBytes})
-	evidence, _ := release.MarshalCanonical(struct {
-		SchemaVersion    string `json:"schema_version"`
-		PackagePreflight string `json:"package_preflight"`
-		Installer        string `json:"installer"`
-	}{"lanpanel.qualification.clean-install-evidence.v1", preflightResponse.Evidence, response.Evidence})
+	installEvidence, _ := evidenceWithObservations("clean-install", map[string]string{"candidate_digest": release.DigestBytes(executor.prepared.CandidateBytes), "installer": response.Evidence, "package_preflight": preflightResponse.Evidence, "target_profile_digest": profileDigest}, nil, response.ObservedPackageTuple)
 	if err != nil || !response.Succeeded {
-		return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: evidence}, errors.Join(err, fmt.Errorf("qualification clean installation failed: %s", response.ErrorCode))
+		return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: installEvidence}, errors.Join(err, fmt.Errorf("qualification clean installation failed: %s", response.ErrorCode))
 	}
-	return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: evidence}, nil
+	return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: installEvidence}, nil
 }
 
 func (executor *LiveExecutor) readInstallArtifacts() ([]byte, []byte, []byte, packages.Plan, map[string][]byte, error) {

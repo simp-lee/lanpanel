@@ -33,11 +33,16 @@ func (executor *fakeExecutor) Observe(_ context.Context, step string) (PriorObse
 
 func (executor *fakeExecutor) Execute(_ context.Context, step string) (MutationObservation, error) {
 	executor.executed = append(executor.executed, step)
-	return MutationObservation{Identity: "observed/" + step, Evidence: []byte("evidence/" + step)}, nil
+	return MutationObservation{Identity: "observed/" + step, Evidence: fakeStepEvidence(step)}, nil
 }
 
 func (executor *fakeExecutor) Recover(_ context.Context, step string) (MutationObservation, error) {
-	return MutationObservation{Identity: "recovered/" + step, Evidence: []byte("recovered-evidence/" + step)}, nil
+	return MutationObservation{Identity: "recovered/" + step, Evidence: fakeStepEvidence("recovered-" + step)}, nil
+}
+
+func fakeStepEvidence(kind string) []byte {
+	data, _ := release.MarshalCanonical(release.LiveStepEvidence{SchemaVersion: release.LiveStepEvidenceSchemaVersion, Kind: kind, Values: map[string]string{"result": "observed"}})
+	return data
 }
 
 func (executor *fakeExecutor) Cleanup(_ context.Context, step string, _ MutationObservation, policy string) (release.CleanupResult, error) {
@@ -83,7 +88,7 @@ func (attestor fakeAttestor) Attest(_ context.Context, report release.LiveCleanu
 		SchemaVersion: release.LiveExecutorAttestationSchemaVersion, ExecutorIdentity: "lanpanel-trusted-live-executor-v1", RunID: report.RunID,
 		CandidateDigest: release.DigestBytes([]byte("candidate")), TargetProfileDigest: release.DigestBytes([]byte("profile")), SideEffectPlanDigest: attestor.planDigest,
 		QualificationInstallManifestDigest: attestor.manifestDigest, ProtectedInputDigest: attestor.inputDigest, TargetHostFingerprint: "host-one", ExternalVantageDigest: release.DigestBytes([]byte("vantage")),
-		DNSProvider: "cloudflare", DNSLiveTested: true, TailnetLiveStatus: "not_live_tested", Steps: steps, Cleanup: append([]release.CleanupItem(nil), report.Items...), CompletedAt: attestor.now,
+		DNSProvider: "cloudflare", DNSLiveTested: true, TailnetLiveStatus: "not_live_tested", Steps: steps, Cleanup: append([]release.CleanupItem(nil), report.Items...), TerminalEvidence: fakeStepEvidence("terminal-cleanup"), CompletedAt: attestor.now,
 	})
 }
 
@@ -118,11 +123,28 @@ func TestRunnerObservesFreshAuthorityRunsFixedJourneyAndCleansInReverse(t *testi
 	}
 }
 
+type changedPriorExecutor struct{ fakeExecutor }
+
+func (executor *changedPriorExecutor) Observe(_ context.Context, step string) (PriorObservation, error) {
+	observed := priorFor(step)
+	observed.PriorState = []byte("step=" + step + ";fresh_observation=value=changed")
+	return observed, nil
+}
+
+func TestRunnerRejectsFreshPriorMismatchBeforeSubmission(t *testing.T) {
+	executor := &changedPriorExecutor{}
+	runner, reports := deadlineTestRunner(t, "run-prior-mismatch", executor, nil)
+	report, err := runner.Run(context.Background())
+	if err == nil || len(executor.executed) != 0 || len(report.Steps) != 0 || len(reports.values) != 0 {
+		t.Fatalf("changed fresh prior state reached mutation submission: report=%+v err=%v", report, err)
+	}
+}
+
 type uncertainExecutor struct{ fakeExecutor }
 
 func (executor *uncertainExecutor) Execute(_ context.Context, step string) (MutationObservation, error) {
 	executor.executed = append(executor.executed, step)
-	return MutationObservation{Identity: "uncertain/" + step, Evidence: []byte("partial/" + step)}, fmt.Errorf("response lost")
+	return MutationObservation{Identity: "uncertain/" + step, Evidence: fakeStepEvidence("partial-" + step)}, fmt.Errorf("response lost")
 }
 
 func TestRunnerFailureIsPersistedCleanedAndNeverPromotedOnResume(t *testing.T) {
@@ -140,6 +162,49 @@ func TestRunnerFailureIsPersistedCleanedAndNeverPromotedOnResume(t *testing.T) {
 	resumed, err := runner.Run(context.Background())
 	if err == nil || resumed.JourneySucceeded || !resumed.ExecutionFailed {
 		t.Fatal("failed journey was promoted on resume")
+	}
+}
+
+type stagedCleanupExecutor struct {
+	fakeExecutor
+	stagingPresent bool
+	failCleanup    bool
+}
+
+func (executor *stagedCleanupExecutor) Execute(ctx context.Context, step string) (MutationObservation, error) {
+	if step == "clean_install" {
+		executor.stagingPresent = true
+	}
+	return executor.fakeExecutor.Execute(ctx, step)
+}
+
+func (executor *stagedCleanupExecutor) Cleanup(ctx context.Context, step string, observation MutationObservation, policy string) (release.CleanupResult, error) {
+	if step == "app_http01" {
+		if !executor.stagingPresent {
+			return "", fmt.Errorf("certificate cleanup executable is absent")
+		}
+		if executor.failCleanup {
+			return "", fmt.Errorf("certificate cleanup is temporarily unavailable")
+		}
+	}
+	if step == "clean_install" {
+		executor.stagingPresent = false
+	}
+	return executor.fakeExecutor.Cleanup(ctx, step, observation, policy)
+}
+
+func TestFailedCertificateCleanupRetainsStagingUntilCleanupOnlyResume(t *testing.T) {
+	executor := &stagedCleanupExecutor{failCleanup: true}
+	runner, _ := deadlineTestRunner(t, "run-staged-cleanup", executor, nil)
+	report, err := runner.Run(context.Background())
+	if err == nil || report.JourneySucceeded || !executor.stagingPresent || slices.Contains(executor.cleaned, "clean_install") {
+		t.Fatalf("failed certificate cleanup lost its staged executable: staging=%t cleaned=%v err=%v", executor.stagingPresent, executor.cleaned, err)
+	}
+	executions := len(executor.executed)
+	executor.failCleanup = false
+	resumed, err := runner.Run(context.Background())
+	if err == nil || !resumed.ExecutionFailed || resumed.JourneySucceeded || !allCleanupTerminal(resumed, runner.Plan) || executor.stagingPresent || len(executor.executed) != executions {
+		t.Fatalf("cleanup-only resume did not remove effects without qualifying/replaying: report=%+v staging=%t err=%v", resumed, executor.stagingPresent, err)
 	}
 }
 
@@ -168,7 +233,7 @@ func sequenceAttempts() func() (string, error) {
 }
 
 func priorFor(step string) PriorObservation {
-	return PriorObservation{Scope: []byte("scope/" + step), PriorState: []byte("prior/" + step), PlannedMutation: []byte("mutation/" + step), Selector: []byte("selector/" + step)}
+	return PriorObservation{Scope: []byte("run=test;host=host-one;providers=test;objects=" + step), PriorState: []byte("step=" + step + ";fresh_observation=value=test"), PlannedMutation: []byte("effects=test-" + step + "[delete_exact]"), Selector: []byte("target=" + step)}
 }
 
 type observeDeadlineSuccessExecutor struct{ fakeExecutor }
@@ -183,14 +248,14 @@ type executeDeadlineSuccessExecutor struct{ fakeExecutor }
 func (executor *executeDeadlineSuccessExecutor) Execute(ctx context.Context, step string) (MutationObservation, error) {
 	executor.executed = append(executor.executed, step)
 	<-ctx.Done()
-	return MutationObservation{Identity: "timed-out/" + step, Evidence: []byte("late-success/" + step)}, nil
+	return MutationObservation{Identity: "timed-out/" + step, Evidence: fakeStepEvidence("late-success-" + step)}, nil
 }
 
 type recoverDeadlineSuccessExecutor struct{ fakeExecutor }
 
 func (executor *recoverDeadlineSuccessExecutor) Recover(ctx context.Context, step string) (MutationObservation, error) {
 	<-ctx.Done()
-	return MutationObservation{Identity: "late-recovery/" + step, Evidence: []byte("late-recovery-evidence")}, nil
+	return MutationObservation{Identity: "late-recovery/" + step, Evidence: fakeStepEvidence("late-recovery-" + step)}, nil
 }
 
 type cleanupDeadlineSuccessExecutor struct{ fakeExecutor }

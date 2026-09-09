@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/bootstrap"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/child"
+	"lanpanel/internal/identity"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"net"
@@ -27,50 +29,53 @@ import (
 )
 
 const (
-	AgentRequestSchemaVersion  = "lanpanel.qualification.agent-request.v1"
-	AgentResponseSchemaVersion = "lanpanel.qualification.agent-response.v1"
+	AgentRequestSchemaVersion  = "lanpanel.qualification.agent-request.v2"
+	AgentResponseSchemaVersion = "lanpanel.qualification.agent-response.v2"
 	maximumAgentRequestBytes   = 40 << 20
 )
 
 type AgentAction string
 
 const (
-	AgentPackagePreflight AgentAction = "package_preflight"
-	AgentInstall          AgentAction = "install"
-	AgentRestartUI        AgentAction = "restart_ui"
-	AgentReboot           AgentAction = "reboot"
-	AgentSetupFixture     AgentAction = "setup_fixture"
-	AgentSetupDNSProfile  AgentAction = "setup_dns_profile"
-	AgentCleanupFixture   AgentAction = "cleanup_fixture"
-	AgentSecretSentinel   AgentAction = "secret_sentinel"
-	AgentFinalInventory   AgentAction = "final_inventory"
-	AgentMagicDNSProbe    AgentAction = "magicdns_probe"
+	AgentPackagePreflight    AgentAction = "package_preflight"
+	AgentInstall             AgentAction = "install"
+	AgentRestartUI           AgentAction = "restart_ui"
+	AgentReboot              AgentAction = "reboot"
+	AgentSetupFixture        AgentAction = "setup_fixture"
+	AgentSetupDNSProfile     AgentAction = "setup_dns_profile"
+	AgentCleanupFixture      AgentAction = "cleanup_fixture"
+	AgentCleanupCertificates AgentAction = "cleanup_certificates"
+	AgentSecretSentinel      AgentAction = "secret_sentinel"
+	AgentFinalInventory      AgentAction = "final_inventory"
+	AgentMagicDNSProbe       AgentAction = "magicdns_probe"
 )
 
 type AgentRequest struct {
-	SchemaVersion      string      `json:"schema_version"`
-	RunID              string      `json:"run_id"`
-	Action             AgentAction `json:"action"`
-	CandidateDigest    string      `json:"candidate_digest"`
-	TargetProfile      []byte      `json:"target_profile,omitempty"`
-	InstallManifest    []byte      `json:"install_manifest,omitempty"`
-	SideEffectPlan     []byte      `json:"side_effect_plan,omitempty"`
-	InstallerAuthority []byte      `json:"installer_authority,omitempty"`
-	Provider           string      `json:"provider,omitempty"`
-	Secret             []byte      `json:"secret,omitempty"`
-	Secrets            [][]byte    `json:"secrets,omitempty"`
-	ProbeName          string      `json:"probe_name,omitempty"`
-	ExpectedIP         string      `json:"expected_ip,omitempty"`
+	SchemaVersion      string                             `json:"schema_version"`
+	RunID              string                             `json:"run_id"`
+	Action             AgentAction                        `json:"action"`
+	CandidateDigest    string                             `json:"candidate_digest"`
+	TargetProfile      []byte                             `json:"target_profile,omitempty"`
+	InstallManifest    []byte                             `json:"install_manifest,omitempty"`
+	SideEffectPlan     []byte                             `json:"side_effect_plan,omitempty"`
+	InstallerAuthority []byte                             `json:"installer_authority,omitempty"`
+	Provider           string                             `json:"provider,omitempty"`
+	Secret             []byte                             `json:"secret,omitempty"`
+	Secrets            [][]byte                           `json:"secrets,omitempty"`
+	ProbeName          string                             `json:"probe_name,omitempty"`
+	ExpectedIP         string                             `json:"expected_ip,omitempty"`
+	Certificates       []qualificationCertificateArtifact `json:"certificates,omitempty"`
 }
 
 type AgentResponse struct {
-	SchemaVersion string           `json:"schema_version"`
-	RunID         string           `json:"run_id"`
-	Action        AgentAction      `json:"action"`
-	Succeeded     bool             `json:"succeeded"`
-	Evidence      string           `json:"evidence"`
-	ErrorCode     string           `json:"error_code,omitempty"`
-	Preflight     preflight.Result `json:"preflight,omitempty"`
+	SchemaVersion        string                 `json:"schema_version"`
+	RunID                string                 `json:"run_id"`
+	Action               AgentAction            `json:"action"`
+	Succeeded            bool                   `json:"succeeded"`
+	Evidence             string                 `json:"evidence"`
+	ErrorCode            string                 `json:"error_code,omitempty"`
+	Preflight            preflight.Result       `json:"preflight,omitempty"`
+	ObservedPackageTuple []release.PackageTuple `json:"observed_package_tuple,omitempty"`
 }
 
 func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
@@ -100,7 +105,7 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 	response := AgentResponse{SchemaVersion: AgentResponseSchemaVersion, RunID: request.RunID, Action: request.Action}
 	switch request.Action {
 	case AgentPackagePreflight:
-		if len(request.TargetProfile) == 0 || len(request.InstallManifest) == 0 || len(request.SideEffectPlan) == 0 || len(request.InstallerAuthority) != 0 {
+		if len(request.TargetProfile) == 0 || len(request.InstallManifest) == 0 || len(request.SideEffectPlan) == 0 || len(request.InstallerAuthority) != 0 || len(request.Certificates) != 0 {
 			return fmt.Errorf("package preflight request shape is invalid")
 		}
 		result, evidence, runErr := runPackagePreflight(request)
@@ -111,11 +116,19 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 			response.ErrorCode = "package_preflight_blocked"
 		}
 	case AgentInstall:
-		if len(request.InstallerAuthority) == 0 || len(request.TargetProfile) != 0 || len(request.InstallManifest) != 0 || len(request.SideEffectPlan) != 0 {
+		if len(request.InstallerAuthority) == 0 || len(request.TargetProfile) != 0 || len(request.InstallManifest) != 0 || len(request.SideEffectPlan) != 0 || len(request.Certificates) != 0 {
 			return fmt.Errorf("installer agent request shape is invalid")
 		}
 		var output bytes.Buffer
 		runErr := bootstrap.RunQualificationInstallerAuthority(request.InstallerAuthority, &output)
+		if runErr == nil {
+			identity, identityErr := bootstrap.ReadCommittedInstallIdentity(bootstrap.FixedPaths())
+			if identityErr != nil || identity.Kind != release.InstallQualification || identity.RunID != request.RunID || identity.CandidateDigest != request.CandidateDigest {
+				runErr = errors.Join(identityErr, fmt.Errorf("qualification installation identity changed before package observation"))
+			} else {
+				response.ObservedPackageTuple, runErr = observeQualificationPackageTuple(context.Background(), identity.Profile.Packages)
+			}
+		}
 		response.Succeeded = runErr == nil
 		response.Evidence = release.DigestBytes(output.Bytes())
 		if runErr != nil {
@@ -142,7 +155,7 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 			response.ErrorCode = "reboot_submission_failed"
 		}
 	case AgentSetupFixture:
-		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) < 16 || len(request.Secret) > 256 {
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) < 16 || len(request.Secret) > 256 || len(request.Certificates) != 0 {
 			return fmt.Errorf("fixture setup request shape is invalid")
 		}
 		runErr := setupQualificationFixture(request.RunID, request.Secret)
@@ -152,7 +165,7 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 			response.ErrorCode = "fixture_setup_failed"
 		}
 	case AgentSetupDNSProfile:
-		if carriesCoreAgentPayload(request) || request.Provider != "cloudflare" || len(request.Secret) < 20 || len(request.Secret) > 4096 {
+		if carriesCoreAgentPayload(request) || request.Provider != "cloudflare" || len(request.Secret) < 20 || len(request.Secret) > 4096 || len(request.Certificates) != 0 {
 			return fmt.Errorf("DNS profile setup request shape is invalid")
 		}
 		runErr := setupQualificationDNSProfile(request.RunID, request.Provider, request.Secret)
@@ -162,7 +175,7 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 			response.ErrorCode = "dns_profile_setup_failed"
 		}
 	case AgentCleanupFixture:
-		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 {
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || len(request.Certificates) != 0 {
 			return fmt.Errorf("fixture cleanup request shape is invalid")
 		}
 		runErr := cleanupQualificationFixture(request.RunID)
@@ -171,8 +184,18 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 		if runErr != nil {
 			response.ErrorCode = "fixture_cleanup_failed"
 		}
+	case AgentCleanupCertificates:
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || request.ProbeName != "" || request.ExpectedIP != "" || len(request.Certificates) == 0 || validateQualificationCertificateArtifacts(request.Certificates, false) != nil {
+			return fmt.Errorf("certificate cleanup request shape is invalid")
+		}
+		runErr := cleanupQualificationCertificates(context.Background(), request.Certificates)
+		response.Succeeded = runErr == nil
+		response.Evidence = release.DigestBytes([]byte("certificate-cleanup/" + request.RunID))
+		if runErr != nil {
+			response.ErrorCode = "certificate_cleanup_failed"
+		}
 	case AgentSecretSentinel:
-		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) == 0 || len(request.Secrets) > 8 {
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) == 0 || len(request.Secrets) > 8 || len(request.Certificates) != 0 {
 			return fmt.Errorf("secret sentinel request shape is invalid")
 		}
 		runErr := runSecretSentinel(request.Secrets)
@@ -182,17 +205,18 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 			response.ErrorCode = "secret_residue_detected"
 		}
 	case AgentFinalInventory:
-		if carriesAgentPayload(request) {
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || request.ProbeName != "" || request.ExpectedIP != "" || validateQualificationCertificateArtifacts(request.Certificates, true) != nil {
 			return fmt.Errorf("final inventory request shape is invalid")
 		}
-		runErr := verifyQualificationFinalInventory(request.RunID)
+		observed, runErr := verifyQualificationFinalInventory(context.Background(), request.RunID, request.Certificates[0])
+		response.ObservedPackageTuple = observed
 		response.Succeeded = runErr == nil
 		response.Evidence = release.DigestBytes([]byte("final-inventory/" + request.RunID))
 		if runErr != nil {
 			response.ErrorCode = "final_inventory_incomplete"
 		}
 	case AgentMagicDNSProbe:
-		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || !canonicalDomain(request.ProbeName) || net.ParseIP(request.ExpectedIP) == nil {
+		if carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || len(request.Certificates) != 0 || !canonicalDomain(request.ProbeName) || net.ParseIP(request.ExpectedIP) == nil {
 			return fmt.Errorf("MagicDNS probe request shape is invalid")
 		}
 		addresses, lookupErr := net.DefaultResolver.LookupHost(context.Background(), request.ProbeName)
@@ -223,6 +247,10 @@ func DecodeAgentResponse(data []byte, runID string, action AgentAction) (AgentRe
 	}
 	if response.SchemaVersion != AgentResponseSchemaVersion || response.RunID != runID || response.Action != action || !release.ValidDigest(response.Evidence) || response.Succeeded && response.ErrorCode != "" || !response.Succeeded && response.ErrorCode == "" {
 		return AgentResponse{}, fmt.Errorf("qualification agent response authority is invalid")
+	}
+	packageObservationAction := action == AgentInstall || action == AgentFinalInventory
+	if len(response.ObservedPackageTuple) != 0 && (!packageObservationAction || !validObservedPackageTuple(response.ObservedPackageTuple)) || response.Succeeded && packageObservationAction && len(response.ObservedPackageTuple) == 0 {
+		return AgentResponse{}, fmt.Errorf("qualification agent package observation is invalid")
 	}
 	if action == AgentPackagePreflight {
 		if _, err := response.Preflight.Digest(); err != nil {
@@ -295,7 +323,7 @@ func carriesCoreAgentPayload(request AgentRequest) bool {
 }
 
 func carriesAgentPayload(request AgentRequest) bool {
-	return carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || request.ProbeName != "" || request.ExpectedIP != ""
+	return carriesCoreAgentPayload(request) || request.Provider != "" || len(request.Secret) != 0 || len(request.Secrets) != 0 || request.ProbeName != "" || request.ExpectedIP != "" || len(request.Certificates) != 0
 }
 
 type QualificationFixturePaths struct {
@@ -500,34 +528,227 @@ func runSecretSentinelRoots(secrets [][]byte, roots []string) error {
 	return nil
 }
 
-func verifyQualificationFinalInventory(runID string) error {
-	identity, err := bootstrap.ReadCommittedInstallIdentity(bootstrap.FixedPaths())
-	if err != nil || identity.Kind != release.InstallQualification || identity.RunID != runID {
-		return fmt.Errorf("final inventory installation authority differs: %w", err)
+func cleanupQualificationCertificates(ctx context.Context, artifacts []qualificationCertificateArtifact) error {
+	if len(artifacts) == 0 {
+		return fmt.Errorf("qualification certificate cleanup authority is empty")
 	}
-	paths, err := FixedQualificationFixturePaths(runID)
+	if err := validateQualificationCertificateArtifacts(artifacts, false); err != nil {
+		return fmt.Errorf("qualification certificate cleanup authority is invalid: %w", err)
+	}
+	byID := make(map[string]map[string]qualificationCertificateArtifact, len(artifacts))
+	for _, artifact := range artifacts {
+		path, _ := certificates.BundlePath(artifact.CertificateID, artifact.Generation)
+		if byID[artifact.CertificateID] == nil {
+			byID[artifact.CertificateID] = map[string]qualificationCertificateArtifact{}
+		}
+		byID[artifact.CertificateID][path] = artifact
+	}
+	bundleEntries, err := readCertificateInventory(certificates.FixedBundlesRoot)
 	if err != nil {
 		return err
 	}
+	activeEntries, err := readCertificateInventory(certificates.FixedActiveRoot)
+	if err != nil {
+		return err
+	}
+	for id, expected := range byID {
+		for _, entry := range bundleEntries {
+			if strings.HasPrefix(entry, id+"-") {
+				path := filepath.Join(certificates.FixedBundlesRoot, entry)
+				artifact, present := expected[path]
+				if !present || certificates.VerifyBundleCleanupIdentity(id, artifact.Generation, artifact.Bundle) != nil {
+					return fmt.Errorf("qualification certificate bundle inventory differs from cleanup authority")
+				}
+			}
+		}
+		pointerName := id + ".current"
+		pointerListed := false
+		for _, entry := range activeEntries {
+			if entry == pointerName {
+				pointerListed = true
+			} else if strings.HasPrefix(entry, id) {
+				return fmt.Errorf("qualification certificate pointer inventory differs from cleanup authority")
+			}
+		}
+		observed, observeErr := certificates.ObservePointer(id)
+		if observeErr != nil && !os.IsNotExist(observeErr) {
+			return observeErr
+		}
+		if observed == "" {
+			if pointerListed {
+				return fmt.Errorf("qualification certificate pointer disappeared during cleanup observation")
+			}
+			continue
+		}
+		artifact, present := expected[observed]
+		if !pointerListed || !present {
+			return fmt.Errorf("qualification certificate active pointer differs from cleanup authority")
+		}
+		pointer := certificates.Pointer{CertificateID: id, CandidateGeneration: artifact.Generation, CandidateIdentity: artifact.Bundle}
+		if err := certificates.RemovePointer(ctx, pointer, observed); err != nil {
+			return err
+		}
+	}
+	for _, artifact := range artifacts {
+		path, _ := certificates.BundlePath(artifact.CertificateID, artifact.Generation)
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		stage, err := identity.CertificateStageIdentityFor(artifact.CertificateID)
+		if err != nil {
+			return err
+		}
+		if err := certificates.RemoveInactiveBundle(artifact.CertificateID, artifact.Generation, artifact.Bundle, stage.UID, stage.GID); err != nil {
+			return err
+		}
+	}
+	for id := range byID {
+		pointer, err := certificates.ObservePointer(id)
+		if err != nil && !os.IsNotExist(err) || pointer != "" {
+			return fmt.Errorf("qualification certificate pointer remains after cleanup: %w", err)
+		}
+	}
+	bundleEntries, err = readCertificateInventory(certificates.FixedBundlesRoot)
+	if err != nil {
+		return err
+	}
+	activeEntries, err = readCertificateInventory(certificates.FixedActiveRoot)
+	if err != nil {
+		return err
+	}
+	for id := range byID {
+		for _, entry := range bundleEntries {
+			if strings.HasPrefix(entry, id+"-") {
+				return fmt.Errorf("qualification certificate bundle remains after cleanup")
+			}
+		}
+		for _, entry := range activeEntries {
+			if strings.HasPrefix(entry, id) {
+				return fmt.Errorf("qualification certificate pointer remains after cleanup")
+			}
+		}
+	}
+	return nil
+}
+
+func verifyQualificationCertificateInventory(retained qualificationCertificateArtifact) error {
+	if err := validateQualificationCertificateArtifacts([]qualificationCertificateArtifact{retained}, true); err != nil {
+		return err
+	}
+	bundlePath, _ := certificates.BundlePath(retained.CertificateID, retained.Generation)
+	pointerPath, _ := certificates.ActivePointerPath(retained.CertificateID)
+	bundles, err := readCertificateInventory(certificates.FixedBundlesRoot)
+	if err != nil {
+		return err
+	}
+	if len(bundles) != 1 || filepath.Join(certificates.FixedBundlesRoot, bundles[0]) != bundlePath {
+		return fmt.Errorf("final certificate bundle inventory is not exactly retained Headscale authority")
+	}
+	pointers, err := readCertificateInventory(certificates.FixedActiveRoot)
+	if err != nil {
+		return err
+	}
+	if len(pointers) != 1 || filepath.Join(certificates.FixedActiveRoot, pointers[0]) != pointerPath {
+		return fmt.Errorf("final certificate pointer inventory is not exactly retained Headscale authority")
+	}
+	observed, err := certificates.ObservePointer(retained.CertificateID)
+	if err != nil || observed != bundlePath {
+		return fmt.Errorf("retained Headscale certificate pointer differs: %w", err)
+	}
+	if err := certificates.VerifyBundleIdentity(retained.CertificateID, retained.Generation, retained.Bundle); err != nil {
+		return fmt.Errorf("retained Headscale certificate bundle differs: %w", err)
+	}
+	return nil
+}
+
+func readCertificateInventory(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	values := make([]string, len(entries))
+	for index, entry := range entries {
+		values[index] = entry.Name()
+	}
+	return values, nil
+}
+
+func verifyQualificationFinalInventory(ctx context.Context, runID string, retainedCertificate qualificationCertificateArtifact) ([]release.PackageTuple, error) {
+	identity, err := bootstrap.ReadCommittedInstallIdentity(bootstrap.FixedPaths())
+	if err != nil || identity.Kind != release.InstallQualification || identity.RunID != runID {
+		return nil, fmt.Errorf("final inventory installation authority differs: %w", err)
+	}
+	observedPackages, err := observeQualificationPackageTuple(ctx, identity.Profile.Packages)
+	if err != nil {
+		return observedPackages, err
+	}
+	if err := verifyQualificationCertificateInventory(retainedCertificate); err != nil {
+		return observedPackages, err
+	}
+	paths, err := FixedQualificationFixturePaths(runID)
+	if err != nil {
+		return observedPackages, err
+	}
 	for _, path := range []string{paths.StaticFile, paths.StaticRoot, paths.HTPasswd, paths.DNSToken, paths.DNSProfile, paths.SrvRunRoot, paths.EtcRunRoot, "/srv/lanpanel-qualification", "/etc/lanpanel-qualification"} {
 		if _, err := os.Lstat(path); err == nil || !os.IsNotExist(err) {
-			return fmt.Errorf("qualification fixture residue remains")
+			return observedPackages, fmt.Errorf("qualification fixture residue remains")
 		}
 	}
 	result, err := runQualificationProfileResult(child.ProfileQualificationServices)
 	if err != nil {
-		return err
+		return observedPackages, err
 	}
 	states := strings.Fields(string(result.Stdout))
-	if len(states) != 5 {
-		return fmt.Errorf("qualification retained service inventory is incomplete")
+	if len(states) != 7 {
+		return observedPackages, fmt.Errorf("qualification retained service inventory is incomplete")
 	}
 	for _, state := range states {
 		if state != "active" {
-			return fmt.Errorf("qualification retained service is not active")
+			return observedPackages, fmt.Errorf("qualification retained service is not active")
 		}
 	}
-	return nil
+	return observedPackages, nil
+}
+
+func observeQualificationPackageTuple(ctx context.Context, expected []release.PackageTuple) ([]release.PackageTuple, error) {
+	names := make([]string, len(expected))
+	for index, tuple := range expected {
+		names[index] = tuple.Name
+	}
+	observed, err := preflight.ObserveInstalledPackageTuples(ctx, names)
+	values := make([]release.PackageTuple, len(observed))
+	for index, tuple := range observed {
+		values[index] = release.PackageTuple{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture}
+	}
+	if err != nil {
+		return values, err
+	}
+	if len(values) != len(expected) {
+		return values, fmt.Errorf("observed package tuple differs from committed target profile")
+	}
+	for index, tuple := range values {
+		if tuple != expected[index] {
+			return values, fmt.Errorf("observed package tuple differs from committed target profile")
+		}
+	}
+	return values, nil
+}
+
+func validObservedPackageTuple(values []release.PackageTuple) bool {
+	previous := ""
+	for _, tuple := range values {
+		key := tuple.Name + "\x00" + tuple.Architecture
+		if tuple.Name == "" || tuple.Version == "" || tuple.Name != strings.TrimSpace(tuple.Name) || tuple.Version != strings.TrimSpace(tuple.Version) || len(tuple.Name) > 128 || len(tuple.Version) > 128 || strings.ContainsAny(tuple.Name+tuple.Version, "\x00\r\n") || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+			return false
+		}
+		previous = key
+	}
+	return len(values) != 0
 }
 
 func runQualificationProfile(profile child.ProfileID) error {

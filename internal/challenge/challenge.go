@@ -8,6 +8,7 @@ import (
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/safety"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -29,6 +30,8 @@ type Prepared struct {
 	Owners []string
 }
 
+var http01TokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{20,256}$`)
+
 func Prepare(request Request) (Prepared, error) {
 	if request.ResourceID == "" || request.PlanID == "" || request.Generation == 0 || !digest(request.ConfigDigest) || request.CertificateIdentity == "" || len(request.Domains) == 0 {
 		return Prepared{}, fmt.Errorf("challenge request incomplete")
@@ -45,20 +48,17 @@ func Prepare(request Request) (Prepared, error) {
 	pending := safety.ChallengePending{Generation: request.Generation, PlanID: request.PlanID, Method: string(request.Binding.Method), ConfigDigest: request.ConfigDigest, SANIdentity: sum([]byte(strings.Join(domains, "\x00"))), ACMEBinding: bindingDigest, CertificateIdentity: request.CertificateIdentity, BaseMarkers: append([]safety.MarkerSnapshot(nil), request.BaseMarkers...), Hosts: domains}
 	switch request.Binding.Method {
 	case acme.ChallengeHTTP01:
-		if !strings.HasPrefix(request.Webroot, "/var/lib/lanpanel/certificates/webroot/") || filepath.Clean(request.Webroot) != request.Webroot {
+		expectedWebroot := filepath.Join("/var/lib/lanpanel/certificates/webroot", request.CertificateIdentity)
+		if request.Webroot != expectedWebroot {
 			return Prepared{}, fmt.Errorf("HTTP-01 route identity invalid")
 		}
+		// The CA chooses each HTTP-01 token after the order starts. Persist this
+		// tokenless operation identity now; PresentHTTP derives the only graph
+		// entry that may be loaded once an exact Host/token is available.
 		pending.Host = domains[0]
-		pending.TokenPath = "/.well-known/acme-challenge"
 		pending.Webroot = request.Webroot
 		pending.BootstrapIdentity = sum([]byte("bootstrap:not-required"))
-		entry := nginx.Entry{Kind: nginx.EntryChallenge, ResourceID: request.ResourceID, Relative: filepath.ToSlash(filepath.Join(nginx.ChallengesDirectory, request.ResourceID+".conf")), Digest: "sha256:" + strings.Repeat("0", 64), Domains: domains, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: request.Generation, Challenge: &nginx.ChallengeSite{Hosts: domains, Webroot: request.Webroot}}
-		data, err := nginx.RenderEntry(entry)
-		if err != nil {
-			return Prepared{}, err
-		}
-		entry.Digest = sum(data)
-		return Prepared{Safety: pending, Entry: &entry}, nil
+		return Prepared{Safety: pending}, nil
 	case acme.ChallengeDNS01:
 		if !acme.DNS01ZoneCoversDomains(request.Binding.Zone, domains) {
 			return Prepared{}, fmt.Errorf("DNS challenge owner outside authoritative zone")
@@ -81,11 +81,23 @@ func Prepare(request Request) (Prepared, error) {
 	}
 }
 
+func ClearHTTP(active Prepared) (Prepared, error) {
+	if active.Entry == nil || active.Safety.Method != "http-01" || active.Safety.Token == "" || active.Safety.TokenPath != "/.well-known/acme-challenge/"+active.Safety.Token || active.Safety.KeyAuthorizationDigest == "" || len(active.Safety.Hosts) == 0 {
+		return Prepared{}, fmt.Errorf("HTTP challenge active presentation identity invalid")
+	}
+	pending := active.Safety
+	pending.Host = pending.Hosts[0]
+	pending.Token = ""
+	pending.TokenPath = ""
+	pending.KeyAuthorizationDigest = ""
+	return Prepared{Safety: pending}, nil
+}
+
 func PreparedHTTP(resourceID string, pending safety.ChallengePending) (Prepared, error) {
-	if pending.Method != "http-01" || resourceID == "" {
+	if pending.Method != "http-01" || resourceID == "" || !slices.Contains(pending.Hosts, pending.Host) || !http01TokenPattern.MatchString(pending.Token) || pending.TokenPath != "/.well-known/acme-challenge/"+pending.Token || !digest(pending.KeyAuthorizationDigest) {
 		return Prepared{}, fmt.Errorf("HTTP challenge recovery identity invalid")
 	}
-	entry := nginx.Entry{Kind: nginx.EntryChallenge, ResourceID: resourceID, Relative: filepath.ToSlash(filepath.Join(nginx.ChallengesDirectory, resourceID+".conf")), Digest: "sha256:" + strings.Repeat("0", 64), Domains: append([]string(nil), pending.Hosts...), Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: pending.Generation, Challenge: &nginx.ChallengeSite{Hosts: append([]string(nil), pending.Hosts...), Webroot: pending.Webroot}}
+	entry := nginx.Entry{Kind: nginx.EntryChallenge, ResourceID: resourceID, Relative: filepath.ToSlash(filepath.Join(nginx.ChallengesDirectory, resourceID+".conf")), Digest: "sha256:" + strings.Repeat("0", 64), Domains: []string{pending.Host}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: pending.Generation, Challenge: &nginx.ChallengeSite{Generation: pending.Generation, Host: pending.Host, Token: pending.Token, TokenPath: pending.TokenPath, KeyAuthorizationDigest: pending.KeyAuthorizationDigest, Webroot: pending.Webroot}}
 	digest, err := nginx.DigestEntry(entry)
 	if err != nil {
 		return Prepared{}, err
@@ -94,8 +106,23 @@ func PreparedHTTP(resourceID string, pending safety.ChallengePending) (Prepared,
 	return Prepared{Safety: pending, Entry: &entry}, nil
 }
 
+func PresentHTTPForResource(resourceID string, base Prepared, host, token, keyAuthorizationDigest string) (Prepared, error) {
+	if resourceID == "" {
+		return Prepared{}, fmt.Errorf("HTTP challenge resource identity invalid")
+	}
+	pending := base.Safety
+	if pending.Method != "http-01" || base.Entry != nil || pending.Token != "" || pending.TokenPath != "" || pending.KeyAuthorizationDigest != "" || !slices.Contains(pending.Hosts, host) || !http01TokenPattern.MatchString(token) || !digest(keyAuthorizationDigest) {
+		return Prepared{}, fmt.Errorf("HTTP challenge presentation identity invalid")
+	}
+	pending.Host = host
+	pending.Token = token
+	pending.TokenPath = "/.well-known/acme-challenge/" + token
+	pending.KeyAuthorizationDigest = keyAuthorizationDigest
+	return PreparedHTTP(resourceID, pending)
+}
+
 func Matches(pending safety.ChallengePending, prepared Prepared) bool {
-	return pending.Generation == prepared.Safety.Generation && pending.PlanID == prepared.Safety.PlanID && pending.Method == prepared.Safety.Method && pending.ConfigDigest == prepared.Safety.ConfigDigest && pending.SANIdentity == prepared.Safety.SANIdentity && pending.ACMEBinding == prepared.Safety.ACMEBinding && pending.CertificateIdentity == prepared.Safety.CertificateIdentity && pending.OwnerLock == prepared.Safety.OwnerLock && pending.Provider == prepared.Safety.Provider && pending.Zone == prepared.Safety.Zone && slices.Equal(pending.Owners, prepared.Safety.Owners) && pending.Host == prepared.Safety.Host && slices.Equal(pending.Hosts, prepared.Safety.Hosts) && pending.TokenPath == prepared.Safety.TokenPath && pending.Webroot == prepared.Safety.Webroot && pending.BootstrapIdentity == prepared.Safety.BootstrapIdentity && slices.Equal(pending.BaseMarkers, prepared.Safety.BaseMarkers)
+	return pending.Generation == prepared.Safety.Generation && pending.PlanID == prepared.Safety.PlanID && pending.Method == prepared.Safety.Method && pending.ConfigDigest == prepared.Safety.ConfigDigest && pending.SANIdentity == prepared.Safety.SANIdentity && pending.ACMEBinding == prepared.Safety.ACMEBinding && pending.CertificateIdentity == prepared.Safety.CertificateIdentity && pending.OwnerLock == prepared.Safety.OwnerLock && pending.Provider == prepared.Safety.Provider && pending.Zone == prepared.Safety.Zone && slices.Equal(pending.Owners, prepared.Safety.Owners) && pending.Host == prepared.Safety.Host && slices.Equal(pending.Hosts, prepared.Safety.Hosts) && pending.Token == prepared.Safety.Token && pending.TokenPath == prepared.Safety.TokenPath && pending.KeyAuthorizationDigest == prepared.Safety.KeyAuthorizationDigest && pending.Webroot == prepared.Safety.Webroot && pending.BootstrapIdentity == prepared.Safety.BootstrapIdentity && slices.Equal(pending.BaseMarkers, prepared.Safety.BaseMarkers)
 }
 
 func sum(data []byte) string {

@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -46,13 +47,17 @@ type PublicProbe struct {
 }
 
 type PublicEvidence struct {
-	SchemaVersion    string `json:"schema_version"`
-	URL              string `json:"url"`
-	Status           int    `json:"status"`
-	BodyDigest       string `json:"body_digest"`
-	ObservedSourceIP string `json:"observed_source_ip,omitempty"`
-	TLSVersion       uint16 `json:"tls_version,omitempty"`
-	WebSocket        bool   `json:"websocket"`
+	SchemaVersion          string   `json:"schema_version"`
+	URL                    string   `json:"url"`
+	Status                 int      `json:"status"`
+	BodyDigest             string   `json:"body_digest"`
+	ObservedSourceIP       string   `json:"observed_source_ip,omitempty"`
+	TLSVersion             uint16   `json:"tls_version,omitempty"`
+	PublicTrustVerified    bool     `json:"public_trust_verified,omitempty"`
+	CertificateSHA256      string   `json:"certificate_sha256,omitempty"`
+	CertificateDNSNames    []string `json:"certificate_dns_names,omitempty"`
+	CertificateNotAfterUTC string   `json:"certificate_not_after_utc,omitempty"`
+	WebSocket              bool     `json:"websocket"`
 }
 
 func LoadVantageAuthority(reference string) (VantageAuthority, string, error) {
@@ -72,6 +77,13 @@ func LoadVantageAuthority(reference string) (VantageAuthority, string, error) {
 		return VantageAuthority{}, "", fmt.Errorf("direct external vantage authority is invalid")
 	}
 	return value, release.DigestBytes(data), nil
+}
+
+func publicProbeRequestAuthority(probe PublicProbe) string {
+	if probe.Scheme == "http" && probe.Port != 80 {
+		return net.JoinHostPort(probe.Host, strconv.Itoa(int(probe.Port)))
+	}
+	return probe.Host
 }
 
 func ProbePublic(ctx context.Context, vantage VantageAuthority, probe PublicProbe) ([]byte, error) {
@@ -101,10 +113,8 @@ func ProbePublic(ctx context.Context, vantage VantageAuthority, probe PublicProb
 	if err != nil {
 		return nil, err
 	}
-	request.Host = probe.Host
-	if probe.Scheme == "http" && probe.Port != 80 {
-		request.Host = net.JoinHostPort(probe.Host, strconv.Itoa(int(probe.Port)))
-	}
+	hostAuthority := publicProbeRequestAuthority(probe)
+	request.Host = hostAuthority
 	request.Header.Set("Authorization", probe.Authorization)
 	if probe.BasicUsername != "" {
 		request.SetBasicAuth(probe.BasicUsername, probe.BasicPassword)
@@ -120,10 +130,8 @@ func ProbePublic(ctx context.Context, vantage VantageAuthority, probe PublicProb
 	if err != nil || response.StatusCode != probe.ExpectedStatus || probe.ExpectedBodyDigest != "" && release.DigestBytes(body) != probe.ExpectedBodyDigest {
 		return nil, fmt.Errorf("public probe status or body differs: status=%d digest=%s: %w", response.StatusCode, release.DigestBytes(body), err)
 	}
-	evidence := PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: probe.Scheme + "://" + probe.Host + probe.Path, Status: response.StatusCode, BodyDigest: release.DigestBytes(body)}
-	if response.TLS != nil {
-		evidence.TLSVersion = response.TLS.Version
-	}
+	evidence := PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v2", URL: probeURL, Status: response.StatusCode, BodyDigest: release.DigestBytes(body)}
+	bindVerifiedTLS(&evidence, response.TLS)
 	if probe.Path == "/echo" {
 		var echo struct {
 			Authorization   string `json:"authorization"`
@@ -135,7 +143,7 @@ func ProbePublic(ctx context.Context, vantage VantageAuthority, probe PublicProb
 			CFConnectingIP  string `json:"cf_connecting_ip"`
 			TrueClientIP    string `json:"true_client_ip"`
 		}
-		if err := json.Unmarshal(body, &echo); err != nil || echo.Authorization != probe.ExpectedAuthorization || echo.Forwarded != "" || echo.CFConnectingIP != "" || echo.TrueClientIP != "" || echo.XRealIP != vantage.ExpectedSourceIPv4 || echo.XForwardedFor != vantage.ExpectedSourceIPv4 || echo.XForwardedHost != probe.Host || echo.XForwardedProto != probe.Scheme {
+		if err := json.Unmarshal(body, &echo); err != nil || echo.Authorization != probe.ExpectedAuthorization || echo.Forwarded != "" || echo.CFConnectingIP != "" || echo.TrueClientIP != "" || echo.XRealIP != vantage.ExpectedSourceIPv4 || echo.XForwardedFor != vantage.ExpectedSourceIPv4 || echo.XForwardedHost != hostAuthority || echo.XForwardedProto != probe.Scheme {
 			return nil, fmt.Errorf("public probe header sanitization or external source identity differs: %w", err)
 		}
 		evidence.ObservedSourceIP = echo.XRealIP
@@ -153,7 +161,7 @@ func ProbeSTUN(ctx context.Context, vantage VantageAuthority, target string) ([]
 	if err != nil {
 		return nil, err
 	}
-	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: "stun:" + target + ":3478", Status: 200, BodyDigest: release.DigestBytes(response), ObservedSourceIP: expectedSource.String()})
+	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v2", URL: "stun:" + target + ":3478", Status: 200, BodyDigest: release.DigestBytes(response), ObservedSourceIP: expectedSource.String()})
 }
 
 func probeSTUNEndpoint(ctx context.Context, endpoint string, expectedSource netip.Addr) ([]byte, error) {
@@ -285,7 +293,10 @@ func ProbeDERP(ctx context.Context, targetIP, host string) ([]byte, error) {
 	if response.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(response.Header.Get("Upgrade"), "DERP") {
 		return nil, fmt.Errorf("public DERP upgrade endpoint did not switch protocols")
 	}
-	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: "https://" + host + "/derp", Status: response.StatusCode, BodyDigest: release.DigestBytes([]byte(response.Header.Get("Upgrade"))), TLSVersion: connection.(*tls.Conn).ConnectionState().Version})
+	evidence := PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v2", URL: "https://" + host + "/derp", Status: response.StatusCode, BodyDigest: release.DigestBytes([]byte(response.Header.Get("Upgrade")))}
+	state := connection.(*tls.Conn).ConnectionState()
+	bindVerifiedTLS(&evidence, &state)
+	return release.MarshalCanonical(evidence)
 }
 
 func exchangeDERPUpgrade(ctx context.Context, connection net.Conn, request *http.Request) (*http.Response, error) {
@@ -332,5 +343,42 @@ func probePublicWebSocket(ctx context.Context, client *http.Client, target strin
 	if err != nil || kind != websocket.MessageText || string(responseBytes) != string(message) {
 		return nil, fmt.Errorf("public WebSocket echo differs: %w", err)
 	}
-	return release.MarshalCanonical(PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v1", URL: parsed.String(), Status: http.StatusSwitchingProtocols, BodyDigest: release.DigestBytes(responseBytes), WebSocket: true})
+	evidence := PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v2", URL: parsed.String(), Status: http.StatusSwitchingProtocols, BodyDigest: release.DigestBytes(responseBytes), WebSocket: true}
+	if response != nil {
+		bindVerifiedTLS(&evidence, response.TLS)
+	}
+	return release.MarshalCanonical(evidence)
+}
+
+func verifyTrustedHTTPSObservation(data []byte, host, path string) error {
+	var evidence PublicEvidence
+	if err := release.DecodeCanonical(data, &evidence); err != nil {
+		return err
+	}
+	parsed, err := url.Parse(evidence.URL)
+	if evidence.SchemaVersion != "lanpanel.qualification.public-evidence.v2" || err != nil || parsed.Scheme != "https" || parsed.Hostname() != host || parsed.Port() != "" || parsed.Path != path || parsed.RawQuery != "" || parsed.Fragment != "" || evidence.Status != http.StatusOK || !release.ValidDigest(evidence.BodyDigest) || evidence.TLSVersion != tls.VersionTLS12 && evidence.TLSVersion != tls.VersionTLS13 || !evidence.PublicTrustVerified || !release.ValidDigest(evidence.CertificateSHA256) || !slices.Contains(evidence.CertificateDNSNames, host) {
+		return fmt.Errorf("public HTTPS observation is not a trusted exact-host result")
+	}
+	if _, err := time.Parse(time.RFC3339, evidence.CertificateNotAfterUTC); err != nil {
+		return fmt.Errorf("public HTTPS certificate expiry observation is invalid")
+	}
+	for index, name := range evidence.CertificateDNSNames {
+		if !canonicalDomain(name) || index > 0 && evidence.CertificateDNSNames[index-1] >= name {
+			return fmt.Errorf("public HTTPS certificate SAN observation is invalid or noncanonical")
+		}
+	}
+	return nil
+}
+
+func bindVerifiedTLS(evidence *PublicEvidence, state *tls.ConnectionState) {
+	if evidence == nil || state == nil || len(state.PeerCertificates) == 0 || len(state.VerifiedChains) == 0 {
+		return
+	}
+	leaf := state.PeerCertificates[0]
+	evidence.TLSVersion = state.Version
+	evidence.PublicTrustVerified = true
+	evidence.CertificateSHA256 = release.DigestBytes(leaf.Raw)
+	evidence.CertificateDNSNames = append([]string(nil), leaf.DNSNames...)
+	slices.Sort(evidence.CertificateDNSNames)
+	evidence.CertificateNotAfterUTC = leaf.NotAfter.UTC().Format(time.RFC3339)
 }

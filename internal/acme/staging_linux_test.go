@@ -34,7 +34,7 @@ func TestPrepareStageRejectsCredentialChangedAfterBindingAndCleansResidue(t *tes
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
 	}
-	base := t.TempDir()
+	base := protectedTestDir(t)
 	chrootBase := filepath.Join(base, "chroot")
 	webrootBase := filepath.Join(base, "webroot")
 	for _, directory := range []string{chrootBase, webrootBase} {
@@ -104,7 +104,7 @@ func TestPrepareStageMidwayFaultLeavesNoResidueAndCanRetry(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root ownership transitions are unavailable")
 	}
-	base := t.TempDir()
+	base := protectedTestDir(t)
 	chrootBase := filepath.Join(base, "chroot")
 	webrootBase := filepath.Join(base, "webroot")
 	for _, directory := range []string{chrootBase, webrootBase} {
@@ -130,11 +130,8 @@ func TestPrepareStageMidwayFaultLeavesNoResidueAndCanRetry(t *testing.T) {
 	}
 	for attempt := 1; attempt <= 2; attempt++ {
 		stage, err := prepareStage(context.Background(), certificateID, binding, uid, gid, root, webroot, nil, cleanup)
-		if err == nil || stage != (Stage{}) {
-			t.Fatalf("attempt %d stage=%#v err=%v", attempt, stage, err)
-		}
-		if strings.Contains(err.Error(), "residue exists") {
-			t.Fatalf("attempt %d was blocked by prior residue: %v", attempt, err)
+		if !errors.Is(err, os.ErrNotExist) || stage != (Stage{}) {
+			t.Fatalf("attempt %d: expected missing account key fault, stage=%#v err=%v", attempt, stage, err)
 		}
 		for _, path := range []string{root, webroot} {
 			if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {

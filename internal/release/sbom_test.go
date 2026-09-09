@@ -99,6 +99,17 @@ func TestReleaseSPDXRequiresExactPackageAndRelationshipSets(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "missing_scanner_package_url",
+			mutate: func(document *SPDXDocument) {
+				for index := range document.Packages {
+					if document.Packages[index].SPDXID != "SPDXRef-Package-lanpanel" {
+						document.Packages[index].ExternalRefs = nil
+						break
+					}
+				}
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -143,6 +154,27 @@ func TestReleaseSPDXResolvesGoModuleReplacement(t *testing.T) {
 	}
 }
 
+func TestSPDXPackagesExposeExactPinnedScannerIdentities(t *testing.T) {
+	tests := []struct {
+		name    string
+		pkg     SPDXPackage
+		locator string
+	}{
+		{name: "go_module", pkg: spdxGoPackage("golang.org/x/net", "v0.58.0"), locator: "pkg:golang/golang.org/x/net@v0.58.0"},
+		{name: "native_go_binary", pkg: spdxNativePackage("headscale", "0.29.0", "https://example.test/headscale", strings.Repeat("a", 64)), locator: "pkg:golang/github.com/juanfont/headscale@v0.29.0"},
+		{name: "debian_package", pkg: spdxOSPackage(PackageTuple{Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}, "debian", "https://example.test/debian"), locator: "pkg:deb/debian/nginx@1.26.0-1"},
+		{name: "ubuntu_package", pkg: spdxOSPackage(PackageTuple{Name: "nginx", Version: "1.26.0-1ubuntu2", Architecture: "amd64"}, "ubuntu", "https://example.test/ubuntu"), locator: "pkg:deb/ubuntu/nginx@1.26.0-1ubuntu2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := SPDXExternalRef{ReferenceCategory: "PACKAGE-MANAGER", ReferenceType: "purl", ReferenceLocator: test.locator}
+			if len(test.pkg.ExternalRefs) != 1 || test.pkg.ExternalRefs[0] != want || !validSPDXPURL(test.pkg.ExternalRefs[0]) {
+				t.Fatalf("scanner identity=%#v, want %#v", test.pkg.ExternalRefs, want)
+			}
+		})
+	}
+}
+
 func TestGenerateSPDXBindsExactGoBinaryAndModules(t *testing.T) {
 	path, err := os.Executable()
 	if err != nil {
@@ -160,6 +192,10 @@ func TestGenerateSPDXBindsExactGoBinaryAndModules(t *testing.T) {
 	for _, pkg := range document.Packages {
 		if pkg.Name == "lanpanel" && len(pkg.Checksums) == 1 {
 			found = true
+			continue
+		}
+		if len(pkg.ExternalRefs) != 1 || !validSPDXPURL(pkg.ExternalRefs[0]) {
+			t.Fatalf("SBOM package %q is not addressable by the fixed scanner: %#v", pkg.Name, pkg.ExternalRefs)
 		}
 	}
 	if !found {

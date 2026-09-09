@@ -98,7 +98,7 @@ func TestHeadscaleCertificateContractionFenceCommitsEmergencyAuthorityFirst(t *t
 	binding := applicationTestDigest("binding")
 	config := applicationTestDigest("config")
 	base := headscaleBaseSnapshot(current.Headscale)
-	pending := &safety.ChallengePending{Generation: 1, PlanID: "plan_headscale", Method: "http-01", ConfigDigest: config, SANIdentity: applicationTestDigest("san"), ACMEBinding: binding, CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: applicationTestDigest("bootstrap"), BaseMarkers: base}
+	pending := &safety.ChallengePending{Generation: 1, PlanID: "plan_headscale", Method: "http-01", ConfigDigest: config, SANIdentity: applicationTestDigest("san"), ACMEBinding: binding, CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: applicationTestDigest("bootstrap"), BaseMarkers: base}
 	challenged := current
 	challenged.Revision++
 	challenged.Headscale.GenerationSequence = 1

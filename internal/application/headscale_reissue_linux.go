@@ -366,6 +366,29 @@ func beginHeadscaleCertificateRenew(ctx context.Context, plan *plans.Plan, actor
 	return &CertificateExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.CertificateRenew, Revision: intent.IntentGeneration + 3, Binding: binding, Challenge: prepared, InstallationID: installation.InstallationID, Deadline: operationDeadline, BundleGeneration: prior.Generation + 1, PriorCertificate: &priorCopy, Child: childRecord, StageUID: stageIdentity.UID, StageGID: stageIdentity.GID, LegoDigest: legoDigest, Headscale: true, HeadscaleID: headscale.ID, HeadscalePrior: &priorCopy}, nil
 }
 
+// A candidate partially deleted after rollback is cleanup material, never a
+// candidate for reactivation. The remaining suffix must still match the exact
+// journal, and both activation intents must already have been contracted.
+func headscaleRollbackCandidate(candidate certificates.Identity, observeErr error, expected certificates.BundleIdentity, cleanupOnly bool, verifyCleanup func() error) (certificates.Identity, bool, error) {
+	if observeErr == nil {
+		if certificates.BundleIdentityFor(candidate) != expected {
+			return certificates.Identity{}, false, fmt.Errorf("headscale rollback candidate identity changed")
+		}
+		return candidate, true, nil
+	}
+	if errors.Is(observeErr, os.ErrNotExist) {
+		return certificates.Identity{}, false, nil
+	}
+	if cleanupOnly {
+		if err := verifyCleanup(); err == nil {
+			return certificates.Identity{}, false, nil
+		} else {
+			return certificates.Identity{}, false, errors.Join(observeErr, err)
+		}
+	}
+	return certificates.Identity{}, false, observeErr
+}
+
 func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (returnErr error) {
 	service, err := OpenFixed()
 	if err != nil {
@@ -432,10 +455,16 @@ func reconcileCompletedHeadscaleRenewal(ctx context.Context, journalID string) (
 		if controlErr != nil || controlJournal.Certificate == nil || controlJournal.Certificate.ID != certificate.CertificateID || controlJournal.Certificate.Generation != certificate.PriorGeneration || certificates.BundleIdentityFor(*controlJournal.Certificate) != certificate.PriorBundleIdentity || (controlJournal.Phase != control.PhaseCommitted && controlJournal.Phase != control.PhaseExpired) || installation.Headscale.Applied == nil {
 			return fenceRollback(errors.Join(controlErr, fmt.Errorf("headscale rollback control certificate authority changed")))
 		}
+		rollbackState, stateErr := service.safety.ReadForRecovery(exposure)
+		if stateErr != nil {
+			return fenceRollback(stateErr)
+		}
 		candidateIdentity, candidateErr := certificates.ObserveIdentity(certificates.FixedBundlesRoot, certificate.CertificateID, certificate.CandidateGeneration, filetxn.Owner{UID: certificate.StageUID, GID: certificate.StageGID})
-		candidatePresent := candidateErr == nil
-		if candidateErr != nil && !errors.Is(candidateErr, os.ErrNotExist) || candidatePresent && certificates.BundleIdentityFor(candidateIdentity) != certificate.CandidateBundleIdentity {
-			return fenceRollback(errors.Join(candidateErr, fmt.Errorf("headscale rollback candidate certificate authority changed")))
+		candidateIdentity, candidatePresent, candidateErr := headscaleRollbackCandidate(candidateIdentity, candidateErr, certificate.CandidateBundleIdentity, installation.Headscale.DeployIntent == nil && rollbackState.Headscale.Reactivating == nil, func() error {
+			return certificates.VerifyBundleCleanupIdentity(certificate.CertificateID, certificate.CandidateGeneration, certificate.CandidateBundleIdentity)
+		})
+		if candidateErr != nil {
+			return fenceRollback(candidateErr)
 		}
 		priorActivation, priorActivationErr := control.BuildActivation(controlJournal.InstallationID, controlJournal.Candidate, *controlJournal.Certificate)
 		if priorActivationErr != nil {

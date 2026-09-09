@@ -98,7 +98,6 @@ func TestTailnetUpdateJournalRecovery(t *testing.T) {
 	prior := recoveryTailnetResource()
 	runResourceUpdateJournalRecovery(t, prior, func(installation domain.Installation, prior domain.AppResource) (domain.AppResource, error) {
 		candidate := prior
-		candidate.Name = "Peer Updated"
 		candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
 		return resource.PrepareUpdate(installation, candidate)
 	}, func(t *testing.T, _, candidate, normal domain.AppResource) {
@@ -130,7 +129,6 @@ func TestLocalUpdateJournalRecoveryPreservesProcessState(t *testing.T) {
 			candidate := prior
 			process := *prior.ManagedProcess
 			candidate.ManagedProcess = &process
-			candidate.Name = "Reference-bound Local App"
 			candidate, err := resource.PrepareUpdate(installation, candidate)
 			if err != nil {
 				return domain.AppResource{}, err

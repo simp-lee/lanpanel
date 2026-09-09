@@ -468,7 +468,7 @@ func probeDomain(ctx context.Context, candidate publication.Candidate, target do
 		if observed != candidate.Bundle.DomainHTTPS.Certificate.Fingerprint {
 			return "", fmt.Errorf("domain served certificate changed")
 		}
-		allowed := slices.Contains(target.AllowedHTTPStatuses, uint16(status)) || site.AuthMode == "basic" && (status == http.StatusUnauthorized || status == http.StatusForbidden) || site.AuthMode == "application_managed" && (status == http.StatusUnauthorized || status == http.StatusForbidden)
+		allowed := slices.Contains(target.AllowedHTTPStatuses, uint16(status)) || site.AuthMode == "basic" && (status == http.StatusUnauthorized || status == http.StatusForbidden)
 		if !allowed {
 			return "", fmt.Errorf("domain runtime status %d rejected", status)
 		}

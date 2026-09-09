@@ -50,7 +50,10 @@ const (
 	AuditMarker          = "# lanpanel rejection audit\n"
 )
 
-var resourcePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+var (
+	resourcePattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	acmeTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{20,256}$`)
+)
 
 type Paths struct {
 	ConfigRoot      string
@@ -133,8 +136,12 @@ type StaticRoute struct {
 	Identity     string `json:"identity"`
 }
 type ChallengeSite struct {
-	Hosts   []string `json:"hosts"`
-	Webroot string   `json:"webroot"`
+	Generation             uint64 `json:"generation"`
+	Host                   string `json:"host"`
+	Token                  string `json:"token"`
+	TokenPath              string `json:"token_path"`
+	KeyAuthorizationDigest string `json:"key_authorization_digest"`
+	Webroot                string `json:"webroot"`
 }
 
 type TemporarySite struct {
@@ -755,20 +762,16 @@ func validateParentChain(path string) error {
 // and control renderers replace this closed representation; Audit never accepts
 // free-form Nginx directives as an entry implementation.
 func validChallengeSite(site ChallengeSite, domains []string) bool {
-	if !slices.Equal(site.Hosts, domains) || len(site.Hosts) == 0 || !strings.HasPrefix(site.Webroot, "/var/lib/lanpanel/certificates/webroot/") || filepath.Clean(site.Webroot) != site.Webroot {
-		return false
-	}
-	return true
+	return site.Generation != 0 && len(domains) == 1 && domains[0] == site.Host && validDomain(site.Host) && acmeTokenPattern.MatchString(site.Token) && site.TokenPath == "/.well-known/acme-challenge/"+site.Token && validDigest(site.KeyAuthorizationDigest) && strings.HasPrefix(site.Webroot, "/var/lib/lanpanel/certificates/webroot/") && filepath.Clean(site.Webroot) == site.Webroot
+}
+
+func renderChallengeLocations(site ChallengeSite) string {
+	return fmt.Sprintf("  # lanpanel HTTP-01 generation %d; key authorization %s\n  location = %s {\n    default_type application/octet-stream;\n    disable_symlinks on;\n    alias %s;\n    limit_except GET HEAD { deny all; }\n  }\n  location ^~ /.well-known/acme-challenge/ { return 404; }\n", site.Generation, site.KeyAuthorizationDigest, site.TokenPath, quoteNginxArgument(site.Webroot+site.TokenPath))
 }
 
 func renderChallenge(entry Entry) ([]byte, error) {
 	site := entry.Challenge
-	hosts := strings.Join(site.Hosts, " ")
-	escaped := make([]string, len(site.Hosts))
-	for index, host := range site.Hosts {
-		escaped[index] = regexp.QuoteMeta(host)
-	}
-	text := fmt.Sprintf("server {\n  listen 0.0.0.0:80;\n  listen [::]:80;\n  server_name %s;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n  location ~ ^/\\.well-known/acme-challenge/([A-Za-z0-9_-]{20,256})$ {\n    default_type application/octet-stream;\n    disable_symlinks on;\n    alias %s/.well-known/acme-challenge/$1;\n    limit_except GET HEAD { deny all; }\n  }\n  location /.well-known/acme-challenge/ { return 404; }\n  location / { return 421; }\n}\n", hosts, strings.Join(escaped, "|"), site.Webroot)
+	text := fmt.Sprintf("server {\n  listen 0.0.0.0:80;\n  listen [::]:80;\n  server_name %s;\n  if ($http_host !~* ^(?:%s)$) { return 421; }\n%s  location / { return 421; }\n}\n", site.Host, regexp.QuoteMeta(site.Host), renderChallengeLocations(*site))
 	return []byte(text), nil
 }
 
@@ -957,7 +960,7 @@ func RenderEntry(entry Entry) ([]byte, error) {
 			if bytes.Count(data, needle) != 1 {
 				return nil, fmt.Errorf("headscale challenge insertion changed")
 			}
-			route := []byte(fmt.Sprintf("  location ~ ^/\\.well-known/acme-challenge/([A-Za-z0-9_-]{20,256})$ {\n    default_type application/octet-stream;\n    disable_symlinks on;\n    alias %s/.well-known/acme-challenge/$1;\n    limit_except GET HEAD { deny all; }\n  }\n  location /.well-known/acme-challenge/ { return 404; }\n", entry.Challenge.Webroot))
+			route := []byte(renderChallengeLocations(*entry.Challenge))
 			data = bytes.Replace(data, needle, append(route, needle...), 1)
 		}
 		return data, nil

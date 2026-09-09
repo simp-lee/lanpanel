@@ -26,6 +26,7 @@ import (
 	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/sources"
+	"lanpanel/internal/storeauthority"
 	"reflect"
 	"slices"
 	"sort"
@@ -110,10 +111,11 @@ type SafetyBinding struct {
 type AdmissionSource string
 
 const (
-	AdmissionPlan    AdmissionSource = "plan"
-	AdmissionTimer   AdmissionSource = "timer"
-	AdmissionStartup AdmissionSource = "startup"
-	AdmissionUI      AdmissionSource = "authenticated_ui"
+	AdmissionPlan         AdmissionSource = "plan"
+	AdmissionTimer        AdmissionSource = "timer"
+	AdmissionStartup      AdmissionSource = "startup"
+	AdmissionRuntimeGuard AdmissionSource = "runtime_guard"
+	AdmissionUI           AdmissionSource = "authenticated_ui"
 )
 
 type ConsumptionSnapshot struct {
@@ -587,6 +589,15 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	}
 	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
+		if request.Operation == Publish {
+			installation, err := loadInstallation(transaction)
+			if err != nil {
+				return err
+			}
+			if err := validatePublicationInventory(installation, state); err != nil {
+				return err
+			}
+		}
 		active, err := activeGraphCount(transaction)
 		if err != nil {
 			return err
@@ -843,6 +854,15 @@ func (admitter *Admitter) ConsumePlan(ctx context.Context, mutation *MutationLea
 		if reservation.Phase != PhaseReserved || mutation.Target() != reservation.Target {
 			return fmt.Errorf("operation reservation is already consumed")
 		}
+		if reservation.Operation == Publish {
+			installation, err := loadInstallation(transaction)
+			if err != nil {
+				return err
+			}
+			if err := validatePublicationInventory(installation, state); err != nil {
+				return err
+			}
+		}
 		if reservation.SafetyDigest != digest && reservation.Operation != Publish {
 			return fmt.Errorf("independent safety authority changed after admission")
 		}
@@ -949,9 +969,10 @@ func (admitter *Admitter) BeginUI(ctx context.Context, mutation *MutationLease, 
 	return result, err
 }
 
-// BeginPlanless starts a previously admitted timer or startup operation only
-// after mutation→exposure acquisition. It records the same immutable local
-// intent boundary as Plan consumption without fabricating a UI Plan.
+// BeginPlanless starts a previously admitted timer, startup, or runtime-guard
+// operation only after mutation→exposure acquisition. It records the same
+// immutable local intent boundary as Plan consumption without fabricating a UI
+// Plan.
 func (admitter *Admitter) BeginPlanless(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, request ConsumeRequest) (Reservation, error) {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
@@ -996,8 +1017,8 @@ func (admitter *Admitter) BeginPlanless(ctx context.Context, mutation *MutationL
 		if err != nil {
 			return err
 		}
-		if reservation.AdmissionSource != AdmissionTimer && reservation.AdmissionSource != AdmissionStartup {
-			return fmt.Errorf("operation reservation is not a timer or startup admission")
+		if reservation.AdmissionSource != AdmissionTimer && reservation.AdmissionSource != AdmissionStartup && reservation.AdmissionSource != AdmissionRuntimeGuard {
+			return fmt.Errorf("operation reservation is not a timer, startup, or runtime-guard admission")
 		}
 		if reservation.Phase != PhaseReserved || mutation.Target() != reservation.Target {
 			return fmt.Errorf("operation reservation is already consumed or target-mismatched")
@@ -1299,6 +1320,55 @@ func (admitter *Admitter) ReenterHeadscaleActivationContraction(ctx context.Cont
 	return intent, mutation, exposure, nil
 }
 
+// ReenterHTTP01Contraction reacquires an operation solely to remove its exact
+// durable HTTP-01 presentation. Unlike expansion reentry, contraction remains
+// available after Plan evidence expires.
+func (admitter *Admitter) ReenterHTTP01Contraction(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID string) (Reservation, *MutationLease, *locks.Lease, error) {
+	if admitter == nil || mutationSet == nil || manager == nil {
+		return Reservation{}, nil, nil, fmt.Errorf("HTTP-01 contraction authority is invalid")
+	}
+	document, err := admitter.normal.Read()
+	if err != nil || document.Revision != expectedRevision {
+		return Reservation{}, nil, nil, errors.Join(err, persist.ErrRevision)
+	}
+	intent, err := loadReservationEntries(document.Entries, jobID)
+	if err != nil || intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered || intent.Consumption == nil || intent.Operation != Publish && intent.Operation != CertificateRenew && intent.Operation != HeadscaleDeploy {
+		return Reservation{}, nil, nil, fmt.Errorf("operation is not in HTTP-01 remote wait or reentry")
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
+	if err != nil {
+		return Reservation{}, nil, nil, err
+	}
+	fail := func(cause error) (Reservation, *MutationLease, *locks.Lease, error) {
+		return Reservation{}, nil, nil, errors.Join(cause, ReleaseExposure(mutation, exposure))
+	}
+	state, err := admitter.safety.Read()
+	if err != nil || !exactHTTP01Challenge(state, intent.Operation, intent.SafetyBinding) {
+		return fail(errors.Join(err, fmt.Errorf("HTTP-01 contraction safety authority changed")))
+	}
+	var result Reservation
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		fresh, err := loadReservation(transaction, jobID)
+		if err != nil || !reflect.DeepEqual(fresh, intent) {
+			return errors.Join(err, fmt.Errorf("HTTP-01 contraction intent changed"))
+		}
+		fresh.Phase = PhaseReentered
+		raw, err := persist.EncodeEntry(fresh)
+		if err != nil {
+			return err
+		}
+		if err := transaction.Replace(reservationKey(jobID), raw); err != nil {
+			return err
+		}
+		result = fresh
+		return nil
+	})
+	if err != nil {
+		return fail(err)
+	}
+	return result, mutation, exposure, nil
+}
+
 func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet, manager *locks.Manager, expectedRevision uint64, jobID string) (Reservation, *MutationLease, *locks.Lease, error) {
 	observedNow, timeErr := admitter.trustedNow()
 	if timeErr != nil {
@@ -1332,6 +1402,15 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return fail(err)
+	}
+	if intent.Operation == Publish {
+		installation, err := loadInstallationEntries(document.Entries)
+		if err != nil {
+			return fail(err)
+		}
+		if err := validatePublicationInventory(installation, state); err != nil {
+			return fail(err)
+		}
 	}
 	currentDigest, err := safetyDigest(state)
 	if err != nil {
@@ -2370,11 +2449,11 @@ func PendingJournalRecovery(document persist.Document) error {
 	for _, key := range persist.EntryKeys(document, "journals") {
 		raw := document.Entries[key]
 		if err := validateJournalEntry(key, raw); err != nil {
-			return fmt.Errorf("Nginx guard journal authority is invalid: %w", err)
+			return fmt.Errorf("nginx guard journal authority is invalid: %w", err)
 		}
 		var journal JournalRecord
 		if err := decodeStrict(raw, &journal); err != nil {
-			return fmt.Errorf("Nginx guard journal authority is invalid: %w", err)
+			return fmt.Errorf("nginx guard journal authority is invalid: %w", err)
 		}
 		entries = append(entries, journalEntry{key: key, journal: journal})
 		journalsByJob[journal.JobID] = append(journalsByJob[journal.JobID], journal)
@@ -2382,22 +2461,22 @@ func PendingJournalRecovery(document persist.Document) error {
 	for _, entry := range entries {
 		key, journal := entry.key, entry.journal
 		if journal.Phase != JournalTerminal {
-			return fmt.Errorf("Nginx guard requires terminal operation journal: %s", key)
+			return fmt.Errorf("nginx guard requires terminal operation journal: %s", key)
 		}
 		intent, err := loadReservationEntries(document.Entries, journal.JobID)
 		if err != nil {
-			return fmt.Errorf("Nginx guard journal intent authority is invalid: %w", err)
+			return fmt.Errorf("nginx guard journal intent authority is invalid: %w", err)
 		}
 		children := map[string]ChildRecord{}
 		childIDs := []string{}
 		for _, childKey := range persist.EntryKeys(document, "children") {
 			childRaw := document.Entries[childKey]
 			if err := validateChildEntry(childKey, childRaw); err != nil {
-				return fmt.Errorf("Nginx guard child authority is invalid: %w", err)
+				return fmt.Errorf("nginx guard child authority is invalid: %w", err)
 			}
 			var child ChildRecord
 			if err := decodeStrict(childRaw, &child); err != nil {
-				return fmt.Errorf("Nginx guard child authority is invalid: %w", err)
+				return fmt.Errorf("nginx guard child authority is invalid: %w", err)
 			}
 			if child.JobID == journal.JobID {
 				children[child.ID] = child
@@ -2406,31 +2485,31 @@ func PendingJournalRecovery(document persist.Document) error {
 		}
 		sort.Strings(childIDs)
 		if len(journalsByJob[journal.JobID]) > 1 && intent.CertificateHandoff == nil {
-			return fmt.Errorf("Nginx guard operation has incompatible journal authorities: %s", key)
+			return fmt.Errorf("nginx guard operation has incompatible journal authorities: %s", key)
 		}
 		handoff := exactCertificatePublicationHandoff(intent, journalsByJob[journal.JobID], childIDs)
 		if intent.CertificateHandoff != nil && !handoff {
-			return fmt.Errorf("Nginx guard certificate publication handoff is incomplete: %s", key)
+			return fmt.Errorf("nginx guard certificate publication handoff is incomplete: %s", key)
 		}
 		if !slices.Equal(childIDs, journal.ChildIDs) {
 			terminalNeverSubmitted := intent.CertificateHandoff == nil && journal.Kind == JournalCertificateActivation && intent.Phase == PhaseTerminal && len(childIDs) < len(journal.ChildIDs) && slices.Equal(childIDs, journal.ChildIDs[:len(childIDs)])
 			if !terminalNeverSubmitted && !handoff {
-				return fmt.Errorf("Nginx guard journal child inventory is incomplete or mismatched: %s", key)
+				return fmt.Errorf("nginx guard journal child inventory is incomplete or mismatched: %s", key)
 			}
 		}
 		for _, child := range children {
 			if child.State != ChildTerminal {
-				return fmt.Errorf("Nginx guard requires terminal journal child: %s", child.ID)
+				return fmt.Errorf("nginx guard requires terminal journal child: %s", child.ID)
 			}
 		}
 	}
 	for _, intentKey := range persist.EntryKeys(document, "intents") {
 		intent, err := loadReservationEntries(document.Entries, strings.TrimPrefix(intentKey, "intents/"))
 		if err != nil {
-			return fmt.Errorf("Nginx guard operation intent authority is invalid: %w", err)
+			return fmt.Errorf("nginx guard operation intent authority is invalid: %w", err)
 		}
 		if intent.CertificateHandoff != nil && len(journalsByJob[intent.JobID]) != 2 {
-			return fmt.Errorf("Nginx guard certificate publication handoff lacks its exact journal pair: %s", intentKey)
+			return fmt.Errorf("nginx guard certificate publication handoff lacks its exact journal pair: %s", intentKey)
 		}
 	}
 	return nil
@@ -4870,7 +4949,8 @@ func FindProcessLifecycleAuthority(document persist.Document, jobID, resourceID 
 	if err != nil {
 		return Reservation{}, err
 	}
-	if (intent.Operation != ProcessStart && intent.Operation != ProcessStop) || intent.AdmissionSource != AdmissionUI || intent.Target != "resource/"+resourceID || intent.SafetyBinding.ResourceID != resourceID || (intent.Phase != PhaseReserved && intent.Phase != PhaseLocalIntent) {
+	sourceAllowed := intent.AdmissionSource == AdmissionUI || intent.AdmissionSource == AdmissionRuntimeGuard && intent.Operation == ProcessStop
+	if (intent.Operation != ProcessStart && intent.Operation != ProcessStop) || !sourceAllowed || intent.Target != "resource/"+resourceID || intent.SafetyBinding.ResourceID != resourceID || (intent.Phase != PhaseReserved && intent.Phase != PhaseLocalIntent) {
 		return Reservation{}, fmt.Errorf("process lifecycle recovery authority mismatched")
 	}
 	return intent, nil
@@ -5247,8 +5327,8 @@ func (admitter *Admitter) CompleteInterruptedEntity(ctx context.Context, mutatio
 		conditions := []jobs.Postcondition{{Kind: "interrupted_remote_mutation", Status: jobs.PostconditionUnobserved, Identity: childClosureDigest}}
 		if intent.Operation == ConnectorLogin {
 			if connectorVerification == nil || connectorVerification.Kind != "connector_recovery_verification" ||
-				!(connectorVerification.Status == jobs.PostconditionVerified && exactDigest(connectorVerification.Identity) ||
-					connectorVerification.Status == jobs.PostconditionUnobserved && connectorVerification.Identity == jobID) {
+				(connectorVerification.Status != jobs.PostconditionVerified || !exactDigest(connectorVerification.Identity)) &&
+					(connectorVerification.Status != jobs.PostconditionUnobserved || connectorVerification.Identity != jobID) {
 				return fmt.Errorf("interrupted connector login lacks fresh verification result")
 			}
 			conditions = append(conditions, *connectorVerification)
@@ -5374,6 +5454,15 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return jobs.Record{}, err
+	}
+	if intentView.Operation == Publish {
+		installation, err := loadInstallationEntries(document.Entries)
+		if err != nil {
+			return jobs.Record{}, err
+		}
+		if err := validatePublicationInventory(installation, state); err != nil {
+			return jobs.Record{}, err
+		}
 	}
 	currentSafetyDigest, err := safetyDigest(state)
 	if err != nil {
@@ -5654,6 +5743,21 @@ func exactCertificatePublicationAuthority(state safety.State, intent Reservation
 	return false
 }
 
+func exactHTTP01Challenge(state safety.State, operation Type, binding SafetyBinding) bool {
+	if !exactCertificateChallenge(state, operation, binding) {
+		return false
+	}
+	if binding.ResourceID == "headscale" {
+		return state.Headscale.ChallengePending != nil && state.Headscale.ChallengePending.Method == "http-01"
+	}
+	for _, resource := range state.Resources {
+		if resource.ResourceID == binding.ResourceID {
+			return resource.ChallengePending != nil && resource.ChallengePending.Method == "http-01"
+		}
+	}
+	return false
+}
+
 func exactCertificateChallenge(state safety.State, operation Type, binding SafetyBinding) bool {
 	if binding.ResourceID == "headscale" {
 		pending := state.Headscale.ChallengePending
@@ -5688,6 +5792,15 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 	state, err := admitter.safety.Read()
 	if err != nil {
 		return err
+	}
+	if intent.Operation == Publish {
+		installation, err := loadInstallationEntries(document.Entries)
+		if err != nil {
+			return err
+		}
+		if err := validatePublicationInventory(installation, state); err != nil {
+			return err
+		}
 	}
 	currentDigest, err := safetyDigest(state)
 	if err != nil {
@@ -5727,6 +5840,13 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 func authorize(operation Type, state safety.State, binding SafetyBinding, consuming bool, now time.Time) error {
 	if !validType(operation) || operation == EmergencyCloseAll {
 		return fmt.Errorf("operation is unsupported for normal admission")
+	}
+	if operation == Publish {
+		for _, resource := range state.Resources {
+			if resource.Ownership == safety.OwnershipOrphan {
+				return fmt.Errorf("resource %q is an ownership orphan and blocks publication; keep ingress closed; do not adopt or delete it; use configuration export and clean-host rebuild", resource.ResourceID)
+			}
+		}
 	}
 	contraction := isContraction(operation)
 	if operation == CertificateExpiry {
@@ -5818,7 +5938,8 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 		if resource == nil || resource.State != safety.ResourceActive || resource.Ownership != safety.OwnershipOwned || resource.Closing != nil {
 			return fmt.Errorf("certificate safety resource unavailable")
 		}
-		if operation == CertificateRenew && (state.GlobalClose.Phase != safety.GlobalCloseNone || resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.ChallengePending != nil || resource.Reactivating != nil) {
+		ownedChallenge := exactCertificateChallenge(state, operation, binding)
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || resource.StickyUnpublished != nil || resource.Contraction != nil || resource.CertificateExpiry != nil || resource.ChallengePending != nil && !ownedChallenge || resource.Reactivating != nil {
 			return fmt.Errorf("certificate renewal blocked by safety marker")
 		}
 	}
@@ -6078,6 +6199,13 @@ func loadInstallation(transaction *persist.Transaction) (domain.Installation, er
 		return domain.Installation{}, fmt.Errorf("installation authority: %w", err)
 	}
 	return installation, nil
+}
+
+func validatePublicationInventory(installation domain.Installation, state safety.State) error {
+	if err := storeauthority.ValidateNormalSafety(&installation, state); err != nil {
+		return fmt.Errorf("publish cross-store authority mismatch: %w", err)
+	}
+	return nil
 }
 
 func loadReservation(transaction *persist.Transaction, jobID string) (Reservation, error) {
@@ -7836,7 +7964,10 @@ func resourceConfigurationEqual(left, right domain.AppResource) bool {
 }
 
 func validateResourceUpdateConfigurationTransition(before, after persist.Document, prior, candidate domain.AppResource) error {
-	if prior.ID != candidate.ID || prior.Lifecycle != candidate.Lifecycle || prior.Target.Kind != candidate.Target.Kind || !reflect.DeepEqual(prior.PublicationRecord, candidate.PublicationRecord) || !protectedManagedProcessStateEqual(prior.ManagedProcess, candidate.ManagedProcess) {
+	if prior.ID != candidate.ID || prior.Name != candidate.Name {
+		return fmt.Errorf("resource update immutable identity changed")
+	}
+	if prior.Lifecycle != candidate.Lifecycle || prior.Target.Kind != candidate.Target.Kind || !reflect.DeepEqual(prior.PublicationRecord, candidate.PublicationRecord) || !protectedManagedProcessStateEqual(prior.ManagedProcess, candidate.ManagedProcess) {
 		return fmt.Errorf("resource update combined configuration with applied-state changes")
 	}
 	candidateDigest, err := appresource.ConfigDigest(candidate)
@@ -8102,6 +8233,10 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 	case AdmissionStartup:
 		if planID != "" || operation != AutomaticReconciliation && operation != StartupContraction && operation != GoAccessRetirement {
 			return fmt.Errorf("startup admission is not authorized for operation")
+		}
+	case AdmissionRuntimeGuard:
+		if planID != "" || operation != ProcessStop {
+			return fmt.Errorf("runtime-guard admission is not authorized for operation")
 		}
 	case AdmissionUI:
 		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {

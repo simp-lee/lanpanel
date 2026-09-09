@@ -156,7 +156,8 @@ func RunRole(args []string) error {
 		target := domain.OperationTarget{Kind: domain.OperationTargetKind(request.Action.TargetKind), ID: request.Action.TargetID}
 		plan, err := service.CreatePlan(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Action.ActorIdentity, Generation: request.Action.ActorGeneration}, application.PlanPayload{Operation: operation, Target: target})
 		if err != nil {
-			return ExecutionResult{}, err
+			closeErr := service.Close()
+			return ExecutionResult{}, contractPublicationProcessViolation(ctx, errors.Join(err, closeErr))
 		}
 		return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: plan.Operation, TargetKind: string(plan.Target.Kind), TargetID: plan.Target.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
 	})
@@ -1120,12 +1121,15 @@ func RunRole(args []string) error {
 		}
 		execution, err := application.BeginPublication(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 		if err != nil {
-			return ExecutionResult{}, err
+			return ExecutionResult{}, contractPublicationProcessViolation(ctx, err)
 		}
 		defer func() {
 			closeErr := execution.Close()
 			if resultErr != nil && closeErr != nil {
 				resultErr = errors.Join(resultErr, closeErr)
+			}
+			if resultErr != nil {
+				resultErr = contractPublicationProcessViolation(ctx, resultErr)
 			}
 		}()
 		job, err := execution.Run(ctx)
@@ -1377,16 +1381,17 @@ func cleanupConnectorLoginSecrets() error {
 }
 
 func helperConnectorObservation(value managedconnector.Observation) helperproto.ConnectorResult {
-	local, peers := make([]string, len(value.LocalIPs)), make([]string, len(value.Peers))
+	local := make([]string, len(value.LocalIPs))
+	peers := make([]helperproto.ConnectorPeerRecord, len(value.Peers))
 	for index, address := range value.LocalIPs {
 		local[index] = address.String()
 	}
 	for index, peer := range value.Peers {
-		peers[index] = peer.IP.String()
+		peers[index] = helperproto.ConnectorPeerRecord{IP: peer.IP.String(), Online: peer.Online}
 	}
 	slices.Sort(local)
-	slices.Sort(peers)
-	return helperproto.ConnectorResult{Operation: string(domain.OperationConnectorVerify), ClientVersion: value.ClientVersion, ControlURL: value.ControlURL, LocalIPs: local, PeerIPs: peers, ValidUntil: value.ValidUntil}
+	slices.SortFunc(peers, func(left, right helperproto.ConnectorPeerRecord) int { return strings.Compare(left.IP, right.IP) })
+	return helperproto.ConnectorResult{Operation: string(domain.OperationConnectorVerify), ClientVersion: value.ClientVersion, ControlURL: value.ControlURL, LocalIPs: local, Peers: peers, ValidUntil: value.ValidUntil}
 }
 
 func runConnectorLoginSecret(ctx context.Context, runner managedconnector.Runner, uid, gid uint32, jobID, controlURL string, secret []byte) (returnErr error) {
@@ -1550,14 +1555,30 @@ func digestString(value string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func contractPublicationProcessViolation(ctx context.Context, cause error) error {
+	if !application.IsProcessRuntimeViolation(cause) {
+		return cause
+	}
+	contractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+	defer cancel()
+	contractErr := application.ContractProcessRuntimeViolation(contractCtx, cause)
+	if contractErr != nil {
+		_ = unix.Kill(os.Getpid(), unix.SIGTERM)
+	}
+	return errors.Join(cause, contractErr)
+}
+
 func executeDomainPublication(ctx context.Context, request helperproto.Request) (output ExecutionResult, resultErr error) {
 	execution, err := application.BeginCertificateIssue(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 	if err != nil {
-		return ExecutionResult{}, err
+		return ExecutionResult{}, contractPublicationProcessViolation(ctx, err)
 	}
 	defer func() {
 		if closeErr := execution.Close(); closeErr != nil {
 			resultErr = errors.Join(resultErr, closeErr)
+		}
+		if resultErr != nil {
+			resultErr = contractPublicationProcessViolation(ctx, resultErr)
 		}
 	}()
 	abort := func(cause error) (ExecutionResult, error) {

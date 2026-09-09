@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := ga-local-gate
 
-.PHONY: build test vet lint race check tidy docs-build go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-secret-sentinel ga-local-walkthrough ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-finalize-release
+.PHONY: build test vet lint race check tidy docs-build go-vulnerability-scan node-vulnerability-scan ga-local-gate ga-root-required-tests ga-secret-sentinel ga-local-walkthrough ga-release-tooling-selftest ga-final-asset-selftest ga-vulnerability-scan ga-playwright-action-boundary ga-contract-audit ga-cli-absence-audit ga-legacy-closure-audit ga-release-disabled-audit ga-helper-boundary-audit ga-release-identity-selftest ga-forbidden-utility-audit ga-preflight-contraction-integration ga-bootstrap-integration ga-nginx-contraction-integration ga-playwright-auth ga-target-readiness-integration ga-managed-process-integration ga-certificate-lifecycle-integration ga-domain-publication-integration ga-goaccess-integration ga-headscale-integration ga-headscale-candidate-integration ga-headscale-control-integration ga-connector-integration ga-management-integration ga-docs-consistency-check ga-security-policy-check ga-qualification-tooling-selftest ga-generate-qualification-artifacts ga-live-qualification-preflight ga-run-live-journey ga-final-release-readiness-check ga-release-vulnerability-scan ga-finalize-release
 
 # S2 HEAD-derived disposition: tests inherit their package disposition; every
 # legacy template/tree is deleted, while the named packages remain for their
 # owning in-place GA rewrite.
-GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./cmd/lanpanel-qualification ./internal/acme ./internal/acmeaccount ./internal/application ./internal/archive ./internal/audit ./internal/bootstrap ./internal/child ./internal/closure ./internal/confinement ./internal/contraction ./internal/connector ./internal/control ./internal/deletion ./internal/dependencies ./internal/diagnostics ./internal/domain ./internal/download ./internal/filetxn ./internal/headscale ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/qualification ./internal/preflight ./internal/process ./internal/relay ./internal/release ./internal/resource ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/tailnet ./internal/target ./internal/ui
+GA_FOUNDATION_PACKAGES := ./cmd/lanpanel ./cmd/lanpanel-qualification ./internal/acme ./internal/acmeaccount ./internal/application ./internal/archive ./internal/audit ./internal/bootstrap ./internal/child ./internal/closure ./internal/confinement ./internal/contraction ./internal/connector ./internal/control ./internal/deletion ./internal/dependencies ./internal/diagnostics ./internal/domain ./internal/download ./internal/filetxn ./internal/headscale ./internal/helper ./internal/helperaudit ./internal/helperproto ./internal/identity ./internal/jobs ./internal/locks ./internal/nginx ./internal/nginxguard ./internal/operations ./internal/ownership ./internal/packages ./internal/persist ./internal/plans ./internal/qualification ./internal/preflight ./internal/process ./internal/relay ./internal/release ./internal/resource ./internal/reservations ./internal/roles ./internal/safety ./internal/secrets ./internal/session ./internal/sources ./internal/storeauthority ./internal/tailnet ./internal/target ./internal/ui
 GA_REWRITE_PACKAGES := ./internal/activation ./internal/basic ./internal/certificates ./internal/challenge ./internal/goaccess ./internal/htpasswdref ./internal/publication ./internal/renewal ./internal/static
 GA_DELETE_TREES := deploy deploy_embed.go internal/appassets internal/appconfig internal/appguard internal/apphost internal/apppreflight internal/apprender internal/appverify internal/assets internal/browserauth internal/components internal/config internal/exposure internal/host internal/hosthealth internal/hostworkflow internal/maindeploy internal/realip internal/realipassets internal/realiprender internal/render internal/sensitive internal/state internal/uistate internal/verify internal/workflow
 
@@ -19,6 +19,22 @@ GOLANGCI_LINT_VERSION := 2.11.3
 GOVULNCHECK_VERSION := 1.1.4
 OSV_SCANNER_VERSION := 2.0.3
 BINARY ?= lanpanel
+
+GA_ROOT_REQUIRED_PACKAGES := ./internal/acme ./internal/bootstrap ./internal/certificates ./internal/goaccess
+GA_ROOT_REQUIRED_TESTS := TestLegoOrchestrationUsesEveryTypedProviderFrameAndRejectsChildFailure \
+	TestPrepareStageRejectsCredentialChangedAfterBindingAndCleansResidue \
+	TestPrepareStageMidwayFaultLeavesNoResidueAndCanRetry \
+	TestAccountStageBindsExactManagedKeyFingerprint \
+	TestLoadDNSBindingPinsTransitiveCredentialFiles \
+	TestEveryDNSProviderBindsClosedEnvironment \
+	TestLoadDNSBindingRejectsUnknownAndDirectSecretKeys \
+	TestBPFGuardDirectoryRequiresExactBPFFSMount \
+	TestCommittedReleaseRejectsManagedACMEAccountKeyReplacement \
+	TestObserveIdentityRejectsUnsafeMembersBeforeReading \
+	TestObserveIdentityAndPointerRejectModifiedBundleMaterial \
+	TestCertificatePointerBindsCandidateAndRestoresExactPriorIdentity \
+	TestInactiveCertificateCleanupResumesWithExactStageOwnership \
+	TestNginxWorkerCanTraverseResourceLogDirectoryOnReopen
 
 build:
 	$(GO) build -o $(BINARY) ./cmd/lanpanel
@@ -35,6 +51,30 @@ lint:
 
 race:
 	$(GO) test -race -count=1 $(PKGS)
+
+# These tests exercise real root/non-root ownership transitions and fixed host
+# roots. Run only on a disposable Linux host; skips are failures in this gate.
+ga-root-required-tests:
+	@set -eu; \
+		test "$$(id -u)" = 0 && test "$$(id -g)" = 0 || { echo 'mandatory root tests require UID:GID 0:0' >&2; exit 1; }; \
+		test "$$(uname -s)" = Linux || { echo 'mandatory root tests require Linux' >&2; exit 1; }; \
+		grep -Eq ' /sys/fs/bpf .* - bpf ' /proc/self/mountinfo || { echo 'mandatory root tests require bpffs mounted at /sys/fs/bpf' >&2; exit 1; }; \
+		test ! -e /sys/fs/bpf/lanpanel && test ! -L /sys/fs/bpf/lanpanel || { echo 'mandatory root tests require an isolated bpffs without /sys/fs/bpf/lanpanel' >&2; exit 1; }; \
+		test ! -e /var/lib/lanpanel/certificates && test ! -L /var/lib/lanpanel/certificates || { echo 'mandatory root tests require an isolated host without /var/lib/lanpanel/certificates' >&2; exit 1; }; \
+		report_dir=$$(mktemp -d); trap 'rm -rf "$$report_dir"' EXIT HUP INT TERM; \
+		pattern=$$(printf '%s\n' $(GA_ROOT_REQUIRED_TESTS) | tr '\n' '|'); pattern=$${pattern%|}; \
+		for mode in test race; do \
+			flags=''; test "$$mode" = test || flags='-race'; \
+			report="$$report_dir/$$mode.json"; status=0; \
+			$(GO) test $$flags -json -count=1 -run "^($$pattern)$$" $(GA_ROOT_REQUIRED_PACKAGES) >"$$report" || status=$$?; \
+			cat "$$report"; \
+			test "$$status" = 0 || { echo "mandatory root $$mode suite failed" >&2; exit "$$status"; }; \
+			if grep -q '"Action":"skip"' "$$report"; then echo "mandatory root $$mode suite skipped a test" >&2; exit 1; fi; \
+			for test_name in $(GA_ROOT_REQUIRED_TESTS); do \
+				grep -Eq "\"Action\":\"pass\".*\"Test\":\"$$test_name\"[,}]" "$$report" || { echo "mandatory root $$mode suite did not pass $$test_name" >&2; exit 1; }; \
+			done; \
+			set -- $(GA_ROOT_REQUIRED_TESTS); echo "verified $$# mandatory root tests in $$mode mode without skips"; \
+		done
 
 tidy:
 	$(GO) mod tidy
@@ -78,7 +118,7 @@ ga-helper-boundary-audit:
 	@grep -Fq 'runtime.LockOSThread' internal/child/executor_linux.go
 	@grep -Fq 'setExactCapabilities' internal/child/executor_linux.go
 	@grep -Fq 'validOperationTarget' internal/helperproto/types.go
-	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); expected=$$(printf '%s\n' internal/child/executor_linux.go internal/process/managed_exec_linux.go internal/qualification/generator_linux.go); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = "$$expected" || { printf 'external process call escaped fixed executor boundary:\n%s\n' "$$found" >&2; exit 1; }
+	@set -eu; found=$$(grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"os/exec"|exec\.Command(Context)?\(|exec\.LookPath\(|unix\.Exec\(|syscall\.Exec\(|os\.StartProcess\(' internal cmd || true); expected=$$(printf '%s\n' internal/child/executor_linux.go internal/process/managed_exec_linux.go internal/qualification/generator_linux.go internal/qualification/security_scan_linux.go); test -z "$$found" || test "$$(printf '%s\n' "$$found" | cut -d: -f1 | sort -u)" = "$$expected" || { printf 'external process call escaped fixed executor boundary:\n%s\n' "$$found" >&2; exit 1; }
 	@set -eu; if grep -R -n -E --include='*.go' --exclude='*_test.go' --exclude-dir='helperaudit' '"([^" ]*/)?(sh|bash|dash)"|"([^" ]*/)?(sudo|doas|pkexec|su)"' internal cmd; then echo 'shell or sudo-like executable remains in production' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 	@set -eu; if grep -n -E 'Command|Arguments|Argv|Unit|Path' internal/helperproto/types.go; then echo 'generic command, unit, argv, or path entered helper request schema' >&2; exit 1; else rc=$$?; test $$rc -eq 1 || exit $$rc; fi
 
@@ -98,6 +138,7 @@ ga-release-tooling-selftest: ga-release-identity-selftest ga-qualification-tooli
 	@grep -Fq 'ReleaseManifestSchemaVersion' internal/release/identity.go
 	@grep -Fq 'QualificationInstallManifestSchemaVersion' internal/release/identity.go
 	@grep -Fq 'LiveSideEffectPlanSchemaVersion' internal/release/identity.go
+	@grep -Fq 'SecurityScanInputSchemaVersion' internal/qualification/security_scan_linux.go
 
 ga-final-asset-selftest:
 	$(GO) test -count=1 -run 'TestSingleReleaseManifest|TestGenerateSPDX|TestSourceArchiveMustMatchCleanTrackedTree' ./internal/release
@@ -134,6 +175,11 @@ ga-final-release-readiness-check:
 	@test -n "$(QUALIFICATION_INPUT)" || { echo 'QUALIFICATION_INPUT protected reference is required' >&2; exit 2; }
 	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'final release source worktree must be clean' >&2; exit 1; }
 	$(GO) run ./cmd/lanpanel-qualification final "$(QUALIFICATION_INPUT)"
+
+ga-release-vulnerability-scan:
+	@test -n "$(SECURITY_SCAN_INPUT)" || { echo 'SECURITY_SCAN_INPUT protected file is required' >&2; exit 2; }
+	@git diff --quiet HEAD -- && git diff --cached --quiet HEAD -- && test -z "$$(git ls-files --others --exclude-standard)" || { echo 'release security scan source worktree must be clean' >&2; exit 1; }
+	$(GO) run ./cmd/lanpanel-qualification scan "$(SECURITY_SCAN_INPUT)"
 
 ga-finalize-release:
 	@test -n "$(RELEASE_FINALIZE_INPUT)" || { echo 'RELEASE_FINALIZE_INPUT protected file is required' >&2; exit 2; }

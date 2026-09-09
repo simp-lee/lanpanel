@@ -486,12 +486,12 @@ func clientConnectorObservation(value helperproto.ConnectorResult) (managedconne
 		}
 		observation.LocalIPs = append(observation.LocalIPs, address)
 	}
-	for _, text := range value.PeerIPs {
-		address, err := netip.ParseAddr(text)
+	for _, peer := range value.Peers {
+		address, err := netip.ParseAddr(peer.IP)
 		if err != nil {
 			return managedconnector.Observation{}, err
 		}
-		observation.Peers = append(observation.Peers, managedconnector.Peer{IP: address, Online: true})
+		observation.Peers = append(observation.Peers, managedconnector.Peer{IP: address, Online: peer.Online})
 	}
 	if time.Now().UTC().After(observation.ValidUntil) {
 		return managedconnector.Observation{}, fmt.Errorf("connector helper evidence expired")

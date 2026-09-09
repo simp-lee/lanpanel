@@ -25,6 +25,14 @@ import (
 
 type SystemdRuntime struct{ launcher *child.Launcher }
 
+type headscaleServiceExpectation uint8
+
+const (
+	headscaleServiceInactive headscaleServiceExpectation = iota
+	headscaleServiceActive
+	headscaleServiceSettled
+)
+
 func NewSystemdRuntime() (*SystemdRuntime, error) {
 	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
 	if err != nil {
@@ -63,20 +71,20 @@ func (runtime *SystemdRuntime) InitializeDatabase(ctx context.Context, rendered 
 		return DatabaseEvidence{}, err
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
-	if _, err := runtime.show(ctx, invocation, rendered, account, false); err != nil {
+	if _, err := runtime.show(ctx, invocation, rendered, account, headscaleServiceInactive, "disabled"); err != nil {
 		return DatabaseEvidence{}, err
 	}
 	if err := runtime.run(ctx, child.ProfileHeadscaleStart, invocation); err != nil {
 		return DatabaseEvidence{}, err
 	}
-	if _, err := runtime.show(ctx, invocation, rendered, account, true); err != nil {
+	if _, err := runtime.show(ctx, invocation, rendered, account, headscaleServiceActive, "disabled"); err != nil {
 		_ = runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
 		return DatabaseEvidence{}, err
 	}
 	if err := runtime.run(ctx, child.ProfileHeadscaleStop, invocation); err != nil {
 		return DatabaseEvidence{}, err
 	}
-	if _, err := runtime.show(ctx, invocation, rendered, account, false); err != nil {
+	if _, err := runtime.show(ctx, invocation, rendered, account, headscaleServiceInactive, "disabled"); err != nil {
 		return DatabaseEvidence{}, err
 	}
 	return observeDatabase(rendered.Candidate, account)
@@ -84,13 +92,13 @@ func (runtime *SystemdRuntime) InitializeDatabase(ctx context.Context, rendered 
 
 func (runtime *SystemdRuntime) StartAndProbe(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (ServiceEvidence, error) {
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
-	if _, err := runtime.show(ctx, invocation, rendered, account, false); err != nil {
+	if _, err := runtime.show(ctx, invocation, rendered, account, headscaleServiceInactive, "disabled"); err != nil {
 		return ServiceEvidence{}, err
 	}
 	if err := runtime.run(ctx, child.ProfileHeadscaleStart, invocation); err != nil {
 		return ServiceEvidence{}, err
 	}
-	show, err := runtime.show(ctx, invocation, rendered, account, true)
+	show, err := runtime.show(ctx, invocation, rendered, account, headscaleServiceActive, "disabled")
 	if err != nil {
 		_ = runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
 		return ServiceEvidence{}, err
@@ -102,8 +110,19 @@ func (runtime *SystemdRuntime) ObserveActive(ctx context.Context, rendered Rende
 	if runtime == nil || runtime.launcher == nil || VerifyRendered(rendered) != nil {
 		return ServiceEvidence{}, fmt.Errorf("headscale active observation authority invalid")
 	}
+	return runtime.observe(ctx, rendered, account, headscaleServiceActive, "disabled")
+}
+
+func (runtime *SystemdRuntime) ObserveCommitted(ctx context.Context, rendered Rendered, account identity.AccountIdentity) (ServiceEvidence, error) {
+	if runtime == nil || runtime.launcher == nil || VerifyRendered(rendered) != nil {
+		return ServiceEvidence{}, fmt.Errorf("headscale committed observation authority invalid")
+	}
+	return runtime.observe(ctx, rendered, account, headscaleServiceActive, "enabled")
+}
+
+func (runtime *SystemdRuntime) observe(ctx context.Context, rendered Rendered, account identity.AccountIdentity, state headscaleServiceExpectation, unitFileState string) (ServiceEvidence, error) {
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: rendered.Candidate.HeadscaleID}}
-	show, err := runtime.show(ctx, invocation, rendered, account, true)
+	show, err := runtime.show(ctx, invocation, rendered, account, state, unitFileState)
 	if err != nil {
 		return ServiceEvidence{}, err
 	}
@@ -132,7 +151,7 @@ func (runtime *SystemdRuntime) StopAndVerify(ctx context.Context, candidate Cand
 	}
 	invocation := child.Invocation{Headscale: &child.HeadscaleInvocation{HeadscaleID: candidate.HeadscaleID}}
 	stopErr := runtime.run(context.WithoutCancel(ctx), child.ProfileHeadscaleStop, invocation)
-	show, showErr := runtime.show(context.WithoutCancel(ctx), invocation, Rendered{Candidate: candidate}, account, false)
+	show, showErr := runtime.show(context.WithoutCancel(ctx), invocation, Rendered{Candidate: candidate}, account, headscaleServiceInactive, "disabled")
 	_ = show
 	return errors.Join(stopErr, showErr)
 }
@@ -145,7 +164,7 @@ func (runtime *SystemdRuntime) run(ctx context.Context, profile child.ProfileID,
 	return nil
 }
 
-func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invocation, rendered Rendered, account identity.AccountIdentity, active bool) ([]byte, error) {
+func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invocation, rendered Rendered, account identity.AccountIdentity, state headscaleServiceExpectation, unitFileState string) ([]byte, error) {
 	result, err := runtime.launcher.RunInvocation(ctx, child.ProfileHeadscaleShow, invocation, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff || len(result.Stdout) == 0 {
 		return nil, fmt.Errorf("fixed Headscale systemd observation failed: %w", err)
@@ -154,35 +173,47 @@ func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invoca
 	if err != nil {
 		return nil, err
 	}
-	exact := map[string]string{"Id": "lanpanel-headscale.service", "LoadState": "loaded", "UnitFileState": "disabled", "ControlGroup": "/system.slice/lanpanel-headscale.service", "User": account.User, "Group": account.Group, "SupplementaryGroups": "", "NoNewPrivileges": "yes", "CapabilityBoundingSet": "", "AmbientCapabilities": "", "RestrictSUIDSGID": "yes", "PrivateNetwork": "yes", "PrivateTmp": "yes", "PrivateDevices": "yes", "RuntimeDirectory": "lanpanel/headscale", "RuntimeDirectoryMode": "0700", "ProtectSystem": "strict", "ProtectHome": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "LockPersonality": "yes", "MemoryDenyWriteExecute": "yes", "SystemCallArchitectures": "native", "UMask": "0077", "KillMode": "control-group", "FragmentPath": rendered.Candidate.Paths.Unit, "DropInPaths": ""}
+	if err := validateHeadscaleServiceProperties(properties, rendered, account, state, unitFileState); err != nil {
+		return nil, err
+	}
+	return result.Stdout, nil
+}
+
+func validateHeadscaleServiceProperties(properties map[string]string, rendered Rendered, account identity.AccountIdentity, state headscaleServiceExpectation, unitFileState string) error {
+	exact := map[string]string{"Id": "lanpanel-headscale.service", "LoadState": "loaded", "UnitFileState": unitFileState, "User": account.User, "Group": account.Group, "SupplementaryGroups": "", "NoNewPrivileges": "yes", "CapabilityBoundingSet": "", "AmbientCapabilities": "", "RestrictSUIDSGID": "yes", "PrivateNetwork": "yes", "PrivateTmp": "yes", "PrivateDevices": "yes", "RuntimeDirectory": "lanpanel/headscale", "RuntimeDirectoryMode": "0700", "ProtectSystem": "strict", "ProtectHome": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "LockPersonality": "yes", "MemoryDenyWriteExecute": "yes", "SystemCallArchitectures": "native", "UMask": "0077", "KillMode": "control-group", "FragmentPath": rendered.Candidate.Paths.Unit, "DropInPaths": ""}
 	for key, expected := range exact {
 		if properties[key] != expected {
-			return nil, fmt.Errorf("effective Headscale unit property %s changed", key)
+			return fmt.Errorf("effective Headscale unit property %s changed", key)
 		}
 	}
 	if !sameWords(properties["RestrictAddressFamilies"], "AF_UNIX AF_INET AF_INET6") || !sameWords(properties["ReadWritePaths"], rendered.Candidate.Paths.RuntimeRoot+" /run/lanpanel/headscale") {
-		return nil, fmt.Errorf("effective Headscale unit namespace paths changed")
+		return fmt.Errorf("effective Headscale unit namespace paths changed")
 	}
 	executable := rendered.Candidate.Paths.Executable
 	config := rendered.Candidate.Paths.Config
 	if strings.Count(properties["ExecStart"], "path=") != 1 || !strings.Contains(properties["ExecStart"], "path="+executable+" ;") || !strings.Contains(properties["ExecStart"], "argv[]="+executable+" serve --config "+config+" ;") || strings.Count(properties["ExecStartPost"], "path=") != 1 || !strings.Contains(properties["ExecStartPost"], "path=/usr/lib/lanpanel/lanpanel ;") || !strings.Contains(properties["ExecStartPost"], "argv[]=/usr/lib/lanpanel/lanpanel headscale-private-probe ;") {
-		return nil, fmt.Errorf("effective Headscale unit executable changed")
+		return fmt.Errorf("effective Headscale unit executable changed")
 	}
-	if active {
-		if properties["ActiveState"] != "active" || properties["SubState"] != "running" || properties["MainPID"] == "" || properties["MainPID"] == "0" {
-			return nil, fmt.Errorf("headscale candidate service is not privately probed")
-		}
+	active := properties["ActiveState"] == "active" && properties["SubState"] == "running" && properties["MainPID"] != "" && properties["MainPID"] != "0"
+	inactive := properties["ActiveState"] == "inactive" && properties["SubState"] != "running" && properties["MainPID"] == "0"
+	pending := properties["ActiveState"] == "activating"
+	controlGroup := properties["ControlGroup"]
+	if active && controlGroup != "/system.slice/lanpanel-headscale.service" || inactive && controlGroup != "" || pending && controlGroup != "" && controlGroup != "/system.slice/lanpanel-headscale.service" {
+		return fmt.Errorf("headscale candidate service cgroup changed")
+	}
+	if state == headscaleServiceActive && !active || state == headscaleServiceInactive && !inactive || state == headscaleServiceSettled && !active && !inactive && !pending {
+		return fmt.Errorf("headscale candidate service state changed")
+	}
+	if active || pending && properties["MainPID"] != "" && properties["MainPID"] != "0" {
 		mainPID, err := strconv.Atoi(properties["MainPID"])
 		if err != nil || mainPID <= 1 {
-			return nil, fmt.Errorf("headscale candidate MainPID is invalid")
+			return fmt.Errorf("headscale candidate MainPID is invalid")
 		}
 		if err := requireHostCandidateListenersAbsent(mainPID); err != nil {
-			return nil, err
+			return err
 		}
-	} else if properties["ActiveState"] != "inactive" || properties["SubState"] == "running" || properties["MainPID"] != "0" {
-		return nil, fmt.Errorf("headscale candidate service remained active")
 	}
-	return result.Stdout, nil
+	return nil
 }
 
 func parseHeadscaleUnitProperties(raw []byte) (map[string]string, error) {

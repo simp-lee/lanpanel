@@ -415,6 +415,16 @@ func (client *SSHClient) sftpRemoveDirectory(ctx context.Context, path string) e
 	return client.withIOContext(ctx, func() error { return client.sftp.RemoveDirectory(path) })
 }
 
+func (client *SSHClient) sftpReadLink(ctx context.Context, path string) (string, error) {
+	var target string
+	err := client.withIOContext(ctx, func() error {
+		var operationErr error
+		target, operationErr = client.sftp.ReadLink(path)
+		return operationErr
+	})
+	return target, err
+}
+
 func (client *SSHClient) ObserveQualificationHost(ctx context.Context, expected release.OSProfile) (string, string, error) {
 	machineID, err := client.readRemoteRegular(ctx, "/etc/machine-id", 4096)
 	if err != nil {
@@ -457,9 +467,14 @@ func VerifyRemotePreflight(ctx context.Context, prepared Prepared) error {
 		if mutation.ID != "clean_install" {
 			continue
 		}
-		expectedPrior := "bootstrap-inventory/" + inventory
+		expectedPrior := release.QualificationCleanInstallPriorState(fingerprint, inventory, prepared.Input.RunID)
 		if mutation.PriorState != expectedPrior || mutation.PriorStateDigest != release.DigestBytes([]byte(expectedPrior)) {
-			return fmt.Errorf("remote clean-host inventory differs from immutable side-effect plan")
+			return fmt.Errorf("remote clean-host inventory or staging absence differs from immutable side-effect plan")
+		}
+		for _, path := range []string{"/var/lib/lanpanel-qualification", remoteStagingRoot(prepared.Input.RunID)} {
+			if _, err := client.sftpLstat(ctx, path); err == nil || !os.IsNotExist(err) {
+				return fmt.Errorf("remote qualification staging prior state is not absent")
+			}
 		}
 		return nil
 	}
@@ -467,7 +482,7 @@ func VerifyRemotePreflight(ctx context.Context, prepared Prepared) error {
 }
 
 func (client *SSHClient) verifyPlatform(ctx context.Context, expected release.OSProfile) error {
-	osRelease, err := client.readRemoteRegular(ctx, "/etc/os-release", 1<<20)
+	osRelease, err := client.readRemoteOSRelease(ctx, 1<<20)
 	if err != nil {
 		return err
 	}
@@ -556,6 +571,43 @@ func (client *SSHClient) readRemoteVirtual(ctx context.Context, path string, max
 	return data, nil
 }
 
+func (client *SSHClient) readRemoteOSRelease(ctx context.Context, maximum int64) ([]byte, error) {
+	const aliasPath = "/etc/os-release"
+	const aliasTarget = "../usr/lib/os-release"
+	const targetPath = "/usr/lib/os-release"
+
+	info, err := client.sftpLstat(ctx, aliasPath)
+	if err != nil {
+		return nil, err
+	}
+	if info != nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		return client.readRemoteRegular(ctx, aliasPath, maximum)
+	}
+	if info == nil || info.Mode()&os.ModeSymlink == 0 {
+		return nil, fmt.Errorf("remote OS release alias metadata is unsafe")
+	}
+	target, err := client.sftpReadLink(ctx, aliasPath)
+	if err != nil {
+		return nil, fmt.Errorf("read remote OS release alias: %w", err)
+	}
+	if target != aliasTarget {
+		return nil, fmt.Errorf("remote OS release alias is nonstandard")
+	}
+	data, err := client.readRemoteRegular(ctx, targetPath, maximum)
+	if err != nil {
+		return nil, err
+	}
+	after, err := client.sftpLstat(ctx, aliasPath)
+	if err != nil || after == nil || after.Mode()&os.ModeSymlink == 0 || after.Size() != info.Size() || after.Mode() != info.Mode() || after.ModTime() != info.ModTime() || fileUID(after) != fileUID(info) || fileGID(after) != fileGID(info) {
+		return nil, fmt.Errorf("remote OS release alias changed while reading")
+	}
+	afterTarget, err := client.sftpReadLink(ctx, aliasPath)
+	if err != nil || afterTarget != aliasTarget {
+		return nil, fmt.Errorf("remote OS release alias changed while reading")
+	}
+	return data, nil
+}
+
 func (client *SSHClient) readRemoteRegular(ctx context.Context, path string, maximum int64) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || maximum <= 0 {
 		return nil, fmt.Errorf("remote protected path is invalid")
@@ -597,7 +649,7 @@ func (client *SSHClient) runFixed(ctx context.Context, command string) ([]byte, 
 }
 
 func (client *SSHClient) RunAgent(ctx context.Context, remoteBinary string, request AgentRequest) (AgentResponse, error) {
-	if !validRemoteRunPath(remoteBinary) {
+	if !validRemoteAgentPath(remoteBinary, request.Action) {
 		return AgentResponse{}, fmt.Errorf("remote qualification candidate path is invalid")
 	}
 	data, err := release.MarshalCanonical(request)
@@ -734,6 +786,10 @@ func canonicalSSHAddress(value string) (string, error) {
 		return "", fmt.Errorf("SSH address must be a canonical IPv4:port")
 	}
 	return net.JoinHostPort(host, port), nil
+}
+
+func validRemoteAgentPath(value string, action AgentAction) bool {
+	return validRemoteRunPath(value) || value == bootstrap.FixedPaths().BinaryPath && action == AgentFinalInventory
 }
 
 func validRemoteRunPath(value string) bool {

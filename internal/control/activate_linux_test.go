@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChallengeControlEntryComparisonUsesCanonicalEncoding(t *testing.T) {
@@ -60,6 +61,47 @@ func TestActivationAuthorityFailurePrecedesPhysicalWork(t *testing.T) {
 	}
 }
 
+func TestCommittedBootActivationRejectsPrivateStagingAuthority(t *testing.T) {
+	rendered := testRendered(t)
+	certificate := testCertificateIdentity(IssueRequest{JobID: "job_control", PlanID: "plan_control", IntentGeneration: 1, CertificateID: rendered.Candidate.CertificateID, BindingDigest: rendered.Candidate.CertificateBinding, Domain: rendered.Candidate.ControlDomain})
+	bundle, err := BuildActivation("ins_00000000000000000000000000000001", rendered.Candidate, certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := AppliedFromActivation(bundle)
+	headscale := testHeadscale()
+	headscale.Applied = &applied
+	headscale.Enabled = true
+	headscale.Certificate = &domain.CertificateBundleIdentity{PointerIdentity: bundle.Entry.Domain.CertificatePointer, BindingIdentity: certificate.BindingIdentity, Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, SANIdentity: certificate.SANIdentity, NotAfter: certificate.NotAfter.Format(time.RFC3339), LastTrustedWall: certificate.LastTrustedWall.Format(time.RFC3339), ChainIdentity: certificate.ChainIdentity, IssuerIdentity: certificate.IssuerIdentity, DirectoryIdentity: certificate.DirectoryIdentity, Authority: &domain.CertificateAuthorityIdentity{CertificateID: certificate.ID}}
+	state := safety.EmptyState()
+	state.Headscale.ControlEntryDigest = bundle.Entry.Digest
+	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: certificate.Generation, Fingerprint: certificate.Fingerprint, Binding: certificate.BindingIdentity, NotAfter: certificate.NotAfter, LastTrustedWall: certificate.LastTrustedWall}
+	manifest := nginx.Manifest{SchemaVersion: nginx.ManifestSchema, InstallationID: bundle.InstallationID, GenerationID: "gen_control", DefaultCertFingerprint: testDigest("default"), MainDigest: testDigest("main"), SanitizerDigest: testDigest("sanitizer"), Entries: []nginx.Entry{bundle.Entry}}
+	current := nginxactivation.ReloadAuthoritySnapshot{Installation: domain.Installation{InstallationID: bundle.InstallationID, Headscale: &headscale}, Safety: state, Ownership: map[string]string{}, ObservedAt: certificate.LastTrustedWall}
+	if err := validateCommittedBootActivation(bundle, current, manifest); err != nil {
+		t.Fatalf("committed boot authority rejected: %v", err)
+	}
+	state.Headscale.ActiveCertificate.LastTrustedWall = certificate.LastTrustedWall.Add(time.Minute)
+	current.Safety, current.ObservedAt = state, state.Headscale.ActiveCertificate.LastTrustedWall
+	if err := validateCommittedBootActivation(bundle, current, manifest); err != nil {
+		t.Fatalf("advanced trusted wall rejected: %v", err)
+	}
+	expired := current
+	expired.ObservedAt = certificate.NotAfter
+	certificateDecision := nginx.GuardDecision{Reason: "control ingress lacks valid committed Headscale certificate authority"}
+	if !expiredCommittedBootPersistenceAllowed(bundle, expired, certificateDecision) {
+		t.Fatal("expired interrupted deploy could not persist non-starting boot links")
+	}
+	if expiredCommittedBootPersistenceAllowed(bundle, expired, nginx.GuardDecision{Reason: "stop fence blocks Nginx start and reload"}) {
+		t.Fatal("non-certificate guard failure was allowed to persist boot links")
+	}
+	headscale.DeployIntent = &domain.HeadscaleDeployIntent{}
+	current.Installation.Headscale = &headscale
+	if err := validateCommittedBootActivation(bundle, current, manifest); err == nil {
+		t.Fatal("private staging authority was allowed to persist boot activation")
+	}
+}
+
 func TestHeadscaleChallengeRemovalProspectiveBaseIsGuarded(t *testing.T) {
 	rendered := testRendered(t)
 	identity := testCertificateIdentity(IssueRequest{JobID: "job_control", PlanID: "plan_control", IntentGeneration: 1, CertificateID: rendered.Candidate.CertificateID, BindingDigest: rendered.Candidate.CertificateBinding, Domain: rendered.Candidate.ControlDomain})
@@ -67,7 +109,7 @@ func TestHeadscaleChallengeRemovalProspectiveBaseIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending := safety.ChallengePending{Generation: bundle.Entry.Generation + 1, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: identity.ID, Host: rendered.Candidate.ControlDomain, Hosts: []string{rendered.Candidate.ControlDomain}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/" + identity.ID, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
+	pending := safety.ChallengePending{Generation: bundle.Entry.Generation + 1, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: identity.ID, Host: rendered.Candidate.ControlDomain, Hosts: []string{rendered.Candidate.ControlDomain}, Token: "abcdefghijklmnopqrstuv", TokenPath: "/.well-known/acme-challenge/abcdefghijklmnopqrstuv", KeyAuthorizationDigest: testDigest("key-authorization"), Webroot: "/var/lib/lanpanel/certificates/webroot/" + identity.ID, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
 	prepared, err := challenge.PreparedHTTP("headscale", pending)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +127,7 @@ func TestHeadscaleChallengeRemovalProspectiveBaseIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installation := domain.Installation{Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity}}}
+	installation := domain.Installation{InstallationID: prospective.InstallationID, Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity}}}
 	state := safety.EmptyState()
 	state.Headscale.GenerationSequence = pending.Generation
 	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: identity.Generation, Fingerprint: identity.Fingerprint, Binding: identity.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}

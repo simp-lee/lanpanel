@@ -186,7 +186,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		}
 		bound := false
 		for _, mutation := range plan.Mutations {
-			expectedPrior := "bootstrap-inventory/" + beforeInventory
+			expectedPrior := release.QualificationCleanInstallPriorState(actualHost, beforeInventory, plan.RunID)
 			if mutation.ID == "clean_install" && mutation.PriorState == expectedPrior && mutation.PriorStateDigest == release.DigestBytes([]byte(expectedPrior)) {
 				bound = true
 			}

@@ -135,6 +135,24 @@ func TestParseBootstrapDPKGStatusClassifiesHeldPackages(t *testing.T) {
 	}
 }
 
+func TestObserveInstalledPackageTuplesReturnsExactRequestedTuple(t *testing.T) {
+	status := filepath.Join(t.TempDir(), "status")
+	fixture := "Package: apache2-utils\nStatus: install ok installed\nVersion: 2.4.62-1\nArchitecture: amd64\n\nPackage: nginx\nStatus: install ok installed\nVersion: 1.26.0-1\nArchitecture: amd64\n\nPackage: unrelated\nStatus: install ok installed\nVersion: 1.0\nArchitecture: all\n"
+	if err := os.WriteFile(status, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := observeInstalledPackageTuples(context.Background(), status, []string{"apache2-utils", "nginx"}, false)
+	if err != nil || len(observed) != 2 || observed[0] != (InstalledPackageTuple{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}) || observed[1] != (InstalledPackageTuple{Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}) {
+		t.Fatalf("observed=%#v err=%v", observed, err)
+	}
+	if _, err := observeInstalledPackageTuples(context.Background(), status, []string{"nginx", "apache2-utils"}, false); err == nil {
+		t.Fatal("unsorted package selector was accepted")
+	}
+	if _, err := observeInstalledPackageTuples(context.Background(), status, []string{"missing"}, false); err == nil {
+		t.Fatal("missing package tuple was accepted")
+	}
+}
+
 func TestParseBootstrapDPKGStatusRejectsMissingRequiredFields(t *testing.T) {
 	fixture := "Package: systemd\nStatus: install ok installed\nVersion: 257.1\nArchitecture: amd64\n"
 	for _, missing := range []string{"Package", "Status", "Version", "Architecture"} {

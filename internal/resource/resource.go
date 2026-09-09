@@ -170,7 +170,7 @@ func PrepareUpdate(current domain.Installation, candidate domain.AppResource) (d
 			break
 		}
 	}
-	if prior == nil || prior.Lifecycle != domain.LifecycleActive || candidate.Target.Kind != prior.Target.Kind || prior.Target.Kind == domain.AppTargetLocalHTTP && (prior.ManagedProcess == nil || candidate.ManagedProcess == nil || candidate.ManagedProcess.ID != prior.ManagedProcess.ID) || prior.Target.Kind == domain.AppTargetTailnetHTTP && candidate.ManagedProcess != nil {
+	if prior == nil || candidate.Name != prior.Name || prior.Lifecycle != domain.LifecycleActive || candidate.Target.Kind != prior.Target.Kind || prior.Target.Kind == domain.AppTargetLocalHTTP && (prior.ManagedProcess == nil || candidate.ManagedProcess == nil || candidate.ManagedProcess.ID != prior.ManagedProcess.ID) || prior.Target.Kind == domain.AppTargetTailnetHTTP && candidate.ManagedProcess != nil {
 		return domain.AppResource{}, fmt.Errorf("resource update immutable identity is absent or changed")
 	}
 	paths, err := DerivePaths(candidate.ID)

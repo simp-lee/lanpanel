@@ -1273,11 +1273,22 @@ func (execution *CertificateExecution) AuthorizeStagedCertificate(ctx context.Co
 }
 
 func (execution *CertificateExecution) Reenter(ctx context.Context) (operations.Reservation, error) {
+	return execution.reenter(ctx, false)
+}
+
+func (execution *CertificateExecution) reenter(ctx context.Context, http01Contraction bool) (operations.Reservation, error) {
 	document, err := execution.Service.normal.Read()
 	if err != nil {
 		return operations.Reservation{}, err
 	}
-	intent, mutation, exposure, err := execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+	var intent operations.Reservation
+	var mutation *operations.MutationLease
+	var exposure *locks.Lease
+	if http01Contraction {
+		intent, mutation, exposure, err = execution.Admitter.ReenterHTTP01Contraction(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+	} else {
+		intent, mutation, exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+	}
 	if err != nil {
 		return operations.Reservation{}, err
 	}
@@ -1317,21 +1328,30 @@ func (execution *CertificateExecution) RunRemote(ctx context.Context, uid, gid u
 	if err != nil {
 		return acme.IssueResult{}, err
 	}
-	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{CertificateStage: child.Identity{UID: uid, GID: gid, Chroot: stage.Root}})
-	if err != nil {
-		return acme.IssueResult{}, errors.Join(err, stage.Close())
-	}
 	execution.StageRoot = stage.Root
 	execution.StageUID = uid
 	execution.StageGID = gid
 	execution.RemoteStarted = true
 	remoteCtx, cancel := context.WithDeadline(ctx, execution.Deadline)
 	defer cancel()
-	result, runErr := acme.RunLego(remoteCtx, launcher, acme.IssueRequest{CertificateID: execution.Challenge.Safety.CertificateIdentity, Domains: execution.Challenge.Safety.Hosts, Binding: execution.Binding, UID: uid, GID: gid, Chroot: stage.Root, ExecutableDigest: execution.LegoDigest})
+	request := acme.IssueRequest{CertificateID: execution.Challenge.Safety.CertificateIdentity, Domains: execution.Challenge.Safety.Hosts, Binding: execution.Binding, UID: uid, GID: gid, Chroot: stage.Root, ExecutableDigest: execution.LegoDigest}
+	var result acme.IssueResult
+	var runErr error
+	if execution.Binding.Method == acme.ChallengeHTTP01 {
+		result, runErr = acme.RunHTTP01(remoteCtx, request, execution)
+	} else {
+		launcher, launcherErr := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{CertificateStage: child.Identity{UID: uid, GID: gid, Chroot: stage.Root}})
+		if launcherErr != nil {
+			return acme.IssueResult{}, errors.Join(launcherErr, stage.Close())
+		}
+		result, runErr = acme.RunLego(remoteCtx, launcher, request)
+	}
 	if child.CgroupClosureUnproved(runErr) {
 		return result, runErr
 	}
-	runErr = errors.Join(runErr, stage.Close())
+	if execution.Binding.Method != acme.ChallengeHTTP01 || execution.Challenge.Entry == nil {
+		runErr = errors.Join(runErr, stage.Close())
+	}
 	if execution.DNSPreflight != nil {
 		runErr = errors.Join(runErr, acme.VerifyDNS01Cleanup(ctx, acme.NetDNSObserver{}, *execution.DNSPreflight))
 	}
@@ -1426,7 +1446,8 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 		return errors.Join(cause, cleanupErr)
 	}
 	if execution.Mutation == nil || execution.Exposure == nil {
-		if _, err := execution.Reenter(ctx); err != nil {
+		http01Contraction := execution.Binding.Method == acme.ChallengeHTTP01
+		if _, err := execution.reenter(ctx, http01Contraction); err != nil {
 			return errors.Join(cause, err)
 		}
 	}
@@ -1435,6 +1456,9 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 		return errors.Join(cause, err)
 	}
 	if err := execution.removeActiveChallenge(ctx, host); err != nil {
+		return errors.Join(cause, err)
+	}
+	if err := execution.clearHTTP01PresentationAuthority(ctx); err != nil {
 		return errors.Join(cause, err)
 	}
 	if execution.StageUID != 0 {
@@ -1557,9 +1581,87 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 	return errors.Join(cause, err)
 }
 
+func (execution *CertificateExecution) clearHTTP01PresentationAuthority(ctx context.Context) error {
+	if execution == nil || execution.Binding.Method != acme.ChallengeHTTP01 || execution.Challenge.Entry == nil {
+		return nil
+	}
+	base, err := challenge.ClearHTTP(execution.Challenge)
+	if err != nil {
+		return err
+	}
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	if execution.Headscale {
+		if state.Headscale.ChallengePending == nil || !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("headscale HTTP-01 active authority changed")
+		}
+		next.Headscale.ChallengePending = &base.Safety
+	} else {
+		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+		matched := false
+		for index := range next.Resources {
+			if next.Resources[index].ResourceID == execution.Resource.ID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
+				next.Resources[index].ChallengePending = &base.Safety
+				matched = true
+			}
+		}
+		if !matched {
+			return fmt.Errorf("app HTTP-01 active authority changed")
+		}
+	}
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return err
+	}
+	execution.Challenge = base
+	return nil
+}
+
+func exactHTTP01PresentationInManifest(manifest nginx.Manifest, resourceID string, prepared challenge.Prepared) (bool, error) {
+	if prepared.Entry == nil || prepared.Entry.Challenge == nil {
+		return false, fmt.Errorf("HTTP-01 presentation graph authority is incomplete")
+	}
+	present := false
+	for _, entry := range manifest.Entries {
+		owned := entry.Kind == nginx.EntryChallenge && entry.ResourceID == resourceID
+		if resourceID == "headscale" {
+			owned = owned || entry.Kind == nginx.EntryControl && entry.Challenge != nil
+		}
+		if !owned {
+			continue
+		}
+		exact := entry.Kind == nginx.EntryChallenge && reflect.DeepEqual(entry, *prepared.Entry)
+		if entry.Kind == nginx.EntryControl {
+			exact = reflect.DeepEqual(entry.Challenge, prepared.Entry.Challenge) && slices.Equal(entry.Domains, []string{prepared.Safety.Host})
+		}
+		if !exact || present {
+			return false, fmt.Errorf("HTTP-01 presentation graph identity changed")
+		}
+		present = true
+	}
+	return present, nil
+}
+
 func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context, host activation.Host) error {
 	if execution == nil || execution.Challenge.Entry == nil {
 		return nil
+	}
+	resourceID := execution.Resource.ID
+	if execution.Headscale {
+		resourceID = "headscale"
+	}
+	manifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return err
+	}
+	// Disk absence is not runtime closure: a failed rollback reload can leave
+	// challenge workers alive after the prior manifest has been restored.
+	_, err = exactHTTP01PresentationInManifest(manifest, resourceID, execution.Challenge)
+	if err != nil {
+		return err
 	}
 	authority, err := execution.challengeReloadAuthority()
 	if err != nil {
@@ -2067,67 +2169,177 @@ func (execution *CertificateExecution) challengeReloadAuthority() (activation.Ch
 }
 
 func (execution *CertificateExecution) ActivateChallenge(ctx context.Context) error {
-	host, err := activation.NewFixedHost()
-	if err != nil {
-		return err
-	}
-	if execution.Binding.Method == acme.ChallengeHTTP01 {
-		authority, authorityErr := execution.challengeReloadAuthority()
-		if authorityErr != nil {
-			return authorityErr
-		}
-		currentAuthority, authorityErr := authority.Current()
-		if authorityErr != nil {
-			return authorityErr
-		}
-		if execution.Headscale {
-			if currentAuthority.Safety.Headscale.CertificateExpiry != nil {
-				if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
-					return err
-				}
-			} else {
-				bundle, bundleErr := execution.headscaleActivationBundle()
-				if bundleErr != nil {
-					return bundleErr
-				}
-				controlHost, hostErr := control.NewActivationHost()
-				if hostErr != nil {
-					return hostErr
-				}
-				if err := controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, authority); err != nil {
-					return err
-				}
-			}
-		} else if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
-			return err
-		}
-	} else {
-		_, remoteErr := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
-		execution.Mutation, execution.Exposure = nil, nil
-		if remoteErr != nil {
-			return remoteErr
-		}
-		execution.Revision++
-		ownerLocks, err := acme.AcquireOwnerLocks(ctx, fixedRoot+"/locks", execution.Binding.Provider, execution.Binding.Zone, execution.Challenge.Owners, execution.Challenge.Safety.OwnerLock)
-		if err != nil {
-			return err
-		}
-		preflight, err := acme.PreflightDNS01(ctx, acme.NetDNSObserver{}, execution.Binding.Zone, execution.Challenge.Owners)
-		if err != nil {
-			_ = ownerLocks.Close()
-			return err
-		}
-		execution.DNSLocks = ownerLocks
-		execution.DNSPreflight = &preflight
-		return nil
-	}
 	_, remoteErr := execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
 	execution.Mutation, execution.Exposure = nil, nil
 	if remoteErr != nil {
 		return remoteErr
 	}
 	execution.Revision++
+	if execution.Binding.Method == acme.ChallengeHTTP01 {
+		if execution.Challenge.Entry != nil || execution.Challenge.Safety.Token != "" {
+			return fmt.Errorf("HTTP-01 operation loaded a route before receiving an exact token")
+		}
+		return nil
+	}
+	ownerLocks, err := acme.AcquireOwnerLocks(ctx, fixedRoot+"/locks", execution.Binding.Provider, execution.Binding.Zone, execution.Challenge.Owners, execution.Challenge.Safety.OwnerLock)
+	if err != nil {
+		return err
+	}
+	preflight, err := acme.PreflightDNS01(ctx, acme.NetDNSObserver{}, execution.Binding.Zone, execution.Challenge.Owners)
+	if err != nil {
+		_ = ownerLocks.Close()
+		return err
+	}
+	execution.DNSLocks = ownerLocks
+	execution.DNSPreflight = &preflight
 	return nil
+}
+
+func (execution *CertificateExecution) PresentHTTP01(ctx context.Context, presentation acme.HTTP01Presentation) error {
+	if execution == nil || execution.Binding.Method != acme.ChallengeHTTP01 || execution.Mutation != nil || execution.Exposure != nil || execution.Challenge.Entry != nil {
+		return fmt.Errorf("HTTP-01 presentation phase is invalid")
+	}
+	resourceID := execution.Resource.ID
+	if execution.Headscale {
+		resourceID = "headscale"
+	}
+	active, err := challenge.PresentHTTPForResource(resourceID, execution.Challenge, presentation.Host, presentation.Token, presentation.KeyAuthorizationDigest)
+	if err != nil {
+		return err
+	}
+	if err := acme.WriteHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation); err != nil {
+		return err
+	}
+	if _, err := execution.Reenter(ctx); err != nil {
+		return errors.Join(err, acme.RemoveHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation))
+	}
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	if execution.Headscale {
+		if state.Headscale.ChallengePending == nil || !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("headscale HTTP-01 base authority changed")
+		}
+		next.Headscale.ChallengePending = &active.Safety
+	} else {
+		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+		matched := false
+		for index := range next.Resources {
+			if next.Resources[index].ResourceID == resourceID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
+				next.Resources[index].ChallengePending = &active.Safety
+				matched = true
+			}
+		}
+		if !matched {
+			return fmt.Errorf("app HTTP-01 base authority changed")
+		}
+	}
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return err
+	}
+	execution.Challenge = active
+	if err := execution.activateHTTP01Route(ctx); err != nil {
+		return err
+	}
+	_, err = execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+	execution.Mutation, execution.Exposure = nil, nil
+	if err == nil {
+		execution.Revision++
+	}
+	return err
+}
+
+func (execution *CertificateExecution) CleanUpHTTP01(ctx context.Context, presentation acme.HTTP01Presentation) error {
+	if execution == nil || execution.Challenge.Entry == nil || execution.Challenge.Safety.Host != presentation.Host || execution.Challenge.Safety.Token != presentation.Token || execution.Challenge.Safety.KeyAuthorizationDigest != presentation.KeyAuthorizationDigest {
+		return fmt.Errorf("HTTP-01 cleanup presentation changed")
+	}
+	base, err := challenge.ClearHTTP(execution.Challenge)
+	if err != nil {
+		return err
+	}
+	if _, err := execution.reenter(ctx, true); err != nil {
+		return err
+	}
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	if err := execution.removeActiveChallenge(ctx, host); err != nil {
+		return err
+	}
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	if execution.Headscale {
+		if state.Headscale.ChallengePending == nil || !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("headscale HTTP-01 active authority changed")
+		}
+		next.Headscale.ChallengePending = &base.Safety
+	} else {
+		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+		matched := false
+		for index := range next.Resources {
+			if next.Resources[index].ResourceID == execution.Resource.ID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
+				next.Resources[index].ChallengePending = &base.Safety
+				matched = true
+			}
+		}
+		if !matched {
+			return fmt.Errorf("app HTTP-01 active authority changed")
+		}
+	}
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return err
+	}
+	execution.Challenge = base
+	if err := acme.VerifyHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation); err != nil {
+		return err
+	}
+	_, err = execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+	execution.Mutation, execution.Exposure = nil, nil
+	if err != nil {
+		return err
+	}
+	execution.Revision++
+	return acme.RemoveHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation)
+}
+
+func (execution *CertificateExecution) activateHTTP01Route(ctx context.Context) error {
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	authority, err := execution.challengeReloadAuthority()
+	if err != nil {
+		return err
+	}
+	current, err := authority.Current()
+	if err != nil {
+		return err
+	}
+	if execution.Headscale {
+		if current.Safety.Headscale.CertificateExpiry != nil {
+			_, err = host.ActivateChallenge(ctx, execution.Challenge, authority)
+			return err
+		}
+		bundle, err := execution.headscaleActivationBundle()
+		if err != nil {
+			return err
+		}
+		controlHost, err := control.NewActivationHost()
+		if err != nil {
+			return err
+		}
+		return controlHost.ActivateCertificateChallenge(ctx, bundle, execution.Challenge, authority)
+	}
+	_, err = host.ActivateChallenge(ctx, execution.Challenge, authority)
+	return err
 }
 
 func (execution *CertificateExecution) Close() error {
@@ -3044,24 +3256,70 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 				_ = mutationSet.Close()
 				return auditErr
 			}
-			expected, prepareErr := challenge.PreparedHTTP(resource.ResourceID, *freshResource.ChallengePending)
-			if prepareErr != nil {
-				_ = operations.ReleaseExposure(mutation, exposure)
-				_ = mutationSet.Close()
-				return prepareErr
-			}
-			for index := range manifest.Entries {
-				current := &manifest.Entries[index]
-				if current.Kind == nginx.EntryChallenge && current.ResourceID == resource.ResourceID && !reflect.DeepEqual(*current, *expected.Entry) {
+			if freshResource.ChallengePending.Token == "" {
+				for _, current := range manifest.Entries {
+					if current.Kind == nginx.EntryChallenge && current.ResourceID == resource.ResourceID {
+						_ = operations.ReleaseExposure(mutation, exposure)
+						_ = mutationSet.Close()
+						return fmt.Errorf("tokenless interrupted HTTP challenge has an active route")
+					}
+				}
+			} else {
+				expected, prepareErr := challenge.PreparedHTTP(resource.ResourceID, *freshResource.ChallengePending)
+				if prepareErr != nil {
 					_ = operations.ReleaseExposure(mutation, exposure)
 					_ = mutationSet.Close()
-					return fmt.Errorf("interrupted HTTP challenge graph identity changed")
+					return prepareErr
 				}
-			}
-			if _, err := host.RemoveChallenge(ctx, expected, authority); err != nil {
-				_ = operations.ReleaseExposure(mutation, exposure)
-				_ = mutationSet.Close()
-				return err
+				_, routeErr := exactHTTP01PresentationInManifest(manifest, resource.ResourceID, expected)
+				if routeErr != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return routeErr
+				}
+				if _, err := host.RemoveChallenge(ctx, expected, authority); err != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return err
+				}
+				base, clearErr := challenge.ClearHTTP(expected)
+				if clearErr != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return clearErr
+				}
+				fresh := currentAuthority.Safety
+				next := fresh
+				next.Resources = append([]safety.ResourceSafety(nil), fresh.Resources...)
+				matched := false
+				for index := range next.Resources {
+					if next.Resources[index].ResourceID == resource.ResourceID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, expected) {
+						next.Resources[index].ChallengePending = &base.Safety
+						matched = true
+					}
+				}
+				if !matched {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return fmt.Errorf("interrupted HTTP challenge safety identity changed")
+				}
+				next.Revision++
+				if _, clearErr := service.safety.Commit(ctx, exposure, safety.RoleChallenge, fresh.Revision, next, safety.TransitionProof{}); clearErr != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return clearErr
+				}
+				pending = &base.Safety
+				stageIdentity, identityErr := identity.CertificateStageIdentityFor(expected.Safety.CertificateIdentity)
+				var tokenErr error
+				if identityErr == nil {
+					tokenErr = acme.VerifyHTTP01TokenDigest(expected.Safety.CertificateIdentity, stageIdentity.UID, stageIdentity.GID, expected.Safety.Token, expected.Safety.KeyAuthorizationDigest)
+				}
+				if identityErr != nil || tokenErr != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return errors.Join(identityErr, tokenErr, fmt.Errorf("interrupted HTTP challenge token identity changed after route contraction"))
+				}
 			}
 		}
 		document, err := service.normal.Read()

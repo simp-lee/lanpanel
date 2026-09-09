@@ -4,6 +4,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"lanpanel/internal/domain"
@@ -17,6 +18,18 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestRuntimeViolationReasonsAreClosedAndTyped(t *testing.T) {
+	for _, kind := range []RuntimeViolationKind{RuntimeViolationPolicyInvalid, RuntimeViolationExtraListener} {
+		reason, err := RuntimeViolationReason(kind)
+		if err != nil || reason != string(kind)+"_contracted" {
+			t.Fatalf("kind=%q reason=%q error=%v", kind, reason, err)
+		}
+	}
+	if _, err := RuntimeViolationReason("unknown"); err == nil {
+		t.Fatal("unknown runtime violation kind was accepted")
+	}
+}
 
 func TestStoppedTCPInventoryRejectsExactListener(t *testing.T) {
 	data := []byte("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0900007F:4A39 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 42\n")
@@ -150,8 +163,10 @@ func TestProcUnixListenerParsingAndRelayOwnership(t *testing.T) {
 			t.Fatal(err)
 		}
 		extraOwners := map[string][]uint64{unixOwnerPID1: {101}, unixOwnerRelay: {101}, unixOwnerApplication: {202, 303}}
-		if _, err := verifyUnixListeners(extraListeners, want, extraOwners, []string{unixOwnerApplication, unixOwnerRelay}); err == nil {
-			t.Fatal("undeclared application listener accepted")
+		_, err = verifyUnixListeners(extraListeners, want, extraOwners, []string{unixOwnerApplication, unixOwnerRelay})
+		var violation *RuntimeViolation
+		if !errors.As(err, &violation) || violation.Kind != RuntimeViolationExtraListener {
+			t.Fatalf("undeclared application listener was not a typed contraction violation: %v", err)
 		}
 	})
 
@@ -197,6 +212,11 @@ func TestTCPApplicationOwnerRejectsUndeclaredUnixListener(t *testing.T) {
 	owners := map[string][]uint64{unixOwnerApplication: {303}}
 	if _, err := verifyUnixListeners(listeners, nil, owners, []string{unixOwnerApplication}); err == nil {
 		t.Fatal("TCP application owner accepted an undeclared Unix listener")
+	} else {
+		var violation *RuntimeViolation
+		if !errors.As(err, &violation) || violation.Kind != RuntimeViolationExtraListener {
+			t.Fatalf("undeclared Unix listener was not typed: %v", err)
+		}
 	}
 	if _, err := verifyUnixListeners(listeners, nil, map[string][]uint64{unixOwnerApplication: {404}}, []string{unixOwnerApplication}); err != nil {
 		t.Fatalf("unowned Unix listener affected exact application inventory: %v", err)

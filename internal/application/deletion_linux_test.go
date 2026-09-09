@@ -144,6 +144,30 @@ func TestRecoveredDeleteKeepsOwnershipUntilNormalRemovalCommits(t *testing.T) {
 	}
 }
 
+func TestDeleteRuntimeClosureAcceptsStoppedAppliedBundleForDeleteAndRecovery(t *testing.T) {
+	root := t.TempDir()
+	short := "00000000000000000000"
+	resource := deletionTestLocalResource(t)
+	resource.ManagedProcess.Applied = &domain.ProcessBundle{
+		Cgroup:              "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-" + short + ".slice/lanpanel-app-" + short + ".service",
+		FrontendEndpoint:    filepath.Join(root, "frontend.sock"),
+		EndpointSocketUnits: []string{"lanpanel-app-" + short + ".socket"},
+	}
+
+	resource.ManagedProcess.Requested = domain.ProcessRequestedRunning
+	if err := verifyDeleteRuntimeClosedWithCgroupRoot(context.Background(), root, resource); err == nil {
+		t.Fatal("running applied bundle was accepted for deletion")
+	}
+	resource.ManagedProcess.Requested = domain.ProcessRequestedStopped
+	for _, phase := range []string{"delete", "tombstone recovery"} {
+		t.Run(phase, func(t *testing.T) {
+			if err := verifyDeleteRuntimeClosedWithCgroupRoot(context.Background(), root, resource); err != nil {
+				t.Fatalf("stopped applied bundle was rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestCleanupDeleteInventoryAccountErrorsFailBeforeMutation(t *testing.T) {
 	installation := domain.Installation{InstallationID: "ins_00000000000000000000000000000001"}
 	resource := deletionTestLocalResource(t)

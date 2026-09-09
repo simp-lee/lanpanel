@@ -21,10 +21,11 @@ const (
 	ReleaseManifestSchemaVersion              = "lanpanel.release.v3"
 	QualificationTargetProfileSchemaVersion   = "lanpanel.qualification.target-profile.v1"
 	QualificationInstallManifestSchemaVersion = "lanpanel.qualification.install-manifest.v4"
-	LiveSideEffectPlanSchemaVersion           = "lanpanel.qualification.side-effect-plan.v2"
-	LiveCleanupReportSchemaVersion            = "lanpanel.qualification.cleanup-report.v3"
-	LiveExecutorAttestationSchemaVersion      = "lanpanel.qualification.executor-attestation.v1"
-	QualificationSummarySchemaVersion         = "lanpanel.qualification.summary.v2"
+	LiveSideEffectPlanSchemaVersion           = "lanpanel.qualification.side-effect-plan.v3"
+	LiveCleanupReportSchemaVersion            = "lanpanel.qualification.cleanup-report.v4"
+	LiveExecutorAttestationSchemaVersion      = "lanpanel.qualification.executor-attestation.v2"
+	LiveStepEvidenceSchemaVersion             = "lanpanel.qualification.step-evidence.v2"
+	QualificationSummarySchemaVersion         = "lanpanel.qualification.summary.v3"
 )
 
 type InstallKind string
@@ -132,25 +133,20 @@ type ProviderLiveTest struct {
 }
 
 type QualificationSummary struct {
-	SchemaVersion             string             `json:"schema_version"`
-	RunID                     string             `json:"run_id"`
-	CandidateDigest           string             `json:"candidate_digest"`
-	SourceTreeDigest          string             `json:"source_tree_digest"`
-	TargetProfileDigest       string             `json:"target_profile_digest"`
-	InstallManifestDigest     string             `json:"install_manifest_digest"`
-	SideEffectPlanDigest      string             `json:"side_effect_plan_digest"`
-	ProtectedInputDigest      string             `json:"protected_input_digest"`
-	CleanupReportDigest       string             `json:"cleanup_report_digest"`
-	ExecutorAttestationDigest string             `json:"executor_attestation_digest"`
-	JourneySucceeded          bool               `json:"journey_succeeded"`
-	TailnetLiveStatus         string             `json:"tailnet_live_status"`
-	ProviderLiveTests         []ProviderLiveTest `json:"provider_live_tests"`
-	CompletedAt               time.Time          `json:"completed_at"`
+	SchemaVersion       string             `json:"schema_version"`
+	RunID               string             `json:"run_id"`
+	CandidateDigest     string             `json:"candidate_digest"`
+	SourceTreeDigest    string             `json:"source_tree_digest"`
+	TargetProfileDigest string             `json:"target_profile_digest"`
+	JourneySucceeded    bool               `json:"journey_succeeded"`
+	TailnetLiveStatus   string             `json:"tailnet_live_status"`
+	ProviderLiveTests   []ProviderLiveTest `json:"provider_live_tests"`
+	CompletedAt         time.Time          `json:"completed_at"`
 }
 
 func DecodeQualificationSummary(data []byte) (QualificationSummary, error) {
 	var value QualificationSummary
-	if DecodeCanonical(data, &value) != nil || value.SchemaVersion != QualificationSummarySchemaVersion || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.SourceTreeDigest) || !ValidDigest(value.TargetProfileDigest) || !ValidDigest(value.InstallManifestDigest) || !ValidDigest(value.SideEffectPlanDigest) || !ValidDigest(value.ProtectedInputDigest) || !ValidDigest(value.CleanupReportDigest) || !ValidDigest(value.ExecutorAttestationDigest) || !value.JourneySucceeded || value.TailnetLiveStatus != "live_tested" && value.TailnetLiveStatus != "not_live_tested" || !sameUTCSecond(value.CompletedAt) {
+	if DecodeCanonical(data, &value) != nil || value.SchemaVersion != QualificationSummarySchemaVersion || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.SourceTreeDigest) || !ValidDigest(value.TargetProfileDigest) || !value.JourneySucceeded || value.TailnetLiveStatus != "live_tested" && value.TailnetLiveStatus != "not_live_tested" || !sameUTCSecond(value.CompletedAt) {
 		return QualificationSummary{}, fmt.Errorf("qualification summary is invalid")
 	}
 	expected := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
@@ -706,6 +702,13 @@ type LiveSideEffectPlan struct {
 	Mutations                 []PlannedMutation `json:"mutations"`
 }
 
+// QualificationCleanInstallPriorState is the canonical preinstall observation
+// bound by the generator, local preflight, and remote installer. It names the
+// concrete clean-host inventory and both staging paths that must be absent.
+func QualificationCleanInstallPriorState(hostFingerprint, inventoryDigest, runID string) string {
+	return "step=clean_install;fresh_observation=host_fingerprint=" + hostFingerprint + ",bootstrap_inventory_digest=" + inventoryDigest + ",staging_base=/var/lib/lanpanel-qualification:absent,staging_root=/var/lib/lanpanel-qualification/" + runID + ":absent"
+}
+
 type QualificationInstallManifest struct {
 	SchemaVersion             string        `json:"schema_version"`
 	RunID                     string        `json:"run_id"`
@@ -745,12 +748,50 @@ const (
 	StepUnknown   StepOutcome = "unknown"
 )
 
+type LiveStepEvidence struct {
+	SchemaVersion        string                     `json:"schema_version"`
+	Kind                 string                     `json:"kind"`
+	Values               map[string]string          `json:"values"`
+	Observations         map[string]json.RawMessage `json:"observations,omitempty"`
+	ObservedPackageTuple []PackageTuple             `json:"observed_package_tuple,omitempty"`
+}
+
+func DecodeLiveStepEvidence(data []byte) (LiveStepEvidence, error) {
+	var value LiveStepEvidence
+	if err := DecodeCanonical(data, &value); err != nil {
+		return LiveStepEvidence{}, err
+	}
+	if value.SchemaVersion != LiveStepEvidenceSchemaVersion || !refPattern.MatchString(value.Kind) || len(value.Values) == 0 || len(value.Values) > 128 || len(value.Observations) > 128 || len(value.ObservedPackageTuple) > 256 {
+		return LiveStepEvidence{}, fmt.Errorf("live step evidence identity or inventory is invalid")
+	}
+	for key, item := range value.Values {
+		if !refPattern.MatchString(key) || !validPlanText(item) {
+			return LiveStepEvidence{}, fmt.Errorf("live step evidence value is invalid")
+		}
+	}
+	for key, observation := range value.Observations {
+		if !refPattern.MatchString(key) || len(observation) < 2 || len(observation) > 256<<10 || observation[0] != '{' || observation[len(observation)-1] != '}' || !json.Valid(observation) {
+			return LiveStepEvidence{}, fmt.Errorf("live step nested observation is invalid")
+		}
+	}
+	previous := ""
+	for _, tuple := range value.ObservedPackageTuple {
+		key := tuple.Name + "\x00" + tuple.Architecture
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+			return LiveStepEvidence{}, fmt.Errorf("live step observed package tuple is invalid or noncanonical")
+		}
+		previous = key
+	}
+	return value, nil
+}
+
 type JourneyStepResult struct {
-	MutationID     string      `json:"mutation_id"`
-	AttemptID      string      `json:"attempt_id"`
-	Outcome        StepOutcome `json:"outcome"`
-	EvidenceDigest string      `json:"evidence_digest,omitempty"`
-	ErrorDigest    string      `json:"error_digest,omitempty"`
+	MutationID     string          `json:"mutation_id"`
+	AttemptID      string          `json:"attempt_id"`
+	Outcome        StepOutcome     `json:"outcome"`
+	Evidence       json.RawMessage `json:"evidence,omitempty"`
+	EvidenceDigest string          `json:"evidence_digest,omitempty"`
+	ErrorDigest    string          `json:"error_digest,omitempty"`
 }
 
 type CleanupItem struct {
@@ -794,6 +835,7 @@ type LiveExecutorAttestation struct {
 	TailnetLiveStatus                  string                `json:"tailnet_live_status"`
 	Steps                              []AttestedJourneyStep `json:"steps"`
 	Cleanup                            []CleanupItem         `json:"cleanup"`
+	TerminalEvidence                   json.RawMessage       `json:"terminal_evidence"`
 	CompletedAt                        time.Time             `json:"completed_at"`
 }
 
@@ -818,7 +860,7 @@ func DecodeLiveSideEffectPlan(data []byte) (LiveSideEffectPlan, error) {
 	}
 	previous := ""
 	for _, mutation := range plan.Mutations {
-		if !refPattern.MatchString(mutation.ID) || !validPlanText(mutation.Scope) || !validPlanText(mutation.PriorState) || !validPlanText(mutation.PlannedMutation) || !validPlanText(mutation.Selector) || mutation.ScopeDigest != DigestBytes([]byte(mutation.Scope)) || mutation.PriorStateDigest != DigestBytes([]byte(mutation.PriorState)) || mutation.PlannedMutationDigest != DigestBytes([]byte(mutation.PlannedMutation)) || mutation.SelectorDigest != DigestBytes([]byte(mutation.Selector)) || (mutation.CleanupPolicy != "delete_exact" && mutation.CleanupPolicy != "retain_authorized") || previous != "" && previous >= mutation.ID {
+		if !refPattern.MatchString(mutation.ID) || !validPlanText(mutation.Scope) || !validPlanText(mutation.PriorState) || !validPlanText(mutation.PlannedMutation) || !validPlanText(mutation.Selector) || !validConcreteSideEffectAuthority(plan, mutation) || mutation.ScopeDigest != DigestBytes([]byte(mutation.Scope)) || mutation.PriorStateDigest != DigestBytes([]byte(mutation.PriorState)) || mutation.PlannedMutationDigest != DigestBytes([]byte(mutation.PlannedMutation)) || mutation.SelectorDigest != DigestBytes([]byte(mutation.Selector)) || (mutation.CleanupPolicy != "delete_exact" && mutation.CleanupPolicy != "retain_authorized") || previous != "" && previous >= mutation.ID {
 			return LiveSideEffectPlan{}, fmt.Errorf("live side-effect mutation inventory is invalid or noncanonical")
 		}
 		previous = mutation.ID
@@ -852,15 +894,16 @@ func DecodeLiveCleanupReport(data []byte) (LiveCleanupReport, error) {
 		}
 		switch step.Outcome {
 		case StepSubmitted:
-			if step.EvidenceDigest != "" || step.ErrorDigest != "" {
+			if len(step.Evidence) != 0 || step.EvidenceDigest != "" || step.ErrorDigest != "" {
 				return LiveCleanupReport{}, fmt.Errorf("submitted live step carries terminal evidence")
 			}
 		case StepPassed:
-			if !ValidDigest(step.EvidenceDigest) || step.ErrorDigest != "" {
+			if !validLiveStepEvidence(step.Evidence, step.EvidenceDigest) || step.ErrorDigest != "" {
 				return LiveCleanupReport{}, fmt.Errorf("passed live step evidence is invalid")
 			}
 		case StepFailed, StepUnknown:
-			if !ValidDigest(step.ErrorDigest) || step.EvidenceDigest != "" && !ValidDigest(step.EvidenceDigest) {
+			hasEvidence := len(step.Evidence) != 0 || step.EvidenceDigest != ""
+			if !ValidDigest(step.ErrorDigest) || hasEvidence && !validLiveStepEvidence(step.Evidence, step.EvidenceDigest) {
 				return LiveCleanupReport{}, fmt.Errorf("failed live step evidence is invalid")
 			}
 		}
@@ -883,6 +926,10 @@ func DecodeLiveExecutorAttestation(data []byte) (LiveExecutorAttestation, error)
 	}
 	providers := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
 	if value.SchemaVersion != LiveExecutorAttestationSchemaVersion || value.ExecutorIdentity != "lanpanel-trusted-live-executor-v1" || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.TargetProfileDigest) || !ValidDigest(value.SideEffectPlanDigest) || !ValidDigest(value.QualificationInstallManifestDigest) || !ValidDigest(value.ProtectedInputDigest) || !refPattern.MatchString(value.TargetHostFingerprint) || !ValidDigest(value.ExternalVantageDigest) || !slices.Contains(providers, value.DNSProvider) || !value.DNSLiveTested || value.TailnetLiveStatus != "live_tested" && value.TailnetLiveStatus != "not_live_tested" || !sameUTCSecond(value.CompletedAt) || len(value.Steps) == 0 || len(value.Steps) > 1024 || len(value.Cleanup) == 0 || len(value.Cleanup) > 1024 {
+		return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation is invalid")
+	}
+	terminal, err := DecodeLiveStepEvidence(value.TerminalEvidence)
+	if err != nil || terminal.Kind != "terminal-cleanup" {
 		return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation is invalid")
 	}
 	previous := ""
@@ -934,12 +981,51 @@ func validStepOutcome(value StepOutcome) bool {
 	return value == StepSubmitted || value == StepPassed || value == StepFailed || value == StepUnknown
 }
 
+func validLiveStepEvidence(data []byte, digest string) bool {
+	if !ValidDigest(digest) || DigestBytes(data) != digest {
+		return false
+	}
+	_, err := DecodeLiveStepEvidence(data)
+	return err == nil
+}
+
 func validPlanText(value string) bool {
 	if value == "" || value != strings.TrimSpace(value) || len(value) > 4096 {
 		return false
 	}
 	for _, character := range []byte(value) {
 		if character < 0x20 || character > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func validConcreteSideEffectAuthority(_ LiveSideEffectPlan, mutation PlannedMutation) bool {
+	priorPrefix := "step=" + mutation.ID + ";fresh_observation="
+	return nonemptyPlanField(mutation.Scope, "providers") &&
+		nonemptyPlanField(mutation.Scope, "objects") &&
+		strings.HasPrefix(mutation.PriorState, priorPrefix) && len(mutation.PriorState) > len(priorPrefix) &&
+		nonemptyPlanField(mutation.PlannedMutation, "effects") &&
+		hasNonemptySelector(mutation.Selector) &&
+		!strings.Contains(mutation.PriorState, "fresh-prior/") &&
+		!strings.Contains(mutation.PlannedMutation, "execute=")
+}
+
+func nonemptyPlanField(text, name string) bool {
+	for field := range strings.SplitSeq(text, ";") {
+		key, value, present := strings.Cut(field, "=")
+		if present && key == name {
+			return value != ""
+		}
+	}
+	return false
+}
+
+func hasNonemptySelector(text string) bool {
+	for field := range strings.SplitSeq(text, ";") {
+		key, value, present := strings.Cut(field, "=")
+		if !present || key == "" || value == "" {
 			return false
 		}
 	}

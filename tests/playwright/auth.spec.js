@@ -20,12 +20,61 @@ test('LP-AUTH-003 real UI Host Origin CSRF and response defenses fail closed',as
 test('LP-AUTH-004 real UI browser back does not reveal authenticated content',async({page})=>{await login(page);await page.goto('about:blank');await page.goBack();await expect(page.locator('#status')).toHaveText('');expect(await page.evaluate(()=>sessionStorage.length)).toBe(0)});
 test('LP-HEADSCALE-001 immutable Headscale initialization requires warning and typed action',async({page})=>{await login(page);const form=page.locator('#headscale-initialize');await form.locator('input[name=control_domain]').fill('control.example.test');await form.locator('input[name=magicdns_namespace]').fill('mesh.example.test');page.once('dialog',async dialog=>{expect(dialog.message()).toContain('cannot be changed or removed');await dialog.accept()});const responsePromise=page.waitForResponse(response=>response.url()===origin+'/api/actions/headscale_initialize');await form.locator('button').click();const response=await responsePromise;expect(response.status(),response.request().postData()).toBe(200);await expect(page.locator('#status')).toHaveText('Headscale identity hds_00000000000000000000000000000001 initialized; control service and ingress remain inactive');await expect(form).toBeHidden()});
 test('LP-HEADSCALE-002 foreign initialization evidence reports terminal job',async({page})=>{await login(page);const form=page.locator('#headscale-initialize');await form.locator('input[name=control_domain]').fill('foreign.example.test');await form.locator('input[name=magicdns_namespace]').fill('mesh.example.test');await form.locator('input[name=proxy_url]').fill('https://proxy.example.test');page.once('dialog',dialog=>dialog.accept());const responsePromise=page.waitForResponse(response=>response.url()===origin+'/api/actions/headscale_initialize');await form.locator('button').click();const response=await responsePromise;expect(response.status()).toBe(409);await expect(page.locator('#status')).toHaveText('Blocked: foreign Headscale database, account, or artifact evidence; job job_foreign_headscale_fixture')});
+test('LP-HEADSCALE-003 preauth key creation submits canonical terminal JSON and delivers the key once',async({page})=>{
+  const bodies=[];
+  await page.route('**/api/actions/preauth_key_create**',async route=>{
+    bodies.push(route.request().postData());
+    const planned=new URL(route.request().url()).pathname.endsWith('/plan');
+    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(planned?{plan_id:'plan-fixture',exposure_summary:'creates one short-lived key'}:{secret:'Zml4dHVyZS1rZXk='})});
+  });
+  await login(page);
+  const form=page.locator('#headscale-key-create');
+  await form.locator('input[name=user_id]').fill('1');
+  await form.locator('input[name=expiration_seconds]').fill('3600');
+  page.once('dialog',dialog=>dialog.accept());
+  await form.locator('button').click();
+  await expect(page.locator('#status')).toHaveText('Preauth key (shown once): fixture-key');
+  expect(bodies).toEqual([
+    '{"expiration_seconds":3600}',
+    '{"plan_id":"plan-fixture","confirmation":"create","expiration_seconds":3600}',
+  ]);
+});
 test('LP-ACTION-002 final typed management controls are discoverable after login', async ({ page }) => {
   await login(page)
   for (const id of ['resource-create','resource-update-json','process-control','resource-delete','headscale-user-create','headscale-key-create','headscale-key-revoke','headscale-device-expire','headscale-reads','connector-binding','connector-login','connector-verify','product-reads','job-detail']) {
     await expect(page.locator('#'+id)).toBeVisible()
   }
 })
+
+test('LP-CONTRACTION-001 unpublish and close-all display exact contraction outcomes',async({page})=>{
+  const outcomes=[
+    {value:{outcome:'succeeded',access_closed:true,shared_ingress_down:false,access_may_remain:false},unpublish:'App unpublished',closeAll:'All App origin ingress closed'},
+    {value:{outcome:'partial',access_closed:true,shared_ingress_down:true,access_may_remain:false},unpublish:'App access closed; shared ingress is down',closeAll:'App access closed; shared ingress is down'},
+    {value:{outcome:'unknown',access_closed:false,shared_ingress_down:false,access_may_remain:true},unpublish:'Unknown: App access may remain',closeAll:'Unknown: App access may remain'},
+  ];
+  let current=outcomes[0].value;
+  const fulfill=async(route,operation)=>{
+    const planned=new URL(route.request().url()).pathname.endsWith('/plan');
+    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(planned?{plan_id:'plan-fixture',operation,target_kind:operation==='unpublish'?'resource':'installation',exposure_summary:'contracts App ingress',prerequisites:'fresh closure authority',expires_at:'2030-01-01T00:00:00Z'}:current)});
+  };
+  await page.route('**/api/actions/unpublish**',route=>fulfill(route,'unpublish'));
+  await page.route('**/api/actions/close_all**',route=>fulfill(route,'close_all'));
+  await login(page);
+  const form=page.locator('#unpublish'),status=page.locator('#status');
+  for(let index=0;index<outcomes.length;index++){
+    current=outcomes[index].value;
+    await form.locator('input[name=resource_id]').fill('res_'+String(index+1).padStart(32,'0'));
+    page.once('dialog',dialog=>dialog.accept());
+    await form.locator('button').click();
+    await expect(status).toHaveText(outcomes[index].unpublish);
+  }
+  for(const outcome of outcomes){
+    current=outcome.value;
+    page.once('dialog',dialog=>dialog.accept());
+    await page.locator('#close-all').click();
+    await expect(status).toHaveText(outcome.closeAll);
+  }
+});
 
 test('LP-AUTH-005 real UI WebSocket binds selector and first-frame proof',async({page,context})=>{await login(page);const proofA=await page.evaluate(()=>sessionStorage.getItem('lp.proof'));const accepted=await page.evaluate(({origin,proof})=>new Promise(resolve=>{const ws=new WebSocket(origin.replace('http:','ws:')+'/api/events','lanpanel.events.v1');ws.onopen=()=>ws.send(JSON.stringify({type:'auth',proof}));ws.onmessage=event=>{resolve(JSON.parse(String(event.data)).type==='ready');ws.close()};ws.onerror=()=>resolve(false);setTimeout(()=>resolve(false),7000)}),{origin,proof:proofA});expect(accepted).toBe(true);await context.clearCookies();await login(page);const rejected=await page.evaluate(({origin,proof})=>new Promise(resolve=>{let ready=false;const ws=new WebSocket(origin.replace('http:','ws:')+'/api/events','lanpanel.events.v1');ws.onopen=()=>ws.send(JSON.stringify({type:'auth',proof}));ws.onmessage=()=>{ready=true};ws.onclose=()=>resolve(!ready);ws.onerror=()=>resolve(true);setTimeout(()=>resolve(false),7000)}),{origin,proof:proofA});expect(rejected).toBe(true)});
 test('LP-ACTION-003 rotation Plan does not cancel a concurrent mutation',async({page,request})=>{await login(page);const action=page.evaluate(async()=>{const response=await fetch('/api/actions/headscale_initialize',{method:'POST',headers:{'X-LanPanel-Session-Proof':sessionStorage.getItem('lp.proof'),'X-LanPanel-CSRF':sessionStorage.getItem('lp.csrf'),'Content-Type':'application/json'},body:JSON.stringify({control_domain:'blocked.example.test',magicdns_namespace:'mesh.example.test',source_kind:'official/canonical_artifact',confirmation:'initialize'})});return response.status});const started=await request.get(controlOrigin+'/action/started');expect(started.status()).toBe(204);let planStatus;try{planStatus=await page.evaluate(async()=>{const response=await fetch('/api/actions/admin_token_rotate/plan',{method:'POST',headers:{'X-LanPanel-Session-Proof':sessionStorage.getItem('lp.proof'),'X-LanPanel-CSRF':sessionStorage.getItem('lp.csrf'),'Content-Type':'application/json'},body:'{}'});return response.status})}finally{const released=await request.post(controlOrigin+'/action/release');expect(released.status()).toBe(204)}expect(planStatus).toBe(200);expect(await action).toBe(200)});

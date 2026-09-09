@@ -43,3 +43,33 @@ jobs:
 
       - name: Run canonical quality gate
         run: make ga-local-gate
+
+  root-required:
+    name: Mandatory isolated root identity tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Prepare isolated bpffs
+        run: |
+          if ! grep -Eq ' /sys/fs/bpf .* - bpf ' /proc/self/mountinfo; then
+            sudo mkdir -p /sys/fs/bpf
+            sudo mount -t bpf -o mode=0700 bpf /sys/fs/bpf
+          fi
+
+      - name: Run mandatory root test and race suites without skips
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "GOCACHE=$RUNNER_TEMP/root-go-build" \
+            "GOMODCACHE=$RUNNER_TEMP/root-go-mod" \
+            "GOPATH=$RUNNER_TEMP/root-go" \
+            make ga-root-required-tests

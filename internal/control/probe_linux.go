@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -57,7 +58,7 @@ func probeAdminSocket() error {
 	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o700 {
 		return fmt.Errorf("headscale admin Unix socket metadata is unsafe")
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) {
 		return fmt.Errorf("headscale admin Unix socket owner changed")
 	}

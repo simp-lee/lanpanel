@@ -14,7 +14,7 @@ import (
 func TestChallengeSnapshotCoexistsWithPublishedResourceEntry(t *testing.T) {
 	paths, prior := installTestGraph(t)
 	owner := testOwner()
-	entry := Entry{Kind: EntryChallenge, ResourceID: "app-one", Relative: ChallengesDirectory + "/app-one.conf", Digest: "sha256:" + repeatHex('0'), Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: 2, Challenge: &ChallengeSite{Hosts: []string{"app.example.test"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_app_one"}}
+	entry := Entry{Kind: EntryChallenge, ResourceID: "app-one", Relative: ChallengesDirectory + "/app-one.conf", Digest: "sha256:" + repeatHex('0'), Domains: []string{"app.example.test"}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: 2, Challenge: &ChallengeSite{Generation: 2, Host: "app.example.test", Token: "abcdefghijklmnopqrstuv", TokenPath: "/.well-known/acme-challenge/abcdefghijklmnopqrstuv", KeyAuthorizationDigest: "sha256:" + repeatHex('b'), Webroot: "/var/lib/lanpanel/certificates/webroot/cert_app_one"}}
 	digestValue, err := DigestEntry(entry)
 	if err != nil {
 		t.Fatal(err)

@@ -109,6 +109,107 @@ func TestWaitFileReopenRequiresMasterToHoldReplacement(t *testing.T) {
 	}
 }
 
+func TestProcObserverRejectsOwnedListenerOutsideExactNginxProcesses(t *testing.T) {
+	procRoot := t.TempDir()
+	netRoot := filepath.Join(procRoot, "net")
+	if err := os.Mkdir(netRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	foreign := "   0: 00000000:46A0 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 91\n"
+	if err := os.WriteFile(filepath.Join(netRoot, "tcp"), []byte(header+foreign), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(netRoot, "tcp6"), []byte(header), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observer := ProcObserver{
+		ProcRoot:       procRoot,
+		UnitCgroup:     "/system.slice/lanpanel-nginx.service",
+		Executable:     "/usr/sbin/nginx",
+		ExpectedArgv:   "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf",
+		PIDPath:        filepath.Join(procRoot, "nginx.pid"),
+		Generation:     "generation-one",
+		OwnedListeners: []string{"tcp:0.0.0.0:18080"},
+	}
+	if _, err := observer.Observe(context.Background()); err == nil {
+		t.Fatal("foreign wildcard listener was accepted as part of the Nginx runtime generation")
+	}
+}
+
+func TestProcessSocketInodesRejectsReusedPIDIdentity(t *testing.T) {
+	procRoot := t.TempDir()
+	pidRoot := filepath.Join(procRoot, "123")
+	if err := os.MkdirAll(filepath.Join(pidRoot, "fd"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"stat":    "123 (nginx) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 101\n",
+		"cmdline": "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00",
+		"cgroup":  "0::/system.slice/lanpanel-nginx.service\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(pidRoot, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/usr/sbin/nginx", filepath.Join(pidRoot, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("socket:[91]", filepath.Join(pidRoot, "fd", "3")); err != nil {
+		t.Fatal(err)
+	}
+	current, err := observeProcess(procRoot, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inodes, err := processSocketInodes(procRoot, []ProcessIdentity{current})
+	if err != nil || !inodes[91] {
+		t.Fatalf("stable Nginx process socket missing: inodes=%v err=%v", inodes, err)
+	}
+	stale := current
+	stale.StartTicks--
+	inodes, err = processSocketInodes(procRoot, []ProcessIdentity{stale})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inodes[91] {
+		t.Fatal("socket from a reused PID was attributed to the stale Nginx process")
+	}
+}
+
+func TestServingRequiresWorkerAndCompleteExpectedListeners(t *testing.T) {
+	master := ProcessIdentity{PID: 10}
+	expected := []string{"tcp:0.0.0.0:80", "tcp::::80"}
+	snapshot := RuntimeSnapshot{
+		ObservedAt: time.Now(),
+		Complete:   true,
+		Master:     &master,
+		Workers:    []ProcessIdentity{{PID: 11, ParentPID: master.PID}},
+		Listeners: []ListenerIdentity{
+			{Protocol: "tcp", Address: "0.0.0.0", Port: 80, Inode: 1},
+			{Protocol: "tcp", Address: "::", Port: 80, Inode: 2},
+		},
+		Generation: "gen",
+	}
+	if err := VerifyServing(snapshot, "gen", expected); err != nil {
+		t.Fatalf("complete serving runtime rejected: %v", err)
+	}
+	if err := VerifyServing(snapshot, "gen", nil); err == nil {
+		t.Fatal("empty expected listener authority accepted")
+	}
+	withoutWorker := snapshot
+	withoutWorker.Workers = nil
+	if err := VerifyServing(withoutWorker, "gen", expected); err == nil {
+		t.Fatal("master without a serving worker accepted")
+	}
+	missingListener := snapshot
+	missingListener.Listeners = missingListener.Listeners[:1]
+	if err := VerifyServing(missingListener, "gen", expected); err == nil {
+		t.Fatal("runtime missing an expected listener accepted")
+	}
+}
+
 func TestStoppedRequiresCompleteEmptyRuntime(t *testing.T) {
 	if err := VerifyStopped(RuntimeSnapshot{ObservedAt: time.Now(), Complete: true, Generation: "gen", Workers: []ProcessIdentity{}, Listeners: []ListenerIdentity{}}); err != nil {
 		t.Fatal(err)

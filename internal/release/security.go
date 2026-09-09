@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const SecurityReportSchemaVersion = "lanpanel.release.security-report.v2"
+const SecurityReportSchemaVersion = "lanpanel.release.security-report.v3"
 
 type Severity string
 
@@ -28,11 +28,14 @@ const (
 )
 
 type ScannerIdentity struct {
-	Kind           string `json:"kind"`
-	Name           string `json:"name"`
-	Version        string `json:"version"`
-	DatabaseDigest string `json:"database_digest"`
-	Coverage       string `json:"coverage"`
+	Kind               string    `json:"kind"`
+	Name               string    `json:"name"`
+	Version            string    `json:"version"`
+	ExecutableDigest   string    `json:"executable_digest"`
+	DatabaseName       string    `json:"database_name"`
+	DatabaseDigest     string    `json:"database_digest"`
+	DatabaseCapturedAt time.Time `json:"database_captured_at"`
+	Coverage           string    `json:"coverage"`
 }
 
 type SecurityFinding struct {
@@ -81,7 +84,7 @@ func ValidateSecurityReport(report SecurityReport) error {
 	seen := map[string]bool{}
 	for _, scanner := range report.Scanners {
 		expectedCoverage, required := requiredScannerCoverage[scanner.Kind]
-		if !required || scanner.Coverage != expectedCoverage || !refPattern.MatchString(scanner.Name) || !concreteVersionPattern.MatchString(scanner.Version) || !ValidDigest(scanner.DatabaseDigest) || previous != "" && strings.Compare(previous, scanner.Kind) >= 0 {
+		if !required || scanner.Coverage != expectedCoverage || !refPattern.MatchString(scanner.Name) || !concreteVersionPattern.MatchString(scanner.Version) || !ValidDigest(scanner.ExecutableDigest) || !refPattern.MatchString(scanner.DatabaseName) || !ValidDigest(scanner.DatabaseDigest) || !sameUTCSecond(scanner.DatabaseCapturedAt) || scanner.DatabaseCapturedAt.After(report.ScannedAt) || previous != "" && strings.Compare(previous, scanner.Kind) >= 0 {
 			return fmt.Errorf("scanner/feed identities or coverage are invalid, duplicated, or unsorted")
 		}
 		seen[scanner.Kind] = true
@@ -94,7 +97,8 @@ func ValidateSecurityReport(report SecurityReport) error {
 	}
 	previous = ""
 	for _, finding := range report.Findings {
-		if !refPattern.MatchString(finding.ID) || !refPattern.MatchString(finding.Component) || previous != "" && strings.Compare(previous, finding.ID) >= 0 || !validSeverity(finding.Severity) || !validResolution(finding.Resolution) {
+		key := finding.ID + "\x00" + finding.Component
+		if !refPattern.MatchString(finding.ID) || !refPattern.MatchString(finding.Component) || previous != "" && strings.Compare(previous, key) >= 0 || !validSeverity(finding.Severity) || !validResolution(finding.Resolution) {
 			return fmt.Errorf("security findings are invalid, duplicated, or unsorted")
 		}
 		if finding.Resolution == ResolutionUnresolved {
@@ -104,7 +108,7 @@ func ValidateSecurityReport(report SecurityReport) error {
 		} else if !ValidDigest(finding.EvidenceDigest) {
 			return fmt.Errorf("resolved finding lacks exact evidence")
 		}
-		previous = finding.ID
+		previous = key
 	}
 	return nil
 }

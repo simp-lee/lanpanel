@@ -46,6 +46,28 @@ func TestSharedReadinessSkipsDisabledWebSocketAndRejectsRedirect(t *testing.T) {
 	}
 }
 
+func TestHTTPReadinessRequiresExplicitlyConfiguredAuthenticationStatus(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(status) }))
+			defer server.Close()
+			address := strings.TrimPrefix(server.URL, "http://")
+			request := validProbeRequest(address)
+			request.AccessMode = domain.AppAccessApplicationManaged
+			request.Target.AllowedHTTPStatuses = []uint16{http.StatusOK}
+			transport := dialTransport{address, request.EndpointIdentity + "/tcp/" + address}
+			if _, err := Probe(context.Background(), request, transport); err == nil || !strings.Contains(err.Error(), fmt.Sprint(status)) {
+				t.Fatalf("unconfigured status %d was accepted: %v", status, err)
+			}
+			request.Target.AllowedHTTPStatuses = []uint16{uint16(status)}
+			evidence, err := Probe(context.Background(), request, transport)
+			if err != nil || evidence.HTTPStatus != status {
+				t.Fatalf("configured status %d evidence=%#v error=%v", status, evidence, err)
+			}
+		})
+	}
+}
+
 func TestTailnetReadinessUsesExactVerifiedTransportIdentity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) }))
 	defer server.Close()
@@ -129,7 +151,7 @@ func TestSharedReadinessValidatesWebSocketAndApplicationBoundary(t *testing.T) {
 	request = validProbeRequest(strings.TrimPrefix(boundary.URL, "http://"))
 	request.AccessMode = domain.AppAccessApplicationManaged
 	request.Target.WebSocket = domain.WebSocketReadiness{Enabled: true, Path: "/ws"}
-	request.Target.AllowedHTTPStatuses = []uint16{200}
+	request.Target.AllowedHTTPStatuses = []uint16{401}
 	transport := dialTransport{strings.TrimPrefix(boundary.URL, "http://"), request.EndpointIdentity + "/tcp/" + strings.TrimPrefix(boundary.URL, "http://")}
 	if _, err := Probe(context.Background(), request, transport); err != nil {
 		t.Fatalf("application-managed 401 boundary rejected: %v", err)

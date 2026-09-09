@@ -129,6 +129,51 @@ func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	}
 }
 
+func TestHeadscaleDeployAndReissueTerminalResponses(t *testing.T) {
+	cases := []struct {
+		name      string
+		operation Operation
+		action    string
+	}{
+		{name: "deploy", operation: OperationHeadscaleDeploy, action: "headscale_control_deploy"},
+		{name: "reissue", operation: OperationHeadscaleReissue, action: "headscale_certificate_reissue"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			response := Response{SchemaVersion: SchemaVersion, RequestID: "headscale-" + test.name, Code: ResponseSucceeded, ResultDigest: digest(test.name), Action: &ActionResult{JobID: "job_00000000000000000000000000000001", JobResult: "succeeded", Operation: test.action, TargetKind: "headscale", TargetID: "headscale"}}
+			var wire bytes.Buffer
+			if err := WriteResponse(&wire, test.operation, response, nil); err != nil {
+				t.Fatalf("terminal response rejected: %v", err)
+			}
+			decoded, output, err := ReadResponse(&wire, test.operation)
+			if err != nil || output != nil || !reflect.DeepEqual(decoded, response) {
+				t.Fatalf("terminal response round trip=%#v,%#v,%v", decoded, output, err)
+			}
+
+			invalid := response
+			invalid.Action = new(ActionResult)
+			*invalid.Action = *response.Action
+			invalid.Action.JobResult = "partial"
+			if ValidateResponse(test.operation, invalid) == nil {
+				t.Fatal("non-success terminal job result accepted")
+			}
+			invalid.Action.JobResult = ""
+			if ValidateResponse(test.operation, invalid) == nil {
+				t.Fatal("terminal response without job result accepted")
+			}
+			invalid.Action.JobID = ""
+			invalid.Action.PlanID = "plan-one"
+			invalid.Action.JobResult = "succeeded"
+			invalid.Action.ExposureSummary = "deploys Headscale control"
+			invalid.Action.Prerequisites = "fresh authority"
+			invalid.Action.ExpiresAt = time.Now().UTC().Add(time.Minute)
+			if ValidateResponse(test.operation, invalid) == nil {
+				t.Fatal("Plan response carrying a terminal job result accepted")
+			}
+		})
+	}
+}
+
 func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	now := time.Now().UTC()
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "domain-status", Operation: OperationDomainStatus, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "status", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1}}

@@ -175,11 +175,8 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	}
 	resource.Lifecycle = domain.LifecycleDeleting
 	resource.PublicationRecord.LastJobID = job.ID
-	if resource.ManagedProcess != nil && resource.ManagedProcess.Applied != nil {
-		observation, observeErr := managedprocess.Observe(ctx, "/sys/fs/cgroup", *resource.ManagedProcess.Applied, resource.Target.LocalHTTP.EndpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
-		if observeErr != nil || managedprocess.VerifyStopped(observation) != nil {
-			return ResourceDeleteResult{}, errors.Join(observeErr, fmt.Errorf("resource cgroup or listener is not stopped"))
-		}
+	if err := verifyDeleteRuntimeClosed(ctx, *resource); err != nil {
+		return ResourceDeleteResult{}, errors.Join(err, fmt.Errorf("resource cgroup or listener is not stopped"))
 	}
 	removed, err := cleanupDeleteInventory(*resource, installation)
 	if err != nil {
@@ -460,6 +457,10 @@ func rejectReservedResourceDelete(ctx context.Context, service *FixedService, ad
 }
 
 func verifyDeleteRuntimeClosed(ctx context.Context, resource domain.AppResource) error {
+	return verifyDeleteRuntimeClosedWithCgroupRoot(ctx, "/sys/fs/cgroup", resource)
+}
+
+func verifyDeleteRuntimeClosedWithCgroupRoot(ctx context.Context, cgroupRoot string, resource domain.AppResource) error {
 	if resource.ManagedProcess == nil {
 		return nil
 	}
@@ -469,7 +470,7 @@ func verifyDeleteRuntimeClosed(ctx context.Context, resource domain.AppResource)
 	if resource.ManagedProcess.Applied == nil {
 		return nil
 	}
-	observation, err := managedprocess.Observe(ctx, "/sys/fs/cgroup", *resource.ManagedProcess.Applied, resource.Target.LocalHTTP.EndpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
+	observation, err := managedprocess.ObserveStopped(ctx, cgroupRoot, *resource.ManagedProcess.Applied)
 	if err != nil {
 		return err
 	}

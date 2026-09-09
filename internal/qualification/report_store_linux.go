@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
+	"reflect"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -112,7 +113,7 @@ func validateReportAdvance(prior, next release.LiveCleanupReport) error {
 		if !present {
 			return fmt.Errorf("cleanup report removed a step")
 		}
-		valid := nextStep == step
+		valid := reflect.DeepEqual(nextStep, step)
 		if step.Outcome == release.StepSubmitted {
 			valid = valid || nextStep.MutationID == step.MutationID && nextStep.AttemptID == step.AttemptID && (nextStep.Outcome == release.StepPassed || nextStep.Outcome == release.StepFailed || nextStep.Outcome == release.StepUnknown)
 		}

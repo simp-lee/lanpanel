@@ -3,9 +3,11 @@
 package qualification
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
@@ -20,7 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const ProtectedInputSchemaVersion = "lanpanel.qualification.protected-input.v4"
+const ProtectedInputSchemaVersion = "lanpanel.qualification.protected-input.v5"
 
 var orderedJourney = []string{
 	"clean_install",
@@ -53,6 +55,7 @@ type ArtifactReferences struct {
 	CleanupReport        string            `json:"cleanup_report"`
 	ExecutorAttestation  string            `json:"executor_attestation"`
 	QualificationSummary string            `json:"qualification_summary"`
+	SecurityReport       string            `json:"security_report"`
 }
 
 type SSHAuthority struct {
@@ -90,6 +93,7 @@ type Prepared struct {
 	Input                    ProtectedInput
 	InputDigest              string
 	Install                  release.InstallAuthority
+	PackageTemplate          packages.Plan
 	PlanBytes                []byte
 	PlanDigest               string
 	InstallManifestDigest    string
@@ -239,7 +243,7 @@ func Prepare(inputPath string) (Prepared, error) {
 	if sourceDigest != manifest.SourceTreeDigest {
 		return Prepared{}, fmt.Errorf("qualification source digest changed")
 	}
-	return Prepared{Input: input, InputDigest: release.DigestBytes(inputBytes), Install: *install, PlanBytes: planBytes, PlanDigest: release.DigestBytes(planBytes), InstallManifestDigest: release.DigestBytes(manifestBytes), CandidateBytes: candidate, SourceDigest: sourceDigest, ProtectedAuthorityDigest: protectedAuthorityDigest, ExternalVantageDigest: vantageDigest, TailnetPeerDigest: tailnetPeerDigest}, nil
+	return Prepared{Input: input, InputDigest: release.DigestBytes(inputBytes), Install: *install, PackageTemplate: template, PlanBytes: planBytes, PlanDigest: release.DigestBytes(planBytes), InstallManifestDigest: release.DigestBytes(manifestBytes), CandidateBytes: candidate, SourceDigest: sourceDigest, ProtectedAuthorityDigest: protectedAuthorityDigest, ExternalVantageDigest: vantageDigest, TailnetPeerDigest: tailnetPeerDigest}, nil
 }
 
 func VerifyFinalReadiness(inputPath string) (Prepared, release.LiveCleanupReport, error) {
@@ -254,7 +258,7 @@ func VerifyFinalReadiness(inputPath string) (Prepared, release.LiveCleanupReport
 	if err := validateOrderedJourneyPlan(plan); err != nil {
 		return Prepared{}, release.LiveCleanupReport{}, err
 	}
-	reportBytes, _, err := readProtectedFile(prepared.Input.Artifacts.CleanupReport, 4<<20, false)
+	reportBytes, _, err := readProtectedFile(prepared.Input.Artifacts.CleanupReport, 4<<20, true)
 	if err != nil {
 		return Prepared{}, release.LiveCleanupReport{}, err
 	}
@@ -274,14 +278,135 @@ func VerifyFinalReadiness(inputPath string) (Prepared, release.LiveCleanupReport
 	if attestation.CandidateDigest != identity.CandidateDigest || attestation.TargetProfileDigest != identity.ProfileDigest || attestation.TargetHostFingerprint != prepared.Input.SSH.MachineFingerprint || attestation.ExternalVantageDigest != prepared.ExternalVantageDigest || attestation.DNSProvider != prepared.Input.DNS.Provider || attestation.TailnetLiveStatus != expectedTailnet {
 		return Prepared{}, release.LiveCleanupReport{}, fmt.Errorf("trusted live executor attestation authority differs")
 	}
+	if err := verifyReviewableLiveEvidence(prepared, report); err != nil {
+		return Prepared{}, release.LiveCleanupReport{}, err
+	}
+	if err := verifyReviewableTerminalEvidence(prepared, attestation); err != nil {
+		return Prepared{}, release.LiveCleanupReport{}, err
+	}
+	if err := verifyMatchingRetainedCertificateEvidence(report, attestation); err != nil {
+		return Prepared{}, release.LiveCleanupReport{}, err
+	}
 	return prepared, report, nil
+}
+
+func verifyMatchingRetainedCertificateEvidence(report release.LiveCleanupReport, attestation release.LiveExecutorAttestation) error {
+	retainedID := ""
+	var finalInventory []byte
+	for _, result := range report.Steps {
+		if result.MutationID != "final_cleanup_inventory" {
+			continue
+		}
+		evidence, err := release.DecodeLiveStepEvidence(result.Evidence)
+		if err != nil {
+			return err
+		}
+		retainedID = evidence.Values["retained_certificate_id"]
+		finalInventory = append([]byte(nil), evidence.Observations["certificate_inventory"]...)
+	}
+	terminal, err := release.DecodeLiveStepEvidence(attestation.TerminalEvidence)
+	if err != nil {
+		return err
+	}
+	if retainedID == "" || terminal.Values["retained_certificate_id"] != retainedID || !bytes.Equal(finalInventory, terminal.Observations["certificate_inventory"]) {
+		return fmt.Errorf("final and terminal certificate inventory evidence differs")
+	}
+	return nil
+}
+
+func verifyReviewableLiveEvidence(prepared Prepared, report release.LiveCleanupReport) error {
+	journeyBytes, _, err := readProtectedFile(prepared.Input.Artifacts.JourneySpecification, 4<<20, true)
+	if err != nil {
+		return err
+	}
+	journey, err := DecodeJourneySpec(journeyBytes)
+	if err != nil {
+		return err
+	}
+	steps := make(map[string]release.LiveStepEvidence, len(report.Steps))
+	for _, result := range report.Steps {
+		evidence, err := release.DecodeLiveStepEvidence(result.Evidence)
+		if err != nil {
+			return fmt.Errorf("live evidence for %q is unreadable: %w", result.MutationID, err)
+		}
+		steps[result.MutationID] = evidence
+	}
+	identity := prepared.Install.Identity()
+	clean := steps["clean_install"]
+	if clean.Kind != "clean-install" || clean.Values["candidate_digest"] != identity.CandidateDigest || clean.Values["target_profile_digest"] != identity.ProfileDigest || !sameObservedPackageTuple(clean.ObservedPackageTuple, identity.Profile.Packages) {
+		return fmt.Errorf("clean-install live evidence omits the exact observed candidate/profile/package tuple")
+	}
+	for _, expected := range []struct {
+		step, kind, observation, host, path, method string
+	}{
+		{"app_http01", "app-http01", "public_https", journey.AppDomain, "/echo", "http-01"},
+		{"headscale_initialize_http01", "headscale-http01", "control_https", journey.HeadscaleDomain, "/health", "http-01"},
+		{"dns01", "dns01", "public_https", journey.DNS01Domain, "/echo", "dns-01"},
+	} {
+		evidence := steps[expected.step]
+		if expected.host == "" || evidence.Kind != expected.kind || evidence.Values["challenge_method"] != expected.method || evidence.Values["acme_directory"] != prepared.Input.ACME.DirectoryURL {
+			return fmt.Errorf("live ACME evidence for %q is incomplete", expected.step)
+		}
+		if err := verifyTrustedHTTPSObservation(evidence.Observations[expected.observation], expected.host, expected.path); err != nil {
+			return fmt.Errorf("live ACME public observation for %q is invalid: %w", expected.step, err)
+		}
+	}
+	dnsEvidence := steps["dns01"]
+	if dnsEvidence.Values["provider"] != prepared.Input.DNS.Provider || dnsEvidence.Values["challenge_owner"] != "_acme-challenge."+journey.DNS01Domain || dnsEvidence.Values["txt_cleanup"] != "provider-and-authoritative-absent" {
+		return fmt.Errorf("live DNS-01 evidence omits exact provider TXT cleanup")
+	}
+	reboot := steps["delete_diagnostics_export_close_reboot"]
+	if reboot.Kind != "management-cleanup-reboot" || reboot.Values["host_fingerprint"] != prepared.Input.SSH.MachineFingerprint || reboot.Values["reboot"] != "verified" || reboot.Values["boot_before"] == "" || reboot.Values["boot_after"] == "" || reboot.Values["boot_before"] == reboot.Values["boot_after"] {
+		return fmt.Errorf("live reboot evidence is incomplete")
+	}
+	final := steps["final_cleanup_inventory"]
+	certificateInventory, certificateInventoryErr := decodeQualificationCertificateInventoryEvidence(final.Observations["certificate_inventory"])
+	_, retainedCertificateErr := certificates.ActivePointerPath(final.Values["retained_certificate_id"])
+	if final.Kind != "final-inventory" || final.Values["candidate_digest"] != identity.CandidateDigest || final.Values["profile_digest"] != identity.ProfileDigest || final.Values["host_fingerprint"] != prepared.Input.SSH.MachineFingerprint || final.Values["cleanup"] != "complete" || final.Values["provider"] != prepared.Input.DNS.Provider || final.Values["provider_txt"] != "provider-and-authoritative-absent" || final.Values["nonretained_certificates"] != "absent" || final.Values["retained_certificate"] != "exact" || retainedCertificateErr != nil || certificateInventoryErr != nil || certificateInventory.Retained.CertificateID != final.Values["retained_certificate_id"] || final.Values["retained_headscale_domain"] != journey.HeadscaleDomain || !sameObservedPackageTuple(final.ObservedPackageTuple, identity.Profile.Packages) {
+		return fmt.Errorf("terminal live inventory evidence omits exact cleanup or observed package tuple")
+	}
+	return nil
+}
+
+func verifyReviewableTerminalEvidence(prepared Prepared, attestation release.LiveExecutorAttestation) error {
+	evidence, err := release.DecodeLiveStepEvidence(attestation.TerminalEvidence)
+	if err != nil {
+		return err
+	}
+	journeyBytes, _, err := readProtectedFile(prepared.Input.Artifacts.JourneySpecification, 4<<20, true)
+	if err != nil {
+		return err
+	}
+	journey, err := DecodeJourneySpec(journeyBytes)
+	if err != nil {
+		return err
+	}
+	identity := prepared.Install.Identity()
+	certificateInventory, certificateInventoryErr := decodeQualificationCertificateInventoryEvidence(evidence.Observations["certificate_inventory"])
+	_, retainedCertificateErr := certificates.ActivePointerPath(evidence.Values["retained_certificate_id"])
+	if evidence.Kind != "terminal-cleanup" || evidence.Values["candidate_digest"] != identity.CandidateDigest || evidence.Values["profile_digest"] != identity.ProfileDigest || evidence.Values["host_fingerprint"] != prepared.Input.SSH.MachineFingerprint || evidence.Values["provider"] != prepared.Input.DNS.Provider || evidence.Values["installed_binary"] != "/usr/lib/lanpanel/lanpanel" || evidence.Values["staging"] != "absent" || evidence.Values["nonretained_certificates"] != "absent" || evidence.Values["retained_certificate"] != "exact" || retainedCertificateErr != nil || certificateInventoryErr != nil || certificateInventory.Retained.CertificateID != evidence.Values["retained_certificate_id"] || evidence.Values["nonretained_dns"] != "provider-and-authoritative-absent" || evidence.Values["acme_txt"] != "provider-and-authoritative-absent" || evidence.Values["retained_headscale_domain"] != journey.HeadscaleDomain || !sameObservedPackageTuple(evidence.ObservedPackageTuple, identity.Profile.Packages) {
+		return fmt.Errorf("terminal cleanup attestation omits exact candidate, package, staging, or DNS evidence")
+	}
+	return nil
+}
+
+func sameObservedPackageTuple(observed, expected []release.PackageTuple) bool {
+	if len(observed) != len(expected) {
+		return false
+	}
+	for index, tuple := range observed {
+		if tuple != expected[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateInput(input ProtectedInput) error {
 	if input.SchemaVersion != ProtectedInputSchemaVersion || input.RunID == "" || input.RunID != strings.TrimSpace(input.RunID) || func() bool { _, err := canonicalSSHAddress(input.SSH.Address); return err != nil }() || input.SSH.User != "root" || !release.ValidDigest(input.SSH.HostKeySHA256) || !machineFingerprintPattern.MatchString(input.SSH.MachineFingerprint) || !protectedReference(input.SSH.CredentialRef) || !canonicalQualificationACMEDirectory(input.ACME.DirectoryURL) || !acmeaccount.ValidContact(input.ACME.Contact) || !input.ACME.TOSAccepted || input.DNS.Provider != "cloudflare" || !canonicalDomain(input.DNS.BaseDomain) || !protectedReference(input.DNS.CredentialRef) || !protectedReference(input.ExternalVantageRef) || input.TailnetPeerRef != "" && !protectedReference(input.TailnetPeerRef) {
 		return fmt.Errorf("qualification protected input is invalid")
 	}
-	paths := []string{input.Artifacts.CandidateBinary, input.Artifacts.SourceArchive, input.Artifacts.SBOM, input.Artifacts.SourceRoot, input.Artifacts.TargetProfile, input.Artifacts.SideEffectPlan, input.Artifacts.InstallManifest, input.Artifacts.DependencyAuthority, input.Artifacts.JourneySpecification, input.Artifacts.PackageTemplate, input.Artifacts.CleanupReport, input.Artifacts.ExecutorAttestation, input.Artifacts.QualificationSummary}
+	paths := []string{input.Artifacts.CandidateBinary, input.Artifacts.SourceArchive, input.Artifacts.SBOM, input.Artifacts.SourceRoot, input.Artifacts.TargetProfile, input.Artifacts.SideEffectPlan, input.Artifacts.InstallManifest, input.Artifacts.DependencyAuthority, input.Artifacts.JourneySpecification, input.Artifacts.PackageTemplate, input.Artifacts.CleanupReport, input.Artifacts.ExecutorAttestation, input.Artifacts.QualificationSummary, input.Artifacts.SecurityReport}
 	for _, value := range input.Artifacts.DependencyAssets {
 		paths = append(paths, value)
 	}

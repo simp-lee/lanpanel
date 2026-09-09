@@ -131,7 +131,11 @@ func (observer ProcObserver) Observe(ctx context.Context) (RuntimeSnapshot, erro
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
-	ownedInodes, err := processSocketInodes(observer.ProcRoot, processes)
+	nginxProcesses := append([]ProcessIdentity(nil), snapshot.Workers...)
+	if snapshot.Master != nil {
+		nginxProcesses = append(nginxProcesses, *snapshot.Master)
+	}
+	ownedInodes, err := processSocketInodes(observer.ProcRoot, nginxProcesses)
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
@@ -184,6 +188,25 @@ func WaitPriorWorkers(ctx context.Context, observer RuntimeObserver, prior []Pro
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func VerifyServing(snapshot RuntimeSnapshot, generation string, expectedListeners []string) error {
+	if !snapshot.Complete || snapshot.Master == nil || len(snapshot.Workers) == 0 || snapshot.ObservedAt.IsZero() || generation == "" || snapshot.Generation != generation {
+		return fmt.Errorf("nginx serving process evidence is incomplete")
+	}
+	if len(expectedListeners) == 0 {
+		return fmt.Errorf("nginx expected listener authority is incomplete")
+	}
+	observed := make(map[string]bool, len(snapshot.Listeners))
+	for _, listener := range snapshot.Listeners {
+		observed[fmt.Sprintf("%s:%s:%d", listener.Protocol, listener.Address, listener.Port)] = true
+	}
+	for _, listener := range expectedListeners {
+		if !observed[listener] {
+			return fmt.Errorf("nginx expected listener evidence is incomplete")
+		}
+	}
+	return nil
 }
 
 func VerifyStopped(snapshot RuntimeSnapshot) error {
@@ -480,6 +503,16 @@ func descriptorFlags(path string) (int, error) {
 func processSocketInodes(procRoot string, processes []ProcessIdentity) (map[uint64]bool, error) {
 	result := map[uint64]bool{}
 	for _, process := range processes {
+		before, err := observeProcess(procRoot, process.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !sameSocketOwnerProcess(before, process) {
+			continue
+		}
 		entries, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(process.PID), "fd"))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -487,6 +520,7 @@ func processSocketInodes(procRoot string, processes []ProcessIdentity) (map[uint
 		if err != nil {
 			return nil, err
 		}
+		observed := map[uint64]bool{}
 		for _, entry := range entries {
 			target, err := os.Readlink(filepath.Join(procRoot, strconv.Itoa(process.PID), "fd", entry.Name()))
 			if errors.Is(err, os.ErrNotExist) {
@@ -500,11 +534,28 @@ func processSocketInodes(procRoot string, processes []ProcessIdentity) (map[uint
 				if err != nil || inode == 0 {
 					return nil, fmt.Errorf("process socket inode is malformed")
 				}
-				result[inode] = true
+				observed[inode] = true
 			}
+		}
+		after, err := observeProcess(procRoot, process.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !sameSocketOwnerProcess(after, process) {
+			continue
+		}
+		for inode := range observed {
+			result[inode] = true
 		}
 	}
 	return result, nil
+}
+
+func sameSocketOwnerProcess(left, right ProcessIdentity) bool {
+	return processKey(left) == processKey(right) && left.ParentPID == right.ParentPID && left.Executable == right.Executable && left.Arguments == right.Arguments
 }
 
 func observeProcListeners(procRoot string) ([]ListenerIdentity, error) {

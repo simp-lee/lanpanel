@@ -23,7 +23,11 @@ const (
 	SchemaVersion      = "lanpanel.plan.v1"
 	MaximumLifetime    = 10 * time.Minute
 	MaximumEvidenceAge = 10 * time.Minute
-	MaximumRecords     = 512
+	// MaximumRecords covers retained terminal operation graphs plus the full
+	// nonterminal operation allowance, so terminal history cannot block the
+	// creation of the next Plan.
+	MaximumRecords      = 512 + 64
+	MaximumDisplayBytes = 4096
 )
 
 var (
@@ -491,8 +495,11 @@ func Match(plan Plan, binding Binding, now time.Time) error {
 }
 
 func Validate(plan Plan, now time.Time) error {
-	if plan.SchemaVersion != SchemaVersion || !idPattern.MatchString(plan.ID) || !validRef(plan.Operation) || !validTarget(plan.Target) || !validRef(plan.ActorIdentity) || !digestBindingValid(plan.Config) || !digestBindingValid(plan.Applied) || !digest(plan.NonceDigest) || plan.CreatedAt.IsZero() || plan.ExpiresAt.IsZero() || !plan.ExpiresAt.After(plan.CreatedAt) || plan.ExpiresAt.Sub(plan.CreatedAt) > MaximumLifetime || !validRef(plan.ExposureSummary) || !validRef(plan.Prerequisites) {
+	if plan.SchemaVersion != SchemaVersion || !idPattern.MatchString(plan.ID) || !validRef(plan.Operation) || !validTarget(plan.Target) || !validRef(plan.ActorIdentity) || !digestBindingValid(plan.Config) || !digestBindingValid(plan.Applied) || !digest(plan.NonceDigest) || plan.CreatedAt.IsZero() || plan.ExpiresAt.IsZero() || !plan.ExpiresAt.After(plan.CreatedAt) || plan.ExpiresAt.Sub(plan.CreatedAt) > MaximumLifetime {
 		return fmt.Errorf("Plan identity or lifetime is invalid")
+	}
+	if !validDisplay(plan.ExposureSummary) || !validDisplay(plan.Prerequisites) {
+		return fmt.Errorf("Plan display text is invalid")
 	}
 	if now.Before(plan.CreatedAt) {
 		return fmt.Errorf("trusted time regressed before Plan creation")
@@ -621,7 +628,12 @@ func digest(value string) bool {
 	_, err := hex.DecodeString(value[7:])
 	return err == nil
 }
+
 func validRef(value string) bool { return refPattern.MatchString(value) }
+func validDisplay(value string) bool {
+	return len(value) > 0 && len(value) <= MaximumDisplayBytes && !strings.ContainsAny(value, "\x00\r\n")
+}
+
 func decode(raw json.RawMessage) (Plan, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()

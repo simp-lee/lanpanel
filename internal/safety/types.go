@@ -53,23 +53,25 @@ type MarkerSnapshot struct {
 }
 
 type ChallengePending struct {
-	Generation          uint64           `json:"generation"`
-	PlanID              string           `json:"plan_id"`
-	Method              string           `json:"method,omitempty"`
-	ConfigDigest        string           `json:"config_digest,omitempty"`
-	SANIdentity         string           `json:"san_identity,omitempty"`
-	ACMEBinding         string           `json:"acme_binding,omitempty"`
-	CertificateIdentity string           `json:"certificate_identity,omitempty"`
-	OwnerLock           string           `json:"owner_lock,omitempty"`
-	Provider            string           `json:"provider,omitempty"`
-	Zone                string           `json:"zone,omitempty"`
-	Owners              []string         `json:"owners,omitempty"`
-	Host                string           `json:"host"`
-	Hosts               []string         `json:"hosts,omitempty"`
-	TokenPath           string           `json:"token_path"`
-	Webroot             string           `json:"webroot"`
-	BootstrapIdentity   string           `json:"bootstrap_identity"`
-	BaseMarkers         []MarkerSnapshot `json:"base_markers"`
+	Generation             uint64           `json:"generation"`
+	PlanID                 string           `json:"plan_id"`
+	Method                 string           `json:"method,omitempty"`
+	ConfigDigest           string           `json:"config_digest,omitempty"`
+	SANIdentity            string           `json:"san_identity,omitempty"`
+	ACMEBinding            string           `json:"acme_binding,omitempty"`
+	CertificateIdentity    string           `json:"certificate_identity,omitempty"`
+	OwnerLock              string           `json:"owner_lock,omitempty"`
+	Provider               string           `json:"provider,omitempty"`
+	Zone                   string           `json:"zone,omitempty"`
+	Owners                 []string         `json:"owners,omitempty"`
+	Host                   string           `json:"host,omitempty"`
+	Hosts                  []string         `json:"hosts,omitempty"`
+	Token                  string           `json:"token,omitempty"`
+	TokenPath              string           `json:"token_path,omitempty"`
+	KeyAuthorizationDigest string           `json:"key_authorization_digest,omitempty"`
+	Webroot                string           `json:"webroot"`
+	BootstrapIdentity      string           `json:"bootstrap_identity"`
+	BaseMarkers            []MarkerSnapshot `json:"base_markers"`
 }
 
 type Reactivating struct {

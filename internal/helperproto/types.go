@@ -203,18 +203,22 @@ type HeadscaleResult struct {
 	Device          *HeadscaleDeviceRecord  `json:"device,omitempty"`
 }
 
+type ConnectorPeerRecord struct {
+	IP     string `json:"ip"`
+	Online bool   `json:"online"`
+}
 type ConnectorResult struct {
-	Operation       string    `json:"operation"`
-	JobID           string    `json:"job_id,omitempty"`
-	PlanID          string    `json:"plan_id,omitempty"`
-	ExposureSummary string    `json:"exposure_summary,omitempty"`
-	Prerequisites   string    `json:"prerequisites,omitempty"`
-	ExpiresAt       time.Time `json:"expires_at,omitzero"`
-	ClientVersion   string    `json:"client_version,omitempty"`
-	ControlURL      string    `json:"control_url,omitempty"`
-	LocalIPs        []string  `json:"local_ips,omitempty"`
-	PeerIPs         []string  `json:"peer_ips,omitempty"`
-	ValidUntil      time.Time `json:"valid_until,omitzero"`
+	Operation       string                `json:"operation"`
+	JobID           string                `json:"job_id,omitempty"`
+	PlanID          string                `json:"plan_id,omitempty"`
+	ExposureSummary string                `json:"exposure_summary,omitempty"`
+	Prerequisites   string                `json:"prerequisites,omitempty"`
+	ExpiresAt       time.Time             `json:"expires_at,omitzero"`
+	ClientVersion   string                `json:"client_version,omitempty"`
+	ControlURL      string                `json:"control_url,omitempty"`
+	LocalIPs        []string              `json:"local_ips,omitempty"`
+	Peers           []ConnectorPeerRecord `json:"peers,omitempty"`
+	ValidUntil      time.Time             `json:"valid_until,omitzero"`
 }
 
 type ReadResult struct {
@@ -567,24 +571,29 @@ func validConnectorResult(operation Operation, result *ConnectorResult) bool {
 	if result == nil || !refPattern.MatchString(result.Operation) {
 		return false
 	}
-	planOnly := result.Operation == "connector_login" && refPattern.MatchString(result.PlanID) && result.JobID == "" && validDisplay(result.ExposureSummary) && validDisplay(result.Prerequisites) && !result.ExpiresAt.IsZero() && result.ClientVersion == "" && result.ControlURL == "" && len(result.LocalIPs)+len(result.PeerIPs) == 0 && result.ValidUntil.IsZero()
+	planOnly := result.Operation == "connector_login" && refPattern.MatchString(result.PlanID) && result.JobID == "" && validDisplay(result.ExposureSummary) && validDisplay(result.Prerequisites) && !result.ExpiresAt.IsZero() && result.ClientVersion == "" && result.ControlURL == "" && len(result.LocalIPs)+len(result.Peers) == 0 && result.ValidUntil.IsZero()
 	switch operation {
 	case OperationConnectorLoginPlan:
 		return planOnly
 	case OperationConnectorMutation, OperationConnectorLogin:
-		return (result.Operation == "connector_binding_set" || result.Operation == "connector_login") && refPattern.MatchString(result.JobID) && result.PlanID == "" && result.ExposureSummary == "" && result.Prerequisites == "" && result.ExpiresAt.IsZero() && result.ClientVersion == "" && result.ControlURL == "" && len(result.LocalIPs)+len(result.PeerIPs) == 0 && result.ValidUntil.IsZero()
+		return (result.Operation == "connector_binding_set" || result.Operation == "connector_login") && refPattern.MatchString(result.JobID) && result.PlanID == "" && result.ExposureSummary == "" && result.Prerequisites == "" && result.ExpiresAt.IsZero() && result.ClientVersion == "" && result.ControlURL == "" && len(result.LocalIPs)+len(result.Peers) == 0 && result.ValidUntil.IsZero()
 	case OperationConnectorRead:
 		if result.Operation != "connector_verify" || result.JobID != "" || result.PlanID != "" || result.ClientVersion == "" || result.ControlURL == "" || len(result.LocalIPs) == 0 || result.ValidUntil.IsZero() {
 			return false
 		}
-		for _, values := range [][]string{result.LocalIPs, result.PeerIPs} {
-			prior := ""
-			for _, value := range values {
-				if value == "" || prior != "" && prior >= value {
-					return false
-				}
-				prior = value
+		prior := ""
+		for _, value := range result.LocalIPs {
+			if value == "" || prior != "" && prior >= value {
+				return false
 			}
+			prior = value
+		}
+		prior = ""
+		for _, peer := range result.Peers {
+			if peer.IP == "" || prior != "" && prior >= peer.IP {
+				return false
+			}
+			prior = peer.IP
 		}
 		return true
 	default:
@@ -605,7 +614,8 @@ func ValidateResponse(operation Operation, response Response) error {
 		if !digestPattern.MatchString(response.ResultDigest) || response.ErrorCode != "" || response.ErrorJobID != "" {
 			return fmt.Errorf("successful helper response is incomplete")
 		}
-		if operation != OperationPublicationActivate && response.Action != nil && response.Action.JobResult != "" {
+		headscaleTerminalResult := response.Action != nil && response.Action.PlanID == "" && response.Action.JobID != "" && response.Action.JobResult == "succeeded" && (operation == OperationHeadscaleDeploy || operation == OperationHeadscaleReissue)
+		if operation != OperationPublicationActivate && !headscaleTerminalResult && response.Action != nil && response.Action.JobResult != "" {
 			return fmt.Errorf("unrelated helper response carried a job result")
 		}
 		if operation != OperationDomainStatus && response.Resource != nil && (response.Resource.GoAccessRetirementJobID != "" || len(response.Resource.GoAccessRetirementGenerations) != 0) {

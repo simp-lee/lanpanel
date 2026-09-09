@@ -14,10 +14,7 @@ func TestAccountStageBindsExactManagedKeyFingerprint(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
 	}
-	root := t.TempDir()
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root := protectedTestDir(t)
 	key, err := acmeaccount.Generate(rand.Reader)
 	if err != nil {
 		t.Fatal(err)

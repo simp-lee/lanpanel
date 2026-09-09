@@ -10,7 +10,15 @@ From a clean exact commit:
 TMPDIR=/var/tmp/lanpanel-ga make ga-local-gate
 ```
 
-The gate runs build, Go test/race/vet/lint, contract and privileged-boundary audits, pinned Chromium Playwright, vulnerability scans, release tooling, documentation, and final-asset self-tests. A failed run does not qualify a candidate.
+The gate runs build, Go test/race/vet/lint, contract and privileged-boundary audits, pinned Chromium Playwright, online source vulnerability checks, release tooling, documentation, and final-asset self-tests. A failed run does not qualify a candidate. These source checks are developer feedback only; they do not replace the fixed-feed exact-candidate release scan below.
+
+The ordinary local gate may run as a non-root developer and therefore is not evidence for real ownership/identity transitions. Fourteen protected-source, certificate-pointer/deletion, bpffs-confinement, installation-authority, and Nginx-worker traversal tests are mandatory in both test and race modes. The `Mandatory isolated root identity tests` CI job runs them on a fresh GitHub-hosted Linux VM and fails on any skip or missing pass. To reproduce it, use only an authorized disposable Linux host with bpffs mounted at `/sys/fs/bpf` and no existing `/sys/fs/bpf/lanpanel` or `/var/lib/lanpanel/certificates`:
+
+```bash
+sudo --preserve-env=PATH make ga-root-required-tests
+```
+
+Never run this target on an installed or shared host. A non-root run, an isolation-precondition failure, or a skip is not passing evidence.
 
 ## Protected references
 
@@ -53,9 +61,9 @@ make ga-generate-qualification-artifacts \
   QUALIFICATION_GENERATION_INPUT=/absolute/protected/generation-input.json
 ```
 
-The generated `side-effect-plan.json`, profile, journey specification, install manifest, package-template digest binding, dependency authority/assets, SBOM, candidate, and source archive are owner-read-only. `qualification-input.json` binds their exact paths and digests. The cleanup report, executor attestation, summary, and live state do not exist yet.
+The generated `side-effect-plan.json`, profile, journey specification, install manifest, package-template digest binding, dependency authority/assets, SBOM, candidate, and source archive are owner-read-only. `qualification-input.json` binds their exact paths and digests and fixes the future `security-report.json` path. The cleanup report, executor attestation, qualification summary, security report, and live state do not exist yet.
 
-Before mutation, inspect the complete immutable `side-effect-plan.json`. It explicitly lists all thirteen fixed steps, human-readable scope/prior/action/selector, exact digests, and fixed `delete_exact|retain_authorized` policy. Do not authorize the run if any host, IP, domain, provider, record, package, or retained object is unexpected.
+Before mutation, inspect the complete immutable `side-effect-plan.json`. It explicitly lists all thirteen fixed steps, concrete observed-state predicates, provider/object scope, exact selectors, every effect in each compound mutation, exact digests, and fixed `delete_exact|retain_authorized` policy. Runtime-assigned IDs use named result references (for example, the local resource ID); a later step may use a reference only after the executor freshly resolves it to one exact remote object matching the frozen selector. Do not authorize the run if any host, IP, domain, provider, record, package, effect, cleanup disposition, or retained object is unexpected.
 
 ## Read-only live preflight
 
@@ -88,28 +96,49 @@ The trusted executor:
 9. exercises diagnostics/export/jobs, deletion, sticky close, secret sentinel, and an observed reboot;
 10. cleans run-owned resources/records/files, verifies retained installation/Headscale authority, and writes final inventory evidence.
 
-The runner observes each prior state immediately before mutation. Every attempt, passed/failed/unknown result, evidence digest, and cleanup identity is persisted monotonically. Cleanup has fixed deadlines and runs in reverse order. A resumed nonterminal run is cleanup-only: remote mutations are never replayed and the run can never become successful. Re-image the host before a new run.
+The runner observes each prior state immediately before mutation. It reconstructs scope, mutation, and selector authority from protected inputs and constructs prior-state comparison bytes from fresh SSH/SFTP, Management inventory, Headscale inventory, and DNS-provider observations; it never returns plan text as an observation. Any digest mismatch stops before submission. Every attempt, passed/failed/unknown result, bounded canonical observation payload, evidence digest, and cleanup identity is persisted monotonically in the protected cleanup report. The payloads are directly readable JSON: they include the exact candidate/profile and freshly observed install/final package tuple, public HTTPS URL/status/TLS version/certificate fingerprint/SAN/expiry, ACME method and directory, DNS provider/challenge owner/TXT absence, before/after boot IDs, and final retained/absent inventory. They contain digests rather than response bodies or credentials. Cleanup has fixed deadlines and runs in reverse order. A resumed nonterminal run is cleanup-only: remote mutations are never replayed and the run can never become successful. Re-image the host before a new run.
 
-The clean installation, Headscale identity/entities, connector binding/device, final retained inventory, and Headscale DNS record are explicitly retained. Other journey objects must be exactly cleaned. Ambiguous DNS, staging, fixture, process, listener, credential, or secret residue blocks the candidate.
+The clean installation, Headscale identity/entities, connector binding/device, exact Headscale certificate pointer and bundle, final retained inventory, and Headscale DNS record are explicitly retained. Every App HTTP-01/DNS-01 certificate ID, generation, and bundle identity is recorded in protected run state. Cleanup removes those exact active pointers and bundles only after their resources are unpublished and deleted; final host inventory requires the retained Headscale pointer and bundle to be the complete certificate inventory. Other journey objects must be exactly cleaned. Ambiguous DNS, staging, fixture, process, listener, certificate, credential, or secret residue blocks the candidate. A successful terminal cleanup report and executor attestation are sealed owner-read-only; final readiness rejects a writable report, unreadable observation, changed observation digest, package tuple drift, missing public-trust certificate metadata, changed retained-certificate identity, unchanged boot ID, or incomplete provider/authoritative TXT cleanup.
 
 ## Final readiness and release bundle
 
-Only a report with all thirteen steps `passed`, exact cleanup policy satisfied, `execution_failed:false`, and a matching immutable `lanpanel-trusted-live-executor-v1` attestation can become successful:
+Only a sealed report with all thirteen steps `passed`, exact cleanup policy satisfied, `execution_failed:false`, reviewable observations matching the selected host/profile/candidate, and a matching immutable `lanpanel-trusted-live-executor-v1` attestation can become successful:
 
 ```bash
 make ga-final-release-readiness-check \
   QUALIFICATION_INPUT=/absolute/protected/run/qualification-input.json
 ```
 
-This writes the canonical qualification summary once. Provider and tailnet claims are derived from executor results, not caller-selected summary fields.
+This writes the canonical public qualification summary once. It contains only the same-binary/source/profile identity and qualification status needed by the release contract; the readable cleanup report, executor attestation, immutable plan, and protected inputs remain private harness artifacts and are not linked from the summary. Give those protected artifacts to the authorized independent reviewer through the approved out-of-repository channel; a summary alone is not live-run evidence. Provider and tailnet claims are derived from executor results, not caller-selected summary fields.
 
-Prepare an owner-read-only canonical security report matching `lanpanel.release.security-report.v2`, including distro package, Go binary, and SBOM scanner/feed identities. It must bind the exact `candidate_digest`, `sbom_digest`, `dependency_manifest_digest`, and `target_profile_digest`, and must be no more than seven days old when the bundle is finalized. Then create an owner-only `lanpanel.release.finalize-input.v1` containing the qualification input, security report, exact tag/commit, and a new output directory:
+Prepare fixed local feed snapshots outside the repository for the Go vulnerability database, the complete SBOM OSV database, and the qualified distro's OSV-compatible advisory database. The Go path is a `vuln.go.dev`-format tree (including `index/db.json`); each OSV path is the cache root above `osv-scanner/<ecosystem>/all.zip`. The complete-SBOM root must include every ecosystem represented in the SBOM (`Go` and the qualified distro), while the distro root must include the named Debian or Ubuntu advisory export. Seal every feed directory owner-only and read-only; it may contain only regular files and directories. Record its canonical closure digest with:
+
+```bash
+go run ./cmd/lanpanel-qualification database-digest /absolute/protected/feed-directory
+```
+
+Create an owner-only `lanpanel.qualification.security-scan-input.v1`. It contains the generated `qualification-input.json`; absolute paths and SHA-256 byte digests for regular, executable, non-group/world-writable copies of the exact `govulncheck` 1.1.4 and `osv-scanner` 2.0.3 executables; and `name`, absolute `path`, canonical directory `digest`, and UTC `captured_at` for each of the three fixed databases. Each feed capture and the resulting report are valid for at most seven days. No scanner may update a feed during this step.
+
+The same input also requires `repository_snapshot`: absolute `keyring` and `in_release` file paths, plus `indexes`, an array of `{ "release_path": "main/binary-amd64/Packages", "path": "/absolute/protected/Packages" }` locators. These files must be owned by the harness user and sealed mode `0400`. Supply the **exact qualified repository snapshot**, not today's repository or the scanning host's installed-package data. Index files contain uncompressed Packages bytes; an existing APT LZ4 index can be exported with `/usr/lib/apt/apt-helper cat-file /path/to/index.lz4 > /absolute/protected/Packages` before sealing. The scanner verifies the keyring/InRelease digests and signature, signed index checksums, cutoff, and every binary name/version/architecture/SHA-256/size against the already-bound package template. Source names and versions come only from those signed stanzas, including Debian's `Source` field defaults; missing or conflicting mappings fail.
+
+Each fixed distro archive may contain multiple releases. The harness derives a temporary cache by keeping only `affected` entries for the profile's exact release (Debian numeric release; Ubuntu numeric release with optional `Pro`/`LTS` labels). It rejects release-less/ambiguous entries and archives with no selected-release evidence. This filtering is applied separately to both scan feeds, without changing either sealed snapshot.
+
+Run the release scan independently when reviewing the candidate:
+
+```bash
+make ga-release-vulnerability-scan \
+  SECURITY_SCAN_INPUT=/absolute/protected/security-scan-input.json
+```
+
+The command verifies scanner bytes and versions and runs `govulncheck` in binary/symbol mode against the exact qualified candidate with the fixed local Go database. For OSV, it derives a private SPDX document from the qualified public SBOM: Go/native identities remain unchanged; distro binaries map to their signed source names/versions, with shared sources deduplicated. It scans that complete derived document and its distro-only subset offline against the respective release-scoped feeds. The public SBOM, its binary package tuples/checksums, and the report's original SBOM digest remain unchanged. Scanner output must enumerate the entire expected derived package closure; an omitted package, changed candidate/SBOM/feed, online resolution, malformed output, or unresolved high/critical finding fails closed. The command directly writes and seals canonical `security-report.json` (`lanpanel.release.security-report.v3`) at the path already bound by `qualification-input.json`; it records exact artifact bindings, scanner executable digests, feed names/digests/capture times, scan UTC, and findings.
+
+Then create an owner-only `lanpanel.release.finalize-input.v2` containing the qualification input, the exact security-scan input path, exact tag/commit, and a new output directory. The mandatory final target re-executes that bound fixed-feed scan before finalization and reads the generated report directly:
 
 ```bash
 make ga-finalize-release \
   RELEASE_FINALIZE_INPUT=/absolute/protected/release-finalize-input.json
 ```
 
-Finalization reuses the exact qualified candidate/source/dependency/SBOM bytes and the limitations from the qualified source archive, creates one `SHA256SUMS` and one canonical `release.json`, runs the complete offline release/security/qualification verifier, and atomically commits a read-only bundle. It does not rebuild the candidate.
+Finalization requires the report to bind the exact `candidate_digest`, `sbom_digest`, `dependency_manifest_digest`, and `target_profile_digest` and to be no more than seven days old. It directly re-runs the terminal cleanup and executor-attestation readiness checks, then reuses the exact qualified candidate/source/dependency/SBOM bytes and the limitations from the qualified source archive, creates one `SHA256SUMS` and one canonical `release.json`, runs the complete offline release/security/qualification verifier, and atomically commits a read-only bundle. Detailed scanner output, cleanup, and attestation artifacts are not published. It does not rebuild the candidate.
 
-Release publication remains fail-closed until one authorized real journey succeeds and the resulting exact bundle is independently reviewed. Do not enable or push the release workflow merely because deterministic tests pass.
+Release publication remains fail-closed until one authorized real journey succeeds, the protected report/attestation/plan are independently reviewed, and every asset listed by the finalizer is present in the resulting exact bundle and verifies against its single `release.json` and `SHA256SUMS`. Do not enable or push the release workflow merely because deterministic tests pass; no repository fixture or generated example is acceptable live evidence.

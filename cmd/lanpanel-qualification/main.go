@@ -24,9 +24,29 @@ type result struct {
 }
 
 func main() {
-	if len(os.Args) != 3 || os.Args[1] != "generate" && os.Args[1] != "preflight" && os.Args[1] != "run" && os.Args[1] != "final" && os.Args[1] != "release" {
-		fmt.Fprintln(os.Stderr, "usage: lanpanel-qualification generate|preflight|run|final|release /absolute/protected-input.json")
+	if len(os.Args) != 3 || os.Args[1] != "generate" && os.Args[1] != "preflight" && os.Args[1] != "run" && os.Args[1] != "final" && os.Args[1] != "database-digest" && os.Args[1] != "scan" && os.Args[1] != "release" {
+		fmt.Fprintln(os.Stderr, "usage: lanpanel-qualification generate|preflight|run|final|database-digest|scan|release /absolute/input-or-database-path")
 		os.Exit(2)
+	}
+	if os.Args[1] == "database-digest" {
+		digest, err := qualification.FixedVulnerabilityDatabaseDigest(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		encoded, err := release.MarshalCanonical(struct {
+			Path   string `json:"path"`
+			Digest string `json:"digest"`
+		}{Path: os.Args[2], Digest: digest})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(append(encoded, '\n')); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	if os.Args[1] == "generate" {
 		generated, err := qualification.Generate(os.Args[2], time.Now)
@@ -35,6 +55,23 @@ func main() {
 			os.Exit(1)
 		}
 		encoded, err := release.MarshalCanonical(result{RunID: generated.RunID, CandidateDigest: generated.CandidateDigest, SourceDigest: generated.SourceTreeDigest, TargetProfileDigest: generated.TargetProfileDigest, PlanDigest: generated.SideEffectPlanDigest, InstallManifestDigest: generated.InstallManifestDigest, ProtectedInput: generated.ProtectedInput})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if _, err := os.Stdout.Write(append(encoded, '\n')); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if os.Args[1] == "scan" {
+		scanned, err := qualification.RunReleaseSecurityScan(os.Args[2], time.Now)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		encoded, err := release.MarshalCanonical(scanned)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

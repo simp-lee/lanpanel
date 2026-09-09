@@ -29,21 +29,30 @@ func TestActivationBundleBindsControlIngressAndPublicSTUNRelay(t *testing.T) {
 	if !strings.Contains(string(bundle.STUNSocket), "ListenDatagram=0.0.0.0:3478") || !strings.Contains(string(bundle.ControlRelay), "JoinsNamespaceOf=lanpanel-headscale.service") || !strings.Contains(string(bundle.STUNRelay), "headscale-stun-relay") {
 		t.Fatal("activation relay topology changed")
 	}
+	for name, unit := range map[string][]byte{"control": bundle.ControlSocket, "stun": bundle.STUNSocket} {
+		if !strings.Contains(string(unit), "Requires=sysinit.target lanpanel-recovery.service lanpanel-headscale.service") || !strings.Contains(string(unit), "After=sysinit.target lanpanel-recovery.service lanpanel-headscale.service") {
+			t.Fatalf("%s socket lacks guarded boot dependency", name)
+		}
+	}
+	if !strings.Contains(string(rendered.Unit), "Requires=lanpanel-recovery.service") || !strings.Contains(string(rendered.Unit), "After=network-online.target lanpanel-recovery.service") {
+		t.Fatal("Headscale service lacks guarded boot dependency")
+	}
 	state := safety.EmptyState()
 	state.Headscale.GenerationSequence = 1
 	state.Headscale.Reactivating = &safety.HeadscaleReactivating{Generation: 1, PriorGeneration: 0, PlanID: "plan_control", ControlGeneration: bundle.Entry.Generation, CertificateGeneration: identity.Generation, CertificateFingerprint: identity.Fingerprint, CandidateDigest: bundle.Candidate.ConfigDigest, CandidateBundle: bundle.Digest, ActivationDigest: bundle.Digest, ControlEntryDigest: bundle.Entry.Digest, BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}, CertificateUntil: identity.NotAfter, CertificateLastTrustedWall: identity.LastTrustedWall}
 	manifest := nginx.Manifest{SchemaVersion: nginx.ManifestSchema, InstallationID: "ins_control", GenerationID: "gen_control", DefaultCertFingerprint: testDigest("default"), MainDigest: testDigest("main"), SanitizerDigest: testDigest("sanitizer"), Entries: []nginx.Entry{bundle.Entry}}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Now: identity.LastTrustedWall}); !decision.Allowed {
+	installation := &domain.Installation{InstallationID: manifest.InstallationID}
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: identity.LastTrustedWall}); !decision.Allowed {
 		t.Fatalf("exact Headscale reactivation graph rejected: %+v", decision)
 	}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Now: identity.NotAfter}); decision.Allowed {
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: identity.NotAfter}); decision.Allowed {
 		t.Fatal("expired Headscale reactivation graph allowed")
 	}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Now: identity.LastTrustedWall.Add(-time.Second)}); decision.Allowed {
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: identity.LastTrustedWall.Add(-time.Second)}); decision.Allowed {
 		t.Fatal("regressed-clock Headscale reactivation graph allowed")
 	}
 	challengeEntry := bundle.Entry
-	challengeEntry.Challenge = &nginx.ChallengeSite{Hosts: []string{bundle.Candidate.ControlDomain}, Webroot: "/var/lib/lanpanel/certificates/webroot/" + bundle.Certificate.ID}
+	challengeEntry.Challenge = &nginx.ChallengeSite{Generation: challengeEntry.Generation, Host: bundle.Candidate.ControlDomain, Token: "abcdefghijklmnopqrstuv", TokenPath: "/.well-known/acme-challenge/abcdefghijklmnopqrstuv", KeyAuthorizationDigest: testDigest("key-authorization"), Webroot: "/var/lib/lanpanel/certificates/webroot/" + bundle.Certificate.ID}
 	challengeEntry.Digest = controlZeroDigest()
 	challengeDigest, digestErr := nginx.DigestEntry(challengeEntry)
 	if digestErr != nil {
@@ -58,12 +67,12 @@ func TestActivationBundleBindsControlIngressAndPublicSTUNRelay(t *testing.T) {
 	state.Headscale.ControlEntryDigest = bundle.Entry.Digest
 	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: identity.Generation, Fingerprint: identity.Fingerprint, Binding: identity.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
 	applied, _ := AppliedIdentity(bundle.Candidate)
-	installation := domain.Installation{Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity}}}
+	committedInstallation := domain.Installation{InstallationID: manifest.InstallationID, Headscale: &domain.HeadscaleDomain{Enabled: true, Applied: &applied, Certificate: &domain.CertificateBundleIdentity{Generation: identity.Generation, Fingerprint: identity.Fingerprint, BindingIdentity: identity.BindingIdentity}}}
 	state.GlobalClose = safety.GlobalClose{Phase: safety.GlobalCloseEmergency, Generation: 4}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Now: identity.LastTrustedWall.Add(time.Minute)}); !decision.Allowed {
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &committedInstallation, Now: identity.LastTrustedWall.Add(time.Minute)}); !decision.Allowed {
 		t.Fatalf("committed Headscale control did not survive App close: %+v", decision)
 	}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Now: identity.NotAfter}); decision.Allowed {
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &committedInstallation, Now: identity.NotAfter}); decision.Allowed {
 		t.Fatal("expired committed Headscale control start allowed")
 	}
 	changed := bundle
@@ -77,7 +86,7 @@ func TestActivationBundleBindsControlIngressAndPublicSTUNRelay(t *testing.T) {
 func TestExpiredHeadscaleHTTPChallengeIsChallengeOnlyAndSnapshotBound(t *testing.T) {
 	now := time.Now().UTC()
 	base := []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotPresent, Generation: 1}}
-	entry := nginx.Entry{Kind: nginx.EntryChallenge, ResourceID: "headscale", Relative: nginx.ChallengesDirectory + "/headscale.conf", Digest: controlZeroDigest(), Domains: []string{"control.example.test"}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: 2, Challenge: &nginx.ChallengeSite{Hosts: []string{"control.example.test"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001"}}
+	entry := nginx.Entry{Kind: nginx.EntryChallenge, ResourceID: "headscale", Relative: nginx.ChallengesDirectory + "/headscale.conf", Digest: controlZeroDigest(), Domains: []string{"control.example.test"}, Listeners: []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}, Generation: 2, Challenge: &nginx.ChallengeSite{Generation: 2, Host: "control.example.test", Token: "abcdefghijklmnopqrstuv", TokenPath: "/.well-known/acme-challenge/abcdefghijklmnopqrstuv", KeyAuthorizationDigest: testDigest("key-authorization"), Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001"}}
 	digestValue, err := nginx.DigestEntry(entry)
 	if err != nil {
 		t.Fatal(err)
@@ -88,13 +97,14 @@ func TestExpiredHeadscaleHTTPChallengeIsChallengeOnlyAndSnapshotBound(t *testing
 	state.Headscale.ControlEntryDigest = testDigest("control")
 	state.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: testDigest("prior"), Binding: "binding", LastTrustedWall: now.Add(-2 * time.Hour), NotAfter: now.Add(-time.Hour)}
 	state.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: 1, Deadline: now.Add(-time.Hour), Binding: "binding"}
-	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 2, PlanID: "plan_reissue", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: entry.Challenge.Webroot, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: base}
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 2, PlanID: "plan_reissue", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, Token: entry.Challenge.Token, TokenPath: entry.Challenge.TokenPath, KeyAuthorizationDigest: entry.Challenge.KeyAuthorizationDigest, Webroot: entry.Challenge.Webroot, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: base}
 	manifest := nginx.Manifest{SchemaVersion: nginx.ManifestSchema, InstallationID: "ins_control", GenerationID: "gen_challenge", DefaultCertFingerprint: testDigest("default"), MainDigest: testDigest("main"), SanitizerDigest: testDigest("sanitizer"), Entries: []nginx.Entry{entry}}
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Now: now}); !decision.Allowed {
+	installation := &domain.Installation{InstallationID: manifest.InstallationID}
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: now}); !decision.Allowed {
 		t.Fatalf("exact expired Headscale challenge rejected: %+v", decision)
 	}
 	state.Headscale.CertificateExpiry.Generation = 2
-	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Now: now}); decision.Allowed {
+	if decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardReload, Manifest: manifest, Safety: state, Installation: installation, Now: now}); decision.Allowed {
 		t.Fatal("stale expired Headscale challenge snapshot accepted")
 	}
 }

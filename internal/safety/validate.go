@@ -178,18 +178,23 @@ func validateChallenge(challenge ChallengePending) error {
 	if challenge.Generation == 0 || !validRef(challenge.PlanID) || !validHost(challenge.Host) || len(challenge.Hosts) == 0 || !isDigest(challenge.ConfigDigest) || !isDigest(challenge.SANIdentity) || !isDigest(challenge.ACMEBinding) || !validRef(challenge.CertificateIdentity) || !isDigest(challenge.BootstrapIdentity) {
 		return fmt.Errorf("challenge complete ACME identity is incomplete")
 	}
+	hostPresent := false
 	for index, host := range challenge.Hosts {
 		if !validHost(host) || index > 0 && challenge.Hosts[index-1] >= host {
 			return fmt.Errorf("challenge Host inventory invalid")
 		}
+		hostPresent = hostPresent || challenge.Host == host
 	}
 	switch challenge.Method {
 	case "http-01":
-		if challenge.OwnerLock != "" || challenge.Provider != "" || challenge.Zone != "" || len(challenge.Owners) != 0 || challenge.TokenPath != "/.well-known/acme-challenge" || !strings.HasPrefix(challenge.Webroot, "/var/lib/lanpanel/certificates/webroot/") {
+		inactive := challenge.Host == challenge.Hosts[0] && challenge.Token == "" && challenge.TokenPath == "" && challenge.KeyAuthorizationDigest == ""
+		active := hostPresent && validHTTP01Token(challenge.Token) && challenge.TokenPath == "/.well-known/acme-challenge/"+challenge.Token && isDigest(challenge.KeyAuthorizationDigest)
+		expectedWebroot := filepath.Join("/var/lib/lanpanel/certificates/webroot", challenge.CertificateIdentity)
+		if challenge.OwnerLock != "" || challenge.Provider != "" || challenge.Zone != "" || len(challenge.Owners) != 0 || challenge.Webroot != expectedWebroot || !inactive && !active {
 			return fmt.Errorf("HTTP-01 route authority invalid")
 		}
 	case "dns-01":
-		if !isDigest(challenge.OwnerLock) || (challenge.Provider != "cloudflare" && challenge.Provider != "route53" && challenge.Provider != "digitalocean" && challenge.Provider != "gcloud" && challenge.Provider != "tencentcloud") || !validHost(challenge.Zone) || len(challenge.Owners) != len(challenge.Hosts) || challenge.TokenPath != "/dns-01" || challenge.Webroot != "/var/lib/lanpanel/certificates/dns-only" {
+		if challenge.Token != "" || challenge.KeyAuthorizationDigest != "" || !isDigest(challenge.OwnerLock) || (challenge.Provider != "cloudflare" && challenge.Provider != "route53" && challenge.Provider != "digitalocean" && challenge.Provider != "gcloud" && challenge.Provider != "tencentcloud") || !validHost(challenge.Zone) || len(challenge.Owners) != len(challenge.Hosts) || challenge.TokenPath != "/dns-01" || challenge.Webroot != "/var/lib/lanpanel/certificates/dns-only" {
 			return fmt.Errorf("DNS-01 owner authority invalid")
 		}
 		for index, owner := range challenge.Owners {
@@ -200,13 +205,27 @@ func validateChallenge(challenge ChallengePending) error {
 	default:
 		return fmt.Errorf("challenge method invalid")
 	}
-	if !strings.HasPrefix(challenge.TokenPath, "/") || filepath.Clean(challenge.TokenPath) != challenge.TokenPath || !cleanAbsolute(challenge.Webroot) {
+	if challenge.TokenPath != "" && (!strings.HasPrefix(challenge.TokenPath, "/") || filepath.Clean(challenge.TokenPath) != challenge.TokenPath) || !cleanAbsolute(challenge.Webroot) {
 		return fmt.Errorf("challenge path authority invalid")
 	}
 	if err := validateBaseSnapshot(challenge.BaseMarkers); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validHTTP01Token(value string) bool {
+	if len(value) < 20 || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		letter := character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z'
+		digit := character >= '0' && character <= '9'
+		if !letter && !digit && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateReactivating(reactivating Reactivating) error {

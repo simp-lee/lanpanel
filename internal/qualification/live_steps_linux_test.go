@@ -38,6 +38,12 @@ func TestSelectConnectorDeviceIgnoresOrderAndRequiresUniqueNewUserIPMatch(t *tes
 	if err != nil || device.ID != selected.ID {
 		t.Fatalf("device order affected exact connector selection: device=%+v err=%v", device, err)
 	}
+	if err := requireExactDeviceInventoryDelta(before, after, selected.ID); err == nil {
+		t.Fatal("connector inventory accepted an unrelated additional device")
+	}
+	if err := requireExactDeviceInventoryDelta(before, []managedheadscale.Device{selected, before[0]}, selected.ID); err != nil {
+		t.Fatalf("one exact connector device delta was rejected: %v", err)
+	}
 
 	after = append(after, managedheadscale.Device{ID: 22, UserID: 41, Name: "duplicate-match", IPAddresses: []string{locals[0].String(), locals[1].String()}})
 	if _, err := selectConnectorDevice(before, after, 41, locals); err == nil {
@@ -45,6 +51,20 @@ func TestSelectConnectorDeviceIgnoresOrderAndRequiresUniqueNewUserIPMatch(t *tes
 	}
 	if _, err := selectConnectorDevice(before, []managedheadscale.Device{{ID: 21, UserID: 42, Name: "wrong-user", IPAddresses: []string{locals[0].String(), locals[1].String()}}}, 41, locals); err == nil {
 		t.Fatal("connector device with a different user was accepted")
+	}
+}
+
+func TestConnectorPriorRequiresFreshlyActivePreauthKey(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	executor := &LiveExecutor{state: liveState{HeadscaleUserID: "41", PreauthKeyID: "73"}}
+	users := []managedheadscale.User{{ID: 41, Name: "qualification"}}
+	key := managedheadscale.PreauthKey{ID: 73, UserID: 41, CreatedAt: now.Add(-2 * time.Hour), Expiration: now.Add(-time.Hour)}
+	if _, _, err := executor.requireExactHeadscaleResults(users, []managedheadscale.PreauthKey{key}, true, now); err == nil {
+		t.Fatal("expired preauth key was reported active")
+	}
+	key.Expiration = now.Add(time.Hour)
+	if _, _, err := executor.requireExactHeadscaleResults(users, []managedheadscale.PreauthKey{key}, true, now); err != nil {
+		t.Fatalf("fresh active preauth key was rejected: %v", err)
 	}
 }
 

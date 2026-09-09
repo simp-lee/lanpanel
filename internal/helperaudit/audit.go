@@ -80,7 +80,12 @@ var expectedCensus = []struct {
 	{"generator build output", 1},
 	{"generator build Dir", 1},
 	{"generator build Env", 1},
-	{"raw SYS_BPF", 11},
+	{"security scan command", 1},
+	{"security scan Run", 1},
+	{"security scan Dir", 1},
+	{"security scan Env", 1},
+	{"security scan output", 1},
+	{"raw SYS_BPF", 12},
 	{"raw SYS_NEWFSTATAT", 1},
 	{"raw SYS_PRCTL", 3},
 }
@@ -418,7 +423,7 @@ func (state *auditState) allowSyscallCall(file fileAudit, info *types.Info, call
 	declaration := enclosingDeclaration(file.file, call.Pos())
 	count := ""
 	switch {
-	case wrapper == "golang.org/x/sys/unix.Syscall" && number == "golang.org/x/sys/unix.SYS_BPF" && file.relative == "internal/process/listen_guard_linux.go" && declarationNameIs(declaration, "openOrCreateListenGuardMap", "verifyListenGuardMap", "ensureListenGuardLink", "verifyListenGuardLink", "updateListenGuardUID", "pinBPF", "getPinnedBPF"):
+	case wrapper == "golang.org/x/sys/unix.Syscall" && number == "golang.org/x/sys/unix.SYS_BPF" && file.relative == "internal/process/listen_guard_linux.go" && declarationNameIs(declaration, "openOrCreateListenGuardMap", "verifyListenGuardMap", "ensureListenGuardLink", "verifyListenGuardLink", "listenGuardUIDPresent", "updateListenGuardUID", "pinBPF", "getPinnedBPF"):
 		count = "raw SYS_BPF"
 	case wrapper == "golang.org/x/sys/unix.Syscall6" && number == "golang.org/x/sys/unix.SYS_NEWFSTATAT" && file.relative == "internal/safety/emergency_linux.go" && declarationNameIs(declaration, "rawLstat"):
 		count = "raw SYS_NEWFSTATAT"
@@ -462,6 +467,16 @@ func (state *auditState) allowProcessCall(file fileAudit, info *types.Info, call
 			return fmt.Errorf("fixed command is not assigned to its exact local in %s", file.relative)
 		}
 		state.commands[object] = commandKind
+	case "os/exec.CommandContext":
+		if file.relative != "internal/qualification/security_scan_linux.go" || !exactBoundaryDeclaration(declaration, "runSystemSecurityCommand") || !uniqueDeclarationNames(declaration, info, "ctx", "command", "process", "stdout", "stderr") || !hasNamedParameters(declaration, info, "ctx", "command") || !call.Ellipsis.IsValid() || args != `ctx, command.Path, command.Arguments` {
+			return fmt.Errorf("exec.CommandContext is outside the fixed release scanner boundary in %s", file.relative)
+		}
+		object := assignedObject(call, file.parents, info)
+		if object == nil || object.Name() != "process" {
+			return fmt.Errorf("fixed release scanner command is not assigned to process")
+		}
+		state.commands[object] = "security-scan"
+		count = "security scan command"
 	case "os/exec.LookPath":
 		if file.relative != "internal/qualification/generator_linux.go" || !exactBoundaryDeclaration(declaration, "buildCandidate") || call.Ellipsis.IsValid() || args != `"go"` {
 			return fmt.Errorf("exec.LookPath is outside the fixed boundary in %s", file.relative)
@@ -620,6 +635,8 @@ func (state *auditState) auditCommandMethods(file fileAudit, info *types.Info) e
 			count = "generator head Output"
 		case kind == "build" && method == "CombinedOutput" && file.relative == "internal/qualification/generator_linux.go" && exactBoundaryDeclaration(declaration, "buildCandidate"):
 			count = "generator build output"
+		case kind == "security-scan" && method == "Run" && file.relative == "internal/qualification/security_scan_linux.go" && exactBoundaryDeclaration(declaration, "runSystemSecurityCommand"):
+			count = "security scan Run"
 		default:
 			auditErr = fmt.Errorf("exec.Cmd method %s is outside the fixed boundary in %s", method, file.relative)
 			return false
@@ -683,6 +700,16 @@ func allowedCommandConfiguration(kind string, file fileAudit, info *types.Info, 
 			return "generator build Dir"
 		case `command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64", "GOENV=off", "GOFLAGS=-mod=readonly", "GOTOOLCHAIN=local", "GOPROXY=off", "GOSUMDB=off"}`:
 			return "generator build Env"
+		}
+	}
+	if kind == "security-scan" && file.relative == "internal/qualification/security_scan_linux.go" && exactBoundaryDeclaration(declaration, "runSystemSecurityCommand") {
+		switch text {
+		case `process.Dir = command.Directory`:
+			return "security scan Dir"
+		case `process.Env = command.Environment`:
+			return "security scan Env"
+		case `process.Stdout, process.Stderr = stdout, stderr`:
+			return "security scan output"
 		}
 	}
 	return ""

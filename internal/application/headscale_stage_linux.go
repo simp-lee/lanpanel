@@ -51,6 +51,7 @@ type HeadscaleDeployExecution struct {
 	Host                control.CandidateHost
 	CertificateStaged   bool
 	CertificateIdentity certificates.BundleIdentity
+	ActivationHost      headscaleActivationHost
 	ClosureUncertain    bool
 	Challenge           challenge.Prepared
 	Child               operations.ChildRecord
@@ -337,22 +338,8 @@ func (execution *HeadscaleDeployExecution) PrepareLocalCandidate(ctx context.Con
 	if _, err := execution.Service.safety.Commit(ctx, exposure, safety.RoleChallenge, freshState.Revision, next, safety.TransitionProof{}); err != nil {
 		return control.IssueRequest{}, err
 	}
-	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
-		authority, authorityErr := challengeReloadAuthorityForExposure(execution.Service, exposure)
-		var currentAuthority activation.ReloadAuthoritySnapshot
-		if authorityErr == nil {
-			currentAuthority, authorityErr = authority.Current()
-		}
-		if authorityErr != nil || currentAuthority.Safety.Headscale.ChallengePending == nil || !challenge.Matches(*currentAuthority.Safety.Headscale.ChallengePending, prepared) {
-			return control.IssueRequest{}, errors.Join(authorityErr, fmt.Errorf("headscale challenge reload authority changed under exposure lock"))
-		}
-		host, err := activation.NewFixedHost()
-		if err != nil {
-			return control.IssueRequest{}, err
-		}
-		if _, err := host.ActivateChallenge(ctx, prepared, authority); err != nil {
-			return control.IssueRequest{}, err
-		}
+	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 && (prepared.Entry != nil || prepared.Safety.Token != "") {
+		return control.IssueRequest{}, fmt.Errorf("headscale HTTP-01 route existed before the CA selected a token")
 	}
 	_, remoteErr := execution.Admitter.EnterRemoteWait(ctx, mutation, exposure, execution.Revision, execution.JobID)
 	execution.Mutation, execution.Exposure = nil, nil
@@ -404,12 +391,20 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 	if err != nil {
 		return certificates.Identity{}, err
 	}
-	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{CertificateStage: child.Identity{UID: execution.StageUID, GID: execution.StageGID, Chroot: stage.Root}})
-	if err != nil {
-		return certificates.Identity{}, errors.Join(err, stage.Close())
-	}
 	remoteCtx, cancel := context.WithDeadline(ctx, execution.Plan.ExpiresAt)
-	result, runErr := acme.RunLego(remoteCtx, launcher, acme.IssueRequest{CertificateID: issueRequest.CertificateID, Domains: []string{issueRequest.Domain}, Binding: execution.Authority.Binding, UID: execution.StageUID, GID: execution.StageGID, Chroot: stage.Root, ExecutableDigest: execution.LegoDigest})
+	request := acme.IssueRequest{CertificateID: issueRequest.CertificateID, Domains: []string{issueRequest.Domain}, Binding: execution.Authority.Binding, UID: execution.StageUID, GID: execution.StageGID, Chroot: stage.Root, ExecutableDigest: execution.LegoDigest}
+	var result acme.IssueResult
+	var runErr error
+	if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
+		result, runErr = acme.RunHTTP01(remoteCtx, request, execution)
+	} else {
+		launcher, launcherErr := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{CertificateStage: child.Identity{UID: execution.StageUID, GID: execution.StageGID, Chroot: stage.Root}})
+		if launcherErr != nil {
+			cancel()
+			return certificates.Identity{}, errors.Join(launcherErr, stage.Close())
+		}
+		result, runErr = acme.RunLego(remoteCtx, launcher, request)
+	}
 	cancel()
 	runErr = errors.Join(runErr, verifyManagedACMEBinding(execution.Authority.Binding))
 	if child.CgroupClosureUnproved(runErr) {
@@ -417,7 +412,9 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 		cleanup = false
 		return certificates.Identity{}, runErr
 	}
-	runErr = errors.Join(runErr, stage.Close())
+	if execution.Authority.Binding.Method != acme.ChallengeHTTP01 || execution.Challenge.Entry == nil {
+		runErr = errors.Join(runErr, stage.Close())
+	}
 	if execution.DNSPreflight != nil {
 		cleanupErr := acme.VerifyDNS01Cleanup(ctx, acme.NetDNSObserver{}, *execution.DNSPreflight)
 		runErr = errors.Join(runErr, cleanupErr)
@@ -445,6 +442,107 @@ func (execution *HeadscaleDeployExecution) RunFirstCertificate(ctx context.Conte
 		return certificates.Identity{}, err
 	}
 	return identity, nil
+}
+
+func (execution *HeadscaleDeployExecution) PresentHTTP01(ctx context.Context, presentation acme.HTTP01Presentation) error {
+	if execution == nil || execution.Authority.Binding.Method != acme.ChallengeHTTP01 || execution.Mutation != nil || execution.Exposure != nil || execution.Challenge.Entry != nil {
+		return fmt.Errorf("headscale HTTP-01 presentation phase is invalid")
+	}
+	active, err := challenge.PresentHTTPForResource("headscale", execution.Challenge, presentation.Host, presentation.Token, presentation.KeyAuthorizationDigest)
+	if err != nil {
+		return err
+	}
+	if err := acme.WriteHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation); err != nil {
+		return err
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil {
+		return err
+	}
+	_, execution.Mutation, execution.Exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+	if err != nil {
+		return errors.Join(err, acme.RemoveHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation))
+	}
+	execution.Revision = document.Revision + 1
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil || state.Headscale.ChallengePending == nil || !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
+		return errors.Join(err, fmt.Errorf("headscale HTTP-01 base authority changed"))
+	}
+	next := state
+	next.Revision++
+	next.Headscale.ChallengePending = &active.Safety
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return err
+	}
+	execution.Challenge = active
+	authority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+	if err != nil {
+		return err
+	}
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	if _, err := host.ActivateChallenge(ctx, execution.Challenge, authority); err != nil {
+		return err
+	}
+	_, err = execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+	execution.Mutation, execution.Exposure = nil, nil
+	if err == nil {
+		execution.Revision++
+	}
+	return err
+}
+
+func (execution *HeadscaleDeployExecution) CleanUpHTTP01(ctx context.Context, presentation acme.HTTP01Presentation) error {
+	if execution == nil || execution.Challenge.Entry == nil || execution.Challenge.Safety.Host != presentation.Host || execution.Challenge.Safety.Token != presentation.Token || execution.Challenge.Safety.KeyAuthorizationDigest != presentation.KeyAuthorizationDigest {
+		return fmt.Errorf("headscale HTTP-01 cleanup presentation changed")
+	}
+	base, err := challenge.ClearHTTP(execution.Challenge)
+	if err != nil {
+		return err
+	}
+	document, err := execution.Service.normal.Read()
+	if err != nil {
+		return err
+	}
+	_, execution.Mutation, execution.Exposure, err = execution.Admitter.ReenterHTTP01Contraction(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+	if err != nil {
+		return err
+	}
+	execution.Revision = document.Revision + 1
+	authority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+	if err != nil {
+		return err
+	}
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	if _, err := host.RemoveChallenge(ctx, execution.Challenge, authority); err != nil {
+		return err
+	}
+	state, err := execution.Service.safety.ReadForRecovery(execution.Exposure)
+	if err != nil || state.Headscale.ChallengePending == nil || !challenge.Matches(*state.Headscale.ChallengePending, execution.Challenge) {
+		return errors.Join(err, fmt.Errorf("headscale HTTP-01 active authority changed"))
+	}
+	next := state
+	next.Revision++
+	next.Headscale.ChallengePending = &base.Safety
+	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, state.Revision, next, safety.TransitionProof{}); err != nil {
+		return err
+	}
+	execution.Challenge = base
+	if err := acme.VerifyHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation); err != nil {
+		return err
+	}
+	_, err = execution.Admitter.EnterRemoteWait(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID)
+	execution.Mutation, execution.Exposure = nil, nil
+	if err != nil {
+		return err
+	}
+	execution.Revision++
+	return acme.RemoveHTTP01Token(execution.Challenge.Safety.CertificateIdentity, execution.StageUID, execution.StageGID, presentation)
 }
 
 func (execution *HeadscaleDeployExecution) authorizeStagedCertificate(ctx context.Context, identity certificates.Identity) error {
@@ -671,7 +769,11 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 	if execution.Mutation == nil && execution.Exposure == nil {
 		document, err := execution.Service.normal.Read()
 		if err == nil {
-			_, execution.Mutation, execution.Exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+			if execution.Authority.Binding.Method == acme.ChallengeHTTP01 {
+				_, execution.Mutation, execution.Exposure, err = execution.Admitter.ReenterHTTP01Contraction(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+			} else {
+				_, execution.Mutation, execution.Exposure, err = execution.Admitter.Reenter(ctx, execution.MutationSet, execution.Service.manager, document.Revision, execution.JobID)
+			}
 			execution.Revision = document.Revision + 1
 		}
 		if err != nil {
@@ -693,11 +795,18 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 		}
 		if execution.Authority.Binding.Method == acme.ChallengeHTTP01 && execution.Challenge.Entry != nil {
 			authority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+			var currentAuthority activation.ReloadAuthoritySnapshot
 			if err == nil {
-				currentAuthority, currentErr := authority.Current()
-				err = currentErr
+				currentAuthority, err = authority.Current()
 				if err == nil && (currentAuthority.Safety.Headscale.ChallengePending == nil || !challenge.Matches(*currentAuthority.Safety.Headscale.ChallengePending, execution.Challenge)) {
 					err = fmt.Errorf("headscale failed challenge removal authority changed under exposure lock")
+				}
+			}
+			if err == nil {
+				var manifest nginx.Manifest
+				manifest, err = nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+				if err == nil {
+					_, err = exactHTTP01PresentationInManifest(manifest, "headscale", execution.Challenge)
 				}
 			}
 			if err == nil {
@@ -707,8 +816,20 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 					_, err = nginxHost.RemoveChallenge(ctx, execution.Challenge, authority)
 				}
 			}
+			var base challenge.Prepared
+			if err == nil {
+				base, err = challenge.ClearHTTP(execution.Challenge)
+			}
+			if err == nil {
+				next := currentAuthority.Safety
+				next.Revision++
+				next.Headscale.ChallengePending = &base.Safety
+				_, err = execution.Service.safety.Commit(ctx, execution.Exposure, safety.RoleChallenge, currentAuthority.Safety.Revision, next, safety.TransitionProof{})
+			}
 			if err != nil {
 				errs = append(errs, err)
+			} else {
+				execution.Challenge = base
 			}
 		}
 	}
@@ -717,11 +838,13 @@ func (execution *HeadscaleDeployExecution) removeFailedChallenge(ctx context.Con
 			errs = append(errs, err)
 		}
 	}
-	if err := acme.RemoveStage(execution.Authority.Rendered.Candidate.CertificateID, execution.StageUID, execution.StageGID); err != nil {
-		errs = append(errs, err)
-	}
-	if err := acme.RemoveWebroot(execution.Authority.Rendered.Candidate.CertificateID, execution.StageUID, execution.StageGID); err != nil {
-		errs = append(errs, err)
+	if execution.Challenge.Entry == nil {
+		if err := acme.RemoveStage(execution.Authority.Rendered.Candidate.CertificateID, execution.StageUID, execution.StageGID); err != nil {
+			errs = append(errs, err)
+		}
+		if err := acme.RemoveWebroot(execution.Authority.Rendered.Candidate.CertificateID, execution.StageUID, execution.StageGID); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if execution.StageUID != 0 && execution.StageGID != 0 {
 		if err := certificates.RemoveInactiveBundle(execution.Authority.Rendered.Candidate.CertificateID, 1, execution.CertificateIdentity, execution.StageUID, execution.StageGID); err != nil {
@@ -1021,7 +1144,18 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 	defer func() {
 		returnErr = errors.Join(returnErr, operations.ReleaseExposure(mutation, exposure), mutationSet.Close())
 	}()
-	if pending.Method == "http-01" {
+	if pending.Method == "http-01" && pending.Token == "" {
+		manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if auditErr != nil {
+			return auditErr
+		}
+		for _, entry := range manifest.Entries {
+			if entry.Kind == nginx.EntryChallenge && entry.ResourceID == "headscale" || entry.Kind == nginx.EntryControl && entry.Challenge != nil {
+				return fmt.Errorf("tokenless interrupted Headscale renewal has an active challenge route")
+			}
+		}
+	}
+	if pending.Method == "http-01" && pending.Token != "" {
 		authority, authorityErr := challengeReloadAuthorityForExposure(service, exposure)
 		var currentAuthority activation.ReloadAuthoritySnapshot
 		if authorityErr == nil {
@@ -1038,6 +1172,13 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 		prepared, prepareErr := challenge.PreparedHTTP("headscale", *currentAuthority.Safety.Headscale.ChallengePending)
 		if prepareErr != nil {
 			return prepareErr
+		}
+		manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if auditErr != nil {
+			return auditErr
+		}
+		if _, routeErr := exactHTTP01PresentationInManifest(manifest, "headscale", prepared); routeErr != nil {
+			return routeErr
 		}
 		if controlJournal.Phase == control.PhaseExpired {
 			host, hostErr := activation.NewFixedHost()
@@ -1059,6 +1200,24 @@ func contractInterruptedHeadscaleRenewal(ctx context.Context, service *FixedServ
 			if removeErr := host.RemoveCertificateChallenge(ctx, bundle, prepared, authority); removeErr != nil {
 				return removeErr
 			}
+		}
+		base, clearErr := challenge.ClearHTTP(prepared)
+		if clearErr != nil {
+			return clearErr
+		}
+		next := currentAuthority.Safety
+		next.Revision++
+		next.Headscale.ChallengePending = &base.Safety
+		if _, clearErr := service.safety.Commit(ctx, exposure, safety.RoleChallenge, currentAuthority.Safety.Revision, next, safety.TransitionProof{}); clearErr != nil {
+			return clearErr
+		}
+		pending = base.Safety
+		stageIdentity, identityErr := identity.CertificateStageIdentityFor(prepared.Safety.CertificateIdentity)
+		if identityErr != nil {
+			return identityErr
+		}
+		if err := acme.VerifyHTTP01TokenDigest(prepared.Safety.CertificateIdentity, stageIdentity.UID, stageIdentity.GID, prepared.Safety.Token, prepared.Safety.KeyAuthorizationDigest); err != nil {
+			return fmt.Errorf("interrupted Headscale HTTP-01 token identity changed after route contraction: %w", err)
 		}
 	}
 	certificate := journal.Certificate
@@ -1207,7 +1366,20 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 		return err
 	}
 	var closureErr error
-	if pending.Method == "http-01" {
+	if pending.Method == "http-01" && pending.Token == "" {
+		manifest, auditErr := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if auditErr != nil {
+			closureErr = errors.Join(closureErr, auditErr)
+		} else {
+			for _, entry := range manifest.Entries {
+				if entry.Kind == nginx.EntryChallenge && entry.ResourceID == "headscale" || entry.Kind == nginx.EntryControl && entry.Challenge != nil {
+					closureErr = errors.Join(closureErr, fmt.Errorf("tokenless interrupted Headscale deploy has an active challenge route"))
+					break
+				}
+			}
+		}
+	}
+	if pending.Method == "http-01" && pending.Token != "" {
 		authority, prepareErr := challengeReloadAuthorityForExposure(service, exposure)
 		var currentAuthority activation.ReloadAuthoritySnapshot
 		if prepareErr == nil {
@@ -1221,17 +1393,42 @@ func reconcileInterruptedHeadscaleChallenge(ctx context.Context, service *FixedS
 			prepared, prepareErr = challenge.PreparedHTTP("headscale", *currentAuthority.Safety.Headscale.ChallengePending)
 		}
 		if prepareErr == nil {
+			var manifest nginx.Manifest
+			manifest, prepareErr = nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+			if prepareErr == nil {
+				_, prepareErr = exactHTTP01PresentationInManifest(manifest, "headscale", prepared)
+			}
+		}
+		if prepareErr == nil {
 			var nginxHost activation.Host
 			nginxHost, prepareErr = activation.NewFixedHost()
 			if prepareErr == nil {
 				_, prepareErr = nginxHost.RemoveChallenge(ctx, prepared, authority)
 			}
 		}
+		var base challenge.Prepared
+		if prepareErr == nil {
+			base, prepareErr = challenge.ClearHTTP(prepared)
+		}
+		if prepareErr == nil {
+			next := currentAuthority.Safety
+			next.Revision++
+			next.Headscale.ChallengePending = &base.Safety
+			_, prepareErr = service.safety.Commit(ctx, exposure, safety.RoleChallenge, currentAuthority.Safety.Revision, next, safety.TransitionProof{})
+		}
+		if prepareErr == nil {
+			pending = base.Safety
+			var tokenIdentity identity.CertificateStageIdentity
+			tokenIdentity, prepareErr = identity.CertificateStageIdentityFor(prepared.Safety.CertificateIdentity)
+			if prepareErr == nil {
+				prepareErr = acme.VerifyHTTP01TokenDigest(prepared.Safety.CertificateIdentity, tokenIdentity.UID, tokenIdentity.GID, prepared.Safety.Token, prepared.Safety.KeyAuthorizationDigest)
+			}
+		}
 		closureErr = errors.Join(closureErr, prepareErr)
 	}
 	stageIdentity, stageErr := identity.CertificateStageIdentityFor(journal.Candidate.CertificateID)
 	closureErr = errors.Join(closureErr, stageErr, host.StopPrivateService(context.WithoutCancel(ctx), journal.Candidate))
-	if stageErr == nil {
+	if stageErr == nil && closureErr == nil {
 		cleanupIdentity := certificates.BundleIdentity{}
 		if operationJournal.Certificate != nil {
 			cleanupIdentity = operationJournal.Certificate.CandidateBundleIdentity

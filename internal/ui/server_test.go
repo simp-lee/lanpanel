@@ -3,6 +3,8 @@ package ui
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"lanpanel/internal/application"
@@ -126,6 +128,86 @@ func TestLoginLogoutAreAuditedWithoutCredentials(t *testing.T) {
 	}
 	if strings.Contains(loginWriter.Body.String()+logoutWriter.Body.String(), "admin") {
 		t.Fatal("audit response exposed credential")
+	}
+}
+
+func TestLogoutRejectsUnexpectedBodyWithoutInvalidatingSession(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, server.origin()+"/api/logout", strings.NewReader(`{"upgrade":true}`))
+	request.Header.Set("Origin", server.origin())
+	request.Header.Set(session.ProofHeader, credentials.Proof)
+	request.Header.Set(session.CSRFHeader, credentials.CSRF)
+	request.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	writer := httptest.NewRecorder()
+	server.ServeHTTP(writer, request)
+	if writer.Code != http.StatusBadRequest {
+		t.Fatalf("logout with unexpected body status=%d", writer.Code)
+	}
+	if _, err := server.config.Sessions.Authenticate(credentials.Selector, credentials.Proof, "", server.origin(), "fp", false); err != nil {
+		t.Fatalf("logout with rejected body invalidated session: %v", err)
+	}
+}
+
+func TestActionsRejectUnknownBodyAndInapplicableQueryBeforeDispatch(t *testing.T) {
+	server := testServer(t)
+	var invocations atomic.Int32
+	plan, err := application.RegisterAction(domain.OperationPlan, application.PlanPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		invocations.Add(1)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: map[string]string{"plan_id": "plan-fixture"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		invocations.Add(1)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ConnectorMutationResult{JobID: "job-fixture"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify, err := application.RegisterAction(domain.OperationConnectorVerify, application.EmptyPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		invocations.Add(1)
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ConnectorVerifyResult{}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{plan, binding, verify})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{"generic Plan body", "/api/actions/admin_token_rotate/plan", `{"upgrade":true}`},
+		{"empty action body", "/api/actions/connector_verify", `{"upgrade":true}`},
+		{"inapplicable selector", "/api/actions/connector_binding_set?resource_id=res_00000000000000000000000000000001", `{"control_url":"https://control.example.test"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, server.origin()+test.path, strings.NewReader(test.body))
+			request.Header.Set("Origin", server.origin())
+			request.Header.Set(session.ProofHeader, credentials.Proof)
+			request.Header.Set(session.CSRFHeader, credentials.CSRF)
+			request.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+			writer := httptest.NewRecorder()
+			server.ServeHTTP(writer, request)
+			if writer.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", writer.Code, writer.Body.String())
+			}
+		})
+	}
+	if got := invocations.Load(); got != 0 {
+		t.Fatalf("rejected input dispatched %d action(s)", got)
 	}
 }
 
@@ -696,6 +778,11 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 		if !strings.Contains(appJS, required) {
 			t.Fatalf("GoAccess retirement UI evidence missing %q", required)
 		}
+	}
+	digest := sha256.Sum256([]byte(appJS))
+	wantJSPath := "/assets/app." + hex.EncodeToString(digest[:4]) + ".js"
+	if appJSPath != wantJSPath || !strings.Contains(response.Body.String(), `src="`+appJSPath+`"`) {
+		t.Fatalf("immutable JavaScript asset path=%q want=%q", appJSPath, wantJSPath)
 	}
 }
 

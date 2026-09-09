@@ -38,6 +38,19 @@ func TestHeadscaleEffectiveUnitObservationIsClosed(t *testing.T) {
 	if _, err := parseHeadscaleUnitProperties(append(raw, []byte("User=other\n")...)); err == nil {
 		t.Fatal("duplicate effective property accepted")
 	}
+	parsed["ActiveState"], parsed["SubState"], parsed["MainPID"], parsed["ControlGroup"] = "inactive", "dead", "0", ""
+	rendered := testRendered(t)
+	account := identity.AccountIdentity{User: "headscale", Group: "headscale"}
+	if err := validateHeadscaleServiceProperties(parsed, rendered, account, headscaleServiceInactive, "disabled"); err != nil {
+		t.Fatalf("private staging unit state rejected: %v", err)
+	}
+	if err := validateHeadscaleServiceProperties(parsed, rendered, account, headscaleServiceInactive, "enabled"); err == nil {
+		t.Fatal("disabled private staging unit accepted as committed boot activation")
+	}
+	parsed["UnitFileState"] = "enabled"
+	if err := validateHeadscaleServiceProperties(parsed, rendered, account, headscaleServiceInactive, "enabled"); err != nil {
+		t.Fatalf("committed boot unit state rejected: %v", err)
+	}
 }
 
 func TestHostListenersOnCandidatePortsDoNotBlockIsolatedCandidate(t *testing.T) {

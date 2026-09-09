@@ -5,9 +5,12 @@ package qualification
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"lanpanel/internal/application"
+	"lanpanel/internal/bootstrap"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/domain"
 	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/helperproto"
@@ -111,7 +114,7 @@ func (executor *LiveExecutor) executeStep(ctx context.Context, step string) (Mut
 	}
 	identity := "step/" + step + "/" + executor.prepared.Input.RunID
 	if len(evidence) == 0 {
-		evidence = []byte("failed/" + step)
+		evidence, _ = evidenceWithObservations("failed-"+step, map[string]string{"result": "no-observation"}, nil, nil)
 	}
 	if err == nil {
 		executor.state.CompletedSteps = append(executor.state.CompletedSteps, step)
@@ -256,7 +259,7 @@ func (executor *LiveExecutor) stepTemporaryHTTP(ctx context.Context) ([]byte, er
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
-	return evidence("temporary-public-http", map[string]string{"publication": published.PublicURL, "probe": release.DigestBytes(probe)})
+	return evidenceWithObservations("temporary-public-http", map[string]string{"publication": published.PublicURL}, map[string][]byte{"public_http": probe}, nil)
 }
 
 func (executor *LiveExecutor) stepDomainHTTPS(ctx context.Context) ([]byte, error) {
@@ -427,7 +430,7 @@ func (executor *LiveExecutor) stepDomainHTTPS(ctx context.Context) ([]byte, erro
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
-	return evidence("domain-https-controls", map[string]string{"public": release.DigestBytes(publicEvidence), "alias": release.DigestBytes(aliasEvidence), "websocket": release.DigestBytes(websocketEvidence), "static": release.DigestBytes(staticEvidence), "basic": release.DigestBytes(basicEvidence), "goaccess": release.DigestBytes(goaccessEvidence), "fixture": setup.Evidence})
+	return evidenceWithObservations("domain-https-controls", map[string]string{"acme_directory": executor.prepared.Input.ACME.DirectoryURL, "challenge_method": "http-01", "fixture": setup.Evidence}, map[string][]byte{"alias_https": aliasEvidence, "basic_https": basicEvidence, "goaccess_https": goaccessEvidence, "public_https": publicEvidence, "static_https": staticEvidence, "websocket_https": websocketEvidence}, nil)
 }
 
 func (executor *LiveExecutor) stepAppHTTP01(ctx context.Context) ([]byte, error) {
@@ -438,7 +441,7 @@ func (executor *LiveExecutor) stepAppHTTP01(ctx context.Context) ([]byte, error)
 	if _, err := executor.closeAll(ctx); err != nil {
 		return nil, fmt.Errorf("app-only close-all before Headscale did not prove exact access closure: %w", err)
 	}
-	return evidence("app-http01", map[string]string{"served_certificate": release.DigestBytes(probe), "app_only_close_all": "verified"})
+	return evidenceWithObservations("app-http01", map[string]string{"acme_directory": executor.prepared.Input.ACME.DirectoryURL, "app_only_close_all": "verified", "challenge_method": "http-01"}, map[string][]byte{"public_https": probe}, nil)
 }
 
 func (executor *LiveExecutor) closeAll(ctx context.Context) (contractionResult, error) {
@@ -454,6 +457,118 @@ func (executor *LiveExecutor) closeAll(ctx context.Context) (contractionResult, 
 		return contraction, fmt.Errorf("close-all did not prove exact access closure")
 	}
 	return contraction, nil
+}
+
+func (executor *LiveExecutor) reconcileCertificateInventory(ctx context.Context, installation domain.Installation) error {
+	knownResources := map[string]bool{}
+	for _, id := range []string{executor.state.ResourceID, executor.state.TemporaryResourceID, executor.state.TailnetResourceID} {
+		if id != "" {
+			knownResources[id] = true
+		}
+	}
+	for _, resource := range installation.Resources {
+		bundle := resource.PublicationRecord.LastAppliedBundle
+		if !knownResources[resource.ID] || bundle == nil || bundle.DomainHTTPS == nil {
+			continue
+		}
+		if err := executor.rememberResourceCertificate(ctx, resource.ID); err != nil {
+			return fmt.Errorf("reconcile certificate for resource %s: %w", resource.ID, err)
+		}
+	}
+	if installation.Headscale != nil && installation.Headscale.Certificate != nil {
+		if err := executor.rememberRetainedHeadscaleCertificate(ctx); err != nil {
+			return fmt.Errorf("reconcile retained Headscale certificate: %w", err)
+		}
+	}
+	return nil
+}
+
+func (executor *LiveExecutor) certificateArtifact(value domain.CertificateBundleIdentity) (qualificationCertificateArtifact, error) {
+	if value.Authority == nil {
+		return qualificationCertificateArtifact{}, fmt.Errorf("certificate authority identity is missing")
+	}
+	artifact := qualificationCertificateArtifact{CertificateID: value.Authority.CertificateID, Generation: value.Generation, Bundle: certificates.BundleIdentity{Fingerprint: value.Fingerprint, SANIdentity: value.SANIdentity, ChainIdentity: value.ChainIdentity, IssuerIdentity: value.IssuerIdentity, BindingIdentity: value.BindingIdentity, DirectoryIdentity: value.DirectoryIdentity}}
+	pointer, err := certificates.ActivePointerPath(artifact.CertificateID)
+	if err != nil {
+		return qualificationCertificateArtifact{}, err
+	}
+	if value.PointerIdentity != pointer {
+		return qualificationCertificateArtifact{}, fmt.Errorf("certificate pointer identity differs from fixed inventory")
+	}
+	if err := validateQualificationCertificateArtifacts([]qualificationCertificateArtifact{artifact}, true); err != nil {
+		return qualificationCertificateArtifact{}, err
+	}
+	return artifact, nil
+}
+
+func (executor *LiveExecutor) rememberResourceCertificate(ctx context.Context, resourceID string) error {
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return err
+	}
+	var matched *domain.AppResource
+	for index := range configuration.Installation.Resources {
+		if configuration.Installation.Resources[index].ID == resourceID {
+			if matched != nil {
+				return fmt.Errorf("published resource certificate identity is ambiguous")
+			}
+			matched = &configuration.Installation.Resources[index]
+		}
+	}
+	// Close-all/unpublish retains LastAppliedBundle, including the exact
+	// certificate that cleanup must remove after deleting the resource.
+	if matched == nil || matched.PublicationRecord.LastAppliedBundle == nil {
+		return fmt.Errorf("applied resource certificate identity is unavailable")
+	}
+	if matched.PublicationRecord.LastAppliedBundle.DomainHTTPS == nil {
+		if matched.Publication.Kind == domain.PublicationTemporaryHTTP {
+			return nil
+		}
+		return fmt.Errorf("domain publication certificate identity is unavailable")
+	}
+	artifact, err := executor.certificateArtifact(matched.PublicationRecord.LastAppliedBundle.DomainHTTPS.Certificate)
+	if err != nil {
+		return err
+	}
+	for _, existing := range executor.state.CertificateCleanup {
+		if existing.CertificateID == artifact.CertificateID && existing.Generation == artifact.Generation {
+			if existing != artifact {
+				return fmt.Errorf("published certificate identity changed")
+			}
+			return nil
+		}
+	}
+	if executor.state.RetainedCertificate != nil && executor.state.RetainedCertificate.CertificateID == artifact.CertificateID {
+		return fmt.Errorf("published App certificate aliases retained Headscale certificate")
+	}
+	executor.state.CertificateCleanup = append(executor.state.CertificateCleanup, artifact)
+	executor.state.CertificateCleanupComplete = false
+	return executor.states.Write(executor.state)
+}
+
+func (executor *LiveExecutor) rememberRetainedHeadscaleCertificate(ctx context.Context) error {
+	configuration, err := executor.configurationInventory(ctx)
+	if err != nil {
+		return err
+	}
+	headscale := configuration.Installation.Headscale
+	if headscale == nil || !headscale.Enabled || headscale.Applied == nil || headscale.Certificate == nil {
+		return fmt.Errorf("retained Headscale certificate identity is unavailable")
+	}
+	artifact, err := executor.certificateArtifact(*headscale.Certificate)
+	if err != nil {
+		return err
+	}
+	for _, cleanup := range executor.state.CertificateCleanup {
+		if cleanup.CertificateID == artifact.CertificateID {
+			return fmt.Errorf("retained Headscale certificate aliases App cleanup identity")
+		}
+	}
+	if executor.state.RetainedCertificate != nil && *executor.state.RetainedCertificate != artifact {
+		return fmt.Errorf("retained Headscale certificate identity changed")
+	}
+	executor.state.RetainedCertificate = &artifact
+	return executor.states.Write(executor.state)
 }
 
 func (executor *LiveExecutor) configurationInventory(ctx context.Context) (application.ConfigurationExport, error) {
@@ -859,6 +974,9 @@ func connectorDeviceCandidate(devices []managedheadscale.Device, intent *connect
 	if err != nil {
 		return 0, false, err
 	}
+	if err := requireExactDeviceInventoryDelta(before, devices, selected.ID); err != nil {
+		return 0, false, err
+	}
 	if selected.CreatedAt.Before(intent.CreatedAt.Add(-time.Second)) || selected.CreatedAt.After(intent.Deadline) {
 		return 0, false, fmt.Errorf("pending connector device creation is outside its operation window")
 	}
@@ -891,6 +1009,9 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 	if _, err := executor.management.Post(ctx, "/api/actions/headscale_control_deploy", application.HeadscaleDeployPayload{PlanID: planID, Confirmation: "deploy", Certificate: certificate}, &deployed); err != nil {
 		return nil, err
 	}
+	if err := executor.rememberRetainedHeadscaleCertificate(ctx); err != nil {
+		return nil, err
+	}
 	probe, err := retryPublicProbe(ctx, executor.vantage, PublicProbe{Scheme: "https", ConnectIPv4: executor.journey.PublicIPv4, Port: 443, Host: executor.journey.HeadscaleDomain, Path: "/health", ExpectedStatus: 200}, 2*time.Minute)
 	if err != nil {
 		return nil, err
@@ -903,7 +1024,7 @@ func (executor *LiveExecutor) stepHeadscale(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	return evidence("headscale-http01", map[string]string{"initialize_job": initialized.JobID, "deploy_job": deployed.JobID, "control_https": release.DigestBytes(probe), "derp": release.DigestBytes(derp), "stun": release.DigestBytes(stun), "dns_record": record.ID})
+	return evidenceWithObservations("headscale-http01", map[string]string{"acme_directory": executor.prepared.Input.ACME.DirectoryURL, "challenge_method": "http-01", "deploy_job": deployed.JobID, "dns_record": record.ID, "initialize_job": initialized.JobID}, map[string][]byte{"control_https": probe, "derp": derp, "stun": stun}, nil)
 }
 
 func (executor *LiveExecutor) stepHeadscaleEntities(ctx context.Context) ([]byte, error) {
@@ -1056,6 +1177,34 @@ func selectConnectorDevice(before, after []managedheadscale.Device, userID uint6
 	return matches[0], nil
 }
 
+func requireExactDeviceInventoryDelta(before, after []managedheadscale.Device, createdID uint64) error {
+	if createdID == 0 || len(after) != len(before)+1 {
+		return fmt.Errorf("connector login changed the device inventory by more than one exact result")
+	}
+	expected := make(map[uint64]bool, len(after))
+	for _, device := range before {
+		if device.ID == 0 || expected[device.ID] {
+			return fmt.Errorf("connector pre-login device inventory is ambiguous")
+		}
+		expected[device.ID] = true
+	}
+	if expected[createdID] {
+		return fmt.Errorf("connector result device was already present")
+	}
+	expected[createdID] = true
+	seen := make(map[uint64]bool, len(after))
+	for _, device := range after {
+		if device.ID == 0 || seen[device.ID] || !expected[device.ID] {
+			return fmt.Errorf("connector post-login device inventory contains an unexpected result")
+		}
+		seen[device.ID] = true
+	}
+	if len(seen) != len(expected) {
+		return fmt.Errorf("connector post-login device inventory lost a prior identity")
+	}
+	return nil
+}
+
 func confirmConnectorDevice(devices []managedheadscale.Device, deviceID, userID uint64, localIPs []netip.Addr) error {
 	matches := 0
 	for _, device := range devices {
@@ -1163,6 +1312,9 @@ func (executor *LiveExecutor) stepConnector(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := requireExactDeviceInventoryDelta(devicesBefore.Devices, devices.Devices, device.ID); err != nil {
+		return nil, err
+	}
 	executor.state.ConnectorDeviceID = strconv.FormatUint(device.ID, 10)
 	executor.state.PendingConnectorDevice = nil
 	if err := executor.states.Write(executor.state); err != nil {
@@ -1232,7 +1384,7 @@ func (executor *LiveExecutor) stepTailnet(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return evidence("tailnet-live", map[string]string{"http": release.DigestBytes(httpEvidence), "websocket": release.DigestBytes(websocketEvidence), "resource_id": created.ResourceID})
+	return evidenceWithObservations("tailnet-live", map[string]string{"resource_id": created.ResourceID}, map[string][]byte{"public_https": httpEvidence, "websocket_https": websocketEvidence}, nil)
 }
 
 func (executor *LiveExecutor) stepDNS01(ctx context.Context) ([]byte, error) {
@@ -1274,7 +1426,7 @@ func (executor *LiveExecutor) stepDNS01(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return evidence("dns01", map[string]string{"provider": "cloudflare", "https": release.DigestBytes(probe), "txt_cleanup": "verified", "profile": setup.Evidence})
+	return evidenceWithObservations("dns01", map[string]string{"acme_directory": executor.prepared.Input.ACME.DirectoryURL, "challenge_method": "dns-01", "challenge_owner": "_acme-challenge." + executor.journey.DNS01Domain, "profile": setup.Evidence, "provider": "cloudflare", "txt_cleanup": "provider-and-authoritative-absent"}, map[string][]byte{"public_https": probe}, nil)
 }
 
 func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) ([]byte, error) {
@@ -1299,6 +1451,8 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if err != nil {
 		return nil, err
 	}
+	bootBeforeID := strings.TrimSpace(string(bootBefore))
+	bootAfterID := ""
 	candidatePath := remoteStagingRoot(executor.prepared.Input.RunID) + "/lanpanel"
 	rebootResponse, rebootErr := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentReboot, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes)})
 	if executor.management != nil {
@@ -1321,7 +1475,8 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 		}
 		fingerprint, _, observeErr := target.ObserveQualificationHost(ctx, executor.prepared.Install.Identity().Profile)
 		bootAfter, bootErr := target.readRemoteVirtual(ctx, "/proc/sys/kernel/random/boot_id", 4096)
-		if observeErr == nil && bootErr == nil && fingerprint == executor.prepared.Input.SSH.MachineFingerprint && strings.TrimSpace(string(bootAfter)) != strings.TrimSpace(string(bootBefore)) {
+		if observeErr == nil && bootErr == nil && fingerprint == executor.prepared.Input.SSH.MachineFingerprint && strings.TrimSpace(string(bootAfter)) != bootBeforeID {
+			bootAfterID = strings.TrimSpace(string(bootAfter))
 			executor.target = target
 			break
 		}
@@ -1401,10 +1556,6 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if err := confirmRevokedPreauthKey(keysAfterRevoke.Keys, keyID, time.Now().UTC()); err != nil {
 		return nil, err
 	}
-	executor.state.PreauthKeyID = ""
-	if err := executor.states.Write(executor.state); err != nil {
-		return nil, err
-	}
 	if err := executor.cleanupLiveEffects(ctx); err != nil {
 		return nil, err
 	}
@@ -1420,7 +1571,7 @@ func (executor *LiveExecutor) stepManagementCleanupReboot(ctx context.Context) (
 	if _, err := executor.management.Post(ctx, "/api/actions/job_list", struct{}{}, &jobs); err != nil || len(jobs.Jobs) == 0 {
 		return nil, errors.Join(err, fmt.Errorf("job inventory is incomplete"))
 	}
-	return evidence("management-cleanup-reboot", map[string]string{"close_before": release.DigestBytes(closedBefore), "close_after": release.DigestBytes(closedAfter), "token_digest": tokenDigest, "device_expiry": "verified", "preauth_key_revoke": "verified", "diagnostics": "read", "configuration_export": "read", "jobs": "read", "reboot": "verified"})
+	return evidenceWithObservations("management-cleanup-reboot", map[string]string{"boot_after": bootAfterID, "boot_before": bootBeforeID, "configuration_export": "read", "device_expiry": "verified", "diagnostics": "read", "host_fingerprint": executor.prepared.Input.SSH.MachineFingerprint, "jobs": "read", "preauth_key_revoke": "verified", "reboot": "verified", "token_digest": tokenDigest}, map[string][]byte{"closed_after_reboot": closedAfter, "closed_before_reboot": closedBefore}, nil)
 }
 
 func (executor *LiveExecutor) stepFinalInventory(ctx context.Context) ([]byte, error) {
@@ -1458,8 +1609,10 @@ func (executor *LiveExecutor) stepFinalInventory(ctx context.Context) ([]byte, e
 			return nil, err
 		}
 	}
-	candidatePath := remoteStagingRoot(executor.prepared.Input.RunID) + "/lanpanel"
-	final, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentFinalInventory, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes)})
+	if executor.state.RetainedCertificate == nil || !executor.state.CertificateCleanupComplete || len(executor.state.CertificateCleanup) == 0 {
+		return nil, fmt.Errorf("final certificate cleanup inventory is incomplete")
+	}
+	final, err := executor.target.RunAgent(ctx, bootstrap.FixedPaths().BinaryPath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentFinalInventory, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), Certificates: []qualificationCertificateArtifact{*executor.state.RetainedCertificate}})
 	if err != nil || !final.Succeeded {
 		return nil, errors.Join(err, fmt.Errorf("final host inventory failed: %s", final.ErrorCode))
 	}
@@ -1478,7 +1631,12 @@ func (executor *LiveExecutor) stepFinalInventory(ctx context.Context) ([]byte, e
 	if err := executor.states.Write(executor.state); err != nil {
 		return nil, err
 	}
-	return evidence("final-inventory", map[string]string{"host": final.Evidence, "provider_txt": "empty", "cleanup": "complete"})
+	certificateEvidence, err := certificateInventoryEvidence(executor.state)
+	if err != nil {
+		return nil, err
+	}
+	identity := executor.prepared.Install.Identity()
+	return evidenceWithObservations("final-inventory", map[string]string{"candidate_digest": identity.CandidateDigest, "cleanup": "complete", "host_fingerprint": executor.prepared.Input.SSH.MachineFingerprint, "host_inventory": final.Evidence, "nonretained_certificates": "absent", "profile_digest": identity.ProfileDigest, "provider": executor.prepared.Input.DNS.Provider, "provider_txt": "provider-and-authoritative-absent", "retained_certificate": "exact", "retained_certificate_id": executor.state.RetainedCertificate.CertificateID, "retained_headscale_domain": executor.journey.HeadscaleDomain}, map[string][]byte{"certificate_inventory": certificateEvidence}, final.ObservedPackageTuple)
 }
 
 func (executor *LiveExecutor) createARecord(ctx context.Context, name string) (cloudflareRecord, error) {
@@ -1529,6 +1687,9 @@ func (executor *LiveExecutor) cleanupLiveEffects(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := executor.reconcileCertificateInventory(ctx, configuration.Installation); err != nil {
+		return err
+	}
 	resourceInventory, err := resourceIDs(configuration.Installation)
 	if err != nil {
 		return err
@@ -1560,45 +1721,85 @@ func (executor *LiveExecutor) cleanupLiveEffects(ctx context.Context) error {
 			}
 		}
 	}
+	if executor.state.ConnectorDeviceID != "" {
+		deviceID, deviceIDErr := strconv.ParseUint(executor.state.ConnectorDeviceID, 10, 64)
+		userID, userIDErr := strconv.ParseUint(executor.state.HeadscaleUserID, 10, 64)
+		var err error
+		var devices application.HeadscaleDevicesResult
+		if deviceIDErr != nil || userIDErr != nil || deviceID == 0 || userID == 0 {
+			err = fmt.Errorf("connector device cleanup identity is invalid")
+		} else if _, err = executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices); err == nil {
+			matches := 0
+			needsExpiry := false
+			for _, device := range devices.Devices {
+				if device.ID == deviceID && device.UserID == userID {
+					matches++
+					needsExpiry = device.Expiry.IsZero() || device.Expiry.After(time.Now().UTC())
+				}
+			}
+			if matches != 1 {
+				err = fmt.Errorf("connector device cleanup result reference does not resolve exactly")
+			} else if needsExpiry {
+				query := "?device_id=" + url.QueryEscape(executor.state.ConnectorDeviceID)
+				var planID string
+				planID, err = executor.management.Plan(ctx, "/api/actions/device_expire", query, application.HeadscaleLifecyclePayload{})
+				if err == nil {
+					var expired application.HeadscaleDeviceResult
+					_, err = executor.management.Post(ctx, "/api/actions/device_expire"+query, application.HeadscaleLifecyclePayload{PlanID: planID, Confirmation: "expire"}, &expired)
+					if err == nil && (expired.Device.ID != deviceID || expired.Device.UserID != userID) {
+						err = fmt.Errorf("connector device cleanup identity changed")
+					}
+				}
+			}
+			if err == nil {
+				_, err = executor.management.Post(ctx, "/api/actions/device_list", struct{}{}, &devices)
+			}
+			if err == nil {
+				err = confirmExpiredConnectorDevice(devices.Devices, deviceID, userID, time.Now().UTC())
+			}
+		}
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup connector device: %w", err))
+		}
+	}
 	if executor.state.PreauthKeyID != "" {
 		keyID, keyIDErr := strconv.ParseUint(executor.state.PreauthKeyID, 10, 64)
 		var err error
+		var keys application.HeadscaleKeysResult
 		if keyIDErr != nil || keyID == 0 {
 			err = fmt.Errorf("preauth key cleanup identity is invalid")
-		} else {
-			var keys application.HeadscaleKeysResult
-			_, err = executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keys)
+		} else if _, err = executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keys); err == nil {
+			matches := 0
+			needsRevocation := false
+			for _, key := range keys.Keys {
+				if key.ID == keyID {
+					matches++
+					needsRevocation = key.Expiration.After(time.Now().UTC()) && !key.Used
+				}
+			}
+			if matches != 1 {
+				err = fmt.Errorf("preauth key cleanup identity is absent or ambiguous")
+			} else if needsRevocation {
+				keyQuery := "?key_id=" + url.QueryEscape(executor.state.PreauthKeyID)
+				var keyPlan string
+				keyPlan, err = executor.management.Plan(ctx, "/api/actions/preauth_key_revoke", keyQuery, application.HeadscaleLifecyclePayload{})
+				if err == nil {
+					var revoked application.HeadscaleKeyResult
+					_, err = executor.management.Post(ctx, "/api/actions/preauth_key_revoke"+keyQuery, application.HeadscaleLifecyclePayload{PlanID: keyPlan, Confirmation: "revoke"}, &revoked)
+					if err == nil && revoked.Key.ID != keyID {
+						err = fmt.Errorf("preauth key cleanup identity changed")
+					}
+				}
+			}
 			if err == nil {
-				present := false
-				for _, key := range keys.Keys {
-					if key.ID == keyID {
-						present = true
-						break
-					}
-				}
-				if !present {
-					err = fmt.Errorf("preauth key cleanup identity is absent; inactive state is unproven")
-				} else {
-					keyQuery := "?key_id=" + url.QueryEscape(executor.state.PreauthKeyID)
-					keyPlan, planErr := executor.management.Plan(ctx, "/api/actions/preauth_key_revoke", keyQuery, application.HeadscaleLifecyclePayload{})
-					err = planErr
-					if err == nil {
-						var revoked application.HeadscaleKeyResult
-						_, err = executor.management.Post(ctx, "/api/actions/preauth_key_revoke"+keyQuery, application.HeadscaleLifecyclePayload{PlanID: keyPlan, Confirmation: "revoke"}, &revoked)
-						if err == nil && revoked.Key.ID != keyID {
-							err = fmt.Errorf("preauth key cleanup identity changed")
-						}
-					}
-				}
+				_, err = executor.management.Post(ctx, "/api/actions/preauth_key_list", struct{}{}, &keys)
+			}
+			if err == nil {
+				err = confirmRevokedPreauthKey(keys.Keys, keyID, time.Now().UTC())
 			}
 		}
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup preauth key: %w", err))
-		} else {
-			executor.state.PreauthKeyID = ""
-			if err := executor.states.Write(executor.state); err != nil {
-				cleanupErr = errors.Join(cleanupErr, err)
-			}
 		}
 	}
 	for _, resourceID := range []string{executor.state.TemporaryResourceID, executor.state.TailnetResourceID, executor.state.ResourceID} {
@@ -1698,6 +1899,22 @@ func (executor *LiveExecutor) cleanupLiveEffects(ctx context.Context) error {
 		}
 	}
 	candidatePath := remoteStagingRoot(executor.prepared.Input.RunID) + "/lanpanel"
+	resourcesRemoved := (executor.state.ResourceID == "" || executor.state.ResourceDeleted) && executor.state.TemporaryResourceID == "" && executor.state.TailnetResourceID == ""
+	if len(executor.state.CertificateCleanup) != 0 && !executor.state.CertificateCleanupComplete {
+		if !resourcesRemoved {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("certificate cleanup is blocked until exact run resources are deleted"))
+		} else {
+			certificateCleanup, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentCleanupCertificates, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), Certificates: append([]qualificationCertificateArtifact(nil), executor.state.CertificateCleanup...)})
+			if err != nil || !certificateCleanup.Succeeded {
+				cleanupErr = errors.Join(cleanupErr, err, fmt.Errorf("certificate cleanup failed: %s", certificateCleanup.ErrorCode))
+			} else {
+				executor.state.CertificateCleanupComplete = true
+				if err := executor.states.Write(executor.state); err != nil {
+					cleanupErr = errors.Join(cleanupErr, err)
+				}
+			}
+		}
+	}
 	cleanup, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentCleanupFixture, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes)})
 	if err != nil || !cleanup.Succeeded {
 		cleanupErr = errors.Join(cleanupErr, err, fmt.Errorf("fixture cleanup failed: %s", cleanup.ErrorCode))
@@ -1755,6 +1972,11 @@ func (executor *LiveExecutor) planConfirmation(ctx context.Context, operation, t
 		if value.JobResult != "succeeded" || value.JobID == "" {
 			return fmt.Errorf("publication did not reach an exact succeeded terminal result")
 		}
+		if operation == "publish" {
+			if err := executor.rememberResourceCertificate(ctx, targetID); err != nil {
+				return err
+			}
+		}
 	case *contractionResult:
 		if value.Outcome == "" || !value.AccessClosed || value.AccessMayRemain {
 			return fmt.Errorf("contraction did not prove exact access closure")
@@ -1795,11 +2017,22 @@ func loadTailnetPeer(reference string) (TailnetPeerAuthority, string, error) {
 }
 
 func evidence(kind string, values map[string]string) ([]byte, error) {
-	return release.MarshalCanonical(struct {
-		SchemaVersion string            `json:"schema_version"`
-		Kind          string            `json:"kind"`
-		Values        map[string]string `json:"values"`
-	}{"lanpanel.qualification.step-evidence.v1", kind, values})
+	return evidenceWithObservations(kind, values, nil, nil)
+}
+
+func evidenceWithObservations(kind string, values map[string]string, observations map[string][]byte, packageTuple []release.PackageTuple) ([]byte, error) {
+	nested := make(map[string]json.RawMessage, len(observations))
+	for name, observation := range observations {
+		nested[name] = append([]byte(nil), observation...)
+	}
+	encoded, err := release.MarshalCanonical(release.LiveStepEvidence{SchemaVersion: release.LiveStepEvidenceSchemaVersion, Kind: kind, Values: values, Observations: nested, ObservedPackageTuple: append([]release.PackageTuple(nil), packageTuple...)})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := release.DecodeLiveStepEvidence(encoded); err != nil {
+		return nil, err
+	}
+	return encoded, nil
 }
 
 func waitAuthoritativeDNS(ctx context.Context, zone string, names []string, expected string) error {

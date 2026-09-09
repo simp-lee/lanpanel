@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -270,7 +271,7 @@ func validateRoot(path string) error {
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("static root parent unsafe")
 		}
-		stat, ok := info.Sys().(*unix.Stat_t)
+		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok || stat.Uid != 0 || info.Mode().Perm()&0o022 != 0 || info.Mode().Perm()&0o005 != 0o005 {
 			return fmt.Errorf("static root parent ownership or mode unsafe")
 		}

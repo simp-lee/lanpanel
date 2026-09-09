@@ -39,13 +39,15 @@ func TestProtectedReportStoreIsMonotonic(t *testing.T) {
 	path := filepath.Join(root, "cleanup.json")
 	store := ProtectedReportStore{Path: path}
 	now := time.Unix(1_700_000_000, 0).UTC()
-	first := release.LiveCleanupReport{SchemaVersion: release.LiveCleanupReportSchemaVersion, RunID: "run-one", SideEffectPlanDigest: release.DigestBytes([]byte("plan")), QualificationInstallManifestDigest: release.DigestBytes([]byte("manifest")), ProtectedInputDigest: release.DigestBytes([]byte("input")), UpdatedAt: now, Steps: []release.JourneyStepResult{{MutationID: "one", AttemptID: "attempt-one", Outcome: release.StepPassed, EvidenceDigest: release.DigestBytes([]byte("one"))}}, Items: []release.CleanupItem{{MutationID: "one", ObservedIdentity: "object/one", Result: release.CleanupCleaned}}}
+	firstEvidence := fakeStepEvidence("one")
+	first := release.LiveCleanupReport{SchemaVersion: release.LiveCleanupReportSchemaVersion, RunID: "run-one", SideEffectPlanDigest: release.DigestBytes([]byte("plan")), QualificationInstallManifestDigest: release.DigestBytes([]byte("manifest")), ProtectedInputDigest: release.DigestBytes([]byte("input")), UpdatedAt: now, Steps: []release.JourneyStepResult{{MutationID: "one", AttemptID: "attempt-one", Outcome: release.StepPassed, Evidence: firstEvidence, EvidenceDigest: release.DigestBytes(firstEvidence)}}, Items: []release.CleanupItem{{MutationID: "one", ObservedIdentity: "object/one", Result: release.CleanupCleaned}}}
 	if err := store.Write(first); err != nil {
 		t.Fatal(err)
 	}
 	second := first
 	second.UpdatedAt = now.Add(time.Second)
-	second.Steps = append(append([]release.JourneyStepResult(nil), first.Steps...), release.JourneyStepResult{MutationID: "two", AttemptID: "attempt-two", Outcome: release.StepPassed, EvidenceDigest: release.DigestBytes([]byte("two"))})
+	secondEvidence := fakeStepEvidence("two")
+	second.Steps = append(append([]release.JourneyStepResult(nil), first.Steps...), release.JourneyStepResult{MutationID: "two", AttemptID: "attempt-two", Outcome: release.StepPassed, Evidence: secondEvidence, EvidenceDigest: release.DigestBytes(secondEvidence)})
 	second.Items = append(append([]release.CleanupItem(nil), first.Items...), release.CleanupItem{MutationID: "two", ObservedIdentity: "object/two", Result: release.CleanupRetained})
 	if err := store.Write(second); err != nil {
 		t.Fatal(err)

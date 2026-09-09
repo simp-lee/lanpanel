@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/safety"
+	"lanpanel/internal/storeauthority"
 	"slices"
 	"strings"
 	"time"
@@ -45,13 +46,19 @@ func Guard(input GuardInput) GuardDecision {
 	if err := safety.Validate(input.Safety); err != nil {
 		return GuardDecision{Reason: "independent safety authority is invalid"}
 	}
+	if input.Installation == nil || input.Manifest.InstallationID != input.Installation.InstallationID {
+		return GuardDecision{Reason: "disk graph installation identity does not exactly match normal authority; keep ingress closed and use configuration export and clean-host rebuild"}
+	}
+	if err := storeauthority.ValidateNormalSafetyOwnership(input.Installation, input.Safety, input.Ownership); err != nil {
+		return GuardDecision{Reason: err.Error()}
+	}
 	if input.Safety.StopFence != nil {
 		return GuardDecision{Reason: "stop fence blocks Nginx start and reload"}
 	}
 	for _, entry := range input.Manifest.Entries {
 		if entry.Kind == EntryChallenge && entry.ResourceID == "headscale" {
 			pending := input.Safety.Headscale.ChallengePending
-			if pending == nil || pending.Method != "http-01" || pending.Generation != entry.Generation || entry.Challenge == nil || pending.Webroot != entry.Challenge.Webroot || !slices.Equal(pending.Hosts, entry.Domains) || !headscaleChallengeSnapshotMatches(pending.BaseMarkers, input.Safety.Headscale) {
+			if pending == nil || pending.Generation != entry.Generation || !exactHTTPChallengeEntry(pending, entry) || !headscaleChallengeSnapshotMatches(pending.BaseMarkers, input.Safety.Headscale) {
 				return GuardDecision{Reason: "Headscale challenge graph lacks exact authority"}
 			}
 			continue
@@ -67,7 +74,7 @@ func Guard(input GuardInput) GuardDecision {
 			base := entry
 			if entry.Challenge != nil {
 				pending := input.Safety.Headscale.ChallengePending
-				if pending == nil || pending.Method != "http-01" || pending.Webroot != entry.Challenge.Webroot || !slices.Equal(pending.Hosts, entry.Domains) || !headscaleChallengeSnapshotMatches(pending.BaseMarkers, input.Safety.Headscale) {
+				if !exactHTTPChallengeEntry(pending, entry) || !headscaleChallengeSnapshotMatches(pending.BaseMarkers, input.Safety.Headscale) {
 					return GuardDecision{Reason: "Headscale control challenge authority changed"}
 				}
 				base.Challenge = nil
@@ -97,7 +104,7 @@ func Guard(input GuardInput) GuardDecision {
 		switch entry.Kind {
 		case EntryChallenge:
 			pending := resource.ChallengePending
-			if pending == nil || pending.Method != "http-01" || pending.Generation != entry.Generation || pending.Webroot != entry.Challenge.Webroot || pending.TokenPath != "/.well-known/acme-challenge" || pending.BootstrapIdentity == "" || !slices.Equal(pending.Hosts, entry.Domains) || !challengeSnapshotMatches(pending.BaseMarkers, *resource) {
+			if pending == nil || pending.Generation != entry.Generation || !exactHTTPChallengeEntry(pending, entry) || pending.BootstrapIdentity == "" || !challengeSnapshotMatches(pending.BaseMarkers, *resource) {
 				return GuardDecision{Reason: "challenge graph lacks exact durable HTTP-01 authority"}
 			}
 		case EntryApp, EntryTemporary:
@@ -116,6 +123,14 @@ func Guard(input GuardInput) GuardDecision {
 		}
 	}
 	return GuardDecision{Allowed: true, Reason: "exact durable safety and disk graph match"}
+}
+
+func exactHTTPChallengeEntry(pending *safety.ChallengePending, entry Entry) bool {
+	if pending == nil || pending.Method != "http-01" || entry.Challenge == nil || pending.Token == "" || pending.TokenPath == "" || pending.KeyAuthorizationDigest == "" {
+		return false
+	}
+	site := entry.Challenge
+	return pending.Generation == site.Generation && pending.Host == site.Host && pending.Token == site.Token && pending.TokenPath == site.TokenPath && pending.KeyAuthorizationDigest == site.KeyAuthorizationDigest && pending.Webroot == site.Webroot && slices.Equal(entry.Domains, []string{pending.Host})
 }
 
 func findInstallationResource(installation *domain.Installation, id string) *domain.AppResource {

@@ -2,13 +2,49 @@ package qualification
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"lanpanel/internal/release"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestTrustedHTTPSObservationBindsPublicCertificate(t *testing.T) {
+	host := "app.example.test"
+	evidence := PublicEvidence{SchemaVersion: "lanpanel.qualification.public-evidence.v2", URL: "https://" + host + "/echo", Status: 200, BodyDigest: release.DigestBytes([]byte("body")), TLSVersion: tls.VersionTLS13, PublicTrustVerified: true, CertificateSHA256: release.DigestBytes([]byte("certificate")), CertificateDNSNames: []string{host}, CertificateNotAfterUTC: time.Unix(2_000_000_000, 0).UTC().Format(time.RFC3339)}
+	data, err := release.MarshalCanonical(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyTrustedHTTPSObservation(data, host, "/echo"); err != nil {
+		t.Fatalf("trusted public certificate observation was rejected: %v", err)
+	}
+	for name, change := range map[string]func(*PublicEvidence){
+		"trust":       func(value *PublicEvidence) { value.PublicTrustVerified = false },
+		"certificate": func(value *PublicEvidence) { value.CertificateSHA256 = "" },
+		"host":        func(value *PublicEvidence) { value.CertificateDNSNames = []string{"other.example.test"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := evidence
+			change(&candidate)
+			encoded, _ := release.MarshalCanonical(candidate)
+			if err := verifyTrustedHTTPSObservation(encoded, host, "/echo"); err == nil || !strings.Contains(err.Error(), "public HTTPS") {
+				t.Fatalf("invalid public trust observation passed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublicProbeRequestAuthorityIncludesTemporaryHTTPPort(t *testing.T) {
+	probe := PublicProbe{Scheme: "http", Host: "8.8.8.8", Port: 18080}
+	if authority := publicProbeRequestAuthority(probe); authority != "8.8.8.8:18080" {
+		t.Fatalf("temporary HTTP authority = %q", authority)
+	}
+}
 
 func TestProbeSTUNEndpointValidatesBindingResponse(t *testing.T) {
 	tests := []struct {

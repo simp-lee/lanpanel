@@ -30,7 +30,7 @@ func TestInvocationCgroupNamesAreTyped(t *testing.T) {
 }
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileQualificationReboot, ProfileQualificationServices, ProfileQualificationUIRestart, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileQualificationReboot, ProfileQualificationServices, ProfileQualificationUIRestart, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -51,7 +51,14 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 		t.Fatalf("Nginx stop profile=%#v error=%v", stop, err)
 	}
 	headscaleInvocation := Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: "hds_00000000000000000000000000000001"}}
-	for profileID, wantArguments := range map[ProfileID][]string{ProfileHeadscaleStart: {"start", "lanpanel-headscale.service"}, ProfileHeadscaleStop: {"stop", "lanpanel-headscale.service"}} {
+	for profileID, wantArguments := range map[ProfileID][]string{
+		ProfileHeadscaleStart:         {"start", "lanpanel-headscale.service"},
+		ProfileHeadscaleStop:          {"stop", "lanpanel-headscale.service"},
+		ProfileHeadscaleBootEnable:    {"enable", "--now", "lanpanel-headscale.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"},
+		ProfileHeadscaleBootReconcile: {"enable", "--now", "--no-block", "lanpanel-headscale.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"},
+		ProfileHeadscaleBootPersist:   {"enable", "lanpanel-headscale.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"},
+		ProfileHeadscaleBootDisable:   {"disable", "--now", "lanpanel-headscale-stun.socket", "lanpanel-headscale-control.socket", "lanpanel-headscale.service"},
+	} {
 		profile, err := ResolveInvocation(profileID, Identities{}, headscaleInvocation)
 		if err != nil || !profile.Complete || !profile.RootTCB || !reflect.DeepEqual(profile.Arguments, wantArguments) {
 			t.Fatalf("Headscale profile %s=%#v error=%v", profileID, profile, err)

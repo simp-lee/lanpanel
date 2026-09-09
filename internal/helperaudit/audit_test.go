@@ -363,6 +363,20 @@ var run = (*exec.Cmd).Run
 			},
 		},
 		{
+			name: "release scanner constructor arguments changed",
+			mutate: func(t *testing.T, root string) {
+				replaceFixture(t, root, "internal/qualification/security_scan_linux.go", `exec.CommandContext(ctx, command.Path, command.Arguments...)`, `exec.CommandContext(ctx, "/bin/sh", command.Arguments...)`)
+			},
+		},
+		{
+			name:          "missing release scanner environment",
+			errorContains: "census mismatch for security scan Env",
+			mutate: func(t *testing.T, root string) {
+				replaceFixture(t, root, "internal/qualification/security_scan_linux.go", `	process.Env = command.Environment
+`, ``)
+			},
+		},
+		{
 			name: "shadowed launcher argument",
 			mutate: func(t *testing.T, root string) {
 				replaceFixture(t, root, "internal/child/executor_linux.go", `func (launcher *Launcher) RunInvocation() error {`, `func (receiver *Launcher) RunInvocation() error {
@@ -468,6 +482,8 @@ func TestImportAliasesDoNotChangeApprovedBoundary(t *testing.T) {
 		replaceFixture(t, root, path, `"os/exec"`, `process "os/exec"`)
 		replaceAllFixture(t, root, path, "exec.", "process.")
 	}
+	replaceFixture(t, root, "internal/qualification/security_scan_linux.go", `"os/exec"`, `processpkg "os/exec"`)
+	replaceAllFixture(t, root, "internal/qualification/security_scan_linux.go", "exec.", "processpkg.")
 	for _, path := range []string{"internal/child/executor_linux.go", "internal/process/managed_exec_linux.go", "internal/process/listen_guard_linux.go", "internal/safety/emergency_linux.go"} {
 		replaceFixture(t, root, path, `"golang.org/x/sys/unix"`, `kernel "golang.org/x/sys/unix"`)
 		replaceAllFixture(t, root, path, "unix.", "kernel.")
@@ -678,6 +694,7 @@ func verifyListenGuardLink() {
 	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
 	_, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0)
 }
+func listenGuardUIDPresent() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
 func updateListenGuardUID() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
 func pinBPF() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
 func getPinnedBPF() { _, _, _ = unix.Syscall(unix.SYS_BPF, 0, 0, 0) }
@@ -723,6 +740,24 @@ func buildCandidate(root, releaseTag, destination string) error {
 	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=amd64", "GOENV=off", "GOFLAGS=-mod=readonly", "GOTOOLCHAIN=local", "GOPROXY=off", "GOSUMDB=off"}
 	_, err = command.CombinedOutput()
 	return err
+}
+`,
+		"internal/qualification/security_scan_linux.go": `package qualification
+import (
+	"bytes"
+	"context"
+	"os/exec"
+)
+type securityCommand struct { Path string; Arguments, Environment []string; Directory string }
+type securityCommandOutput struct{}
+func runSystemSecurityCommand(ctx context.Context, command securityCommand) (securityCommandOutput, error) {
+	process := exec.CommandContext(ctx, command.Path, command.Arguments...)
+	process.Dir = command.Directory
+	process.Env = command.Environment
+	stdout, stderr := new(bytes.Buffer), new(bytes.Buffer)
+	process.Stdout, process.Stderr = stdout, stderr
+	err := process.Run()
+	return securityCommandOutput{}, err
 }
 `,
 		"cmd/app/main.go": "package main\nfunc main() {}\n",

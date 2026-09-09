@@ -85,6 +85,27 @@ func TestReadProcessJournalRequiresCanonicalSafeFile(t *testing.T) {
 			t.Fatalf("valid applied process journal was rejected: %v", err)
 		}
 
+		contracted := applied
+		contracted.Operation = "process_stop"
+		contracted.Phase = "prepared"
+		contracted.Policy = confinement.UnitPolicy{}
+		contracted.ContractionKind = RuntimeViolationExtraListener
+		data, err = json.Marshal(contracted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readProcessJournal(newPath(data), owner); err != nil {
+			t.Fatalf("typed process contraction journal was rejected: %v", err)
+		}
+		contracted.Operation = "process_start"
+		data, err = json.Marshal(contracted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readProcessJournal(newPath(data), owner); err == nil {
+			t.Fatal("process expansion journal accepted a contraction violation kind")
+		}
+
 		reconfigured := applied
 		reconfigured.Phase = "prepared"
 		reconfigured.Policy = confinement.UnitPolicy{}

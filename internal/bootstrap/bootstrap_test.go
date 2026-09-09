@@ -35,6 +35,15 @@ func TestBPFGuardDirectoryRequiresExactBPFFSMount(t *testing.T) {
 	if !strings.Contains(string(data), " /sys/fs/bpf ") {
 		t.Skip("test runner has no bpffs")
 	}
+	guardPath := "/sys/fs/bpf/lanpanel"
+	if _, err := os.Lstat(guardPath); !errors.Is(err, os.ErrNotExist) {
+		t.Skip("requires an isolated bpffs without an existing LanPanel guard")
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(guardPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove isolated BPF guard: %v", err)
+		}
+	})
 	if err := ensureBPFGuardDirectory(); err != nil {
 		t.Fatal(err)
 	}

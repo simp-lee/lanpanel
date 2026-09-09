@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
@@ -15,7 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const liveStateSchemaVersion = "lanpanel.qualification.live-state.v3"
+const liveStateSchemaVersion = "lanpanel.qualification.live-state.v4"
 
 type dnsCreateIntent struct {
 	Name    string `json:"name"`
@@ -58,33 +59,50 @@ type connectorDeviceIntent struct {
 	PriorIDs   []uint64  `json:"prior_ids"`
 }
 
+type qualificationCertificateArtifact struct {
+	CertificateID string                      `json:"certificate_id"`
+	Generation    uint64                      `json:"generation"`
+	Bundle        certificates.BundleIdentity `json:"bundle"`
+}
+
+type qualificationCertificateInventoryEvidence struct {
+	SchemaVersion string                             `json:"schema_version"`
+	Deleted       []qualificationCertificateArtifact `json:"deleted"`
+	Retained      qualificationCertificateArtifact   `json:"retained"`
+}
+
+const qualificationCertificateInventoryEvidenceSchema = "lanpanel.qualification.certificate-inventory.v1"
+
 type liveState struct {
-	SchemaVersion              string                     `json:"schema_version"`
-	RunID                      string                     `json:"run_id"`
-	ProtectedInputDigest       string                     `json:"protected_input_digest"`
-	ResourceID                 string                     `json:"resource_id,omitempty"`
-	TemporaryResourceID        string                     `json:"temporary_resource_id,omitempty"`
-	TailnetResourceID          string                     `json:"tailnet_resource_id,omitempty"`
-	BasicCredentialID          string                     `json:"basic_credential_id,omitempty"`
-	StaticRootID               string                     `json:"static_root_id,omitempty"`
-	ExternalCredentialID       string                     `json:"external_credential_id,omitempty"`
-	HeadscaleUserID            string                     `json:"headscale_user_id,omitempty"`
-	PreauthKeyID               string                     `json:"preauth_key_id,omitempty"`
-	ConnectorDeviceID          string                     `json:"connector_device_id,omitempty"`
-	ConnectorBound             bool                       `json:"connector_bound"`
-	DNSCreateIntents           []dnsCreateIntent          `json:"dns_create_intents"`
-	CloudflareRecords          []cloudflareRecord         `json:"cloudflare_records"`
-	FixtureCreated             bool                       `json:"fixture_created"`
-	DNSProfileCreated          bool                       `json:"dns_profile_created"`
-	ResourceDeleted            bool                       `json:"resource_deleted"`
-	CloseAllCommitted          bool                       `json:"close_all_committed"`
-	CompletedSteps             []string                   `json:"completed_steps"`
-	FinalCleanupComplete       bool                       `json:"final_cleanup_complete"`
-	PendingRegistration        *registrationIntent        `json:"pending_registration,omitempty"`
-	PendingResourceCreate      *resourceCreateIntent      `json:"pending_resource_create,omitempty"`
-	PendingHeadscaleUserCreate *headscaleUserCreateIntent `json:"pending_headscale_user_create,omitempty"`
-	PendingPreauthKeyCreate    *preauthKeyCreateIntent    `json:"pending_preauth_key_create,omitempty"`
-	PendingConnectorDevice     *connectorDeviceIntent     `json:"pending_connector_device,omitempty"`
+	SchemaVersion              string                             `json:"schema_version"`
+	RunID                      string                             `json:"run_id"`
+	ProtectedInputDigest       string                             `json:"protected_input_digest"`
+	ResourceID                 string                             `json:"resource_id,omitempty"`
+	TemporaryResourceID        string                             `json:"temporary_resource_id,omitempty"`
+	TailnetResourceID          string                             `json:"tailnet_resource_id,omitempty"`
+	BasicCredentialID          string                             `json:"basic_credential_id,omitempty"`
+	StaticRootID               string                             `json:"static_root_id,omitempty"`
+	ExternalCredentialID       string                             `json:"external_credential_id,omitempty"`
+	HeadscaleUserID            string                             `json:"headscale_user_id,omitempty"`
+	PreauthKeyID               string                             `json:"preauth_key_id,omitempty"`
+	ConnectorDeviceID          string                             `json:"connector_device_id,omitempty"`
+	ConnectorBound             bool                               `json:"connector_bound"`
+	DNSCreateIntents           []dnsCreateIntent                  `json:"dns_create_intents"`
+	CloudflareRecords          []cloudflareRecord                 `json:"cloudflare_records"`
+	CertificateCleanup         []qualificationCertificateArtifact `json:"certificate_cleanup"`
+	CertificateCleanupComplete bool                               `json:"certificate_cleanup_complete"`
+	RetainedCertificate        *qualificationCertificateArtifact  `json:"retained_certificate,omitempty"`
+	FixtureCreated             bool                               `json:"fixture_created"`
+	DNSProfileCreated          bool                               `json:"dns_profile_created"`
+	ResourceDeleted            bool                               `json:"resource_deleted"`
+	CloseAllCommitted          bool                               `json:"close_all_committed"`
+	CompletedSteps             []string                           `json:"completed_steps"`
+	FinalCleanupComplete       bool                               `json:"final_cleanup_complete"`
+	PendingRegistration        *registrationIntent                `json:"pending_registration,omitempty"`
+	PendingResourceCreate      *resourceCreateIntent              `json:"pending_resource_create,omitempty"`
+	PendingHeadscaleUserCreate *headscaleUserCreateIntent         `json:"pending_headscale_user_create,omitempty"`
+	PendingPreauthKeyCreate    *preauthKeyCreateIntent            `json:"pending_preauth_key_create,omitempty"`
+	PendingConnectorDevice     *connectorDeviceIntent             `json:"pending_connector_device,omitempty"`
 }
 
 type liveStateStore struct{ path string }
@@ -92,7 +110,7 @@ type liveStateStore struct{ path string }
 func (store liveStateStore) Read(runID, inputDigest string) (liveState, bool, error) {
 	data, _, err := readProtectedFile(store.path, 4<<20, false)
 	if os.IsNotExist(err) {
-		return liveState{SchemaVersion: liveStateSchemaVersion, RunID: runID, ProtectedInputDigest: inputDigest, DNSCreateIntents: []dnsCreateIntent{}, CloudflareRecords: []cloudflareRecord{}, CompletedSteps: []string{}}, false, nil
+		return liveState{SchemaVersion: liveStateSchemaVersion, RunID: runID, ProtectedInputDigest: inputDigest, DNSCreateIntents: []dnsCreateIntent{}, CloudflareRecords: []cloudflareRecord{}, CertificateCleanup: []qualificationCertificateArtifact{}, CompletedSteps: []string{}}, false, nil
 	}
 	if err != nil {
 		return liveState{}, false, err
@@ -159,8 +177,24 @@ func (store liveStateStore) Write(state liveState) error {
 }
 
 func validateLiveState(state liveState, runID, inputDigest string) error {
-	if state.SchemaVersion != liveStateSchemaVersion || state.RunID != runID || state.ProtectedInputDigest != inputDigest || !release.ValidDigest(inputDigest) || len(state.DNSCreateIntents) > 16 || len(state.CloudflareRecords) > 16 {
+	if state.SchemaVersion != liveStateSchemaVersion || state.RunID != runID || state.ProtectedInputDigest != inputDigest || !release.ValidDigest(inputDigest) || len(state.DNSCreateIntents) > 16 || len(state.CloudflareRecords) > 16 || len(state.CertificateCleanup) > 32 {
 		return fmt.Errorf("live executor state authority is invalid")
+	}
+	if err := validateQualificationCertificateArtifacts(state.CertificateCleanup, false); err != nil {
+		return err
+	}
+	if state.RetainedCertificate != nil {
+		if err := validateQualificationCertificateArtifacts([]qualificationCertificateArtifact{*state.RetainedCertificate}, false); err != nil {
+			return err
+		}
+		for _, artifact := range state.CertificateCleanup {
+			if artifact.CertificateID == state.RetainedCertificate.CertificateID {
+				return fmt.Errorf("retained certificate is scheduled for cleanup")
+			}
+		}
+	}
+	if state.CertificateCleanupComplete && len(state.CertificateCleanup) == 0 || state.FinalCleanupComplete && len(state.CertificateCleanup) != 0 && !state.CertificateCleanupComplete {
+		return fmt.Errorf("live executor certificate cleanup state is incomplete")
 	}
 	for _, value := range []string{state.ResourceID, state.TemporaryResourceID, state.TailnetResourceID, state.BasicCredentialID, state.StaticRootID, state.ExternalCredentialID, state.HeadscaleUserID, state.PreauthKeyID, state.ConnectorDeviceID} {
 		if value != "" && (len(value) > 256 || value != filepath.Base(value)) {
@@ -202,6 +236,57 @@ func validateLiveState(state liveState, runID, inputDigest string) error {
 			return fmt.Errorf("live executor Cloudflare state is invalid")
 		}
 		seen[record.ID] = true
+	}
+	return nil
+}
+
+func validateQualificationCertificateArtifacts(values []qualificationCertificateArtifact, requireOne bool) error {
+	if len(values) > 32 || requireOne && len(values) != 1 {
+		return fmt.Errorf("qualification certificate inventory is invalid")
+	}
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		bundlePath, bundleErr := certificates.BundlePath(value.CertificateID, value.Generation)
+		pointerPath, pointerErr := certificates.ActivePointerPath(value.CertificateID)
+		key := fmt.Sprintf("%s/%d", value.CertificateID, value.Generation)
+		if bundleErr != nil || pointerErr != nil || bundlePath == "" || pointerPath == "" || certificates.ValidateBundleIdentity(value.Bundle) != nil || seen[key] {
+			return fmt.Errorf("qualification certificate identity is invalid")
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func certificateInventoryEvidence(state liveState) ([]byte, error) {
+	if !state.CertificateCleanupComplete || len(state.CertificateCleanup) == 0 || state.RetainedCertificate == nil {
+		return nil, fmt.Errorf("qualification certificate evidence state is incomplete")
+	}
+	value := qualificationCertificateInventoryEvidence{SchemaVersion: qualificationCertificateInventoryEvidenceSchema, Deleted: append([]qualificationCertificateArtifact(nil), state.CertificateCleanup...), Retained: *state.RetainedCertificate}
+	if err := validateQualificationCertificateInventoryEvidence(value); err != nil {
+		return nil, err
+	}
+	return release.MarshalCanonical(value)
+}
+
+func decodeQualificationCertificateInventoryEvidence(data []byte) (qualificationCertificateInventoryEvidence, error) {
+	var value qualificationCertificateInventoryEvidence
+	if err := release.DecodeCanonical(data, &value); err != nil {
+		return qualificationCertificateInventoryEvidence{}, err
+	}
+	if err := validateQualificationCertificateInventoryEvidence(value); err != nil {
+		return qualificationCertificateInventoryEvidence{}, err
+	}
+	return value, nil
+}
+
+func validateQualificationCertificateInventoryEvidence(value qualificationCertificateInventoryEvidence) error {
+	if value.SchemaVersion != qualificationCertificateInventoryEvidenceSchema || len(value.Deleted) == 0 || validateQualificationCertificateArtifacts(value.Deleted, false) != nil || validateQualificationCertificateArtifacts([]qualificationCertificateArtifact{value.Retained}, true) != nil {
+		return fmt.Errorf("qualification certificate evidence is invalid")
+	}
+	for _, deleted := range value.Deleted {
+		if deleted.CertificateID == value.Retained.CertificateID {
+			return fmt.Errorf("qualification retained certificate is in deleted inventory")
+		}
 	}
 	return nil
 }

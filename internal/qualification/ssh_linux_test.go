@@ -4,6 +4,7 @@ package qualification
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -18,11 +19,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
+
+func TestRemoteAgentPathAllowsInstalledBinaryOnlyForTerminalInventory(t *testing.T) {
+	installed := "/usr/lib/lanpanel/lanpanel"
+	if !validRemoteAgentPath(installed, AgentFinalInventory) {
+		t.Fatal("installed exact candidate cannot perform terminal inventory")
+	}
+	if validRemoteAgentPath(installed, AgentReboot) || validRemoteAgentPath("/usr/bin/lanpanel", AgentFinalInventory) {
+		t.Fatal("installed-agent exception escaped fixed terminal inventory path/action")
+	}
+	if !validRemoteAgentPath("/var/lib/lanpanel-qualification/run_"+strings.Repeat("a", 64)+"/lanpanel", AgentInstall) {
+		t.Fatal("run-scoped candidate path was rejected")
+	}
+}
 
 func TestPinnedSSHHostKeyAndCanonicalAddress(t *testing.T) {
 	public, _, err := ed25519.GenerateKey(rand.Reader)
@@ -50,6 +66,52 @@ func TestPinnedSSHHostKeyAndCanonicalAddress(t *testing.T) {
 		if _, err := canonicalSSHAddress(invalid); err == nil {
 			t.Fatalf("invalid SSH address accepted: %s", invalid)
 		}
+	}
+}
+
+func TestReadRemoteOSReleaseAcceptsStandardLayouts(t *testing.T) {
+	content := []byte("ID=debian\nVERSION_ID=13\n")
+	for _, test := range []struct {
+		name  string
+		files map[string]*qualificationSFTPFixtureFile
+	}{
+		{name: "regular", files: map[string]*qualificationSFTPFixtureFile{
+			"/etc/os-release": {name: "/etc/os-release", mode: 0o644, data: content},
+		}},
+		{name: "debian_alias", files: map[string]*qualificationSFTPFixtureFile{
+			"/etc/os-release":     {name: "/etc/os-release", mode: os.ModeSymlink | 0o777, target: "../usr/lib/os-release"},
+			"/usr/lib/os-release": {name: "/usr/lib/os-release", mode: 0o644, data: content},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := openQualificationSFTPFixture(t, test.files)
+			data, err := client.readRemoteOSRelease(context.Background(), 1<<20)
+			if err != nil || !bytes.Equal(data, content) {
+				t.Fatalf("readRemoteOSRelease() = %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestReadRemoteOSReleaseRejectsNonstandardAliasOrNonregularTarget(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		files map[string]*qualificationSFTPFixtureFile
+	}{
+		{name: "nonstandard_alias", files: map[string]*qualificationSFTPFixtureFile{
+			"/etc/os-release": {name: "/etc/os-release", mode: os.ModeSymlink | 0o777, target: "/tmp/os-release"},
+		}},
+		{name: "nonregular_target", files: map[string]*qualificationSFTPFixtureFile{
+			"/etc/os-release":     {name: "/etc/os-release", mode: os.ModeSymlink | 0o777, target: "../usr/lib/os-release"},
+			"/usr/lib/os-release": {name: "/usr/lib/os-release", mode: os.ModeSymlink | 0o777, target: "/tmp/os-release"},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := openQualificationSFTPFixture(t, test.files)
+			if _, err := client.readRemoteOSRelease(context.Background(), 1<<20); err == nil {
+				t.Fatal("unsafe OS release layout was accepted")
+			}
+		})
 	}
 }
 
@@ -251,6 +313,108 @@ func writeTestSSHCredential(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+type qualificationSFTPFixture struct {
+	files map[string]*qualificationSFTPFixtureFile
+}
+
+type qualificationSFTPFixtureFile struct {
+	name   string
+	mode   os.FileMode
+	data   []byte
+	target string
+}
+
+func (file *qualificationSFTPFixtureFile) Name() string { return filepath.Base(file.name) }
+func (file *qualificationSFTPFixtureFile) Size() int64 {
+	return int64(len(file.data) + len(file.target))
+}
+func (file *qualificationSFTPFixtureFile) Mode() os.FileMode  { return file.mode }
+func (file *qualificationSFTPFixtureFile) ModTime() time.Time { return time.Unix(1_700_000_000, 0) }
+func (file *qualificationSFTPFixtureFile) IsDir() bool        { return false }
+func (file *qualificationSFTPFixtureFile) Sys() any {
+	return &syscall.Stat_t{Uid: 0, Gid: 0}
+}
+
+func (fixture *qualificationSFTPFixture) Fileread(request *sftp.Request) (io.ReaderAt, error) {
+	file, present := fixture.files[request.Filepath]
+	if !present {
+		return nil, os.ErrNotExist
+	}
+	if !file.mode.IsRegular() || file.mode&os.ModeSymlink != 0 {
+		return nil, os.ErrInvalid
+	}
+	return bytes.NewReader(file.data), nil
+}
+
+func (fixture *qualificationSFTPFixture) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
+	return fixture.list(request.Filepath)
+}
+
+func (fixture *qualificationSFTPFixture) Lstat(request *sftp.Request) (sftp.ListerAt, error) {
+	return fixture.list(request.Filepath)
+}
+
+func (fixture *qualificationSFTPFixture) Readlink(path string) (string, error) {
+	file, present := fixture.files[path]
+	if !present {
+		return "", os.ErrNotExist
+	}
+	if file.mode&os.ModeSymlink == 0 {
+		return "", os.ErrInvalid
+	}
+	return file.target, nil
+}
+
+func (fixture *qualificationSFTPFixture) list(path string) (sftp.ListerAt, error) {
+	file, present := fixture.files[path]
+	if !present {
+		return nil, os.ErrNotExist
+	}
+	return qualificationSFTPLister{file}, nil
+}
+
+type qualificationSFTPLister []os.FileInfo
+
+func (files qualificationSFTPLister) ListAt(destination []os.FileInfo, offset int64) (int, error) {
+	if offset >= int64(len(files)) {
+		return 0, io.EOF
+	}
+	count := copy(destination, files[offset:])
+	if count < len(destination) {
+		return count, io.EOF
+	}
+	return count, nil
+}
+
+func openQualificationSFTPFixture(t *testing.T, files map[string]*qualificationSFTPFixtureFile) *SSHClient {
+	t.Helper()
+	serverConnection, clientConnection := net.Pipe()
+	fixture := &qualificationSFTPFixture{files: files}
+	server := sftp.NewRequestServer(serverConnection, sftp.Handlers{FileGet: fixture, FileList: fixture})
+	serverDone := make(chan struct{})
+	go func() {
+		_ = server.Serve()
+		close(serverDone)
+	}()
+	fileClient, err := sftp.NewClientPipe(clientConnection, clientConnection, sftp.UseConcurrentReads(false), sftp.UseConcurrentWrites(false))
+	if err != nil {
+		_ = server.Close()
+		_ = clientConnection.Close()
+		t.Fatal(err)
+	}
+	client := &SSHClient{sftp: fileClient, connection: clientConnection}
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Error("test SFTP server did not stop")
+		}
+	})
+	return client
 }
 
 func serveInitializedStalledTunnel(listener net.Listener, config *ssh.ServerConfig, done chan<- struct{}) {

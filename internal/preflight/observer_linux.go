@@ -202,6 +202,82 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
 }
 
+type InstalledPackageTuple struct {
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+}
+
+// ObserveInstalledPackageTuples rereads dpkg's authoritative status database
+// and returns only the exact, sorted package names requested by qualification.
+// Missing, duplicate, partial, or ambiguous package state fails closed.
+func ObserveInstalledPackageTuples(ctx context.Context, names []string) ([]InstalledPackageTuple, error) {
+	return observeInstalledPackageTuples(ctx, "/var/lib/dpkg/status", names, true)
+}
+
+func observeInstalledPackageTuples(ctx context.Context, statusPath string, names []string, requireRoot bool) ([]InstalledPackageTuple, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if statusPath == "" || len(names) == 0 || len(names) > 256 {
+		return nil, fmt.Errorf("package tuple observation authority is invalid")
+	}
+	for index, name := range names {
+		if !validPackageTupleName(name) || index > 0 && names[index-1] >= name {
+			return nil, fmt.Errorf("package tuple selector is invalid, duplicated, or unsorted")
+		}
+	}
+	status, err := readSafeBoundedFile(statusPath, 32<<20, requireRoot)
+	if err != nil {
+		return nil, err
+	}
+	installed, partial, err := parseBootstrapDPKGStatus(status)
+	if err != nil {
+		return nil, err
+	}
+	if partial {
+		return nil, fmt.Errorf("dpkg package tuple observation found partial state")
+	}
+	selected := make(map[string]InstalledPackageTuple, len(names))
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	for _, item := range installed {
+		if !wanted[item.Name] {
+			continue
+		}
+		if _, duplicate := selected[item.Name]; duplicate || item.Version == "" || item.Version != strings.TrimSpace(item.Version) || strings.ContainsAny(item.Version, "\x00\r\n") || item.Architecture != "amd64" && item.Architecture != "all" {
+			return nil, fmt.Errorf("installed package tuple is invalid or ambiguous")
+		}
+		selected[item.Name] = InstalledPackageTuple(item)
+	}
+	result := make([]InstalledPackageTuple, 0, len(names))
+	for _, name := range names {
+		item, present := selected[name]
+		if !present {
+			return nil, fmt.Errorf("installed package tuple omits %q", name)
+		}
+		result = append(result, item)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validPackageTupleName(value string) bool {
+	if value == "" || len(value) > 128 || (value[0] < 'a' || value[0] > 'z') && (value[0] < '0' || value[0] > '9') {
+		return false
+	}
+	for _, character := range value[1:] {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '+' && character != '.' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 type bootstrapDPKGPackage struct {
 	Name         string
 	Version      string

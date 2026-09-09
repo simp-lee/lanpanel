@@ -145,6 +145,21 @@ func TestSecretFingerprintBindingIsDurableAndImmutable(t *testing.T) {
 	}
 }
 
+func TestRuntimeGuardAdmissionAllowsOnlyTypedProcessStopContraction(t *testing.T) {
+	if err := validateAdmissionSource(ProcessStop, AdmissionRuntimeGuard, ""); err != nil {
+		t.Fatalf("runtime-guard process contraction was rejected: %v", err)
+	}
+	if err := validateAdmissionSource(ProcessStart, AdmissionRuntimeGuard, ""); err == nil {
+		t.Fatal("runtime-guard admission was allowed to expand process runtime")
+	}
+	if err := validateAdmissionSource(ProcessStop, AdmissionRuntimeGuard, "plan_forbidden"); err == nil {
+		t.Fatal("runtime-guard process contraction accepted a fabricated Plan")
+	}
+	if err := validateAdmissionSource(ProcessStop, AdmissionStartup, ""); err == nil {
+		t.Fatal("runtime process contraction was mislabeled as startup recovery")
+	}
+}
+
 func TestAuthenticatedResourceUpdateBindsPriorAndCandidateDigests(t *testing.T) {
 	request := AdmitRequest{Operation: ResourceUpdate, Target: "resource/res_00000000000000000000000000000001", Source: AdmissionUI, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", CandidateDigest: testDigest("candidate"), CandidateBundle: testDigest("prior")}}
 	if err := validateSafetyTargetBinding(request); err != nil {
@@ -641,18 +656,19 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		createOperationInstallation(t, normal, admission, 2)
 		safetyStore := &fakeSafety{state: openSafetyState(), authority: manager.Authority()}
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, safetyStore, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{2}, 96)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
 		deadline := now.Add(time.Hour)
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 2})
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 3})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if record.Status != jobs.StatusReserved {
 			t.Fatalf("reserved job=%#v", record)
 		}
-		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 3}); err == nil {
+		if _, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001", Deadline: deadline}, ExpectedRevision: 4}); err == nil {
 			t.Fatal("one Plan reserved multiple jobs")
 		}
 		if err := admission.Release(); err != nil {
@@ -671,29 +687,20 @@ func TestOperationAdmissionContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		foreignMutation := &MutationLease{fd: mutationLease.fd, target: mutationLease.target, authority: locks.Authority{}}
-		if _, err := admitter.ConsumePlan(context.Background(), foreignMutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
+		if _, err := admitter.ConsumePlan(context.Background(), foreignMutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest}); err == nil {
 			t.Fatal("operation accepted a mutation lease from another authority")
 		}
-		intent, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest})
+		intent, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if intent.Phase != PhaseLocalIntent {
 			t.Fatalf("intent=%#v", intent)
 		}
-		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
+		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 5, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest}); err == nil {
 			t.Fatal("Plan/reservation consumed twice")
 		}
-		rawInstallation, err := persist.EncodeEntry(testOperationInstallation())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := normal.Update(context.Background(), exposure, 4, func(transaction *persist.Transaction) error {
-			return transaction.Create("installations/current", rawInstallation)
-		}); err != nil {
-			t.Fatal(err)
-		}
-		child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "child-one", JobID: record.ID, InstallationID: testOperationInstallation().InstallationID, Operation: Publish, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 4, Profile: "provider", InputDigest: testDigest("input"), ArtifactDigest: testDigest("artifact"), Deadline: deadline, State: ChildSubmitted, SubmittedAt: now}
+		child := ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "child-one", JobID: record.ID, InstallationID: testOperationInstallation().InstallationID, Operation: Publish, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 5, Profile: "provider", InputDigest: testDigest("input"), ArtifactDigest: testDigest("artifact"), Deadline: deadline, State: ChildSubmitted, SubmittedAt: now}
 		if err := ReleaseExposure(mutationLease, exposure); err != nil {
 			t.Fatal(err)
 		}
@@ -719,7 +726,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: JournalAppContraction, Operation: Publish, InstallationID: testOperationInstallation().InstallationID, Target: "resource/res_00000000000000000000000000000001", Generation: 4, Deadline: deadline, ArtifactDigest: testDigest("artifact"), SafetyMarkerDigest: journalMarkerDigest, ResourceIDs: []string{"res_00000000000000000000000000000001"}, ChildIDs: []string{"child-one"}, Phase: JournalPrepared}
+		journal := JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "journal-one", JobID: record.ID, Kind: JournalAppContraction, Operation: Publish, InstallationID: testOperationInstallation().InstallationID, Target: "resource/res_00000000000000000000000000000001", Generation: 5, Deadline: deadline, ArtifactDigest: testDigest("artifact"), SafetyMarkerDigest: journalMarkerDigest, ResourceIDs: []string{"res_00000000000000000000000000000001"}, ChildIDs: []string{"child-one"}, Phase: JournalPrepared}
 		if err := admitter.PutJournal(context.Background(), mutationLease, exposure, 7, journal, true); err != nil {
 			t.Fatal(err)
 		}
@@ -863,11 +870,12 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		createOperationInstallation(t, normal, admission, 2)
 		closed := safety.EmptyState()
 		closed.GlobalClose = safety.GlobalClose{Phase: safety.GlobalCloseClosing, Generation: 1}
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, &changingSafety{states: []safety.State{openSafetyState(), closed}, authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{4}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 2})
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 3})
 		if err == nil {
 			t.Fatal("safety race admitted operation")
 		}
@@ -890,9 +898,10 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		createOperationInstallation(t, normal, admission, 2)
 		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
 		admitter, _ := NewAdmitter(normal, &fakeSafety{state: openSafetyState(), authority: manager.Authority()}, Options{Now: func() time.Time { return clock }, Random: bytes.NewReader(bytes.Repeat([]byte{6}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
-		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 2})
+		record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 3})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -904,7 +913,7 @@ func TestOperationAdmissionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 3, IntentGeneration: 4, ConfirmationProof: plan.NonceDigest}); err == nil {
+		if _, err := admitter.ConsumePlan(context.Background(), mutationLease, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest}); err == nil {
 			t.Fatal("expired Plan consumed")
 		}
 		_ = ReleaseExposure(mutationLease, exposure)
@@ -916,6 +925,31 @@ func TestOperationAdmissionContract(t *testing.T) {
 		rejected, err := planStore.Read(plan.ID)
 		if err != nil || rejected.RejectedByJob != record.ID {
 			t.Fatalf("rejected Plan=%#v,%v", rejected, err)
+		}
+	})
+
+	t.Run("one_sided_orphan_inventory_blocks_other_resource_publish", func(t *testing.T) {
+		now := time.Unix(1700000000, 0).UTC()
+		normal, manager, admission, mutation := newOperationStores(t)
+		defer func(ignore func() error) { _ = ignore() }(normal.Close)
+		defer func(ignore func() error) { _ = ignore() }(mutation.Close)
+		defer func(ignore func() error) { _ = ignore() }(manager.Close)
+		planStore, _ := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{8}, 64))})
+		plan, err := planStore.Create(context.Background(), admission, 1, operationPlanSpec(now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		createOperationInstallation(t, normal, admission, 2)
+		state := openSafetyState()
+		state.Resources = append(state.Resources, safety.ResourceSafety{ResourceID: "res_orphan", State: safety.ResourceActive, Ownership: safety.OwnershipOrphan, OwnershipDigest: testDigest("orphan")})
+		binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+		admitter, err := NewAdmitter(normal, &fakeSafety{state: state, authority: manager.Authority()}, Options{Now: func() time.Time { return now }, Random: bytes.NewReader(bytes.Repeat([]byte{9}, 32)), Bindings: trustedBindings{binding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/res_00000000000000000000000000000001", ActorIdentity: "session-one", PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: "res_00000000000000000000000000000001"}, ExpectedRevision: 3})
+		if err == nil || !strings.Contains(err.Error(), "clean-host rebuild") {
+			t.Fatalf("one-sided orphan publish admission error = %v", err)
 		}
 	})
 
@@ -1701,6 +1735,139 @@ func TestOperationOwnedResourceStateRequiresAtomicIntent(t *testing.T) {
 	}
 }
 
+func TestPlanCapacityIncludesTerminalAndActiveGraphAuthorities(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func() {
+		_ = admission.Release()
+		_ = mutationSet.Close()
+		_ = normal.Close()
+		_ = manager.Close()
+	}()
+	random := append(bytes.Repeat([]byte{9}, 64), bytes.Repeat([]byte{10}, 64)...)
+	random = append(random, bytes.Repeat([]byte{11}, 64)...)
+	planStore, err := plans.NewStore(normal, plans.Options{Now: func() time.Time { return now }, Random: bytes.NewReader(random)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := operationPlanSpec(now)
+	makePlan := func(index int) plans.Plan {
+		seed := []byte{byte(index >> 24), byte(index >> 16), byte(index >> 8), byte(index)}
+		identity := sha256.Sum256(seed)
+		return plans.Plan{
+			SchemaVersion:   plans.SchemaVersion,
+			ID:              "plan_" + hex.EncodeToString(identity[:]),
+			Operation:       spec.Operation,
+			Target:          spec.Target,
+			ActorIdentity:   spec.ActorIdentity,
+			Config:          spec.Config,
+			Applied:         spec.Applied,
+			Evidence:        append([]plans.Evidence(nil), spec.Evidence...),
+			ExposureSummary: spec.ExposureSummary,
+			Prerequisites:   spec.Prerequisites,
+			CreatedAt:       now,
+			ExpiresAt:       now.Add(plans.MaximumLifetime),
+			NonceDigest:     testDigestBytes(append(seed, byte('n'))),
+		}
+	}
+	jobID := func(plan plans.Plan) string { return "job_" + strings.TrimPrefix(plan.ID, "plan_") }
+	target := string(spec.Target.Kind) + "/" + spec.Target.ID
+
+	history := make([]plans.Plan, maximumTerminalOperationGraphs)
+	for index := range history {
+		history[index] = makePlan(index)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 1, func(transaction *persist.Transaction) error {
+		for _, plan := range history {
+			if err := plans.Put(transaction, plan); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 2, func(transaction *persist.Transaction) error {
+		for _, plan := range history {
+			if _, err := plans.Reserve(transaction, plan.ID, jobID(plan), plan.Operation, target, plan.ActorIdentity, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 3, func(transaction *persist.Transaction) error {
+		for _, plan := range history {
+			binding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+			if _, err := plans.Consume(transaction, plan.ID, jobID(plan), binding, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	firstActive, err := planStore.Create(context.Background(), admission, 4, spec)
+	if err != nil {
+		t.Fatalf("Create() at saturated terminal history: %v", err)
+	}
+	active := []plans.Plan{firstActive}
+	for index := 0; index < maximumActiveOperationGraphs-2; index++ {
+		active = append(active, makePlan(maximumTerminalOperationGraphs+index))
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 5, func(transaction *persist.Transaction) error {
+		for _, plan := range active[1:] {
+			if err := plans.Put(transaction, plan); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 6, func(transaction *persist.Transaction) error {
+		for _, plan := range active {
+			if _, err := plans.Reserve(transaction, plan.ID, jobID(plan), plan.Operation, target, plan.ActorIdentity, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lastActive, err := planStore.Create(context.Background(), admission, 7, spec)
+	if err != nil {
+		t.Fatalf("Create() for final active graph allowance: %v", err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 8, func(transaction *persist.Transaction) error {
+		_, err := plans.Reserve(transaction, lastActive.ID, jobID(lastActive), lastActive.Operation, target, lastActive.ActorIdentity, now)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planStore.Create(context.Background(), admission, 9, spec); err == nil {
+		t.Fatal("Create() exceeded the combined terminal and active authority bound")
+	}
+	document, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := maximumTerminalOperationGraphs + maximumActiveOperationGraphs
+	if got := len(persist.EntryKeys(document, "plans")); got != want || got != plans.MaximumRecords {
+		t.Fatalf("Plan authorities=%d, want %d", got, want)
+	}
+	retained, err := plans.LoadEntries(document.Entries, history[0].ID)
+	if err != nil || retained.ConsumedAt == nil {
+		t.Fatalf("terminal Plan authority was pruned or rewritten: %#v, %v", retained, err)
+	}
+	reserved, err := plans.LoadEntries(document.Entries, lastActive.ID)
+	if err != nil || reserved.ReservedAt == nil || reserved.ConsumedAt != nil {
+		t.Fatalf("active Plan authority was not retained exactly: %#v, %v", reserved, err)
+	}
+}
+
 func unavailableProof(t *testing.T) (*Admitter, persist.UnavailableProof, *locks.Manager) {
 	t.Helper()
 	lockRoot := t.TempDir()
@@ -1790,15 +1957,75 @@ func TestExactHeadscaleCertificateChallengeAuthority(t *testing.T) {
 }
 
 func TestExactAppCertificateChallengeBindsCertificateIdentity(t *testing.T) {
-	binding := SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), CertificateIdentity: "cert_00000000000000000000000000000001"}
+	binding := SafetyBinding{ResourceID: "res_00000000000000000000000000000001", PlanID: "plan_00000000000000000000000000000001", IntentGeneration: 1, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("acme"), ChallengeMethod: "http-01", CertificateIdentity: "cert_00000000000000000000000000000001"}
 	state := openSafetyState()
-	state.Resources[0].ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
+	state.Resources[0].ChallengePending = &safety.ChallengePending{Generation: 1, PlanID: binding.PlanID, Method: "http-01", SANIdentity: binding.CandidateDigest, ACMEBinding: binding.CandidateBundle, CertificateIdentity: binding.CertificateIdentity}
 	if !exactCertificateChallenge(state, Publish, binding) {
 		t.Fatal("exact App challenge rejected")
+	}
+	if err := authorize(CertificateRenew, state, binding, true, time.Now().UTC()); err != nil {
+		t.Fatalf("App renewal rejected its own challenge authority: %v", err)
 	}
 	state.Resources[0].ChallengePending.CertificateIdentity = "cert_11111111111111111111111111111111"
 	if exactCertificateChallenge(state, Publish, binding) {
 		t.Fatal("App challenge with another certificate identity accepted")
+	}
+}
+
+func TestExpiredPlanCannotBlockExactHTTP01ContractionReentry(t *testing.T) {
+	createdAt := time.Unix(1_700_000_000, 0).UTC()
+	observedNow := createdAt
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func(ignore func() error) { _ = ignore() }(normal.Close)
+	defer func(ignore func() error) { _ = ignore() }(mutationSet.Close)
+	defer func(ignore func() error) { _ = ignore() }(manager.Close)
+	planStore, err := plans.NewStore(normal, plans.Options{Now: func() time.Time { return observedNow }, Random: bytes.NewReader(bytes.Repeat([]byte{3}, 64))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planStore.Create(context.Background(), admission, 1, operationPlanSpec(createdAt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createOperationInstallation(t, normal, admission, 2)
+	resourceID := testOperationInstallation().Resources[0].ID
+	planBinding := plans.Binding{Operation: plan.Operation, Target: plan.Target, ActorIdentity: plan.ActorIdentity, Config: plan.Config, Applied: plan.Applied, Evidence: plan.Evidence}
+	safetyStore := &fakeSafety{state: openSafetyState(), authority: manager.Authority()}
+	admitter, err := NewAdmitter(normal, safetyStore, Options{Now: func() time.Time { return observedNow }, Random: bytes.NewReader(bytes.Repeat([]byte{4}, 96)), Bindings: trustedBindings{planBinding}, Confirmation: testConfirmation{}, Registry: testRegistry(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificateID := "cert_00000000000000000000000000000001"
+	record, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: Publish, Target: "resource/" + resourceID, ActorIdentity: plan.ActorIdentity, PlanID: plan.ID, Source: AdmissionPlan, SafetyBinding: SafetyBinding{ResourceID: resourceID, ChallengeMethod: "http-01", CertificateIdentity: certificateID, Deadline: createdAt.Add(time.Hour)}, ExpectedRevision: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	mutation, exposure, err := mutationSet.AcquireExposure(context.Background(), "resource/"+resourceID, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := admitter.ConsumePlan(context.Background(), mutation, exposure, ConsumeRequest{JobID: record.ID, ExpectedRevision: 4, IntentGeneration: 5, ConfirmationProof: plan.NonceDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admitter.EnterRemoteWait(context.Background(), mutation, exposure, 5, record.ID); err != nil {
+		t.Fatal(err)
+	}
+	safetyStore.state.Resources[0].GenerationSequence = intent.SafetyBinding.IntentGeneration
+	safetyStore.state.Resources[0].ChallengePending = &safety.ChallengePending{Generation: intent.SafetyBinding.IntentGeneration, PlanID: intent.SafetyBinding.PlanID, Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: intent.SafetyBinding.CandidateDigest, ACMEBinding: intent.SafetyBinding.CandidateBundle, CertificateIdentity: intent.SafetyBinding.CertificateIdentity, Host: "app.example.test", Hosts: []string{"app.example.test"}, Token: "abcdefghijklmnopqrstuv", TokenPath: "/.well-known/acme-challenge/abcdefghijklmnopqrstuv", KeyAuthorizationDigest: testDigest("key-authorization"), Webroot: "/var/lib/lanpanel/certificates/webroot/" + certificateID, BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: absentSafetySnapshot()}
+	observedNow = createdAt.Add(plans.MaximumEvidenceAge + time.Second)
+	if _, _, _, err := admitter.Reenter(context.Background(), mutationSet, manager, 6, record.ID); err == nil {
+		t.Fatal("ordinary expansion reentry accepted expired Plan evidence")
+	}
+	reentered, mutation, exposure, err := admitter.ReenterHTTP01Contraction(context.Background(), mutationSet, manager, 6, record.ID)
+	if err != nil || reentered.Phase != PhaseReentered {
+		t.Fatalf("HTTP-01 contraction reentry=%#v err=%v", reentered, err)
+	}
+	if err := ReleaseExposure(mutation, exposure); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1904,7 +2131,7 @@ func TestHeadscaleRenewalAdmissionAndChallengeBindingAreExact(t *testing.T) {
 	}
 	state := safety.EmptyState()
 	state.Headscale.GenerationSequence = 7
-	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 7, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, TokenPath: "/.well-known/acme-challenge", Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
+	state.Headscale.ChallengePending = &safety.ChallengePending{Generation: 7, PlanID: "plan_renew", Method: "http-01", ConfigDigest: testDigest("config"), SANIdentity: testDigest("san"), ACMEBinding: testDigest("binding"), CertificateIdentity: "cert_00000000000000000000000000000001", Host: "control.example.test", Hosts: []string{"control.example.test"}, Webroot: "/var/lib/lanpanel/certificates/webroot/cert_00000000000000000000000000000001", BootstrapIdentity: testDigest("bootstrap"), BaseMarkers: []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: safety.SnapshotAbsent}}}
 	binding := SafetyBinding{ResourceID: "headscale", PlanID: "plan_renew", IntentGeneration: 7, CandidateDigest: testDigest("san"), CandidateBundle: testDigest("binding"), CertificateIdentity: state.Headscale.ChallengePending.CertificateIdentity}
 	if !exactCertificateChallenge(state, CertificateRenew, binding) {
 		t.Fatal("exact Headscale renewal challenge binding rejected")
@@ -1986,7 +2213,7 @@ func TestNewResourceAuthorityMatchesTargetManagedProcessContract(t *testing.T) {
 func TestResourceUpdateDeltaMatchesTargetManagedProcessContract(t *testing.T) {
 	tailnet := tailnetOperationResource()
 	updatedTailnet := tailnet
-	updatedTailnet.Name = "Peer Updated"
+	updatedTailnet.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
 	if err := validateOperationResourceDelta(tailnet, updatedTailnet, ResourceUpdate); err != nil {
 		t.Fatalf("Tailnet update rejected: %v", err)
 	}
@@ -2004,7 +2231,6 @@ func TestResourceUpdateDeltaMatchesTargetManagedProcessContract(t *testing.T) {
 	process := *local.ManagedProcess
 	process.Service.Arguments = []string{"--updated"}
 	updatedLocal.ManagedProcess = &process
-	updatedLocal.Name = "Local Updated"
 	if err := validateOperationResourceDelta(local, updatedLocal, ResourceUpdate); err != nil {
 		t.Fatalf("Local update preserving process state rejected: %v", err)
 	}
@@ -2076,7 +2302,6 @@ func TestLocalResourceUpdatePreservesManagedRuntimeState(t *testing.T) {
 	process.LastJobID = ""
 	process.Service.Arguments = []string{"--updated"}
 	candidate.ManagedProcess = &process
-	candidate.Name = "Local Updated"
 	candidateDigest, err := appresource.ConfigDigest(candidate)
 	if err != nil {
 		t.Fatal(err)
@@ -2096,13 +2321,35 @@ func TestLocalResourceUpdatePreservesManagedRuntimeState(t *testing.T) {
 	}
 }
 
+func TestResourceUpdateRejectsNameChangeAtDurableCommit(t *testing.T) {
+	prior := tailnetOperationResource()
+	installation := tailnetOperationInstallation(&prior)
+	state := safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("tailnet-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
+	candidate := prior
+	candidate.Name = "Peer Renamed"
+	candidateDigest, err := appresource.ConfigDigest(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.CurrentConfigDigest = candidateDigest
+	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
+	if err := harness.admitter.CommitResourceUpdate(context.Background(), harness.mutation, harness.exposure, harness.revision, harness.jobID, candidate); err == nil {
+		t.Fatal("resource update durable commit accepted immutable name change")
+	}
+	updated := readOperationResource(t, harness.normal, prior.ID)
+	if updated.Name != prior.Name {
+		t.Fatalf("resource name=%q, want %q", updated.Name, prior.Name)
+	}
+}
+
 func TestResourceUpdateRejectsReplacedCandidateAndDirectNormalMutation(t *testing.T) {
 	prior := tailnetOperationResource()
 	installation := tailnetOperationInstallation(&prior)
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("tailnet-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
 	candidate := prior
-	candidate.Name = "Admitted Candidate"
+	candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
 	candidateDigest, err := appresource.ConfigDigest(candidate)
 	if err != nil {
 		t.Fatal(err)
@@ -2110,7 +2357,7 @@ func TestResourceUpdateRejectsReplacedCandidateAndDirectNormalMutation(t *testin
 	candidate.CurrentConfigDigest = candidateDigest
 	harness := beginResourceOperation(t, ResourceUpdate, installation, &state, SafetyBinding{ResourceID: prior.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest})
 	replaced := candidate
-	replaced.Name = "Replacement Candidate"
+	replaced.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.4", SourceIP: "100.64.0.1", Port: 8082}
 	replacementDigest, err := appresource.ConfigDigest(replaced)
 	if err != nil {
 		t.Fatal(err)
@@ -2203,7 +2450,6 @@ func runTailnetResourceUpdate(t *testing.T) {
 	state := safety.EmptyState()
 	state.Resources = []safety.ResourceSafety{{ResourceID: prior.ID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: testDigest("tailnet-ownership"), StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}}
 	candidate := prior
-	candidate.Name = "Peer Updated"
 	candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
 	candidateDigest, err := appresource.ConfigDigest(candidate)
 	if err != nil {
@@ -2346,6 +2592,19 @@ func testOperationInstallation() domain.Installation {
 	installation := operationStateInstallation()
 	installation.Resources[0].CurrentConfigDigest = testDigest("operation-config")
 	return installation
+}
+
+func createOperationInstallation(t *testing.T, normal *persist.Store, lease *locks.Lease, expectedRevision uint64) {
+	t.Helper()
+	raw, err := persist.EncodeEntry(testOperationInstallation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), lease, expectedRevision, func(transaction *persist.Transaction) error {
+		return transaction.Create("installations/current", raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func newOperationStores(t *testing.T) (*persist.Store, *locks.Manager, *locks.Lease, *MutationSet) {

@@ -172,6 +172,23 @@ func TestInstallationSchema(t *testing.T) {
 		}
 	})
 
+	t.Run("target_readiness_statuses_are_closed", func(t *testing.T) {
+		for _, statuses := range [][]uint16{{200}, {401}, {403}, {200, 204, 399, 401, 403}} {
+			installation := validGAInstallation()
+			installation.Resources[0].Target.AllowedHTTPStatuses = statuses
+			if err := ValidateInstallation(installation); err != nil {
+				t.Fatalf("ValidateInstallation(statuses %v) error = %v", statuses, err)
+			}
+		}
+		for _, statuses := range [][]uint16{{199}, {400}, {402}, {404}, {500}, {200, 200}, {403, 401}} {
+			installation := validGAInstallation()
+			installation.Resources[0].Target.AllowedHTTPStatuses = statuses
+			if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "allowed_http_statuses") {
+				t.Fatalf("ValidateInstallation(statuses %v) error = %v", statuses, err)
+			}
+		}
+	})
+
 	t.Run("local_endpoint_realizations_are_closed", func(t *testing.T) {
 		for _, local := range []LocalHTTPTarget{
 			{EndpointKind: LocalEndpointUnixSocketActivation},

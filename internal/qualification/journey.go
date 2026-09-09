@@ -146,26 +146,31 @@ func (runner Runner) Run(ctx context.Context) (release.LiveCleanupReport, error)
 		executeContextErr := executeCtx.Err()
 		executeCancel()
 		executeErr = errors.Join(executeErr, executeContextErr)
+		evidenceValid := false
+		if len(observation.Evidence) != 0 {
+			if _, evidenceErr := release.DecodeLiveStepEvidence(observation.Evidence); evidenceErr != nil {
+				executeErr = errors.Join(executeErr, fmt.Errorf("live mutation returned invalid review evidence: %w", evidenceErr))
+			} else {
+				evidenceValid = true
+			}
+		}
 		terminalStep := release.JourneyStepResult{MutationID: step, AttemptID: attemptID}
-		switch {
-		case observation.Identity != "" && len(observation.Evidence) != 0 && executeErr == nil:
-			terminalStep.Outcome = release.StepPassed
+		if evidenceValid {
+			terminalStep.Evidence = append([]byte(nil), observation.Evidence...)
 			terminalStep.EvidenceDigest = release.DigestBytes(observation.Evidence)
+		}
+		switch {
+		case observation.Identity != "" && evidenceValid && executeErr == nil:
+			terminalStep.Outcome = release.StepPassed
 			setItem(&report, release.CleanupItem{MutationID: step, ObservedIdentity: observation.Identity, Result: release.CleanupExecuted})
 		case observation.Identity != "" && executeErr != nil:
 			terminalStep.Outcome = release.StepFailed
-			if len(observation.Evidence) != 0 {
-				terminalStep.EvidenceDigest = release.DigestBytes(observation.Evidence)
-			}
 			terminalStep.ErrorDigest = errorDigest(executeErr)
 			setItem(&report, release.CleanupItem{MutationID: step, ObservedIdentity: observation.Identity, Result: release.CleanupExecuted})
 			report.ExecutionFailed = true
 		default:
 			terminalStep.Outcome = release.StepUnknown
-			if len(observation.Evidence) != 0 {
-				terminalStep.EvidenceDigest = release.DigestBytes(observation.Evidence)
-			}
-			terminalStep.ErrorDigest = errorDigest(errors.Join(executeErr, fmt.Errorf("live mutation did not return a durable cleanup identity and evidence")))
+			terminalStep.ErrorDigest = errorDigest(errors.Join(executeErr, fmt.Errorf("live mutation did not return a durable cleanup identity and valid review evidence")))
 			report.ExecutionFailed = true
 		}
 		setStep(&report, terminalStep)
@@ -203,6 +208,12 @@ func (runner Runner) cleanup(ctx context.Context, report release.LiveCleanupRepo
 		step := orderedJourney[index]
 		item, present := items[step]
 		if !present || item.Result == release.CleanupCleaned || item.Result == release.CleanupRetained {
+			continue
+		}
+		// The installation step owns the staged cleanup executable. Keep it
+		// available whenever a dependent cleanup/recovery or its report write
+		// failed; cleanup-only resume must not need to replay remote mutation.
+		if step == "clean_install" && cleanupErr != nil {
 			continue
 		}
 		observation := MutationObservation{Identity: item.ObservedIdentity}

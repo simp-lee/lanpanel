@@ -64,6 +64,13 @@ func Check(input GuardInput) Decision {
 	if input.Action == ActionReadOnly {
 		return Decision{Allowed: true, Priority: effectivePriority(input.State, input.ResourceID, input.Now), Reason: "read-only action"}
 	}
+	if input.Action == ActionPublish || input.Action == ActionAppChallenge || input.Action == ActionReactivate {
+		for _, candidate := range input.State.Resources {
+			if candidate.Ownership == OwnershipOrphan {
+				return Decision{Priority: PriorityDeletingOrOrphan, Reason: fmt.Sprintf("resource %q is an ownership orphan; keep ingress closed; do not adopt or delete it; use configuration export and clean-host rebuild", candidate.ResourceID)}
+			}
+		}
+	}
 	resource := findResource(input.State, input.ResourceID)
 	priority := effectivePriority(input.State, input.ResourceID, input.Now)
 	if input.State.StopFence != nil {

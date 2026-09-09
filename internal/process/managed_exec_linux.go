@@ -41,30 +41,39 @@ type ExecAuthority struct {
 func LoadExecAuthority(resourceID string) (ExecAuthority, error) {
 	path := AuthorityPath(resourceID)
 	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed execution authority is absent"))
+	}
 	if err != nil {
 		return ExecAuthority{}, err
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
-	if unix.Fstat(int(file.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumManagedExecBytes {
-		return ExecAuthority{}, fmt.Errorf("managed execution authority file unsafe")
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return ExecAuthority{}, fmt.Errorf("inspect managed execution authority: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Gid != 0 || stat.Mode&0o777 != 0o600 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > maximumManagedExecBytes {
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed execution authority file unsafe"))
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, maximumManagedExecBytes+1))
-	if err != nil || int64(len(payload)) != stat.Size {
-		return ExecAuthority{}, fmt.Errorf("managed execution authority changed")
+	if err != nil {
+		return ExecAuthority{}, fmt.Errorf("read managed execution authority: %w", err)
+	}
+	if int64(len(payload)) != stat.Size {
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed execution authority changed"))
 	}
 	var authority ExecAuthority
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&authority); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return ExecAuthority{}, fmt.Errorf("managed execution authority malformed")
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed execution authority malformed"))
 	}
 	canonical, _ := json.Marshal(authority)
 	if !bytes.Equal(canonical, payload) || authority.SchemaVersion != managedExecSchema || authority.ResourceID != resourceID {
-		return ExecAuthority{}, fmt.Errorf("managed execution authority noncanonical")
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, fmt.Errorf("managed execution authority noncanonical"))
 	}
 	if _, err := secretInventory(authority.SecretDigests); err != nil {
-		return ExecAuthority{}, err
+		return ExecAuthority{}, NewRuntimeViolation(RuntimeViolationPolicyInvalid, err)
 	}
 	return authority, nil
 }

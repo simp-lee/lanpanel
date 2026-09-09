@@ -177,7 +177,7 @@ func BuildInventory(input Inputs) (Inventory, error) {
 			if resource.ChallengePending != nil {
 				requiresOwnership[resource.ResourceID] = true
 				challenge := resource.ChallengePending
-				value := strings.Join([]string{challenge.Host, challenge.TokenPath, challenge.Webroot}, "\x00")
+				value := strings.Join([]string{challenge.Host, challenge.Token, challenge.TokenPath, challenge.KeyAuthorizationDigest, challenge.Webroot, fmt.Sprintf("%d", challenge.Generation)}, "\x00")
 				if err := add(resource.ResourceID, IdentityChallenge, value, challenge.BootstrapIdentity); err != nil {
 					return Inventory{}, err
 				}

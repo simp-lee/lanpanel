@@ -27,6 +27,7 @@ import (
 type headscaleActivationHost interface {
 	Stage(context.Context, control.ActivationBundle) error
 	Activate(context.Context, control.ActivationBundle, control.ActivationAuthority, activation.ReloadAuthority) (control.ActivationResult, error)
+	CommitBootActivation(context.Context, control.ActivationBundle, control.Rendered, activation.ReloadAuthority) error
 	Contract(context.Context, control.ActivationBundle) error
 }
 
@@ -163,6 +164,7 @@ func (execution *HeadscaleDeployExecution) ActivateControl(ctx context.Context, 
 	intent := *execution.Installation.Headscale.DeployIntent
 	intent.Phase, intent.ActivationDigest, intent.RuntimeDigest = domain.HeadscaleDeployActivated, bundle.Digest, result.RuntimeDigest
 	execution.Installation.Headscale.DeployIntent = &intent
+	execution.ActivationHost = host
 	return nil
 }
 

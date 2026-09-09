@@ -91,14 +91,27 @@ func TestProviderSchemasAreClosed(t *testing.T) {
 	}
 }
 
+// Protected sources require every ancestor to be root-owned and not writable
+// by other users. A private t.TempDir under /tmp or /var/tmp does not satisfy it.
+func protectedTestDir(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp("/root", "lanpanel-acme-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove protected fixture: %v", err)
+		}
+	})
+	return root
+}
+
 func TestLoadDNSBindingPinsTransitiveCredentialFiles(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
 	}
-	root := t.TempDir()
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root := protectedTestDir(t)
 	account := filepath.Join(root, "account.key")
 	token := filepath.Join(root, "token")
 	profile := filepath.Join(root, "cloudflare.env")
@@ -126,10 +139,11 @@ func TestEveryDNSProviderBindsClosedEnvironment(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
 	}
-	root := t.TempDir()
-	_ = os.Chmod(root, 0o700)
+	root := protectedTestDir(t)
 	account := filepath.Join(root, "account.key")
-	_ = os.WriteFile(account, []byte("account"), 0o600)
+	if err := os.WriteFile(account, []byte("account"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		provider DNSProvider
 		lines    []string
@@ -180,15 +194,28 @@ func TestLoadDNSBindingRejectsUnknownAndDirectSecretKeys(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("protected source identity requires root test")
 	}
-	root := t.TempDir()
-	_ = os.Chmod(root, 0o700)
+	root := protectedTestDir(t)
 	account := filepath.Join(root, "account.key")
 	profile := filepath.Join(root, "provider.env")
-	_ = os.WriteFile(account, []byte("account"), 0o600)
-	for _, line := range []string{"CF_DNS_API_TOKEN=secret\n", "UNKNOWN_FILE=/root/value\n", "CF_DNS_API_TOKEN_FILE=relative\n"} {
-		_ = os.WriteFile(profile, []byte(line), 0o600)
-		if _, err := LoadDNSBinding("https://acme.example.test/directory", account, "admin@example.test", true, DNSProviderCloudflare, profile, "example.test"); err == nil {
-			t.Fatalf("accepted profile %q", line)
+	token := filepath.Join(root, "token")
+	for path, data := range map[string]string{account: "account", token: "token", profile: "CF_DNS_API_TOKEN_FILE=" + token + "\n"} {
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := LoadDNSBinding("https://acme.example.test/directory", account, "admin@example.test", true, DNSProviderCloudflare, profile, "example.test"); err != nil {
+		t.Fatalf("valid profile baseline: %v", err)
+	}
+	for _, test := range []struct{ line, wantError string }{
+		{"CF_DNS_API_TOKEN=secret\n", `unknown key "CF_DNS_API_TOKEN"`},
+		{"UNKNOWN_FILE=/root/value\n", `unknown key "UNKNOWN_FILE"`},
+		{"CF_DNS_API_TOKEN_FILE=relative\n", `DNS credential "CF_DNS_API_TOKEN_FILE": protected path invalid`},
+	} {
+		if err := os.WriteFile(profile, []byte(test.line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDNSBinding("https://acme.example.test/directory", account, "admin@example.test", true, DNSProviderCloudflare, profile, "example.test"); err == nil || !strings.Contains(err.Error(), test.wantError) {
+			t.Fatalf("profile %q: want %q, got %v", test.line, test.wantError, err)
 		}
 	}
 }

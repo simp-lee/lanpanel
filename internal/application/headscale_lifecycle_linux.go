@@ -116,7 +116,8 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	if err := certificates.VerifyBundleIdentity(journal.Certificate.ID, journal.Certificate.Generation, certificates.BundleIdentityFor(*journal.Certificate)); err != nil {
 		return err
 	}
-	if err := verifyLiveHeadscaleCertificate(ctx, journal.InstallationID, journal.Candidate, *journal.Certificate); err != nil {
+	bundle, err := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
+	if err != nil {
 		return err
 	}
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
@@ -136,10 +137,9 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	}
 	if fresh.Headscale.Reactivating != nil {
 		active := fresh.Headscale.Reactivating
-		bundle, bundleErr := control.BuildActivation(journal.InstallationID, journal.Candidate, *journal.Certificate)
 		candidateDigest, candidateDigestErr := control.Digest(journal.Candidate)
-		if bundleErr != nil || candidateDigestErr != nil {
-			return errors.Join(bundleErr, candidateDigestErr)
+		if candidateDigestErr != nil {
+			return candidateDigestErr
 		}
 		if active.PlanID != journal.PlanID || active.Generation != journal.IntentGeneration || active.PriorGeneration+1 != active.Generation || active.ControlGeneration != journal.Candidate.Generation || active.CertificateGeneration != journal.Certificate.Generation || active.CertificateFingerprint != journal.Certificate.Fingerprint || active.CandidateDigest != journal.Candidate.ConfigDigest || active.CandidateBundle != candidateDigest || active.ActivationDigest != bundle.Digest || active.ControlEntryDigest != bundle.Entry.Digest || !active.CertificateUntil.Equal(journal.Certificate.NotAfter) || !active.CertificateLastTrustedWall.Equal(journal.Certificate.LastTrustedWall) {
 			return fmt.Errorf("headscale lifecycle reactivation changed")
@@ -184,12 +184,51 @@ func finalizeInterruptedHeadscaleLifecycle(ctx context.Context, service *FixedSe
 	if err != nil || installation.Headscale.Certificate == nil || installation.Headscale.Certificate.Authority == nil || installation.Headscale.Certificate.Authority.CertificateID != journal.Certificate.ID || installation.Headscale.Certificate.Generation != journal.Certificate.Generation || certificateBundleIdentity(*installation.Headscale.Certificate) != certificates.BundleIdentityFor(*journal.Certificate) {
 		return fmt.Errorf("committed Headscale lifecycle normal authority missing")
 	}
+	rendered, err := readHeadscaleRendered(journal.Candidate)
+	if err != nil {
+		return err
+	}
+	activationHost, err := control.NewActivationHost()
+	if err != nil {
+		return err
+	}
+	reloadAuthority, err := challengeReloadAuthorityForExposure(service, exposure)
+	if err != nil {
+		return err
+	}
+	rawIntent, present := document.Entries["intents/"+current.JobID]
+	var intent operations.Reservation
+	if !present || json.Unmarshal(rawIntent, &intent) != nil || intent.JobID != current.JobID || intent.Operation != operations.HeadscaleDeploy || intent.Target != "headscale/"+current.Candidate.HeadscaleID || intent.Phase != operations.PhaseReentered && intent.Phase != operations.PhaseTerminal {
+		return fmt.Errorf("committed Headscale lifecycle operation authority missing")
+	}
+	if intent.Phase == operations.PhaseTerminal {
+		err = activationHost.ObserveBootActivation(ctx, bundle, rendered, reloadAuthority)
+	} else {
+		err = activationHost.ReconcileBootActivation(ctx, bundle, rendered, reloadAuthority)
+	}
+	if err != nil {
+		return err
+	}
 	admitter, err := service.TimerAdmitter()
 	if err != nil {
 		return err
 	}
 	_, err = admitter.CompleteHeadscaleDeploy(ctx, mutation, exposure, document.Revision, current.JobID, operations.HeadscaleDeployCompleteCommit{HeadscaleID: current.Candidate.HeadscaleID, Certificate: *installation.Headscale.Certificate, RuntimeDigest: current.RuntimeDigest})
 	return err
+}
+
+func readHeadscaleRendered(candidate control.Candidate) (control.Rendered, error) {
+	config, configErr := os.ReadFile(candidate.Paths.Config)
+	policy, policyErr := os.ReadFile(candidate.Paths.Policy)
+	unit, unitErr := os.ReadFile(candidate.Paths.Unit)
+	if err := errors.Join(configErr, policyErr, unitErr); err != nil {
+		return control.Rendered{}, err
+	}
+	rendered := control.Rendered{Candidate: candidate, Config: config, Policy: policy, Unit: unit}
+	if err := control.VerifyRendered(rendered); err != nil {
+		return control.Rendered{}, err
+	}
+	return rendered, nil
 }
 
 func headscaleControlCandidateMatchesNormal(installation domain.Installation, journal control.Journal) bool {
@@ -854,7 +893,7 @@ func ExecuteHeadscaleDeploy(ctx context.Context, actor Actor, payload HeadscaleD
 }
 
 func (execution *HeadscaleDeployExecution) CompleteHeadscaleLifecycle(ctx context.Context) (jobs.Record, error) {
-	if execution == nil || execution.Mutation == nil || execution.Exposure == nil || execution.Installation.Headscale == nil || execution.Installation.Headscale.DeployIntent == nil || execution.Installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivated {
+	if execution == nil || execution.Mutation == nil || execution.Exposure == nil || execution.ActivationHost == nil || execution.Installation.Headscale == nil || execution.Installation.Headscale.DeployIntent == nil || execution.Installation.Headscale.DeployIntent.Phase != domain.HeadscaleDeployActivated {
 		return jobs.Record{}, fmt.Errorf("headscale lifecycle completion phase invalid")
 	}
 	store := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
@@ -892,6 +931,13 @@ func (execution *HeadscaleDeployExecution) CompleteHeadscaleLifecycle(ctx contex
 	committed := journal
 	committed.Phase = control.PhaseCommitted
 	if err := store.Replace(ctx, journal, committed); err != nil {
+		return jobs.Record{}, err
+	}
+	reloadAuthority, err := challengeReloadAuthorityForExposure(execution.Service, execution.Exposure)
+	if err != nil {
+		return jobs.Record{}, err
+	}
+	if err := execution.ActivationHost.CommitBootActivation(ctx, bundle, execution.Authority.Rendered, reloadAuthority); err != nil {
 		return jobs.Record{}, err
 	}
 	record, err := execution.Admitter.CompleteHeadscaleDeploy(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, commit)

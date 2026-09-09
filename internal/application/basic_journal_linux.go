@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -104,7 +105,7 @@ func removeBasicJournal(path string) error {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return fmt.Errorf("managed Basic journal removal unsafe")
 	}
-	stat, ok := info.Sys().(*unix.Stat_t)
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 {
 		return fmt.Errorf("managed Basic journal owner changed")
 	}

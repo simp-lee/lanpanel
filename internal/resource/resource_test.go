@@ -68,11 +68,15 @@ func TestPrepareUpdatePreservesPriorSnapshot(t *testing.T) {
 	process := *prior.ManagedProcess
 	candidate.ManagedProcess = &process
 	candidate.Name = "Candidate"
+	if _, err := PrepareUpdate(installation, candidate); err == nil {
+		t.Fatal("resource update accepted immutable name change")
+	}
+	candidate.Name = prior.Name
 	updated, err := PrepareUpdate(installation, candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if installation.Resources[0].Name != "Prior" || updated.Name != "Candidate" {
+	if installation.Resources[0].Name != "Prior" || updated.Name != prior.Name {
 		t.Fatalf("prior=%q updated=%q", installation.Resources[0].Name, updated.Name)
 	}
 
@@ -132,7 +136,7 @@ func TestPrepareTailnetUpdatePreservesAbsentProcess(t *testing.T) {
 	}
 	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}, Connector: &domain.TailnetConnector{ID: "con_00000000000000000000000000000001", ControlURL: "https://control.example.test", ManagedPaths: domain.ConnectorManagedPaths()}, Resources: []domain.AppResource{prior}}
 	candidate := prior
-	candidate.Name = "Peer Updated"
+	candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: "100.64.0.3", SourceIP: "100.64.0.1", Port: 8081}
 	updated, err := PrepareUpdate(installation, candidate)
 	if err != nil {
 		t.Fatal(err)

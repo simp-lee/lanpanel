@@ -3,7 +3,6 @@
 package qualification
 
 import (
-	"errors"
 	"fmt"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/release"
@@ -16,12 +15,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const FinalizeInputSchemaVersion = "lanpanel.release.finalize-input.v1"
+const FinalizeInputSchemaVersion = "lanpanel.release.finalize-input.v2"
 
 type FinalizeInput struct {
 	SchemaVersion      string `json:"schema_version"`
 	QualificationInput string `json:"qualification_input"`
-	SecurityReport     string `json:"security_report"`
+	SecurityScanInput  string `json:"security_scan_input"`
 	OutputDirectory    string `json:"output_directory"`
 	ExpectedReleaseTag string `json:"expected_release_tag"`
 	ExpectedCommitOID  string `json:"expected_commit_oid"`
@@ -45,10 +44,10 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 	if err := release.DecodeCanonical(data, &input); err != nil {
 		return FinalizedRelease{}, err
 	}
-	if input.SchemaVersion != FinalizeInputSchemaVersion || !filepath.IsAbs(input.QualificationInput) || filepath.Clean(input.QualificationInput) != input.QualificationInput || !filepath.IsAbs(input.SecurityReport) || filepath.Clean(input.SecurityReport) != input.SecurityReport || !filepath.IsAbs(input.OutputDirectory) || filepath.Clean(input.OutputDirectory) != input.OutputDirectory || input.OutputDirectory == "/" || input.ExpectedReleaseTag == "" || !commitOIDPattern(input.ExpectedCommitOID) || now == nil {
+	if input.SchemaVersion != FinalizeInputSchemaVersion || !filepath.IsAbs(input.QualificationInput) || filepath.Clean(input.QualificationInput) != input.QualificationInput || !filepath.IsAbs(input.SecurityScanInput) || filepath.Clean(input.SecurityScanInput) != input.SecurityScanInput || !filepath.IsAbs(input.OutputDirectory) || filepath.Clean(input.OutputDirectory) != input.OutputDirectory || input.OutputDirectory == "/" || input.ExpectedReleaseTag == "" || !commitOIDPattern(input.ExpectedCommitOID) || now == nil {
 		return FinalizedRelease{}, fmt.Errorf("release finalization input is invalid")
 	}
-	prepared, report, err := VerifyFinalReadiness(input.QualificationInput)
+	prepared, _, err := VerifyFinalReadiness(input.QualificationInput)
 	if err != nil {
 		return FinalizedRelease{}, err
 	}
@@ -59,23 +58,54 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 	if identity.ReleaseTag != input.ExpectedReleaseTag {
 		return FinalizedRelease{}, fmt.Errorf("release tag differs from qualified candidate")
 	}
+	securityScanBytes, _, err := readProtectedFile(input.SecurityScanInput, 1<<20, false)
+	if err != nil {
+		return FinalizedRelease{}, err
+	}
+	var securityScanInput SecurityScanInput
+	if err := release.DecodeCanonical(securityScanBytes, &securityScanInput); err != nil {
+		return FinalizedRelease{}, fmt.Errorf("release finalization security scan input is invalid: %w", err)
+	}
+	if err := validateSecurityScanInput(securityScanInput); err != nil {
+		return FinalizedRelease{}, fmt.Errorf("release finalization security scan authority is invalid: %w", err)
+	}
+	if securityScanInput.QualificationInput != input.QualificationInput {
+		return FinalizedRelease{}, fmt.Errorf("release finalization does not bind the qualification security scan")
+	}
+	if _, err := RunReleaseSecurityScan(input.SecurityScanInput, now); err != nil {
+		return FinalizedRelease{}, fmt.Errorf("mandatory fixed-feed release security scan failed: %w", err)
+	}
 	summaryBytes, _, err := readProtectedFile(prepared.Input.Artifacts.QualificationSummary, 4<<20, true)
 	if err != nil {
 		return FinalizedRelease{}, err
 	}
 	summary, err := release.DecodeQualificationSummary(summaryBytes)
-	reportBytes, reportErr := release.MarshalCanonical(report)
-	attestationBytes, _, attestationReadErr := readProtectedFile(prepared.Input.Artifacts.ExecutorAttestation, 4<<20, true)
-	attestation, attestationErr := release.DecodeLiveExecutorAttestation(attestationBytes)
-	if err != nil || reportErr != nil || attestationReadErr != nil || attestationErr != nil || summary.RunID != prepared.Input.RunID || summary.CandidateDigest != identity.CandidateDigest || summary.SourceTreeDigest != prepared.SourceDigest || summary.TargetProfileDigest != identity.ProfileDigest || summary.InstallManifestDigest != prepared.InstallManifestDigest || summary.SideEffectPlanDigest != prepared.PlanDigest || summary.ProtectedInputDigest != prepared.InputDigest || summary.CleanupReportDigest != release.DigestBytes(reportBytes) || summary.ExecutorAttestationDigest != release.DigestBytes(attestationBytes) || summary.ExecutorAttestationDigest != report.ExecutorAttestationDigest || summary.TailnetLiveStatus != attestation.TailnetLiveStatus || !providerClaimsMatch(summary.ProviderLiveTests, attestation.DNSProvider) {
-		return FinalizedRelease{}, fmt.Errorf("qualification summary differs from final readiness: %w", errors.Join(err, reportErr, attestationReadErr, attestationErr))
+	if err != nil {
+		return FinalizedRelease{}, err
 	}
-	securityBytes, _, err := readProtectedFile(input.SecurityReport, 16<<20, true)
+	attestationBytes, _, err := readProtectedFile(prepared.Input.Artifacts.ExecutorAttestation, 4<<20, true)
+	if err != nil {
+		return FinalizedRelease{}, err
+	}
+	attestation, err := release.DecodeLiveExecutorAttestation(attestationBytes)
+	if err != nil {
+		return FinalizedRelease{}, err
+	}
+	if summary.RunID != prepared.Input.RunID || summary.CandidateDigest != identity.CandidateDigest || summary.SourceTreeDigest != prepared.SourceDigest || summary.TargetProfileDigest != identity.ProfileDigest || summary.TailnetLiveStatus != attestation.TailnetLiveStatus || !providerClaimsMatch(summary.ProviderLiveTests, attestation.DNSProvider) {
+		return FinalizedRelease{}, fmt.Errorf("qualification summary differs from final readiness")
+	}
+	securityBytes, _, err := readProtectedFile(prepared.Input.Artifacts.SecurityReport, 16<<20, true)
 	if err != nil {
 		return FinalizedRelease{}, err
 	}
 	security, err := release.DecodeSecurityReport(securityBytes)
-	if err != nil || security.CandidateDigest != identity.CandidateDigest || release.CheckSecurityGate(security) != nil {
+	if err != nil {
+		return FinalizedRelease{}, fmt.Errorf("security report does not authorize qualified candidate: %w", err)
+	}
+	if security.CandidateDigest != identity.CandidateDigest || !securityReportMatchesScanInput(security, securityScanInput) {
+		return FinalizedRelease{}, fmt.Errorf("security report does not bind the qualified candidate and fixed scan authority")
+	}
+	if err := release.CheckSecurityGate(security); err != nil {
 		return FinalizedRelease{}, fmt.Errorf("security report does not authorize qualified candidate: %w", err)
 	}
 	candidateBytes, _, err := readProtectedFile(prepared.Input.Artifacts.CandidateBinary, 256<<20, false)
@@ -110,8 +140,13 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 		return FinalizedRelease{}, err
 	}
 	createdAt := now().UTC().Truncate(time.Second)
-	if createdAt.Before(summary.CompletedAt) || security.ScannedAt.After(createdAt) || createdAt.Sub(security.ScannedAt) > 7*24*time.Hour {
+	if createdAt.Before(summary.CompletedAt) || security.ScannedAt.After(createdAt) || createdAt.Sub(security.ScannedAt) > maximumSecurityAuthorityAge {
 		return FinalizedRelease{}, fmt.Errorf("release finalization clock regressed or security report is outside its seven-day validity")
+	}
+	for _, scanner := range security.Scanners {
+		if scanner.DatabaseCapturedAt.After(createdAt) || createdAt.Sub(scanner.DatabaseCapturedAt) > maximumSecurityAuthorityAge {
+			return FinalizedRelease{}, fmt.Errorf("release vulnerability feed is outside its seven-day validity")
+		}
 	}
 	sbomBytes, _, err := readProtectedFile(prepared.Input.Artifacts.SBOM, 16<<20, true)
 	if err != nil || release.ValidateReleaseSPDX(sbomBytes, candidateBytes, identity.CandidateDigest, identity.ReleaseTag, dependency, identity.Profile) != nil {

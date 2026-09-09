@@ -42,7 +42,7 @@ func BuildSummary(prepared Prepared, report release.LiveCleanupReport, completed
 		providers = append(providers, release.ProviderLiveTest{Provider: name, Status: status})
 	}
 	installIdentity := prepared.Install.Identity()
-	summary := release.QualificationSummary{SchemaVersion: release.QualificationSummarySchemaVersion, RunID: prepared.Input.RunID, CandidateDigest: installIdentity.CandidateDigest, SourceTreeDigest: prepared.SourceDigest, TargetProfileDigest: installIdentity.ProfileDigest, InstallManifestDigest: prepared.InstallManifestDigest, SideEffectPlanDigest: prepared.PlanDigest, ProtectedInputDigest: prepared.InputDigest, CleanupReportDigest: release.DigestBytes(reportBytes), ExecutorAttestationDigest: release.DigestBytes(attestationBytes), JourneySucceeded: true, TailnetLiveStatus: attestation.TailnetLiveStatus, ProviderLiveTests: append([]release.ProviderLiveTest(nil), providers...), CompletedAt: completedAt}
+	summary := release.QualificationSummary{SchemaVersion: release.QualificationSummarySchemaVersion, RunID: prepared.Input.RunID, CandidateDigest: installIdentity.CandidateDigest, SourceTreeDigest: prepared.SourceDigest, TargetProfileDigest: installIdentity.ProfileDigest, JourneySucceeded: true, TailnetLiveStatus: attestation.TailnetLiveStatus, ProviderLiveTests: append([]release.ProviderLiveTest(nil), providers...), CompletedAt: completedAt}
 	encoded, err := release.MarshalCanonical(summary)
 	if err != nil {
 		return nil, err

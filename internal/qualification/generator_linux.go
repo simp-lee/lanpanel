@@ -226,7 +226,7 @@ func Generate(inputPath string, now func() time.Time) (GeneratedArtifacts, error
 			return GeneratedArtifacts{}, err
 		}
 	}
-	plan := buildSideEffectPlan(runID, input, tailnetPeer, release.DigestBytes(candidateBytes), profileDigest, journeyDigest, createdAt)
+	plan := buildSideEffectPlan(runID, input, tailnetPeer, vantage, release.DigestBytes(candidateBytes), profileDigest, journeyDigest, createdAt)
 	planBytes, err := release.MarshalCanonical(plan)
 	if err != nil {
 		return GeneratedArtifacts{}, err
@@ -273,7 +273,7 @@ func Generate(inputPath string, now func() time.Time) (GeneratedArtifacts, error
 			CandidateBinary: filepath.Join(input.OutputDirectory, "candidate", "lanpanel"), SourceArchive: filepath.Join(input.OutputDirectory, sourceRelative), SBOM: filepath.Join(input.OutputDirectory, "lanpanel.spdx.json"), SourceRoot: input.SourceRoot,
 			TargetProfile: filepath.Join(input.OutputDirectory, "target-profile.json"), SideEffectPlan: filepath.Join(input.OutputDirectory, "side-effect-plan.json"), InstallManifest: filepath.Join(input.OutputDirectory, "install-manifest.json"),
 			DependencyAuthority: filepath.Join(input.OutputDirectory, "dependency-authority.json"), DependencyAssets: finalDependencyPaths, JourneySpecification: filepath.Join(input.OutputDirectory, "journey-spec.json"), PackageTemplate: filepath.Join(input.OutputDirectory, "package-template.json"),
-			CleanupReport: filepath.Join(input.OutputDirectory, "cleanup-report.json"), ExecutorAttestation: filepath.Join(input.OutputDirectory, "executor-attestation.json"), QualificationSummary: filepath.Join(input.OutputDirectory, "qualification-summary.json"),
+			CleanupReport: filepath.Join(input.OutputDirectory, "cleanup-report.json"), ExecutorAttestation: filepath.Join(input.OutputDirectory, "executor-attestation.json"), QualificationSummary: filepath.Join(input.OutputDirectory, "qualification-summary.json"), SecurityReport: filepath.Join(input.OutputDirectory, "security-report.json"),
 		},
 		SSH: input.SSH, ACME: input.ACME, DNS: input.DNS, ExternalVantageRef: input.ExternalVantageRef, TailnetPeerRef: input.TailnetPeerRef,
 	}
@@ -313,7 +313,7 @@ func validateGenerationInput(input GenerationInput, createdAt time.Time) error {
 	if err := validateJourneySpec(input.Journey, input.DNS.BaseDomain); err != nil {
 		return err
 	}
-	candidate := ProtectedInput{SchemaVersion: ProtectedInputSchemaVersion, RunID: "run-validation", Artifacts: ArtifactReferences{CandidateBinary: "/validation/candidate", SourceArchive: "/validation/source", SBOM: "/validation/sbom", SourceRoot: input.SourceRoot, TargetProfile: "/validation/target", SideEffectPlan: "/validation/plan", InstallManifest: "/validation/manifest", DependencyAuthority: input.DependencyAuthority, DependencyAssets: input.DependencyAssets, JourneySpecification: "/validation/journey", PackageTemplate: "/validation/package-template", CleanupReport: "/validation/cleanup", ExecutorAttestation: "/validation/attestation", QualificationSummary: "/validation/summary"}, SSH: input.SSH, ACME: input.ACME, DNS: input.DNS, ExternalVantageRef: input.ExternalVantageRef, TailnetPeerRef: input.TailnetPeerRef}
+	candidate := ProtectedInput{SchemaVersion: ProtectedInputSchemaVersion, RunID: "run-validation", Artifacts: ArtifactReferences{CandidateBinary: "/validation/candidate", SourceArchive: "/validation/source", SBOM: "/validation/sbom", SourceRoot: input.SourceRoot, TargetProfile: "/validation/target", SideEffectPlan: "/validation/plan", InstallManifest: "/validation/manifest", DependencyAuthority: input.DependencyAuthority, DependencyAssets: input.DependencyAssets, JourneySpecification: "/validation/journey", PackageTemplate: "/validation/package-template", CleanupReport: "/validation/cleanup", ExecutorAttestation: "/validation/attestation", QualificationSummary: "/validation/summary", SecurityReport: "/validation/security-report"}, SSH: input.SSH, ACME: input.ACME, DNS: input.DNS, ExternalVantageRef: input.ExternalVantageRef, TailnetPeerRef: input.TailnetPeerRef}
 	if err := validateInput(candidate); err != nil {
 		return err
 	}
@@ -353,42 +353,6 @@ func validateJourneySpec(value JourneySpec, baseDomain string) error {
 		}
 	}
 	return nil
-}
-
-func buildSideEffectPlan(runID string, input GenerationInput, tailnetPeer TailnetPeerAuthority, candidateDigest, profileDigest, journeyDigest string, createdAt time.Time) release.LiveSideEffectPlan {
-	selectors := map[string]string{
-		"clean_install":                          "host=" + input.SSH.MachineFingerprint,
-		"ui_startup_session_restart":             "management=installation-specific-loopback",
-		"local_http_websocket":                   "resource=qualification-local-" + runID[4:16],
-		"temporary_public_http":                  fmt.Sprintf("listener=%s:%d", input.Journey.PublicIPv4, input.Journey.TemporaryHTTPPort),
-		"domain_https_controls":                  "domains=" + input.Journey.AppDomain + "," + input.Journey.AppAlias,
-		"app_http01":                             "certificate=" + input.Journey.AppDomain,
-		"headscale_initialize_http01":            "control=" + input.Journey.HeadscaleDomain,
-		"headscale_entities":                     "headscale=qualification-entities-" + runID,
-		"connector_assisted_login":               "connector=installation-singleton",
-		"tailnet_http_websocket":                 "tailnet=" + map[bool]string{true: fmt.Sprintf("live:%s:%s:%d:%s", tailnetPeer.SourceIP, tailnetPeer.PeerIP, tailnetPeer.Port, input.Journey.TailnetDomain), false: "not-live-tested"}[input.Journey.TailnetLiveEnabled],
-		"dns01":                                  "certificate=" + input.Journey.DNS01Domain + ";provider=" + input.DNS.Provider,
-		"delete_diagnostics_export_close_reboot": "installation=" + runID,
-		"final_cleanup_inventory":                "host=" + input.SSH.MachineFingerprint + ";dns=" + input.DNS.BaseDomain,
-	}
-	retained := map[string]bool{"clean_install": true, "headscale_initialize_http01": true, "headscale_entities": true, "connector_assisted_login": true, "final_cleanup_inventory": true}
-	mutations := make([]release.PlannedMutation, 0, len(orderedJourney))
-	for _, step := range orderedJourney {
-		scope := "run=" + runID + ";host=" + input.SSH.MachineFingerprint + ";journey=" + journeyDigest
-		prior := "fresh-prior/" + step + "/" + journeyDigest
-		if step == "clean_install" {
-			prior = "bootstrap-inventory/" + input.CleanInstallInventoryDigest
-		}
-		mutation := "execute=" + step + ";candidate=" + candidateDigest + ";profile=" + profileDigest
-		policy := "delete_exact"
-		if retained[step] {
-			policy = "retain_authorized"
-		}
-		selector := selectors[step]
-		mutations = append(mutations, release.PlannedMutation{ID: step, Scope: scope, ScopeDigest: release.DigestBytes([]byte(scope)), PriorState: prior, PriorStateDigest: release.DigestBytes([]byte(prior)), PlannedMutation: mutation, PlannedMutationDigest: release.DigestBytes([]byte(mutation)), Selector: selector, SelectorDigest: release.DigestBytes([]byte(selector)), CleanupPolicy: policy})
-	}
-	slices.SortFunc(mutations, func(left, right release.PlannedMutation) int { return strings.Compare(left.ID, right.ID) })
-	return release.LiveSideEffectPlan{SchemaVersion: release.LiveSideEffectPlanSchemaVersion, RunID: runID, AuthorizedHostFingerprint: input.SSH.MachineFingerprint, CreatedAt: createdAt, Mutations: mutations}
 }
 
 func protectedAuthorityDigest(acme ACMEAuthority, dns DNSAuthority) (string, error) {
