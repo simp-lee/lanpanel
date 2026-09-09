@@ -144,7 +144,7 @@ func buildPublicInstallerInput(bundleDir, contact, expectedDigest string) ([]byt
 		return nil, identity.Material{}, err
 	}
 	identityValue := authority.Identity()
-	preflightEvaluator := newPublicPreflightEvaluator(identityValue)
+	preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
 	packagePreflightRequest, packagePreflight, err := preflightEvaluator(context.Background(), material.Authority, material.SafetyGeneration)
 	if err != nil {
 		material.Destroy()
@@ -189,26 +189,6 @@ func bindPublicPackagePlan(template packages.Plan, identityValue release.Install
 		return packages.Plan{}, err
 	}
 	return plan, nil
-}
-
-func newPublicPreflightEvaluator(identityValue release.InstallIdentity) func(context.Context, identity.ManagementAuthority, uint64) (preflight.ExpansionRequest, preflight.Result, error) {
-	return func(ctx context.Context, management identity.ManagementAuthority, generation uint64) (preflight.ExpansionRequest, preflight.Result, error) {
-		profileAuthority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + identityValue.ProfileDigest, LiveQualified: true}
-		confinement := identityValue.Profile.ManagedConfinement
-		request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: generation, Profile: preflight.ExpectedProfile{ID: identityValue.Profile.Family, VersionID: identityValue.Profile.Release, Architecture: "amd64", SystemdVersion: identityValue.Profile.SystemdVersion, NginxVersion: identityValue.Profile.NginxVersion, PackageSnapshotDigest: "sha256:" + identityValue.Profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), QualificationDigest: "sha256:" + confinement.QualificationDigest}, Authority: profileAuthority}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: management.Address, Port: management.Port, Purpose: "management"}}, ManagedPaths: FixedManagedPathRequirements(FixedPaths()), Disks: FixedDiskRequirements(FixedPaths()), LastTrustedWall: identityValue.AuthorityCreatedAt}
-		observer, err := preflight.NewLinuxObserver(func(ctx context.Context) (preflight.PackageObservation, error) {
-			return preflight.ObserveBootstrapReadiness(ctx)
-		})
-		if err != nil {
-			return preflight.ExpansionRequest{}, preflight.Result{}, err
-		}
-		observed, err := observer.ObserveExpansion(ctx, request)
-		if err != nil {
-			return preflight.ExpansionRequest{}, preflight.Result{}, err
-		}
-		result, err := preflight.EvaluateExpansion(request, observed)
-		return request, result, err
-	}
 }
 
 func readCurrentExecutable(maximum uint64) ([]byte, error) {

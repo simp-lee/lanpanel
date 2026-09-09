@@ -4,11 +4,13 @@ package qualification
 
 import (
 	"lanpanel/internal/certificates"
+	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAgentResponseRequiresReviewableObservedPackageTuple(t *testing.T) {
@@ -30,6 +32,50 @@ func TestAgentResponseRequiresReviewableObservedPackageTuple(t *testing.T) {
 	data, _ = release.MarshalCanonical(response)
 	if _, err := DecodeAgentResponse(data, response.RunID, response.Action); err == nil {
 		t.Fatal("noncanonical observed package tuple was accepted")
+	}
+}
+
+func TestAgentInstallResponseRequiresActualBootstrapPreflight(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 73, RequestDigest: "sha256:" + strings.Repeat("a", 64), Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "fixture", Disposition: preflight.FindingPassed, Summary: "bootstrap observation", Identity: "fixture"}}}
+	original := AgentResponse{SchemaVersion: AgentResponseSchemaVersion, RunID: "run-one", Action: AgentInstall, Succeeded: true, Evidence: release.DigestBytes([]byte("install")), Preflight: result, ObservedPackageTuple: []release.PackageTuple{{Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}}
+	for _, test := range []struct {
+		name      string
+		change    func(*AgentResponse)
+		wantError bool
+	}{
+		{name: "allowed_install", change: func(*AgentResponse) {}},
+		{name: "missing_preflight", change: func(value *AgentResponse) { value.Preflight = preflight.Result{} }, wantError: true},
+		{name: "denied_preflight_cannot_succeed", change: func(value *AgentResponse) {
+			value.Preflight.Allowed = false
+			value.Preflight.Findings = []preflight.Finding{{Code: "blocked", Disposition: preflight.FindingBlocked, Summary: "blocked", Identity: "fixture"}}
+		}, wantError: true},
+		{name: "unrelated_target", change: func(value *AgentResponse) { value.Preflight.Target = "other" }, wantError: true},
+		{name: "unrelated_action", change: func(value *AgentResponse) { value.Action = AgentFinalInventory }, wantError: true},
+		{name: "failure_before_preflight", change: func(value *AgentResponse) {
+			value.Preflight = preflight.Result{}
+			value.Succeeded = false
+			value.ErrorCode = "qualification_install_failed"
+			value.ObservedPackageTuple = nil
+		}},
+		{name: "failure_after_preflight", change: func(value *AgentResponse) {
+			value.Succeeded = false
+			value.ErrorCode = "qualification_install_failed"
+			value.ObservedPackageTuple = nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := original
+			test.change(&value)
+			data, err := release.MarshalCanonical(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = DecodeAgentResponse(data, value.RunID, value.Action)
+			if (err != nil) != test.wantError {
+				t.Fatalf("decode error = %v, wantError %v", err, test.wantError)
+			}
+		})
 	}
 }
 

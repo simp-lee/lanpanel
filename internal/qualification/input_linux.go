@@ -9,7 +9,6 @@ import (
 	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/packages"
-	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"net/url"
 	"os"
@@ -221,12 +220,7 @@ func Prepare(inputPath string) (Prepared, error) {
 	if err := release.DecodeCanonical(packageTemplateBytes, &template); err != nil {
 		return Prepared{}, err
 	}
-	plan, err := release.DecodeLiveSideEffectPlan(planBytes)
-	if err != nil {
-		return Prepared{}, err
-	}
-	templateProbe := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + release.DigestBytes([]byte("prepare-package-template-request")), Allowed: true, ObservedAt: manifest.CreatedAt, ValidUntil: manifest.CreatedAt.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "template_validation", Disposition: preflight.FindingPassed, Summary: "immutable template validation", Identity: manifest.RunID}}}
-	if _, err := BindQualificationPackagePlan(template, manifest, plan, install.Identity().Profile, templateProbe, manifest.CreatedAt); err != nil {
+	if err := release.ValidateQualificationPackageTemplate(template, install.Identity().Profile); err != nil {
 		return Prepared{}, fmt.Errorf("qualification package template differs from exact profile: %w", err)
 	}
 	var dependency release.QualificationDependencyAuthority

@@ -320,23 +320,29 @@ func (executor *LiveExecutor) executeCleanInstall(ctx context.Context) (Mutation
 		}
 		remoteAssets[name] = path
 	}
-	preflightResponse, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentPackagePreflight, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), TargetProfile: targetBytes, InstallManifest: manifestBytes, SideEffectPlan: executor.prepared.PlanBytes})
-	profileDigest := executor.prepared.Install.Identity().ProfileDigest
-	preflightEvidence, _ := evidence("clean-install", map[string]string{"candidate_digest": release.DigestBytes(executor.prepared.CandidateBytes), "package_preflight": preflightResponse.Evidence, "target_profile_digest": profileDigest})
-	if err != nil || !preflightResponse.Succeeded {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, errors.Join(err, fmt.Errorf("remote package preflight did not pass: %s", preflightResponse.ErrorCode))
-	}
-	manifest, _ := release.DecodeQualificationInstallManifest(manifestBytes)
-	packagePlan, err := BindQualificationPackagePlan(packageTemplate, manifest, executor.plan, executor.prepared.Install.Identity().Profile, preflightResponse.Preflight, time.Now().UTC())
+	templateBytes, err := release.MarshalCanonical(packageTemplate)
 	if err != nil {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, err
+		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID}, err
 	}
-	installerBytes, err := bootstrap.BuildQualificationInstallerAuthority(bootstrap.QualificationInstallerAuthority{ACMEAccountContact: executor.prepared.Input.ACME.Contact, InstallManifest: manifestBytes, TargetProfile: targetBytes, SideEffectPlan: executor.prepared.PlanBytes, DependencyAuthority: dependencyBytes, ExpectedInstallManifestDigest: executor.prepared.InstallManifestDigest, RemoteAssetPaths: remoteAssets, PackagePlan: packagePlan, PackagePreflight: preflightResponse.Preflight})
+	installerBytes, err := bootstrap.BuildQualificationInstallerAuthority(bootstrap.QualificationInstallerAuthority{ACMEAccountContact: executor.prepared.Input.ACME.Contact, InstallManifest: manifestBytes, TargetProfile: targetBytes, SideEffectPlan: executor.prepared.PlanBytes, DependencyAuthority: dependencyBytes, ExpectedInstallManifestDigest: executor.prepared.InstallManifestDigest, RemoteAssetPaths: remoteAssets, PackageTemplate: templateBytes})
 	if err != nil {
-		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID, Evidence: preflightEvidence}, err
+		return MutationObservation{Identity: "staging/" + executor.prepared.Input.RunID}, err
 	}
 	response, err := executor.target.RunAgent(ctx, candidatePath, AgentRequest{SchemaVersion: AgentRequestSchemaVersion, RunID: executor.prepared.Input.RunID, Action: AgentInstall, CandidateDigest: release.DigestBytes(executor.prepared.CandidateBytes), InstallerAuthority: installerBytes})
-	installEvidence, _ := evidenceWithObservations("clean-install", map[string]string{"candidate_digest": release.DigestBytes(executor.prepared.CandidateBytes), "installer": response.Evidence, "package_preflight": preflightResponse.Evidence, "target_profile_digest": profileDigest}, nil, response.ObservedPackageTuple)
+	values := map[string]string{"candidate_digest": release.DigestBytes(executor.prepared.CandidateBytes), "target_profile_digest": executor.prepared.Install.Identity().ProfileDigest}
+	if response.Evidence != "" {
+		values["installer"] = response.Evidence
+	}
+	if preflightDigest, digestErr := response.Preflight.Digest(); digestErr == nil {
+		values["package_preflight"] = preflightDigest
+	}
+	if response.ErrorCode != "" {
+		values["error_code"] = response.ErrorCode
+	}
+	installEvidence, evidenceErr := evidenceWithObservations("clean-install", values, nil, response.ObservedPackageTuple)
+	if evidenceErr != nil {
+		return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID}, errors.Join(err, evidenceErr)
+	}
 	if err != nil || !response.Succeeded {
 		return MutationObservation{Identity: "installation/" + executor.prepared.Input.RunID, Evidence: installEvidence}, errors.Join(err, fmt.Errorf("qualification clean installation failed: %s", response.ErrorCode))
 	}

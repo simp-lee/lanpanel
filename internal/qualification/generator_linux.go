@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/packages"
-	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"net/netip"
 	"os"
@@ -254,10 +253,6 @@ func Generate(inputPath string, now func() time.Time) (GeneratedArtifacts, error
 		return GeneratedArtifacts{}, err
 	}
 	manifestDigest := release.DigestBytes(manifestBytes)
-	probeResult := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + release.DigestBytes([]byte("generator-package-preflight-request")), Allowed: true, ObservedAt: createdAt, ValidUntil: createdAt.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "generator_validation", Disposition: preflight.FindingPassed, Summary: "template validation only", Identity: runID}}}
-	if _, err := BindQualificationPackagePlan(input.PackageTemplate, manifest, plan, input.Profile, probeResult, createdAt); err != nil {
-		return GeneratedArtifacts{}, fmt.Errorf("qualification package template is invalid: %w", err)
-	}
 	if _, err := release.VerifyQualificationInstallAuthority(manifestDigest, manifestBytes, targetBytes, planBytes, dependencyBytes, candidateBytes, dependencyAssetBytes, release.QualificationInstallObservation{HostFingerprint: input.SSH.MachineFingerprint, ObservedAt: createdAt}); err != nil {
 		return GeneratedArtifacts{}, fmt.Errorf("generated qualification authority failed self-verification: %w", err)
 	}
@@ -307,7 +302,7 @@ func validateGenerationInput(input GenerationInput, createdAt time.Time) error {
 	if _, err := release.ProfileDigest(input.Profile); err != nil {
 		return err
 	}
-	if err := validateQualificationPackageTemplate(input.PackageTemplate, input.Profile); err != nil {
+	if err := release.ValidateQualificationPackageTemplate(input.PackageTemplate, input.Profile); err != nil {
 		return err
 	}
 	if err := validateJourneySpec(input.Journey, input.DNS.BaseDomain); err != nil {

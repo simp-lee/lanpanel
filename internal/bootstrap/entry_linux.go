@@ -25,43 +25,6 @@ const (
 	maximumInstallerInputBytes = 32 << 20
 )
 
-type QualificationInstallerAuthority struct {
-	ACMEAccountContact            string
-	InstallManifest               []byte
-	TargetProfile                 []byte
-	SideEffectPlan                []byte
-	DependencyAuthority           []byte
-	ExpectedInstallManifestDigest string
-	RemoteAssetPaths              map[string]string
-	PackagePlan                   packages.Plan
-	PackagePreflight              preflight.Result
-}
-
-func BuildQualificationInstallerAuthority(authority QualificationInstallerAuthority) ([]byte, error) {
-	input := installerInput{
-		SchemaVersion: installerInputSchema, Kind: release.InstallQualification, ACMEAccountContact: authority.ACMEAccountContact,
-		ExpectedQualificationInstallManifestDigest: authority.ExpectedInstallManifestDigest,
-		QualificationInstallManifest:               authority.InstallManifest, QualificationTargetProfile: authority.TargetProfile,
-		LiveSideEffectPlan: authority.SideEffectPlan, QualificationDependencyAuthority: authority.DependencyAuthority,
-		AssetPaths: authority.RemoteAssetPaths, PackagePlan: authority.PackagePlan, PackagePreflight: authority.PackagePreflight,
-	}
-	data, err := json.Marshal(input)
-	if err != nil || len(data) == 0 || len(data) > maximumInstallerInputBytes {
-		return nil, fmt.Errorf("qualification installer authority is invalid or unbounded")
-	}
-	return data, nil
-}
-
-// RunQualificationInstallerAuthority is available only to the fixed
-// qualification-agent role; it preserves the same root and canonical input
-// checks as the inherited-fd installer entrypoint.
-func RunQualificationInstallerAuthority(data []byte, stdout io.Writer) error {
-	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
-		return fmt.Errorf("qualification installer requires root")
-	}
-	return runInstallerAuthorityWithMaterial(data, stdout, nil)
-}
-
 type installerInput struct {
 	SchemaVersion                              string              `json:"schema_version"`
 	Kind                                       release.InstallKind `json:"kind"`
@@ -161,6 +124,9 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		return err
 	}
 	if resumeAttempt {
+		if material != nil {
+			return fmt.Errorf("fresh installation material cannot resume an existing bootstrap attempt")
+		}
 		store, journal, openErr := openJournal(FixedPaths().Journal, 0, 0)
 		if openErr != nil {
 			return openErr
@@ -196,27 +162,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		}
 	}
 
-	preflightEvaluator := func(ctx context.Context, management identity.ManagementAuthority, generation uint64) (preflight.ExpansionRequest, preflight.Result, error) {
-		profileAuthority := preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + identityValue.ProfileDigest, LiveQualified: true}
-		if input.Kind == release.InstallQualification {
-			profileAuthority = preflight.ProfileAuthority{Kind: preflight.QualificationTarget, Digest: "sha256:" + identityValue.ProfileDigest, CandidateDigest: "sha256:" + identityValue.CandidateDigest, InstallManifestDigest: "sha256:" + identityValue.QualificationInstallManifestDigest, SideEffectPlanDigest: "sha256:" + identityValue.SideEffectPlanDigest, HostFingerprint: identityValue.HostFingerprint, RunID: identityValue.RunID}
-		}
-		paths := FixedPaths()
-		confinement := identityValue.Profile.ManagedConfinement
-		request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: generation, Profile: preflight.ExpectedProfile{ID: identityValue.Profile.Family, VersionID: identityValue.Profile.Release, Architecture: "amd64", SystemdVersion: identityValue.Profile.SystemdVersion, NginxVersion: identityValue.Profile.NginxVersion, PackageSnapshotDigest: "sha256:" + identityValue.Profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), QualificationDigest: "sha256:" + confinement.QualificationDigest}, Authority: profileAuthority}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: management.Address, Port: management.Port, Purpose: "management"}}, ManagedPaths: FixedManagedPathRequirements(paths), Disks: FixedDiskRequirements(paths), LastTrustedWall: identityValue.AuthorityCreatedAt}
-		observer, err := preflight.NewLinuxObserver(func(ctx context.Context) (preflight.PackageObservation, error) {
-			return preflight.ObserveBootstrapReadiness(ctx)
-		})
-		if err != nil {
-			return preflight.ExpansionRequest{}, preflight.Result{}, err
-		}
-		observed, err := observer.ObserveExpansion(ctx, request)
-		if err != nil {
-			return preflight.ExpansionRequest{}, preflight.Result{}, err
-		}
-		result, err := preflight.EvaluateExpansion(request, observed)
-		return request, result, err
-	}
+	preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
 	legoBytes, present := assets[identityValue.Lego.Path]
 	if !present || release.DigestBytes(legoBytes) != identityValue.Lego.Digest || uint64(len(legoBytes)) != identityValue.Lego.Bytes {
 		return fmt.Errorf("selected lego asset missing or mismatched")

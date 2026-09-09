@@ -95,6 +95,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 		return err
 	}
 	if journalPresent {
+		if request.Material != nil {
+			return fmt.Errorf("fresh installation material cannot resume an existing bootstrap attempt")
+		}
 		store, journal, err := openJournal(paths.Journal, 0, 0)
 		if err != nil {
 			return err
@@ -113,7 +116,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 				return preflightErr
 			}
 			resumeNow := now().UTC()
-			if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, resumeNow); err != nil {
+			if err := validateBootstrapPreflight(releaseIdentity, journal.Authority, journal.SafetyGeneration, preflightRequest, preflightResult, resumeNow); err != nil {
 				return err
 			}
 			request.PackagePlan, packagePlanDigest, err = refreshPackagePlanForResume(releaseIdentity, request.PackagePlan, preflightRequest, preflightResult, resumeNow)
@@ -195,7 +198,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 		return err
 	}
 	preflightNow := now().UTC()
-	if err := validateBootstrapPreflight(releaseIdentity, preflightRequest, preflightResult, preflightNow); err != nil {
+	if err := validateBootstrapPreflight(releaseIdentity, material.Authority, material.SafetyGeneration, preflightRequest, preflightResult, preflightNow); err != nil {
 		return err
 	}
 	request.PackagePlan, packagePlanDigest, err = refreshPackagePlanForResume(releaseIdentity, request.PackagePlan, preflightRequest, preflightResult, preflightNow)
@@ -893,8 +896,8 @@ func deliverToken(store *journalStore, journal *Journal, request Request, token 
 	return nil
 }
 
-func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, request preflight.ExpansionRequest, result preflight.Result, now time.Time) error {
-	if request.Scope != preflight.ExpansionBootstrap || request.Target != "installation" || request.Generation == 0 {
+func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, management identity.ManagementAuthority, generation uint64, request preflight.ExpansionRequest, result preflight.Result, now time.Time) error {
+	if request.Scope != preflight.ExpansionBootstrap || request.Target != "installation" || request.Generation == 0 || request.Generation != generation {
 		return fmt.Errorf("installer bootstrap preflight request is invalid")
 	}
 	if err := preflight.RequireExpansionResultForRequest(result, request, now); err != nil {
@@ -903,8 +906,8 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, request
 	if request.Profile.Authority.Digest != "sha256:"+releaseIdentity.ProfileDigest || request.Profile.ID != releaseIdentity.Profile.Family || request.Profile.VersionID != releaseIdentity.Profile.Release || request.Profile.Architecture != "amd64" {
 		return fmt.Errorf("bootstrap preflight does not bind the selected release profile")
 	}
-	if len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Protocol != "tcp" || request.BootstrapListeners[0].Purpose != "management" {
-		return fmt.Errorf("bootstrap preflight Management listener is incomplete")
+	if len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Protocol != "tcp" || request.BootstrapListeners[0].Purpose != "management" || request.BootstrapListeners[0].Address != management.Address || request.BootstrapListeners[0].Port != management.Port {
+		return fmt.Errorf("bootstrap preflight Management listener differs from installation authority")
 	}
 	return nil
 }

@@ -5,7 +5,6 @@ package qualification
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,15 +28,14 @@ import (
 )
 
 const (
-	AgentRequestSchemaVersion  = "lanpanel.qualification.agent-request.v2"
-	AgentResponseSchemaVersion = "lanpanel.qualification.agent-response.v2"
+	AgentRequestSchemaVersion  = "lanpanel.qualification.agent-request.v3"
+	AgentResponseSchemaVersion = "lanpanel.qualification.agent-response.v3"
 	maximumAgentRequestBytes   = 40 << 20
 )
 
 type AgentAction string
 
 const (
-	AgentPackagePreflight    AgentAction = "package_preflight"
 	AgentInstall             AgentAction = "install"
 	AgentRestartUI           AgentAction = "restart_ui"
 	AgentReboot              AgentAction = "reboot"
@@ -55,9 +53,6 @@ type AgentRequest struct {
 	RunID              string                             `json:"run_id"`
 	Action             AgentAction                        `json:"action"`
 	CandidateDigest    string                             `json:"candidate_digest"`
-	TargetProfile      []byte                             `json:"target_profile,omitempty"`
-	InstallManifest    []byte                             `json:"install_manifest,omitempty"`
-	SideEffectPlan     []byte                             `json:"side_effect_plan,omitempty"`
 	InstallerAuthority []byte                             `json:"installer_authority,omitempty"`
 	Provider           string                             `json:"provider,omitempty"`
 	Secret             []byte                             `json:"secret,omitempty"`
@@ -104,23 +99,13 @@ func RunAgentRole(args []string, stdin io.Reader, stdout io.Writer) error {
 	}()
 	response := AgentResponse{SchemaVersion: AgentResponseSchemaVersion, RunID: request.RunID, Action: request.Action}
 	switch request.Action {
-	case AgentPackagePreflight:
-		if len(request.TargetProfile) == 0 || len(request.InstallManifest) == 0 || len(request.SideEffectPlan) == 0 || len(request.InstallerAuthority) != 0 || len(request.Certificates) != 0 {
-			return fmt.Errorf("package preflight request shape is invalid")
-		}
-		result, evidence, runErr := runPackagePreflight(request)
-		response.Preflight = result
-		response.Evidence = evidence
-		response.Succeeded = runErr == nil
-		if runErr != nil {
-			response.ErrorCode = "package_preflight_blocked"
-		}
 	case AgentInstall:
-		if len(request.InstallerAuthority) == 0 || len(request.TargetProfile) != 0 || len(request.InstallManifest) != 0 || len(request.SideEffectPlan) != 0 || len(request.Certificates) != 0 {
+		if len(request.InstallerAuthority) == 0 || len(request.Certificates) != 0 {
 			return fmt.Errorf("installer agent request shape is invalid")
 		}
 		var output bytes.Buffer
-		runErr := bootstrap.RunQualificationInstallerAuthority(request.InstallerAuthority, &output)
+		result, runErr := bootstrap.RunQualificationInstallerAuthority(request.InstallerAuthority, request.RunID, request.CandidateDigest, &output)
+		response.Preflight = result
 		if runErr == nil {
 			identity, identityErr := bootstrap.ReadCommittedInstallIdentity(bootstrap.FixedPaths())
 			if identityErr != nil || identity.Kind != release.InstallQualification || identity.RunID != request.RunID || identity.CandidateDigest != request.CandidateDigest {
@@ -252,53 +237,19 @@ func DecodeAgentResponse(data []byte, runID string, action AgentAction) (AgentRe
 	if len(response.ObservedPackageTuple) != 0 && (!packageObservationAction || !validObservedPackageTuple(response.ObservedPackageTuple)) || response.Succeeded && packageObservationAction && len(response.ObservedPackageTuple) == 0 {
 		return AgentResponse{}, fmt.Errorf("qualification agent package observation is invalid")
 	}
-	if action == AgentPackagePreflight {
-		if _, err := response.Preflight.Digest(); err != nil {
-			return AgentResponse{}, err
+	if action == AgentInstall {
+		if response.Succeeded || !reflectZeroPreflight(response.Preflight) {
+			if _, err := response.Preflight.Digest(); err != nil {
+				return AgentResponse{}, err
+			}
+			if response.Preflight.Scope != string(preflight.ExpansionBootstrap) || response.Preflight.Target != "installation" || response.Succeeded && !response.Preflight.Allowed {
+				return AgentResponse{}, fmt.Errorf("qualification installation preflight is not an allowed bootstrap observation")
+			}
 		}
 	} else if !reflectZeroPreflight(response.Preflight) {
 		return AgentResponse{}, fmt.Errorf("qualification agent response carries unrelated preflight")
 	}
 	return response, nil
-}
-
-func runPackagePreflight(request AgentRequest) (preflight.Result, string, error) {
-	target, err := release.DecodeQualificationTargetProfile(request.TargetProfile)
-	if err != nil {
-		return preflight.Result{}, "", err
-	}
-	manifest, err := release.DecodeQualificationInstallManifest(request.InstallManifest)
-	if err != nil {
-		return preflight.Result{}, "", err
-	}
-	plan, err := release.DecodeLiveSideEffectPlan(request.SideEffectPlan)
-	if err != nil {
-		return preflight.Result{}, "", err
-	}
-	host, err := bootstrap.ObserveHostFingerprint()
-	if err != nil || release.ValidateQualificationBinding(manifest, target, plan, host) != nil || manifest.RunID != request.RunID || manifest.CandidateBinary.Digest != request.CandidateDigest {
-		return preflight.Result{}, "", fmt.Errorf("qualification agent authority differs from target host: %w", err)
-	}
-	profileDigest, _ := release.ProfileDigest(target.Profile)
-	confinement := target.Profile.ManagedConfinement
-	expected := preflight.ExpectedProfile{ID: target.Profile.Family, VersionID: target.Profile.Release, Architecture: "amd64", SystemdVersion: target.Profile.SystemdVersion, NginxVersion: target.Profile.NginxVersion, PackageSnapshotDigest: "sha256:" + target.Profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), QualificationDigest: "sha256:" + confinement.QualificationDigest}, Authority: preflight.ProfileAuthority{Kind: preflight.QualificationTarget, Digest: "sha256:" + profileDigest, CandidateDigest: "sha256:" + manifest.CandidateBinary.Digest, InstallManifestDigest: "sha256:" + release.DigestBytes(request.InstallManifest), SideEffectPlanDigest: "sha256:" + release.DigestBytes(request.SideEffectPlan), HostFingerprint: host, RunID: request.RunID}}
-	preflightRequest := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: 1, Profile: expected, ManagedPaths: bootstrap.FixedManagedPathRequirements(bootstrap.FixedPaths()), Disks: bootstrap.FixedDiskRequirements(bootstrap.FixedPaths()), LastTrustedWall: manifest.CreatedAt}
-	observer, err := preflight.NewLinuxObserver(func(ctx context.Context) (preflight.PackageObservation, error) {
-		return preflight.ObserveBootstrapReadiness(ctx)
-	})
-	if err != nil {
-		return preflight.Result{}, "", err
-	}
-	observed, err := observer.ObserveExpansion(context.Background(), preflightRequest)
-	if err != nil {
-		return preflight.Result{}, "", err
-	}
-	result, evaluateErr := preflight.EvaluateExpansion(preflightRequest, observed)
-	evidenceBytes, _ := json.Marshal(struct {
-		RequestDigest string `json:"request_digest"`
-		ResultDigest  string `json:"result_digest"`
-	}{result.RequestDigest, func() string { value, _ := result.Digest(); return value }()})
-	return result, release.DigestBytes(evidenceBytes), evaluateErr
 }
 
 func verifyRunningCandidate(expected string) error {
@@ -319,7 +270,7 @@ func verifyRunningCandidate(expected string) error {
 }
 
 func carriesCoreAgentPayload(request AgentRequest) bool {
-	return len(request.TargetProfile) != 0 || len(request.InstallManifest) != 0 || len(request.SideEffectPlan) != 0 || len(request.InstallerAuthority) != 0
+	return len(request.InstallerAuthority) != 0
 }
 
 func carriesAgentPayload(request AgentRequest) bool {

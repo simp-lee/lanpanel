@@ -257,7 +257,7 @@ func FinalizeRelease(inputPath string, now func() time.Time) (FinalizedRelease, 
 }
 
 func buildPublicPackageTemplate(template packages.Plan, profile release.OSProfile, binaryDigest string) ([]byte, error) {
-	if err := validateQualificationPackageTemplate(template, profile); err != nil {
+	if err := release.ValidateQualificationPackageTemplate(template, profile); err != nil {
 		return nil, err
 	}
 	profileDigest, err := release.ProfileDigest(profile)
