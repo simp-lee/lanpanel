@@ -39,7 +39,7 @@ A direct external-vantage reference is an owner-read-only canonical JSON file:
 {"schema_version":"lanpanel.qualification.direct-vantage.v1","expected_source_ipv4":"198.51.100.10"}
 ```
 
-Use the actual independently verified public source address, not this documentation address. It must differ from the target host. Public probes connect directly from the harness host, disable proxies and redirects, pin the target IP/Host/SNI, verify the public trust chain, and prove header sanitization from the echoed source IP.
+Use the actual independently verified public source address, not this documentation address. It must differ from the target host. Public probes connect directly from the harness host, disable proxies and redirects, pin the target IP/Host/SNI, verify the public trust chain, and prove header sanitization from the echoed source IP. Authoritative DNS checks use IPv4 transport to every authoritative nameserver's IPv4 endpoints; a nameserver without IPv4 or a failed endpoint blocks qualification. AAAA, CNAME, and TXT records are still checked over IPv4, so the harness does not need IPv6 egress.
 
 ## Generate immutable artifacts
 

@@ -2050,6 +2050,17 @@ func waitAuthoritativeDNS(ctx context.Context, zone string, names []string, expe
 	}
 }
 
+func lookupAuthoritativeIPv4(ctx context.Context, resolver *net.Resolver, server string) ([]netip.Addr, error) {
+	addresses, err := resolver.LookupNetIP(ctx, "ip4", strings.TrimSuffix(server, "."))
+	if err != nil {
+		return nil, fmt.Errorf("authoritative nameserver IPv4 inventory is unavailable: %w", err)
+	}
+	if len(addresses) == 0 || len(addresses) > 16 {
+		return nil, fmt.Errorf("authoritative nameserver IPv4 inventory is empty or unbounded")
+	}
+	return addresses, nil
+}
+
 func exactAuthoritativeA(ctx context.Context, zone string, names []string, expected string) error {
 	servers, err := net.DefaultResolver.LookupNS(ctx, zone)
 	if err != nil || len(servers) == 0 || len(servers) > 16 {
@@ -2057,12 +2068,12 @@ func exactAuthoritativeA(ctx context.Context, zone string, names []string, expec
 	}
 	client := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
 	for _, server := range servers {
-		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, strings.TrimSuffix(server.Host, "."))
-		if err != nil || len(addresses) == 0 || len(addresses) > 16 {
-			return fmt.Errorf("authoritative nameserver address is unavailable: %w", err)
+		addresses, err := lookupAuthoritativeIPv4(ctx, net.DefaultResolver, server.Host)
+		if err != nil {
+			return err
 		}
 		for _, address := range addresses {
-			destination := net.JoinHostPort(address.IP.String(), "53")
+			destination := net.JoinHostPort(address.String(), "53")
 			for _, name := range names {
 				for _, queryType := range []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME} {
 					message := new(dns.Msg)
@@ -2096,8 +2107,8 @@ func waitAuthoritativeAbsent(ctx context.Context, zone, name string) error {
 		servers, err := net.DefaultResolver.LookupNS(ctx, zone)
 		clean := err == nil && len(servers) > 0 && len(servers) <= 16
 		for _, server := range servers {
-			addresses, lookupErr := net.DefaultResolver.LookupIPAddr(ctx, strings.TrimSuffix(server.Host, "."))
-			if lookupErr != nil || len(addresses) == 0 || len(addresses) > 16 {
+			addresses, lookupErr := lookupAuthoritativeIPv4(ctx, net.DefaultResolver, server.Host)
+			if lookupErr != nil {
 				clean = false
 				break
 			}
@@ -2106,7 +2117,7 @@ func waitAuthoritativeAbsent(ctx context.Context, zone, name string) error {
 					message := new(dns.Msg)
 					message.SetQuestion(dns.Fqdn(name), queryType)
 					message.RecursionDesired = false
-					response, _, queryErr := (&dns.Client{Net: "udp", Timeout: 5 * time.Second}).ExchangeContext(ctx, message, net.JoinHostPort(address.IP.String(), "53"))
+					response, _, queryErr := (&dns.Client{Net: "udp", Timeout: 5 * time.Second}).ExchangeContext(ctx, message, net.JoinHostPort(address.String(), "53"))
 					if queryErr != nil || response == nil || !response.Authoritative || response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError || len(response.Answer) != 0 {
 						clean = false
 						break
@@ -2132,8 +2143,8 @@ func waitAuthoritativeNoTXT(ctx context.Context, zone, owner string) error {
 		servers, err := net.DefaultResolver.LookupNS(ctx, zone)
 		clean := err == nil && len(servers) > 0 && len(servers) <= 16
 		for _, server := range servers {
-			addresses, lookupErr := net.DefaultResolver.LookupIPAddr(ctx, strings.TrimSuffix(server.Host, "."))
-			if lookupErr != nil || len(addresses) == 0 || len(addresses) > 16 {
+			addresses, lookupErr := lookupAuthoritativeIPv4(ctx, net.DefaultResolver, server.Host)
+			if lookupErr != nil {
 				clean = false
 				break
 			}
@@ -2141,7 +2152,7 @@ func waitAuthoritativeNoTXT(ctx context.Context, zone, owner string) error {
 				message := new(dns.Msg)
 				message.SetQuestion(dns.Fqdn(owner), dns.TypeTXT)
 				message.RecursionDesired = false
-				response, _, queryErr := (&dns.Client{Net: "udp", Timeout: 5 * time.Second}).ExchangeContext(ctx, message, net.JoinHostPort(address.IP.String(), "53"))
+				response, _, queryErr := (&dns.Client{Net: "udp", Timeout: 5 * time.Second}).ExchangeContext(ctx, message, net.JoinHostPort(address.String(), "53"))
 				if queryErr != nil || response == nil || !response.Authoritative || response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError || len(response.Answer) != 0 {
 					clean = false
 					break
