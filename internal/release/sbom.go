@@ -129,7 +129,7 @@ func GenerateReleaseSPDX(binaryPath string, dependency QualificationDependencyAu
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	}
 	for _, tuple := range profile.Packages {
-		native = append(native, spdxOSPackage(tuple, profile.Family, profile.RepositorySource))
+		native = append(native, spdxOSPackage(tuple, profile.Family, profileRepositorySource(profile, tuple)))
 	}
 	document.Packages = append(document.Packages, native...)
 	sort.Slice(document.Packages, func(i, j int) bool { return document.Packages[i].SPDXID < document.Packages[j].SPDXID })
@@ -232,7 +232,7 @@ func expectedReleaseSPDXPackages(candidate []byte, candidateDigest, releaseTag s
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	)
 	for _, tuple := range profile.Packages {
-		packages = append(packages, spdxOSPackage(tuple, profile.Family, profile.RepositorySource))
+		packages = append(packages, spdxOSPackage(tuple, profile.Family, profileRepositorySource(profile, tuple)))
 	}
 	expected := make(map[string]SPDXPackage, len(packages))
 	for _, pkg := range packages {
@@ -283,6 +283,18 @@ func spdxNativePackage(name, version, location, digest string) SPDXPackage {
 	module := map[string]string{"headscale": "github.com/juanfont/headscale", "lego": "github.com/go-acme/lego/v4", "tailscale-client": "tailscale.com"}[name]
 	pkg.ExternalRefs = []SPDXExternalRef{spdxPURL("pkg:golang/" + module + "@v" + strings.TrimPrefix(version, "v"))}
 	return pkg
+}
+
+func profileRepositorySource(profile OSProfile, tuple PackageTuple) string {
+	for _, repository := range profile.Repositories {
+		if tuple.RepositoryID == repository.ID {
+			return repository.URI
+		}
+	}
+	if len(profile.Repositories) == 1 {
+		return profile.Repositories[0].URI
+	}
+	return ""
 }
 
 func spdxOSPackage(tuple PackageTuple, family, repositorySource string) SPDXPackage {

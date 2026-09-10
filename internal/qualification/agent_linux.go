@@ -674,7 +674,7 @@ func observeQualificationPackageTuple(ctx context.Context, expected []release.Pa
 	observed, err := preflight.ObserveInstalledPackageTuples(ctx, names)
 	values := make([]release.PackageTuple, len(observed))
 	for index, tuple := range observed {
-		values[index] = release.PackageTuple{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture}
+		values[index] = release.PackageTuple{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture, RepositoryID: expected[index].RepositoryID}
 	}
 	if err != nil {
 		return values, err
@@ -694,7 +694,7 @@ func validObservedPackageTuple(values []release.PackageTuple) bool {
 	previous := ""
 	for _, tuple := range values {
 		key := tuple.Name + "\x00" + tuple.Architecture
-		if tuple.Name == "" || tuple.Version == "" || tuple.Name != strings.TrimSpace(tuple.Name) || tuple.Version != strings.TrimSpace(tuple.Version) || len(tuple.Name) > 128 || len(tuple.Version) > 128 || strings.ContainsAny(tuple.Name+tuple.Version, "\x00\r\n") || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+		if tuple.Name == "" || tuple.Version == "" || tuple.Name != strings.TrimSpace(tuple.Name) || tuple.Version != strings.TrimSpace(tuple.Version) || len(tuple.Name) > 128 || len(tuple.Version) > 128 || strings.ContainsAny(tuple.Name+tuple.Version, "\x00\r\n") || tuple.Architecture != "amd64" && tuple.Architecture != "all" || tuple.RepositoryID != "" && !release.ValidReference(tuple.RepositoryID) || previous != "" && previous >= key {
 			return false
 		}
 		previous = key

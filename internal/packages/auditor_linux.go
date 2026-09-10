@@ -45,7 +45,7 @@ func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 	if launcher == nil {
 		return nil, fmt.Errorf("package auditor requires the typed child launcher")
 	}
-	paths := []string{"/etc/apt", "/etc/dpkg", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", "/proc/net", "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
+	paths := []string{"/etc/apt", "/etc/dpkg", "/usr/share/keyrings", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", "/proc/net", "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
 	for _, path := range paths {
 		if err := validateAuditorParent(path); err != nil {
 			return nil, err
@@ -254,7 +254,7 @@ const maximumRepositoryMetadataFileBytes = 128 << 20
 // metadata actually present in the local lists directory. The Plan is never
 // used as a source for either digest: it is only compared later by
 // ValidateAPTConfiguration.
-func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repositories []ObservedRepository, keyrings map[string][]byte) error {
+func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repositories []ObservedRepository, keyrings map[string][]byte, expectedPackages []Package) error {
 	if len(repositories) == 0 {
 		return nil
 	}
@@ -311,7 +311,19 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 		if !releaseFieldContainsToken(plaintext, "Architectures", "amd64") {
 			return fmt.Errorf("APT repository %q InRelease does not authorize amd64", repositories[index].ID)
 		}
+		if !releaseFieldEqualsTokens(plaintext, "Suite", []string{repositories[index].Suite}) || !releaseFieldEqualsTokens(plaintext, "Components", repositories[index].Components) {
+			return fmt.Errorf("APT repository %q signed suite or components differ from authority", repositories[index].ID)
+		}
 		allArchitectureRequired := releaseFieldContainsToken(plaintext, "Architectures", "all") && !releaseFieldContainsToken(plaintext, "No-Support-for-Architecture-all", "Packages")
+		requireIndexes := expectedPackages == nil
+		if !requireIndexes {
+			for _, pkg := range expectedPackages {
+				if pkg.RepositoryID == "" || pkg.RepositoryID == repositories[index].ID {
+					requireIndexes = true
+					break
+				}
+			}
+		}
 		for _, component := range repositories[index].Components {
 			for _, architecture := range []string{"amd64", "all"} {
 				packagePrefix := prefix + aptListPart(component) + "_binary-" + architecture + "_Packages"
@@ -327,7 +339,7 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 						return fmt.Errorf("APT repository %q package index is not bound by its InRelease metadata: %w", repositories[index].ID, err)
 					}
 				}
-				if !found && (architecture == "amd64" || allArchitectureRequired) {
+				if !found && requireIndexes && (architecture == "amd64" || allArchitectureRequired) {
 					return fmt.Errorf("APT repository %q lacks the exact %s package index for component %q", repositories[index].ID, architecture, component)
 				}
 			}
@@ -425,14 +437,30 @@ func (auditor *LinuxAuditor) validateRepositoryPackageIndex(file repositoryMetad
 	return nil
 }
 
-func releaseFieldContainsToken(release []byte, field, expected string) bool {
+func releaseFieldTokens(release []byte, field string) ([]string, bool) {
+	var values []string
+	found := false
 	for line := range strings.SplitSeq(string(release), "\n") {
-		key, value, found := strings.Cut(line, ":")
-		if found && key == field {
-			return slices.Contains(strings.Fields(value), expected)
+		key, value, hasValue := strings.Cut(line, ":")
+		if key != field || !hasValue || found {
+			if key == field && found {
+				return nil, false
+			}
+			continue
 		}
+		values, found = strings.Fields(value), true
 	}
-	return false
+	return values, found
+}
+
+func releaseFieldEqualsTokens(release []byte, field string, expected []string) bool {
+	actual, found := releaseFieldTokens(release, field)
+	return found && slices.Equal(actual, expected)
+}
+
+func releaseFieldContainsToken(release []byte, field, expected string) bool {
+	values, found := releaseFieldTokens(release, field)
+	return found && slices.Contains(values, expected)
 }
 
 func releaseSHA256Files(release []byte) (map[string]repositoryReleaseFile, error) {
@@ -463,7 +491,7 @@ func releaseSHA256Files(release []byte) (map[string]repositoryReleaseFile, error
 		}
 		files[fields[2]] = repositoryReleaseFile{Bytes: bytes, Digest: fields[0]}
 	}
-	if len(files) == 0 {
+	if !inSHA256 {
 		return nil, fmt.Errorf("signed Release metadata omits its SHA256 index")
 	}
 	return files, nil
@@ -538,6 +566,7 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 		{filepath.Join(auditor.aptRoot, "auth.conf"), APTConfig, false},
 		{filepath.Join(auditor.aptRoot, "auth.conf.d"), APTConfig, true},
 		{filepath.Join(auditor.aptRoot, "keyrings"), APTKeyring, true},
+		{filepath.Join(filepath.Dir(filepath.Dir(auditor.aptRoot)), "usr/share/keyrings"), APTKeyring, true},
 		{filepath.Join(auditor.aptRoot, "preferences"), APTConfig, false},
 		{filepath.Join(auditor.aptRoot, "preferences.d"), APTConfig, true},
 		{filepath.Join(auditor.aptRoot, "sources.list"), APTSource, false},
@@ -570,7 +599,7 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 	for index := range repositories {
 		repositories[index].KeyringDigest = digestBytes(keyrings[repositories[index].KeyringPath])
 	}
-	if err := auditor.observeRepositoryMetadata(ctx, repositories, keyrings); err != nil {
+	if err := auditor.observeRepositoryMetadata(ctx, repositories, keyrings, plan.Packages); err != nil {
 		return nil, nil, err
 	}
 	return files, repositories, nil
@@ -657,6 +686,8 @@ func canonicalAuditPath(path string, kind ConfigKind, strict bool) string {
 		return "/etc/apt/sources.list.d/" + base
 	case APTKeyring:
 		switch {
+		case strings.Contains(path, "/usr/share/keyrings/"):
+			return "/usr/share/keyrings/" + base
 		case strings.Contains(path, "/trusted.gpg.d/"):
 			return "/etc/apt/trusted.gpg.d/" + base
 		case strings.HasSuffix(path, "/trusted.gpg"):
@@ -690,11 +721,20 @@ func parseObservedRepositories(files []ObservedConfig, expected []Repository) ([
 	for _, observed := range parsed {
 		matched := false
 		for _, want := range expected {
-			if observed.URI == want.URI && observed.Suite == want.Suite && slices.Equal(observed.Components, want.Components) && observed.KeyringPath == want.KeyringPath {
+			keyringMatches := observed.KeyringPath == want.KeyringPath
+			if observed.KeyringPath == "" && strings.HasPrefix(want.KeyringPath, "/usr/share/keyrings/") {
+				keyringMatches = true
+			}
+			if observed.URI == want.URI && observed.Suite == want.Suite && slices.Equal(observed.Components, want.Components) && keyringMatches {
+				if matched {
+					return nil, fmt.Errorf("active APT source matches multiple repository authorities")
+				}
+				if observed.KeyringPath == "" {
+					observed.KeyringPath = want.KeyringPath
+				}
 				observed.ID, observed.Enabled = want.ID, true
 				result = append(result, observed)
 				matched = true
-				break
 			}
 		}
 		if !matched {
@@ -716,14 +756,22 @@ func parseSourceFile(path string, data []byte) ([]ObservedRepository, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 5 || fields[0] != "deb" || !strings.HasPrefix(fields[1], "[") {
+		if len(fields) < 4 || fields[0] != "deb" {
 			return nil, fmt.Errorf("APT source line is unsupported or malformed")
+		}
+		if !strings.HasPrefix(fields[1], "[") {
+			result = append(result, ObservedRepository{URI: fields[1], Suite: fields[2], Components: append([]string(nil), fields[3:]...), Enabled: true})
+			continue
 		}
 		closing := slices.IndexFunc(fields, func(value string) bool { return strings.HasSuffix(value, "]") })
 		if closing < 1 || closing+3 >= len(fields) {
 			return nil, fmt.Errorf("APT source options are incomplete")
 		}
-		options := strings.Trim(strings.Join(fields[1:closing+1], " "), "[]")
+		options := strings.Join(fields[1:closing+1], " ")
+		if len(options) < 2 || options[0] != '[' || options[len(options)-1] != ']' || strings.Count(options, "[") != 1 || strings.Count(options, "]") != 1 {
+			return nil, fmt.Errorf("APT source option brackets are malformed")
+		}
+		options = options[1 : len(options)-1]
 		signedBy := ""
 		for _, option := range strings.Fields(options) {
 			key, value, found := strings.Cut(option, "=")
@@ -744,24 +792,55 @@ func parseSourceFile(path string, data []byte) ([]ObservedRepository, error) {
 
 func parseDeb822Sources(data []byte) ([]ObservedRepository, error) {
 	result := []ObservedRepository{}
-	for _, paragraph := range strings.Split(strings.TrimSpace(string(data)), "\n\n") {
+	paragraph := []string{}
+	flush := func() error {
+		if len(paragraph) == 0 {
+			return nil
+		}
 		fields := map[string]string{}
-		for _, line := range strings.Split(paragraph, "\n") {
+		for _, line := range paragraph {
 			key, value, found := strings.Cut(line, ":")
-			if !found || strings.TrimSpace(key) != key || fields[key] != "" {
-				return nil, fmt.Errorf("deb822 APT source is malformed or duplicated")
+			if !found || strings.TrimSpace(key) != key || key == "" {
+				return fmt.Errorf("deb822 APT source is malformed or duplicated")
+			}
+			if _, duplicate := fields[key]; duplicate {
+				return fmt.Errorf("deb822 APT source is malformed or duplicated")
 			}
 			fields[key] = strings.TrimSpace(value)
 		}
 		for key := range fields {
 			if key != "Types" && key != "URIs" && key != "Suites" && key != "Components" && key != "Signed-By" && key != "Architectures" && key != "Enabled" {
-				return nil, fmt.Errorf("deb822 APT source contains an unsupported field")
+				return fmt.Errorf("deb822 APT source contains an unsupported field")
 			}
 		}
-		if fields["Types"] != "deb" || len(strings.Fields(fields["URIs"])) != 1 || len(strings.Fields(fields["Suites"])) != 1 || len(strings.Fields(fields["Signed-By"])) != 1 || len(strings.Fields(fields["Components"])) == 0 || fields["Architectures"] != "" && fields["Architectures"] != "amd64" || fields["Enabled"] != "" && fields["Enabled"] != "yes" {
-			return nil, fmt.Errorf("deb822 APT source authority is unsupported")
+		uris, suites, components, signedBy := strings.Fields(fields["URIs"]), strings.Fields(fields["Suites"]), strings.Fields(fields["Components"]), strings.Fields(fields["Signed-By"])
+		if fields["Types"] != "deb" || len(uris) != 1 || len(suites) == 0 || len(suites) > 16 || len(signedBy) != 1 || len(components) == 0 || fields["Architectures"] != "" && fields["Architectures"] != "amd64" || fields["Enabled"] != "" && fields["Enabled"] != "yes" {
+			return fmt.Errorf("deb822 APT source authority is unsupported")
 		}
-		result = append(result, ObservedRepository{URI: fields["URIs"], Suite: fields["Suites"], Components: strings.Fields(fields["Components"]), KeyringPath: fields["Signed-By"], Enabled: true})
+		for _, suite := range suites {
+			result = append(result, ObservedRepository{URI: uris[0], Suite: suite, Components: append([]string(nil), components...), KeyringPath: signedBy[0], Enabled: true})
+		}
+		paragraph = nil
+		return nil
+	}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSuffix(raw, "\r")
+		if strings.TrimSpace(line) == "" {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			return nil, fmt.Errorf("deb822 APT source continuation is unsupported")
+		}
+		paragraph = append(paragraph, line)
+	}
+	if err := flush(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }

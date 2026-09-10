@@ -293,15 +293,12 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	}
 	for index, pkg := range plan.Packages {
 		tuple := installed.Profile.Packages[index]
-		if pkg.Name != tuple.Name || pkg.Version != tuple.Version || pkg.Architecture != tuple.Architecture {
+		if pkg.Name != tuple.Name || pkg.Version != tuple.Version || pkg.Architecture != tuple.Architecture || pkg.RepositoryID != tuple.RepositoryID {
 			return "", fmt.Errorf("package Plan tuple differs from qualification target profile")
 		}
 	}
-	if len(plan.Repositories) != 1 || plan.Repositories[0].URI != installed.Profile.RepositorySource || plan.Repositories[0].KeyringDigest != installed.Profile.RepositoryKeyFingerprint || plan.Repositories[0].MetadataDigest != installed.Profile.RepositoryMetadataDigest || plan.Repositories[0].CutoffDigest != installed.Profile.RepositoryCutoffDigest {
-		return "", fmt.Errorf("package Plan repository snapshot differs from qualification target profile")
-	}
-	repositoryDigest, err := release.RepositoryAuthorityDigest(plan.Repositories[0])
-	if err != nil || repositoryDigest != installed.Profile.RepositoryAuthorityDigest {
+	repositoryDigest, err := release.RepositoriesAuthorityDigest(plan.Repositories)
+	if err != nil || !reflect.DeepEqual(plan.Repositories, installed.Profile.Repositories) || repositoryDigest != installed.Profile.RepositoryAuthorityDigest {
 		return "", fmt.Errorf("package Plan repository authority differs from qualification target profile")
 	}
 	resultDigest, err := result.Digest()

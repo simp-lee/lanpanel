@@ -27,12 +27,15 @@ type SourcePackageMapping struct {
 // ResolveRepositoryPackageSources reuses the installation's repository trust
 // authority. A caller-supplied source name is never advisory-matching authority.
 func ResolveRepositoryPackageSources(repository Repository, keyring, inRelease []byte, indexes []RepositoryPackageIndex, closure []Package) ([]SourcePackageMapping, error) {
-	if len(closure) == 0 || len(indexes) == 0 || digestBytes(keyring) != repository.KeyringDigest || digestBytes(inRelease) != repository.MetadataDigest {
+	if len(closure) > 0 && len(indexes) == 0 || digestBytes(keyring) != repository.KeyringDigest || digestBytes(inRelease) != repository.MetadataDigest {
 		return nil, fmt.Errorf("source mapping repository snapshot differs from package authority")
 	}
 	plaintext, err := verifyInRelease(inRelease, keyring)
 	if err != nil {
 		return nil, err
+	}
+	if !releaseFieldEqualsTokens(plaintext, "Suite", []string{repository.Suite}) || !releaseFieldEqualsTokens(plaintext, "Components", repository.Components) || !releaseFieldContainsToken(plaintext, "Architectures", "amd64") {
+		return nil, fmt.Errorf("source mapping signed suite, components, or architecture differs")
 	}
 	cutoff, err := repositoryCutoffDigest(plaintext)
 	if err != nil || cutoff != repository.CutoffDigest {

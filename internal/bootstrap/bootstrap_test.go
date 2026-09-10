@@ -164,8 +164,9 @@ func TestInstallerPackagePhaseBindsReleaseRepositoryClosureAndPreflight(t *testi
 	installed.Profile.Packages = []release.PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}
 	installed.Profile.PackageClosureDigest = closure
 	installed.Profile.NginxVersion = "1.26.0-1"
-	repository := packages.Repository{ID: "debian", URI: installed.Profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: installed.Profile.RepositoryKeyFingerprint, MetadataDigest: installed.Profile.RepositoryMetadataDigest, CutoffDigest: installed.Profile.RepositoryCutoffDigest}
-	installed.Profile.RepositoryAuthorityDigest, err = release.RepositoryAuthorityDigest(repository)
+	repository := packages.Repository{ID: "debian", URI: installed.Profile.Repositories[0].URI, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: installed.Profile.Repositories[0].KeyringDigest, MetadataDigest: installed.Profile.Repositories[0].MetadataDigest, CutoffDigest: installed.Profile.Repositories[0].CutoffDigest}
+	installed.Profile.Repositories = []packages.Repository{repository}
+	installed.Profile.RepositoryAuthorityDigest, err = release.RepositoriesAuthorityDigest(installed.Profile.Repositories)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,8 +199,8 @@ func TestBootstrapJournalPackageAuthorityUsesExactPersistedPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile.PackageClosureDigest = closure
-	repository := packages.Repository{ID: "debian", URI: profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: profile.RepositoryKeyFingerprint, MetadataDigest: profile.RepositoryMetadataDigest, CutoffDigest: profile.RepositoryCutoffDigest}
-	profile.RepositoryAuthorityDigest, err = release.RepositoryAuthorityDigest(repository)
+	repository := packages.Repository{ID: "debian", URI: profile.Repositories[0].URI, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: profile.Repositories[0].KeyringDigest, MetadataDigest: profile.Repositories[0].MetadataDigest, CutoffDigest: profile.Repositories[0].CutoffDigest}
+	profile.RepositoryAuthorityDigest, err = release.RepositoriesAuthorityDigest([]packages.Repository{repository})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +506,8 @@ func TestTokenDeliveryMarksAttemptBeforeOutputAndNeverRedirectsSecret(t *testing
 
 func testJournal(root string) Journal {
 	digest := func(value byte) string { return strings.Repeat(string(value), 64) }
-	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest('1'), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest('2'), RepositoryMetadataDigest: digest('3'), RepositoryCutoffDigest: digest('4'), RepositoryAuthorityDigest: digest('6'), PackageClosureDigest: digest('5'), Packages: []release.PackageTuple{{Name: "nginx", Version: "1.26.0", Architecture: "amd64"}}, ManagedConfinement: release.ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest('8')}}
+	profile := release.OSProfile{ID: "debian-13", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: digest('1'), Repositories: []packages.Repository{{ID: "debian", URI: "https://deb.example.test/debian", Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: digest('2'), MetadataDigest: digest('3'), CutoffDigest: digest('4')}}, RepositoryAuthorityDigest: digest('6'), PackageClosureDigest: digest('5'), Packages: []release.PackageTuple{{Name: "nginx", Version: "1.26.0", Architecture: "amd64"}}, ManagedConfinement: release.ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest('8')}}
+	profile.RepositoryAuthorityDigest, _ = release.RepositoriesAuthorityDigest(profile.Repositories)
 	profileDigest, _ := release.ProfileDigest(profile)
 	paths := testPaths(root)
 	request := preflight.ExpansionRequest{Scope: preflight.ExpansionBootstrap, Target: "installation", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: profile.ManagedConfinement.SchemaVersion, KernelRelease: profile.ManagedConfinement.KernelRelease, CgroupMode: profile.ManagedConfinement.CgroupMode, BindListenPolicy: profile.ManagedConfinement.BindListenPolicy, ConnectPolicy: profile.ManagedConfinement.ConnectPolicy, FilesystemPolicy: profile.ManagedConfinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), profile.ManagedConfinement.ProtectedDestinations...), QualificationDigest: "sha256:" + profile.ManagedConfinement.QualificationDigest}, Authority: preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + profileDigest, LiveQualified: true}}, BootstrapListeners: []preflight.ListenerRequirement{{Protocol: "tcp", Address: "127.41.42.43", Port: 52345, Purpose: "management"}}, Disks: []preflight.DiskRequirement{{Path: root, MinimumAvailableBytes: 1}}, LastTrustedWall: time.Unix(1700000000, 0).UTC()}

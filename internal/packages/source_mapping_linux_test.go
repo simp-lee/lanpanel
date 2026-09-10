@@ -12,6 +12,16 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 )
 
+func TestSignedRepositoryMetadataAllowsEmptyIndexOnlyForEmptyClosure(t *testing.T) {
+	files, err := releaseSHA256Files([]byte("Suite: stable\nComponents: main\nArchitectures: amd64\nSHA256:\n"))
+	if err != nil || len(files) != 0 {
+		t.Fatalf("empty signed index = %#v, %v", files, err)
+	}
+	if _, err := releaseSHA256Files([]byte("Suite: stable\nComponents: main\nArchitectures: amd64\n")); err == nil {
+		t.Fatal("missing SHA256 field was accepted")
+	}
+}
+
 func TestSignedRepositorySourceMappingBindsExactBinaryClosure(t *testing.T) {
 	signer, err := openpgp.NewEntity("Source fixture", "", "fixture@example.test", nil)
 	if err != nil {
@@ -39,7 +49,7 @@ func TestSignedRepositorySourceMappingBindsExactBinaryClosure(t *testing.T) {
 	}
 	resolve := func(data string, mutate func(*Repository, []byte, []byte, []RepositoryPackageIndex, []Package)) ([]SourcePackageMapping, error) {
 		t.Helper()
-		plain := []byte(fmt.Sprintf("Date: Mon, 01 Sep 2025 00:00:00 UTC\nArchitectures: amd64 all\nComponents: main\nSHA256:\n %s %d main/binary-amd64/Packages\n", digestBytes([]byte(data)), len(data)))
+		plain := []byte(fmt.Sprintf("Suite: stable\nDate: Mon, 01 Sep 2025 00:00:00 UTC\nArchitectures: amd64 all\nComponents: main\nSHA256:\n %s %d main/binary-amd64/Packages\n", digestBytes([]byte(data)), len(data)))
 		var signed bytes.Buffer
 		writer, err := clearsign.Encode(&signed, signer.PrivateKey, nil)
 		if err != nil {
@@ -55,7 +65,7 @@ func TestSignedRepositorySourceMappingBindsExactBinaryClosure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		repository := Repository{Components: []string{"main"}, KeyringDigest: digestBytes(keyring.Bytes()), MetadataDigest: digestBytes(signed.Bytes()), CutoffDigest: cutoff}
+		repository := Repository{Suite: "stable", Components: []string{"main"}, KeyringDigest: digestBytes(keyring.Bytes()), MetadataDigest: digestBytes(signed.Bytes()), CutoffDigest: cutoff}
 		keys, inRelease := append([]byte(nil), keyring.Bytes()...), append([]byte(nil), signed.Bytes()...)
 		indexes := []RepositoryPackageIndex{{ReleasePath: "main/binary-amd64/Packages", Data: []byte(data)}}
 		packages := append([]Package(nil), closure...)
@@ -80,6 +90,11 @@ func TestSignedRepositorySourceMappingBindsExactBinaryClosure(t *testing.T) {
 		},
 		"signature despite changed digest": func(repo *Repository, _, signed []byte, _ []RepositoryPackageIndex, _ []Package) {
 			signed[bytes.Index(signed, []byte("Architectures"))] = 'Z'
+			repo.MetadataDigest = digestBytes(signed)
+		},
+		"signed suite": func(repo *Repository, _, signed []byte, _ []RepositoryPackageIndex, _ []Package) {
+			index := bytes.Index(signed, []byte("Suite: stable"))
+			signed[index+len("Suite: ")] = 'x'
 			repo.MetadataDigest = digestBytes(signed)
 		},
 		"index": func(_ *Repository, _, _ []byte, indexes []RepositoryPackageIndex, _ []Package) {

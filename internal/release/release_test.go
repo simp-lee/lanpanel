@@ -324,13 +324,62 @@ func TestQualificationInstallBindsCandidateTargetHostAndImmutablePlan(t *testing
 	}
 }
 
+func TestInstallIdentityCopiesRepositoryComponentsWithoutAliasing(t *testing.T) {
+	profile := testProfile()
+	authority := &InstallAuthority{identity: InstallIdentity{Profile: profile}}
+	copy := authority.Identity()
+	copy.Profile.Repositories[0].Components[0] = "mutated"
+	fresh := authority.Identity()
+	if fresh.Profile.Repositories[0].Components[0] == "mutated" {
+		t.Fatal("install identity repository components are aliased")
+	}
+}
+
+func TestOSProfileBindsMultipleExactRepositoriesAndPackageOwners(t *testing.T) {
+	profile := testProfile()
+	security := profile.Repositories[0]
+	security.ID = "debian-security"
+	security.Suite = "stable-security"
+	profile.Repositories[0].ID = "debian-main"
+	profile.Repositories = append(profile.Repositories, security)
+	for index := range profile.Packages {
+		if index == len(profile.Packages)-1 {
+			profile.Packages[index].RepositoryID = "debian-security"
+		} else {
+			profile.Packages[index].RepositoryID = "debian-main"
+		}
+	}
+	profile.RepositoryAuthorityDigest, _ = RepositoriesAuthorityDigest(profile.Repositories)
+	if _, err := ProfileDigest(profile); err != nil {
+		t.Fatal(err)
+	}
+	changed := profile
+	changed.Packages = append([]PackageTuple(nil), profile.Packages...)
+	changed.Packages[0].RepositoryID = "unknown"
+	changed.RepositoryAuthorityDigest, _ = RepositoriesAuthorityDigest(changed.Repositories)
+	if _, err := ProfileDigest(changed); err == nil {
+		t.Fatal("package bound to an unknown repository was accepted")
+	}
+	changed = profile
+	changed.Repositories = append([]packages.Repository(nil), profile.Repositories...)
+	changed.Repositories[1].ID = "debian-main"
+	changed.RepositoryAuthorityDigest, _ = RepositoriesAuthorityDigest(changed.Repositories)
+	if _, err := ProfileDigest(changed); err == nil {
+		t.Fatal("duplicate repository authority was accepted")
+	}
+}
+
 func TestOSProfileDigestBindsRepositorySnapshotClosureAndTuple(t *testing.T) {
 	profile := testProfile()
 	before, err := ProfileDigest(profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile.RepositoryMetadataDigest = digest("changed-metadata")
+	profile.Repositories[0].MetadataDigest = digest("changed-metadata")
+	profile.RepositoryAuthorityDigest, err = RepositoriesAuthorityDigest(profile.Repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
 	after, err := ProfileDigest(profile)
 	if err != nil {
 		t.Fatal(err)
@@ -474,13 +523,13 @@ func dependencyAuthorityFixture(t *testing.T, profile OSProfile) ([]byte, Qualif
 }
 
 func testProfile() OSProfile {
-	profile := OSProfile{ID: "debian-13-amd64", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0-1", PackageSnapshotDigest: digest("packages"), RepositorySource: "https://deb.example.test/debian", RepositoryKeyFingerprint: digest("repo-key"), RepositoryMetadataDigest: digest("repo-metadata"), RepositoryCutoffDigest: digest("repo-cutoff"), PackageClosureDigest: digest("closure"), Packages: []PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}, ManagedConfinement: ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest("confinement")}}
-	profile.RepositoryAuthorityDigest, _ = RepositoryAuthorityDigest(testRepository(profile))
+	profile := OSProfile{ID: "debian-13-amd64", Family: "debian", Release: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0-1", PackageSnapshotDigest: digest("packages"), Repositories: []packages.Repository{{ID: "debian-main", URI: "https://deb.example.test/debian", Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/release.gpg", KeyringDigest: digest("repo-key"), MetadataDigest: digest("repo-metadata"), CutoffDigest: digest("repo-cutoff")}}, PackageClosureDigest: digest("closure"), Packages: []PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}}, ManagedConfinement: ConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digest("confinement")}}
+	profile.RepositoryAuthorityDigest, _ = RepositoriesAuthorityDigest(profile.Repositories)
 	return profile
 }
 
 func testRepository(profile OSProfile) packages.Repository {
-	return packages.Repository{ID: "debian-main", URI: profile.RepositorySource, Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/release.gpg", KeyringDigest: profile.RepositoryKeyFingerprint, MetadataDigest: profile.RepositoryMetadataDigest, CutoffDigest: profile.RepositoryCutoffDigest}
+	return profile.Repositories[0]
 }
 
 func profileWithPackageClosure(profile OSProfile) OSProfile {
@@ -492,7 +541,7 @@ func profileWithPackageClosure(profile OSProfile) OSProfile {
 func packageValuesFixture(profile OSProfile) []packages.Package {
 	values := make([]packages.Package, len(profile.Packages))
 	for index, tuple := range profile.Packages {
-		values[index] = packages.Package{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture, ArtifactDigest: digest("package-artifact-" + tuple.Name), ArtifactBytes: 1, MaximumInstalledFileBytes: 1, AffectedUnits: []string{}, PossibleListeners: []string{}, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: tuple.Name, Version: tuple.Version, OperatingOS: "linux", Architecture: tuple.Architecture, Digest: digest("package-artifact-" + tuple.Name)}}}
+		values[index] = packages.Package{Name: tuple.Name, Version: tuple.Version, Architecture: tuple.Architecture, RepositoryID: tuple.RepositoryID, ArtifactDigest: digest("package-artifact-" + tuple.Name), ArtifactBytes: 1, MaximumInstalledFileBytes: 1, AffectedUnits: []string{}, PossibleListeners: []string{}, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: tuple.Name, Version: tuple.Version, OperatingOS: "linux", Architecture: tuple.Architecture, Digest: digest("package-artifact-" + tuple.Name)}}}
 	}
 	return values
 }
@@ -618,7 +667,7 @@ func releaseSPDXFixture(t *testing.T, data []byte, dependency QualificationDepen
 		spdxNativePackage("tailscale-client", dependency.Tailscale.Version, dependency.Tailscale.ArtifactIdentity, dependency.Tailscale.Archive.Digest),
 	)
 	for _, tuple := range profile.Packages {
-		document.Packages = append(document.Packages, spdxOSPackage(tuple, profile.Family, profile.RepositorySource))
+		document.Packages = append(document.Packages, spdxOSPackage(tuple, profile.Family, profile.Repositories[0].URI))
 	}
 	sort.Slice(document.Packages, func(i, j int) bool { return document.Packages[i].SPDXID < document.Packages[j].SPDXID })
 	document.Relationships = make([]SPDXRelationship, len(document.Packages))

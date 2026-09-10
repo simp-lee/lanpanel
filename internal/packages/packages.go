@@ -45,9 +45,12 @@ type QualificationAuthority struct {
 }
 
 type Package struct {
-	Name                      string         `json:"name"`
-	Version                   string         `json:"version"`
-	Architecture              string         `json:"architecture"`
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+	// RepositoryID binds a distro package to the signed repository authority
+	// that supplies its exact artifact. It is required for multi-repository plans.
+	RepositoryID              string         `json:"repository_id,omitempty"`
 	ArtifactDigest            string         `json:"artifact_digest"`
 	ArtifactBytes             int64          `json:"artifact_bytes"`
 	MaximumInstalledFileBytes int64          `json:"maximum_installed_file_bytes"`
@@ -191,6 +194,14 @@ var (
 	suitePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9+./_-]{0,127}$`)
 )
 
+// ValidateRepositories validates a complete, canonical repository authority set.
+func ValidateRepositories(repositories []Repository) error {
+	if len(repositories) == 0 {
+		return fmt.Errorf("package repository authority set is empty")
+	}
+	return validateRepositories(repositories)
+}
+
 func ValidatePlan(plan Plan) error {
 	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(plan.OSProfileDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
 		return fmt.Errorf("package transaction identity, bounds, or OS profile are invalid")
@@ -221,9 +232,13 @@ func ValidatePlan(plan Plan) error {
 		return err
 	}
 	previous := ""
+	repositoryIDs := make(map[string]bool, len(plan.Repositories))
+	for _, repository := range plan.Repositories {
+		repositoryIDs[repository.ID] = true
+	}
 	hasNginx, hasApacheUtils := false, false
 	for _, pkg := range plan.Packages {
-		if !packageNamePattern.MatchString(pkg.Name) || !versionPattern.MatchString(pkg.Version) || moving(pkg.Version) || pkg.Architecture != "amd64" && pkg.Architecture != "all" || !digestPattern.MatchString(pkg.ArtifactDigest) || pkg.ArtifactBytes <= 0 || pkg.ArtifactBytes > 4<<30 || pkg.MaximumInstalledFileBytes <= 0 || pkg.MaximumInstalledFileBytes > 4<<30 || previous != "" && strings.Compare(previous, pkg.Name) >= 0 {
+		if !packageNamePattern.MatchString(pkg.Name) || !versionPattern.MatchString(pkg.Version) || moving(pkg.Version) || pkg.Architecture != "amd64" && pkg.Architecture != "all" || pkg.RepositoryID != "" && (!refPattern.MatchString(pkg.RepositoryID) || !repositoryIDs[pkg.RepositoryID]) || len(plan.Repositories) > 1 && pkg.RepositoryID == "" || !digestPattern.MatchString(pkg.ArtifactDigest) || pkg.ArtifactBytes <= 0 || pkg.ArtifactBytes > 4<<30 || pkg.MaximumInstalledFileBytes <= 0 || pkg.MaximumInstalledFileBytes > 4<<30 || previous != "" && strings.Compare(previous, pkg.Name) >= 0 {
 			return fmt.Errorf("package closure is invalid, duplicated, floating, or unsorted")
 		}
 		if (plan.Mode == StagedDebs || plan.Mode == OfflineDebs) && pkg.StagedIdentity != "sha256:"+pkg.ArtifactDigest || plan.Mode == DistroRepository && pkg.StagedIdentity != "" {
@@ -383,19 +398,25 @@ func ValidatePostcondition(plan Plan, before RuntimeSnapshot, observed Postcondi
 }
 
 func validateRepositories(repositories []Repository) error {
+	if len(repositories) > 16 {
+		return fmt.Errorf("package repository authority set is unbounded")
+	}
 	previous := ""
+	seenLocation := map[string]bool{}
 	for _, repository := range repositories {
 		parsed, err := url.Parse(repository.URI)
-		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 {
+		location := repository.URI + "\x00" + repository.Suite
+		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") && !strings.HasPrefix(repository.KeyringPath, "/usr/share/keyrings/") || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 || seenLocation[location] {
 			return fmt.Errorf("package repository authority is invalid, duplicated, or unsorted")
 		}
-		componentPrevious := ""
+		seenComponents := map[string]bool{}
 		for _, component := range repository.Components {
-			if !componentPattern.MatchString(component) || componentPrevious != "" && strings.Compare(componentPrevious, component) >= 0 {
-				return fmt.Errorf("package repository components are invalid, duplicated, or unsorted")
+			if !componentPattern.MatchString(component) || seenComponents[component] {
+				return fmt.Errorf("package repository components are invalid or duplicated")
 			}
-			componentPrevious = component
+			seenComponents[component] = true
 		}
+		seenLocation[location] = true
 		previous = repository.ID
 	}
 	return nil
@@ -411,7 +432,7 @@ func validConfigPath(kind ConfigKind, value string) bool {
 	case APTSource:
 		return value == "/etc/apt/sources.list" || strings.HasPrefix(value, "/etc/apt/sources.list.d/")
 	case APTKeyring:
-		return value == "/etc/apt/trusted.gpg" || strings.HasPrefix(value, "/etc/apt/trusted.gpg.d/") || strings.HasPrefix(value, "/etc/apt/keyrings/")
+		return value == "/etc/apt/trusted.gpg" || strings.HasPrefix(value, "/etc/apt/trusted.gpg.d/") || strings.HasPrefix(value, "/etc/apt/keyrings/") || strings.HasPrefix(value, "/usr/share/keyrings/")
 	case DPKGConfig:
 		return value == "/etc/dpkg/dpkg.cfg" || strings.HasPrefix(value, "/etc/dpkg/dpkg.cfg.d/")
 	default:
@@ -441,7 +462,7 @@ func forbiddenAPTConfiguration(data []byte) bool {
 	}
 	flush()
 	for index, word := range words {
-		if word == "pre-invoke" || word == "post-invoke" || word == "pre-install-pkgs" || word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" {
+		if word == "pre-invoke" || word == "post-invoke" || word == "pre-install-pkgs" || word == "status-logger" || word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" {
 			return true
 		}
 		if index > 0 && (words[index-1] == "http" || words[index-1] == "https" || words[index-1] == "ftp") && word == "proxy" {

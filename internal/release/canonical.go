@@ -58,6 +58,10 @@ func DigestBytes(data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func ValidReference(value string) bool {
+	return refPattern.MatchString(value)
+}
+
 func ValidDigest(value string) bool {
 	if len(value) != sha256.Size*2 {
 		return false

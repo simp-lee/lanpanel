@@ -89,24 +89,22 @@ type PackageTuple struct {
 	Name         string `json:"name"`
 	Version      string `json:"version"`
 	Architecture string `json:"architecture"`
+	RepositoryID string `json:"repository_id,omitempty"`
 }
 
 type OSProfile struct {
-	ID                        string             `json:"id"`
-	Family                    string             `json:"family"`
-	Release                   string             `json:"release"`
-	Architecture              string             `json:"architecture"`
-	SystemdVersion            string             `json:"systemd_version"`
-	NginxVersion              string             `json:"nginx_version"`
-	PackageSnapshotDigest     string             `json:"package_snapshot_digest"`
-	RepositorySource          string             `json:"repository_source"`
-	RepositoryKeyFingerprint  string             `json:"repository_key_fingerprint"`
-	RepositoryMetadataDigest  string             `json:"repository_metadata_digest"`
-	RepositoryCutoffDigest    string             `json:"repository_cutoff_digest"`
-	RepositoryAuthorityDigest string             `json:"repository_authority_digest"`
-	PackageClosureDigest      string             `json:"package_closure_digest"`
-	Packages                  []PackageTuple     `json:"packages"`
-	ManagedConfinement        ConfinementProfile `json:"managed_confinement"`
+	ID                        string                `json:"id"`
+	Family                    string                `json:"family"`
+	Release                   string                `json:"release"`
+	Architecture              string                `json:"architecture"`
+	SystemdVersion            string                `json:"systemd_version"`
+	NginxVersion              string                `json:"nginx_version"`
+	PackageSnapshotDigest     string                `json:"package_snapshot_digest"`
+	Repositories              []packages.Repository `json:"repositories"`
+	RepositoryAuthorityDigest string                `json:"repository_authority_digest"`
+	PackageClosureDigest      string                `json:"package_closure_digest"`
+	Packages                  []PackageTuple        `json:"packages"`
+	ManagedConfinement        ConfinementProfile    `json:"managed_confinement"`
 }
 
 type ConfinementProfile struct {
@@ -350,25 +348,20 @@ func validatePublicPackageTemplate(data []byte, binary AssetIdentity, profile OS
 	}
 	for index, pkg := range plan.Packages {
 		want := profile.Packages[index]
-		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture {
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
 			return fmt.Errorf("public package template tuple differs from supported profile")
 		}
 	}
-	if len(plan.Repositories) != 1 || plan.Repositories[0].URI != profile.RepositorySource || plan.Repositories[0].KeyringDigest != profile.RepositoryKeyFingerprint || plan.Repositories[0].MetadataDigest != profile.RepositoryMetadataDigest || plan.Repositories[0].CutoffDigest != profile.RepositoryCutoffDigest {
-		return fmt.Errorf("public package template repository differs from supported profile")
-	}
-	repositoryDigest, err := RepositoryAuthorityDigest(plan.Repositories[0])
-	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+	repositoryDigest, err := RepositoriesAuthorityDigest(plan.Repositories)
+	if err != nil || !reflect.DeepEqual(plan.Repositories, profile.Repositories) || repositoryDigest != profile.RepositoryAuthorityDigest {
 		return fmt.Errorf("public package template repository authority differs from supported profile")
 	}
 	return nil
 }
 
-// RepositoryAuthorityDigest binds every field of the exact apt repository
-// authority, including its identity, suite, components, keyring path, and
-// metadata snapshots.
-func RepositoryAuthorityDigest(repository packages.Repository) (string, error) {
-	data, err := json.Marshal(repository)
+// RepositoriesAuthorityDigest binds the complete canonical repository set.
+func RepositoriesAuthorityDigest(repositories []packages.Repository) (string, error) {
+	data, err := MarshalCanonical(repositories)
 	if err != nil {
 		return "", err
 	}
@@ -631,20 +624,30 @@ func validateOSProfile(profile OSProfile) error {
 	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) {
 		return fmt.Errorf("OS profile platform identity is invalid")
 	}
-	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryKeyFingerprint) || !ValidDigest(profile.RepositoryMetadataDigest) || !ValidDigest(profile.RepositoryCutoffDigest) || !ValidDigest(profile.RepositoryAuthorityDigest) || !ValidDigest(profile.PackageClosureDigest) {
+	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryAuthorityDigest) || !ValidDigest(profile.PackageClosureDigest) || packages.ValidateRepositories(profile.Repositories) != nil {
 		return fmt.Errorf("OS profile repository digest authority is invalid")
+	}
+	repositoryDigest, err := RepositoriesAuthorityDigest(profile.Repositories)
+	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+		return fmt.Errorf("OS profile repository authority digest does not match its repositories")
+	}
+	repositoryIDs := make(map[string]bool, len(profile.Repositories))
+	for _, repository := range profile.Repositories {
+		repositoryIDs[repository.ID] = true
 	}
 	if len(profile.Packages) == 0 || len(profile.Packages) > 4096 {
 		return fmt.Errorf("OS profile exact package closure is empty or unbounded")
 	}
-	repository, err := url.Parse(profile.RepositorySource)
-	if err != nil || repository.Scheme != "https" || repository.Host == "" || repository.User != nil || repository.RawQuery != "" || repository.Fragment != "" || repository.String() != profile.RepositorySource {
-		return fmt.Errorf("OS profile repository source is invalid")
+	for _, repository := range profile.Repositories {
+		parsed, err := url.Parse(repository.URI)
+		if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.String() != repository.URI {
+			return fmt.Errorf("OS profile repository source is invalid")
+		}
 	}
 	previous := ""
 	for _, tuple := range profile.Packages {
 		key := tuple.Name + "\x00" + tuple.Architecture
-		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || tuple.RepositoryID != "" && (!refPattern.MatchString(tuple.RepositoryID) || !repositoryIDs[tuple.RepositoryID]) || len(profile.Repositories) > 1 && tuple.RepositoryID == "" || previous != "" && previous >= key {
 			return fmt.Errorf("OS profile package tuple is invalid, duplicated, or unsorted")
 		}
 		previous = key
@@ -777,7 +780,7 @@ func DecodeLiveStepEvidence(data []byte) (LiveStepEvidence, error) {
 	previous := ""
 	for _, tuple := range value.ObservedPackageTuple {
 		key := tuple.Name + "\x00" + tuple.Architecture
-		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || tuple.RepositoryID != "" && !refPattern.MatchString(tuple.RepositoryID) || previous != "" && previous >= key {
 			return LiveStepEvidence{}, fmt.Errorf("live step observed package tuple is invalid or noncanonical")
 		}
 		previous = key
@@ -1050,6 +1053,7 @@ func cloneReleaseManifest(source ReleaseManifest) ReleaseManifest {
 	copy.Headscale.Members = append([]ArchiveMemberAuthority(nil), source.Headscale.Members...)
 	for index := range copy.SupportedProfiles {
 		copy.SupportedProfiles[index].Profile.Packages = append([]PackageTuple(nil), source.SupportedProfiles[index].Profile.Packages...)
+		copy.SupportedProfiles[index].Profile.Repositories = cloneRepositories(source.SupportedProfiles[index].Profile.Repositories)
 		copy.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations = append([]string(nil), source.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations...)
 	}
 	return copy

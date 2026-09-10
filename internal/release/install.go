@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"lanpanel/internal/acmeaccount"
+	"lanpanel/internal/packages"
 	"reflect"
 	"time"
 )
@@ -240,6 +241,15 @@ func cloneHeadscaleAuthority(value HeadscaleArtifactAuthority) HeadscaleArtifact
 func cloneInstallIdentity(value InstallIdentity) InstallIdentity {
 	value.Headscale = cloneHeadscaleAuthority(value.Headscale)
 	value.Profile.Packages = append([]PackageTuple(nil), value.Profile.Packages...)
+	value.Profile.Repositories = cloneRepositories(value.Profile.Repositories)
 	value.Profile.ManagedConfinement.ProtectedDestinations = append([]string(nil), value.Profile.ManagedConfinement.ProtectedDestinations...)
 	return value
+}
+
+func cloneRepositories(values []packages.Repository) []packages.Repository {
+	clone := append([]packages.Repository(nil), values...)
+	for index := range clone {
+		clone[index].Components = append([]string(nil), values[index].Components...)
+	}
+	return clone
 }

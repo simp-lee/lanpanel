@@ -42,6 +42,60 @@ func TestDistroPackageClosureAllowsOnlyAmd64AndArchitectureIndependentPackages(t
 	}
 }
 
+func TestMultiRepositoryPlanBindsEachPackageAndRejectsAmbiguousAuthority(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	second := plan.Repositories[0]
+	second.ID = "debian-security"
+	second.Suite = "stable-security"
+	plan.Repositories[0].ID = "debian-main"
+	plan.Repositories = append(plan.Repositories, second)
+	plan.Packages = clonePackages(plan.Packages)
+	for index := range plan.Packages {
+		if index == len(plan.Packages)-1 {
+			plan.Packages[index].RepositoryID = "debian-security"
+		} else {
+			plan.Packages[index].RepositoryID = "debian-main"
+		}
+	}
+	closure, err := ClosureDigest(plan.Packages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Authority.FrozenClosureDigest = closure
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	changed := plan
+	changed.Repositories = append([]Repository(nil), plan.Repositories...)
+	changed.Repositories[1].ID = changed.Repositories[0].ID
+	if err := ValidatePlan(changed); err == nil {
+		t.Fatal("duplicate repository identity was accepted")
+	}
+	changed = plan
+	changed.Packages = clonePackages(plan.Packages)
+	changed.Packages[0].RepositoryID = ""
+	if err := ValidatePlan(changed); err == nil {
+		t.Fatal("unbound multi-repository package was accepted")
+	}
+	changed = plan
+	changed.Repositories = append([]Repository(nil), plan.Repositories...)
+	slices.Reverse(changed.Repositories)
+	if err := ValidatePlan(changed); err == nil {
+		t.Fatal("noncanonical repository ordering was accepted")
+	}
+}
+
+func TestDeb822SourcesAcceptCommentsAndMultipleSuites(t *testing.T) {
+	data := []byte("# Ubuntu archive authority\nTypes: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-security\nComponents: main universe restricted multiverse\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n")
+	values, err := parseDeb822Sources(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 3 || values[0].Suite != "noble" || values[1].Suite != "noble-updates" || values[2].Suite != "noble-security" || values[0].KeyringPath != "/usr/share/keyrings/ubuntu-archive-keyring.gpg" {
+		t.Fatalf("parsed deb822 repositories = %#v", values)
+	}
+}
+
 func TestPackagePlanBindsExactQualifiedClosureRepositoriesAndNoNetwork(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	if err := ValidatePlan(plan); err != nil {
@@ -77,6 +131,40 @@ func TestPackagePlanBindsExactQualifiedClosureRepositoriesAndNoNetwork(t *testin
 	}
 }
 
+func TestAPTConfigurationAcceptsDistroSharedKeyringPath(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	plan.Repositories[0].KeyringPath = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+	files := []ObservedConfig{
+		{Path: "/etc/apt/apt.conf", Kind: APTConfig, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte(`Dir::Etc::sourceparts "-";`)},
+		{Path: "/etc/apt/sources.list", Kind: APTSource, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte("deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://deb.example.test/debian stable main\n")},
+		{Path: plan.Repositories[0].KeyringPath, Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte("keyring")},
+	}
+	observed := []ObservedRepository{{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: []string{"main"}, KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digestBytes([]byte("keyring")), MetadataDigest: plan.Repositories[0].MetadataDigest, CutoffDigest: plan.Repositories[0].CutoffDigest, Enabled: true}}
+	if err := ValidateAPTConfiguration(files, observed, plan.Repositories); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAPTSourceAcceptsOptionlessLineOnlyWithAuthorizedSharedKeyring(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	plan.Repositories[0].KeyringPath = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+	files := []ObservedConfig{{Path: "/etc/apt/sources.list", Kind: APTSource, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: []byte("deb https://deb.example.test/debian stable main\n")}}
+	observed, err := parseObservedRepositories(files, plan.Repositories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) != 1 || observed[0].ID != plan.Repositories[0].ID || observed[0].KeyringPath != plan.Repositories[0].KeyringPath {
+		t.Fatalf("optionless source was not bound exactly: %#v", observed)
+	}
+	plan.Repositories[0].KeyringPath = "/etc/apt/keyrings/lanpanel.gpg"
+	if _, err := parseObservedRepositories(files, plan.Repositories); err == nil {
+		t.Fatal("optionless source was accepted without its authorized shared keyring")
+	}
+	if _, err := parseSourceFile("/etc/apt/sources.list", []byte("deb [[signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg]] https://deb.example.test/debian stable main\n")); err == nil {
+		t.Fatal("malformed source option brackets were accepted")
+	}
+}
+
 func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDrift(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	keyring := []byte("test keyring identity")
@@ -91,7 +179,7 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 	if err := ValidateAPTConfiguration(files, repositories, plan.Repositories); err != nil {
 		t.Fatal(err)
 	}
-	for _, hostile := range []string{`DPkg::Pre-Invoke { "bad"; };`, `Acquire::http::Proxy "http://ambient";`, `Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `Acquire { http { Proxy "http://ambient"; }; };`, `APT::Get::AllowUnauthenticated "true";`} {
+	for _, hostile := range []string{`DPkg::Pre-Invoke { "bad"; };`, `status-logger "/usr/bin/logger";`, `Acquire::http::Proxy "http://ambient";`, `Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `Acquire { http { Proxy "http://ambient"; }; };`, `APT::Get::AllowUnauthenticated "true";`} {
 		changed := append([]ObservedConfig(nil), files...)
 		changed[0].Bytes = []byte(hostile)
 		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err == nil {

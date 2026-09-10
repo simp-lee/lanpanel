@@ -917,7 +917,7 @@ func packageFailureCode(runErr, monitorErr error, result child.Result) string {
 
 func reflectPackages(left, right []Package) bool {
 	return slices.EqualFunc(left, right, func(a, b Package) bool {
-		return a.Name == b.Name && a.Version == b.Version && a.Architecture == b.Architecture && a.ArtifactDigest == b.ArtifactDigest && a.ArtifactBytes == b.ArtifactBytes && a.MaximumInstalledFileBytes == b.MaximumInstalledFileBytes && a.StagedIdentity == b.StagedIdentity && reflect.DeepEqual(a.Source, b.Source) && slices.Equal(a.AffectedUnits, b.AffectedUnits) && slices.Equal(a.PossibleListeners, b.PossibleListeners)
+		return a.Name == b.Name && a.Version == b.Version && a.Architecture == b.Architecture && a.RepositoryID == b.RepositoryID && a.ArtifactDigest == b.ArtifactDigest && a.ArtifactBytes == b.ArtifactBytes && a.MaximumInstalledFileBytes == b.MaximumInstalledFileBytes && a.StagedIdentity == b.StagedIdentity && reflect.DeepEqual(a.Source, b.Source) && slices.Equal(a.AffectedUnits, b.AffectedUnits) && slices.Equal(a.PossibleListeners, b.PossibleListeners)
 	})
 }
 

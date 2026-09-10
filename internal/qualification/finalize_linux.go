@@ -8,6 +8,7 @@ import (
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -270,15 +271,12 @@ func buildPublicPackageTemplate(template packages.Plan, profile release.OSProfil
 	}
 	for index, pkg := range template.Packages {
 		want := profile.Packages[index]
-		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture {
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
 			return nil, fmt.Errorf("public package template tuple differs from supported profile")
 		}
 	}
-	if len(template.Repositories) != 1 || template.Repositories[0].URI != profile.RepositorySource || template.Repositories[0].KeyringDigest != profile.RepositoryKeyFingerprint || template.Repositories[0].MetadataDigest != profile.RepositoryMetadataDigest || template.Repositories[0].CutoffDigest != profile.RepositoryCutoffDigest {
-		return nil, fmt.Errorf("public package template repository differs from supported profile")
-	}
-	repositoryDigest, err := release.RepositoryAuthorityDigest(template.Repositories[0])
-	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+	repositoryDigest, err := release.RepositoriesAuthorityDigest(template.Repositories)
+	if err != nil || !reflect.DeepEqual(template.Repositories, profile.Repositories) || repositoryDigest != profile.RepositoryAuthorityDigest {
 		return nil, fmt.Errorf("public package template repository authority differs from supported profile")
 	}
 	template.TransactionID = "pkg_" + strings.Repeat("0", 64)

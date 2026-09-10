@@ -42,6 +42,32 @@ func writeTestOSVArchive(t *testing.T, root, ecosystem string, records map[strin
 	}
 }
 
+func TestRepositorySnapshotsBindEveryExactRepository(t *testing.T) {
+	valid := RepositorySnapshotFiles{Repositories: []RepositorySnapshot{
+		{ID: "ubuntu-base", Keyring: "/protected/base.gpg", InRelease: "/protected/base.inrelease", Indexes: []RepositoryIndexFile{{ReleasePath: "main/binary-amd64/Packages", Path: "/protected/base.packages"}}},
+		{ID: "ubuntu-security", Keyring: "/protected/security.gpg", InRelease: "/protected/security.inrelease", Indexes: []RepositoryIndexFile{{ReleasePath: "main/binary-amd64/Packages", Path: "/protected/security.packages"}}},
+	}}
+	if err := validateRepositorySnapshotFiles(valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*RepositorySnapshotFiles){
+		func(value *RepositorySnapshotFiles) { value.Repositories[1].ID = value.Repositories[0].ID },
+		func(value *RepositorySnapshotFiles) {
+			value.Repositories[1], value.Repositories[0] = value.Repositories[0], value.Repositories[1]
+		},
+		func(value *RepositorySnapshotFiles) { value.Repositories[0].Indexes[0].ReleasePath = "../bad" },
+	} {
+		changed := valid
+		changed.Repositories = append([]RepositorySnapshot(nil), valid.Repositories...)
+		changed.Repositories[0].Indexes = append([]RepositoryIndexFile(nil), valid.Repositories[0].Indexes...)
+		changed.Repositories[1].Indexes = append([]RepositoryIndexFile(nil), valid.Repositories[1].Indexes...)
+		mutate(&changed)
+		if err := validateRepositorySnapshotFiles(changed); err == nil {
+			t.Fatal("invalid multi-repository snapshot authority was accepted")
+		}
+	}
+}
+
 func TestDistroFeedSelectsAffectedEntriesForExactRelease(t *testing.T) {
 	data := []byte(`{"id":"OSV-mixed","modified":"2025-01-01T00:00:00Z","affected":[{"package":{"name":"apache2","ecosystem":"Debian:12"},"versions":["2.4.62-1"]},{"package":{"name":"apache2","ecosystem":"Debian:13"},"versions":["2.4.61-1"]}]}`)
 	filtered, err := filterDistroAdvisory(data, "Debian", "13")

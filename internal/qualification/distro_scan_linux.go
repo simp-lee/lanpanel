@@ -17,6 +17,11 @@ import (
 )
 
 type RepositorySnapshotFiles struct {
+	Repositories []RepositorySnapshot `json:"repositories"`
+}
+
+type RepositorySnapshot struct {
+	ID        string                `json:"id"`
 	Keyring   string                `json:"keyring"`
 	InRelease string                `json:"in_release"`
 	Indexes   []RepositoryIndexFile `json:"indexes"`
@@ -28,13 +33,22 @@ type RepositoryIndexFile struct {
 }
 
 func validateRepositorySnapshotFiles(snapshot RepositorySnapshotFiles) error {
-	if !absoluteCleanPath(snapshot.Keyring) || !absoluteCleanPath(snapshot.InRelease) || len(snapshot.Indexes) == 0 || len(snapshot.Indexes) > 64 {
-		return fmt.Errorf("protected repository snapshot locators are invalid")
+	if len(snapshot.Repositories) == 0 || len(snapshot.Repositories) > 16 {
+		return fmt.Errorf("protected repository snapshot set is empty or unbounded")
 	}
-	for _, index := range snapshot.Indexes {
-		if !absoluteCleanPath(index.Path) || !release.ValidRelativePath(index.ReleasePath) {
-			return fmt.Errorf("protected Packages index locator is invalid")
+	previous := ""
+	for _, repository := range snapshot.Repositories {
+		if !release.ValidReference(repository.ID) || previous != "" && previous >= repository.ID || !absoluteCleanPath(repository.Keyring) || !absoluteCleanPath(repository.InRelease) || len(repository.Indexes) > 64 {
+			return fmt.Errorf("protected repository snapshot locators are invalid, duplicated, or unsorted")
 		}
+		indexPrevious := ""
+		for _, index := range repository.Indexes {
+			if !absoluteCleanPath(index.Path) || !release.ValidRelativePath(index.ReleasePath) || indexPrevious != "" && indexPrevious >= index.ReleasePath {
+				return fmt.Errorf("protected Packages index locator is invalid or unsorted")
+			}
+			indexPrevious = index.ReleasePath
+		}
+		previous = repository.ID
 	}
 	return nil
 }
@@ -43,26 +57,55 @@ func loadRepositorySourceMapping(snapshot RepositorySnapshotFiles, template pack
 	if err := validateRepositorySnapshotFiles(snapshot); err != nil {
 		return nil, err
 	}
-	if len(template.Repositories) != 1 {
-		return nil, fmt.Errorf("source mapping requires the exact qualified repository")
+	if err := packages.ValidateRepositories(template.Repositories); err != nil {
+		return nil, fmt.Errorf("source mapping package repositories are invalid: %w", err)
 	}
-	keyring, _, err := readProtectedFile(snapshot.Keyring, 4<<20, true)
-	if err != nil {
-		return nil, err
+	expected := make(map[string]packages.Repository, len(template.Repositories))
+	for _, repository := range template.Repositories {
+		expected[repository.ID] = repository
 	}
-	inRelease, _, err := readProtectedFile(snapshot.InRelease, 4<<20, true)
-	if err != nil {
-		return nil, err
-	}
-	indexes := make([]packages.RepositoryPackageIndex, 0, len(snapshot.Indexes))
-	for _, index := range snapshot.Indexes {
-		data, _, err := readProtectedFile(index.Path, 128<<20, true)
+	mappings := make([]packages.SourcePackageMapping, 0, len(template.Packages))
+	for _, snapshotRepository := range snapshot.Repositories {
+		repository, present := expected[snapshotRepository.ID]
+		if !present {
+			return nil, fmt.Errorf("source mapping contains an unauthorized repository snapshot")
+		}
+		keyring, _, err := readProtectedFile(snapshotRepository.Keyring, 4<<20, true)
 		if err != nil {
 			return nil, err
 		}
-		indexes = append(indexes, packages.RepositoryPackageIndex{ReleasePath: index.ReleasePath, Data: data})
+		inRelease, _, err := readProtectedFile(snapshotRepository.InRelease, 4<<20, true)
+		if err != nil {
+			return nil, err
+		}
+		indexes := make([]packages.RepositoryPackageIndex, 0, len(snapshotRepository.Indexes))
+		for _, index := range snapshotRepository.Indexes {
+			data, _, err := readProtectedFile(index.Path, 128<<20, true)
+			if err != nil {
+				return nil, err
+			}
+			indexes = append(indexes, packages.RepositoryPackageIndex{ReleasePath: index.ReleasePath, Data: data})
+		}
+		closure := make([]packages.Package, 0, len(template.Packages))
+		for _, pkg := range template.Packages {
+			if len(template.Repositories) == 1 || pkg.RepositoryID == repository.ID {
+				closure = append(closure, pkg)
+			}
+		}
+		part, err := packages.ResolveRepositoryPackageSources(repository, keyring, inRelease, indexes, closure)
+		if err != nil {
+			return nil, fmt.Errorf("repository %q source mapping failed: %w", repository.ID, err)
+		}
+		mappings = append(mappings, part...)
+		delete(expected, snapshotRepository.ID)
 	}
-	return packages.ResolveRepositoryPackageSources(template.Repositories[0], keyring, inRelease, indexes, template.Packages)
+	if len(expected) != 0 {
+		return nil, fmt.Errorf("source mapping omits an authorized repository snapshot")
+	}
+	if len(mappings) != len(template.Packages) {
+		return nil, fmt.Errorf("source mapping does not cover the exact package closure")
+	}
+	return mappings, nil
 }
 
 // Only the private scanner input is mapped. The qualified public SBOM and its

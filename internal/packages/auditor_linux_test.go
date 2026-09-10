@@ -82,7 +82,7 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 		}
 		return signed.Bytes()
 	}
-	releasePlaintext := fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))
+	releasePlaintext := fmt.Sprintf("Origin: fixture\nSuite: stable\nComponents: main\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))
 	release := signRelease(releasePlaintext)
 	var compressedPackageIndex bytes.Buffer
 	compressor := lz4.NewWriter(&compressedPackageIndex)
@@ -105,12 +105,17 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	launcher := &auditLauncher{}
 	auditor := newTestLinuxAuditor(launcher, root)
 	observedRepositories := []ObservedRepository{{URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: plan.Repositories[0].Components, KeyringPath: plan.Repositories[0].KeyringPath}}
-	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}); err != nil {
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}, nil); err != nil {
 		t.Fatal(err)
 	}
 	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", []byte(releasePlaintext), 0o644)
-	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}); err == nil {
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}, nil); err == nil {
 		t.Fatal("unsigned InRelease metadata was accepted")
+	}
+	wrongSuite := signRelease(strings.Replace(releasePlaintext, "Suite: stable", "Suite: other", 1))
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", wrongSuite, 0o644)
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: keyring}, nil); err == nil {
+		t.Fatal("signed metadata for a different suite was accepted")
 	}
 	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", release, 0o644)
 	wrongSigner, err := openpgp.NewEntity("Wrong APT Fixture", "", "wrong@example.test", nil)
@@ -121,7 +126,7 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	if err := wrongSigner.Serialize(&wrongKeyring); err != nil {
 		t.Fatal(err)
 	}
-	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: wrongKeyring.Bytes()}); err == nil {
+	if err := auditor.observeRepositoryMetadata(context.Background(), observedRepositories, map[string][]byte{plan.Repositories[0].KeyringPath: wrongKeyring.Bytes()}, nil); err == nil {
 		t.Fatal("InRelease signed by a different key was accepted")
 	}
 	audit, err := auditor.AuditPackages(context.Background(), plan)
@@ -156,6 +161,11 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	resolved, err := executor.Resolve(context.Background(), plan)
 	if err != nil || !reflectPackages(resolved, plan.Packages) {
 		t.Fatalf("resolved=%#v error=%v", resolved, err)
+	}
+	changedResolved := append([]Package(nil), resolved...)
+	changedResolved[0].RepositoryID = "other-repository"
+	if reflectPackages(changedResolved, plan.Packages) {
+		t.Fatal("package postcondition ignored repository ownership")
 	}
 
 	writeFixture(t, root, "etc/apt/apt.conf", []byte(`DPkg::Pre-Invoke { "bad"; };`), 0o644)

@@ -313,7 +313,7 @@ func qualificationPackageFixture(t *testing.T, root string) (release.InstallIden
 	installed.Tailscale = release.AssetIdentity{Path: "tailscale", Digest: release.DigestBytes([]byte("tailscale")), Bytes: uint64(len("tailscale"))}
 	profile := &installed.Profile
 	pkg := packages.Package{Name: "nginx", Version: profile.NginxVersion, Architecture: "amd64", ArtifactDigest: strings.Repeat("d", 64), ArtifactBytes: 1, MaximumInstalledFileBytes: 1 << 20, AffectedUnits: []string{"nginx.service"}, PossibleListeners: []string{"tcp/443", "tcp/80"}, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: "nginx", Version: profile.NginxVersion, OperatingOS: "linux", Architecture: "amd64", Digest: strings.Repeat("d", 64)}}}
-	repository := packages.Repository{ID: "debian", URI: profile.RepositorySource, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: profile.RepositoryKeyFingerprint, MetadataDigest: profile.RepositoryMetadataDigest, CutoffDigest: profile.RepositoryCutoffDigest}
+	repository := packages.Repository{ID: "debian", URI: profile.Repositories[0].URI, Suite: "trixie", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/lanpanel.gpg", KeyringDigest: profile.Repositories[0].KeyringDigest, MetadataDigest: profile.Repositories[0].MetadataDigest, CutoffDigest: profile.Repositories[0].CutoffDigest}
 	var packageValues []packages.Package
 	profile.Packages = nil
 	for _, tuple := range []release.PackageTuple{{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}, {Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}, {Name: "nginx", Version: profile.NginxVersion, Architecture: "amd64"}} {
@@ -331,7 +331,8 @@ func qualificationPackageFixture(t *testing.T, root string) (release.InstallIden
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile.RepositoryAuthorityDigest, err = release.RepositoryAuthorityDigest(repository)
+	profile.Repositories = []packages.Repository{repository}
+	profile.RepositoryAuthorityDigest, err = release.RepositoriesAuthorityDigest(profile.Repositories)
 	if err != nil {
 		t.Fatal(err)
 	}

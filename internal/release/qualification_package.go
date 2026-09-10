@@ -3,6 +3,7 @@ package release
 import (
 	"fmt"
 	"lanpanel/internal/packages"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -37,15 +38,12 @@ func ValidateQualificationPackageTemplate(template packages.Plan, profile OSProf
 	}
 	for index, pkg := range candidate.Packages {
 		want := profile.Packages[index]
-		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture {
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
 			return fmt.Errorf("qualification package template tuple differs from target profile")
 		}
 	}
-	if len(candidate.Repositories) != 1 {
-		return fmt.Errorf("qualification package template repository is incomplete")
-	}
-	repositoryDigest, err := RepositoryAuthorityDigest(candidate.Repositories[0])
-	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
+	repositoryDigest, err := RepositoriesAuthorityDigest(candidate.Repositories)
+	if err != nil || !reflect.DeepEqual(candidate.Repositories, profile.Repositories) || repositoryDigest != profile.RepositoryAuthorityDigest {
 		return fmt.Errorf("qualification package template repository authority differs from target profile")
 	}
 	return nil
