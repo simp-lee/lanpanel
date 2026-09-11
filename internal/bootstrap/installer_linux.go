@@ -365,6 +365,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if _, err := ensureDirectory(filepath.Dir(journal.Paths.BinaryPath), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
 			return err
 		}
+		if _, err := ensureDirectory(filepath.Dir(publicCommandPath(journal.Paths)), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
+			return err
+		}
 		if err := copyOrVerifyBinaryBytes(request.SourceBinary, journal.Paths, releaseBinary{Digest: journal.Release.Binary.Digest, Bytes: journal.Release.Binary.Bytes}); err != nil {
 			return err
 		}
@@ -498,6 +501,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 	}
 	if journal.Phase == PhaseBundleCommitted {
 		if _, err := ensureDirectory(filepath.Dir(journal.Paths.BinaryPath), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
+			return err
+		}
+		if _, err := ensureDirectory(filepath.Dir(publicCommandPath(journal.Paths)), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
 			return err
 		}
 		if err := copyOrVerifyBinaryBytes(request.SourceBinary, journal.Paths, releaseBinary{Digest: journal.Release.Binary.Digest, Bytes: journal.Release.Binary.Bytes}); err != nil {
