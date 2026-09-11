@@ -304,7 +304,7 @@ func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Re
 		MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(members), Members: members,
 	})
 	if err != nil {
-		return fmt.Errorf("Headscale release archive is invalid: %w", err)
+		return fmt.Errorf("headscale release archive is invalid: %w", err)
 	}
 	archivePath := filepath.Join(filepath.Dir(authority.InstallPath), filepath.Base(authority.Archive.Path))
 	if err := putOrVerifyTargetFile(ctx, archivePath, request.HeadscaleBytes, 0o600); err != nil {
@@ -314,7 +314,7 @@ func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Re
 	for _, member := range authority.Members {
 		data, ok := extracted[member.Path]
 		if !ok || uint64(len(data)) != member.Asset.Bytes || digestBytes(data) != member.Asset.Digest {
-			return fmt.Errorf("Headscale archive member %q differs from release authority", member.Path)
+			return fmt.Errorf("headscale archive member %q differs from release authority", member.Path)
 		}
 		if err := putOrVerifyTargetFile(ctx, member.Destination, data, os.FileMode(member.Mode)); err != nil {
 			return err
