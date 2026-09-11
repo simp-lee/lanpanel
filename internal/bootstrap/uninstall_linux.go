@@ -100,6 +100,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
 	if err := exposure.Release(); err != nil {
 		return fmt.Errorf("uninstall exposure lock release failed: %w", err)
 	}
@@ -134,11 +137,27 @@ func stopOwnedServices(ctx context.Context, paths []string) error {
 	}
 	slices.Sort(units)
 	for _, unit := range slices.Compact(units) {
-		if err := exec.CommandContext(ctx, "systemctl", "stop", unit).Run(); err != nil {
-			return fmt.Errorf("uninstall could not stop %s; fence retained: %w", unit, err)
+		if err := exec.CommandContext(ctx, "systemctl", "mask", "--runtime", "--now", unit).Run(); err != nil {
+			return fmt.Errorf("uninstall could not fence %s; fence retained: %w", unit, err)
 		}
 		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run(); err == nil {
 			return fmt.Errorf("uninstall service fence is incomplete for %s", unit)
+		}
+	}
+	return nil
+}
+
+func unmaskOwnedServices(ctx context.Context, paths []string) error {
+	units := make([]string, 0)
+	for _, path := range paths {
+		base := filepath.Base(path)
+		if strings.HasSuffix(base, ".service") || strings.HasSuffix(base, ".socket") || strings.HasSuffix(base, ".timer") {
+			units = append(units, base)
+		}
+	}
+	for _, unit := range slices.Compact(units) {
+		if err := exec.CommandContext(ctx, "systemctl", "unmask", unit).Run(); err != nil {
+			return fmt.Errorf("uninstall could not clear fence for %s: %w", unit, err)
 		}
 	}
 	return nil
