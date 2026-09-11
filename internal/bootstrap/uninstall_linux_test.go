@@ -25,7 +25,7 @@ func TestUninstallNeverRemovesForeignFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("foreign"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeOwnedPath(path, map[string]string{path: strings.Repeat("0", 64)}); err == nil {
+	if err := removeOwnedPath(path, map[string]string{path: strings.Repeat("0", 64)}, nil); err == nil {
 		t.Fatal("foreign file was accepted for deletion")
 	}
 }

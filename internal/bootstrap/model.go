@@ -132,6 +132,7 @@ type OwnershipInventory struct {
 	InstallationID string            `json:"installation_id"`
 	GenerationID   string            `json:"generation_id"`
 	Paths          []string          `json:"paths"`
+	MutablePaths   []string          `json:"mutable_paths"`
 	Artifacts      map[string]string `json:"artifacts"`
 }
 

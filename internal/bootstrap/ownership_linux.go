@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"lanpanel/internal/control"
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
@@ -14,6 +15,18 @@ const ownershipInventorySchema = "lanpanel.bootstrap.ownership.v1"
 
 func ownershipInventoryPath(paths Paths) string {
 	return filepath.Join(paths.OwnershipRoot, "installation.json")
+}
+
+func mutableOwnershipPaths(paths Paths) []string {
+	values := []string{filepath.Join(paths.InstallationRoot, "acme-account.contact")}
+	if paths == FixedPaths() {
+		controlPaths := control.FixedPaths()
+		values = append(values, controlPaths.Config, controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
+		activationPaths := control.FixedActivationPaths()
+		values = append(values, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
+	}
+	slices.Sort(values)
+	return slices.Compact(values)
 }
 
 func ownedInventoryPaths(journal Journal) ([]string, error) {
@@ -58,7 +71,7 @@ func buildOwnershipInventory(journal Journal) (OwnershipInventory, []byte, strin
 		}
 		artifacts[path] = release.DigestBytes(data)
 	}
-	value := OwnershipInventory{SchemaVersion: ownershipInventorySchema, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Paths: paths, Artifacts: artifacts}
+	value := OwnershipInventory{SchemaVersion: ownershipInventorySchema, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Paths: paths, MutablePaths: mutableOwnershipPaths(journal.Paths), Artifacts: artifacts}
 	data, err := encodeCanonical(value)
 	if err != nil {
 		return OwnershipInventory{}, nil, "", fmt.Errorf("encode installation ownership inventory: %w", err)
@@ -67,7 +80,7 @@ func buildOwnershipInventory(journal Journal) (OwnershipInventory, []byte, strin
 }
 
 func validateOwnershipInventory(value OwnershipInventory, journal Journal) error {
-	if value.SchemaVersion != ownershipInventorySchema || value.AttemptID != journal.AttemptID || value.InstallationID != journal.InstallationID || value.GenerationID != journal.GenerationID || len(value.Paths) == 0 || value.Paths[0] == "" {
+	if value.SchemaVersion != ownershipInventorySchema || value.AttemptID != journal.AttemptID || value.InstallationID != journal.InstallationID || value.GenerationID != journal.GenerationID || len(value.Paths) == 0 || value.Paths[0] == "" || !slices.Equal(value.MutablePaths, mutableOwnershipPaths(journal.Paths)) {
 		return fmt.Errorf("installation ownership inventory is incomplete")
 	}
 	expected, err := plannedBootstrapPaths(journal.Paths)

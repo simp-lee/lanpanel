@@ -93,11 +93,11 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		if path == paths.BinaryPath || path == ownershipInventoryPath(paths) {
 			continue // remove authority files only after every other postcondition.
 		}
-		if err := removeOwnedPath(path, inventory.Artifacts); err != nil {
+		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {
 			return err
 		}
 	}
-	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}); err != nil {
+	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
 		return err
 	}
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
@@ -120,7 +120,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 			return err
 		}
 	}
-	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts); err != nil {
+	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
@@ -234,7 +234,7 @@ func removeOwnedLockFile(path string) error {
 	return nil
 }
 
-func removeOwnedPath(path string, artifacts map[string]string) error {
+func removeOwnedPath(path string, artifacts map[string]string, mutable []string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -264,6 +264,13 @@ func removeOwnedPath(path string, artifacts map[string]string) error {
 		data, err := os.ReadFile(path)
 		if err != nil || release.DigestBytes(data) != digest {
 			return fmt.Errorf("uninstall foreign residue at %q", path)
+		}
+	} else if slices.Contains(mutable, path) {
+		if info.Mode()&0o022 != 0 {
+			return fmt.Errorf("uninstall foreign residue at %q", path)
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != 0 || stat.Gid != 0 {
+			return fmt.Errorf("uninstall foreign ownership at %q", path)
 		}
 	} else {
 		return fmt.Errorf("uninstall ownership digest is missing for %q", path)
