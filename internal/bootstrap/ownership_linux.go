@@ -41,6 +41,16 @@ func validateOwnershipInventory(value OwnershipInventory, journal Journal) error
 	if value.SchemaVersion != ownershipInventorySchema || value.AttemptID != journal.AttemptID || value.InstallationID != journal.InstallationID || value.GenerationID != journal.GenerationID || len(value.Paths) == 0 || value.Paths[0] == "" {
 		return fmt.Errorf("installation ownership inventory is incomplete")
 	}
+	expected, err := plannedBootstrapPaths(journal.Paths)
+	if err != nil {
+		return err
+	}
+	expected = append(expected, ownershipInventoryPath(journal.Paths))
+	slices.Sort(expected)
+	expected = slices.Compact(expected)
+	if !slices.Equal(value.Paths, expected) {
+		return fmt.Errorf("installation ownership inventory is incomplete")
+	}
 	for index, path := range value.Paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || index > 0 && value.Paths[index-1] >= path {
 			return fmt.Errorf("installation ownership path inventory is invalid")

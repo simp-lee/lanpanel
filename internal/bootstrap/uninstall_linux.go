@@ -4,14 +4,18 @@ package bootstrap
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/identity"
+	"lanpanel/internal/locks"
 	"lanpanel/internal/release"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -64,7 +68,24 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := decodeCanonical(inventoryBytes, &inventory); err != nil || validateOwnershipInventory(inventory, journal) != nil {
 		return fmt.Errorf("uninstall ownership inventory is invalid")
 	}
+	manager, err := locks.Open(locks.Config{RootPath: paths.LockRoot, Owner: 0, Group: 0, Mode: 0o700})
+	if err != nil {
+		return fmt.Errorf("uninstall mutation lock is unavailable: %w", err)
+	}
+	admission, err := manager.Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		return fmt.Errorf("uninstall mutation lock is unavailable: %w", err)
+	}
+	defer func() { _ = admission.Release(); _ = manager.Close() }()
+	exposure, err := manager.Acquire(ctx, locks.Exposure)
+	if err != nil {
+		return fmt.Errorf("uninstall exposure lock is unavailable: %w", err)
+	}
+	defer func() { _ = exposure.Release() }()
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
+	if err := removeOwnedAccounts(journal); err != nil {
 		return err
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
@@ -78,6 +99,23 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
+	}
+	if err := exposure.Release(); err != nil {
+		return fmt.Errorf("uninstall exposure lock release failed: %w", err)
+	}
+	if err := admission.Release(); err != nil {
+		return fmt.Errorf("uninstall mutation lock release failed: %w", err)
+	}
+	if err := manager.Close(); err != nil {
+		return fmt.Errorf("uninstall lock release failed: %w", err)
+	}
+	for _, lockName := range []string{"mutation-admission.lock", "exposure.lock"} {
+		if err := removeOwnedLockFile(filepath.Join(paths.LockRoot, lockName)); err != nil {
+			return err
+		}
+	}
+	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts); err != nil {
+		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		return fmt.Errorf("uninstall binary removal failed: %w", err)
@@ -99,6 +137,77 @@ func stopOwnedServices(ctx context.Context, paths []string) error {
 		if err := exec.CommandContext(ctx, "systemctl", "stop", unit).Run(); err != nil {
 			return fmt.Errorf("uninstall could not stop %s; fence retained: %w", unit, err)
 		}
+		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run(); err == nil {
+			return fmt.Errorf("uninstall service fence is incomplete for %s", unit)
+		}
+	}
+	return nil
+}
+
+func removeOwnedAccounts(journal Journal) error {
+	sets := []identity.AccountSet{journal.Accounts}
+	if data, err := os.ReadFile("/etc/sysusers.d/lanpanel-headscale.conf"); err == nil {
+		match := regexp.MustCompile(`(?m)^u ([^ ]+) -:[^ ]+ "([^"]+)" /nonexistent /usr/sbin/nologin$`).FindSubmatch(data)
+		if len(match) != 3 || !strings.Contains(string(match[2]), " headscale ") {
+			return fmt.Errorf("uninstall Headscale account authority is invalid")
+		}
+		fields := strings.Fields(string(match[2]))
+		if len(fields) != 4 || fields[0] != "LanPanel" || fields[1] != journal.InstallationID || fields[2] != "headscale" || !strings.HasPrefix(string(match[1]), "lp-") {
+			return fmt.Errorf("uninstall Headscale account authority is foreign")
+		}
+		set, err := identity.HeadscaleAccounts(journal.InstallationID, fields[3])
+		if err != nil || set.Specs[0].User != string(match[1]) || set.Specs[0].Comment != string(match[2]) {
+			return fmt.Errorf("uninstall Headscale account authority is foreign")
+		}
+		expected, err := identity.RenderSysusers(set)
+		if err != nil || !bytes.Equal(expected, data) {
+			return fmt.Errorf("uninstall Headscale account authority is foreign")
+		}
+		sets = append(sets, set)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("uninstall cannot inspect Headscale account authority: %w", err)
+	}
+	for _, set := range sets {
+		present, _, err := identity.InspectAccounts(set)
+		if err != nil || !present {
+			return fmt.Errorf("uninstall account ownership is incomplete: %w", err)
+		}
+	}
+	removedUsers := map[string]bool{}
+	removedGroups := map[string]bool{}
+	for _, set := range sets {
+		for _, spec := range set.Specs {
+			if !removedUsers[spec.User] {
+				if err := exec.Command("userdel", "--system", "--force", spec.User).Run(); err != nil {
+					return fmt.Errorf("uninstall could not remove owned account %s: %w", spec.User, err)
+				}
+				removedUsers[spec.User] = true
+			}
+			if !removedGroups[spec.Group] {
+				if err := exec.Command("groupdel", spec.Group).Run(); err != nil {
+					return fmt.Errorf("uninstall could not remove owned group %s: %w", spec.Group, err)
+				}
+				removedGroups[spec.Group] = true
+			}
+		}
+	}
+	return nil
+}
+
+func removeOwnedLockFile(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("uninstall foreign lock residue at %q", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) != 0 {
+		return fmt.Errorf("uninstall foreign lock residue at %q", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("uninstall could not remove lock %q: %w", path, err)
 	}
 	return nil
 }
@@ -123,7 +232,7 @@ func removeOwnedPath(path string, artifacts map[string]string) error {
 			// Non-empty managed roots may contain external application data; retain
 			// them rather than recursively deleting user files.
 			if errors.Is(err, syscall.ENOTEMPTY) {
-				return nil
+				return fmt.Errorf("uninstall foreign residue at %q", path)
 			}
 			return fmt.Errorf("uninstall could not remove owned directory %q: %w", path, err)
 		}

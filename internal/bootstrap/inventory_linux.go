@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/nginx"
 	"os"
 	"path/filepath"
@@ -20,6 +21,9 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 		values = append(values, filepath.Join(paths.SystemdRoot, name))
 	}
 	values = append(values, filepath.Join(paths.SystemdRoot, "nginx.service"))
+	if paths == FixedPaths() {
+		values = append(values, domain.HeadscaleManagedPaths()...)
+	}
 	slices.Sort(values)
 	values = slices.Compact(values)
 	for _, path := range values {
