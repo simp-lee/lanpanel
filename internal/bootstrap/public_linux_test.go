@@ -4,29 +4,16 @@ package bootstrap
 
 import (
 	"encoding/json"
+	"io"
 	"lanpanel/internal/preflight"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestPublicInstallerArgsAreClosedAndExplicit(t *testing.T) {
-	digest := strings.Repeat("a", 64)
-	bundle, contact, selectedDigest, err := parsePublicInstallerArgs([]string{"--bundle-dir", "/srv/lanpanel-release", "--release-digest", digest, "--acme-account-contact", "admin@example.com"})
-	if err != nil || bundle != "/srv/lanpanel-release" || contact != "admin@example.com" || selectedDigest != digest {
-		t.Fatalf("valid public installer arguments rejected: %q %q %q %v", bundle, contact, selectedDigest, err)
-	}
-	for _, args := range [][]string{
-		{"--bundle-dir", "release", "--release-digest", digest, "--acme-account-contact", "admin@example.com"},
-		{"--bundle-dir", "/srv/release", "--release-digest", "not-a-digest", "--acme-account-contact", "admin@example.com"},
-		{"--bundle-dir", "/srv/release", "--release-digest", digest, "--acme-account-contact", "not-an-email"},
-		{"--bundle-dir", "/srv/release", "--unknown", "value", "--release-digest", digest, "--acme-account-contact", "admin@example.com"},
-		{"--bundle-dir", "/srv/release", "--bundle-dir", "/srv/other", "--release-digest", digest, "--acme-account-contact", "admin@example.com"},
-		{"--bundle-dir", "/srv/release", "--release-digest", "", "--release-digest", digest, "--acme-account-contact", "admin@example.com"},
-	} {
-		if _, _, _, err := parsePublicInstallerArgs(args); err == nil {
-			t.Fatalf("unsafe public installer arguments accepted: %#v", args)
-		}
+func TestPublicInstallerHasNoUserSuppliedAuthorityArguments(t *testing.T) {
+	if err := runPublicInstaller([]string{"--bundle-dir", "/srv/release"}, io.Discard); err == nil {
+		t.Fatal("legacy public installer arguments were accepted")
 	}
 }
 
@@ -40,7 +27,7 @@ func TestPublicInstallerResumeChecksTerminalPhaseBeforeInput(t *testing.T) {
 }
 
 func TestPublicInstallerInputRebindsPackageAuthority(t *testing.T) {
-	original := installerInput{SchemaVersion: installerInputSchema, Kind: "public_release", ACMEAccountContact: "admin@example.com", AssetPaths: map[string]string{"lanpanel": "/srv/lanpanel"}}
+	original := installerInput{SchemaVersion: installerInputSchema, Kind: "public_release", AssetPaths: map[string]string{"lanpanel": "/srv/lanpanel"}}
 	data, err := json.Marshal(original)
 	if err != nil {
 		t.Fatal(err)

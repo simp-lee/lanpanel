@@ -86,7 +86,6 @@ type Journal struct {
 	Authority              identity.ManagementAuthority `json:"management_authority"`
 	PreflightRequest       preflight.ExpansionRequest   `json:"preflight_request"`
 	PreflightDigest        string                       `json:"preflight_digest"`
-	ACMEAccountContact     string                       `json:"acme_account_contact"`
 	PackageTransactionID   string                       `json:"package_transaction_id"`
 	PackagePlanDigest      string                       `json:"package_plan_digest"`
 	PackageInputPlanDigest string                       `json:"package_input_plan_digest"`
@@ -112,7 +111,6 @@ type Bundle struct {
 	Management                identity.ManagementAuthority `json:"management_authority"`
 	Release                   release.InstallIdentity      `json:"release"`
 	PreflightDigest           string                       `json:"preflight_digest"`
-	ACMEAccountContact        string                       `json:"acme_account_contact"`
 	ACMEAccountKeyFingerprint string                       `json:"acme_account_key_fingerprint"`
 }
 
@@ -162,9 +160,9 @@ type Request struct {
 	PackagePreflight   preflight.Result
 	PackageTransaction PackageTransaction
 	SourceBinary       []byte
-	ACMEAccountContact string
 	LegoBytes          []byte
 	TailscaleBytes     []byte
+	HeadscaleBytes     []byte
 	Random             io.Reader
 	Now                func() time.Time
 	Paths              Paths
@@ -178,7 +176,7 @@ type TTY interface {
 }
 
 func validateJournal(value Journal) error {
-	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
+	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
 		return fmt.Errorf("bootstrap journal is incomplete or invalid")
 	}
 	beforePackages := value.Phase == PhasePrepared || value.Phase == PhaseNginxMasked
@@ -197,18 +195,21 @@ func validateJournal(value Journal) error {
 			return fmt.Errorf("bootstrap planned path inventory is invalid")
 		}
 	}
-	previous := ""
-	for path, digest := range value.ArtifactDigests {
-		if path == "" || !release.ValidDigest(digest) || path == previous {
+	artifactPaths := make([]string, 0, len(value.ArtifactDigests))
+	for path := range value.ArtifactDigests {
+		artifactPaths = append(artifactPaths, path)
+	}
+	slices.Sort(artifactPaths)
+	for index, path := range artifactPaths {
+		if path == "" || index > 0 && artifactPaths[index-1] >= path || !release.ValidDigest(value.ArtifactDigests[path]) {
 			return fmt.Errorf("bootstrap artifact inventory is invalid")
 		}
-		previous = path
 	}
 	return nil
 }
 
 func validateBundle(value Bundle) error {
-	if value.SchemaVersion != BundleSchemaVersion || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || len(value.Fingerprint) != 16 || identity.ValidateManagementAuthority(value.Management) != nil || release.ValidateInstallIdentity(value.Release) != nil || value.PreflightDigest == "" || !acmeaccount.ValidContact(value.ACMEAccountContact) || !strings.HasPrefix(value.ACMEAccountKeyFingerprint, "sha256:") || !release.ValidDigest(strings.TrimPrefix(value.ACMEAccountKeyFingerprint, "sha256:")) {
+	if value.SchemaVersion != BundleSchemaVersion || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || len(value.Fingerprint) != 16 || identity.ValidateManagementAuthority(value.Management) != nil || release.ValidateInstallIdentity(value.Release) != nil || value.PreflightDigest == "" || !strings.HasPrefix(value.ACMEAccountKeyFingerprint, "sha256:") || !release.ValidDigest(strings.TrimPrefix(value.ACMEAccountKeyFingerprint, "sha256:")) {
 		return fmt.Errorf("installation bundle is invalid")
 	}
 	fingerprint, _ := identity.Fingerprint(value.InstallationID)

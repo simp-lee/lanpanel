@@ -28,9 +28,9 @@ const (
 type installerInput struct {
 	SchemaVersion                 string              `json:"schema_version"`
 	Kind                          release.InstallKind `json:"kind"`
-	ACMEAccountContact            string              `json:"acme_account_contact"`
 	ExpectedReleaseManifestDigest string              `json:"expected_release_manifest_digest,omitempty"`
 	ReleaseManifest               []byte              `json:"release_manifest,omitempty"`
+	ReleaseSignature              []byte              `json:"release_signature"`
 	Checksums                     []byte              `json:"checksums,omitempty"`
 	AssetPaths                    map[string]string   `json:"asset_paths"`
 	PackagePlan                   packages.Plan       `json:"package_plan"`
@@ -43,8 +43,11 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("installer requires its fixed root invocation")
 	}
+	if len(args) == 1 && args[0] == "install" {
+		return runPublicInstaller(nil, stdout)
+	}
 	if len(args) != 0 {
-		return runPublicInstaller(args, stdout)
+		return fmt.Errorf("installer accepts only the public install command")
 	}
 	file := os.NewFile(3, "installer-authority")
 	if file == nil {
@@ -74,7 +77,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		return fmt.Errorf("installer release authority has trailing data")
 	}
 	canonical, _ := json.Marshal(input)
-	if !bytes.Equal(canonical, data) || input.SchemaVersion != installerInputSchema || input.ACMEAccountContact == "" {
+	if !bytes.Equal(canonical, data) || input.SchemaVersion != installerInputSchema || input.Kind != release.InstallPublicRelease || len(input.ReleaseSignature) != release.ReleaseSignatureBytes {
 		return fmt.Errorf("installer release authority is noncanonical")
 	}
 	assets, err := readInstallerAssets(input.AssetPaths)
@@ -90,7 +93,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if input.Kind != release.InstallPublicRelease {
 		return fmt.Errorf("installer release kind is invalid")
 	}
-	authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now})
+	authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now}, input.ReleaseSignature)
 	if err == nil {
 		current, currentErr := readCurrentExecutable(authority.Identity().Binary.Bytes)
 		if currentErr != nil || uint64(len(current)) != authority.Identity().Binary.Bytes || release.DigestBytes(current) != authority.Identity().Binary.Digest {
@@ -132,7 +135,11 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		return fmt.Errorf("selected Tailscale asset missing or mismatched")
 	}
 	installerInput := append([]byte(nil), data...)
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], ACMEAccountContact: input.ACMEAccountContact, LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	headscaleBytes, present := assets[identityValue.Headscale.Archive.Path]
+	if !present || release.DigestBytes(headscaleBytes) != identityValue.Headscale.Archive.Digest || uint64(len(headscaleBytes)) != identityValue.Headscale.Archive.Bytes {
+		return fmt.Errorf("selected Headscale archive is missing or mismatched")
+	}
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 
 func rebindPublicInstallerInput(data []byte, plan packages.Plan, result preflight.Result) ([]byte, error) {

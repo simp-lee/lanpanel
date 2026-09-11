@@ -31,6 +31,12 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "install" {
+		return bootstrap.RunInstallerRole(args, stdout)
+	}
+	if len(args) > 0 && args[0] == "uninstall" {
+		return bootstrap.RunPublicUninstall(args[1:], os.Stdin, stdout)
+	}
 	registry, err := roles.NewRegistry([]roles.Registration{
 		{Name: roles.ChildExecutor, Handler: func(args []string, _, _ io.Writer) error { return child.ExecuteBootstrap(args) }},
 		{Name: roles.Helper, Handler: func(args []string, _, _ io.Writer) error {

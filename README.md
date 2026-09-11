@@ -14,22 +14,17 @@ The UI process is non-root. Root mutations cross a peer-authenticated, typed Uni
 
 The code targets Debian and Ubuntu Linux amd64 with systemd and apt/dpkg. LanPanel is Preview-only: installation performs basic host checks, signed repository validation, exact package-version checks, and transaction cleanup. It is not a hardened GA or live-qualified release.
 
-Only clean installation is supported. From an extracted release bundle, run the fixed installer as root and provide the bundle directory, the independently selected `release.json` SHA-256 digest, and ACME account contact:
+Only clean installation is supported. From an extracted official release artifact, run the sole public Preview path:
 
 ```text
-sudo ./lanpanel installer --bundle-dir /absolute/path/to/lanpanel-release --release-digest <release.json-sha256> --acme-account-contact admin@example.com
+sudo ./lanpanel install
 ```
+
+The artifact directory is discovered from the running binary. Its canonical manifest, detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, NOTICE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. A release-specific bootstrap command is published with each fixed artifact version and digest; it verifies the same material in a protected temporary directory and then invokes this command, never pipe-to-shell or an online fallback.
 
 The installer constructs the host-bound package Plan and fresh bootstrap preflight from the checksum-bound release assets before any mutation. Before service bootstrap, it verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, signed repository/key metadata, exact package set and versions, host architecture, systemd, apt/dpkg health, clock, disk, paths, and listeners. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
 
-Dependency sources are:
-
-- `official/canonical_artifact`: release-pinned HTTPS URL, version, archive digest, members, and executable digest;
-- `official/distro_repository`: clean-install-only signed apt repository and exact package set;
-- `mirror`: an administrator-selected HTTP(S) URL with the same fixed digest;
-- `offline`: an administrator-selected safe regular file with exact name/version/OS/arch/digest.
-
-One explicit unauthenticated canonical HTTP(S) download proxy may be configured. LanPanel does not read ambient proxy variables and never silently bypasses or switches a failed source.
+System packages use only the release-authority-bound signed `OfficialDistro` repository and exact package set. Lego, Tailscale, and Headscale are delivered as release-authority-bound assets; no third-party installer script, mirror, offline source, proxy, or download fallback is used.
 
 ## Headscale and connector
 
@@ -70,7 +65,7 @@ Access modes are `public`, `application_managed`, and `basic`. Basic may use a o
 
 Every ingress removes untrusted identity headers before rebuilding only `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` from the actual socket peer. The first release does not trust CDN identity headers.
 
-The clean installer generates one installation-managed P-256 ACME account key atomically; operators provide only the account email and explicit Terms approval, never a private-key path. ACME supports HTTP-01 and DNS-01 with exactly `cloudflare`, `route53`, `digitalocean`, `gcloud`, and `tencentcloud`. DNS credentials remain in protected files/profiles. Provider, CA, and source fallback are forbidden. Release notes distinguish real live-tested providers from deterministic fixture coverage.
+The clean installer generates one installation-managed P-256 ACME account key atomically. Contact is configured or changed only in the authenticated Management UI and is validated again immediately before the first ACME request; it is never a command-line, log, or release-artifact input. ACME supports HTTP-01 and DNS-01 with exactly `cloudflare`, `route53`, `digitalocean`, `gcloud`, and `tencentcloud`. DNS credentials remain in protected files/profiles. Provider, CA, and source fallback are forbidden. Release notes distinguish real live-tested providers from deterministic fixture coverage.
 
 ## Closing, recovery, deletion, and export
 

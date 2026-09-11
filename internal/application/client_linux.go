@@ -49,10 +49,6 @@ type (
 type HeadscaleInitializePayload struct {
 	ControlDomain     string `json:"control_domain"`
 	MagicDNSNamespace string `json:"magicdns_namespace"`
-	SourceKind        string `json:"source_kind"`
-	MirrorURL         string `json:"mirror_url,omitempty"`
-	OfflinePath       string `json:"offline_path,omitempty"`
-	ProxyURL          string `json:"proxy_url,omitempty"`
 	Confirmation      string `json:"confirmation"`
 }
 type ManagedBasicPayload struct {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/acmeaccount"
+	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
@@ -49,9 +50,6 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err := release.ValidateInstallIdentity(releaseIdentity); err != nil {
 		return err
 	}
-	if !acmeaccount.ValidContact(request.ACMEAccountContact) {
-		return fmt.Errorf("managed ACME account contact is invalid")
-	}
 	if len(request.InstallerInput) > maximumPublicInstallerInputBytes {
 		return fmt.Errorf("installer resume authority is too large")
 	}
@@ -78,6 +76,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 	}
 	if len(request.TailscaleBytes) == 0 || uint64(len(request.TailscaleBytes)) != releaseIdentity.Tailscale.Bytes || digestBytes(request.TailscaleBytes) != releaseIdentity.Tailscale.Digest {
 		return fmt.Errorf("selected Tailscale bytes differ from release authority")
+	}
+	if len(request.HeadscaleBytes) == 0 || uint64(len(request.HeadscaleBytes)) != releaseIdentity.Headscale.Archive.Bytes || digestBytes(request.HeadscaleBytes) != releaseIdentity.Headscale.Archive.Digest {
+		return fmt.Errorf("selected Headscale archive bytes differ from release authority")
 	}
 	if request.Preflight == nil || request.PackageTransaction == nil {
 		return fmt.Errorf("installer bootstrap preflight or package transaction executor is missing")
@@ -154,7 +155,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 		if err := verifyResumeInventory(journal); err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(journal.Release, releaseIdentity) || journal.Paths != paths || journal.SafetyGeneration != preflightRequest.Generation || journal.PreflightDigest != preflightDigest || !reflect.DeepEqual(journal.PreflightRequest, preflightRequest) || journal.PackageTransactionID != request.PackagePlan.TransactionID || journal.PackagePlanDigest != packagePlanDigest || journal.ACMEAccountContact != request.ACMEAccountContact {
+		if !reflect.DeepEqual(journal.Release, releaseIdentity) || journal.Paths != paths || journal.SafetyGeneration != preflightRequest.Generation || journal.PreflightDigest != preflightDigest || !reflect.DeepEqual(journal.PreflightRequest, preflightRequest) || journal.PackageTransactionID != request.PackagePlan.TransactionID || journal.PackagePlanDigest != packagePlanDigest {
 			return fmt.Errorf("existing bootstrap attempt belongs to different exact authority")
 		}
 		if journal.PackageInputPlanDigest != inputPackagePlanDigest {
@@ -215,7 +216,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err != nil {
 		return err
 	}
-	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, ACMEAccountContact: request.ACMEAccountContact, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
+	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
 	if err := validateJournal(journal); err != nil {
 		return err
 	}
@@ -284,6 +285,51 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 		return "", fmt.Errorf("package plan preflight result is not exact and allowed")
 	}
 	return planDigest, nil
+}
+
+func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Request) error {
+	if journal == nil || release.ValidateInstallIdentity(journal.Release) != nil || len(request.HeadscaleBytes) == 0 {
+		return fmt.Errorf("fixed runtime asset authority is incomplete")
+	}
+	authority := journal.Release.Headscale
+	members := make([]managedarchive.Member, 0, len(authority.Members))
+	for _, member := range authority.Members {
+		members = append(members, managedarchive.Member{
+			Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(authority.Archive.Bytes),
+			Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)},
+		})
+	}
+	extracted, err := managedarchive.Extract(request.HeadscaleBytes, managedarchive.Spec{
+		Format: managedarchive.Format(authority.ArchiveFormat), MaximumArchiveBytes: int64(authority.Archive.Bytes),
+		MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(members), Members: members,
+	})
+	if err != nil {
+		return fmt.Errorf("Headscale release archive is invalid: %w", err)
+	}
+	archivePath := filepath.Join(filepath.Dir(authority.InstallPath), filepath.Base(authority.Archive.Path))
+	if err := putOrVerifyTargetFile(ctx, archivePath, request.HeadscaleBytes, 0o600); err != nil {
+		return err
+	}
+	journal.ArtifactDigests[archivePath] = authority.Archive.Digest
+	for _, member := range authority.Members {
+		data, ok := extracted[member.Path]
+		if !ok || uint64(len(data)) != member.Asset.Bytes || digestBytes(data) != member.Asset.Digest {
+			return fmt.Errorf("Headscale archive member %q differs from release authority", member.Path)
+		}
+		if err := putOrVerifyTargetFile(ctx, member.Destination, data, os.FileMode(member.Mode)); err != nil {
+			return err
+		}
+		journal.ArtifactDigests[member.Destination] = member.Asset.Digest
+	}
+	if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/lego", request.LegoBytes, 0o755); err != nil {
+		return err
+	}
+	journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/lego"] = journal.Release.Lego.Digest
+	if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/tailscale", request.TailscaleBytes, 0o755); err != nil {
+		return err
+	}
+	journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/tailscale"] = journal.Release.Tailscale.Digest
+	return nil
 }
 
 func reconcilePackageCommit(journal *Journal, packageJournal packages.Journal) error {
@@ -374,7 +420,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if fingerprintErr != nil {
 			return fingerprintErr
 		}
-		bundle := Bundle{SchemaVersion: BundleSchemaVersion, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, SafetyGeneration: journal.SafetyGeneration, Fingerprint: fingerprint, Management: journal.Authority, Release: journal.Release, PreflightDigest: journal.PreflightDigest, ACMEAccountContact: journal.ACMEAccountContact, ACMEAccountKeyFingerprint: accountFingerprint}
+		bundle := Bundle{SchemaVersion: BundleSchemaVersion, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, SafetyGeneration: journal.SafetyGeneration, Fingerprint: fingerprint, Management: journal.Authority, Release: journal.Release, PreflightDigest: journal.PreflightDigest, ACMEAccountKeyFingerprint: accountFingerprint}
 		bundleBytes, _ := encodeCanonical(bundle)
 		if len(token) == 0 {
 			if existing, err := readCommittedArtifact(filepath.Join(journal.Paths.InstallationRoot, "admin-token"), 4096, 0o600); err == nil {
@@ -519,14 +565,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 	}
 	if journal.Phase == PhaseStoresInitialized {
-		if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/lego", request.LegoBytes, 0o755); err != nil {
+		if err := installFixedRuntimeAssets(ctx, &journal, request); err != nil {
 			return err
 		}
-		journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/lego"] = journal.Release.Lego.Digest
-		if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/tailscale", request.TailscaleBytes, 0o755); err != nil {
-			return err
-		}
-		journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/tailscale"] = journal.Release.Tailscale.Digest
 		if err := installNginxBaseline(ctx, &journal); err != nil {
 			return err
 		}
@@ -1002,7 +1043,7 @@ func bootstrapArtifactMode(journal Journal, path string) uint32 {
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)
 	}
-	if path == journal.Paths.ACMEAccountKey || path == journal.Paths.SysusersPath || path == nginxPaths.MainPath() || path == nginxPaths.SanitizerPath() {
+	if path == journal.Paths.ACMEAccountKey || path == journal.Paths.SysusersPath || path == nginxPaths.MainPath() || path == nginxPaths.SanitizerPath() || path == filepath.Join(filepath.Dir(journal.Release.Headscale.InstallPath), filepath.Base(journal.Release.Headscale.Archive.Path)) {
 		return 0o600
 	}
 	if strings.HasSuffix(path, ".service") || strings.HasSuffix(path, ".socket") || strings.HasSuffix(path, ".timer") {

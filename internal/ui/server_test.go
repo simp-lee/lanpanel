@@ -756,9 +756,14 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if strings.Contains(response.Body.String(), `name="account_key_path"`) || strings.Contains(appJS, "account_key_path") || strings.Contains(response.Body.String(), `name="account_email"`) || strings.Contains(appJS, "account_email") || strings.Count(response.Body.String(), "installation-managed ACME account key") != 2 {
 		t.Fatal("ACME account key is still caller-selected or its managed authority is not disclosed")
 	}
-	for _, field := range []string{"control_domain", "magicdns_namespace", "source_kind", "mirror_url", "offline_path", "proxy_url"} {
+	for _, field := range []string{"control_domain", "magicdns_namespace"} {
 		if !strings.Contains(response.Body.String(), `name="`+field+`"`) {
 			t.Fatalf("Headscale UI field %s missing", field)
+		}
+	}
+	for _, field := range []string{"source_kind", "mirror_url", "offline_path", "proxy_url"} {
+		if strings.Contains(response.Body.String(), `name="`+field+`"`) || strings.Contains(appJS, field) {
+			t.Fatalf("removed Headscale source field %s is still exposed", field)
 		}
 	}
 	for _, required := range []string{"trusted_mesh", "/api/actions/headscale_initialize", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence"} {

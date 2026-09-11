@@ -32,4 +32,8 @@ tidy:
 	$(GO) mod tidy
 
 docs-build:
-	@test -f README.md && test -f docs/README.md
+	@test -f README.md && test -f README.zh-CN.md && test -f docs/README.md
+	@grep -Fq 'sudo ./lanpanel install' README.md README.zh-CN.md docs/README.md
+	@grep -Fq 'sudo lanpanel uninstall' docs/README.md
+	@! grep -Eq 'lanpanel installer --bundle-dir|--release-digest|--acme-account-contact' README.md README.zh-CN.md docs/README.md
+	@! grep -Eq 'source_kind|mirror_url|offline_path|proxy_url' docs/README.md

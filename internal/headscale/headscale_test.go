@@ -9,7 +9,6 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/release"
-	"lanpanel/internal/sources"
 	"strings"
 	"testing"
 	"time"
@@ -43,8 +42,7 @@ func TestInitializationJournalPinsExactCandidateAcrossRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source, _ := BuildSource(installed, SourceChoice{Kind: sources.OfficialCanonical})
-	journal, data, err := BuildInitializationJournal(candidate, installed, snapshot, "job_00000000000000000000000000000001", source, "")
+	journal, data, err := BuildInitializationJournal(candidate, installed, snapshot, "job_00000000000000000000000000000001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,30 +52,11 @@ func TestInitializationJournalPinsExactCandidateAcrossRetry(t *testing.T) {
 	}
 	changed := installed
 	changed.Headscale.Archive.Digest = strings.Repeat("f", 64)
-	if _, _, err := BuildInitializationJournal(candidate, changed, snapshot, journal.JobID, source, ""); err == nil {
+	if _, _, err := BuildInitializationJournal(candidate, changed, snapshot, journal.JobID); err == nil {
 		t.Fatal("changed release authority accepted for pending initialization")
 	}
-	if _, _, err := BuildInitializationJournal(candidate, installed, append(snapshot, '\n'), journal.JobID, source, ""); err == nil {
+	if _, _, err := BuildInitializationJournal(candidate, installed, append(snapshot, '\n'), journal.JobID); err == nil {
 		t.Fatal("changed identity snapshot accepted")
-	}
-}
-
-func TestSourceChoiceNeverFloatsOrFallsBack(t *testing.T) {
-	installed, _ := fixtureRelease()
-	official, err := BuildSource(installed, SourceChoice{Kind: sources.OfficialCanonical})
-	if err != nil || official.URL != installed.Headscale.ArtifactIdentity || official.Artifact.Version != installed.Headscale.Version {
-		t.Fatalf("official = %#v, %v", official, err)
-	}
-	mirror, err := BuildSource(installed, SourceChoice{Kind: sources.Mirror, MirrorURL: "https://mirror.example.test/headscale.tar.gz"})
-	if err != nil || mirror.Kind != sources.Mirror {
-		t.Fatalf("mirror = %#v, %v", mirror, err)
-	}
-	offline, err := BuildSource(installed, SourceChoice{Kind: sources.Offline, OfflinePath: "/srv/offline/headscale.tar.gz"})
-	if err != nil || offline.Kind != sources.Offline {
-		t.Fatalf("offline = %#v, %v", offline, err)
-	}
-	if _, err := BuildSource(installed, SourceChoice{Kind: sources.OfficialCanonical, MirrorURL: "https://other.example.test/headscale"}); err == nil {
-		t.Fatal("official source accepted alternate URL")
 	}
 }
 

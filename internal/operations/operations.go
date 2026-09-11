@@ -140,8 +140,6 @@ type CertificatePublicationHandoff struct {
 type HeadscaleInitializationBinding struct {
 	Candidate        domain.HeadscaleDomain     `json:"candidate"`
 	Snapshot         json.RawMessage            `json:"snapshot"`
-	Source           sources.Source             `json:"source"`
-	ProxyURL         string                     `json:"proxy_url,omitempty"`
 	PreflightRequest preflight.ExpansionRequest `json:"preflight_request"`
 	PreflightResult  preflight.Result           `json:"preflight_result"`
 }
@@ -8072,7 +8070,7 @@ func validateHeadscaleInitializationBinding(operation Type, safetyBinding Safety
 		}
 		return nil
 	}
-	if binding == nil || binding.Candidate.LastJobID != "" || binding.Candidate.LastOperation != "" || binding.Candidate.DesiredDigest != safetyBinding.CandidateDigest || binding.Candidate.Artifact.ArchiveDigest != safetyBinding.CandidateBundle || managedheadscale.VerifySnapshot(binding.Candidate, binding.Snapshot) != nil || sources.Validate(binding.Source) != nil || binding.Source.Artifact.Name != "headscale" || binding.Source.Artifact.Version != binding.Candidate.Artifact.Version || "sha256:"+binding.Source.Artifact.Digest != binding.Candidate.Artifact.ArchiveDigest || sources.ValidateProxy(journalProxy(binding.ProxyURL)) != nil {
+	if binding == nil || binding.Candidate.LastJobID != "" || binding.Candidate.LastOperation != "" || binding.Candidate.DesiredDigest != safetyBinding.CandidateDigest || binding.Candidate.Artifact.ArchiveDigest != safetyBinding.CandidateBundle || managedheadscale.VerifySnapshot(binding.Candidate, binding.Snapshot) != nil {
 		return fmt.Errorf("headscale initialization authority is invalid")
 	}
 	preflightDigest, err := preflight.ExpansionRequestDigest(binding.PreflightRequest)

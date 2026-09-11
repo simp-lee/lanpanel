@@ -100,7 +100,7 @@ func TestManagedBasicAndStaticRequestsAreClosed(t *testing.T) {
 
 func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	now := time.Now().UTC()
-	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","source_kind":"official/canonical_artifact","confirmation":"initialize"}`)
+	payload := []byte(`{"control_domain":"control.example.test","magicdns_namespace":"mesh.example.test","confirmation":"initialize"}`)
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "headscale-initialize", Operation: OperationHeadscaleInitialize, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "headscale_initialize", ActorIdentity: "session-one", ActorGeneration: 1, Confirmation: "initialize", Resource: payload}}
 	request.InputDigest, _ = ApplicationInputDigest(request)
 	if err := ValidateRequest(request, now); err != nil {

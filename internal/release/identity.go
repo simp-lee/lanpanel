@@ -1,6 +1,7 @@
 package release
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"lanpanel/internal/packages"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 
 const (
 	ReleaseManifestSchemaVersion = "lanpanel.release.v3"
+	ReleaseSignaturePath         = "release.json.sig"
+	ReleaseSignatureBytes        = ed25519.SignatureSize
 )
 
 type InstallKind string
@@ -149,9 +152,39 @@ func DecodeReleaseManifest(data []byte) (*VerifiedRelease, error) {
 	return &VerifiedRelease{value: manifest, digest: DigestBytes(data)}, nil
 }
 
+// trustedReleasePublicKey is supplied by the installer binary. It is
+// deliberately not read from release material. Rotating it requires
+// publishing a new authenticated installer.
+var trustedReleasePublicKey = ed25519.PublicKey{
+	0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+	0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+}
+
+func TrustedReleasePublicKeyBytes() []byte {
+	return append([]byte(nil), trustedReleasePublicKey...)
+}
+
+// VerifyRelease verifies the unsigned integrity portion of a release. Public
+// installation must use VerifySignedRelease; this function remains useful to
+// release tooling that has already authenticated the detached signature.
 func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
+	return verifyRelease(expectedManifestDigest, manifestBytes, nil, checksumBytes, assets, false)
+}
+
+// VerifySignedRelease authenticates canonical release manifest bytes with the
+// installer-trusted Ed25519 key and then verifies the complete inventory.
+func VerifySignedRelease(expectedManifestDigest string, manifestBytes, signatureBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
+	return verifyRelease(expectedManifestDigest, manifestBytes, signatureBytes, checksumBytes, assets, true)
+}
+
+func verifyRelease(expectedManifestDigest string, manifestBytes, signatureBytes, checksumBytes []byte, assets map[string][]byte, requireSignature bool) (*VerifiedRelease, error) {
 	if !ValidDigest(expectedManifestDigest) || DigestBytes(manifestBytes) != expectedManifestDigest {
 		return nil, fmt.Errorf("release manifest differs from selected digest")
+	}
+	if requireSignature {
+		if len(signatureBytes) != ReleaseSignatureBytes || !ed25519.Verify(trustedReleasePublicKey, manifestBytes, signatureBytes) {
+			return nil, fmt.Errorf("release manifest signature is invalid")
+		}
 	}
 	var manifest ReleaseManifest
 	if err := DecodeCanonical(manifestBytes, &manifest); err != nil {
@@ -160,17 +193,17 @@ func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes [
 	if err := validateReleaseManifest(manifest); err != nil {
 		return nil, err
 	}
-	if err := verifyReleaseAssets(manifest, checksumBytes, assets); err != nil {
+	if err := verifyReleaseAssets(manifest, checksumBytes, assets, requireSignature); err != nil {
 		return nil, err
 	}
 	return &VerifiedRelease{value: manifest, digest: expectedManifestDigest}, nil
 }
 
-func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte) error {
+func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte, requireSignature bool) error {
 	if DigestBytes(checksumBytes) != manifest.Checksums.Digest || uint64(len(checksumBytes)) != manifest.Checksums.Bytes {
 		return fmt.Errorf("release checksum file is invalid")
 	}
-	set, err := ParseChecksums(checksumBytes, releaseAssetPaths(manifest))
+	set, err := ParseChecksums(checksumBytes, releaseAssetPaths(manifest, requireSignature))
 	if err != nil {
 		return fmt.Errorf("release checksum inventory is invalid: %w", err)
 	}
@@ -182,15 +215,23 @@ func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets 
 		if !ok || uint64(len(data)) != asset.Bytes || DigestBytes(data) != asset.Digest {
 			return fmt.Errorf("release asset %q is missing or mismatched", asset.Path)
 		}
+		if asset.Path == manifest.KnownLimitations.Path {
+			if err := ValidateKnownLimitations(data); err != nil {
+				return fmt.Errorf("known limitations asset is invalid: %w", err)
+			}
+		}
 	}
 	return nil
 }
 
-func releaseAssetPaths(manifest ReleaseManifest) []string {
+func releaseAssetPaths(manifest ReleaseManifest, requireSignature ...bool) []string {
 	assets := mustReleaseAssets(manifest)
-	paths := make([]string, 0, len(assets))
+	paths := make([]string, 0, len(assets)+1)
 	for _, asset := range assets {
 		paths = append(paths, asset.Path)
+	}
+	if len(requireSignature) == 0 || requireSignature[0] {
+		paths = append(paths, ReleaseSignaturePath)
 	}
 	return paths
 }
@@ -218,7 +259,7 @@ func InstallAssetPaths(manifest ReleaseManifest) ([]string, error) {
 			paths = append(paths, asset.Path)
 		}
 	}
-	paths = append(paths, manifest.Checksums.Path, "release.json")
+	paths = append(paths, manifest.Checksums.Path, ReleaseSignaturePath, "release.json")
 	slices.Sort(paths)
 	return paths, nil
 }
@@ -227,7 +268,7 @@ func releaseAssetInventory(manifest ReleaseManifest) ([]AssetIdentity, error) {
 	assets := mustReleaseAssets(manifest)
 	seen := map[string]bool{}
 	for _, asset := range assets {
-		if err := validateAsset(asset); err != nil || seen[asset.Path] || asset.Path == "release.json" {
+		if err := validateAsset(asset); err != nil || seen[asset.Path] || asset.Path == "release.json" || asset.Path == ReleaseSignaturePath || asset.Path == manifest.Checksums.Path {
 			return nil, fmt.Errorf("release asset inventory is invalid")
 		}
 		seen[asset.Path] = true
@@ -242,14 +283,24 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.Notice) != nil || validateAsset(manifest.DependencyManifest) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
 		return fmt.Errorf("release manifest asset authority is invalid")
 	}
-	packageTemplate := false
+	requiredAdditional := map[string]bool{
+		"package-template.json": false, "dependency-baseline.json": false,
+		"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false,
+	}
+	seenAdditional := map[string]bool{}
 	for _, asset := range manifest.AdditionalAssets {
-		if asset.Path == "package-template.json" {
-			packageTemplate = true
+		if validateAsset(asset) != nil || asset.Path == "release.json" || asset.Path == ReleaseSignaturePath || asset.Path == manifest.Checksums.Path || seenAdditional[asset.Path] {
+			return fmt.Errorf("release manifest additional asset inventory is invalid")
+		}
+		seenAdditional[asset.Path] = true
+		if _, required := requiredAdditional[asset.Path]; required {
+			requiredAdditional[asset.Path] = true
 		}
 	}
-	if !packageTemplate {
-		return fmt.Errorf("release manifest package template is missing")
+	for assetPath, present := range requiredAdditional {
+		if !present {
+			return fmt.Errorf("release manifest required asset %q is missing", assetPath)
+		}
 	}
 	profile := manifest.SupportedProfiles[0]
 	if validateOSProfile(profile.Profile) != nil {

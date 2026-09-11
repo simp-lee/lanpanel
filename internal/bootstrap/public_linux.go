@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
@@ -19,9 +18,8 @@ import (
 )
 
 func runPublicInstaller(args []string, stdout io.Writer) error {
-	bundleDir, contact, expectedDigest, err := parsePublicInstallerArgs(args)
-	if err != nil {
-		return err
+	if len(args) != 0 {
+		return fmt.Errorf("public install accepts no options; unpack the official release and run ./lanpanel install")
 	}
 	resuming, err := journalExists(FixedPaths().Journal)
 	if err != nil {
@@ -35,13 +33,13 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 		if err := validatePublicInstallerResume(journalPhase, data); err != nil {
 			return err
 		}
-		var input installerInput
-		if err := json.Unmarshal(data, &input); err != nil || input.Kind != release.InstallPublicRelease || input.ACMEAccountContact != contact || input.ExpectedReleaseManifestDigest != expectedDigest {
-			return fmt.Errorf("public installer resume authority does not match the requested release, digest, or ACME contact")
-		}
 		return runInstallerAuthority(data, stdout)
 	}
-	data, material, err := buildPublicInstallerInput(bundleDir, contact, expectedDigest)
+	bundleDir, err := currentArtifactDirectory()
+	if err != nil {
+		return err
+	}
+	data, material, err := buildPublicInstallerInput(bundleDir)
 	if err != nil {
 		return err
 	}
@@ -52,41 +50,15 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func parsePublicInstallerArgs(args []string) (string, string, string, error) {
-	var bundleDir, contact, expectedDigest string
-	seenBundle, seenContact, seenDigest := false, false, false
-	for index := 0; index < len(args); index += 2 {
-		if index+1 >= len(args) {
-			return "", "", "", fmt.Errorf("public installer requires --bundle-dir, --release-digest, and --acme-account-contact")
-		}
-		value := args[index+1]
-		switch args[index] {
-		case "--bundle-dir":
-			if seenBundle {
-				return "", "", "", fmt.Errorf("public installer bundle directory was specified twice")
-			}
-			seenBundle, bundleDir = true, value
-		case "--release-digest":
-			if seenDigest {
-				return "", "", "", fmt.Errorf("public installer release digest was specified twice")
-			}
-			seenDigest, expectedDigest = true, value
-		case "--acme-account-contact":
-			if seenContact {
-				return "", "", "", fmt.Errorf("public installer ACME contact was specified twice")
-			}
-			seenContact, contact = true, value
-		default:
-			return "", "", "", fmt.Errorf("unknown public installer option %q", args[index])
-		}
+func currentArtifactDirectory() (string, error) {
+	executable, err := os.Readlink("/proc/self/exe")
+	if err != nil || !filepath.IsAbs(executable) || filepath.Clean(executable) != executable || filepath.Base(executable) != "lanpanel" {
+		return "", fmt.Errorf("public install must run from the official lanpanel artifact")
 	}
-	if !filepath.IsAbs(bundleDir) || filepath.Clean(bundleDir) != bundleDir || bundleDir == "/" || !release.ValidDigest(expectedDigest) || !acmeaccount.ValidContact(contact) {
-		return "", "", "", fmt.Errorf("public installer bundle directory, release digest, or ACME contact is invalid")
-	}
-	return bundleDir, contact, expectedDigest, nil
+	return filepath.Dir(executable), nil
 }
 
-func buildPublicInstallerInput(bundleDir, contact, expectedDigest string) ([]byte, identity.Material, error) {
+func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, error) {
 	manifestAssets, err := readInstallerAssets(map[string]string{"release.json": filepath.Join(bundleDir, "release.json")})
 	if err != nil {
 		return nil, identity.Material{}, err
@@ -95,9 +67,6 @@ func buildPublicInstallerInput(bundleDir, contact, expectedDigest string) ([]byt
 	manifest, err := release.DecodeReleaseManifest(manifestBytes)
 	if err != nil {
 		return nil, identity.Material{}, fmt.Errorf("public release manifest is invalid: %w", err)
-	}
-	if release.DigestBytes(manifestBytes) != expectedDigest {
-		return nil, identity.Material{}, fmt.Errorf("public release manifest differs from the selected digest")
 	}
 	runningBinary, err := readCurrentExecutable(manifest.Manifest().Binary.Bytes)
 	if err != nil || uint64(len(runningBinary)) != manifest.Manifest().Binary.Bytes || release.DigestBytes(runningBinary) != manifest.Manifest().Binary.Digest {
@@ -122,12 +91,16 @@ func buildPublicInstallerInput(bundleDir, contact, expectedDigest string) ([]byt
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
+	signature, err := readInstallerAssets(map[string]string{release.ReleaseSignaturePath: filepath.Join(bundleDir, release.ReleaseSignaturePath)})
+	if err != nil {
+		return nil, identity.Material{}, err
+	}
 	actualHost, err := observeHostFingerprint()
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
 	observedAt := time.Now().UTC().Truncate(time.Second)
-	authority, err := release.VerifyPublicInstallAuthority(release.DigestBytes(manifestBytes), manifestBytes, checksums["SHA256SUMS"], assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: observedAt})
+	authority, err := release.VerifyPublicInstallAuthority(release.DigestBytes(manifestBytes), manifestBytes, checksums["SHA256SUMS"], assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: observedAt}, signature[release.ReleaseSignaturePath])
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
@@ -155,7 +128,7 @@ func buildPublicInstallerInput(bundleDir, contact, expectedDigest string) ([]byt
 		material.Destroy()
 		return nil, identity.Material{}, err
 	}
-	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ACMEAccountContact: contact, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
+	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: signature[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
 	data, err := json.Marshal(input)
 	if err != nil || len(data) == 0 || len(data) > maximumPublicInstallerInputBytes {
 		material.Destroy()

@@ -15,7 +15,6 @@ import (
 	"lanpanel/internal/persist"
 	"lanpanel/internal/plans"
 	"os"
-	"reflect"
 )
 
 func (s *FixedService) PendingHeadscaleRecovery() error {
@@ -142,11 +141,11 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 		}
 		binding := pending.HeadscaleBinding
 		if journal == nil {
-			if err := managedheadscale.CommitInitializationJournal(ctx, paths, installed, binding.Candidate, binding.Snapshot, pending.JobID, binding.Source, binding.ProxyURL); err != nil {
+			if err := managedheadscale.CommitInitializationJournal(ctx, paths, installed, binding.Candidate, binding.Snapshot, pending.JobID); err != nil {
 				_ = service.Close()
 				return err
 			}
-		} else if journal.JobID != pending.JobID || journal.Candidate.ID != binding.Candidate.ID || !reflect.DeepEqual(journal.Source, binding.Source) || journal.ProxyURL != binding.ProxyURL {
+		} else if journal.JobID != pending.JobID || journal.Candidate.ID != binding.Candidate.ID {
 			_ = service.Close()
 			return fmt.Errorf("headscale initialization journal differs from running intent")
 		}
@@ -193,7 +192,7 @@ func ReconcileHeadscaleInitialization(ctx context.Context) error {
 	}
 	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
 	if journal != nil {
-		if err := managedheadscale.RemoveInitializationJournal(paths, installed, journal.Candidate, journal.Snapshot, journal.JobID, journal.Source, journal.ProxyURL); err != nil {
+		if err := managedheadscale.RemoveInitializationJournal(paths, installed, journal.Candidate, journal.Snapshot, journal.JobID); err != nil {
 			return err
 		}
 	}

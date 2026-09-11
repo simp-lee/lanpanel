@@ -21,7 +21,6 @@ import (
 	"lanpanel/internal/preflight"
 	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
-	"lanpanel/internal/sources"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2054,13 +2053,12 @@ func TestHeadscaleRemoteWaitCanResumeSameDurableUIJob(t *testing.T) {
 	candidate.Database.IdentityBundleDigest = testDigestBytes(snapshotBytes)
 	snapshot.Artifact = candidate.Artifact
 	snapshotBytes, _ = json.Marshal(snapshot)
-	source := sources.Source{Kind: sources.OfficialCanonical, URL: "https://downloads.example.test/headscale.tar.gz", OfficialAuthorities: []string{"downloads.example.test"}, Artifact: sources.Artifact{Name: "headscale", Version: candidate.Artifact.Version, OperatingOS: "linux", Architecture: "amd64", Digest: strings.TrimPrefix(candidate.Artifact.ArchiveDigest, "sha256:")}}
 	preflightRequest := preflight.ExpansionRequest{Scope: preflight.ExpansionHeadscale, Target: "headscale", Generation: 1, Profile: preflight.ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages"), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_baseline_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, PolicyDigest: testDigest("confinement")}, Authority: preflight.ProfileAuthority{Kind: preflight.PreviewProfile, Digest: testDigest("profile")}}, Domains: []string{candidate.ControlDomain}, Disks: []preflight.DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1}}, LastTrustedWall: now.Add(-time.Second)}
 	preflightResult, err := preflight.EvaluateExpansion(preflightRequest, preflight.ExpansionObservations{OperatingSystem: "linux", Architecture: "amd64", KernelRelease: "6.12.1", CgroupMode: "unified_v2", Platform: preflight.PlatformInfo{ID: "debian", VersionID: "13"}, Clock: preflight.ClockObservation{Now: now, Synchronized: true, Source: "kernel"}, ExecutorUID: 0, Systemd: preflight.ComponentObservation{Available: true, Identity: "systemd/1"}, APT: preflight.ComponentObservation{Available: true, Identity: "apt/1"}, DPKG: preflight.ComponentObservation{Available: true, Identity: "dpkg/1"}, Packages: preflight.PackageObservation{Ready: true, Identity: testDigest("package-observation"), SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: testDigest("packages")}, DNS: []preflight.DNSObservation{{Domain: candidate.ControlDomain, Addresses: []string{"8.8.8.8"}}}, ListenerInventoryComplete: true, Disks: []preflight.DiskObservation{{Path: "/var/lib/lanpanel", Device: 1, AvailableBytes: 1}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: HeadscaleInitialize, Target: "installation", ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: SafetyBinding{CandidateDigest: candidate.DesiredDigest, CandidateBundle: candidate.Artifact.ArchiveDigest}, HeadscaleBinding: &HeadscaleInitializationBinding{Candidate: candidate, Snapshot: snapshotBytes, Source: source, PreflightRequest: preflightRequest, PreflightResult: preflightResult}, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(context.Background(), admission, AdmitRequest{Operation: HeadscaleInitialize, Target: "installation", ActorIdentity: "ui/session/generation/1", Source: AdmissionUI, SafetyBinding: SafetyBinding{CandidateDigest: candidate.DesiredDigest, CandidateBundle: candidate.Artifact.ArchiveDigest}, HeadscaleBinding: &HeadscaleInitializationBinding{Candidate: candidate, Snapshot: snapshotBytes, PreflightRequest: preflightRequest, PreflightResult: preflightResult}, ExpectedRevision: document.Revision})
 	if err != nil {
 		t.Fatal(err)
 	}

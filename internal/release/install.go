@@ -28,7 +28,6 @@ type InstallIdentity struct {
 	Kind                     InstallKind                `json:"kind"`
 	ReleaseTag               string                     `json:"release_tag"`
 	ReleaseManifestDigest    string                     `json:"release_manifest_digest,omitempty"`
-	ACMEAccountContact       string                     `json:"acme_account_contact,omitempty"`
 	Binary                   AssetIdentity              `json:"binary"`
 	Profile                  OSProfile                  `json:"profile"`
 	ProfileDigest            string                     `json:"profile_digest"`
@@ -73,8 +72,8 @@ type PublicInstallObservation struct {
 	ObservedAt      time.Time
 }
 
-func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseManifestBytes, checksumBytes []byte, assets map[string][]byte, observed PublicInstallObservation) (*InstallAuthority, error) {
-	verified, err := VerifyRelease(expectedReleaseManifestDigest, releaseManifestBytes, checksumBytes, assets)
+func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseManifestBytes, checksumBytes []byte, assets map[string][]byte, observed PublicInstallObservation, detachedSignature []byte) (*InstallAuthority, error) {
+	verified, err := VerifySignedRelease(expectedReleaseManifestDigest, releaseManifestBytes, detachedSignature, checksumBytes, assets)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +93,18 @@ func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseM
 	dependencies, err := decodeDependencyAuthority(dependencyBytes, manifest.DependencyManifest.Digest)
 	if err != nil {
 		return nil, err
+	}
+	for _, asset := range []AssetIdentity{dependencies.DependencyBaseline, dependencies.LegoArchive, dependencies.Lego, dependencies.Tailscale.Archive} {
+		data, present := assets[asset.Path]
+		if !present || uint64(len(data)) != asset.Bytes || DigestBytes(data) != asset.Digest {
+			return nil, fmt.Errorf("dependency asset %q is missing or mismatched", asset.Path)
+		}
+	}
+	for _, member := range append(append([]ArchiveMemberAuthority(nil), dependencies.LegoMembers...), dependencies.Tailscale.Members...) {
+		data, present := assets[member.Asset.Path]
+		if !present || uint64(len(data)) != member.Asset.Bytes || DigestBytes(data) != member.Asset.Digest {
+			return nil, fmt.Errorf("dependency member %q is missing or mismatched", member.Asset.Path)
+		}
 	}
 	if !reflect.DeepEqual(manifest.Headscale, dependencies.Headscale) {
 		return nil, fmt.Errorf("release and dependency Headscale authorities differ")
@@ -119,7 +130,7 @@ func decodeDependencyAuthority(data []byte, expectedDigest string) (DependencyAu
 	if err := DecodeCanonical(data, &authority); err != nil {
 		return DependencyAuthority{}, err
 	}
-	if authority.SchemaVersion == "" || validateAsset(authority.DependencyBaseline) != nil || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil {
+	if authority.SchemaVersion == "" || !concreteVersionPattern.MatchString(authority.LegoVersion) || !canonicalArtifactURL(authority.LegoArtifactIdentity) || validateAsset(authority.DependencyBaseline) != nil || authority.DependencyBaseline.Path != "dependency-baseline.json" || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.LegoArchive) != nil || authority.LegoArchive.Path != "lego.tar.gz" || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || len(authority.LegoMembers) != 1 || authority.LegoMembers[0].Path != "lego" || authority.LegoMembers[0].Destination != "/usr/lib/lanpanel/dependencies/lego" || authority.LegoMembers[0].Mode != 0o755 || authority.LegoMembers[0].Asset != authority.Lego || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil || authority.Tailscale.Archive.Path != "tailscale.tar.gz" {
 		return DependencyAuthority{}, fmt.Errorf("dependency manifest is invalid")
 	}
 	return authority, nil

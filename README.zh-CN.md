@@ -14,22 +14,17 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 
 代码目标是使用 systemd 和 apt/dpkg 的 Debian/Ubuntu Linux amd64。LanPanel 仅提供 Preview：安装执行基础主机检查、签名仓库校验、精确包版本校验和事务清理；不声称 hardened GA 或 live qualification。
 
-首版只支持 clean install。从解压后的 release bundle 运行 root installer，提供 bundle 目录、独立选定的 `release.json` SHA-256 digest 和 ACME account contact：
+首版只支持 clean install。从解压后的官方 release artifact 执行唯一公开 Preview 路径：
 
 ```text
-sudo ./lanpanel installer --bundle-dir /absolute/path/to/lanpanel-release --release-digest <release.json-sha256> --acme-account-contact admin@example.com
+sudo ./lanpanel install
 ```
+
+程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、Ed25519 detached signature、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。每个固定版本会发布带固定版本和 digest 的 bootstrap 命令；它在受保护临时目录验证同一材料后调用该命令，不使用 pipe-to-shell 或在线 fallback。
 
 installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、signed repository/key metadata、exact package set/version，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
 
-Dependency source 仅为：
-
-- `official/canonical_artifact`：release 固定 HTTPS URL、version、archive digest、member 和 executable digest；
-- `official/distro_repository`：只用于 clean install 的 signed apt repository 与 exact package set；
-- `mirror`：管理员选择的 HTTP(S) URL，仍校验相同固定 digest；
-- `offline`：管理员选择的安全 regular file，校验 name/version/OS/arch/digest。
-
-只能配置一个显式、无认证 canonical HTTP(S) download proxy。LanPanel 不读取 ambient proxy，source 失败时不会静默 bypass 或切换。
+系统包只使用 release authority 绑定的 signed `OfficialDistro` repository 与精确 package set。Lego、Tailscale 和 Headscale 都由 release authority 绑定的资产交付；不执行第三方 installer script，也不提供 mirror、offline source、proxy 或 download fallback。
 
 ## Headscale 与 connector
 
@@ -70,7 +65,7 @@ Access mode 为 `public|application_managed|basic`。Basic 可使用一次性 Ma
 
 每个入口先移除 untrusted identity header，再只根据实际 socket peer 重建 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Host` 和 `X-Forwarded-Proto`。首版不信任 CDN identity header。
 
-clean installer 会原子生成唯一的 installation-managed P-256 ACME account key；操作员只提供 account email 并明确接受条款，不能选择私钥路径。ACME 支持 HTTP-01 和 DNS-01；DNS provider exact 闭集为 `cloudflare|route53|digitalocean|gcloud|tencentcloud`。DNS credential 保持在 protected file/profile。禁止 provider、CA 和 source fallback。release notes 会区分真实 live-tested provider 与 deterministic fixture coverage。
+clean installer 会原子生成唯一的 installation-managed P-256 ACME account key。Contact 只能在 authenticated Management UI 中设置或修改，并在首次 ACME request 前再次校验；不会进入命令行、日志或 release artifact。ACME 支持 HTTP-01 和 DNS-01；DNS provider exact 闭集为 `cloudflare|route53|digitalocean|gcloud|tencentcloud`。DNS credential 保持在 protected file/profile。禁止 provider、CA 和 source fallback。release notes 会区分真实 live-tested provider 与 deterministic fixture coverage。
 
 ## 关闭、恢复、删除与导出
 

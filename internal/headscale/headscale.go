@@ -10,22 +10,13 @@ import (
 	"io"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/release"
-	"lanpanel/internal/sources"
-	"net/url"
 	"slices"
-	"strings"
 )
 
 const (
 	IdentitySnapshotSchema = "lanpanel.headscale.identity.v1"
 	TrustedMeshPolicy      = "trusted_mesh"
 )
-
-type SourceChoice struct {
-	Kind        sources.Kind
-	MirrorURL   string
-	OfflinePath string
-}
 
 type IdentitySnapshot struct {
 	SchemaVersion       string                           `json:"schema_version"`
@@ -71,42 +62,6 @@ func ArtifactIdentity(installed release.InstallIdentity) (domain.HeadscaleArtifa
 		ConfigContract:       authority.ConfigContract,
 		ConfigContractDigest: prefixed(authority.ConfigContractDigest),
 	}, nil
-}
-
-func BuildSource(installed release.InstallIdentity, choice SourceChoice) (sources.Source, error) {
-	if err := release.ValidateInstallIdentity(installed); err != nil {
-		return sources.Source{}, err
-	}
-	authority := installed.Headscale
-	artifact := sources.Artifact{Name: "headscale", Version: authority.Version, OperatingOS: "linux", Architecture: installed.Profile.Architecture, Digest: authority.Archive.Digest}
-	var source sources.Source
-	switch choice.Kind {
-	case sources.OfficialCanonical:
-		if choice.MirrorURL != "" || choice.OfflinePath != "" {
-			return sources.Source{}, fmt.Errorf("official Headscale source carries alternate location")
-		}
-		parsed, err := url.Parse(authority.ArtifactIdentity)
-		if err != nil || parsed.Host == "" || !slices.Contains(authority.RedirectAuthorities, parsed.Host) {
-			return sources.Source{}, fmt.Errorf("headscale canonical artifact authority is inconsistent")
-		}
-		source = sources.Source{Kind: choice.Kind, URL: authority.ArtifactIdentity, OfficialAuthorities: append([]string(nil), authority.RedirectAuthorities...), Artifact: artifact}
-	case sources.Mirror:
-		if choice.MirrorURL == "" || choice.OfflinePath != "" {
-			return sources.Source{}, fmt.Errorf("headscale mirror source is incomplete")
-		}
-		source = sources.Source{Kind: choice.Kind, URL: choice.MirrorURL, Artifact: artifact}
-	case sources.Offline:
-		if choice.OfflinePath == "" || choice.MirrorURL != "" {
-			return sources.Source{}, fmt.Errorf("headscale offline source is incomplete")
-		}
-		source = sources.Source{Kind: choice.Kind, OfflinePath: choice.OfflinePath, Artifact: artifact}
-	default:
-		return sources.Source{}, fmt.Errorf("headscale source kind is unsupported")
-	}
-	if err := sources.Validate(source); err != nil {
-		return sources.Source{}, err
-	}
-	return source, nil
 }
 
 func NewCandidate(request CandidateRequest) (domain.HeadscaleDomain, IdentitySnapshot, []byte, error) {
@@ -178,5 +133,3 @@ func randomID(reader io.Reader, prefix string) (string, error) {
 	clear(value)
 	return encoded, nil
 }
-
-var _ = strings.Compare

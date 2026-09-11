@@ -28,13 +28,14 @@ type Paths struct {
 	Journal        string
 	JournalStaging string
 	Executable     string
+	Archive        string
 	IdentityParent string
 	IdentityName   string
 	SQLite         string
 }
 
 func FixedPaths() Paths {
-	return Paths{Root: "/", Staging: "/usr/lib/lanpanel/dependencies/.filetxn", Journal: "/var/lib/lanpanel/headscale-initialize.json", JournalStaging: "/var/lib/lanpanel/.bootstrap-filetxn", Executable: "/usr/lib/lanpanel/dependencies/headscale", IdentityParent: "/var/lib/lanpanel/headscale", IdentityName: "identity", SQLite: "/var/lib/lanpanel/headscale-runtime/db.sqlite"}
+	return Paths{Root: "/", Staging: "/usr/lib/lanpanel/dependencies/.filetxn", Journal: "/var/lib/lanpanel/headscale-initialize.json", JournalStaging: "/var/lib/lanpanel/.bootstrap-filetxn", Executable: "/usr/lib/lanpanel/dependencies/headscale", Archive: "/usr/lib/lanpanel/dependencies/headscale.tar.gz", IdentityParent: "/var/lib/lanpanel/headscale", IdentityName: "identity", SQLite: "/var/lib/lanpanel/headscale-runtime/db.sqlite"}
 }
 
 func EnsureLayout(paths Paths, owner filetxn.Owner) error {
@@ -178,6 +179,30 @@ type InstallRequest struct {
 	Candidate     domain.HeadscaleDomain
 	SnapshotBytes []byte
 	ArchiveBytes  []byte
+}
+
+// ReadInstalledArchive returns only the archive committed by the initial
+// release transaction. Headscale lifecycle never downloads or selects a new
+// source after installation.
+func ReadInstalledArchive(paths Paths, installed release.InstallIdentity, owner filetxn.Owner) ([]byte, error) {
+	if err := release.ValidateInstallIdentity(installed); err != nil {
+		return nil, err
+	}
+	archivePath := paths.Archive
+	if archivePath == "" {
+		archivePath = filepath.Join(filepath.Dir(paths.Executable), filepath.Base(installed.Headscale.Archive.Path))
+	}
+	data, err := os.ReadFile(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(data)) != installed.Headscale.Archive.Bytes || release.DigestBytes(data) != installed.Headscale.Archive.Digest {
+		return nil, fmt.Errorf("installed Headscale archive differs from release authority")
+	}
+	if owner.UID != 0 || owner.GID != 0 {
+		return nil, fmt.Errorf("installed Headscale archive owner authority is invalid")
+	}
+	return data, nil
 }
 
 func Install(ctx context.Context, request InstallRequest) error {
