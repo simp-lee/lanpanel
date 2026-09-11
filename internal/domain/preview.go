@@ -20,7 +20,7 @@ import (
 	"unicode"
 )
 
-const InstallationSchemaVersion = "lanpanel.installation.ga.v2"
+const InstallationSchemaVersion = "lanpanel.installation.preview.v1"
 
 var ErrHeadscaleDomainConflict = errors.New("headscale control and MagicDNS domains conflict")
 
@@ -89,10 +89,9 @@ const (
 type PrerequisiteCode string
 
 const (
-	PrerequisiteHeadscaleNotConfigured   PrerequisiteCode = "headscale_not_configured"
-	PrerequisiteConnectorRequired        PrerequisiteCode = "connector_required"
-	PrerequisiteOSProfileLiveUnqualified PrerequisiteCode = "os_profile_live_unqualified"
-	PrerequisitePackageIdentityDrift     PrerequisiteCode = "package_identity_drift"
+	PrerequisiteHeadscaleNotConfigured PrerequisiteCode = "headscale_not_configured"
+	PrerequisiteConnectorRequired      PrerequisiteCode = "connector_required"
+	PrerequisitePackageIdentityDrift   PrerequisiteCode = "package_identity_drift"
 )
 
 type OperationCode string
@@ -696,7 +695,7 @@ func ParseOperationResult(value string) (OperationResult, error) {
 
 func ParsePrerequisiteCode(value string) (PrerequisiteCode, error) {
 	switch PrerequisiteCode(value) {
-	case PrerequisiteHeadscaleNotConfigured, PrerequisiteConnectorRequired, PrerequisiteOSProfileLiveUnqualified, PrerequisitePackageIdentityDrift:
+	case PrerequisiteHeadscaleNotConfigured, PrerequisiteConnectorRequired, PrerequisitePackageIdentityDrift:
 		return PrerequisiteCode(value), nil
 	default:
 		return "", fmt.Errorf("prerequisite code %q is not supported", value)

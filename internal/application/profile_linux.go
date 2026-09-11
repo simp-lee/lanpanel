@@ -28,7 +28,7 @@ func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfi
 			ConnectPolicy:         confinement.ConnectPolicy,
 			FilesystemPolicy:      confinement.FilesystemPolicy,
 			ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...),
-			QualificationDigest:   "sha256:" + confinement.QualificationDigest,
+			PolicyDigest:          "sha256:" + confinement.PolicyDigest,
 		},
 	}
 }
@@ -54,10 +54,10 @@ func verifyInstalledPackageProfile(ctx context.Context, profile release.OSProfil
 		ConnectPolicy:         confinement.ConnectPolicy,
 		FilesystemPolicy:      confinement.FilesystemPolicy,
 		ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...),
-		QualificationDigest:   confinement.QualificationDigest,
+		PolicyDigest:          confinement.PolicyDigest,
 	}
 	if !reflect.DeepEqual(expected.ManagedConfinement, observedConfinement) {
-		return &preflight.ProfileDriftError{Component: "managed_confinement", Expected: expected.ManagedConfinement.QualificationDigest, Observed: observedConfinement.QualificationDigest}
+		return &preflight.ProfileDriftError{Component: "managed_confinement", Expected: expected.ManagedConfinement.PolicyDigest, Observed: observedConfinement.PolicyDigest}
 	}
 	return nil
 }

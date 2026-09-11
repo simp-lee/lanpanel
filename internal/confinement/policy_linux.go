@@ -1,6 +1,6 @@
 //go:build linux
 
-// Package confinement owns the qualification-bound kernel policy for managed processes.
+// Package confinement owns the fixed systemd policy for managed processes.
 package confinement
 
 import (
@@ -21,22 +21,6 @@ import (
 
 const SchemaVersion = "lanpanel.managed.confinement.v1"
 
-// BPFLSMActive reports whether the kernel enabled the BPF LSM at boot. The
-// compatibility installer may run without it; callers must report the weaker
-// isolation rather than treating its absence as an installation failure.
-func BPFLSMActive() bool {
-	data, err := os.ReadFile("/sys/kernel/security/lsm")
-	if err != nil {
-		return false
-	}
-	for _, value := range strings.Split(strings.TrimSpace(string(data)), ",") {
-		if strings.TrimSpace(value) == "bpf" {
-			return true
-		}
-	}
-	return false
-}
-
 type Profile struct {
 	SchemaVersion         string   `json:"schema_version"`
 	KernelRelease         string   `json:"kernel_release"`
@@ -45,7 +29,7 @@ type Profile struct {
 	ConnectPolicy         string   `json:"connect_policy"`
 	FilesystemPolicy      string   `json:"filesystem_policy"`
 	ProtectedDestinations []string `json:"protected_destinations"`
-	QualificationDigest   string   `json:"qualification_digest"`
+	PolicyDigest          string   `json:"policy_digest"`
 }
 
 type UnitPolicy struct {
@@ -58,7 +42,7 @@ type UnitPolicy struct {
 
 func ValidateUnitPolicy(policy UnitPolicy) error {
 	short := strings.TrimPrefix(policy.ResourceID, "res_")
-	if len(policy.ResourceID) != 36 || len(short) != 32 || !lowerHex(short) || policy.Cgroup != "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-"+short[:20]+".slice/lanpanel-app-"+short[:20]+".service" || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || !validDigest(policy.Digest) || strings.ToLower(policy.Digest) != policy.Digest || len(policy.Directives) == 0 {
+	if len(policy.ResourceID) != 36 || len(short) != 32 || !lowerHex(short) || policy.Cgroup != "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-"+short[:20]+".slice/lanpanel-app-"+short[:20]+".service" || policy.BindListenPolicy != "systemd_bind_baseline_v1" || !validDigest(policy.Digest) || strings.ToLower(policy.Digest) != policy.Digest || len(policy.Directives) == 0 {
 		return fmt.Errorf("managed-process unit policy is invalid")
 	}
 	for index, directive := range policy.Directives {
@@ -71,7 +55,7 @@ func ValidateUnitPolicy(policy UnitPolicy) error {
 }
 
 func ValidateProfile(profile Profile) error {
-	if profile.SchemaVersion != SchemaVersion || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
+	if profile.SchemaVersion != SchemaVersion || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_baseline_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.PolicyDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
 		return fmt.Errorf("managed-process confinement profile is incomplete or unqualified")
 	}
 	for index, destination := range profile.ProtectedDestinations {
@@ -95,7 +79,7 @@ func Render(profile Profile, resourceID, workingDirectory, environmentFile, fron
 		"NoNewPrivileges=yes", "AmbientCapabilities=", "RestrictSUIDSGID=yes",
 		"PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid",
 		"LockPersonality=yes", "RestrictRealtime=yes", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-		"SocketBindDeny=any", "UMask=" + map[bool]string{true: "0117", false: "0077"}[backend != ""],
+		"UMask=" + map[bool]string{true: "0117", false: "0077"}[backend != ""],
 		"TemporaryFileSystem=/run:ro", "InaccessiblePaths=/etc/lanpanel /var/lib/lanpanel/installation /var/lib/lanpanel/state /var/lib/lanpanel/safety /var/lib/lanpanel/ownership /var/lib/lanpanel/locks",
 		"BindReadOnlyPaths=" + filepath.Join("/var/lib/lanpanel/resources", resourceID, "exec-authority.json"),
 		"ReadOnlyPaths=" + workingDirectory,
@@ -119,7 +103,7 @@ func Render(profile Profile, resourceID, workingDirectory, environmentFile, fron
 		directives = append(directives, "ReadWritePaths="+path)
 	}
 	slices.Sort(directives)
-	sum := sha256.Sum256([]byte(strings.Join(directives, "\n") + "\n" + profile.QualificationDigest + "\n" + cgroup))
+	sum := sha256.Sum256([]byte(strings.Join(directives, "\n") + "\n" + profile.PolicyDigest + "\n" + cgroup))
 	return UnitPolicy{ResourceID: resourceID, Cgroup: cgroup, BindListenPolicy: profile.BindListenPolicy, Directives: directives, Digest: "sha256:" + hex.EncodeToString(sum[:])}, nil
 }
 
@@ -149,7 +133,7 @@ func VerifyEffectiveRelay(policy UnitPolicy, effective map[string][]string) erro
 }
 
 func VerifyEffective(policy UnitPolicy, effective map[string][]string) error {
-	if policy.ResourceID == "" || policy.Cgroup == "" || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || !validDigest(policy.Digest) {
+	if policy.ResourceID == "" || policy.Cgroup == "" || policy.BindListenPolicy != "systemd_bind_baseline_v1" || !validDigest(policy.Digest) {
 		return fmt.Errorf("confinement policy identity is invalid")
 	}
 	return verifyEffectiveDirectives(policy.Directives, effective)

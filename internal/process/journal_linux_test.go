@@ -64,7 +64,7 @@ func TestReadProcessJournalRequiresCanonicalSafeFile(t *testing.T) {
 			t.Fatal(err)
 		}
 		accounts.Identities = []identity.AccountIdentity{{Role: accounts.Application.Role, User: accounts.Application.User, UID: 1200, Group: accounts.Application.Group, GID: 1200}}
-		profile := confinement.Profile{SchemaVersion: confinement.SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, QualificationDigest: "sha256:" + strings.Repeat("b", 64)}
+		profile := confinement.Profile{SchemaVersion: confinement.SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_baseline_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, PolicyDigest: "sha256:" + strings.Repeat("b", 64)}
 		evidence := resource.ReferenceEvidence{ExecutableDigest: "sha256:" + strings.Repeat("c", 64), WorkingDirectoryIdentity: "sha256:" + strings.Repeat("d", 64), WritePathIdentities: []string{}}
 		units, err := Render("ins_00000000000000000000000000000001", app, accounts, profile, evidence, 33, map[string]struct{}{})
 		if err != nil {

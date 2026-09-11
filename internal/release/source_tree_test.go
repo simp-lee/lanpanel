@@ -1,10 +1,14 @@
 package release
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSourceArchiveMustMatchCleanTrackedTree(t *testing.T) {
@@ -50,4 +54,29 @@ func runGit(t *testing.T, root string, args ...string) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
+}
+
+func sourceArchiveFixture(t *testing.T) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	gz := gzip.NewWriter(&output)
+	gz.ModTime = time.Unix(0, 0).UTC()
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "lanpanel-v1.0.0/", Typeflag: tar.TypeDir, Mode: 0o755, ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR}); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("package main\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "lanpanel-v1.0.0/main.go", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(data)), ModTime: time.Unix(0, 0).UTC(), Format: tar.FormatUSTAR}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
 }

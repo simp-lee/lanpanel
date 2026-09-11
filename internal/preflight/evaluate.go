@@ -164,7 +164,7 @@ func validateContractionRequest(request ContractionRequest) error {
 }
 
 func validManagedConfinement(profile ManagedConfinementProfile) bool {
-	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
+	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_baseline_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !validDigest(profile.PolicyDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
 		return false
 	}
 	for index, destination := range profile.ProtectedDestinations {
@@ -176,13 +176,7 @@ func validManagedConfinement(profile ManagedConfinementProfile) bool {
 }
 
 func validProfileAuthority(profile ExpectedProfile) bool {
-	if profile.ID == "" || profile.ID != strings.ToLower(profile.ID) || profile.VersionID == "" || strings.ContainsAny(profile.ID+profile.VersionID, "\x00\r\n") || !validDigest(profile.Authority.Digest) {
-		return false
-	}
-	if profile.Authority.Kind == QualificationTarget {
-		return !profile.Authority.LiveQualified && validDigest(profile.Authority.CandidateDigest) && validDigest(profile.Authority.InstallManifestDigest) && validDigest(profile.Authority.SideEffectPlanDigest) && refPattern.MatchString(profile.Authority.HostFingerprint) && refPattern.MatchString(profile.Authority.RunID)
-	}
-	return profile.Authority.Kind == FinalSupportedProfile && profile.Authority.LiveQualified && profile.Authority.CandidateDigest == "" && profile.Authority.InstallManifestDigest == "" && profile.Authority.SideEffectPlanDigest == "" && profile.Authority.HostFingerprint == "" && profile.Authority.RunID == ""
+	return profile.ID != "" && profile.ID == strings.ToLower(profile.ID) && profile.VersionID != "" && !strings.ContainsAny(profile.ID+profile.VersionID, "\x00\r\n") && validDigest(profile.Authority.Digest) && profile.Authority.Kind == PreviewProfile
 }
 
 func requiredListeners(request ExpansionRequest) []ListenerRequirement {

@@ -27,7 +27,7 @@ func BeforeInventoryPaths(paths Paths) []string {
 		nginxPaths = testNginxPaths(paths)
 	}
 	roots := []string{paths.Journal, paths.StartupAuthority, paths.CommitPath, paths.PersistentRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath}
-	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
+	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		roots = append(roots, filepath.Join(paths.SystemdRoot, name))
 	}
 	roots = append(roots, filepath.Join(paths.SystemdRoot, "nginx.service"))

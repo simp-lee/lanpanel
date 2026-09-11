@@ -23,20 +23,16 @@ func TestPackageNoAutostartRoleAlwaysDeniesMaintainerStarts(t *testing.T) {
 	}
 }
 
-func TestDistroPackageClosureAllowsOnlyAmd64AndArchitectureIndependentPackages(t *testing.T) {
+func TestDistroPackagePlanAllowsOnlyAmd64AndArchitectureIndependentPackages(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	plan.Packages = clonePackages(plan.Packages)
 	plan.Packages[0].Architecture = "all"
 	plan.Packages[0].Source.Artifact.Architecture = "all"
-	closure, _ := ClosureDigest(plan.Packages)
-	plan.Authority.FrozenClosureDigest = closure
 	if err := ValidatePlan(plan); err != nil {
 		t.Fatal(err)
 	}
 	plan.Packages[0].Architecture = "arm64"
 	plan.Packages[0].Source.Artifact.Architecture = "arm64"
-	closure, _ = ClosureDigest(plan.Packages)
-	plan.Authority.FrozenClosureDigest = closure
 	if err := ValidatePlan(plan); err == nil {
 		t.Fatal("unsupported package architecture was accepted")
 	}
@@ -57,11 +53,6 @@ func TestMultiRepositoryPlanBindsEachPackageAndRejectsAmbiguousAuthority(t *test
 			plan.Packages[index].RepositoryID = "debian-main"
 		}
 	}
-	closure, err := ClosureDigest(plan.Packages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.Authority.FrozenClosureDigest = closure
 	if err := ValidatePlan(plan); err != nil {
 		t.Fatal(err)
 	}
@@ -116,16 +107,9 @@ func TestPackagePlanBindsExactQualifiedClosureRepositoriesAndNoNetwork(t *testin
 	if err := ValidatePlan(changed); err == nil {
 		t.Fatal("offline package transaction without no-network authority was accepted")
 	}
-	changed = offline
-	changed.Authority.FrozenClosureDigest = strings.Repeat("0", 64)
-	if err := ValidatePlan(changed); err == nil {
-		t.Fatal("qualification authority with a different closure was accepted")
-	}
 	apache := testPlan(t, DistroRepository)
 	apache.Packages = clonePackages(apache.Packages)
 	apache.Packages[0].Name = "apache2"
-	closure, _ := ClosureDigest(apache.Packages)
-	apache.Authority.FrozenClosureDigest = closure
 	if err := ValidatePlan(apache); err == nil {
 		t.Fatal("Apache HTTP Server package was accepted in the closure")
 	}
@@ -845,14 +829,10 @@ func testPlan(t *testing.T, mode Mode) Plan {
 			packages[index].Source = sources.Source{Kind: sources.Offline, OfflinePath: "/var/lib/lanpanel/imports/" + packages[index].ArtifactDigest + ".deb", Artifact: artifact, OfficialAuthorities: []string{}}
 		}
 	}
-	closure, err := ClosureDigest(packages)
-	if err != nil {
-		t.Fatal(err)
-	}
 	plan := Plan{
 		TransactionID: "pkg_" + strings.Repeat("1", 64), JobID: "job_" + strings.Repeat("2", 64), IntentGeneration: 1, Deadline: time.Unix(2_000_000_000, 0).UTC(), OSProfileDigest: strings.Repeat("a", 64), Mode: mode, Packages: packages, FirstNginxInstall: true,
 		LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoNetwork: noNetwork, NoAutostartPolicyDigest: strings.Repeat("9", 64), PreflightDigest: "sha256:" + strings.Repeat("6", 64), PreflightRequestDigest: "sha256:" + strings.Repeat("6", 64),
-		Authority: QualificationAuthority{Kind: QualificationTarget, ReleaseAuthorityDigest: strings.Repeat("d", 64), BinaryDigest: strings.Repeat("e", 64), RunID: "run-1", InstallManifestDigest: strings.Repeat("7", 64), SideEffectPlanDigest: strings.Repeat("8", 64), HostFingerprint: "host/fingerprint", Operation: "package_transaction", TargetOSProfileDigest: strings.Repeat("a", 64), FrozenClosureDigest: closure},
+		Authority: Authority{Kind: PreviewProfile, ReleaseAuthorityDigest: strings.Repeat("d", 64), BinaryDigest: strings.Repeat("e", 64), HostFingerprint: "host/fingerprint", TargetOSProfileDigest: strings.Repeat("a", 64)},
 	}
 	if mode == DistroRepository {
 		keyringDigest := fmt.Sprintf("%x", sha256.Sum256([]byte("keyring")))
@@ -866,11 +846,6 @@ func testPlanWithTwoUnits(t *testing.T) Plan {
 	plan := testPlan(t, OfflineDebs)
 	plan.Packages = clonePackages(plan.Packages)
 	plan.Packages[1].AffectedUnits = []string{"nginx.service", "nginx.socket"}
-	closure, err := ClosureDigest(plan.Packages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.Authority.FrozenClosureDigest = closure
 	return plan
 }
 

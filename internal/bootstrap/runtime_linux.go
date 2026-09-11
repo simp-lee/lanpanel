@@ -4,16 +4,12 @@ package bootstrap
 
 import (
 	"fmt"
-	"lanpanel/internal/confinement"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
 	"os"
 	"os/user"
 	"strconv"
-	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 // RunRuntimeGuard recreates the one volatile helper socket directory after reboot.
@@ -44,47 +40,6 @@ func RunRuntimeGuard(args []string) error {
 	}
 	if _, err = ensureDirectory("/run/lanpanel-goaccess", filetxn.Owner{UID: 0, GID: uint32(nginxGID)}, 0o750); err != nil {
 		return err
-	}
-	if !confinement.BPFLSMActive() {
-		return nil
-	}
-	return ensureBPFGuardDirectory()
-}
-
-func ensureBPFGuardDirectory() error {
-	const root = "/sys/fs/bpf"
-	data, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return err
-	}
-	mounted := false
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		separator := -1
-		for index, value := range fields {
-			if value == "-" {
-				separator = index
-				break
-			}
-		}
-		if separator > 5 && separator+1 < len(fields) && fields[4] == root && fields[separator+1] == "bpf" {
-			mounted = true
-			break
-		}
-	}
-	if !mounted {
-		return fmt.Errorf("bpffs is not mounted at exact guard root")
-	}
-	path := root + "/lanpanel"
-	if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
-		return err
-	}
-	var stat unix.Stat_t
-	if err := unix.Lstat(path, &stat); err != nil {
-		return err
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o7777 != 0o700 || stat.Uid != 0 || stat.Gid != 0 {
-		return fmt.Errorf("BPF guard directory identity is unsafe")
 	}
 	return nil
 }

@@ -14,10 +14,7 @@ import (
 )
 
 func installedProfileAuthority(installed release.InstallIdentity) preflight.ProfileAuthority {
-	if installed.Kind == release.InstallQualification {
-		return preflight.ProfileAuthority{Kind: preflight.QualificationTarget, Digest: "sha256:" + installed.ProfileDigest, CandidateDigest: "sha256:" + installed.CandidateDigest, InstallManifestDigest: "sha256:" + installed.QualificationInstallManifestDigest, SideEffectPlanDigest: "sha256:" + installed.SideEffectPlanDigest, HostFingerprint: installed.HostFingerprint, RunID: installed.RunID}
-	}
-	return preflight.ProfileAuthority{Kind: preflight.FinalSupportedProfile, Digest: "sha256:" + installed.ProfileDigest, LiveQualified: true}
+	return preflight.ProfileAuthority{Kind: preflight.PreviewProfile, Digest: "sha256:" + installed.ProfileDigest}
 }
 
 func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallIdentity, controlDomain string, generation uint64, additionalPaths ...preflight.ManagedPathRequirement) (preflight.ExpansionRequest, preflight.Result, error) {
@@ -50,7 +47,7 @@ func evaluateHeadscalePreflight(ctx context.Context, installed release.InstallId
 	maximum := installed.Headscale.Archive.Bytes + installed.Headscale.MaximumExtractedBytes + 1<<20
 	request := preflight.ExpansionRequest{
 		Scope: preflight.ExpansionHeadscale, Target: "headscale", Generation: generation,
-		Profile: preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: profile.Architecture, SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), QualificationDigest: "sha256:" + confinement.QualificationDigest}, Authority: authority},
+		Profile: preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: profile.Architecture, SystemdVersion: profile.SystemdVersion, NginxVersion: profile.NginxVersion, PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest, ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), PolicyDigest: "sha256:" + confinement.PolicyDigest}, Authority: authority},
 		Domains: []string{controlDomain}, OwnedListeners: owned,
 		ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/sysusers.d/lanpanel-headscale.conf", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o600, MaximumMode: 0o600, AllowAbsent: true}, {Path: "/usr/lib/lanpanel/dependencies/headscale", Kind: preflight.ManagedPathRegular, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o755, MaximumMode: 0o755, AllowAbsent: true}, {Path: "/var/lib/lanpanel/headscale", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700, AllowAbsent: true}},
 		Disks:        []preflight.DiskRequirement{{Path: "/usr/lib/lanpanel/dependencies", MinimumAvailableBytes: maximum}, {Path: "/var/lib/lanpanel", MinimumAvailableBytes: maximum}}, LastTrustedWall: installed.AuthorityCreatedAt,

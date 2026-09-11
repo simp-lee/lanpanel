@@ -64,7 +64,7 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 	if relay {
 		unitRequires = ""
 	}
-	service.WriteString("[Unit]\nDescription=LanPanel managed application " + app.ID + "\nRequires=lanpanel-process-guard.service\nAfter=network.target lanpanel-process-guard.service\n" + unitRequires + "\n[Service]\nType=simple\n")
+	service.WriteString("[Unit]\nDescription=LanPanel managed application " + app.ID + "\nAfter=network.target\n" + unitRequires + "\n[Service]\nType=simple\n")
 	service.WriteString("User=root\nGroup=root\nCapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP\n")
 	service.WriteString("ExecStart=/usr/lib/lanpanel/lanpanel managed-executor\nWorkingDirectory=" + escapeSystemd(app.ManagedProcess.Service.WorkingDirectory) + "\n")
 	service.WriteString("Environment=LANPANEL_EXEC_AUTHORITY=" + escapeSystemd(AuthorityPath(app.ID)) + "\n")

@@ -117,7 +117,7 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		}
 		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected {
 			switch response.ErrorCode {
-			case "foreign_database_evidence", "headscale_not_configured", "connector_required", "os_profile_live_unqualified", "package_identity_drift":
+			case "foreign_database_evidence", "headscale_not_configured", "connector_required", "package_identity_drift":
 				return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
 			}
 		}

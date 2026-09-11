@@ -4,7 +4,6 @@ package packages
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"lanpanel/internal/sources"
 	"net/url"
@@ -27,21 +26,15 @@ const (
 type AuthorityKind string
 
 const (
-	FinalSupportedProfile AuthorityKind = "final_supported_profile"
-	QualificationTarget   AuthorityKind = "qualification_target_profile"
+	PreviewProfile AuthorityKind = "preview"
 )
 
-type QualificationAuthority struct {
+type Authority struct {
 	Kind                   AuthorityKind `json:"kind"`
 	ReleaseAuthorityDigest string        `json:"release_authority_digest"`
 	BinaryDigest           string        `json:"binary_digest"`
-	RunID                  string        `json:"run_id,omitempty"`
-	InstallManifestDigest  string        `json:"install_manifest_digest,omitempty"`
-	SideEffectPlanDigest   string        `json:"side_effect_plan_digest,omitempty"`
 	HostFingerprint        string        `json:"host_fingerprint"`
-	Operation              string        `json:"operation"`
 	TargetOSProfileDigest  string        `json:"target_os_profile_digest"`
-	FrozenClosureDigest    string        `json:"frozen_closure_digest"`
 }
 
 type Package struct {
@@ -74,25 +67,25 @@ type Repository struct {
 }
 
 type Plan struct {
-	TransactionID           string                 `json:"transaction_id"`
-	JobID                   string                 `json:"job_id"`
-	IntentGeneration        uint64                 `json:"intent_generation"`
-	Deadline                time.Time              `json:"deadline"`
-	OSProfileDigest         string                 `json:"os_profile_digest"`
-	Mode                    Mode                   `json:"mode"`
-	Proxy                   *sources.Proxy         `json:"proxy,omitempty"`
-	Packages                []Package              `json:"packages"`
-	Repositories            []Repository           `json:"repositories"`
-	FirstNginxInstall       bool                   `json:"first_nginx_install"`
-	LockWait                time.Duration          `json:"lock_wait"`
-	ConnectTimeout          time.Duration          `json:"connect_timeout"`
-	ReadTimeout             time.Duration          `json:"read_timeout"`
-	TotalTimeout            time.Duration          `json:"total_timeout"`
-	NoNetwork               bool                   `json:"no_network"`
-	NoAutostartPolicyDigest string                 `json:"no_autostart_policy_digest"`
-	PreflightDigest         string                 `json:"preflight_digest"`
-	PreflightRequestDigest  string                 `json:"preflight_request_digest"`
-	Authority               QualificationAuthority `json:"authority"`
+	TransactionID           string         `json:"transaction_id"`
+	JobID                   string         `json:"job_id"`
+	IntentGeneration        uint64         `json:"intent_generation"`
+	Deadline                time.Time      `json:"deadline"`
+	OSProfileDigest         string         `json:"os_profile_digest"`
+	Mode                    Mode           `json:"mode"`
+	Proxy                   *sources.Proxy `json:"proxy,omitempty"`
+	Packages                []Package      `json:"packages"`
+	Repositories            []Repository   `json:"repositories"`
+	FirstNginxInstall       bool           `json:"first_nginx_install"`
+	LockWait                time.Duration  `json:"lock_wait"`
+	ConnectTimeout          time.Duration  `json:"connect_timeout"`
+	ReadTimeout             time.Duration  `json:"read_timeout"`
+	TotalTimeout            time.Duration  `json:"total_timeout"`
+	NoNetwork               bool           `json:"no_network"`
+	NoAutostartPolicyDigest string         `json:"no_autostart_policy_digest"`
+	PreflightDigest         string         `json:"preflight_digest"`
+	PreflightRequestDigest  string         `json:"preflight_request_digest"`
+	Authority               Authority      `json:"authority"`
 }
 
 type ConfigKind string
@@ -266,32 +259,10 @@ func ValidatePlan(plan Plan) error {
 	if plan.FirstNginxInstall && (!hasNginx || !hasApacheUtils) {
 		return fmt.Errorf("first Nginx package closure omits nginx or apache2-utils")
 	}
-	closureDigest, err := ClosureDigest(plan.Packages)
-	if err != nil || closureDigest != plan.Authority.FrozenClosureDigest || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest || plan.Authority.Operation != "package_transaction" || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) {
-		return fmt.Errorf("package qualification authority does not bind the exact closure and host profile")
-	}
-	switch plan.Authority.Kind {
-	case FinalSupportedProfile:
-		if plan.Authority.RunID != "" || plan.Authority.InstallManifestDigest != "" || plan.Authority.SideEffectPlanDigest != "" {
-			return fmt.Errorf("final supported package authority carries candidate-only fields")
-		}
-	case QualificationTarget:
-		if !refPattern.MatchString(plan.Authority.RunID) || !digestPattern.MatchString(plan.Authority.InstallManifestDigest) || !digestPattern.MatchString(plan.Authority.SideEffectPlanDigest) {
-			return fmt.Errorf("qualification candidate package authority is incomplete")
-		}
-	default:
-		return fmt.Errorf("package qualification authority kind is unknown")
+	if plan.Authority.Kind != PreviewProfile || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest {
+		return fmt.Errorf("package authority does not match the install identity")
 	}
 	return nil
-}
-
-func ClosureDigest(packages []Package) (string, error) {
-	data, err := json.Marshal(packages)
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(data)
-	return hex.EncodeToString(digest[:]), nil
 }
 
 // ValidateAPTConfigurationBasic checks the functional APT/dpkg prerequisites

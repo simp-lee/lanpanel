@@ -1,4 +1,4 @@
-name: Quality
+name: Preview quality
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
 
 jobs:
   quality:
-    name: Go and Node quality gate
+    name: Preview Go quality gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -22,54 +22,8 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Set up Node from package.json engines
-        uses: actions/setup-node@v7
-        with:
-          node-version-file: package.json
-          cache: npm
-          cache-dependency-path: package-lock.json
+      - name: Install pinned linter
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
 
-      - name: Install pinned Go quality tools
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.0.3
-
-      - name: Install Node dependencies
-        run: npm ci
-
-      - name: Install matching Playwright Chromium
-        run: ./node_modules/.bin/playwright install --with-deps chromium
-
-      - name: Run canonical quality gate
-        run: make ga-local-gate
-
-  root-required:
-    name: Mandatory isolated root identity tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Set up Go from go.mod
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Prepare isolated bpffs
-        run: |
-          if ! grep -Eq ' /sys/fs/bpf .* - bpf ' /proc/self/mountinfo; then
-            sudo mkdir -p /sys/fs/bpf
-            sudo mount -t bpf -o mode=0700 bpf /sys/fs/bpf
-          fi
-
-      - name: Run mandatory root test and race suites without skips
-        run: |
-          sudo env \
-            "PATH=$PATH" \
-            "GOCACHE=$RUNNER_TEMP/root-go-build" \
-            "GOMODCACHE=$RUNNER_TEMP/root-go-mod" \
-            "GOPATH=$RUNNER_TEMP/root-go" \
-            make ga-root-required-tests
+      - name: Run Preview quality gate
+        run: make preview-local-gate

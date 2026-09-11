@@ -12,7 +12,7 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 
 ## 平台与安装
 
-代码目标是使用 systemd、apt/dpkg 和 release-qualified Nginx profile 的 Debian/Ubuntu Linux amd64。只有同一个 exact release binary 在真实主机完成 live qualification 后，一个 profile 才能成为 **supported OS profile**。其他 Debian/Ubuntu profile 只能称 code target 或“not live tested”。
+代码目标是使用 systemd 和 apt/dpkg 的 Debian/Ubuntu Linux amd64。LanPanel 仅提供 Preview：安装执行基础主机检查、签名仓库校验、精确包版本校验和事务清理；不声称 hardened GA 或 live qualification。
 
 首版只支持 clean install。从解压后的 release bundle 运行 root installer，提供 bundle 目录、独立选定的 `release.json` SHA-256 digest 和 ACME account contact：
 
@@ -20,12 +20,12 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 sudo ./lanpanel installer --bundle-dir /absolute/path/to/lanpanel-release --release-digest <release.json-sha256> --acme-account-contact admin@example.com
 ```
 
-installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、exact repository/key/metadata snapshot、package closure/tuple，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
+installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、signed repository/key metadata、exact package set/version，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
 
 Dependency source 仅为：
 
 - `official/canonical_artifact`：release 固定 HTTPS URL、version、archive digest、member 和 executable digest；
-- `official/distro_repository`：只用于 clean install 的 exact apt repository 与 package closure；
+- `official/distro_repository`：只用于 clean install 的 signed apt repository 与 exact package set；
 - `mirror`：管理员选择的 HTTP(S) URL，仍校验相同固定 digest；
 - `offline`：管理员选择的安全 regular file，校验 name/version/OS/arch/digest。
 
@@ -94,4 +94,4 @@ Plan-bound resource delete 要求 fresh unpublished closure；本机 App 还要�
 
 ## 安全与发行
 
-参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、SBOM、dependency manifest、public `package-template.json`、`SHA256SUMS`、一个 canonical `release.json`、恰好一个 live-qualified supported profile、provider live-test 说明和 known limitations。最终发布复用通过 deterministic/live gate 的 exact binary bytes。发行操作员应遵循[受保护 qualification tooling 指南](docs/qualification.md)。
+参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、dependency manifest、public `package-template.json`、`SHA256SUMS` 和 canonical `release.json`。Preview 不发布 SBOM/OSV 或 live qualification 证据。

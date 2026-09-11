@@ -19,12 +19,12 @@ func TestManagedCgroupIdentityAcceptsOnlyDerivedServices(t *testing.T) {
 }
 
 func TestManagedPolicyCoversDescendantsAndProtectedDestinations(t *testing.T) {
-	profile := Profile{SchemaVersion: SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: digestForTest()}
+	profile := Profile{SchemaVersion: SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_baseline_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, PolicyDigest: digestForTest()}
 	policy, err := Render(profile, "res_00000000000000000000000000000001", "/srv/app", "", "/run/app.sock", "", []string{"/srv/app/data"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	required := map[string]bool{"SocketBindDeny=any": false, "IPAddressDeny=127.0.0.0/8": false, "IPAddressDeny=169.254.169.254/32": false, "NoNewPrivileges=yes": false}
+	required := map[string]bool{"IPAddressDeny=127.0.0.0/8": false, "IPAddressDeny=169.254.169.254/32": false, "NoNewPrivileges=yes": false}
 	for _, value := range policy.Directives {
 		if _, ok := required[value]; ok {
 			required[value] = true
@@ -38,7 +38,7 @@ func TestManagedPolicyCoversDescendantsAndProtectedDestinations(t *testing.T) {
 }
 
 func TestManagedPolicyRejectsSystemdDirectiveInjection(t *testing.T) {
-	profile := Profile{SchemaVersion: SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, QualificationDigest: digestForTest()}
+	profile := Profile{SchemaVersion: SchemaVersion, KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_baseline_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8"}, PolicyDigest: digestForTest()}
 	resourceID := "res_00000000000000000000000000000001"
 	for _, path := range []string{"/srv/app/data\nExecStart=/tmp/payload", "/srv/app:/etc", "/srv/app%h", "/srv/app data", `/srv/app\\escape`} {
 		if _, err := Render(profile, resourceID, "/srv/app", "", "", "", []string{path}); err == nil {

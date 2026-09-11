@@ -2,17 +2,17 @@
 
 ## Supported versions / 支持版本
 
-Before the first GA release, no development build is supported for production use. After GA, this page will list the currently supported release. Community security handling is best effort; LanPanel does not promise a response or remediation SLA.
+LanPanel Preview is not supported for production use. Community security handling is best effort; LanPanel does not promise a response or remediation SLA.
 
-首个 GA 发布前，开发构建不受生产支持。GA 后，本页会列出当前受支持版本。社区安全处理采用 best-effort，不承诺响应或修复 SLA。
+LanPanel Preview 不用于生产环境。社区安全处理采用 best-effort，不承诺响应或修复 SLA。
 
 ## Private reporting / 私密报告
 
-Do not open a public issue for a suspected vulnerability or include credentials, admin tokens, auth keys, private keys, host addresses, or live qualification inputs in a report.
+Do not open a public issue for a suspected vulnerability or include credentials, admin tokens, auth keys, private keys, host addresses, or private Preview installation inputs in a report.
 
 Please report privately through GitHub Security Advisories for this repository. If private advisories are unavailable, contact the repository owner through the private contact channel shown on the repository profile and request an encrypted reporting channel before sending details.
 
-请勿为疑似漏洞创建公开 issue，也不要在报告中包含 credential、admin token、auth key、private key、host address 或 live qualification input。
+请勿为疑似漏洞创建公开 issue，也不要在报告中包含 credential、admin token、auth key、private key、host address 或 private Preview installation input。
 
 请优先通过本仓库 GitHub Security Advisories 私密报告。如该功能不可用，请通过仓库 profile 展示的私密联系方式联系维护者，并在发送细节前请求加密报告通道。
 

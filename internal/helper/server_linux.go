@@ -345,7 +345,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			var prerequisite domain.PrerequisiteError
 			if errors.As(err, &prerequisite) {
 				switch prerequisite.Code {
-				case domain.PrerequisiteHeadscaleNotConfigured, domain.PrerequisiteConnectorRequired, domain.PrerequisiteOSProfileLiveUnqualified, domain.PrerequisitePackageIdentityDrift:
+				case domain.PrerequisiteHeadscaleNotConfigured, domain.PrerequisiteConnectorRequired, domain.PrerequisitePackageIdentityDrift:
 					response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseRejected, ErrorCode: string(prerequisite.Code)}
 					return helperproto.WriteResponse(connection, request.Operation, response, nil)
 				}

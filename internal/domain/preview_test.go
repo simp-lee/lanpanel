@@ -27,7 +27,7 @@ func TestTemporaryPublicationRejectsReservedIPv4(t *testing.T) {
 
 func TestInstallationSchema(t *testing.T) {
 	t.Run("optional_headscale_allows_local_app", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		installation.Headscale = nil
 		data, err := json.Marshal(installation)
 		if err != nil {
@@ -46,12 +46,12 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("concrete_prerequisite_codes", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		installation.Headscale = nil
 		if err := RequireHeadscale(installation); !errors.As(err, new(PrerequisiteError)) || err.Error() != "headscale_not_configured" {
 			t.Fatalf("RequireHeadscale() error = %v", err)
 		}
-		for _, code := range []string{"headscale_not_configured", "os_profile_live_unqualified", "package_identity_drift"} {
+		for _, code := range []string{"headscale_not_configured", "package_identity_drift"} {
 			if _, err := ParsePrerequisiteCode(code); err != nil {
 				t.Fatalf("ParsePrerequisiteCode(%q) error = %v", code, err)
 			}
@@ -64,7 +64,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("single_schema_round_trip_is_canonical", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		data, err := json.Marshal(installation)
 		if err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("single_optional_component_fields", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		data, err := json.Marshal(installation)
 		if err != nil {
 			t.Fatal(err)
@@ -94,7 +94,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("strict_decoder_rejects_unknown_and_alpha_fields", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		data, err := json.Marshal(installation)
 		if err != nil {
 			t.Fatal(err)
@@ -115,8 +115,8 @@ func TestInstallationSchema(t *testing.T) {
 		}
 	})
 
-	t.Run("commercial_gate_fields_are_impossible", func(t *testing.T) {
-		installation := validGAInstallation()
+	t.Run("preview_contract_fields_are_impossible", func(t *testing.T) {
+		installation := validPreviewInstallation()
 		data, err := json.Marshal(installation)
 		if err != nil {
 			t.Fatal(err)
@@ -130,13 +130,13 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("target_union_is_closed", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.Target.LocalHTTP = nil
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must contain local_http") {
 			t.Fatalf("ValidateInstallation(incomplete target) error = %v", err)
 		}
-		installation = validGAInstallation()
+		installation = validPreviewInstallation()
 		resource = &installation.Resources[0]
 		resource.Target.Kind = "hostname_http"
 		resource.Target.LocalHTTP = nil
@@ -146,25 +146,25 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("target_readiness_and_websocket_are_typed", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.Target.ReadinessPath = ""
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "readiness_path") {
 			t.Fatalf("ValidateInstallation(missing readiness) error = %v", err)
 		}
-		installation = validGAInstallation()
+		installation = validPreviewInstallation()
 		resource = &installation.Resources[0]
 		resource.Target.WebSocket = WebSocketReadiness{Enabled: false, Path: "/ws"}
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "requires enabled=true") {
 			t.Fatalf("ValidateInstallation(disabled websocket path) error = %v", err)
 		}
-		installation = validGAInstallation()
+		installation = validPreviewInstallation()
 		installation.Resources[0].Target.WebSocket = WebSocketReadiness{Enabled: true, Path: "/ws-ready"}
 		if err := ValidateInstallation(installation); err != nil {
 			t.Fatalf("ValidateInstallation(enabled websocket) error = %v", err)
 		}
 		for _, invalidPath := range []string{"/a/../ready", "/a//ready", `/a\ready`, "/ready%2fnext", "/bad\x00path"} {
-			installation = validGAInstallation()
+			installation = validPreviewInstallation()
 			installation.Resources[0].Target.ReadinessPath = invalidPath
 			if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "normalized absolute HTTP path") {
 				t.Fatalf("ValidateInstallation(readiness path %q) error = %v", invalidPath, err)
@@ -174,14 +174,14 @@ func TestInstallationSchema(t *testing.T) {
 
 	t.Run("target_readiness_statuses_are_closed", func(t *testing.T) {
 		for _, statuses := range [][]uint16{{200}, {401}, {403}, {200, 204, 399, 401, 403}} {
-			installation := validGAInstallation()
+			installation := validPreviewInstallation()
 			installation.Resources[0].Target.AllowedHTTPStatuses = statuses
 			if err := ValidateInstallation(installation); err != nil {
 				t.Fatalf("ValidateInstallation(statuses %v) error = %v", statuses, err)
 			}
 		}
 		for _, statuses := range [][]uint16{{199}, {400}, {402}, {404}, {500}, {200, 200}, {403, 401}} {
-			installation := validGAInstallation()
+			installation := validPreviewInstallation()
 			installation.Resources[0].Target.AllowedHTTPStatuses = statuses
 			if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "allowed_http_statuses") {
 				t.Fatalf("ValidateInstallation(statuses %v) error = %v", statuses, err)
@@ -195,13 +195,13 @@ func TestInstallationSchema(t *testing.T) {
 			{EndpointKind: LocalEndpointRelayUnix},
 			{EndpointKind: LocalEndpointTCPSocketActivation, TCPAddress: "127.0.0.9", TCPPort: 19001},
 		} {
-			installation := validGAInstallation()
+			installation := validPreviewInstallation()
 			installation.Resources[0].Target.LocalHTTP = &local
 			if err := ValidateInstallation(installation); err != nil {
 				t.Fatalf("ValidateInstallation(%s) error = %v", local.EndpointKind, err)
 			}
 		}
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		installation.Resources[0].Target.LocalHTTP = &LocalHTTPTarget{EndpointKind: LocalEndpointRelayUnix, TCPAddress: "127.0.0.9", TCPPort: 19001}
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must not include TCP authority") {
 			t.Fatalf("ValidateInstallation(relay with TCP) error = %v", err)
@@ -209,7 +209,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("managed_process_state_includes_runtime_observation", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		installation.Resources[0].ManagedProcess.RuntimeObservation = &RuntimeObservation{
 			Status: RuntimeHealthy, ObservedAt: "2026-08-10T00:00:00Z",
 		}
@@ -223,13 +223,13 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("publication_union_is_closed", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.Publication.TemporaryHTTP = &TemporaryIPPublication{PublicIPv4: "8.8.8.8", Port: 8080}
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "must contain only domain_https") {
 			t.Fatalf("ValidateInstallation(mixed publication) error = %v", err)
 		}
-		installation = validGAInstallation()
+		installation = validPreviewInstallation()
 		resource = &installation.Resources[0]
 		resource.Publication.DomainHTTPS.CanonicalDomain = "*.example.com"
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "wildcard") {
@@ -238,7 +238,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("publication_state_preserves_applied_identity", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		record := &installation.Resources[0].PublicationRecord
 		record.LastAppliedDigest = pointer(testDigest)
 		record.LastAppliedBundle = pointerBundle(domainBundle("bundle-old", testDigest))
@@ -253,7 +253,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("publication_type_changes_require_unpublished_state", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.Publication = AppPublication{
 			Kind:          PublicationTemporaryHTTP,
@@ -271,14 +271,14 @@ func TestInstallationSchema(t *testing.T) {
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "cannot change before unpublish") {
 			t.Fatalf("ValidateInstallation(published temporary edit) error = %v", err)
 		}
-		resource.Publication = validGAInstallation().Resources[0].Publication
+		resource.Publication = validPreviewInstallation().Resources[0].Publication
 		if err := ValidateInstallation(installation); err == nil || !strings.Contains(err.Error(), "kind cannot change") {
 			t.Fatalf("ValidateInstallation(published type change) error = %v", err)
 		}
 	})
 
 	t.Run("publication_bundle_is_kind_complete", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		record := &installation.Resources[0].PublicationRecord
 		record.LastAppliedDigest = pointer(testDigest)
 		incomplete := domainBundle("bundle-incomplete", testDigest)
@@ -288,7 +288,7 @@ func TestInstallationSchema(t *testing.T) {
 			t.Fatalf("ValidateInstallation(incomplete domain bundle) error = %v", err)
 		}
 
-		installation = validGAInstallation()
+		installation = validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.Publication = AppPublication{
 			Kind:          PublicationTemporaryHTTP,
@@ -315,7 +315,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("activation_prior_matches_applied_identity", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		applied := domainBundle("bundle-applied", testDigest)
 		resource.PublicationRecord.State = PublicationActivating
@@ -337,7 +337,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("new_resource_is_sticky_unpublished_without_applied_identity", func(t *testing.T) {
-		resource := validGAInstallation().Resources[0]
+		resource := validPreviewInstallation().Resources[0]
 		record := resource.PublicationRecord
 		if record.State != PublicationUnpublished || record.UnpublishedGeneration == 0 || record.LastAppliedDigest != nil || record.LastAppliedBundle != nil || record.ActivationIntent != nil {
 			t.Fatalf("new resource publication record = %#v", record)
@@ -345,7 +345,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("current_and_applied_digests_stay_distinct", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.PublicationRecord.State = PublicationPublished
 		resource.PublicationRecord.LastAppliedDigest = pointer(testDigest)
@@ -361,7 +361,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("stable_id_is_explicit", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		originalID := installation.Resources[0].ID
 		installation.Resources[0].Name = "Renamed Application"
 		if err := ValidateInstallation(installation); err != nil {
@@ -373,7 +373,7 @@ func TestInstallationSchema(t *testing.T) {
 	})
 
 	t.Run("activating_from_unpublished_is_valid", func(t *testing.T) {
-		installation := validGAInstallation()
+		installation := validPreviewInstallation()
 		resource := &installation.Resources[0]
 		resource.PublicationRecord.State = PublicationActivating
 		resource.PublicationRecord.ActivationIntent = &ActivationIntent{
@@ -453,7 +453,7 @@ func TestInstallationSchema(t *testing.T) {
 }
 
 func TestGoAccessRequiresIndependentOwnedExternalCredential(t *testing.T) {
-	installation := validGAInstallation()
+	installation := validPreviewInstallation()
 	resource := &installation.Resources[0]
 	resource.Publication.DomainHTTPS.GoAccess = GoAccessPublication{Enabled: true, CredentialID: "cred_00000000000000000000000000000001", DashboardPath: "/__lanpanel/goaccess/", WebSocketPath: "/__lanpanel/goaccess-ws"}
 	if ValidateInstallation(installation) == nil {
@@ -486,7 +486,7 @@ func TestGoAccessRequiresIndependentOwnedExternalCredential(t *testing.T) {
 }
 
 func TestInstallationAllowsMoreThan256Resources(t *testing.T) {
-	installation := validGAInstallation()
+	installation := validPreviewInstallation()
 	base := installation.Resources[0]
 	for index := 2; index <= 257; index++ {
 		resource := base
@@ -520,7 +520,7 @@ func TestDecodeInstallationRejectsConflictingHeadscaleDomains(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			installation := validGAInstallation()
+			installation := validPreviewInstallation()
 			mutate(installation.Headscale)
 			data, err := json.Marshal(installation)
 			if err != nil {
@@ -541,7 +541,7 @@ func TestDecodeInstallationRejectsNoncanonicalStaticRootIDs(t *testing.T) {
 		"control":    "static_0000000000000000000000000000000\x00",
 	} {
 		t.Run(name, func(t *testing.T) {
-			installation := validGAInstallation()
+			installation := validPreviewInstallation()
 			installation.StaticRoots = []StaticContentRoot{{ID: id, OwnerResourceID: installation.Resources[0].ID, Path: "/srv/example-static", Fingerprint: testDigest, Device: 1}}
 			data, err := json.Marshal(installation)
 			if err != nil {
@@ -606,7 +606,7 @@ func TestDecodeInstallationUsesRuntimeStaticRelativePathGrammar(t *testing.T) {
 		t.Run(layer.name, func(t *testing.T) {
 			for _, testCase := range cases {
 				t.Run(testCase.name, func(t *testing.T) {
-					installation := validGAInstallation()
+					installation := validPreviewInstallation()
 					installation.StaticRoots = []StaticContentRoot{{ID: rootID, OwnerResourceID: installation.Resources[0].ID, Path: "/srv/example-static", Fingerprint: testDigest, Device: 1}}
 					layer.configure(&installation, testCase.relativePath)
 					data, err := json.Marshal(installation)
@@ -763,7 +763,7 @@ func TestHeadscaleDeployIntentIsExactAndNonApplied(t *testing.T) {
 }
 
 func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
-	installation := validGAInstallation()
+	installation := validPreviewInstallation()
 	installation.Resources[0].Publication.DomainHTTPS.GoAccess.DashboardPath = "/__lanpanel/goaccess/"
 	if ValidateInstallation(installation) == nil {
 		t.Fatal("disabled GoAccess authority accepted")
@@ -771,7 +771,7 @@ func TestDisabledGoAccessCarriesNoLatentAuthority(t *testing.T) {
 }
 
 func TestCompleteInstallationCanonicalRoundTrip(t *testing.T) {
-	installation := validGAInstallation()
+	installation := validPreviewInstallation()
 	installation.Headscale = enabledTestHeadscaleDomain()
 	bundle := domainBundle("bundle-complete", testDigest)
 	installation.Resources[0].PublicationRecord.State = PublicationPublished
@@ -794,7 +794,7 @@ func TestCompleteInstallationCanonicalRoundTrip(t *testing.T) {
 	}
 }
 
-func validGAInstallation() Installation {
+func validPreviewInstallation() Installation {
 	return Installation{
 		SchemaVersion:  InstallationSchemaVersion,
 		InstallationID: "ins_00000000000000000000000000000001",

@@ -30,9 +30,6 @@ const (
 	ProfileSystemctlNginxStart    ProfileID = "systemctl_nginx_start"
 	ProfileSystemctlNginxReload   ProfileID = "systemctl_nginx_reload"
 	ProfileSystemctlNginxStop     ProfileID = "systemctl_nginx_stop"
-	ProfileQualificationUIRestart ProfileID = "qualification_ui_restart"
-	ProfileQualificationReboot    ProfileID = "qualification_reboot"
-	ProfileQualificationServices  ProfileID = "qualification_services"
 	ProfileNginxStart             ProfileID = "nginx_start"
 	ProfileNginxTest              ProfileID = "nginx_test"
 	ProfileNginxDump              ProfileID = "nginx_dump"
@@ -228,7 +225,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileNginxQuitSignal:   {ID: ProfileNginxQuitSignal, Executable: "/usr/sbin/nginx", Arguments: []string{"-s", "quit", "-c", "/etc/lanpanel/nginx/nginx.conf", "-p", "/var/lib/lanpanel/nginx/"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 5, 6, 7, 10}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	// The remaining profiles are deliberately unavailable until their owning
 	// component supplies its release-fixed argv, identity, chroot, and network
-	// qualification. There is no root or generic-exec fallback.
+	// managed process execution uses the fixed profile; no generic fallback.
 	ProfileAPTDownload:            {ID: ProfileAPTDownload, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
 	ProfileAPTSimulate:            {ID: ProfileAPTSimulate, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkNone, RootTCB: true},
 	ProfileAPTTransaction:         {ID: ProfileAPTTransaction, Executable: "/usr/bin/apt-get", IdentityKind: IdentityRoot, Network: NetworkHostQualified, RootTCB: true},
@@ -239,9 +236,6 @@ var catalog = map[ProfileID]Profile{
 	ProfileSystemctlNginxStart:    {ID: ProfileSystemctlNginxStart, Executable: "/usr/bin/systemctl", Arguments: []string{"start", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxReload:   {ID: ProfileSystemctlNginxReload, Executable: "/usr/bin/systemctl", Arguments: []string{"reload", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileSystemctlNginxStop:     {ID: ProfileSystemctlNginxStop, Executable: "/usr/bin/systemctl", Arguments: []string{"stop", "lanpanel-nginx.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileQualificationUIRestart: {ID: ProfileQualificationUIRestart, Executable: "/usr/bin/systemctl", Arguments: []string{"restart", "lanpanel-ui.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileQualificationReboot:    {ID: ProfileQualificationReboot, Executable: "/usr/bin/systemctl", Arguments: []string{"reboot"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
-	ProfileQualificationServices:  {ID: ProfileQualificationServices, Executable: "/usr/bin/systemctl", Arguments: []string{"show", "--property=ActiveState", "--value", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-nginx.service", "lanpanel-headscale.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket", "tailscaled.service"}, Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true, Complete: true},
 	ProfileHeadscaleAccounts:      {ID: ProfileHeadscaleAccounts, Executable: "/usr/bin/systemd-sysusers", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkNone, AllowedAddressFamilies: []int{1}, AllowedCapabilities: []int{0, 1, 2, 3, 4, 5, 6, 7}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleStart:         {ID: ProfileHeadscaleStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileHeadscaleStop:          {ID: ProfileHeadscaleStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
@@ -431,7 +425,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			if invocation.Resource.Relay {
 				unit = "lanpanel-relay-" + short + ".service"
 			}
-			profile.Arguments = []string{"show", "--property=ActiveState,SubState,MainPID,ControlGroup,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,SocketBindDeny,SocketBindAllow,IPAddressDeny,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,PrivateTmp,PrivateDevices,LockPersonality,RestrictRealtime,RestrictAddressFamilies,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,InaccessiblePaths,UMask", unit}
+			profile.Arguments = []string{"show", "--property=ActiveState,SubState,MainPID,ControlGroup,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,IPAddressDeny,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,PrivateTmp,PrivateDevices,LockPersonality,RestrictRealtime,RestrictAddressFamilies,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,InaccessiblePaths,UMask", unit}
 		}
 		profile.Complete = true
 		if err := validateProfile(profile); err != nil {

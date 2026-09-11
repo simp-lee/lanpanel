@@ -167,9 +167,6 @@ func Execute(args []string) error {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return err
 	}
-	if err := verifyBindListenDenied(authority.Policy); err != nil {
-		return err
-	}
 	endpoint := authority.Endpoint
 	if endpointEnv != "" {
 		endpoint = endpointEnv
@@ -224,41 +221,6 @@ func removeStaleBackend(path string, uid uint32) error {
 		return fmt.Errorf("stale managed backend identity is unsafe")
 	}
 	return unix.Unlink(path)
-}
-
-func verifyBindListenDenied(policy confinement.UnitPolicy) error {
-	if !confinement.BPFLSMActive() {
-		return nil
-	}
-	if policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" {
-		return fmt.Errorf("managed bind/listen policy identity is unsupported")
-	}
-	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
-		fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
-		if err != nil {
-			return err
-		}
-		listenErr := unix.Listen(fd, 1)
-		_ = unix.Close(fd)
-		if !errors.Is(listenErr, unix.EACCES) {
-			return fmt.Errorf("BPF LSM unbound INET listen probe was not denied: %w", listenErr)
-		}
-		fd, err = unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
-		if err != nil {
-			return err
-		}
-		var bindErr error
-		if family == unix.AF_INET {
-			bindErr = unix.Bind(fd, &unix.SockaddrInet4{Port: 0, Addr: [4]byte{127, 0, 0, 1}})
-		} else {
-			bindErr = unix.Bind(fd, &unix.SockaddrInet6{Port: 0, Addr: [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}})
-		}
-		_ = unix.Close(fd)
-		if !errors.Is(bindErr, unix.EACCES) {
-			return fmt.Errorf("systemd explicit INET bind probe was not denied: %w", bindErr)
-		}
-	}
-	return nil
 }
 
 func dropManagedCapabilities() error {

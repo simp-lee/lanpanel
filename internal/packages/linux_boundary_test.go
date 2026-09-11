@@ -283,12 +283,6 @@ func distroStageFixture(t *testing.T) (Plan, *ArtifactStager, string, string) {
 		plan.Packages[index].ArtifactBytes = int64(len(payload))
 		plan.Packages[index].Source.Artifact.Digest = plan.Packages[index].ArtifactDigest
 	}
-	closure, err := ClosureDigest(plan.Packages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.Authority.FrozenClosureDigest = closure
-
 	root := t.TempDir()
 	transactions, staging := filepath.Join(root, "transactions"), filepath.Join(root, "staging")
 	archives := filepath.Join(transactions, plan.TransactionID, "archives")
@@ -322,11 +316,6 @@ func TestTransactionFilesBindExactAPTConfigAndStagedClosure(t *testing.T) {
 		plan.Packages[index].Source.Artifact.Digest = plan.Packages[index].ArtifactDigest
 		plan.Packages[index].Source.OfflinePath = "/var/lib/lanpanel/imports/" + plan.Packages[index].ArtifactDigest + ".deb"
 	}
-	closure, err := ClosureDigest(plan.Packages)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan.Authority.FrozenClosureDigest = closure
 	root := t.TempDir()
 	transactions, staging := filepath.Join(root, "transactions"), filepath.Join(root, "staging")
 	for _, directory := range []string{transactions, staging, filepath.Join(staging, plan.TransactionID)} {

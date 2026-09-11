@@ -6,7 +6,7 @@ import (
 )
 
 // PlatformInfo is a read-only parse result. S7 owns exact profile
-// qualification and must not infer support from ID_LIKE.
+// Preview support and must not infer support from ID_LIKE.
 type PlatformInfo struct {
 	ID         string `json:"id,omitempty"`
 	IDLike     string `json:"id_like,omitempty"`

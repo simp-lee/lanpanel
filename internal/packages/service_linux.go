@@ -306,13 +306,6 @@ func (service *Service) verifyCurrentAuthority(plan Plan) error {
 			return fmt.Errorf("package Plan release, host, or OS authority differs from installation")
 		}
 	}
-	if plan.Authority.Kind == QualificationTarget {
-		path := filepath.Join("/var/lib/lanpanel/qualification/package-authorities", plan.TransactionID+".json")
-		binding, stat, err := service.auditor.readFileAndStat(path, maximumJournalBytes)
-		expected, encodeErr := json.Marshal(plan.Authority)
-		if err != nil || encodeErr != nil || stat.Mode&0o777 != 0o600 || !bytes.Equal(binding, expected) {
-			return fmt.Errorf("package qualification install authority is missing or mismatched")
-		}
-	}
+
 	return nil
 }

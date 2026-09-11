@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'LanPanel',
-  description: 'LanPanel product, operations, and qualification documentation',
+  description: 'LanPanel Preview product and operations documentation',
   base: process.env.DOCS_BASE || '/',
   cleanUrls: true,
   lastUpdated: true,
@@ -11,15 +11,13 @@ export default defineConfig({
   },
   themeConfig: {
     nav: [
-      { text: 'Documentation', link: '/' },
-      { text: 'Qualification', link: '/qualification' }
+      { text: 'Documentation', link: '/' }
     ],
     sidebar: [
       {
         text: 'LanPanel',
         items: [
-          { text: 'Documentation', link: '/' },
-          { text: 'GA Qualification Tooling', link: '/qualification' }
+          { text: 'Documentation', link: '/' }
         ]
       }
     ],

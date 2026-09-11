@@ -52,11 +52,8 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if !acmeaccount.ValidContact(request.ACMEAccountContact) {
 		return fmt.Errorf("managed ACME account contact is invalid")
 	}
-	if releaseIdentity.Kind == release.InstallQualification && releaseIdentity.ACMEAccountContact != request.ACMEAccountContact {
-		return fmt.Errorf("managed ACME account contact differs from qualification authority")
-	}
-	if len(request.InstallerInput) > maximumPublicInstallerInputBytes || len(request.InstallerInput) != 0 && releaseIdentity.Kind != release.InstallPublicRelease {
-		return fmt.Errorf("installer resume authority is invalid for the selected install kind")
+	if len(request.InstallerInput) > maximumPublicInstallerInputBytes {
+		return fmt.Errorf("installer resume authority is too large")
 	}
 	paths := request.Paths
 	if paths.PersistentRoot == "" {
@@ -270,40 +267,21 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 		return "", err
 	}
 	planDigest, err := packages.PlanDigest(plan)
-	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest == "" {
-		return "", fmt.Errorf("package Plan does not match installer release, host, and profile authority")
+	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile || !reflect.DeepEqual(plan.Repositories, installed.Profile.Repositories) {
+		return "", fmt.Errorf("package plan does not match installer identity")
 	}
-	releaseAuthorityDigest := installed.ReleaseManifestDigest
-	if installed.Kind == release.InstallQualification {
-		releaseAuthorityDigest = installed.QualificationInstallManifestDigest
-	}
-	if plan.Authority.ReleaseAuthorityDigest != releaseAuthorityDigest {
-		return "", fmt.Errorf("package Plan release authority changed")
-	}
-	if installed.Kind == release.InstallPublicRelease {
-		if plan.Authority.Kind != packages.FinalSupportedProfile || plan.Authority.RunID != "" || plan.Authority.InstallManifestDigest != "" || plan.Authority.SideEffectPlanDigest != "" {
-			return "", fmt.Errorf("public package Plan carries qualification authority")
-		}
-	} else if plan.Authority.Kind != packages.QualificationTarget || plan.Authority.RunID != installed.RunID || plan.Authority.InstallManifestDigest != installed.QualificationInstallManifestDigest || plan.Authority.SideEffectPlanDigest != installed.SideEffectPlanDigest {
-		return "", fmt.Errorf("qualification package Plan does not match install manifest and side-effect plan")
-	}
-	closureDigest, err := packages.ClosureDigest(plan.Packages)
-	if err != nil || closureDigest != installed.Profile.PackageClosureDigest || len(plan.Packages) != len(installed.Profile.Packages) {
-		return "", fmt.Errorf("package Plan closure differs from qualification target profile")
+	if len(plan.Packages) != len(installed.Profile.Packages) {
+		return "", fmt.Errorf("package plan package set differs from installer profile")
 	}
 	for index, pkg := range plan.Packages {
-		tuple := installed.Profile.Packages[index]
-		if pkg.Name != tuple.Name || pkg.Version != tuple.Version || pkg.Architecture != tuple.Architecture || pkg.RepositoryID != tuple.RepositoryID {
-			return "", fmt.Errorf("package Plan tuple differs from qualification target profile")
+		want := installed.Profile.Packages[index]
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
+			return "", fmt.Errorf("package plan version set differs from installer profile")
 		}
-	}
-	repositoryDigest, err := release.RepositoriesAuthorityDigest(plan.Repositories)
-	if err != nil || !reflect.DeepEqual(plan.Repositories, installed.Profile.Repositories) || repositoryDigest != installed.Profile.RepositoryAuthorityDigest {
-		return "", fmt.Errorf("package Plan repository authority differs from qualification target profile")
 	}
 	resultDigest, err := result.Digest()
 	if err != nil || resultDigest != plan.PreflightDigest || result.RequestDigest != plan.PreflightRequestDigest || result.Generation != plan.IntentGeneration || !result.Allowed {
-		return "", fmt.Errorf("package Plan preflight result is not exact and allowed")
+		return "", fmt.Errorf("package plan preflight result is not exact and allowed")
 	}
 	return planDigest, nil
 }
@@ -441,9 +419,6 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return confinementErr
 		}
 		releaseAuthorityDigest := journal.Release.ReleaseManifestDigest
-		if journal.Release.Kind == release.InstallQualification {
-			releaseAuthorityDigest = journal.Release.QualificationInstallManifestDigest
-		}
 		members := []filetxn.DirectoryMember{
 			{Name: "acme-account.key", Data: accountKey, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: acmeaccount.MaximumKeyBytes},
 			{Name: "admin-token", Data: token, Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o600, Maximum: 4096},
@@ -918,6 +893,9 @@ func scanExistingEvidence(paths Paths) ([]string, error) {
 	candidates = append(candidates, nginxPaths.ConfigRoot, nginxPaths.StateRoot, nginxPaths.AuditPath)
 	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		candidates = append(candidates, filepath.Join(paths.SystemdRoot, name))
+	}
+	if paths == FixedPaths() {
+		candidates = append(candidates, "/sys/fs/bpf/lanpanel")
 	}
 	result := []string{}
 	for _, path := range candidates {

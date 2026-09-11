@@ -1,38 +1,22 @@
 package release
 
 import (
-	"encoding/json"
 	"fmt"
-	"lanpanel/internal/acmeaccount"
-	managedarchive "lanpanel/internal/archive"
-	"lanpanel/internal/dependencies"
-	"lanpanel/internal/filetxn"
 	"lanpanel/internal/packages"
 	"net/url"
-	"os"
-	"reflect"
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 )
 
 const (
-	ReleaseManifestSchemaVersion              = "lanpanel.release.v3"
-	QualificationTargetProfileSchemaVersion   = "lanpanel.qualification.target-profile.v1"
-	QualificationInstallManifestSchemaVersion = "lanpanel.qualification.install-manifest.v4"
-	LiveSideEffectPlanSchemaVersion           = "lanpanel.qualification.side-effect-plan.v3"
-	LiveCleanupReportSchemaVersion            = "lanpanel.qualification.cleanup-report.v4"
-	LiveExecutorAttestationSchemaVersion      = "lanpanel.qualification.executor-attestation.v2"
-	LiveStepEvidenceSchemaVersion             = "lanpanel.qualification.step-evidence.v2"
-	QualificationSummarySchemaVersion         = "lanpanel.qualification.summary.v3"
+	ReleaseManifestSchemaVersion = "lanpanel.release.v3"
 )
 
 type InstallKind string
 
 const (
 	InstallPublicRelease InstallKind = "public_release"
-	InstallQualification InstallKind = "qualification"
 )
 
 type AssetIdentity struct {
@@ -93,18 +77,16 @@ type PackageTuple struct {
 }
 
 type OSProfile struct {
-	ID                        string                `json:"id"`
-	Family                    string                `json:"family"`
-	Release                   string                `json:"release"`
-	Architecture              string                `json:"architecture"`
-	SystemdVersion            string                `json:"systemd_version"`
-	NginxVersion              string                `json:"nginx_version"`
-	PackageSnapshotDigest     string                `json:"package_snapshot_digest"`
-	Repositories              []packages.Repository `json:"repositories"`
-	RepositoryAuthorityDigest string                `json:"repository_authority_digest"`
-	PackageClosureDigest      string                `json:"package_closure_digest"`
-	Packages                  []PackageTuple        `json:"packages"`
-	ManagedConfinement        ConfinementProfile    `json:"managed_confinement"`
+	ID                    string                `json:"id"`
+	Family                string                `json:"family"`
+	Release               string                `json:"release"`
+	Architecture          string                `json:"architecture"`
+	SystemdVersion        string                `json:"systemd_version"`
+	NginxVersion          string                `json:"nginx_version"`
+	PackageSnapshotDigest string                `json:"package_snapshot_digest"`
+	Repositories          []packages.Repository `json:"repositories"`
+	Packages              []PackageTuple        `json:"packages"`
+	ManagedConfinement    ConfinementProfile    `json:"managed_confinement"`
 }
 
 type ConfinementProfile struct {
@@ -115,82 +97,31 @@ type ConfinementProfile struct {
 	ConnectPolicy         string   `json:"connect_policy"`
 	FilesystemPolicy      string   `json:"filesystem_policy"`
 	ProtectedDestinations []string `json:"protected_destinations"`
-	QualificationDigest   string   `json:"qualification_digest"`
+	PolicyDigest          string   `json:"policy_digest"`
 }
 
 type SupportedOSProfile struct {
-	Profile                    OSProfile `json:"profile"`
-	QualifiedBinaryDigest      string    `json:"qualified_binary_digest"`
-	QualificationRunID         string    `json:"qualification_run_id"`
-	QualificationSummaryDigest string    `json:"qualification_summary_digest"`
-}
-
-type ProviderLiveTest struct {
-	Provider string `json:"provider"`
-	Status   string `json:"status"`
-}
-
-type QualificationSummary struct {
-	SchemaVersion       string             `json:"schema_version"`
-	RunID               string             `json:"run_id"`
-	CandidateDigest     string             `json:"candidate_digest"`
-	SourceTreeDigest    string             `json:"source_tree_digest"`
-	TargetProfileDigest string             `json:"target_profile_digest"`
-	JourneySucceeded    bool               `json:"journey_succeeded"`
-	TailnetLiveStatus   string             `json:"tailnet_live_status"`
-	ProviderLiveTests   []ProviderLiveTest `json:"provider_live_tests"`
-	CompletedAt         time.Time          `json:"completed_at"`
-}
-
-func DecodeQualificationSummary(data []byte) (QualificationSummary, error) {
-	var value QualificationSummary
-	if DecodeCanonical(data, &value) != nil || value.SchemaVersion != QualificationSummarySchemaVersion || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.SourceTreeDigest) || !ValidDigest(value.TargetProfileDigest) || !value.JourneySucceeded || value.TailnetLiveStatus != "live_tested" && value.TailnetLiveStatus != "not_live_tested" || !sameUTCSecond(value.CompletedAt) {
-		return QualificationSummary{}, fmt.Errorf("qualification summary is invalid")
-	}
-	expected := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
-	if len(value.ProviderLiveTests) != len(expected) {
-		return QualificationSummary{}, fmt.Errorf("qualification summary provider inventory is invalid")
-	}
-	liveCount := 0
-	for index, item := range value.ProviderLiveTests {
-		if item.Status == "live_tested" {
-			liveCount++
-		}
-		if item.Provider != expected[index] || item.Status != "live_tested" && item.Status != "not_live_tested" {
-			return QualificationSummary{}, fmt.Errorf("qualification summary provider inventory is invalid")
-		}
-	}
-	if liveCount != 1 {
-		return QualificationSummary{}, fmt.Errorf("qualification summary must contain exactly one live-tested provider")
-	}
-	return value, nil
+	Profile OSProfile `json:"profile"`
 }
 
 type ReleaseManifest struct {
-	SchemaVersion        string                     `json:"schema_version"`
-	ReleaseTag           string                     `json:"release_tag"`
-	Binary               AssetIdentity              `json:"binary"`
-	SourceArchive        AssetIdentity              `json:"source_archive"`
-	License              AssetIdentity              `json:"license"`
-	Notice               AssetIdentity              `json:"notice"`
-	SBOM                 AssetIdentity              `json:"sbom"`
-	DependencyManifest   AssetIdentity              `json:"dependency_manifest"`
-	Headscale            HeadscaleArtifactAuthority `json:"headscale"`
-	SecurityReport       AssetIdentity              `json:"security_report"`
-	QualificationSummary AssetIdentity              `json:"qualification_summary"`
-	ProviderLiveTests    []ProviderLiveTest         `json:"provider_live_tests"`
-	KnownLimitations     AssetIdentity              `json:"known_limitations"`
-	AdditionalAssets     []AssetIdentity            `json:"additional_assets"`
-	Checksums            AssetIdentity              `json:"checksums"`
-	SourceTreeDigest     string                     `json:"source_tree_digest"`
-	SupportedProfiles    []SupportedOSProfile       `json:"supported_os_profiles"`
+	SchemaVersion      string                     `json:"schema_version"`
+	ReleaseTag         string                     `json:"release_tag"`
+	Binary             AssetIdentity              `json:"binary"`
+	SourceArchive      AssetIdentity              `json:"source_archive"`
+	License            AssetIdentity              `json:"license"`
+	Notice             AssetIdentity              `json:"notice"`
+	DependencyManifest AssetIdentity              `json:"dependency_manifest"`
+	Headscale          HeadscaleArtifactAuthority `json:"headscale"`
+	KnownLimitations   AssetIdentity              `json:"known_limitations"`
+	AdditionalAssets   []AssetIdentity            `json:"additional_assets"`
+	Checksums          AssetIdentity              `json:"checksums"`
+	SupportedProfiles  []SupportedOSProfile       `json:"supported_os_profiles"`
 }
 
 type VerifiedRelease struct {
-	value         ReleaseManifest
-	digest        string
-	security      SecurityReport
-	qualification QualificationSummary
+	value  ReleaseManifest
+	digest string
 }
 
 func (verified *VerifiedRelease) Manifest() ReleaseManifest {
@@ -220,165 +151,72 @@ func DecodeReleaseManifest(data []byte) (*VerifiedRelease, error) {
 
 func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
 	if !ValidDigest(expectedManifestDigest) || DigestBytes(manifestBytes) != expectedManifestDigest {
-		return nil, fmt.Errorf("release.json differs from the selected digest")
+		return nil, fmt.Errorf("release manifest differs from selected digest")
 	}
-	verified, err := DecodeReleaseManifest(manifestBytes)
-	if err != nil {
+	var manifest ReleaseManifest
+	if err := DecodeCanonical(manifestBytes, &manifest); err != nil {
+		return nil, fmt.Errorf("release manifest is invalid: %w", err)
+	}
+	if err := validateReleaseManifest(manifest); err != nil {
 		return nil, err
 	}
-	if err := verifyReleaseAssets(verified.value, checksumBytes, assets); err != nil {
+	if err := verifyReleaseAssets(manifest, checksumBytes, assets); err != nil {
 		return nil, err
 	}
-	sbomBytes, present := assets[verified.value.SBOM.Path]
-	if !present || ValidateSPDX(sbomBytes, verified.value.Binary.Digest) != nil {
-		return nil, fmt.Errorf("release SBOM is invalid or bound to other bytes")
-	}
-	securityBytes, present := assets[verified.value.SecurityReport.Path]
-	if !present {
-		return nil, fmt.Errorf("release security report asset is missing")
-	}
-	security, err := DecodeSecurityReport(securityBytes)
-	profileDigestForSecurity, _ := ProfileDigest(verified.value.SupportedProfiles[0].Profile)
-	if err != nil || security.CandidateDigest != verified.value.Binary.Digest || security.SBOMDigest != verified.value.SBOM.Digest || security.DependencyManifestDigest != verified.value.DependencyManifest.Digest || security.TargetProfileDigest != profileDigestForSecurity {
-		return nil, fmt.Errorf("release security report is invalid or bound to other bytes")
-	}
-	verified.security = security
-	limitationsBytes, present := assets[verified.value.KnownLimitations.Path]
-	if !present || ValidateKnownLimitations(limitationsBytes) != nil {
-		return nil, fmt.Errorf("release known limitations are missing or incomplete")
-	}
-	summaryBytes, present := assets[verified.value.QualificationSummary.Path]
-	if !present {
-		return nil, fmt.Errorf("qualification summary asset is missing")
-	}
-	summary, summaryErr := DecodeQualificationSummary(summaryBytes)
-	profile := verified.value.SupportedProfiles[0]
-	profileDigest, _ := ProfileDigest(profile.Profile)
-	packageTemplate, present := assets["package-template.json"]
-	if !present || validatePublicPackageTemplate(packageTemplate, verified.value.Binary, profile.Profile, profileDigest) != nil {
-		return nil, fmt.Errorf("public package template is missing, invalid, or not installable")
-	}
-	if summaryErr != nil || summary.RunID != profile.QualificationRunID || summary.CandidateDigest != verified.value.Binary.Digest || summary.SourceTreeDigest != verified.value.SourceTreeDigest || summary.TargetProfileDigest != profileDigest || !reflect.DeepEqual(summary.ProviderLiveTests, verified.value.ProviderLiveTests) {
-		return nil, fmt.Errorf("qualification summary does not bind the supported release")
-	}
-	verified.qualification = summary
-	return verified, nil
+	return &VerifiedRelease{value: manifest, digest: expectedManifestDigest}, nil
 }
 
 func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte) error {
 	if DigestBytes(checksumBytes) != manifest.Checksums.Digest || uint64(len(checksumBytes)) != manifest.Checksums.Bytes {
-		return fmt.Errorf("SHA256SUMS does not match release.json")
+		return fmt.Errorf("release checksum file is invalid")
 	}
-	identities, err := releaseAssetInventory(manifest)
+	set, err := ParseChecksums(checksumBytes, releaseAssetPaths(manifest))
 	if err != nil {
+		return fmt.Errorf("release checksum inventory is invalid: %w", err)
+	}
+	if err := VerifyAssetBytes(set, assets); err != nil {
 		return err
 	}
-	expectedPaths := make([]string, len(identities))
-	byPath := make(map[string]AssetIdentity, len(identities))
-	for index, identity := range identities {
-		expectedPaths[index] = identity.Path
-		byPath[identity.Path] = identity
-	}
-	checksums, err := ParseChecksums(checksumBytes, expectedPaths)
-	if err != nil {
-		return err
-	}
-	if len(assets) != len(identities) {
-		return fmt.Errorf("release asset inventory differs from release.json")
-	}
-	if err := VerifyAssetBytes(checksums, assets); err != nil {
-		return err
-	}
-	for path, data := range assets {
-		identity, present := byPath[path]
-		if !present || identity.Bytes != uint64(len(data)) || identity.Digest != DigestBytes(data) {
-			return fmt.Errorf("asset %q size or digest differs from release.json", path)
+	for _, asset := range mustReleaseAssets(manifest) {
+		data, ok := assets[asset.Path]
+		if !ok || uint64(len(data)) != asset.Bytes || DigestBytes(data) != asset.Digest {
+			return fmt.Errorf("release asset %q is missing or mismatched", asset.Path)
 		}
-	}
-	sourceBytes, present := assets[manifest.SourceArchive.Path]
-	if !present {
-		return fmt.Errorf("source archive asset is missing")
-	}
-	treeDigest, err := sourceArchiveTreeDigest(sourceBytes, "lanpanel-"+manifest.ReleaseTag)
-	if err != nil || treeDigest != manifest.SourceTreeDigest {
-		return fmt.Errorf("source archive does not match source-tree digest: %w", err)
-	}
-	dependencyBytes, present := assets[manifest.DependencyManifest.Path]
-	if !present {
-		return fmt.Errorf("dependency manifest asset is missing")
-	}
-	dependency, err := decodeQualificationDependencyAuthority(dependencyBytes, manifest.DependencyManifest.Digest)
-	if err != nil || !reflect.DeepEqual(dependency.Headscale, manifest.Headscale) {
-		return fmt.Errorf("dependency manifest is invalid or differs from release.json")
-	}
-	if sbomBytes, present := assets[manifest.SBOM.Path]; !present || ValidateReleaseSPDX(sbomBytes, assets[manifest.Binary.Path], manifest.Binary.Digest, manifest.ReleaseTag, dependency, manifest.SupportedProfiles[0].Profile) != nil {
-		return fmt.Errorf("release SBOM omits the native or OS package closure")
-	}
-	baselineBytes, present := assets[dependency.DependencyBaseline.Path]
-	if !present || dependency.DependencyBaseline.Bytes != uint64(len(baselineBytes)) || dependency.DependencyBaseline.Digest != DigestBytes(baselineBytes) {
-		return fmt.Errorf("dependency baseline asset is missing or mismatched")
-	}
-	baseline, err := dependencies.DecodeBaseline(baselineBytes)
-	if err != nil {
-		return fmt.Errorf("dependency baseline is invalid: %w", err)
-	}
-	dependencyPaths, err := QualificationDependencyAssetPaths(dependency)
-	if err != nil {
-		return err
-	}
-	dependencyAssets := make(map[string][]byte, len(dependencyPaths))
-	for _, path := range dependencyPaths {
-		dependencyAssets[path] = assets[path]
-	}
-	return verifyDependencyAuthority(dependency, manifest.SupportedProfiles[0].Profile, dependencyAssets, baseline)
-}
-
-func validatePublicPackageTemplate(data []byte, binary AssetIdentity, profile OSProfile, profileDigest string) error {
-	var plan packages.Plan
-	if err := DecodeCanonical(data, &plan); err != nil || packages.ValidatePlan(plan) != nil {
-		return fmt.Errorf("public package template is not canonical")
-	}
-	zeroDigest := strings.Repeat("0", 64)
-	oneDigest := strings.Repeat("1", 64)
-	if plan.Mode != packages.DistroRepository || plan.Proxy != nil || !plan.FirstNginxInstall || plan.TransactionID != "pkg_"+zeroDigest || plan.JobID != "job_"+oneDigest || plan.IntentGeneration != 1 || !plan.Deadline.Equal(time.Unix(4102444800, 0).UTC()) || plan.OSProfileDigest != profileDigest || plan.NoAutostartPolicyDigest != binary.Digest || plan.PreflightDigest != "sha256:"+zeroDigest || plan.PreflightRequestDigest != "sha256:"+oneDigest || plan.Authority.Kind != packages.FinalSupportedProfile || plan.Authority.ReleaseAuthorityDigest != zeroDigest || plan.Authority.BinaryDigest != binary.Digest || plan.Authority.HostFingerprint != "host-template" || plan.Authority.Operation != "package_transaction" || plan.Authority.TargetOSProfileDigest != profileDigest || plan.Authority.FrozenClosureDigest != profile.PackageClosureDigest {
-		return fmt.Errorf("public package template carries non-template authority")
-	}
-	if len(plan.Packages) != len(profile.Packages) {
-		return fmt.Errorf("public package template closure differs from supported profile")
-	}
-	for index, pkg := range plan.Packages {
-		want := profile.Packages[index]
-		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
-			return fmt.Errorf("public package template tuple differs from supported profile")
-		}
-	}
-	repositoryDigest, err := RepositoriesAuthorityDigest(plan.Repositories)
-	if err != nil || !reflect.DeepEqual(plan.Repositories, profile.Repositories) || repositoryDigest != profile.RepositoryAuthorityDigest {
-		return fmt.Errorf("public package template repository authority differs from supported profile")
 	}
 	return nil
 }
 
-// RepositoriesAuthorityDigest binds the complete canonical repository set.
-func RepositoriesAuthorityDigest(repositories []packages.Repository) (string, error) {
-	data, err := MarshalCanonical(repositories)
-	if err != nil {
-		return "", err
+func releaseAssetPaths(manifest ReleaseManifest) []string {
+	assets := mustReleaseAssets(manifest)
+	paths := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		paths = append(paths, asset.Path)
 	}
-	return DigestBytes(data), nil
+	return paths
+}
+
+func mustReleaseAssets(manifest ReleaseManifest) []AssetIdentity {
+	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.DependencyManifest, manifest.Headscale.Archive, manifest.KnownLimitations}
+	for _, member := range manifest.Headscale.Members {
+		assets = append(assets, member.Asset)
+	}
+	assets = append(assets, manifest.AdditionalAssets...)
+	return assets
 }
 
 // InstallAssetPaths returns the complete public release asset inventory,
 // including the checksum and manifest files supplied separately to the
 // installer authority document.
 func InstallAssetPaths(manifest ReleaseManifest) ([]string, error) {
-	identities, err := releaseAssetInventory(manifest)
+	assets, err := releaseAssetInventory(manifest)
 	if err != nil {
 		return nil, err
 	}
-	paths := make([]string, 0, len(identities)+2)
-	for _, identity := range identities {
-		paths = append(paths, identity.Path)
+	paths := make([]string, 0, len(assets)+2)
+	for _, asset := range assets {
+		if asset.Path != "release.json" && asset.Path != manifest.Checksums.Path {
+			paths = append(paths, asset.Path)
+		}
 	}
 	paths = append(paths, manifest.Checksums.Path, "release.json")
 	slices.Sort(paths)
@@ -386,71 +224,49 @@ func InstallAssetPaths(manifest ReleaseManifest) ([]string, error) {
 }
 
 func releaseAssetInventory(manifest ReleaseManifest) ([]AssetIdentity, error) {
-	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.SBOM, manifest.DependencyManifest, manifest.Headscale.Archive, manifest.SecurityReport, manifest.QualificationSummary, manifest.KnownLimitations}
-	for _, member := range manifest.Headscale.Members {
-		assets = append(assets, member.Asset)
-	}
-	assets = append(assets, manifest.AdditionalAssets...)
+	assets := mustReleaseAssets(manifest)
 	seen := map[string]bool{}
 	for _, asset := range assets {
-		if err := validateAsset(asset); err != nil || seen[asset.Path] || asset.Path == manifest.Checksums.Path || asset.Path == "release.json" {
-			return nil, fmt.Errorf("release asset inventory is invalid or duplicated")
+		if err := validateAsset(asset); err != nil || seen[asset.Path] || asset.Path == "release.json" {
+			return nil, fmt.Errorf("release asset inventory is invalid")
 		}
 		seen[asset.Path] = true
 	}
-	slices.SortFunc(assets, func(a, b AssetIdentity) int { return strings.Compare(a.Path, b.Path) })
 	return assets, nil
 }
 
 func validateReleaseManifest(manifest ReleaseManifest) error {
-	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || !ValidDigest(manifest.SourceTreeDigest) || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) != 1 || len(manifest.ProviderLiveTests) != 5 {
-		return fmt.Errorf("release.json common identity is invalid")
+	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) != 1 {
+		return fmt.Errorf("release manifest is incomplete")
 	}
-	if err := validateHeadscaleAuthority(manifest.Headscale); err != nil {
-		return err
+	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.Notice) != nil || validateAsset(manifest.DependencyManifest) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
+		return fmt.Errorf("release manifest asset authority is invalid")
 	}
-	if _, err := releaseAssetInventory(manifest); err != nil {
-		return err
-	}
-	hasPackageTemplate := false
+	packageTemplate := false
 	for _, asset := range manifest.AdditionalAssets {
-		hasPackageTemplate = hasPackageTemplate || asset.Path == "package-template.json"
+		if asset.Path == "package-template.json" {
+			packageTemplate = true
+		}
 	}
-	if !hasPackageTemplate {
-		return fmt.Errorf("release public package template is missing")
-	}
-	if manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.License.Path != "LICENSE" || manifest.Notice.Path != "NOTICE" || manifest.SBOM.Path == "" || manifest.DependencyManifest.Path == "" || manifest.SecurityReport.Path == "" || manifest.QualificationSummary.Path == "" || manifest.KnownLimitations.Path == "" {
-		return fmt.Errorf("release mandatory asset paths are invalid")
+	if !packageTemplate {
+		return fmt.Errorf("release manifest package template is missing")
 	}
 	profile := manifest.SupportedProfiles[0]
-	if validateOSProfile(profile.Profile) != nil || profile.QualifiedBinaryDigest != manifest.Binary.Digest || !refPattern.MatchString(profile.QualificationRunID) || !ValidDigest(profile.QualificationSummaryDigest) || profile.QualificationSummaryDigest != manifest.QualificationSummary.Digest {
-		return fmt.Errorf("supported profile lacks exact same-binary qualification identity")
-	}
-	expectedProviders := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
-	liveProviders := 0
-	for index, provider := range manifest.ProviderLiveTests {
-		if provider.Status == "live_tested" {
-			liveProviders++
-		}
-		if provider.Provider != expectedProviders[index] || provider.Status != "live_tested" && provider.Status != "not_live_tested" {
-			return fmt.Errorf("provider live-test inventory is invalid or noncanonical")
-		}
-	}
-	if liveProviders != 1 {
-		return fmt.Errorf("release must contain exactly one live-tested provider")
+	if validateOSProfile(profile.Profile) != nil {
+		return fmt.Errorf("release manifest OS profile is invalid")
 	}
 	return nil
 }
 
 func validateAsset(asset AssetIdentity) error {
-	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 || asset.Bytes > uint64(filetxn.MaximumContentBytes) {
+	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 || asset.Bytes > uint64(32<<20) {
 		return fmt.Errorf("asset identity is incomplete or exceeds the installation size contract")
 	}
 	return nil
 }
 
 func validateHeadscaleAuthority(authority HeadscaleArtifactAuthority) error {
-	if authority.Version != SupportedHeadscaleVersion || !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
+	if authority.Version != SupportedHeadscaleVersion || !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != "tar_gzip" || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
 		return fmt.Errorf("headscale artifact authority is incomplete")
 	}
 	if !canonicalArtifactURL(authority.ArtifactIdentity) {
@@ -468,7 +284,7 @@ func validateHeadscaleAuthority(authority HeadscaleArtifactAuthority) error {
 }
 
 func validateClientArtifactAuthority(authority ClientArtifactAuthority, executable, installPath string) error {
-	if !concreteVersionPattern.MatchString(authority.Version) || !canonicalArtifactURL(authority.ArtifactIdentity) || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != string(managedarchive.TarGzip) || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.ExecutableAsset != executable || authority.InstallPath != installPath || len(authority.Members) == 0 || len(authority.Members) > 16 {
+	if !concreteVersionPattern.MatchString(authority.Version) || !canonicalArtifactURL(authority.ArtifactIdentity) || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != "tar_gzip" || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.ExecutableAsset != executable || authority.InstallPath != installPath || len(authority.Members) == 0 || len(authority.Members) > 16 {
 		return fmt.Errorf("client artifact authority is incomplete")
 	}
 	found := false
@@ -493,150 +309,19 @@ func canonicalArtifactURL(value string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
 }
 
-func QualificationDependencyAssetPaths(authority QualificationDependencyAuthority) ([]string, error) {
-	paths := []string{authority.DependencyBaseline.Path, authority.Headscale.Archive.Path, authority.LegoArchive.Path, authority.Tailscale.Archive.Path}
-	for _, member := range authority.Headscale.Members {
-		paths = append(paths, member.Asset.Path)
-	}
-	for _, member := range authority.LegoMembers {
-		paths = append(paths, member.Asset.Path)
-	}
-	for _, member := range authority.Tailscale.Members {
-		paths = append(paths, member.Asset.Path)
-	}
-	slices.Sort(paths)
-	for index, path := range paths {
-		if !ValidRelativePath(path) || reservedReleaseAssetPath(path) || index > 0 && paths[index-1] == path {
-			return nil, fmt.Errorf("qualification dependency asset inventory is invalid or colliding")
-		}
-	}
-	return paths, nil
-}
-
-func reservedReleaseAssetPath(path string) bool {
-	switch path {
-	case "lanpanel", "LICENSE", "NOTICE", "lanpanel.spdx.json", "dependency-manifest.json", "security-report.json", "qualification-summary.json", "known-limitations.md", "package-template.json", "SHA256SUMS", "release.json":
-		return true
-	}
-	return strings.HasPrefix(path, "lanpanel-") && strings.HasSuffix(path, ".tar.gz")
-}
-
-func verifyDependencyAuthority(authority QualificationDependencyAuthority, profile OSProfile, assets map[string][]byte, decoded ...dependencies.Baseline) error {
-	expectedAssets, err := QualificationDependencyAssetPaths(authority)
-	if err != nil || len(assets) != len(expectedAssets) {
-		return fmt.Errorf("dependency asset inventory is missing or contains extras")
-	}
-	for _, path := range expectedAssets {
-		if _, present := assets[path]; !present {
-			return fmt.Errorf("dependency asset %q is missing", path)
-		}
-	}
-	baselineBytes, present := assets[authority.DependencyBaseline.Path]
-	if !present || authority.DependencyBaseline.Bytes != uint64(len(baselineBytes)) || authority.DependencyBaseline.Digest != DigestBytes(baselineBytes) {
-		return fmt.Errorf("dependency baseline bytes are missing or mismatched")
-	}
-	var baseline dependencies.Baseline
-	err = nil
-	if len(decoded) == 1 {
-		baseline = decoded[0]
-	} else if len(decoded) == 0 {
-		baseline, err = dependencies.DecodeBaseline(baselineBytes)
-	} else {
-		return fmt.Errorf("dependency baseline observation is ambiguous")
-	}
-	if err != nil {
-		return err
-	}
-	profileDigest, err := ProfileDigest(profile)
-	if err != nil || dependencies.ValidateForOSProfile(baseline, profileDigest, profile.NginxVersion) != nil {
-		return fmt.Errorf("dependency baseline does not bind the exact OS profile")
-	}
-	packageVersions := make(map[string]string, len(profile.Packages))
-	for _, tuple := range profile.Packages {
-		if prior, exists := packageVersions[tuple.Name]; exists && prior != tuple.Version {
-			return fmt.Errorf("qualified OS profile contains ambiguous package versions")
-		}
-		packageVersions[tuple.Name] = tuple.Version
-	}
-	for _, selection := range baseline.Selections {
-		if selection.SourceKind == dependencies.SourceDistroRepository && packageVersions[selection.Component] != selection.SelectedVersion {
-			return fmt.Errorf("distro dependency %q differs from qualified package tuple", selection.Component)
-		}
-	}
-	var headscaleSelection, legoSelection, tailscaleSelection *dependencies.Selection
-	for index := range baseline.Selections {
-		switch baseline.Selections[index].Component {
-		case "headscale":
-			headscaleSelection = &baseline.Selections[index]
-		case "lego":
-			legoSelection = &baseline.Selections[index]
-		case "tailscale-client":
-			tailscaleSelection = &baseline.Selections[index]
-		}
-	}
-	if headscaleSelection == nil || headscaleSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Headscale.Version != headscaleSelection.SelectedVersion || authority.Headscale.ArtifactIdentity != headscaleSelection.ArtifactIdentity || authority.Headscale.Archive.Digest != headscaleSelection.ArtifactDigest {
-		return fmt.Errorf("headscale artifact does not match dependency manifest")
-	}
-	if err := verifyArchiveAssets(authority.Headscale.Archive, authority.Headscale.ArchiveFormat, authority.Headscale.MaximumExtractedBytes, authority.Headscale.Members, assets); err != nil {
-		return fmt.Errorf("headscale artifact: %w", err)
-	}
-	if legoSelection == nil || legoSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.LegoVersion != legoSelection.SelectedVersion || authority.LegoArtifactIdentity != legoSelection.ArtifactIdentity || authority.LegoArchive.Digest != legoSelection.ArtifactDigest {
-		return fmt.Errorf("lego artifact does not match dependency manifest")
-	}
-	if err := verifyArchiveAssets(authority.LegoArchive, string(managedarchive.TarGzip), 258<<20, authority.LegoMembers, assets); err != nil {
-		return fmt.Errorf("lego artifact: %w", err)
-	}
-	if tailscaleSelection == nil || tailscaleSelection.SourceKind != dependencies.SourceCanonicalArtifact || authority.Tailscale.Version != tailscaleSelection.SelectedVersion || authority.Tailscale.ArtifactIdentity != tailscaleSelection.ArtifactIdentity || authority.Tailscale.Archive.Digest != tailscaleSelection.ArtifactDigest {
-		return fmt.Errorf("tailscale artifact does not match dependency manifest")
-	}
-	if err := verifyArchiveAssets(authority.Tailscale.Archive, authority.Tailscale.ArchiveFormat, authority.Tailscale.MaximumExtractedBytes, authority.Tailscale.Members, assets); err != nil {
-		return fmt.Errorf("tailscale artifact: %w", err)
-	}
-	return nil
-}
-
-func verifyArchiveAssets(archive AssetIdentity, format string, maximum uint64, members []ArchiveMemberAuthority, assets map[string][]byte) error {
-	archiveBytes, present := assets[archive.Path]
-	if !present || archive.Bytes != uint64(len(archiveBytes)) || archive.Digest != DigestBytes(archiveBytes) || maximum == 0 || maximum > 1<<30 {
-		return fmt.Errorf("archive bytes are missing, mismatched, or unbounded")
-	}
-	spec := managedarchive.Spec{Format: managedarchive.Format(format), MaximumArchiveBytes: int64(maximum), MaximumExtractedBytes: int64(maximum), MaximumMembers: len(members)}
-	for _, member := range members {
-		data, present := assets[member.Asset.Path]
-		if !present || member.Asset.Bytes != uint64(len(data)) || member.Asset.Digest != DigestBytes(data) {
-			return fmt.Errorf("archive member %q bytes are missing or mismatched", member.Path)
-		}
-		spec.Members = append(spec.Members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(maximum), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)}})
-	}
-	extracted, err := managedarchive.Extract(archiveBytes, spec)
-	if err != nil {
-		return err
-	}
-	for _, member := range members {
-		if !slices.Equal(extracted[member.Path], assets[member.Asset.Path]) {
-			return fmt.Errorf("extracted member %q differs from its fixed identity", member.Path)
-		}
-	}
-	return nil
-}
-
 func validateOSProfile(profile OSProfile) error {
-	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) {
+	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) || !ValidDigest(profile.PackageSnapshotDigest) {
 		return fmt.Errorf("OS profile platform identity is invalid")
 	}
-	if !ValidDigest(profile.PackageSnapshotDigest) || !ValidDigest(profile.RepositoryAuthorityDigest) || !ValidDigest(profile.PackageClosureDigest) || packages.ValidateRepositories(profile.Repositories) != nil {
-		return fmt.Errorf("OS profile repository digest authority is invalid")
-	}
-	repositoryDigest, err := RepositoriesAuthorityDigest(profile.Repositories)
-	if err != nil || repositoryDigest != profile.RepositoryAuthorityDigest {
-		return fmt.Errorf("OS profile repository authority digest does not match its repositories")
+	if packages.ValidateRepositories(profile.Repositories) != nil {
+		return fmt.Errorf("OS profile repository configuration is invalid")
 	}
 	repositoryIDs := make(map[string]bool, len(profile.Repositories))
 	for _, repository := range profile.Repositories {
 		repositoryIDs[repository.ID] = true
 	}
 	if len(profile.Packages) == 0 || len(profile.Packages) > 4096 {
-		return fmt.Errorf("OS profile exact package closure is empty or unbounded")
+		return fmt.Errorf("OS profile exact package set is empty or unbounded")
 	}
 	for _, repository := range profile.Repositories {
 		parsed, err := url.Parse(repository.URI)
@@ -656,8 +341,8 @@ func validateOSProfile(profile OSProfile) error {
 }
 
 func validateConfinementProfile(profile ConfinementProfile) error {
-	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || !concreteVersionPattern.MatchString(profile.KernelRelease) || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !ValidDigest(profile.QualificationDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
-		return fmt.Errorf("managed confinement qualification is incomplete")
+	if profile.SchemaVersion != "lanpanel.managed.confinement.v1" || profile.KernelRelease == "" || profile.CgroupMode != "unified_v2" || profile.BindListenPolicy != "systemd_bind_baseline_v1" || profile.ConnectPolicy != "systemd_cgroup_ip_deny_v1" || profile.FilesystemPolicy != "systemd_mount_namespace_v1" || !ValidDigest(profile.PolicyDigest) || len(profile.ProtectedDestinations) == 0 || len(profile.ProtectedDestinations) > 64 {
+		return fmt.Errorf("managed confinement profile is incomplete")
 	}
 	for index, destination := range profile.ProtectedDestinations {
 		if destination == "" || index > 0 && profile.ProtectedDestinations[index-1] >= destination {
@@ -678,376 +363,9 @@ func ProfileDigest(profile OSProfile) (string, error) {
 	return DigestBytes(data), nil
 }
 
-type QualificationTargetProfile struct {
-	SchemaVersion string    `json:"schema_version"`
-	Profile       OSProfile `json:"profile"`
-	CapturedAt    time.Time `json:"captured_at"`
-}
-
-type PlannedMutation struct {
-	ID                    string `json:"id"`
-	Scope                 string `json:"scope"`
-	ScopeDigest           string `json:"scope_digest"`
-	PriorState            string `json:"prior_state"`
-	PriorStateDigest      string `json:"prior_state_digest"`
-	PlannedMutation       string `json:"planned_mutation"`
-	PlannedMutationDigest string `json:"planned_mutation_digest"`
-	Selector              string `json:"selector"`
-	SelectorDigest        string `json:"selector_digest"`
-	CleanupPolicy         string `json:"cleanup_policy"`
-}
-
-type LiveSideEffectPlan struct {
-	SchemaVersion             string            `json:"schema_version"`
-	RunID                     string            `json:"run_id"`
-	AuthorizedHostFingerprint string            `json:"authorized_host_fingerprint"`
-	CreatedAt                 time.Time         `json:"created_at"`
-	Mutations                 []PlannedMutation `json:"mutations"`
-}
-
-// QualificationCleanInstallPriorState is the canonical preinstall observation
-// bound by the generator, local preflight, and remote installer. It names the
-// concrete clean-host inventory and both staging paths that must be absent.
-func QualificationCleanInstallPriorState(hostFingerprint, inventoryDigest, runID string) string {
-	return "step=clean_install;fresh_observation=host_fingerprint=" + hostFingerprint + ",bootstrap_inventory_digest=" + inventoryDigest + ",staging_base=/var/lib/lanpanel-qualification:absent,staging_root=/var/lib/lanpanel-qualification/" + runID + ":absent"
-}
-
-type QualificationInstallManifest struct {
-	SchemaVersion             string        `json:"schema_version"`
-	RunID                     string        `json:"run_id"`
-	ReleaseTag                string        `json:"release_tag"`
-	CandidateBinary           AssetIdentity `json:"candidate_binary"`
-	SourceArchive             AssetIdentity `json:"source_archive"`
-	SBOM                      AssetIdentity `json:"sbom"`
-	SourceTreeDigest          string        `json:"source_tree_digest"`
-	DependencyManifestDigest  string        `json:"dependency_manifest_digest"`
-	TargetProfileDigest       string        `json:"target_profile_digest"`
-	AuthorizedHostFingerprint string        `json:"authorized_host_fingerprint"`
-	SideEffectPlanDigest      string        `json:"side_effect_plan_digest"`
-	JourneySpecDigest         string        `json:"journey_spec_digest"`
-	PackageTemplateDigest     string        `json:"package_template_digest"`
-	TailnetPeerDigest         string        `json:"tailnet_peer_digest,omitempty"`
-	ExternalVantageDigest     string        `json:"external_vantage_digest"`
-	ProtectedAuthorityDigest  string        `json:"protected_authority_digest"`
-	ACMEAccountContact        string        `json:"acme_account_contact"`
-	CreatedAt                 time.Time     `json:"created_at"`
-}
-
-type CleanupResult string
-
-const (
-	CleanupSubmitted CleanupResult = "submitted"
-	CleanupExecuted  CleanupResult = "executed"
-	CleanupCleaned   CleanupResult = "cleaned"
-	CleanupRetained  CleanupResult = "retained"
-)
-
-type StepOutcome string
-
-const (
-	StepSubmitted StepOutcome = "submitted"
-	StepPassed    StepOutcome = "passed"
-	StepFailed    StepOutcome = "failed"
-	StepUnknown   StepOutcome = "unknown"
-)
-
-type LiveStepEvidence struct {
-	SchemaVersion        string                     `json:"schema_version"`
-	Kind                 string                     `json:"kind"`
-	Values               map[string]string          `json:"values"`
-	Observations         map[string]json.RawMessage `json:"observations,omitempty"`
-	ObservedPackageTuple []PackageTuple             `json:"observed_package_tuple,omitempty"`
-}
-
-func DecodeLiveStepEvidence(data []byte) (LiveStepEvidence, error) {
-	var value LiveStepEvidence
-	if err := DecodeCanonical(data, &value); err != nil {
-		return LiveStepEvidence{}, err
-	}
-	if value.SchemaVersion != LiveStepEvidenceSchemaVersion || !refPattern.MatchString(value.Kind) || len(value.Values) == 0 || len(value.Values) > 128 || len(value.Observations) > 128 || len(value.ObservedPackageTuple) > 256 {
-		return LiveStepEvidence{}, fmt.Errorf("live step evidence identity or inventory is invalid")
-	}
-	for key, item := range value.Values {
-		if !refPattern.MatchString(key) || !validPlanText(item) {
-			return LiveStepEvidence{}, fmt.Errorf("live step evidence value is invalid")
-		}
-	}
-	for key, observation := range value.Observations {
-		if !refPattern.MatchString(key) || len(observation) < 2 || len(observation) > 256<<10 || observation[0] != '{' || observation[len(observation)-1] != '}' || !json.Valid(observation) {
-			return LiveStepEvidence{}, fmt.Errorf("live step nested observation is invalid")
-		}
-	}
-	previous := ""
-	for _, tuple := range value.ObservedPackageTuple {
-		key := tuple.Name + "\x00" + tuple.Architecture
-		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || tuple.RepositoryID != "" && !refPattern.MatchString(tuple.RepositoryID) || previous != "" && previous >= key {
-			return LiveStepEvidence{}, fmt.Errorf("live step observed package tuple is invalid or noncanonical")
-		}
-		previous = key
-	}
-	return value, nil
-}
-
-type JourneyStepResult struct {
-	MutationID     string          `json:"mutation_id"`
-	AttemptID      string          `json:"attempt_id"`
-	Outcome        StepOutcome     `json:"outcome"`
-	Evidence       json.RawMessage `json:"evidence,omitempty"`
-	EvidenceDigest string          `json:"evidence_digest,omitempty"`
-	ErrorDigest    string          `json:"error_digest,omitempty"`
-}
-
-type CleanupItem struct {
-	MutationID       string        `json:"mutation_id"`
-	ObservedIdentity string        `json:"observed_identity"`
-	Result           CleanupResult `json:"result"`
-}
-
-type LiveCleanupReport struct {
-	SchemaVersion                      string              `json:"schema_version"`
-	RunID                              string              `json:"run_id"`
-	SideEffectPlanDigest               string              `json:"side_effect_plan_digest"`
-	QualificationInstallManifestDigest string              `json:"qualification_install_manifest_digest"`
-	ProtectedInputDigest               string              `json:"protected_input_digest"`
-	ExecutionFailed                    bool                `json:"execution_failed"`
-	JourneySucceeded                   bool                `json:"journey_succeeded"`
-	ExecutorAttestationDigest          string              `json:"executor_attestation_digest,omitempty"`
-	UpdatedAt                          time.Time           `json:"updated_at"`
-	Steps                              []JourneyStepResult `json:"steps"`
-	Items                              []CleanupItem       `json:"items"`
-}
-
-type AttestedJourneyStep struct {
-	MutationID     string `json:"mutation_id"`
-	EvidenceDigest string `json:"evidence_digest"`
-}
-
-type LiveExecutorAttestation struct {
-	SchemaVersion                      string                `json:"schema_version"`
-	ExecutorIdentity                   string                `json:"executor_identity"`
-	RunID                              string                `json:"run_id"`
-	CandidateDigest                    string                `json:"candidate_digest"`
-	TargetProfileDigest                string                `json:"target_profile_digest"`
-	SideEffectPlanDigest               string                `json:"side_effect_plan_digest"`
-	QualificationInstallManifestDigest string                `json:"qualification_install_manifest_digest"`
-	ProtectedInputDigest               string                `json:"protected_input_digest"`
-	TargetHostFingerprint              string                `json:"target_host_fingerprint"`
-	ExternalVantageDigest              string                `json:"external_vantage_digest"`
-	DNSProvider                        string                `json:"dns_provider"`
-	DNSLiveTested                      bool                  `json:"dns_live_tested"`
-	TailnetLiveStatus                  string                `json:"tailnet_live_status"`
-	Steps                              []AttestedJourneyStep `json:"steps"`
-	Cleanup                            []CleanupItem         `json:"cleanup"`
-	TerminalEvidence                   json.RawMessage       `json:"terminal_evidence"`
-	CompletedAt                        time.Time             `json:"completed_at"`
-}
-
-func DecodeQualificationTargetProfile(data []byte) (QualificationTargetProfile, error) {
-	var profile QualificationTargetProfile
-	if err := DecodeCanonical(data, &profile); err != nil {
-		return QualificationTargetProfile{}, err
-	}
-	if profile.SchemaVersion != QualificationTargetProfileSchemaVersion || !sameUTCSecond(profile.CapturedAt) || validateOSProfile(profile.Profile) != nil {
-		return QualificationTargetProfile{}, fmt.Errorf("qualification target profile is invalid")
-	}
-	return profile, nil
-}
-
-func DecodeLiveSideEffectPlan(data []byte) (LiveSideEffectPlan, error) {
-	var plan LiveSideEffectPlan
-	if err := DecodeCanonical(data, &plan); err != nil {
-		return LiveSideEffectPlan{}, err
-	}
-	if plan.SchemaVersion != LiveSideEffectPlanSchemaVersion || !refPattern.MatchString(plan.RunID) || !refPattern.MatchString(plan.AuthorizedHostFingerprint) || !sameUTCSecond(plan.CreatedAt) || len(plan.Mutations) == 0 || len(plan.Mutations) > 1024 {
-		return LiveSideEffectPlan{}, fmt.Errorf("live side-effect plan is invalid")
-	}
-	previous := ""
-	for _, mutation := range plan.Mutations {
-		if !refPattern.MatchString(mutation.ID) || !validPlanText(mutation.Scope) || !validPlanText(mutation.PriorState) || !validPlanText(mutation.PlannedMutation) || !validPlanText(mutation.Selector) || !validConcreteSideEffectAuthority(plan, mutation) || mutation.ScopeDigest != DigestBytes([]byte(mutation.Scope)) || mutation.PriorStateDigest != DigestBytes([]byte(mutation.PriorState)) || mutation.PlannedMutationDigest != DigestBytes([]byte(mutation.PlannedMutation)) || mutation.SelectorDigest != DigestBytes([]byte(mutation.Selector)) || (mutation.CleanupPolicy != "delete_exact" && mutation.CleanupPolicy != "retain_authorized") || previous != "" && previous >= mutation.ID {
-			return LiveSideEffectPlan{}, fmt.Errorf("live side-effect mutation inventory is invalid or noncanonical")
-		}
-		previous = mutation.ID
-	}
-	return plan, nil
-}
-
-func DecodeQualificationInstallManifest(data []byte) (QualificationInstallManifest, error) {
-	var manifest QualificationInstallManifest
-	if err := DecodeCanonical(data, &manifest); err != nil {
-		return QualificationInstallManifest{}, err
-	}
-	if manifest.SchemaVersion != QualificationInstallManifestSchemaVersion || !refPattern.MatchString(manifest.RunID) || !releaseTagPattern.MatchString(manifest.ReleaseTag) || validateAsset(manifest.CandidateBinary) != nil || manifest.CandidateBinary.Path != "lanpanel" || validateAsset(manifest.SourceArchive) != nil || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || validateAsset(manifest.SBOM) != nil || manifest.SBOM.Path != "lanpanel.spdx.json" || !ValidDigest(manifest.SourceTreeDigest) || !ValidDigest(manifest.DependencyManifestDigest) || !ValidDigest(manifest.TargetProfileDigest) || !refPattern.MatchString(manifest.AuthorizedHostFingerprint) || !ValidDigest(manifest.SideEffectPlanDigest) || !ValidDigest(manifest.JourneySpecDigest) || !ValidDigest(manifest.PackageTemplateDigest) || manifest.TailnetPeerDigest != "" && !ValidDigest(manifest.TailnetPeerDigest) || !ValidDigest(manifest.ExternalVantageDigest) || !ValidDigest(manifest.ProtectedAuthorityDigest) || !acmeaccount.ValidContact(manifest.ACMEAccountContact) || !sameUTCSecond(manifest.CreatedAt) {
-		return QualificationInstallManifest{}, fmt.Errorf("qualification install manifest is invalid")
-	}
-	return manifest, nil
-}
-
-func DecodeLiveCleanupReport(data []byte) (LiveCleanupReport, error) {
-	var report LiveCleanupReport
-	if err := DecodeCanonical(data, &report); err != nil {
-		return LiveCleanupReport{}, err
-	}
-	if report.SchemaVersion != LiveCleanupReportSchemaVersion || !refPattern.MatchString(report.RunID) || !ValidDigest(report.SideEffectPlanDigest) || !ValidDigest(report.QualificationInstallManifestDigest) || !ValidDigest(report.ProtectedInputDigest) || report.JourneySucceeded && (report.ExecutionFailed || !ValidDigest(report.ExecutorAttestationDigest)) || !report.JourneySucceeded && report.ExecutorAttestationDigest != "" || !sameUTCSecond(report.UpdatedAt) || len(report.Steps) == 0 || len(report.Steps) > 1024 || len(report.Items) == 0 || len(report.Items) > 1024 {
-		return LiveCleanupReport{}, fmt.Errorf("live cleanup report is invalid")
-	}
-	previous := ""
-	for _, step := range report.Steps {
-		if !refPattern.MatchString(step.MutationID) || !refPattern.MatchString(step.AttemptID) || !validStepOutcome(step.Outcome) || previous != "" && previous >= step.MutationID {
-			return LiveCleanupReport{}, fmt.Errorf("live cleanup report step inventory is invalid or noncanonical")
-		}
-		switch step.Outcome {
-		case StepSubmitted:
-			if len(step.Evidence) != 0 || step.EvidenceDigest != "" || step.ErrorDigest != "" {
-				return LiveCleanupReport{}, fmt.Errorf("submitted live step carries terminal evidence")
-			}
-		case StepPassed:
-			if !validLiveStepEvidence(step.Evidence, step.EvidenceDigest) || step.ErrorDigest != "" {
-				return LiveCleanupReport{}, fmt.Errorf("passed live step evidence is invalid")
-			}
-		case StepFailed, StepUnknown:
-			hasEvidence := len(step.Evidence) != 0 || step.EvidenceDigest != ""
-			if !ValidDigest(step.ErrorDigest) || hasEvidence && !validLiveStepEvidence(step.Evidence, step.EvidenceDigest) {
-				return LiveCleanupReport{}, fmt.Errorf("failed live step evidence is invalid")
-			}
-		}
-		previous = step.MutationID
-	}
-	previous = ""
-	for _, item := range report.Items {
-		if !refPattern.MatchString(item.MutationID) || !refPattern.MatchString(item.ObservedIdentity) || item.Result != CleanupSubmitted && item.Result != CleanupExecuted && item.Result != CleanupCleaned && item.Result != CleanupRetained || previous != "" && previous >= item.MutationID {
-			return LiveCleanupReport{}, fmt.Errorf("live cleanup report inventory is invalid or noncanonical")
-		}
-		previous = item.MutationID
-	}
-	return report, nil
-}
-
-func DecodeLiveExecutorAttestation(data []byte) (LiveExecutorAttestation, error) {
-	var value LiveExecutorAttestation
-	if err := DecodeCanonical(data, &value); err != nil {
-		return LiveExecutorAttestation{}, err
-	}
-	providers := []string{"cloudflare", "digitalocean", "gcloud", "route53", "tencentcloud"}
-	if value.SchemaVersion != LiveExecutorAttestationSchemaVersion || value.ExecutorIdentity != "lanpanel-trusted-live-executor-v1" || !refPattern.MatchString(value.RunID) || !ValidDigest(value.CandidateDigest) || !ValidDigest(value.TargetProfileDigest) || !ValidDigest(value.SideEffectPlanDigest) || !ValidDigest(value.QualificationInstallManifestDigest) || !ValidDigest(value.ProtectedInputDigest) || !refPattern.MatchString(value.TargetHostFingerprint) || !ValidDigest(value.ExternalVantageDigest) || !slices.Contains(providers, value.DNSProvider) || !value.DNSLiveTested || value.TailnetLiveStatus != "live_tested" && value.TailnetLiveStatus != "not_live_tested" || !sameUTCSecond(value.CompletedAt) || len(value.Steps) == 0 || len(value.Steps) > 1024 || len(value.Cleanup) == 0 || len(value.Cleanup) > 1024 {
-		return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation is invalid")
-	}
-	terminal, err := DecodeLiveStepEvidence(value.TerminalEvidence)
-	if err != nil || terminal.Kind != "terminal-cleanup" {
-		return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation is invalid")
-	}
-	previous := ""
-	for _, step := range value.Steps {
-		if !refPattern.MatchString(step.MutationID) || !ValidDigest(step.EvidenceDigest) || previous != "" && previous >= step.MutationID {
-			return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation step inventory is invalid")
-		}
-		previous = step.MutationID
-	}
-	previous = ""
-	for _, item := range value.Cleanup {
-		if !refPattern.MatchString(item.MutationID) || !refPattern.MatchString(item.ObservedIdentity) || item.Result != CleanupCleaned && item.Result != CleanupRetained || previous != "" && previous >= item.MutationID {
-			return LiveExecutorAttestation{}, fmt.Errorf("live executor attestation cleanup inventory is invalid")
-		}
-		previous = item.MutationID
-	}
-	return value, nil
-}
-
-func VerifyLiveCleanup(planBytes, reportBytes, attestationBytes []byte, qualificationInstallManifestDigest, protectedInputDigest string) (LiveCleanupReport, LiveExecutorAttestation, error) {
-	plan, err := DecodeLiveSideEffectPlan(planBytes)
-	if err != nil {
-		return LiveCleanupReport{}, LiveExecutorAttestation{}, err
-	}
-	report, err := DecodeLiveCleanupReport(reportBytes)
-	if err != nil {
-		return LiveCleanupReport{}, LiveExecutorAttestation{}, err
-	}
-	attestation, err := DecodeLiveExecutorAttestation(attestationBytes)
-	if err != nil {
-		return LiveCleanupReport{}, LiveExecutorAttestation{}, err
-	}
-	if !ValidDigest(qualificationInstallManifestDigest) || !ValidDigest(protectedInputDigest) || report.ExecutionFailed || report.ProtectedInputDigest != protectedInputDigest || report.RunID != plan.RunID || report.SideEffectPlanDigest != DigestBytes(planBytes) || report.QualificationInstallManifestDigest != qualificationInstallManifestDigest || !report.JourneySucceeded || report.ExecutorAttestationDigest != DigestBytes(attestationBytes) || report.UpdatedAt.Before(plan.CreatedAt) || len(report.Steps) != len(plan.Mutations) || len(report.Items) != len(plan.Mutations) {
-		return LiveCleanupReport{}, LiveExecutorAttestation{}, fmt.Errorf("live cleanup report does not match immutable plan")
-	}
-	if attestation.RunID != report.RunID || attestation.SideEffectPlanDigest != report.SideEffectPlanDigest || attestation.QualificationInstallManifestDigest != report.QualificationInstallManifestDigest || attestation.ProtectedInputDigest != report.ProtectedInputDigest || len(attestation.Steps) != len(report.Steps) || !reflect.DeepEqual(attestation.Cleanup, report.Items) || attestation.CompletedAt.After(report.UpdatedAt) {
-		return LiveCleanupReport{}, LiveExecutorAttestation{}, fmt.Errorf("live executor attestation does not match cleanup report")
-	}
-	for index, mutation := range plan.Mutations {
-		step, attested, item := report.Steps[index], attestation.Steps[index], report.Items[index]
-		if step.MutationID != mutation.ID || step.Outcome != StepPassed || attested.MutationID != mutation.ID || attested.EvidenceDigest != step.EvidenceDigest || item.MutationID != mutation.ID || item.Result != CleanupCleaned && item.Result != CleanupRetained || mutation.CleanupPolicy == "delete_exact" && item.Result != CleanupCleaned {
-			return LiveCleanupReport{}, LiveExecutorAttestation{}, fmt.Errorf("live cleanup report is incomplete or violates cleanup policy")
-		}
-	}
-	return report, attestation, nil
-}
-
-func validStepOutcome(value StepOutcome) bool {
-	return value == StepSubmitted || value == StepPassed || value == StepFailed || value == StepUnknown
-}
-
-func validLiveStepEvidence(data []byte, digest string) bool {
-	if !ValidDigest(digest) || DigestBytes(data) != digest {
-		return false
-	}
-	_, err := DecodeLiveStepEvidence(data)
-	return err == nil
-}
-
-func validPlanText(value string) bool {
-	if value == "" || value != strings.TrimSpace(value) || len(value) > 4096 {
-		return false
-	}
-	for _, character := range []byte(value) {
-		if character < 0x20 || character > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
-func validConcreteSideEffectAuthority(_ LiveSideEffectPlan, mutation PlannedMutation) bool {
-	priorPrefix := "step=" + mutation.ID + ";fresh_observation="
-	return nonemptyPlanField(mutation.Scope, "providers") &&
-		nonemptyPlanField(mutation.Scope, "objects") &&
-		strings.HasPrefix(mutation.PriorState, priorPrefix) && len(mutation.PriorState) > len(priorPrefix) &&
-		nonemptyPlanField(mutation.PlannedMutation, "effects") &&
-		hasNonemptySelector(mutation.Selector) &&
-		!strings.Contains(mutation.PriorState, "fresh-prior/") &&
-		!strings.Contains(mutation.PlannedMutation, "execute=")
-}
-
-func nonemptyPlanField(text, name string) bool {
-	for field := range strings.SplitSeq(text, ";") {
-		key, value, present := strings.Cut(field, "=")
-		if present && key == name {
-			return value != ""
-		}
-	}
-	return false
-}
-
-func hasNonemptySelector(text string) bool {
-	for field := range strings.SplitSeq(text, ";") {
-		key, value, present := strings.Cut(field, "=")
-		if !present || key == "" || value == "" {
-			return false
-		}
-	}
-	return true
-}
-
-func ValidateQualificationBinding(manifest QualificationInstallManifest, target QualificationTargetProfile, plan LiveSideEffectPlan, observedHost string) error {
-	profileDigest, profileErr := ProfileDigest(target.Profile)
-	planBytes, planErr := MarshalCanonical(plan)
-	if profileErr != nil || planErr != nil || manifest.TargetProfileDigest != profileDigest || manifest.SideEffectPlanDigest != DigestBytes(planBytes) || manifest.RunID != plan.RunID || manifest.AuthorizedHostFingerprint != plan.AuthorizedHostFingerprint || manifest.AuthorizedHostFingerprint != observedHost || plan.CreatedAt.After(manifest.CreatedAt) {
-		return fmt.Errorf("qualification install authority binding is invalid")
-	}
-	return nil
-}
-
 func cloneReleaseManifest(source ReleaseManifest) ReleaseManifest {
 	copy := source
 	copy.AdditionalAssets = append([]AssetIdentity(nil), source.AdditionalAssets...)
-	copy.ProviderLiveTests = append([]ProviderLiveTest(nil), source.ProviderLiveTests...)
 	copy.SupportedProfiles = append([]SupportedOSProfile(nil), source.SupportedProfiles...)
 	copy.Headscale.RedirectAuthorities = append([]string(nil), source.Headscale.RedirectAuthorities...)
 	copy.Headscale.Members = append([]ArchiveMemberAuthority(nil), source.Headscale.Members...)
@@ -1057,10 +375,6 @@ func cloneReleaseManifest(source ReleaseManifest) ReleaseManifest {
 		copy.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations = append([]string(nil), source.SupportedProfiles[index].Profile.ManagedConfinement.ProtectedDestinations...)
 	}
 	return copy
-}
-
-func sameUTCSecond(value time.Time) bool {
-	return !value.IsZero() && value.Location() == time.UTC && value.Nanosecond() == 0
 }
 
 var (

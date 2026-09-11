@@ -57,19 +57,12 @@ const (
 type ProfileAuthorityKind string
 
 const (
-	FinalSupportedProfile ProfileAuthorityKind = "final_supported_profile"
-	QualificationTarget   ProfileAuthorityKind = "qualification_target_profile"
+	PreviewProfile ProfileAuthorityKind = "preview"
 )
 
 type ProfileAuthority struct {
-	Kind                  ProfileAuthorityKind `json:"kind"`
-	Digest                string               `json:"digest"`
-	LiveQualified         bool                 `json:"live_qualified"`
-	CandidateDigest       string               `json:"candidate_digest,omitempty"`
-	InstallManifestDigest string               `json:"install_manifest_digest,omitempty"`
-	SideEffectPlanDigest  string               `json:"side_effect_plan_digest,omitempty"`
-	HostFingerprint       string               `json:"host_fingerprint,omitempty"`
-	RunID                 string               `json:"run_id,omitempty"`
+	Kind   ProfileAuthorityKind `json:"kind"`
+	Digest string               `json:"digest"`
 }
 
 type ExpectedProfile struct {
@@ -91,7 +84,7 @@ type ManagedConfinementProfile struct {
 	ConnectPolicy         string   `json:"connect_policy"`
 	FilesystemPolicy      string   `json:"filesystem_policy"`
 	ProtectedDestinations []string `json:"protected_destinations"`
-	QualificationDigest   string   `json:"qualification_digest"`
+	PolicyDigest          string   `json:"policy_digest"`
 }
 
 type ListenerRequirement struct {

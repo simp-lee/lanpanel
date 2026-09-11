@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"lanpanel/internal/confinement"
 	"net"
 	"net/netip"
 	"os"
@@ -199,11 +198,7 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 	}
 	_, _ = hasher.Write(status)
 	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	reason := ""
-	if !confinement.BPFLSMActive() {
-		reason = "BPF LSM unavailable; running with weaker isolation"
-	}
-	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: reason}, nil
+	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot}, nil
 }
 
 type InstalledPackageTuple struct {
@@ -213,7 +208,7 @@ type InstalledPackageTuple struct {
 }
 
 // ObserveInstalledPackageTuples rereads dpkg's authoritative status database
-// and returns only the exact, sorted package names requested by qualification.
+// and returns only the exact, sorted package names requested by the installer.
 // Missing, duplicate, partial, or ambiguous package state fails closed.
 func ObserveInstalledPackageTuples(ctx context.Context, names []string) ([]InstalledPackageTuple, error) {
 	return observeInstalledPackageTuples(ctx, "/var/lib/dpkg/status", names, true)

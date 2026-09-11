@@ -30,7 +30,7 @@ func TestInvocationCgroupNamesAreTyped(t *testing.T) {
 }
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileQualificationReboot, ProfileQualificationServices, ProfileQualificationUIRestart, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -242,17 +242,6 @@ func TestExecutableValidationRejectsLinksAndWritablePaths(t *testing.T) {
 	}
 	if err := verifyRootExecutable(link); err == nil {
 		t.Fatal("symlink executable was accepted")
-	}
-}
-
-func TestNoNetworkProfilesDenyINETAndAllowOnlyUnixSockets(t *testing.T) {
-	profile, err := ResolveInvocation(ProfileAPTOfflineTransaction, Identities{}, Invocation{Package: &PackageInvocation{TransactionID: "pkg_" + strings.Repeat("a", 64), LockWaitSeconds: 30, Staged: true, Packages: []PackageArgument{{Name: "nginx", Version: "1.22.1-9", Digest: strings.Repeat("b", 64), Bytes: 1024, MaximumInstalledFileBytes: 8 << 20}}}})
-	if err != nil || profile.Network != NetworkNoSockets || len(profile.AllowedAddressFamilies) != 0 {
-		t.Fatalf("offline profile=%#v error=%v", profile, err)
-	}
-	filter, err := addressFamilyFilter(profile.AllowedAddressFamilies)
-	if err != nil || len(filter) != 4 || filter[2].K&uint32(syscall.EAFNOSUPPORT) == 0 {
-		t.Fatalf("address-family filter=%#v error=%v", filter, err)
 	}
 }
 

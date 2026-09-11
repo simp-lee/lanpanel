@@ -93,7 +93,7 @@ func LoadConfinementProfile() (confinement.Profile, error) {
 	if err := release.DecodeCanonical(data, &source); err != nil {
 		return confinement.Profile{}, err
 	}
-	profile := confinement.Profile{SchemaVersion: source.SchemaVersion, KernelRelease: source.KernelRelease, CgroupMode: source.CgroupMode, BindListenPolicy: source.BindListenPolicy, ConnectPolicy: source.ConnectPolicy, FilesystemPolicy: source.FilesystemPolicy, ProtectedDestinations: append([]string(nil), source.ProtectedDestinations...), QualificationDigest: "sha256:" + source.QualificationDigest}
+	profile := confinement.Profile{SchemaVersion: source.SchemaVersion, KernelRelease: source.KernelRelease, CgroupMode: source.CgroupMode, BindListenPolicy: source.BindListenPolicy, ConnectPolicy: source.ConnectPolicy, FilesystemPolicy: source.FilesystemPolicy, ProtectedDestinations: append([]string(nil), source.ProtectedDestinations...), PolicyDigest: "sha256:" + source.PolicyDigest}
 	if err := confinement.ValidateProfile(profile); err != nil {
 		return confinement.Profile{}, err
 	}
@@ -188,9 +188,6 @@ func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) 
 
 func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) error {
 	relay := units.Bundle.RelayRequired
-	if err := ensureListenGuard(resourceID, units.ApplicationUID, units.Confinement); err != nil {
-		return err
-	}
 	if err := host.run(ctx, child.ProfileResourceStart, resourceID, relay); err != nil {
 		return err
 	}
@@ -212,13 +209,6 @@ func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) er
 }
 
 func (host Host) VerifyApplied(ctx context.Context, resourceID string, bundle domain.ProcessBundle, policy confinement.UnitPolicy) error {
-	if err := verifyListenGuard(resourceID, bundle.ApplicationUID, policy); err != nil {
-		var violation *RuntimeViolation
-		if errors.As(err, &violation) {
-			return fmt.Errorf("managed listen guard invalid: %w", err)
-		}
-		return fmt.Errorf("managed listen guard observation failed: %w", err)
-	}
 	if err := host.verifyEffectiveUnit(ctx, resourceID, false, policy); err != nil {
 		return err
 	}
@@ -247,7 +237,7 @@ func (host Host) VerifyCommittedJournal(ctx context.Context, journal Journal, ru
 		if err := VerifyStopped(observation); err != nil {
 			return err
 		}
-		return releaseListenGuardUID(journal.Applied.ApplicationUID)
+		return nil
 	}
 	if journal.Operation != "process_start" || journal.Phase != "host_mutated" {
 		return fmt.Errorf("committed process journal operation is invalid")

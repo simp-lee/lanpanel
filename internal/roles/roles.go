@@ -17,7 +17,6 @@ const (
 	StartupGuard          Name = "startup-guard"
 	ReloadGuard           Name = "reload-guard"
 	RuntimeGuard          Name = "runtime-guard"
-	ProcessGuard          Name = "process-guard"
 	Installer             Name = "installer"
 	StartupRecovery       Name = "startup-recovery"
 	Timer                 Name = "timer"
@@ -30,13 +29,11 @@ const (
 	HeadscaleSTUNRelay    Name = "headscale-stun-relay"
 	PackageNoAutostart    Name = "package-no-autostart"
 	ManagedExecutor       Name = "managed-executor"
-	QualificationAgent    Name = "qualification-agent"
-	QualificationFixture  Name = "qualification-fixture"
 )
 
 var fixed = map[Name]struct{}{
 	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
-	StartupRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessGuard: {}, QualificationAgent: {}, QualificationFixture: {},
+	StartupRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {},
 }
 
 type Handler func(args []string, stdout, stderr io.Writer) error

@@ -254,20 +254,6 @@ func TestExpansionResultBindsExactTypedRequest(t *testing.T) {
 	}
 }
 
-func TestQualificationTargetUsesInstallPlanHostAndRunBinding(t *testing.T) {
-	now := time.Unix(1_700_000_000, 0).UTC()
-	request := expansionRequest(ExpansionHeadscale)
-	request.Profile.Authority = ProfileAuthority{Kind: QualificationTarget, Digest: "sha256:" + strings.Repeat("a", 64), CandidateDigest: "sha256:" + strings.Repeat("b", 64), InstallManifestDigest: "sha256:" + strings.Repeat("c", 64), SideEffectPlanDigest: "sha256:" + strings.Repeat("d", 64), HostFingerprint: "host/fingerprint", RunID: "run-one"}
-	result, err := EvaluateExpansion(request, passingExpansionObservations(request, now))
-	if err != nil || !result.Allowed {
-		t.Fatalf("candidate result=%#v err=%v", result, err)
-	}
-	request.Profile.Authority.RunID = ""
-	if _, err := EvaluateExpansion(request, passingExpansionObservations(request, now)); err == nil {
-		t.Fatal("qualification target without run binding was accepted")
-	}
-}
-
 func TestFallbackStopDoesNotDependOnCompleteSelectiveInventory(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	request := ContractionRequest{Kind: ContractionEmergency, Target: "installation", Generation: 1, OwnershipInventoryDigest: "sha256:" + strings.Repeat("1", 64), ClosureAuthorityDigest: "sha256:" + strings.Repeat("2", 64), FallbackStop: true}
@@ -305,13 +291,13 @@ func TestPreflightAuthorityRejectsStaleWrongScopeOrTarget(t *testing.T) {
 func expansionRequest(scope ExpansionScope) ExpansionRequest {
 	return ExpansionRequest{
 		Scope: scope, Target: "resource/res_00000000000000000000000000000001", Generation: 7,
-		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64), ManagedConfinement: testConfinement(), Authority: ProfileAuthority{Kind: FinalSupportedProfile, Digest: "sha256:" + strings.Repeat("a", 64), LiveQualified: true}},
+		Profile: ExpectedProfile{ID: "debian", VersionID: "13", Architecture: "amd64", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64), ManagedConfinement: testConfinement(), Authority: ProfileAuthority{Kind: PreviewProfile, Digest: "sha256:" + strings.Repeat("a", 64)}},
 		Domains: []string{"app.example.test"}, ManagedPaths: []ManagedPathRequirement{{Path: "/var/lib/lanpanel/apps/app-one", Kind: ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}}, Disks: []DiskRequirement{{Path: "/var/lib/lanpanel", MinimumAvailableBytes: 1024}}, LastTrustedWall: time.Unix(1_699_999_000, 0).UTC(),
 	}
 }
 
 func testConfinement() ManagedConfinementProfile {
-	return ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_deny_bpf_lsm_listen_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, QualificationDigest: "sha256:" + strings.Repeat("8", 64)}
+	return ManagedConfinementProfile{SchemaVersion: "lanpanel.managed.confinement.v1", KernelRelease: "6.12.1", CgroupMode: "unified_v2", BindListenPolicy: "systemd_bind_baseline_v1", ConnectPolicy: "systemd_cgroup_ip_deny_v1", FilesystemPolicy: "systemd_mount_namespace_v1", ProtectedDestinations: []string{"127.0.0.0/8", "169.254.169.254/32", "::1/128"}, PolicyDigest: "sha256:" + strings.Repeat("8", 64)}
 }
 
 func passingExpansionObservations(request ExpansionRequest, now time.Time) ExpansionObservations {

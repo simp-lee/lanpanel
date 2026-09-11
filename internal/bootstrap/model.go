@@ -155,7 +155,7 @@ type Request struct {
 	// its package Plan can bind the same installation generation used by Install.
 	Material *identity.Material
 	// InstallerInput is persisted in the preinstall journal for public resume;
-	// qualification authorities are intentionally not copied into the journal.
+	// transient authority material is intentionally not copied into the journal.
 	InstallerInput     []byte
 	Preflight          PreflightEvaluator
 	PackagePlan        packages.Plan

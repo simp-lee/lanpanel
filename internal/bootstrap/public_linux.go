@@ -184,7 +184,7 @@ func bindPublicPackagePlan(template packages.Plan, identityValue release.Install
 	plan.NoAutostartPolicyDigest = identityValue.Binary.Digest
 	plan.PreflightDigest = resultDigest
 	plan.PreflightRequestDigest = result.RequestDigest
-	plan.Authority = packages.QualificationAuthority{Kind: packages.FinalSupportedProfile, ReleaseAuthorityDigest: releaseDigest, BinaryDigest: identityValue.Binary.Digest, HostFingerprint: identityValue.HostFingerprint, Operation: "package_transaction", TargetOSProfileDigest: identityValue.ProfileDigest, FrozenClosureDigest: identityValue.Profile.PackageClosureDigest}
+	plan.Authority = packages.Authority{Kind: packages.PreviewProfile, ReleaseAuthorityDigest: releaseDigest, BinaryDigest: identityValue.Binary.Digest, HostFingerprint: identityValue.HostFingerprint, TargetOSProfileDigest: identityValue.ProfileDigest}
 	if err := packages.ValidatePlan(plan); err != nil {
 		return packages.Plan{}, err
 	}

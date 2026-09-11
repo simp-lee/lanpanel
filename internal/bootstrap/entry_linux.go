@@ -26,20 +26,15 @@ const (
 )
 
 type installerInput struct {
-	SchemaVersion                              string              `json:"schema_version"`
-	Kind                                       release.InstallKind `json:"kind"`
-	ACMEAccountContact                         string              `json:"acme_account_contact"`
-	ExpectedReleaseManifestDigest              string              `json:"expected_release_manifest_digest,omitempty"`
-	ExpectedQualificationInstallManifestDigest string              `json:"expected_qualification_install_manifest_digest,omitempty"`
-	ReleaseManifest                            []byte              `json:"release_manifest,omitempty"`
-	QualificationInstallManifest               []byte              `json:"qualification_install_manifest,omitempty"`
-	QualificationTargetProfile                 []byte              `json:"qualification_target_profile,omitempty"`
-	LiveSideEffectPlan                         []byte              `json:"live_side_effect_plan,omitempty"`
-	QualificationDependencyAuthority           []byte              `json:"qualification_dependency_authority,omitempty"`
-	Checksums                                  []byte              `json:"checksums,omitempty"`
-	AssetPaths                                 map[string]string   `json:"asset_paths"`
-	PackagePlan                                packages.Plan       `json:"package_plan"`
-	PackagePreflight                           preflight.Result    `json:"package_preflight"`
+	SchemaVersion                 string              `json:"schema_version"`
+	Kind                          release.InstallKind `json:"kind"`
+	ACMEAccountContact            string              `json:"acme_account_contact"`
+	ExpectedReleaseManifestDigest string              `json:"expected_release_manifest_digest,omitempty"`
+	ReleaseManifest               []byte              `json:"release_manifest,omitempty"`
+	Checksums                     []byte              `json:"checksums,omitempty"`
+	AssetPaths                    map[string]string   `json:"asset_paths"`
+	PackagePlan                   packages.Plan       `json:"package_plan"`
+	PackagePreflight              preflight.Result    `json:"package_preflight"`
 }
 
 // RunInstallerRole accepts either the release tooling's inherited fd 3 or
@@ -92,29 +87,15 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	var authority *release.InstallAuthority
-	switch input.Kind {
-	case release.InstallPublicRelease:
-		if len(input.QualificationInstallManifest) != 0 || len(input.QualificationTargetProfile) != 0 || len(input.LiveSideEffectPlan) != 0 || len(input.QualificationDependencyAuthority) != 0 || input.ExpectedQualificationInstallManifestDigest != "" {
-			return fmt.Errorf("public installer input carries qualification authority")
-		}
-		authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now})
-		if err == nil {
-			current, currentErr := readCurrentExecutable(authority.Identity().Binary.Bytes)
-			if currentErr != nil || uint64(len(current)) != authority.Identity().Binary.Bytes || release.DigestBytes(current) != authority.Identity().Binary.Digest {
-				err = fmt.Errorf("running installer binary differs from the selected release")
-			}
-		}
-	case release.InstallQualification:
-		if len(input.ReleaseManifest) != 0 || len(input.Checksums) != 0 || input.ExpectedReleaseManifestDigest != "" {
-			return fmt.Errorf("qualification installer input carries public release authority")
-		}
-		candidateBytes, present := assets["lanpanel"]
-		if !present {
-			return fmt.Errorf("qualification candidate binary bytes are missing")
-		}
-		authority, err = release.VerifyQualificationInstallAuthority(input.ExpectedQualificationInstallManifestDigest, input.QualificationInstallManifest, input.QualificationTargetProfile, input.LiveSideEffectPlan, input.QualificationDependencyAuthority, candidateBytes, assets, release.QualificationInstallObservation{HostFingerprint: actualHost, ObservedAt: now})
-	default:
+	if input.Kind != release.InstallPublicRelease {
 		return fmt.Errorf("installer release kind is invalid")
+	}
+	authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now})
+	if err == nil {
+		current, currentErr := readCurrentExecutable(authority.Identity().Binary.Bytes)
+		if currentErr != nil || uint64(len(current)) != authority.Identity().Binary.Bytes || release.DigestBytes(current) != authority.Identity().Binary.Digest {
+			err = fmt.Errorf("running installer binary differs from the selected release")
+		}
 	}
 	if err != nil {
 		return err
@@ -141,27 +122,6 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 		}
 	}
 	identityValue := authority.Identity()
-	if input.Kind == release.InstallQualification && !resumeAttempt {
-		beforeInventory, inventoryErr := observeBeforeInventory(FixedPaths())
-		if inventoryErr != nil {
-			return inventoryErr
-		}
-		plan, decodeErr := release.DecodeLiveSideEffectPlan(input.LiveSideEffectPlan)
-		if decodeErr != nil {
-			return decodeErr
-		}
-		bound := false
-		for _, mutation := range plan.Mutations {
-			expectedPrior := release.QualificationCleanInstallPriorState(actualHost, beforeInventory, plan.RunID)
-			if mutation.ID == "clean_install" && mutation.PriorState == expectedPrior && mutation.PriorStateDigest == release.DigestBytes([]byte(expectedPrior)) {
-				bound = true
-			}
-		}
-		if !bound {
-			return fmt.Errorf("qualification side-effect plan does not bind the actual preinstall inventory")
-		}
-	}
-
 	preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
 	legoBytes, present := assets[identityValue.Lego.Path]
 	if !present || release.DigestBytes(legoBytes) != identityValue.Lego.Digest || uint64(len(legoBytes)) != identityValue.Lego.Bytes {
@@ -171,10 +131,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if !present || release.DigestBytes(tailscaleBytes) != identityValue.Tailscale.Digest || uint64(len(tailscaleBytes)) != identityValue.Tailscale.Bytes {
 		return fmt.Errorf("selected Tailscale asset missing or mismatched")
 	}
-	installerInput := []byte(nil)
-	if input.Kind == release.InstallPublicRelease {
-		installerInput = append([]byte(nil), data...)
-	}
+	installerInput := append([]byte(nil), data...)
 	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], ACMEAccountContact: input.ACMEAccountContact, LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 

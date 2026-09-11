@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"lanpanel/internal/application"
 	"lanpanel/internal/bootstrap"
 	"lanpanel/internal/child"
 	"lanpanel/internal/control"
@@ -12,7 +11,6 @@ import (
 	"lanpanel/internal/nginxguard"
 	"lanpanel/internal/packages"
 	managedprocess "lanpanel/internal/process"
-	"lanpanel/internal/qualification"
 	"lanpanel/internal/relay"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/roles"
@@ -58,17 +56,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		{Name: roles.StartupGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunStartupGuard(args) }},
 		{Name: roles.ReloadGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunReloadGuard(args) }},
 		{Name: roles.RuntimeGuard, Handler: func(args []string, _, _ io.Writer) error { return bootstrap.RunRuntimeGuard(args) }},
-		{Name: roles.ProcessGuard, Handler: func(args []string, _, _ io.Writer) error {
-			if err := bootstrap.RequireCommitted(bootstrap.FixedPaths()); err != nil {
-				return err
-			}
-			return managedprocess.RunGuard(args, application.RunningProcessBundles)
-		}},
 		{Name: roles.ManagedExecutor, Handler: func(args []string, _, _ io.Writer) error { return managedprocess.Execute(args) }},
-		{Name: roles.QualificationAgent, Handler: func(args []string, stdout, _ io.Writer) error {
-			return qualification.RunAgentRole(args, os.Stdin, stdout)
-		}},
-		{Name: roles.QualificationFixture, Handler: func(args []string, _, _ io.Writer) error { return qualification.RunFixtureRole(args) }},
 		{Name: roles.HeadscalePrivateProbe, Handler: func(args []string, _, _ io.Writer) error { return control.RunPrivateProbe(args) }},
 		{Name: roles.HeadscaleControlRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunControlRelay(args) }},
 		{Name: roles.HeadscaleSTUNRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunSTUNRelay(args) }},
