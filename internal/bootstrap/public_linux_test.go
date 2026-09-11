@@ -6,10 +6,25 @@ import (
 	"encoding/json"
 	"io"
 	"lanpanel/internal/preflight"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestArtifactDirectoryRejectsUnexpectedAssets(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "release.json"), []byte("manifest"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unexpected"), []byte("extra"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateArtifactDirectory(root, []string{"release.json"}); err == nil {
+		t.Fatal("unexpected artifact asset was accepted")
+	}
+}
 
 func TestPublicInstallerHasNoUserSuppliedAuthorityArguments(t *testing.T) {
 	if err := runPublicInstaller([]string{"--bundle-dir", "/srv/release"}, io.Discard); err == nil {

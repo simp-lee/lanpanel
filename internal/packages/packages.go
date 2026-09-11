@@ -67,13 +67,15 @@ type Repository struct {
 }
 
 type Plan struct {
-	TransactionID           string         `json:"transaction_id"`
-	JobID                   string         `json:"job_id"`
-	IntentGeneration        uint64         `json:"intent_generation"`
-	Deadline                time.Time      `json:"deadline"`
-	OSProfileDigest         string         `json:"os_profile_digest"`
-	Mode                    Mode           `json:"mode"`
-	Proxy                   *sources.Proxy `json:"proxy,omitempty"`
+	TransactionID    string    `json:"transaction_id"`
+	JobID            string    `json:"job_id"`
+	IntentGeneration uint64    `json:"intent_generation"`
+	Deadline         time.Time `json:"deadline"`
+	OSProfileDigest  string    `json:"os_profile_digest"`
+	Mode             Mode      `json:"mode"`
+	// Public release plans never persist a proxy; a non-nil in-memory value is
+	// rejected by ValidatePublicReleasePlan and strict decoders reject legacy JSON.
+	Proxy                   *sources.Proxy `json:"-"`
 	Packages                []Package      `json:"packages"`
 	Repositories            []Repository   `json:"repositories"`
 	FirstNginxInstall       bool           `json:"first_nginx_install"`

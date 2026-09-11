@@ -30,10 +30,12 @@ type Artifact struct {
 }
 
 type Source struct {
-	Kind                Kind     `json:"kind"`
-	URL                 string   `json:"url,omitempty"`
-	OfflinePath         string   `json:"offline_path,omitempty"`
-	OfficialAuthorities []string `json:"official_authorities"`
+	Kind Kind `json:"kind"`
+	// Acquisition locations are runtime-only and are not part of the
+	// persisted release/package contract.
+	URL                 string   `json:"-"`
+	OfflinePath         string   `json:"-"`
+	OfficialAuthorities []string `json:"-"`
 	Artifact            Artifact `json:"artifact"`
 }
 
