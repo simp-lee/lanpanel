@@ -165,7 +165,7 @@ func TestAPTSourceAcceptsOptionlessLineOnlyWithAuthorizedSharedKeyring(t *testin
 	}
 }
 
-func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDrift(t *testing.T) {
+func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverridesAndRepositoryDrift(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	keyring := []byte("test keyring identity")
 	keyringDigest := fmt.Sprintf("%x", sha256.Sum256(keyring))
@@ -179,7 +179,14 @@ func TestPackageConfigurationRejectsHooksAmbientProxyUnsafeFilesAndRepositoryDri
 	if err := ValidateAPTConfiguration(files, repositories, plan.Repositories); err != nil {
 		t.Fatal(err)
 	}
-	for _, hostile := range []string{`DPkg::Pre-Invoke { "bad"; };`, `status-logger "/usr/bin/logger";`, `Acquire::http::Proxy "http://ambient";`, `Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `Acquire { http { Proxy "http://ambient"; }; };`, `APT::Get::AllowUnauthenticated "true";`} {
+	for _, allowed := range []string{`DPkg::Pre-Invoke { "needrestart"; };`, `status-logger "/usr/lib/needrestart/dpkg-status";`} {
+		changed := append([]ObservedConfig(nil), files...)
+		changed[0].Bytes = []byte(allowed)
+		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err != nil {
+			t.Fatalf("standard distro hook %q was rejected: %v", allowed, err)
+		}
+	}
+	for _, hostile := range []string{`Acquire::http::Proxy "http://ambient";`, `Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `Acquire { http { Proxy "http://ambient"; }; };`, `APT::Get::AllowUnauthenticated "true";`} {
 		changed := append([]ObservedConfig(nil), files...)
 		changed[0].Bytes = []byte(hostile)
 		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err == nil {

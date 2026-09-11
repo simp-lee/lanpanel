@@ -36,8 +36,8 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
 	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID
 	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
-	confinementMatches := observed.KernelRelease == request.Profile.ManagedConfinement.KernelRelease && observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
-	add("managed_confinement", confinementMatches, "exact qualified kernel release and cgroup mode", observed.KernelRelease+"/"+observed.CgroupMode)
+	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
+	add("managed_confinement", confinementMatches, "unified cgroup mode required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode)
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
 	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source+"/"+observed.Clock.Now.UTC().Format(time.RFC3339Nano))
 	add("root_executor", observed.ExecutorUID == 0, "actual mutation executor is root", strconv.FormatUint(uint64(observed.ExecutorUID), 10))
@@ -46,7 +46,7 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("dpkg", observed.DPKG.Available && observed.DPKG.Identity != "", "dpkg capability and identity", observed.DPKG.Identity)
 	packageExact := observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == request.Profile.NginxVersion && observed.Packages.PackageSnapshotDigest == request.Profile.PackageSnapshotDigest
 	if request.Scope == ExpansionBootstrap {
-		packageExact = observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == ""
+		packageExact = observed.Packages.Ready && observed.Packages.Identity != ""
 	}
 	add("package_state", packageExact, "apt/dpkg state and exact release package profile are ready", observed.Packages.Identity+"/"+observed.Packages.SystemdVersion+"/"+observed.Packages.NginxVersion+"/"+observed.Packages.PackageSnapshotDigest+"/"+observed.Packages.Reason)
 

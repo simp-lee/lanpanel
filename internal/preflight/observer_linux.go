@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/confinement"
 	"net"
 	"net/netip"
 	"os"
@@ -126,7 +127,6 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 	}{
 		{"architecture", expected.Architecture, observed.Architecture},
 		{"os_profile", expected.ID + "/" + expected.VersionID, observed.Platform.ID + "/" + observed.Platform.VersionID},
-		{"kernel_release", expected.ManagedConfinement.KernelRelease, observed.KernelRelease},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
 		{"systemd_package", expected.SystemdVersion, observed.Packages.SystemdVersion},
 		{"nginx_package", expected.NginxVersion, observed.Packages.NginxVersion},
@@ -170,8 +170,8 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 		}
 		for _, value := range values {
 			lower := strings.ToLower(string(value))
-			if strings.Contains(lower, "pre-invoke") || strings.Contains(lower, "post-invoke") || strings.Contains(lower, "proxy") || strings.Contains(lower, "chroot-directory") || strings.Contains(lower, "admindir") || strings.Contains(lower, "root") && strings.Contains(lower, "::") {
-				return PackageObservation{Reason: "ambient_apt_dpkg_override"}, nil
+			if strings.Contains(lower, "proxy") || strings.Contains(lower, "chroot-directory") || strings.Contains(lower, "admindir") || strings.Contains(lower, "root") && strings.Contains(lower, "::") {
+				return PackageObservation{Reason: "apt_dpkg_configuration_override"}, nil
 			}
 			_, _ = hasher.Write(value)
 		}
@@ -199,7 +199,11 @@ func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) 
 	}
 	_, _ = hasher.Write(status)
 	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: ""}, nil
+	reason := ""
+	if !confinement.BPFLSMActive() {
+		reason = "BPF LSM unavailable; running with weaker isolation"
+	}
+	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot, Reason: reason}, nil
 }
 
 type InstalledPackageTuple struct {

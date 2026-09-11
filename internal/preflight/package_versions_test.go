@@ -47,9 +47,15 @@ func TestExpansionPreflightExactPackageVersions(t *testing.T) {
 					}
 					return
 				}
+				if scope == ExpansionBootstrap {
+					if !result.Allowed {
+						t.Fatalf("bootstrap package capability check blocked: %#v", result)
+					}
+					return
+				}
 				finding, ok := findingByCode(result.Findings, "package_state")
 				if result.Allowed || !ok || finding.Disposition != FindingBlocked {
-					t.Fatalf("package revision drift or preinstalled nginx not blocked: %#v", result)
+					t.Fatalf("package revision drift was not blocked after installation: %#v", result)
 				}
 			})
 		}

@@ -21,6 +21,22 @@ import (
 
 const SchemaVersion = "lanpanel.managed.confinement.v1"
 
+// BPFLSMActive reports whether the kernel enabled the BPF LSM at boot. The
+// compatibility installer may run without it; callers must report the weaker
+// isolation rather than treating its absence as an installation failure.
+func BPFLSMActive() bool {
+	data, err := os.ReadFile("/sys/kernel/security/lsm")
+	if err != nil {
+		return false
+	}
+	for _, value := range strings.Split(strings.TrimSpace(string(data)), ",") {
+		if strings.TrimSpace(value) == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
 type Profile struct {
 	SchemaVersion         string   `json:"schema_version"`
 	KernelRelease         string   `json:"kernel_release"`

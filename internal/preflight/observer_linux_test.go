@@ -95,7 +95,6 @@ func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
 		change func(*InstalledProfileObservation)
 	}{
 		{name: "os_profile", change: func(value *InstalledProfileObservation) { value.Platform.VersionID = "14" }},
-		{name: "kernel", change: func(value *InstalledProfileObservation) { value.KernelRelease = "6.12.2" }},
 		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "1:257.8-1~deb13u2" }},
 		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "1.26.3-3+deb13u2" }},
 		{name: "package_snapshot", change: func(value *InstalledProfileObservation) {

@@ -137,12 +137,11 @@ func (auditor *LinuxAuditor) PreflightReadiness(ctx context.Context, repositorie
 	if auditor == nil || auditor.launcher == nil {
 		return "", fmt.Errorf("package auditor is unavailable")
 	}
-	plan := Plan{Repositories: append([]Repository(nil), repositories...)}
-	configuration, observedRepositories, err := auditor.readConfiguration(ctx, plan)
+	configuration, observedRepositories, err := auditor.readConfiguration(ctx, Plan{})
 	if err != nil {
 		return "", err
 	}
-	if err := ValidateAPTConfiguration(configuration, observedRepositories, repositories); err != nil {
+	if err := ValidateAPTConfigurationBasic(configuration, observedRepositories); err != nil {
 		return "", err
 	}
 	dpkg, _, packages, err := auditor.readDPKG(ctx, nil)
@@ -586,9 +585,20 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 		files = append(files, observed...)
 	}
 	slices.SortFunc(files, func(left, right ObservedConfig) int { return strings.Compare(left.Path, right.Path) })
+	basic := len(plan.Repositories) == 0
 	repositories, err := parseObservedRepositories(files, plan.Repositories)
+	if err != nil && !basic {
+		// Existing host sources need not match the release transaction plan.
+		// They are still parsed and signature-checked before the transaction
+		// installs its exact source set.
+		repositories, err = parseObservedRepositories(files, nil)
+		basic = true
+	}
 	if err != nil {
 		return nil, nil, err
+	}
+	if auditor.strict && len(repositories) == 0 {
+		return nil, nil, fmt.Errorf("APT has no configured repository")
 	}
 	keyrings := map[string][]byte{}
 	for _, file := range files {
@@ -596,10 +606,19 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 			keyrings[file.Path] = file.Bytes
 		}
 	}
+	if basic {
+		if err := auditor.bindObservedRepositoryKeyrings(repositories, keyrings); err != nil {
+			return nil, nil, err
+		}
+	}
 	for index := range repositories {
 		repositories[index].KeyringDigest = digestBytes(keyrings[repositories[index].KeyringPath])
 	}
-	if err := auditor.observeRepositoryMetadata(ctx, repositories, keyrings, plan.Packages); err != nil {
+	var expectedPackages []Package
+	if !basic {
+		expectedPackages = plan.Packages
+	}
+	if err := auditor.observeRepositoryMetadata(ctx, repositories, keyrings, expectedPackages); err != nil {
 		return nil, nil, err
 	}
 	return files, repositories, nil
@@ -705,6 +724,42 @@ func canonicalAuditPath(path string, kind ConfigKind, strict bool) string {
 	}
 }
 
+func (auditor *LinuxAuditor) bindObservedRepositoryKeyrings(repositories []ObservedRepository, keyrings map[string][]byte) error {
+	for index := range repositories {
+		repository := &repositories[index]
+		if repository.KeyringPath == "" {
+			prefix, err := aptListRepositoryPrefix(repository.URI, repository.Suite)
+			if err != nil {
+				return err
+			}
+			release, _, err := auditor.readFileAndStat(filepath.Join(auditor.aptListsRoot, prefix+"InRelease"), maximumRepositoryMetadataFileBytes)
+			if err != nil {
+				return fmt.Errorf("read signed InRelease for repository %q: %w", repository.URI, err)
+			}
+			paths := make([]string, 0, len(keyrings))
+			for path := range keyrings {
+				if strings.HasPrefix(path, "/usr/share/keyrings/") || strings.HasPrefix(path, "/etc/apt/trusted.gpg") {
+					paths = append(paths, path)
+				}
+			}
+			slices.Sort(paths)
+			for _, path := range paths {
+				if _, err := verifyInRelease(release, keyrings[path]); err == nil {
+					repository.KeyringPath = path
+					break
+				}
+			}
+			if repository.KeyringPath == "" {
+				return fmt.Errorf("repository %q has no trusted keyring for its signed InRelease", repository.URI)
+			}
+		}
+		repository.ID = "host-" + digestBytes([]byte(repository.URI + "\x00" + repository.Suite))[:32]
+		repository.Enabled = true
+	}
+	slices.SortFunc(repositories, func(left, right ObservedRepository) int { return strings.Compare(left.ID, right.ID) })
+	return nil
+}
+
 func parseObservedRepositories(files []ObservedConfig, expected []Repository) ([]ObservedRepository, error) {
 	parsed := []ObservedRepository{}
 	for _, file := range files {
@@ -719,6 +774,10 @@ func parseObservedRepositories(files []ObservedConfig, expected []Repository) ([
 	}
 	result := make([]ObservedRepository, 0, len(parsed))
 	for _, observed := range parsed {
+		if len(expected) == 0 {
+			result = append(result, observed)
+			continue
+		}
 		matched := false
 		for _, want := range expected {
 			keyringMatches := observed.KeyringPath == want.KeyringPath

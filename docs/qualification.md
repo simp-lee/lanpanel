@@ -1,5 +1,12 @@
 # GA Qualification Tooling
 
+> **Current delivery note:** the default fast-install path is temporarily a
+> compatibility-first Preview. It does not require an active BPF LSM and does
+> not reject normal distro-provided APT/dpkg hooks; preflight records
+> `BPF LSM unavailable; running with weaker isolation` when applicable. This
+> Preview must not be described as hardened GA or as complete qualification
+> evidence.
+
 This tooling is for release operators. It does not add a supported LanPanel management CLI. The installed binary exposes only fixed, unsupported qualification-agent and fixture roles used by the protected harness.
 
 ## Local deterministic gate

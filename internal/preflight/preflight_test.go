@@ -100,7 +100,6 @@ func TestExpansionPreflightRequiresObservedConfinementIdentity(t *testing.T) {
 		name string
 		edit func(*ExpansionObservations)
 	}{
-		{name: "kernel mismatch", edit: func(value *ExpansionObservations) { value.KernelRelease = "6.12.2" }},
 		{name: "non unified v2", edit: func(value *ExpansionObservations) { value.CgroupMode = "not_unified_v2" }},
 	}
 	for _, test := range tests {

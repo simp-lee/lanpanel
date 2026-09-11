@@ -294,23 +294,28 @@ func ClosureDigest(packages []Package) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func ValidateAPTConfiguration(files []ObservedConfig, repositories []ObservedRepository, expected []Repository) error {
-	if len(files) == 0 || len(files) > 1024 {
-		return fmt.Errorf("APT/dpkg configuration inventory is empty or unbounded")
+// ValidateAPTConfigurationBasic checks the functional APT/dpkg prerequisites
+// and signed repository observations without requiring the host's pre-existing
+// sources or distro-provided hooks to match the eventual transaction plan.
+func ValidateAPTConfigurationBasic(files []ObservedConfig, repositories []ObservedRepository) error {
+	if _, err := validateAPTConfigurationFiles(files); err != nil {
+		return err
 	}
-	previous := ""
-	observedKeyrings := map[string]string{}
-	for _, file := range files {
-		if !validConfigPath(file.Kind, file.Path) || file.UID != 0 || file.GID != 0 || file.Mode&0o022 != 0 || !file.Regular || file.Linked || !file.ParentsSafe || len(file.Bytes) > 1<<20 || previous != "" && strings.Compare(previous, file.Path) >= 0 {
-			return fmt.Errorf("APT/dpkg configuration path, owner, type, mode, parent, or order is unsafe")
+	if len(repositories) > 16 {
+		return fmt.Errorf("APT repository configuration is unbounded")
+	}
+	for _, repository := range repositories {
+		if !repository.Enabled || repository.KeyringPath == "" || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) {
+			return fmt.Errorf("APT repository signature or metadata identity is incomplete")
 		}
-		if file.Kind == APTKeyring {
-			digest := sha256.Sum256(file.Bytes)
-			observedKeyrings[file.Path] = hex.EncodeToString(digest[:])
-		} else if forbiddenAPTConfiguration(file.Bytes) {
-			return fmt.Errorf("APT/dpkg configuration contains a hook, executable override, ambient proxy, or dangerous option")
-		}
-		previous = file.Path
+	}
+	return nil
+}
+
+func ValidateAPTConfiguration(files []ObservedConfig, repositories []ObservedRepository, expected []Repository) error {
+	observedKeyrings, err := validateAPTConfigurationFiles(files)
+	if err != nil {
+		return err
 	}
 	if err := validateRepositoryObservations(repositories, expected); err != nil {
 		return err
@@ -322,6 +327,27 @@ func ValidateAPTConfiguration(files []ObservedConfig, repositories []ObservedRep
 		}
 	}
 	return nil
+}
+
+func validateAPTConfigurationFiles(files []ObservedConfig) (map[string]string, error) {
+	if len(files) == 0 || len(files) > 1024 {
+		return nil, fmt.Errorf("APT/dpkg configuration inventory is empty or unbounded")
+	}
+	previous := ""
+	observedKeyrings := map[string]string{}
+	for _, file := range files {
+		if !validConfigPath(file.Kind, file.Path) || file.UID != 0 || file.GID != 0 || file.Mode&0o022 != 0 || !file.Regular || file.Linked || !file.ParentsSafe || len(file.Bytes) > 1<<20 || previous != "" && strings.Compare(previous, file.Path) >= 0 {
+			return nil, fmt.Errorf("APT/dpkg configuration path, owner, type, mode, parent, or order is unsafe")
+		}
+		if file.Kind == APTKeyring {
+			digest := sha256.Sum256(file.Bytes)
+			observedKeyrings[file.Path] = hex.EncodeToString(digest[:])
+		} else if forbiddenAPTConfiguration(file.Bytes) {
+			return nil, fmt.Errorf("APT/dpkg configuration contains an unsafe proxy, executable override, or dangerous option")
+		}
+		previous = file.Path
+	}
+	return observedKeyrings, nil
 }
 
 func validateRepositoryObservations(observed []ObservedRepository, expected []Repository) error {
@@ -462,7 +488,7 @@ func forbiddenAPTConfiguration(data []byte) bool {
 	}
 	flush()
 	for index, word := range words {
-		if word == "pre-invoke" || word == "post-invoke" || word == "pre-install-pkgs" || word == "status-logger" || word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" {
+		if word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" {
 			return true
 		}
 		if index > 0 && (words[index-1] == "http" || words[index-1] == "https" || words[index-1] == "ftp") && word == "proxy" {

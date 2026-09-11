@@ -187,6 +187,9 @@ type kernelBTFLayout struct {
 }
 
 func ensureListenGuard(resourceID string, uid uint32, policy confinement.UnitPolicy) error {
+	if !confinement.BPFLSMActive() {
+		return nil
+	}
 	listenGuardMu.Lock()
 	defer listenGuardMu.Unlock()
 	if uid == 0 || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" {
@@ -220,6 +223,9 @@ func ensureListenGuard(resourceID string, uid uint32, policy confinement.UnitPol
 }
 
 func verifyListenGuard(resourceID string, uid uint32, policy confinement.UnitPolicy) error {
+	if !confinement.BPFLSMActive() {
+		return nil
+	}
 	listenGuardMu.Lock()
 	defer listenGuardMu.Unlock()
 	if uid == 0 || policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" || len(resourceID) != 36 || !strings.HasPrefix(resourceID, "res_") || len(policy.Digest) != 71 {
@@ -266,6 +272,9 @@ func verifyListenGuard(resourceID string, uid uint32, policy confinement.UnitPol
 }
 
 func InitializeListenGuards(running []domain.ProcessBundle) error {
+	if !confinement.BPFLSMActive() {
+		return nil
+	}
 	listenGuardMu.Lock()
 	defer listenGuardMu.Unlock()
 	if err := ensureBPFDirectory(); err != nil {
@@ -299,6 +308,9 @@ func InitializeListenGuards(running []domain.ProcessBundle) error {
 }
 
 func releaseListenGuardUID(uid uint32) error {
+	if !confinement.BPFLSMActive() {
+		return nil
+	}
 	listenGuardMu.Lock()
 	defer listenGuardMu.Unlock()
 	if uid == 0 {

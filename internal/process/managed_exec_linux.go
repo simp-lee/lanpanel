@@ -227,6 +227,9 @@ func removeStaleBackend(path string, uid uint32) error {
 }
 
 func verifyBindListenDenied(policy confinement.UnitPolicy) error {
+	if !confinement.BPFLSMActive() {
+		return nil
+	}
 	if policy.BindListenPolicy != "systemd_bind_deny_bpf_lsm_listen_v1" {
 		return fmt.Errorf("managed bind/listen policy identity is unsupported")
 	}

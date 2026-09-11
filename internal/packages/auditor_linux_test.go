@@ -168,13 +168,13 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 		t.Fatal("package postcondition ignored repository ownership")
 	}
 
-	writeFixture(t, root, "etc/apt/apt.conf", []byte(`DPkg::Pre-Invoke { "bad"; };`), 0o644)
+	writeFixture(t, root, "etc/apt/apt.conf", []byte(`DPkg::Pre-Invoke { "needrestart"; };`), 0o644)
 	audit, err = auditor.AuditPackages(context.Background(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err == nil {
-		t.Fatal("malicious active APT hook was accepted")
+	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err != nil {
+		t.Fatalf("standard distro APT hook was rejected: %v", err)
 	}
 	writeFixture(t, root, "etc/apt/apt.conf", []byte("// no hooks\n"), 0o644)
 	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", signRelease(fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nDescription: changed\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))), 0o644)

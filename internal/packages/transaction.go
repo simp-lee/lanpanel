@@ -160,7 +160,7 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	if err != nil {
 		return Journal{}, fmt.Errorf("package transaction preflight audit: %w", err)
 	}
-	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err != nil {
+	if err := ValidateAPTConfigurationBasic(audit.Configuration, audit.Repositories); err != nil {
 		return Journal{}, err
 	}
 	if err := ValidateDPKGReady(audit.DPKG); err != nil {

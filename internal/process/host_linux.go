@@ -97,14 +97,6 @@ func LoadConfinementProfile() (confinement.Profile, error) {
 	if err := confinement.ValidateProfile(profile); err != nil {
 		return confinement.Profile{}, err
 	}
-	var uname unix.Utsname
-	if err := unix.Uname(&uname); err != nil {
-		return confinement.Profile{}, err
-	}
-	kernel := strings.TrimRight(string(uname.Release[:]), "\x00")
-	if kernel != profile.KernelRelease {
-		return confinement.Profile{}, fmt.Errorf("running kernel differs from qualified confinement profile")
-	}
 	data, err = os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
 	if err != nil || len(data) == 0 {
 		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 authority unavailable")

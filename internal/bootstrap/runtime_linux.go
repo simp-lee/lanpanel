@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"lanpanel/internal/confinement"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
@@ -43,6 +44,9 @@ func RunRuntimeGuard(args []string) error {
 	}
 	if _, err = ensureDirectory("/run/lanpanel-goaccess", filetxn.Owner{UID: 0, GID: uint32(nginxGID)}, 0o750); err != nil {
 		return err
+	}
+	if !confinement.BPFLSMActive() {
+		return nil
 	}
 	return ensureBPFGuardDirectory()
 }
