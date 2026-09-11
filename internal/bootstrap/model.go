@@ -122,7 +122,17 @@ type Commit struct {
 	JournalSequence uint64    `json:"journal_sequence"`
 	BundleDigest    string    `json:"bundle_digest"`
 	ArtifactDigest  string    `json:"artifact_inventory_digest"`
+	OwnershipDigest string    `json:"ownership_inventory_digest"`
 	CommittedAt     time.Time `json:"committed_at"`
+}
+
+type OwnershipInventory struct {
+	SchemaVersion  string            `json:"schema_version"`
+	AttemptID      string            `json:"attempt_id"`
+	InstallationID string            `json:"installation_id"`
+	GenerationID   string            `json:"generation_id"`
+	Paths          []string          `json:"paths"`
+	Artifacts      map[string]string `json:"artifacts"`
 }
 
 func FixedManagedPathRequirements(paths Paths) []preflight.ManagedPathRequirement {

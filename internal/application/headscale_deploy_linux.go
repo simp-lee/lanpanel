@@ -26,6 +26,7 @@ import (
 type HeadscaleCertificateConfig struct {
 	ChallengeMethod     string `json:"challenge_method"`
 	DirectoryURL        string `json:"directory_url"`
+	AccountEmail        string `json:"account_email"`
 	TermsAccepted       bool   `json:"terms_accepted"`
 	DNSProvider         string `json:"dns_provider,omitempty"`
 	ProviderProfilePath string `json:"provider_profile_path,omitempty"`
@@ -52,6 +53,11 @@ type HeadscaleDeployAuthority struct {
 }
 
 func loadHeadscaleCertificateBinding(request HeadscaleCertificateConfig) (acme.Binding, error) {
+	if request.AccountEmail != "" {
+		if err := acmeaccount.WriteContact(request.AccountEmail); err != nil {
+			return acme.Binding{}, err
+		}
+	}
 	accountContact, accountKeyFingerprint, contactErr := readManagedACMEAccountAuthority()
 	if contactErr != nil {
 		return acme.Binding{}, contactErr

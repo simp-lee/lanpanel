@@ -217,7 +217,14 @@ func readCommittedReleaseIdentity() (release.InstallIdentity, error) {
 
 func readManagedACMEAccountAuthority() (string, string, error) {
 	bundle, err := readCommittedInstallationAuthority()
-	return "", bundle.ACMEAccountKeyFingerprint, err
+	if err != nil {
+		return "", "", err
+	}
+	contact, err := acmeaccount.ReadContact()
+	if err != nil {
+		return "", "", fmt.Errorf("ACME contact is not configured in the authenticated Management UI: %w", err)
+	}
+	return contact, bundle.ACMEAccountKeyFingerprint, nil
 }
 
 func decodeProtectedCanonical(data []byte, destination any) error {

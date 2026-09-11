@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/application"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/child"
@@ -873,6 +874,11 @@ func RunRole(args []string) error {
 		if err != nil {
 			_ = unix.Kill(os.Getpid(), unix.SIGTERM)
 			return ExecutionResult{}, err
+		}
+		if candidate.Publication.DomainHTTPS != nil && candidate.Publication.DomainHTTPS.Certificate != nil && candidate.Publication.DomainHTTPS.Certificate.AccountEmail != "" {
+			if err := acmeaccount.WriteContact(candidate.Publication.DomainHTTPS.Certificate.AccountEmail); err != nil {
+				return ExecutionResult{}, err
+			}
 		}
 		digest, err := resource.ConfigDigest(candidate)
 		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID}}, err

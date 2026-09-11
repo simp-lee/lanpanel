@@ -12,12 +12,16 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
 const (
-	ManagedKeyPath  = "/var/lib/lanpanel/installation/acme-account.key"
-	MaximumKeyBytes = 4096
+	ManagedKeyPath      = "/var/lib/lanpanel/installation/acme-account.key"
+	ManagedContactPath  = "/var/lib/lanpanel/installation/acme-account.contact"
+	MaximumKeyBytes     = 4096
+	MaximumContactBytes = 254
 )
 
 func ValidContact(value string) bool {
@@ -56,6 +60,48 @@ func validLocalContactByte(value byte) bool {
 
 func validDomainContactByte(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '-'
+}
+
+func ReadContact() (string, error) {
+	data, err := os.ReadFile(ManagedContactPath)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 || len(data) > MaximumContactBytes || strings.TrimSpace(string(data)) != string(data) || !ValidContact(string(data)) {
+		return "", fmt.Errorf("managed ACME contact is missing or invalid")
+	}
+	return string(data), nil
+}
+
+func WriteContact(value string) error {
+	if !ValidContact(value) {
+		return fmt.Errorf("managed ACME contact is invalid")
+	}
+	if err := os.MkdirAll(filepath.Dir(ManagedContactPath), 0o700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(ManagedContactPath), ".contact-")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer func() { _ = os.Remove(name) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := io.WriteString(temporary, value); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, ManagedContactPath)
 }
 
 func Generate(reader io.Reader) ([]byte, error) {

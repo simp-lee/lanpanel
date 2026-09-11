@@ -76,6 +76,9 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
+	if err := validateArtifactDirectory(bundleDir, paths); err != nil {
+		return nil, identity.Material{}, err
+	}
 	assetPaths := make(map[string]string, len(paths)-2)
 	for _, path := range paths {
 		if path == "release.json" || path == "SHA256SUMS" {
@@ -138,7 +141,7 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 }
 
 func bindPublicPackagePlan(template packages.Plan, identityValue release.InstallIdentity, material identity.Material, request preflight.ExpansionRequest, result preflight.Result, now time.Time, releaseDigest string) (packages.Plan, error) {
-	if template.Mode != packages.DistroRepository || packages.ValidatePlan(template) != nil {
+	if packages.ValidatePublicReleasePlan(template) != nil {
 		return packages.Plan{}, fmt.Errorf("public package template is not a valid distro repository plan")
 	}
 	if !identity.ValidateAttemptID(material.AttemptID) || material.SafetyGeneration == 0 || request.Scope != preflight.ExpansionBootstrap || request.Target != "installation" || request.Generation != material.SafetyGeneration || len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Address != material.Authority.Address || request.BootstrapListeners[0].Port != material.Authority.Port || preflight.RequireExpansionResultForRequest(result, request, now.UTC()) != nil {
@@ -162,6 +165,44 @@ func bindPublicPackagePlan(template packages.Plan, identityValue release.Install
 		return packages.Plan{}, err
 	}
 	return plan, nil
+}
+
+func validateArtifactDirectory(root string, expected []string) error {
+	allowed := map[string]bool{"release.json": true}
+	for _, path := range expected {
+		allowed[path] = true
+	}
+	seen := make(map[string]bool, len(allowed))
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil || !release.ValidRelativePath(filepath.ToSlash(relative)) {
+			return fmt.Errorf("public release artifact path is unsafe")
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() || !allowed[relative] || seen[relative] {
+			return fmt.Errorf("public release artifact contains an unexpected or duplicate asset %q", relative)
+		}
+		seen[relative] = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for path := range allowed {
+		if !seen[path] && path != "release.json" {
+			return fmt.Errorf("public release artifact asset %q is missing", path)
+		}
+	}
+	return nil
 }
 
 func readCurrentExecutable(maximum uint64) ([]byte, error) {

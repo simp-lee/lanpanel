@@ -20,7 +20,7 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 sudo ./lanpanel install
 ```
 
-程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、Ed25519 detached signature、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。每个固定版本会发布带固定版本和 digest 的 bootstrap 命令；它在受保护临时目录验证同一材料后调用该命令，不使用 pipe-to-shell 或在线 fallback。
+程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、Ed25519 detached signature、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。每个固定版本会发布带固定版本和 digest 的 bootstrap 脚本（仓库生成器为 `scripts/generate-preview-bootstrap.sh`）；它在受保护临时目录验证同一材料后调用该命令，不使用 pipe-to-shell 或在线 fallback。
 
 installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、signed repository/key metadata、exact package set/version，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
 

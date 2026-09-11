@@ -348,6 +348,7 @@ type GoAccessPublication struct {
 type CertificateRequest struct {
 	ChallengeMethod     string `json:"challenge_method"`
 	DirectoryURL        string `json:"directory_url"`
+	AccountEmail        string `json:"account_email,omitempty"`
 	TermsAccepted       bool   `json:"terms_accepted"`
 	DNSProvider         string `json:"dns_provider,omitempty"`
 	ProviderProfilePath string `json:"provider_profile_path,omitempty"`

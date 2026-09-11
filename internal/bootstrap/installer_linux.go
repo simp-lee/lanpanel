@@ -372,6 +372,10 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return err
 		}
 		journal.ArtifactDigests[journal.Paths.BinaryPath] = journal.Release.Binary.Digest
+		if err := putOrVerifyTargetFile(ctx, publicCommandPath(journal.Paths), request.SourceBinary, 0o755); err != nil {
+			return err
+		}
+		journal.ArtifactDigests[publicCommandPath(journal.Paths)] = journal.Release.Binary.Digest
 		journal.ArtifactDigests["/usr/sbin/policy-rc.d"] = journal.Release.Binary.Digest
 		if _, err := ensureDirectory(journal.Paths.PersistentRoot, filetxn.Owner{UID: 0, GID: 0}, 0o711); err != nil {
 			return err
@@ -500,6 +504,10 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return err
 		}
 		journal.ArtifactDigests[journal.Paths.BinaryPath] = journal.Release.Binary.Digest
+		if err := putOrVerifyTargetFile(ctx, publicCommandPath(journal.Paths), request.SourceBinary, 0o755); err != nil {
+			return err
+		}
+		journal.ArtifactDigests[publicCommandPath(journal.Paths)] = journal.Release.Binary.Digest
 		sysusers, err := identity.RenderSysusers(journal.Accounts)
 		if err != nil {
 			return err
@@ -587,6 +595,14 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			}
 			journal.ArtifactDigests[path] = digestBytes(data)
 		}
+		_, ownershipBytes, ownershipDigest, err := buildOwnershipInventory(journal)
+		if err != nil {
+			return err
+		}
+		if err := putOrVerifyTargetFile(ctx, ownershipInventoryPath(journal.Paths), ownershipBytes, 0o600); err != nil {
+			return err
+		}
+		journal.ArtifactDigests[ownershipInventoryPath(journal.Paths)] = ownershipDigest
 		if err := advance(PhaseAssetsInstalled); err != nil {
 			return err
 		}
@@ -603,7 +619,15 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err != nil {
 			return err
 		}
-		commit := Commit{SchemaVersion: CommitSchemaVersion, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, JournalSequence: journal.Sequence + 1, BundleDigest: digestBytes(bundleDocument), ArtifactDigest: artifactInventoryDigest(journal.ArtifactDigests), CommittedAt: currentTime}
+		ownershipBytes, ownershipErr := readCommittedArtifact(ownershipInventoryPath(journal.Paths), MaximumJournalBytes, 0o600)
+		if ownershipErr != nil {
+			return ownershipErr
+		}
+		var ownership OwnershipInventory
+		if decodeCanonical(ownershipBytes, &ownership) != nil || validateOwnershipInventory(ownership, journal) != nil {
+			return fmt.Errorf("installation ownership inventory is invalid before commit")
+		}
+		commit := Commit{SchemaVersion: CommitSchemaVersion, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, JournalSequence: journal.Sequence + 1, BundleDigest: digestBytes(bundleDocument), ArtifactDigest: artifactInventoryDigest(journal.ArtifactDigests), OwnershipDigest: digestBytes(ownershipBytes), CommittedAt: currentTime}
 		commitBytes, _ := encodeCanonical(commit)
 		if existing, err := readCommittedArtifact(journal.Paths.CommitPath, MaximumJournalBytes, 0o644); err == nil {
 			var prior Commit
@@ -644,6 +668,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err := verifyCommittedBundle(journal.Paths, journal, commit); err != nil {
 			return err
 		}
+		if err := verifyCommittedOwnership(journal.Paths, journal, commit); err != nil {
+			return err
+		}
 		if strict {
 			launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
 			if err != nil {
@@ -673,6 +700,9 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return fmt.Errorf("activated bootstrap commit differs from journal")
 		}
 		if err := verifyCommittedBundle(journal.Paths, journal, commit); err != nil {
+			return err
+		}
+		if err := verifyCommittedOwnership(journal.Paths, journal, commit); err != nil {
 			return err
 		}
 		if len(journal.InstallerInput) != 0 {
@@ -926,7 +956,7 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, managem
 }
 
 func scanExistingEvidence(paths Paths) ([]string, error) {
-	candidates := []string{paths.CommitPath, paths.StartupAuthority, paths.PersistentRoot, paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, filepath.Dir(paths.BinaryPath)}
+	candidates := []string{paths.CommitPath, paths.StartupAuthority, paths.PersistentRoot, paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, publicCommandPath(paths), filepath.Dir(paths.BinaryPath)}
 	nginxPaths := nginx.FixedPaths()
 	if paths != FixedPaths() {
 		nginxPaths = testNginxPaths(paths)
@@ -1043,13 +1073,25 @@ func bootstrapArtifactMode(journal Journal, path string) uint32 {
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)
 	}
-	if path == journal.Paths.ACMEAccountKey || path == journal.Paths.SysusersPath || path == nginxPaths.MainPath() || path == nginxPaths.SanitizerPath() || path == filepath.Join(filepath.Dir(journal.Release.Headscale.InstallPath), filepath.Base(journal.Release.Headscale.Archive.Path)) {
+	if path == journal.Paths.ACMEAccountKey || path == journal.Paths.SysusersPath || path == ownershipInventoryPath(journal.Paths) || path == nginxPaths.MainPath() || path == nginxPaths.SanitizerPath() || path == filepath.Join(filepath.Dir(journal.Release.Headscale.InstallPath), filepath.Base(journal.Release.Headscale.Archive.Path)) {
 		return 0o600
 	}
 	if strings.HasSuffix(path, ".service") || strings.HasSuffix(path, ".socket") || strings.HasSuffix(path, ".timer") {
 		return 0o644
 	}
 	return 0o755
+}
+
+func verifyCommittedOwnership(paths Paths, journal Journal, commit Commit) error {
+	data, err := readCommittedArtifact(ownershipInventoryPath(paths), MaximumJournalBytes, 0o600)
+	if err != nil || digestBytes(data) != commit.OwnershipDigest {
+		return fmt.Errorf("committed ownership inventory differs from final commit")
+	}
+	var inventory OwnershipInventory
+	if decodeCanonical(data, &inventory) != nil || validateOwnershipInventory(inventory, journal) != nil {
+		return fmt.Errorf("committed ownership inventory is invalid")
+	}
+	return nil
 }
 
 func verifyCommittedBundle(paths Paths, journal Journal, commit Commit) error {
@@ -1137,7 +1179,7 @@ func RequireCommitted(paths Paths) error {
 		return fmt.Errorf("bootstrap final commit is missing or unsafe: %w", err)
 	}
 	var commit Commit
-	if decodeCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != CommitSchemaVersion {
+	if decodeCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != CommitSchemaVersion || !release.ValidDigest(commit.OwnershipDigest) {
 		return fmt.Errorf("bootstrap final commit is invalid")
 	}
 	store, journal, err := openJournal(paths.Journal, 0, 0)
@@ -1145,8 +1187,11 @@ func RequireCommitted(paths Paths) error {
 		return fmt.Errorf("bootstrap fence is active or missing: %w", err)
 	}
 	defer func(ignore func() error) { _ = ignore() }(store.close)
-	if (journal.Phase != PhaseActivated && journal.Phase != PhaseCommitted) || !release.ValidDigest(journal.FinalCommitDigest) || digestBytes(commitBytes) != journal.FinalCommitDigest || commit.AttemptID != journal.AttemptID || commit.InstallationID != journal.InstallationID || commit.GenerationID != journal.GenerationID {
+	if (journal.Phase != PhaseActivated && journal.Phase != PhaseCommitted) || !release.ValidDigest(journal.FinalCommitDigest) || !release.ValidDigest(commit.OwnershipDigest) || digestBytes(commitBytes) != journal.FinalCommitDigest || commit.AttemptID != journal.AttemptID || commit.InstallationID != journal.InstallationID || commit.GenerationID != journal.GenerationID {
 		return fmt.Errorf("bootstrap fence is active")
 	}
-	return verifyCommittedBundle(paths, journal, commit)
+	if err := verifyCommittedBundle(paths, journal, commit); err != nil {
+		return err
+	}
+	return verifyCommittedOwnership(paths, journal, commit)
 }

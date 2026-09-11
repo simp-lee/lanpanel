@@ -753,7 +753,7 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if !strings.Contains(appJS, `/api/actions/managed_basic_rotate/plan`) || !strings.Contains(appJS, `confirmation:"rotate"`) {
 		t.Fatal("Managed Basic rotate does not use a Plan")
 	}
-	if strings.Contains(response.Body.String(), `name="account_key_path"`) || strings.Contains(appJS, "account_key_path") || strings.Contains(response.Body.String(), `name="account_email"`) || strings.Contains(appJS, "account_email") || strings.Count(response.Body.String(), "installation-managed ACME account key") != 2 {
+	if strings.Contains(response.Body.String(), `name="account_key_path"`) || strings.Contains(appJS, "account_key_path") || strings.Count(response.Body.String(), "installation-managed ACME account key") != 2 {
 		t.Fatal("ACME account key is still caller-selected or its managed authority is not disclosed")
 	}
 	for _, field := range []string{"control_domain", "magicdns_namespace"} {

@@ -4,6 +4,7 @@ package application
 
 import (
 	"fmt"
+	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/htpasswdref"
 	"slices"
@@ -36,6 +37,9 @@ func DomainPublicationCandidate(update DomainPublicationUpdate) (domain.AppResou
 	}
 	if err := requireAppliedDomainSourcesHealthy(resource); err != nil {
 		return domain.AppResource{}, err
+	}
+	if update.Publication.Certificate != nil && !acmeaccount.ValidContact(update.Publication.Certificate.AccountEmail) {
+		return domain.AppResource{}, fmt.Errorf("ACME account contact is invalid")
 	}
 	priorCredential, priorGoAccessCredential := "", ""
 	if resource.Publication.DomainHTTPS != nil {

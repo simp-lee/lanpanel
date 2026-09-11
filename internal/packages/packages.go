@@ -195,6 +195,23 @@ func ValidateRepositories(repositories []Repository) error {
 	return validateRepositories(repositories)
 }
 
+// ValidatePublicReleasePlan narrows the generic transaction validator to the
+// only package source exposed by the public release contract.
+func ValidatePublicReleasePlan(plan Plan) error {
+	if err := ValidatePlan(plan); err != nil {
+		return err
+	}
+	if plan.Mode != DistroRepository || plan.Proxy != nil {
+		return fmt.Errorf("public release package plan must use signed OfficialDistro without a proxy")
+	}
+	for _, pkg := range plan.Packages {
+		if pkg.Source.Kind != sources.OfficialDistro || pkg.Source.URL != "" || pkg.Source.OfflinePath != "" || len(pkg.Source.OfficialAuthorities) != 0 {
+			return fmt.Errorf("public release package source is not the release-bound OfficialDistro authority")
+		}
+	}
+	return nil
+}
+
 func ValidatePlan(plan Plan) error {
 	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(plan.OSProfileDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
 		return fmt.Errorf("package transaction identity, bounds, or OS profile are invalid")

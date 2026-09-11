@@ -26,7 +26,6 @@ import (
 	"lanpanel/internal/publication"
 	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
-	"lanpanel/internal/sources"
 	"lanpanel/internal/storeauthority"
 	"reflect"
 	"slices"
@@ -8101,13 +8100,6 @@ func validateHeadscaleDeployBinding(operation Type, safetyBinding SafetyBinding,
 		return fmt.Errorf("headscale deploy preflight authority is invalid")
 	}
 	return nil
-}
-
-func journalProxy(value string) *sources.Proxy {
-	if value == "" {
-		return nil
-	}
-	return &sources.Proxy{URL: value}
 }
 
 func validateReservation(value Reservation) error {
