@@ -90,12 +90,15 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
 		path := inventory.Paths[index]
-		if path == paths.BinaryPath {
-			continue // remove the executing file only after every other postcondition.
+		if path == paths.BinaryPath || path == ownershipInventoryPath(paths) {
+			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts); err != nil {
 			return err
 		}
+	}
+	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}); err != nil {
+		return err
 	}
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
@@ -262,8 +265,8 @@ func removeOwnedPath(path string, artifacts map[string]string) error {
 		if err != nil || release.DigestBytes(data) != digest {
 			return fmt.Errorf("uninstall foreign residue at %q", path)
 		}
-	} else if info.Mode()&0o022 != 0 {
-		return fmt.Errorf("uninstall foreign residue at %q", path)
+	} else {
+		return fmt.Errorf("uninstall ownership digest is missing for %q", path)
 	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("uninstall could not remove %q: %w", path, err)

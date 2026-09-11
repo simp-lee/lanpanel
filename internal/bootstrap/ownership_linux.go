@@ -5,6 +5,7 @@ package bootstrap
 import (
 	"fmt"
 	"lanpanel/internal/release"
+	"os"
 	"path/filepath"
 	"slices"
 )
@@ -37,11 +38,25 @@ func buildOwnershipInventory(journal Journal) (OwnershipInventory, []byte, strin
 	if err != nil {
 		return OwnershipInventory{}, nil, "", err
 	}
-	artifacts := make(map[string]string, len(journal.ArtifactDigests))
+	artifacts := make(map[string]string, len(journal.ArtifactDigests)+len(paths))
 	for path, digest := range journal.ArtifactDigests {
 		if filepath.IsAbs(path) {
 			artifacts[path] = digest
 		}
+	}
+	for _, path := range paths {
+		if _, exists := artifacts[path]; exists {
+			continue
+		}
+		info, statErr := os.Lstat(path)
+		if os.IsNotExist(statErr) || statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return OwnershipInventory{}, nil, "", fmt.Errorf("read installation ownership artifact %q: %w", path, readErr)
+		}
+		artifacts[path] = release.DigestBytes(data)
 	}
 	value := OwnershipInventory{SchemaVersion: ownershipInventorySchema, AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Paths: paths, Artifacts: artifacts}
 	data, err := encodeCanonical(value)
@@ -55,12 +70,21 @@ func validateOwnershipInventory(value OwnershipInventory, journal Journal) error
 	if value.SchemaVersion != ownershipInventorySchema || value.AttemptID != journal.AttemptID || value.InstallationID != journal.InstallationID || value.GenerationID != journal.GenerationID || len(value.Paths) == 0 || value.Paths[0] == "" {
 		return fmt.Errorf("installation ownership inventory is incomplete")
 	}
-	expected, err := ownedInventoryPaths(journal)
+	expected, err := plannedBootstrapPaths(journal.Paths)
 	if err != nil {
 		return err
 	}
-	if !slices.Equal(value.Paths, expected) {
-		return fmt.Errorf("installation ownership inventory is incomplete")
+	expected = append(expected, ownershipInventoryPath(journal.Paths))
+	slices.Sort(expected)
+	expected = slices.Compact(expected)
+	inventoryPaths := make(map[string]bool, len(value.Paths))
+	for _, path := range value.Paths {
+		inventoryPaths[path] = true
+	}
+	for _, path := range expected {
+		if !inventoryPaths[path] {
+			return fmt.Errorf("installation ownership inventory is incomplete")
+		}
 	}
 	for index, path := range value.Paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || index > 0 && value.Paths[index-1] >= path {
