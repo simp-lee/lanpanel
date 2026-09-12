@@ -57,7 +57,7 @@ func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("uninstall fenced: %w", err)
 	}
-	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only these committed LanPanel-owned paths:\n%s\nAPT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", strings.Join(scope, "\n"))
+	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only these verified LanPanel-owned paths:\n%s\nAPT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", strings.Join(scope, "\n"))
 	scanner := bufio.NewScanner(in)
 	if !scanner.Scan() || scanner.Text() != "UNINSTALL LANPANEL" {
 		return fmt.Errorf("uninstall requires exact confirmation UNINSTALL LANPANEL")
@@ -93,6 +93,30 @@ func readUninstallScope(paths Paths) ([]string, error) {
 	if err := validateOwnershipInventory(inventory, journal); err != nil {
 		return nil, fmt.Errorf("uninstall ownership inventory is invalid: %w", err)
 	}
+	manager, err := locks.Open(locks.Config{RootPath: paths.LockRoot, Owner: 0, Group: 0, Mode: 0o700})
+	if err != nil {
+		return nil, fmt.Errorf("uninstall mutation lock is unavailable: %w", err)
+	}
+	admission, err := manager.Acquire(context.Background(), locks.MutationAdmission)
+	if err != nil {
+		_ = manager.Close()
+		return nil, fmt.Errorf("uninstall mutation lock is unavailable: %w", err)
+	}
+	exposure, err := manager.Acquire(context.Background(), locks.Exposure)
+	if err != nil {
+		_ = admission.Release()
+		_ = manager.Close()
+		return nil, fmt.Errorf("uninstall exposure lock is unavailable: %w", err)
+	}
+	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
+		_ = exposure.Release()
+		_ = admission.Release()
+		_ = manager.Close()
+		return nil, err
+	}
+	_ = exposure.Release()
+	_ = admission.Release()
+	_ = manager.Close()
 	scope := append([]string(nil), inventory.Paths...)
 	slices.Sort(scope)
 	return slices.Compact(scope), nil
