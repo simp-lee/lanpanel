@@ -180,50 +180,51 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
 	}
-	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
-		return err
-	}
-	if err := removeOwnedPath(paths.CommitPath, nil, inventory.MutablePaths); err != nil {
-		return err
-	}
-	if err := removeOwnedPath(paths.StartupAuthority, nil, inventory.MutablePaths); err != nil {
-		return err
-	}
-	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
-		return err
-	}
-	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
-		return err
-	}
-	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
-		return err
-	}
-	if err := exposure.Release(); err != nil {
-		return fmt.Errorf("uninstall exposure lock release failed: %w", err)
-	}
-	if err := admission.Release(); err != nil {
-		return fmt.Errorf("uninstall mutation lock release failed: %w", err)
-	}
-	if err := manager.Close(); err != nil {
-		return fmt.Errorf("uninstall lock release failed: %w", err)
-	}
-	for _, lockName := range []string{"mutation-admission.lock", "exposure.lock"} {
-		if err := removeOwnedLockFile(filepath.Join(paths.LockRoot, lockName)); err != nil {
-			return err
-		}
-	}
-	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
-		return err
-	}
-	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
-		return err
-	}
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
+	}
+	retainFence := func(err error) error {
+		_ = stopOwnedServices(ctx, inventory.Paths)
+		return err
+	}
+	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
+	if err := removeOwnedPath(paths.CommitPath, nil, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
+	if err := removeOwnedPath(paths.StartupAuthority, nil, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
+	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
+		return retainFence(err)
+	}
+	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
+	if err := exposure.Release(); err != nil {
+		return retainFence(fmt.Errorf("uninstall exposure lock release failed: %w", err))
+	}
+	if err := admission.Release(); err != nil {
+		return retainFence(fmt.Errorf("uninstall mutation lock release failed: %w", err))
+	}
+	if err := manager.Close(); err != nil {
+		return retainFence(fmt.Errorf("uninstall lock release failed: %w", err))
+	}
+	for _, lockName := range []string{"mutation-admission.lock", "exposure.lock"} {
+		if err := removeOwnedLockFile(filepath.Join(paths.LockRoot, lockName)); err != nil {
+			return retainFence(err)
+		}
+	}
+	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
+	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return retainFence(err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
 	return nil
@@ -299,6 +300,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		return nil
 	}
 	addManagedTree := func(root string) error {
+		if !known[root] {
+			if err := add(root, true); err != nil {
+				return err
+			}
+		}
 		count := 0
 		return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 			if errors.Is(walkErr, os.ErrNotExist) {
@@ -309,6 +315,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			}
 			if entry.Type()&os.ModeSymlink != 0 {
 				return fmt.Errorf("uninstall lifecycle staging contains a symlink")
+			}
+			if path != root && !known[path] {
+				return fmt.Errorf("uninstall lifecycle staging contains foreign residue at %q", path)
 			}
 			count++
 			if count > 4096 {
