@@ -26,6 +26,8 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // RunPublicUninstall is the sole lifecycle removal entry point. It uses the
@@ -40,6 +42,13 @@ func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
 	}
 	if in == nil || out == nil {
 		return fmt.Errorf("uninstall confirmation terminal is unavailable")
+	}
+	fdReader, ok := in.(interface{ Fd() uintptr })
+	if !ok {
+		return fmt.Errorf("uninstall confirmation requires an interactive terminal")
+	}
+	if _, err := unix.IoctlGetTermios(int(fdReader.Fd()), unix.TCGETS); err != nil {
+		return fmt.Errorf("uninstall confirmation requires an interactive terminal")
 	}
 	paths := FixedPaths()
 	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only committed LanPanel-owned paths: %s, %s, %s, %s, %s, and fixed runtime assets. APT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", paths.BinaryPath, paths.PersistentRoot, paths.InstallationRoot, paths.SystemdRoot, paths.RuntimeRoot)
@@ -131,9 +140,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
 	}
-	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
-		return err
-	}
 	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
 		return err
 	}
@@ -151,10 +157,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
-	}
-	if err := os.Remove(paths.BinaryPath); err != nil {
-		_ = stopOwnedServices(ctx, inventory.Paths)
-		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
 	}
 	if err := exposure.Release(); err != nil {
 		return fmt.Errorf("uninstall exposure lock release failed: %w", err)
@@ -175,6 +177,13 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
+	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
+	if err := os.Remove(paths.BinaryPath); err != nil {
+		_ = stopOwnedServices(ctx, inventory.Paths)
+		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
 	return nil

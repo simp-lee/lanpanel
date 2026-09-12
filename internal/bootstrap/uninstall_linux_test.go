@@ -15,8 +15,8 @@ func TestUninstallRequiresExactConfirmation(t *testing.T) {
 	}
 	var output bytes.Buffer
 	err := RunPublicUninstall(nil, strings.NewReader("UNINSTALL\n"), &output)
-	if err == nil || !strings.Contains(err.Error(), "exact confirmation") {
-		t.Fatalf("wrong uninstall confirmation was accepted: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "interactive terminal") {
+		t.Fatalf("non-interactive uninstall was accepted: %v", err)
 	}
 }
 
