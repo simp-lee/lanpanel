@@ -18,10 +18,10 @@ func ownershipInventoryPath(paths Paths) string {
 }
 
 func mutableOwnershipPaths(paths Paths) []string {
-	values := []string{filepath.Join(paths.InstallationRoot, "acme-account.contact")}
+	values := []string{paths.Journal, paths.CommitPath, paths.StartupAuthority, filepath.Join(paths.InstallationRoot, "acme-account.contact")}
 	if paths == FixedPaths() {
 		controlPaths := control.FixedPaths()
-		values = append(values, controlPaths.Config, controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
+		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
 		activationPaths := control.FixedActivationPaths()
 		values = append(values, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
 	}

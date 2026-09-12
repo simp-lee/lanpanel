@@ -25,9 +25,9 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 	if paths == FixedPaths() {
 		values = append(values, domain.HeadscaleManagedPaths()...)
 		controlPaths := control.FixedPaths()
-		values = append(values, controlPaths.ConfigRoot, controlPaths.Config, controlPaths.Policy, controlPaths.Unit, controlPaths.RuntimeRoot, controlPaths.JournalRoot, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
+		values = append(values, controlPaths.ConfigRoot, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Config, controlPaths.Policy, controlPaths.Unit, controlPaths.RuntimeRoot, controlPaths.JournalRoot, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
 		activationPaths := control.FixedActivationPaths()
-		values = append(values, activationPaths.ControlRuntime, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
+		values = append(values, activationPaths.ControlRuntime, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
 	}
 	slices.Sort(values)
 	values = slices.Compact(values)

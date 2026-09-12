@@ -9,11 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/domain"
+	"lanpanel/internal/filetxn"
+	"lanpanel/internal/goaccess"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/persist"
 	"lanpanel/internal/release"
+	appresource "lanpanel/internal/resource"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -82,10 +88,14 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall exposure lock is unavailable: %w", err)
 	}
 	defer func() { _ = exposure.Release() }()
+	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
-	if err := removeOwnedAccounts(journal); err != nil {
+	accountRemoval, err := prepareOwnedAccounts(journal)
+	if err != nil {
 		return err
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
@@ -120,6 +130,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 			return err
 		}
 	}
+	if err := accountRemoval.Remove(); err != nil {
+		return err
+	}
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
@@ -128,6 +141,137 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
 	return nil
+}
+
+func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, inventory *OwnershipInventory) error {
+	if inventory == nil {
+		return fmt.Errorf("uninstall lifecycle inventory is missing")
+	}
+	store, err := persist.Open(persist.Config{RootPath: paths.StateRoot, StagingPath: filepath.Join(paths.StateRoot, ".filetxn"), StatePath: filepath.Join(paths.StateRoot, "normal.json"), Owner: structOwner(), LockAuthority: authority})
+	if err != nil {
+		return fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	document, err := store.Read()
+	if err != nil {
+		return fmt.Errorf("uninstall lifecycle state is unreadable: %w", err)
+	}
+	installation, present, err := persist.DecodeEntry[domain.Installation](document, "installations/current")
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	known := make(map[string]bool, len(inventory.Paths))
+	for _, path := range inventory.Paths {
+		known[path] = true
+	}
+	mutable := make(map[string]bool, len(inventory.MutablePaths))
+	for _, path := range inventory.MutablePaths {
+		mutable[path] = true
+	}
+	add := func(path string, mutablePath bool) error {
+		if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return fmt.Errorf("uninstall lifecycle ownership path is invalid")
+		}
+		if !known[path] {
+			inventory.Paths = append(inventory.Paths, path)
+			known[path] = true
+		}
+		if mutablePath && !mutable[path] {
+			inventory.MutablePaths = append(inventory.MutablePaths, path)
+			mutable[path] = true
+		}
+		return nil
+	}
+	addList := func(values []string, mutablePath bool) error {
+		for _, value := range values {
+			if err := add(value, mutablePath); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, app := range installation.Resources {
+		derived, err := appresource.DerivePaths(app.ID)
+		if err != nil {
+			return err
+		}
+		if err := addList(derived.ManagedPaths(), true); err != nil {
+			return err
+		}
+		if app.ManagedProcess != nil {
+			if app.ManagedProcess.Applied != nil {
+				if err := addList(app.ManagedProcess.Applied.ManagedPaths, true); err != nil {
+					return err
+				}
+				if err := addList(app.ManagedProcess.Applied.EndpointSocketUnits, true); err != nil {
+					return err
+				}
+			}
+		}
+		bundles := []*domain.PublicationBundle{app.PublicationRecord.LastAppliedBundle}
+		if intent := app.PublicationRecord.ActivationIntent; intent != nil {
+			bundles = append(bundles, &intent.Candidate, intent.Prior)
+		}
+		if intent := app.PublicationRecord.ContractionIntent; intent != nil {
+			bundles = append(bundles, intent.Candidate, intent.Prior)
+		}
+		for _, bundle := range bundles {
+			if err := addBundleGoAccess(app.ID, bundle, addList); err != nil {
+				return err
+			}
+		}
+		for _, retirement := range app.PublicationRecord.PendingGoAccessRetirements {
+			if err := addGoAccessGeneration(app.ID, retirement.Generation, retirement.StateGeneration, addList); err != nil {
+				return err
+			}
+		}
+	}
+	slices.Sort(inventory.Paths)
+	inventory.Paths = slices.Compact(inventory.Paths)
+	slices.Sort(inventory.MutablePaths)
+	inventory.MutablePaths = slices.Compact(inventory.MutablePaths)
+	return nil
+}
+
+func structOwner() filetxn.Owner { return filetxn.Owner{UID: 0, GID: 0} }
+
+func addBundleGoAccess(resourceID string, bundle *domain.PublicationBundle, addList func([]string, bool) error) error {
+	if bundle == nil || bundle.DomainHTTPS == nil {
+		return nil
+	}
+	return addGoAccessOwnership(resourceID, bundle.DomainHTTPS.GoAccess, addList)
+}
+
+func addGoAccessOwnership(resourceID string, value domain.GoAccessBundleIdentity, addList func([]string, bool) error) error {
+	if !value.Enabled {
+		return nil
+	}
+	if err := addGoAccessGeneration(resourceID, value.Generation, value.StateGeneration, addList); err != nil {
+		return err
+	}
+	return addGoAccessGeneration(resourceID, value.RetiredGeneration, value.RetiredStateGeneration, addList)
+}
+
+func addGoAccessGeneration(resourceID string, generation, stateGeneration uint64, addList func([]string, bool) error) error {
+	if generation == 0 {
+		return nil
+	}
+	if stateGeneration == 0 {
+		stateGeneration = generation
+	}
+	paths, err := goaccess.DerivePaths(resourceID, generation)
+	if err != nil {
+		return err
+	}
+	statePaths, err := goaccess.DerivePaths(resourceID, stateGeneration)
+	if err != nil {
+		return err
+	}
+	paths.StateRoot, paths.Database, paths.Report = statePaths.StateRoot, statePaths.Database, statePaths.Report
+	return addList([]string{paths.ResourceRoot, paths.StateRoot, paths.Database, paths.Report, paths.AccessLog, paths.RetainedLog, paths.RetentionOld, paths.RetentionNew, paths.RetentionState, paths.RetentionStateTemp, paths.RetentionTemp, paths.Endpoint, paths.ServiceUnit, paths.ServiceEnablement, paths.RelayUnit, paths.RelayEnablement, paths.SocketUnit, paths.SocketEnablement, paths.Sysusers, paths.RetentionUnit, paths.RetentionTimer, paths.RetentionEnablement, paths.RetentionLock}, true)
 }
 
 func stopOwnedServices(ctx context.Context, paths []string) error {
@@ -166,54 +310,92 @@ func unmaskOwnedServices(ctx context.Context, paths []string) error {
 	return nil
 }
 
-func removeOwnedAccounts(journal Journal) error {
+type ownedAccountRemoval struct {
+	sets []identity.AccountSet
+}
+
+func prepareOwnedAccounts(journal Journal) (ownedAccountRemoval, error) {
 	sets := []identity.AccountSet{journal.Accounts}
 	if data, err := os.ReadFile("/etc/sysusers.d/lanpanel-headscale.conf"); err == nil {
 		match := regexp.MustCompile(`(?m)^u ([^ ]+) -:[^ ]+ "([^"]+)" /nonexistent /usr/sbin/nologin$`).FindSubmatch(data)
 		if len(match) != 3 || !strings.Contains(string(match[2]), " headscale ") {
-			return fmt.Errorf("uninstall Headscale account authority is invalid")
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is invalid")
 		}
 		fields := strings.Fields(string(match[2]))
 		if len(fields) != 4 || fields[0] != "LanPanel" || fields[1] != journal.InstallationID || fields[2] != "headscale" || !strings.HasPrefix(string(match[1]), "lp-") {
-			return fmt.Errorf("uninstall Headscale account authority is foreign")
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is foreign")
 		}
 		set, err := identity.HeadscaleAccounts(journal.InstallationID, fields[3])
 		if err != nil || set.Specs[0].User != string(match[1]) || set.Specs[0].Comment != string(match[2]) {
-			return fmt.Errorf("uninstall Headscale account authority is foreign")
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is foreign")
 		}
 		expected, err := identity.RenderSysusers(set)
 		if err != nil || !bytes.Equal(expected, data) {
-			return fmt.Errorf("uninstall Headscale account authority is foreign")
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is foreign")
 		}
 		sets = append(sets, set)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("uninstall cannot inspect Headscale account authority: %w", err)
+		return ownedAccountRemoval{}, fmt.Errorf("uninstall cannot inspect Headscale account authority: %w", err)
 	}
 	for _, set := range sets {
-		present, _, err := identity.InspectAccounts(set)
-		if err != nil || !present {
-			return fmt.Errorf("uninstall account ownership is incomplete: %w", err)
+		complete, _, err := identity.InspectPartialAccounts(set)
+		if err != nil {
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", err)
+		}
+		if !complete {
+			present, presentErr := identity.PartialAccountEvidencePresent(set)
+			if presentErr != nil {
+				return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", presentErr)
+			}
+			if !present {
+				continue
+			}
 		}
 	}
+	return ownedAccountRemoval{sets: sets}, nil
+}
+
+func (removal ownedAccountRemoval) Remove() error {
 	removedUsers := map[string]bool{}
 	removedGroups := map[string]bool{}
-	for _, set := range sets {
+	for _, set := range removal.sets {
 		for _, spec := range set.Specs {
 			if !removedUsers[spec.User] {
-				if err := exec.Command("userdel", "--system", "--force", spec.User).Run(); err != nil {
-					return fmt.Errorf("uninstall could not remove owned account %s: %w", spec.User, err)
+				if _, lookupErr := osuser.Lookup(spec.User); lookupErr == nil {
+					if err := exec.Command("userdel", "--system", spec.User).Run(); err != nil {
+						return fmt.Errorf("uninstall could not remove owned account %s: %w", spec.User, err)
+					}
+				} else if _, ok := lookupErr.(osuser.UnknownUserError); !ok {
+					return fmt.Errorf("uninstall could not inspect owned account %s: %w", spec.User, lookupErr)
 				}
 				removedUsers[spec.User] = true
 			}
+		}
+	}
+	for _, set := range removal.sets {
+		for _, spec := range set.Specs {
 			if !removedGroups[spec.Group] {
-				if err := exec.Command("groupdel", spec.Group).Run(); err != nil {
-					return fmt.Errorf("uninstall could not remove owned group %s: %w", spec.Group, err)
+				if _, lookupErr := osuser.LookupGroup(spec.Group); lookupErr == nil {
+					if err := exec.Command("groupdel", spec.Group).Run(); err != nil {
+						return fmt.Errorf("uninstall could not remove owned group %s: %w", spec.Group, err)
+					}
+				} else if _, ok := lookupErr.(osuser.UnknownGroupError); !ok {
+					return fmt.Errorf("uninstall could not inspect owned group %s: %w", spec.Group, lookupErr)
 				}
 				removedGroups[spec.Group] = true
 			}
 		}
 	}
 	return nil
+}
+
+func mutableServiceOwnedPath(path string) bool {
+	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
+		if path == strings.TrimSuffix(root, "/") || strings.HasPrefix(path, root) {
+			return true
+		}
+	}
+	return false
 }
 
 func removeOwnedLockFile(path string) error {
@@ -269,7 +451,7 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 		if info.Mode()&0o022 != 0 {
 			return fmt.Errorf("uninstall foreign residue at %q", path)
 		}
-		if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != 0 || stat.Gid != 0 {
+		if stat, ok := info.Sys().(*syscall.Stat_t); !ok || (stat.Uid != 0 || stat.Gid != 0) && !mutableServiceOwnedPath(path) {
 			return fmt.Errorf("uninstall foreign ownership at %q", path)
 		}
 	} else {
