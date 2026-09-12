@@ -91,24 +91,25 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
 		return err
 	}
+	lifecycleInstallation, err := readLifecycleInstallation(paths, manager.Authority())
+	if err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
-	accountRemoval, err := prepareOwnedAccounts(journal)
+	accountRemoval, err := prepareOwnedAccounts(journal, lifecycleInstallation)
 	if err != nil {
 		return err
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
 		path := inventory.Paths[index]
-		if path == paths.BinaryPath || path == ownershipInventoryPath(paths) {
+		if path == paths.BinaryPath || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot {
 			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {
 			return err
 		}
-	}
-	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
-		return err
 	}
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
@@ -131,6 +132,12 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		}
 	}
 	if err := accountRemoval.Remove(); err != nil {
+		return err
+	}
+	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
+		return err
+	}
+	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
@@ -193,6 +200,13 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		}
 		return nil
 	}
+	for _, credential := range installation.Credentials {
+		if credential.ManagedPath != "" {
+			if err := add(credential.ManagedPath, true); err != nil {
+				return err
+			}
+		}
+	}
 	for _, app := range installation.Resources {
 		derived, err := appresource.DerivePaths(app.ID)
 		if err != nil {
@@ -201,12 +215,15 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		if err := addList(derived.ManagedPaths(), true); err != nil {
 			return err
 		}
-		if app.ManagedProcess != nil {
-			if app.ManagedProcess.Applied != nil {
-				if err := addList(app.ManagedProcess.Applied.ManagedPaths, true); err != nil {
-					return err
+		if app.ManagedProcess != nil && app.ManagedProcess.Applied != nil {
+			if err := addList(app.ManagedProcess.Applied.ManagedPaths, true); err != nil {
+				return err
+			}
+			for _, unit := range app.ManagedProcess.Applied.EndpointSocketUnits {
+				if unit == "" || filepath.Base(unit) != unit || strings.ContainsAny(unit, `/\\`) {
+					return fmt.Errorf("uninstall lifecycle unit identity is invalid")
 				}
-				if err := addList(app.ManagedProcess.Applied.EndpointSocketUnits, true); err != nil {
+				if err := add(filepath.Join("/etc/systemd/system", unit), true); err != nil {
 					return err
 				}
 			}
@@ -219,6 +236,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			bundles = append(bundles, intent.Candidate, intent.Prior)
 		}
 		for _, bundle := range bundles {
+			if bundle != nil {
+				if err := addList(bundle.ManagedPaths, true); err != nil {
+					return err
+				}
+			}
 			if err := addBundleGoAccess(app.ID, bundle, addList); err != nil {
 				return err
 			}
@@ -237,6 +259,26 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 }
 
 func structOwner() filetxn.Owner { return filetxn.Owner{UID: 0, GID: 0} }
+
+func readLifecycleInstallation(paths Paths, authority locks.Authority) (domain.Installation, error) {
+	store, err := persist.Open(persist.Config{RootPath: paths.StateRoot, StagingPath: filepath.Join(paths.StateRoot, ".filetxn"), StatePath: filepath.Join(paths.StateRoot, "normal.json"), Owner: structOwner(), LockAuthority: authority})
+	if err != nil {
+		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
+	}
+	defer func() { _ = store.Close() }()
+	document, err := store.Read()
+	if err != nil {
+		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unreadable: %w", err)
+	}
+	installation, present, err := persist.DecodeEntry[domain.Installation](document, "installations/current")
+	if err != nil {
+		return domain.Installation{}, err
+	}
+	if !present {
+		return domain.Installation{}, nil
+	}
+	return installation, nil
+}
 
 func addBundleGoAccess(resourceID string, bundle *domain.PublicationBundle, addList func([]string, bool) error) error {
 	if bundle == nil || bundle.DomainHTTPS == nil {
@@ -311,10 +353,11 @@ func unmaskOwnedServices(ctx context.Context, paths []string) error {
 }
 
 type ownedAccountRemoval struct {
-	sets []identity.AccountSet
+	sets         []identity.AccountSet
+	resourceSets []identity.ResourceAccountSet
 }
 
-func prepareOwnedAccounts(journal Journal) (ownedAccountRemoval, error) {
+func prepareOwnedAccounts(journal Journal, installation domain.Installation) (ownedAccountRemoval, error) {
 	sets := []identity.AccountSet{journal.Accounts}
 	if data, err := os.ReadFile("/etc/sysusers.d/lanpanel-headscale.conf"); err == nil {
 		match := regexp.MustCompile(`(?m)^u ([^ ]+) -:[^ ]+ "([^"]+)" /nonexistent /usr/sbin/nologin$`).FindSubmatch(data)
@@ -349,38 +392,70 @@ func prepareOwnedAccounts(journal Journal) (ownedAccountRemoval, error) {
 			return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", presentErr)
 		}
 	}
-	return ownedAccountRemoval{sets: sets}, nil
+	removal := ownedAccountRemoval{sets: sets}
+	for _, resource := range installation.Resources {
+		set, err := identity.ResourceAccounts(installation.InstallationID, resource.ID, resource.ManagedProcess != nil && resource.ManagedProcess.Applied != nil && resource.ManagedProcess.Applied.RelayRequired)
+		if err != nil {
+			return ownedAccountRemoval{}, err
+		}
+		present, identities, err := identity.InspectResourceAccountFiles(set, "/etc/passwd", "/etc/group", "/etc/shadow")
+		if err != nil {
+			return ownedAccountRemoval{}, err
+		}
+		if present {
+			set.Identities = identities
+			removal.resourceSets = append(removal.resourceSets, set)
+		}
+		ga, err := identity.GoAccessAccounts(installation.InstallationID, resource.ID)
+		if err != nil {
+			return ownedAccountRemoval{}, err
+		}
+		gaPresent, gaIdentities, err := identity.InspectResourceAccountFiles(ga, "/etc/passwd", "/etc/group", "/etc/shadow")
+		if err != nil {
+			return ownedAccountRemoval{}, err
+		}
+		if gaPresent {
+			ga.Identities = gaIdentities
+			removal.resourceSets = append(removal.resourceSets, ga)
+		}
+	}
+	return removal, nil
 }
 
 func (removal ownedAccountRemoval) Remove() error {
-	removedUsers := map[string]bool{}
-	removedGroups := map[string]bool{}
-	for _, set := range removal.sets {
-		for _, spec := range set.Specs {
-			if !removedUsers[spec.User] {
-				if _, lookupErr := osuser.Lookup(spec.User); lookupErr == nil {
-					if err := exec.Command("userdel", "--system", spec.User).Run(); err != nil {
-						return fmt.Errorf("uninstall could not remove owned account %s: %w", spec.User, err)
-					}
-				} else if _, ok := lookupErr.(osuser.UnknownUserError); !ok {
-					return fmt.Errorf("uninstall could not inspect owned account %s: %w", spec.User, lookupErr)
-				}
-				removedUsers[spec.User] = true
-			}
-		}
+	users := map[string]bool{}
+	groups := map[string]bool{}
+	addSpec := func(spec identity.AccountSpec) {
+		users[spec.User] = true
+		groups[spec.Group] = true
 	}
 	for _, set := range removal.sets {
 		for _, spec := range set.Specs {
-			if !removedGroups[spec.Group] {
-				if _, lookupErr := osuser.LookupGroup(spec.Group); lookupErr == nil {
-					if err := exec.Command("groupdel", spec.Group).Run(); err != nil {
-						return fmt.Errorf("uninstall could not remove owned group %s: %w", spec.Group, err)
-					}
-				} else if _, ok := lookupErr.(osuser.UnknownGroupError); !ok {
-					return fmt.Errorf("uninstall could not inspect owned group %s: %w", spec.Group, lookupErr)
-				}
-				removedGroups[spec.Group] = true
+			addSpec(spec)
+		}
+	}
+	for _, set := range removal.resourceSets {
+		addSpec(set.Application)
+		if set.Relay != nil {
+			addSpec(*set.Relay)
+		}
+	}
+	for name := range users {
+		if _, lookupErr := osuser.Lookup(name); lookupErr == nil {
+			if err := exec.Command("userdel", "--system", name).Run(); err != nil {
+				return fmt.Errorf("uninstall could not remove owned account %s: %w", name, err)
 			}
+		} else if _, ok := lookupErr.(osuser.UnknownUserError); !ok {
+			return fmt.Errorf("uninstall could not inspect owned account %s: %w", name, lookupErr)
+		}
+	}
+	for name := range groups {
+		if _, lookupErr := osuser.LookupGroup(name); lookupErr == nil {
+			if err := exec.Command("groupdel", name).Run(); err != nil {
+				return fmt.Errorf("uninstall could not remove owned group %s: %w", name, err)
+			}
+		} else if _, ok := lookupErr.(osuser.UnknownGroupError); !ok {
+			return fmt.Errorf("uninstall could not inspect owned group %s: %w", name, lookupErr)
 		}
 	}
 	return nil
