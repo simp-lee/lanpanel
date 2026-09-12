@@ -170,7 +170,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
 	for _, stateFile := range []string{filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json")} {
-		if err := removeOwnedPath(stateFile, nil, inventory.MutablePaths); err != nil {
+		if err := removeOwnedPath(stateFile, inventory.Artifacts, inventory.MutablePaths); err != nil {
 			return err
 		}
 	}
@@ -193,13 +193,13 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return err
 	}
-	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
+	if err := removeOwnedPath(paths.Journal, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
 	}
-	if err := removeOwnedPath(paths.CommitPath, nil, inventory.MutablePaths); err != nil {
+	if err := removeOwnedPath(paths.CommitPath, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
 	}
-	if err := removeOwnedPath(paths.StartupAuthority, nil, inventory.MutablePaths); err != nil {
+	if err := removeOwnedPath(paths.StartupAuthority, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
 	}
 	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
@@ -795,6 +795,9 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 			return fmt.Errorf("uninstall foreign residue at %q", path)
 		}
 	} else if slices.Contains(mutable, path) {
+		if info.Mode().IsRegular() {
+			return fmt.Errorf("uninstall ownership digest is missing for %q", path)
+		}
 		if info.Mode()&0o022 != 0 {
 			return fmt.Errorf("uninstall foreign residue at %q", path)
 		}
