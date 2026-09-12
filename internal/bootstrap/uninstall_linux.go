@@ -180,9 +180,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
 	}
-	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
-		return err
-	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
@@ -225,6 +222,12 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
+	}
+	if err := verifyUnmaskTargets(ctx, inventory.Paths, inventory.Artifacts); err != nil {
+		return retainFence(err)
+	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
 	return nil
@@ -497,6 +500,31 @@ func stopOwnedServices(ctx context.Context, paths []string) error {
 		}
 		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run(); err == nil {
 			return fmt.Errorf("uninstall service fence is incomplete for %s", unit)
+		}
+	}
+	return nil
+}
+
+func verifyUnmaskTargets(ctx context.Context, paths []string, artifacts map[string]string) error {
+	owned := make(map[string]bool, len(paths)+len(artifacts))
+	for _, path := range paths {
+		owned[path] = true
+	}
+	for path := range artifacts {
+		owned[path] = true
+	}
+	for _, path := range paths {
+		base := filepath.Base(path)
+		if !strings.HasSuffix(base, ".service") && !strings.HasSuffix(base, ".socket") && !strings.HasSuffix(base, ".timer") {
+			continue
+		}
+		output, err := exec.CommandContext(ctx, "systemctl", "show", "--property=FragmentPath", "--value", base).Output()
+		if err != nil {
+			continue
+		}
+		fragment := strings.TrimSpace(string(output))
+		if fragment != "" && !owned[fragment] {
+			return fmt.Errorf("uninstall cannot clear fence for foreign unit %s", base)
 		}
 	}
 	return nil
