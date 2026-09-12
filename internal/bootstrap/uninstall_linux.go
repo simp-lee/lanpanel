@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/certificates"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/goaccess"
@@ -114,9 +115,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
-	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
-		return err
-	}
 	if err := accountRemoval.Remove(); err != nil {
 		return err
 	}
@@ -155,6 +153,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		}
 	}
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return err
+	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
@@ -214,6 +215,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		}
 		return nil
 	}
+	if installation.Connector != nil {
+		if err := addList(append(append([]string(nil), installation.Connector.ManagedPaths...), "/var/lib/lanpanel/connector/auth"), true); err != nil {
+			return err
+		}
+	}
 	for _, credential := range installation.Credentials {
 		if credential.ManagedPath != "" {
 			if err := add(credential.ManagedPath, true); err != nil {
@@ -271,6 +277,15 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		}
 		for _, retirement := range app.PublicationRecord.PendingGoAccessRetirements {
 			if err := addGoAccessGeneration(app.ID, retirement.Generation, retirement.StateGeneration, addList); err != nil {
+				return err
+			}
+		}
+		for _, artifact := range app.PublicationRecord.CertificateInventory {
+			bundle, err := certificates.BundlePath(artifact.CertificateID, artifact.Generation)
+			if err != nil {
+				return err
+			}
+			if err := addList([]string{bundle, filepath.Join(certificates.FixedBundlesRoot, "."+filepath.Base(bundle)+".lanpanel-staging"), filepath.Join(certificates.FixedActiveRoot, artifact.CertificateID+".current"), filepath.Join("/var/lib/lanpanel/certificates/chroot", artifact.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", artifact.CertificateID)}, true); err != nil {
 				return err
 			}
 		}
@@ -369,7 +384,7 @@ func unmaskOwnedServices(ctx context.Context, paths []string) error {
 		}
 	}
 	for _, unit := range slices.Compact(units) {
-		if err := exec.CommandContext(ctx, "systemctl", "unmask", unit).Run(); err != nil {
+		if err := exec.CommandContext(ctx, "systemctl", "unmask", "--runtime", unit).Run(); err != nil {
 			return fmt.Errorf("uninstall could not clear fence for %s: %w", unit, err)
 		}
 	}
@@ -494,7 +509,7 @@ func mutableEnablementTarget(path, target string) bool {
 }
 
 func mutableServiceOwnedPath(path string) bool {
-	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
+	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/certificates/", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
 		if path == strings.TrimSuffix(root, "/") || strings.HasPrefix(path, root) {
 			return true
 		}
