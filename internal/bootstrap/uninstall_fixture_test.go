@@ -188,6 +188,35 @@ func openFixturePTY(t *testing.T, input string) (*os.File, *os.File) {
 	return master, slave
 }
 
+func TestCommittedUninstallFixtureLateUnmaskFailureKeepsBinary(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned lifecycle fixture")
+	}
+	root := t.TempDir()
+	paths := testPaths(root)
+	for _, directory := range []string{paths.InstallationRoot, paths.StateRoot, filepath.Join(paths.StateRoot, ".filetxn"), paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, filepath.Dir(paths.BinaryPath), paths.SystemdRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installFixtureState(t, paths)
+	systemctl := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; unmask) exit 99;; *) exit 0;; esac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var output bytes.Buffer
+	if err := uninstallCommitted(context.Background(), paths, &output); err == nil || !strings.Contains(err.Error(), "clear fence") {
+		t.Fatalf("late unmask failure was not reported: %v", err)
+	}
+	if _, err := os.Stat(paths.BinaryPath); err != nil {
+		t.Fatalf("binary was deleted before final unmask succeeded: %v", err)
+	}
+}
+
 func TestCommittedUninstallFixtureForeignResidueFailsAndRetries(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-owned lifecycle fixture")
