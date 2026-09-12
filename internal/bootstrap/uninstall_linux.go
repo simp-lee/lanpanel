@@ -164,6 +164,15 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 		return fmt.Errorf("uninstall exposure lock is unavailable: %w", err)
 	}
 	defer func() { _ = exposure.Release() }()
+	lockedInventoryBytes, err := readCommittedArtifact(ownershipInventoryPath(paths), MaximumJournalBytes, 0o600)
+	if err != nil || release.DigestBytes(lockedInventoryBytes) != commit.OwnershipDigest {
+		return fmt.Errorf("uninstall ownership inventory changed after locking")
+	}
+	var lockedInventory OwnershipInventory
+	if err := decodeCanonical(lockedInventoryBytes, &lockedInventory); err != nil || validateOwnershipInventory(lockedInventory, journal) != nil {
+		return fmt.Errorf("uninstall ownership inventory changed after locking")
+	}
+	inventory = lockedInventory
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
