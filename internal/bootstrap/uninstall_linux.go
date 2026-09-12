@@ -51,12 +51,49 @@ func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
 		return fmt.Errorf("uninstall confirmation requires an interactive terminal")
 	}
 	paths := FixedPaths()
-	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only committed LanPanel-owned paths: %s, %s, %s, %s, %s, and fixed runtime assets. APT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", paths.BinaryPath, paths.PersistentRoot, paths.InstallationRoot, paths.SystemdRoot, paths.RuntimeRoot)
+	scope, err := readUninstallScope(paths)
+	if err != nil {
+		return fmt.Errorf("uninstall fenced: %w", err)
+	}
+	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only these committed LanPanel-owned paths:\n%s\nAPT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", strings.Join(scope, "\n"))
 	scanner := bufio.NewScanner(in)
 	if !scanner.Scan() || scanner.Text() != "UNINSTALL LANPANEL" {
 		return fmt.Errorf("uninstall requires exact confirmation UNINSTALL LANPANEL")
 	}
 	return uninstallCommitted(context.Background(), paths, out)
+}
+
+func readUninstallScope(paths Paths) ([]string, error) {
+	if err := RequireCommitted(paths); err != nil {
+		return nil, err
+	}
+	commitBytes, err := readCommittedArtifact(paths.CommitPath, MaximumJournalBytes, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	var commit Commit
+	if err := decodeCanonical(commitBytes, &commit); err != nil || !release.ValidDigest(commit.OwnershipDigest) {
+		return nil, fmt.Errorf("uninstall ownership commit is invalid")
+	}
+	inventoryBytes, err := readCommittedArtifact(ownershipInventoryPath(paths), MaximumJournalBytes, 0o600)
+	if err != nil || release.DigestBytes(inventoryBytes) != commit.OwnershipDigest {
+		return nil, fmt.Errorf("uninstall ownership inventory is missing or changed")
+	}
+	store, journal, err := openJournal(paths.Journal, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = store.close() }()
+	var inventory OwnershipInventory
+	if err := decodeCanonical(inventoryBytes, &inventory); err != nil {
+		return nil, fmt.Errorf("uninstall ownership inventory is invalid")
+	}
+	if err := validateOwnershipInventory(inventory, journal); err != nil {
+		return nil, fmt.Errorf("uninstall ownership inventory is invalid: %w", err)
+	}
+	scope := append([]string(nil), inventory.Paths...)
+	slices.Sort(scope)
+	return slices.Compact(scope), nil
 }
 
 func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
@@ -197,7 +234,7 @@ func verifyLifecycleIngressClosed(installation domain.Installation) error {
 		if app.PublicationRecord.State != domain.PublicationUnpublished || app.PublicationRecord.ActivationIntent != nil || app.PublicationRecord.ContractionIntent != nil {
 			return fmt.Errorf("uninstall ingress is not closed for App %s", app.ID)
 		}
-		if app.ManagedProcess != nil && (app.ManagedProcess.Requested != domain.ProcessRequestedStopped || app.ManagedProcess.Applied != nil) {
+		if app.ManagedProcess != nil && app.ManagedProcess.Requested != domain.ProcessRequestedStopped {
 			return fmt.Errorf("uninstall managed process is not stopped for App %s", app.ID)
 		}
 	}
