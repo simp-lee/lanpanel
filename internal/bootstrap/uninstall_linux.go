@@ -228,10 +228,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := accountRemoval.Remove(); err != nil {
 		return err
 	}
-	if err := os.Remove(paths.BinaryPath); err != nil {
-		_ = stopOwnedServices(ctx, inventory.Paths)
-		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
-	}
 	retainFence := func(err error) error {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return err
@@ -276,6 +272,10 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
+	}
+	if err := os.Remove(paths.BinaryPath); err != nil {
+		_ = stopOwnedServices(ctx, inventory.Paths)
+		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed; package and service ownership not proven by this lifecycle remain retained.")
 	return nil
