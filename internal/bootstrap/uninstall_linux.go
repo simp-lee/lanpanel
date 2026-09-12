@@ -229,6 +229,16 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		if err := addList(derived.ManagedPaths(), true); err != nil {
 			return err
 		}
+		for _, link := range []string{
+			filepath.Join("/etc/systemd/system/multi-user.target.wants", derived.ServiceUnit),
+			filepath.Join("/etc/systemd/system/multi-user.target.wants", derived.RelayUnit),
+			filepath.Join("/etc/systemd/system/sockets.target.wants", derived.SocketUnit),
+			filepath.Join("/etc/systemd/system/sockets.target.wants", derived.BackendSocketUnit),
+		} {
+			if err := add(link, true); err != nil {
+				return err
+			}
+		}
 		if app.ManagedProcess != nil && app.ManagedProcess.Applied != nil {
 			if err := addList(app.ManagedProcess.Applied.ManagedPaths, true); err != nil {
 				return err
@@ -475,6 +485,14 @@ func (removal ownedAccountRemoval) Remove() error {
 	return nil
 }
 
+func mutableEnablementTarget(path, target string) bool {
+	if target == "" || filepath.IsAbs(target) || filepath.Clean(target) != target || strings.Contains(target, "\\x00") {
+		return false
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
+	return strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".service") || strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".socket") || strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".timer")
+}
+
 func mutableServiceOwnedPath(path string) bool {
 	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
 		if path == strings.TrimSuffix(root, "/") || strings.HasPrefix(path, root) {
@@ -512,12 +530,21 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		target, err := os.Readlink(path)
-		if err != nil || target != "/dev/null" || artifacts[path] != release.DigestBytes([]byte("/dev/null")) {
-			return fmt.Errorf("uninstall foreign residue at %q", path)
+		if err == nil && target == "/dev/null" && artifacts[path] == release.DigestBytes([]byte("/dev/null")) {
+			return os.Remove(path)
 		}
-		return os.Remove(path)
+		if slices.Contains(mutable, path) && err == nil && mutableEnablementTarget(path, target) {
+			return os.Remove(path)
+		}
+		return fmt.Errorf("uninstall foreign residue at %q", path)
 	}
 	if info.IsDir() {
+		if info.Mode()&0o022 != 0 {
+			return fmt.Errorf("uninstall foreign directory metadata at %q", path)
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); !ok || (stat.Uid != 0 || stat.Gid != 0) && !mutableServiceOwnedPath(path) {
+			return fmt.Errorf("uninstall foreign directory ownership at %q", path)
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			// Non-empty managed roots may contain external application data; retain
 			// them rather than recursively deleting user files.

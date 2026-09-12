@@ -19,6 +19,10 @@ func ownershipInventoryPath(paths Paths) string {
 
 func mutableOwnershipPaths(paths Paths) []string {
 	values := []string{paths.Journal, paths.CommitPath, paths.StartupAuthority, filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json"), filepath.Join(paths.InstallationRoot, "acme-account.contact"), "/var/log/lanpanel/goaccess/.retention-reopen.lock"}
+	for _, name := range []string{"lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
+		values = append(values, filepath.Join(paths.SystemdRoot, "multi-user.target.wants", name))
+	}
+	values = append(values, filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-management.socket"))
 	if paths == FixedPaths() {
 		controlPaths := control.FixedPaths()
 		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket, "/var/lib/lanpanel/headscale/identity", "/var/lib/lanpanel/headscale/identity/database-uuid", "/var/lib/lanpanel/headscale/identity/snapshot.json", "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging")
