@@ -338,6 +338,22 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			inventory.MutablePaths = append(inventory.MutablePaths, path)
 			mutable[path] = true
 		}
+		if _, bound := inventory.Artifacts[path]; !bound {
+			info, statErr := os.Lstat(path)
+			if statErr == nil && info.Mode().IsRegular() {
+				if info.Size() < 0 || info.Size() > MaximumJournalBytes {
+					return fmt.Errorf("uninstall augmented artifact is too large at %q", path)
+				}
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					return fmt.Errorf("uninstall augmented artifact is unreadable at %q: %w", path, readErr)
+				}
+				if inventory.Artifacts == nil {
+					inventory.Artifacts = map[string]string{}
+				}
+				inventory.Artifacts[path] = release.DigestBytes(data)
+			}
+		}
 
 		return nil
 	}
