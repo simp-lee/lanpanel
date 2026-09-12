@@ -105,7 +105,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
 		path := inventory.Paths[index]
-		if path == paths.BinaryPath || path == paths.Journal || path == paths.CommitPath || path == paths.StartupAuthority || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot || path == paths.LockRoot || path == paths.PersistentRoot || path == paths.StateRoot || path == paths.SafetyRoot || path == paths.RuntimeRoot || path == paths.PackageRoot {
+		if path == paths.BinaryPath || path == paths.Journal || path == paths.CommitPath || path == paths.StartupAuthority || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot || path == paths.LockRoot || path == paths.PersistentRoot || path == paths.StateRoot || path == filepath.Join(paths.StateRoot, "normal.json") || path == paths.SafetyRoot || path == filepath.Join(paths.SafetyRoot, "state.json") || path == paths.RuntimeRoot || path == paths.PackageRoot {
 			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {
@@ -155,11 +155,15 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
+	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
+		return err
+	}
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
-		return fmt.Errorf("uninstall binary removal failed: %w", err)
+		_ = stopOwnedServices(ctx, inventory.Paths)
+		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
 	return nil
@@ -214,6 +218,30 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			}
 		}
 		return nil
+	}
+	addManagedTree := func(root string) error {
+		count := 0
+		return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("uninstall lifecycle staging contains a symlink")
+			}
+			count++
+			if count > 4096 {
+				return fmt.Errorf("uninstall lifecycle staging exceeds its fixed bound")
+			}
+			return add(path, true)
+		})
+	}
+	for _, root := range []string{paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.PackageRoot, paths.RuntimeRoot} {
+		if err := addManagedTree(root); err != nil {
+			return err
+		}
 	}
 	if installation.Connector != nil {
 		if err := addList(append(append([]string(nil), installation.Connector.ManagedPaths...), "/var/lib/lanpanel/connector/auth"), true); err != nil {
@@ -496,6 +524,22 @@ func (removal ownedAccountRemoval) Remove() error {
 		} else if _, ok := lookupErr.(osuser.UnknownGroupError); !ok {
 			return fmt.Errorf("uninstall could not inspect owned group %s: %w", name, lookupErr)
 		}
+	}
+	return nil
+}
+
+func verifyOwnedFileIdentity(path string, artifacts map[string]string) error {
+	want, ok := artifacts[path]
+	if !ok {
+		return fmt.Errorf("uninstall binary ownership digest is missing")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("uninstall binary is missing or foreign")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || release.DigestBytes(data) != want {
+		return fmt.Errorf("uninstall binary differs from committed ownership")
 	}
 	return nil
 }
