@@ -821,6 +821,17 @@ func removeOwnedLockFile(path string) error {
 	return nil
 }
 
+func verifyOwnedFileMetadata(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("uninstall foreign file metadata at %q", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 1 || (stat.Uid != 0 || stat.Gid != 0) && !mutableServiceOwnedPath(path) {
+		return fmt.Errorf("uninstall foreign file ownership at %q", path)
+	}
+	return nil
+}
+
 func removeOwnedPath(path string, artifacts map[string]string, mutable []string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -857,6 +868,9 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 		return nil
 	}
 	if digest, ok := artifacts[path]; ok {
+		if err := verifyOwnedFileMetadata(path, info); err != nil {
+			return err
+		}
 		data, err := os.ReadFile(path)
 		if err != nil || release.DigestBytes(data) != digest {
 			return fmt.Errorf("uninstall foreign residue at %q", path)
