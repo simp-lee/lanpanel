@@ -342,14 +342,11 @@ func prepareOwnedAccounts(journal Journal) (ownedAccountRemoval, error) {
 		if err != nil {
 			return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", err)
 		}
-		if !complete {
-			present, presentErr := identity.PartialAccountEvidencePresent(set)
-			if presentErr != nil {
-				return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", presentErr)
-			}
-			if !present {
-				continue
-			}
+		if complete {
+			continue
+		}
+		if _, presentErr := identity.PartialAccountEvidencePresent(set); presentErr != nil {
+			return ownedAccountRemoval{}, fmt.Errorf("uninstall account ownership is incomplete: %w", presentErr)
 		}
 	}
 	return ownedAccountRemoval{sets: sets}, nil
