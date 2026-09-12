@@ -96,7 +96,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 {
-		return false, fmt.Errorf("bootstrap directory parent is unsafe")
+		return false, fmt.Errorf("bootstrap directory parent is unsafe for %q", path)
 	}
 	created := false
 	if err := unix.Mkdirat(parentFD, filepath.Base(path), mode); errors.Is(err, unix.EEXIST) {
@@ -120,7 +120,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != mode {
-		return false, fmt.Errorf("bootstrap directory identity differs")
+		return false, fmt.Errorf("bootstrap directory identity differs for %q (owner=%d:%d mode=%04o)", path, owner.UID, owner.GID, mode)
 	}
 	if created && unix.Fsync(parentFD) != nil {
 		return false, fmt.Errorf("sync bootstrap directory")
@@ -261,6 +261,9 @@ func copyOrVerifyPolicyBytes(data []byte, expected release.AssetIdentity, paths 
 	}
 	destination := "/usr/sbin/policy-rc.d"
 	if paths != FixedPaths() {
+		if _, err := ensureDirectory(paths.PersistentRoot, filetxn.Owner{UID: 0, GID: 0}, 0o711); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
 		destination = filepath.Join(paths.PersistentRoot, "sbin", "policy-rc.d")
 		if _, err := ensureDirectory(filepath.Dir(destination), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
 			return err

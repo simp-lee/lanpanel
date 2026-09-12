@@ -203,7 +203,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
 		path := inventory.Paths[index]
-		if path == paths.BinaryPath || path == paths.Journal || path == paths.CommitPath || path == paths.StartupAuthority || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot || path == paths.LockRoot || path == paths.PersistentRoot || path == paths.StateRoot || path == filepath.Join(paths.StateRoot, "normal.json") || path == paths.SafetyRoot || path == filepath.Join(paths.SafetyRoot, "state.json") || path == paths.RuntimeRoot || path == paths.PackageRoot {
+		if path == paths.BinaryPath || path == filepath.Dir(paths.BinaryPath) || path == filepath.Dir(publicCommandPath(paths)) || path == paths.Journal || path == paths.CommitPath || path == paths.StartupAuthority || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot || path == paths.LockRoot || path == paths.PersistentRoot || path == paths.StateRoot || path == filepath.Join(paths.StateRoot, "normal.json") || path == paths.SafetyRoot || path == filepath.Join(paths.SafetyRoot, "state.json") || path == paths.RuntimeRoot || path == paths.PackageRoot {
 			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {

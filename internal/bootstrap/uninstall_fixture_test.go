@@ -164,16 +164,16 @@ func openFixturePTY(t *testing.T, input string) (*os.File, *os.File) {
 	t.Helper()
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open ptmx: %v", err)
 	}
-	if err := unix.IoctlSetInt(int(master.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+	if err := unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0); err != nil {
 		_ = master.Close()
-		t.Fatal(err)
+		t.Fatalf("unlock ptmx: %v", err)
 	}
 	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
 	if err != nil {
 		_ = master.Close()
-		t.Fatal(err)
+		t.Fatalf("get pty number: %v", err)
 	}
 	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
 	if err != nil {

@@ -214,7 +214,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 	preflightDigest, _ := preflight.ExpansionRequestDigest(preflightRequest)
 	plannedPaths, err := plannedBootstrapPaths(paths)
 	if err != nil {
-		return err
+		return fmt.Errorf("bootstrap planned path inventory failed: %w", err)
 	}
 	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
 	if err := validateJournal(journal); err != nil {
@@ -222,11 +222,14 @@ func install(ctx context.Context, request Request, strict bool) error {
 	}
 	store, err := createJournal(paths.Journal, 0, 0, journal)
 	if err != nil {
-		return err
+		return fmt.Errorf("bootstrap journal creation failed: %w", err)
 	}
 	defer func(ignore func() error) { _ = ignore() }(store.close)
 	token := material.TakeAdminToken()
-	return resume(ctx, store, journal, request, token, strict)
+	if err := resume(ctx, store, journal, request, token, strict); err != nil {
+		return fmt.Errorf("bootstrap resume failed: %w", err)
+	}
+	return nil
 }
 
 func validateJournalPackageAuthority(journal Journal) error {
@@ -357,26 +360,26 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		journal.Sequence++
 		journal.Phase = phase
 		if err := store.update(journal); err != nil {
-			return err
+			return fmt.Errorf("advance %s: %w", phase, err)
 		}
 		return nil
 	}
 	if journal.Phase == PhasePrepared {
 		if _, err := ensureDirectory(filepath.Dir(journal.Paths.BinaryPath), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
-			return err
+			return fmt.Errorf("bootstrap binary directory failed: %w", err)
 		}
 		if _, err := ensureDirectory(filepath.Dir(publicCommandPath(journal.Paths)), filetxn.Owner{UID: 0, GID: 0}, 0o755); err != nil {
-			return err
+			return fmt.Errorf("bootstrap public command directory failed: %w", err)
 		}
 		if err := copyOrVerifyBinaryBytes(request.SourceBinary, journal.Paths, releaseBinary{Digest: journal.Release.Binary.Digest, Bytes: journal.Release.Binary.Bytes}); err != nil {
-			return err
+			return fmt.Errorf("bootstrap binary install failed: %w", err)
 		}
 		if err := copyOrVerifyPolicyBytes(request.SourceBinary, journal.Release.Binary, journal.Paths); err != nil {
-			return err
+			return fmt.Errorf("bootstrap policy install failed: %w", err)
 		}
 		journal.ArtifactDigests[journal.Paths.BinaryPath] = journal.Release.Binary.Digest
 		if err := putOrVerifyTargetFile(ctx, publicCommandPath(journal.Paths), request.SourceBinary, 0o755); err != nil {
-			return err
+			return fmt.Errorf("bootstrap public command install failed: %w", err)
 		}
 		journal.ArtifactDigests[publicCommandPath(journal.Paths)] = journal.Release.Binary.Digest
 		journal.ArtifactDigests["/usr/sbin/policy-rc.d"] = journal.Release.Binary.Digest
@@ -385,7 +388,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 		if journal.Paths == FixedPaths() {
 			if err := installVendorNginxMask(journal.Paths.SystemdRoot); err != nil {
-				return err
+				return fmt.Errorf("bootstrap nginx mask failed: %w", err)
 			}
 			journal.ArtifactDigests[filepath.Join(journal.Paths.SystemdRoot, "nginx.service")] = digestBytes([]byte("/dev/null"))
 		}
@@ -399,7 +402,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return err
 		}
 		if err := reconcilePackageCommit(&journal, packageJournal); err != nil {
-			return err
+			return fmt.Errorf("bootstrap package commit failed: %w", err)
 		}
 		if err := advance(PhasePackagesCommitted); err != nil {
 			return err
@@ -560,19 +563,21 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if !ok || uiIdentity.GID == 0 {
 			return fmt.Errorf("UI account authority is missing")
 		}
-		if _, err := ensureDirectory(filepath.Dir(journal.Paths.StartupAuthority), filetxn.Owner{UID: 0, GID: uiIdentity.GID}, 0o710); err != nil {
+		startupParentGID := uiIdentity.GID
+		if journal.Paths != FixedPaths() {
+			startupParentGID = 0
+		}
+		if _, err := ensureDirectory(filepath.Dir(journal.Paths.StartupAuthority), filetxn.Owner{UID: 0, GID: startupParentGID}, 0o710); err != nil {
 			return err
 		}
 		if err := createBootstrapDirectories(journal); err != nil {
-			return err
+			return fmt.Errorf("bootstrap directory initialization failed: %w", err)
 		}
-		if strict {
-			if err := initializeStores(ctx, journal); err != nil {
-				return err
-			}
+		if err := initializeStores(ctx, journal); err != nil {
+			return fmt.Errorf("bootstrap stores initialization failed: %w", err)
 		}
 		if err := writeHelperIdentities(ctx, journal); err != nil {
-			return err
+			return fmt.Errorf("bootstrap helper identity initialization failed: %w", err)
 		}
 		if err := advance(PhaseStoresInitialized); err != nil {
 			return err
@@ -580,14 +585,14 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 	}
 	if journal.Phase == PhaseStoresInitialized {
 		if err := installFixedRuntimeAssets(ctx, &journal, request); err != nil {
-			return err
+			return fmt.Errorf("bootstrap fixed runtime assets failed: %w", err)
 		}
 		if err := installNginxBaseline(ctx, &journal); err != nil {
-			return err
+			return fmt.Errorf("bootstrap nginx baseline failed: %w", err)
 		}
 		if journal.Paths == FixedPaths() {
 			if err := installVendorNginxMask(journal.Paths.SystemdRoot); err != nil {
-				return err
+				return fmt.Errorf("bootstrap final nginx mask failed: %w", err)
 			}
 			journal.ArtifactDigests[filepath.Join(journal.Paths.SystemdRoot, "nginx.service")] = digestBytes([]byte("/dev/null"))
 		}
@@ -597,7 +602,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 		for path, data := range artifacts {
 			if err := putOrVerifyTargetFile(ctx, path, data, 0o644); err != nil {
-				return err
+				return fmt.Errorf("bootstrap rendered artifact %q failed: %w", path, err)
 			}
 			journal.ArtifactDigests[path] = digestBytes(data)
 		}
@@ -606,7 +611,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			return err
 		}
 		if err := putOrVerifyTargetFile(ctx, ownershipInventoryPath(journal.Paths), ownershipBytes, 0o600); err != nil {
-			return err
+			return fmt.Errorf("bootstrap ownership inventory install failed: %w", err)
 		}
 		journal.ArtifactDigests[ownershipInventoryPath(journal.Paths)] = ownershipDigest
 		if err := advance(PhaseAssetsInstalled); err != nil {
@@ -655,7 +660,11 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		journal.FinalCommitDigest = digestBytes(commitBytes)
 		startup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: journal.FinalCommitDigest}
 		uiIdentity, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
-		if err := putOrVerifyStartupAuthority(ctx, journal.Paths.StartupAuthority, startup, uiIdentity.GID); err != nil {
+		startupGID := uiIdentity.GID
+		if journal.Paths != FixedPaths() {
+			startupGID = 0
+		}
+		if err := putOrVerifyStartupAuthority(ctx, journal.Paths.StartupAuthority, startup, startupGID); err != nil {
 			return err
 		}
 		if err := advance(PhaseCommitted); err != nil {
@@ -731,7 +740,7 @@ func createBootstrapDirectories(journal Journal) error {
 	}
 	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot} {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
-			return err
+			return fmt.Errorf("bootstrap directory %q: %w", path, err)
 		}
 	}
 	auditMode := uint32(0o700)
@@ -785,8 +794,12 @@ func createBootstrapDirectories(journal Journal) error {
 	if _, err := ensureDirectory(filepath.Dir(journal.Paths.BinaryPath), owner, 0o755); err != nil {
 		return err
 	}
-	ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
-	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, filetxn.Owner{UID: 0, GID: ui.GID}, 0o710); err != nil {
+	runtimeOwner := filetxn.Owner{UID: 0, GID: 0}
+	if journal.Paths == FixedPaths() {
+		ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
+		runtimeOwner.GID = ui.GID
+	}
+	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, runtimeOwner, 0o710); err != nil {
 		return err
 	}
 	return nil
@@ -977,6 +990,12 @@ func scanExistingEvidence(paths Paths) ([]string, error) {
 	result := []string{}
 	for _, path := range candidates {
 		if _, err := os.Lstat(path); err == nil {
+			if path == filepath.Dir(paths.BinaryPath) {
+				entries, readErr := os.ReadDir(path)
+				if readErr == nil && len(entries) == 0 {
+					continue
+				}
+			}
 			result = append(result, path)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
