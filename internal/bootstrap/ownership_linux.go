@@ -18,10 +18,10 @@ func ownershipInventoryPath(paths Paths) string {
 }
 
 func mutableOwnershipPaths(paths Paths) []string {
-	values := []string{paths.Journal, paths.CommitPath, paths.StartupAuthority, filepath.Join(paths.InstallationRoot, "acme-account.contact")}
+	values := []string{paths.Journal, paths.CommitPath, paths.StartupAuthority, filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json"), filepath.Join(paths.InstallationRoot, "acme-account.contact"), "/var/log/lanpanel/goaccess/.retention-reopen.lock"}
 	if paths == FixedPaths() {
 		controlPaths := control.FixedPaths()
-		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket)
+		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket, "/var/lib/lanpanel/headscale/identity", "/var/lib/lanpanel/headscale/identity/database-uuid", "/var/lib/lanpanel/headscale/identity/snapshot.json", "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging")
 		activationPaths := control.FixedActivationPaths()
 		values = append(values, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
 	}

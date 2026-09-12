@@ -104,7 +104,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	for index := len(inventory.Paths) - 1; index >= 0; index-- {
 		path := inventory.Paths[index]
-		if path == paths.BinaryPath || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot {
+		if path == paths.BinaryPath || path == paths.Journal || path == paths.CommitPath || path == paths.StartupAuthority || path == ownershipInventoryPath(paths) || path == paths.OwnershipRoot || path == paths.LockRoot || path == paths.PersistentRoot || path == paths.StateRoot || path == paths.SafetyRoot || path == paths.RuntimeRoot || path == paths.PackageRoot {
 			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {
@@ -115,6 +115,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
+	if err := accountRemoval.Remove(); err != nil {
 		return err
 	}
 	if err := exposure.Release(); err != nil {
@@ -131,7 +134,13 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 			return err
 		}
 	}
-	if err := accountRemoval.Remove(); err != nil {
+	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
+		return err
+	}
+	if err := removeOwnedPath(paths.CommitPath, nil, inventory.MutablePaths); err != nil {
+		return err
+	}
+	if err := removeOwnedPath(paths.StartupAuthority, nil, inventory.MutablePaths); err != nil {
 		return err
 	}
 	if err := removeOwnedPath(ownershipInventoryPath(paths), map[string]string{ownershipInventoryPath(paths): commit.OwnershipDigest}, nil); err != nil {
@@ -139,6 +148,11 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
+	}
+	for _, root := range []string{paths.StateRoot, paths.SafetyRoot, paths.RuntimeRoot, paths.PackageRoot, paths.PersistentRoot} {
+		if err := removeOwnedPath(root, inventory.Artifacts, inventory.MutablePaths); err != nil {
+			return err
+		}
 	}
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
@@ -313,7 +327,7 @@ func addGoAccessGeneration(resourceID string, generation, stateGeneration uint64
 		return err
 	}
 	paths.StateRoot, paths.Database, paths.Report = statePaths.StateRoot, statePaths.Database, statePaths.Report
-	return addList([]string{paths.ResourceRoot, paths.StateRoot, paths.Database, paths.Report, paths.AccessLog, paths.RetainedLog, paths.RetentionOld, paths.RetentionNew, paths.RetentionState, paths.RetentionStateTemp, paths.RetentionTemp, paths.Endpoint, paths.ServiceUnit, paths.ServiceEnablement, paths.RelayUnit, paths.RelayEnablement, paths.SocketUnit, paths.SocketEnablement, paths.Sysusers, paths.RetentionUnit, paths.RetentionTimer, paths.RetentionEnablement, paths.RetentionLock}, true)
+	return addList([]string{paths.ResourceRoot, paths.StateRoot, paths.Database, paths.Report, paths.AccessLog, paths.RetainedLog, paths.RetentionOld, paths.RetentionNew, paths.RetentionState, paths.RetentionStateTemp, paths.RetentionTemp, paths.Endpoint, paths.ServiceUnit, paths.ServiceEnablement, paths.RelayUnit, paths.RelayEnablement, paths.SocketUnit, paths.SocketEnablement, paths.Sysusers, paths.RetentionUnit, paths.RetentionTimer, paths.RetentionEnablement, paths.RetentionLock, "/var/log/lanpanel/goaccess/.retention-reopen.lock"}, true)
 }
 
 func stopOwnedServices(ctx context.Context, paths []string) error {
@@ -462,7 +476,7 @@ func (removal ownedAccountRemoval) Remove() error {
 }
 
 func mutableServiceOwnedPath(path string) bool {
-	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
+	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
 		if path == strings.TrimSuffix(root, "/") || strings.HasPrefix(path, root) {
 			return true
 		}
