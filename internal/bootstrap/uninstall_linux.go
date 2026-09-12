@@ -15,7 +15,9 @@ import (
 	"lanpanel/internal/goaccess"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/locks"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/persist"
+	"lanpanel/internal/process"
 	"lanpanel/internal/release"
 	appresource "lanpanel/internal/resource"
 	"os"
@@ -145,6 +147,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyLifecycleIngressClosed(lifecycleInstallation); err != nil {
 		return err
 	}
+	if err := verifyRuntimeIngressClosed(ctx, lifecycleInstallation); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
@@ -240,6 +245,27 @@ func verifyLifecycleIngressClosed(installation domain.Installation) error {
 		}
 		if app.ManagedProcess != nil && app.ManagedProcess.Requested != domain.ProcessRequestedStopped {
 			return fmt.Errorf("uninstall managed process is not stopped for App %s", app.ID)
+		}
+	}
+	return nil
+}
+
+func verifyRuntimeIngressClosed(ctx context.Context, installation domain.Installation) error {
+	graph, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if err != nil {
+		return fmt.Errorf("uninstall ingress graph is unavailable: %w", err)
+	}
+	for _, entry := range graph.Entries {
+		if entry.Kind == nginx.EntryApp || entry.Kind == nginx.EntryTemporary {
+			return fmt.Errorf("uninstall ingress graph still serves %s", entry.ResourceID)
+		}
+	}
+	for _, app := range installation.Resources {
+		if app.ManagedProcess == nil || app.ManagedProcess.Applied == nil {
+			continue
+		}
+		if _, err := process.ObserveStopped(ctx, "/sys/fs/cgroup", *app.ManagedProcess.Applied); err != nil {
+			return fmt.Errorf("uninstall process closure is unproven for App %s: %w", app.ID, err)
 		}
 	}
 	return nil
