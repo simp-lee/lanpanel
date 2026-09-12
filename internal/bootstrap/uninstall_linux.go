@@ -174,7 +174,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyRuntimeIngressClosed(ctx, lifecycleInstallation); err != nil {
 		return err
 	}
-	if err := bindCurrentAuthorityArtifacts(paths, &inventory); err != nil {
+	if err := bindCurrentAuthorityArtifacts(paths, journal, commitBytes, &inventory); err != nil {
 		return err
 	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
@@ -209,9 +209,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 			return err
 		}
 	}
-	if err := accountRemoval.Remove(); err != nil {
-		return err
-	}
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
 	}
@@ -220,6 +217,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall binary identity is unavailable: %w", err)
 	}
 	if err := verifyOwnedFileMetadata(paths.BinaryPath, binaryInfo); err != nil {
+		return err
+	}
+	if err := accountRemoval.Remove(); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
@@ -275,7 +275,23 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	return nil
 }
 
-func bindCurrentAuthorityArtifacts(paths Paths, inventory *OwnershipInventory) error {
+func bindCurrentAuthorityArtifacts(paths Paths, journal Journal, commitBytes []byte, inventory *OwnershipInventory) error {
+	freshStore, freshJournal, err := openJournal(paths.Journal, 0, 0)
+	if err != nil {
+		return fmt.Errorf("uninstall journal changed during teardown: %w", err)
+	}
+	_ = freshStore.close()
+	if freshJournal.Sequence != journal.Sequence || freshJournal.FinalCommitDigest != journal.FinalCommitDigest {
+		return fmt.Errorf("uninstall journal changed during teardown")
+	}
+	startup, err := ReadPublicStartupAuthority(paths)
+	if err != nil {
+		return err
+	}
+	expectedStartup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: release.DigestBytes(commitBytes)}
+	if startup != expectedStartup {
+		return fmt.Errorf("uninstall startup authority differs from committed identity")
+	}
 	if inventory.Artifacts == nil {
 		inventory.Artifacts = map[string]string{}
 	}
