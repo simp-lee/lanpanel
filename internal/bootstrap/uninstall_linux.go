@@ -44,7 +44,7 @@ func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
 	paths := FixedPaths()
 	_, _ = fmt.Fprintf(out, "LanPanel uninstall will remove only committed LanPanel-owned paths: %s, %s, %s, %s, %s, and fixed runtime assets. APT/dpkg packages and external application files will not be removed.\nType UNINSTALL LANPANEL to continue: ", paths.BinaryPath, paths.PersistentRoot, paths.InstallationRoot, paths.SystemdRoot, paths.RuntimeRoot)
 	scanner := bufio.NewScanner(in)
-	if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "UNINSTALL LANPANEL" {
+	if !scanner.Scan() || scanner.Text() != "UNINSTALL LANPANEL" {
 		return fmt.Errorf("uninstall requires exact confirmation UNINSTALL LANPANEL")
 	}
 	return uninstallCommitted(context.Background(), paths, out)
@@ -221,12 +221,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			mutable[path] = true
 		}
 		base := filepath.Base(path)
-		if strings.HasSuffix(base, ".service") || strings.HasSuffix(base, ".socket") || strings.HasSuffix(base, ".timer") {
+		if strings.HasPrefix(path, "/etc/systemd/system/") && (strings.HasSuffix(base, ".service") || strings.HasSuffix(base, ".socket") || strings.HasSuffix(base, ".timer")) {
 			if inventory.Artifacts == nil {
 				inventory.Artifacts = map[string]string{}
 			}
 			inventory.Artifacts[filepath.Join("/usr/lib/systemd/system", base)] = ""
-			inventory.Artifacts[filepath.Join("/etc/systemd/system", base)] = ""
 		}
 		return nil
 	}
