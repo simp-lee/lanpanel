@@ -132,6 +132,20 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 			return err
 		}
 	}
+	for _, root := range []string{paths.StateRoot, paths.SafetyRoot, paths.RuntimeRoot, paths.PackageRoot} {
+		if err := removeOwnedPath(root, inventory.Artifacts, inventory.MutablePaths); err != nil {
+			return err
+		}
+	}
+	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return err
+	}
+	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
+		return err
+	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
 	if err := removeOwnedPath(paths.Journal, nil, inventory.MutablePaths); err != nil {
 		return err
 	}
@@ -147,18 +161,10 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
-	for _, root := range []string{paths.StateRoot, paths.SafetyRoot, paths.RuntimeRoot, paths.PackageRoot, paths.PersistentRoot} {
-		if err := removeOwnedPath(root, inventory.Artifacts, inventory.MutablePaths); err != nil {
-			return err
-		}
-	}
-	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
-		return err
-	}
-	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
@@ -238,7 +244,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			return add(path, true)
 		})
 	}
-	for _, root := range []string{paths.InstallationRoot, paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.PackageRoot, paths.RuntimeRoot} {
+	for _, root := range []string{
+		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/var/lib/lanpanel/certificates/bundles", "/var/lib/lanpanel/nginx/.filetxn",
+	} {
 		if err := addManagedTree(root); err != nil {
 			return err
 		}
@@ -544,6 +552,14 @@ func verifyOwnedFileIdentity(path string, artifacts map[string]string) error {
 	return nil
 }
 
+func mutableCertificatePointer(path, target string) bool {
+	if !strings.HasPrefix(path, "/var/lib/lanpanel/certificates/active/") || filepath.Base(path) == "." || filepath.IsAbs(target) == false || filepath.Clean(target) != target {
+		return false
+	}
+	id := strings.TrimSuffix(filepath.Base(path), ".current")
+	return strings.HasPrefix(target, certificates.FixedBundlesRoot+string(filepath.Separator)) && strings.HasPrefix(filepath.Base(target), id+"-")
+}
+
 func mutableEnablementTarget(path, target string) bool {
 	if target == "" || filepath.IsAbs(target) || filepath.Clean(target) != target || strings.Contains(target, "\\x00") {
 		return false
@@ -592,7 +608,7 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 		if err == nil && target == "/dev/null" && artifacts[path] == release.DigestBytes([]byte("/dev/null")) {
 			return os.Remove(path)
 		}
-		if slices.Contains(mutable, path) && err == nil && mutableEnablementTarget(path, target) {
+		if slices.Contains(mutable, path) && err == nil && (mutableEnablementTarget(path, target) || mutableCertificatePointer(path, target)) {
 			return os.Remove(path)
 		}
 		return fmt.Errorf("uninstall foreign residue at %q", path)

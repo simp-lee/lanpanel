@@ -27,7 +27,7 @@ func mutableOwnershipPaths(paths Paths) []string {
 		controlPaths := control.FixedPaths()
 		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket, "/var/lib/lanpanel/headscale/identity", "/var/lib/lanpanel/headscale/identity/database-uuid", "/var/lib/lanpanel/headscale/identity/snapshot.json", "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging")
 		activationPaths := control.FixedActivationPaths()
-		values = append(values, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit)
+		values = append(values, activationPaths.ControlSocketUnit, activationPaths.ControlRelayUnit, activationPaths.STUNSocketUnit, activationPaths.STUNRelayUnit, activationPaths.PrivateProbeUnit, filepath.Join(paths.SystemdRoot, "multi-user.target.wants", "lanpanel-headscale.service"), filepath.Join(paths.SystemdRoot, "multi-user.target.wants", "lanpanel-headscale-control-relay.service"), filepath.Join(paths.SystemdRoot, "multi-user.target.wants", "lanpanel-headscale-stun-relay.service"), filepath.Join(paths.SystemdRoot, "multi-user.target.wants", "lanpanel-headscale-private-probe.service"), filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-headscale-control.socket"), filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-headscale-stun.socket"))
 	}
 	slices.Sort(values)
 	return slices.Compact(values)
