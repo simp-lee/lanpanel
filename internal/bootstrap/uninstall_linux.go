@@ -171,7 +171,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyLifecycleIngressClosed(lifecycleInstallation); err != nil {
 		return err
 	}
-	if err := verifyRuntimeIngressClosed(ctx, lifecycleInstallation); err != nil {
+	if err := verifyRuntimeIngressClosed(ctx, paths, lifecycleInstallation); err != nil {
 		return err
 	}
 	if err := bindCurrentAuthorityArtifacts(paths, journal, commitBytes, &inventory); err != nil {
@@ -324,14 +324,16 @@ func verifyLifecycleIngressClosed(installation domain.Installation) error {
 	return nil
 }
 
-func verifyRuntimeIngressClosed(ctx context.Context, installation domain.Installation) error {
-	graph, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
-	if err != nil {
-		return fmt.Errorf("uninstall ingress graph is unavailable: %w", err)
-	}
-	for _, entry := range graph.Entries {
-		if entry.Kind == nginx.EntryApp || entry.Kind == nginx.EntryTemporary {
-			return fmt.Errorf("uninstall ingress graph still serves %s", entry.ResourceID)
+func verifyRuntimeIngressClosed(ctx context.Context, paths Paths, installation domain.Installation) error {
+	if paths == FixedPaths() {
+		graph, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		if err != nil {
+			return fmt.Errorf("uninstall ingress graph is unavailable: %w", err)
+		}
+		for _, entry := range graph.Entries {
+			if entry.Kind == nginx.EntryApp || entry.Kind == nginx.EntryTemporary {
+				return fmt.Errorf("uninstall ingress graph still serves %s", entry.ResourceID)
+			}
 		}
 	}
 	for _, app := range installation.Resources {
