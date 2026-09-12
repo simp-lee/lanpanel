@@ -212,6 +212,13 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
 		return err
 	}
+	binaryInfo, err := os.Lstat(paths.BinaryPath)
+	if err != nil {
+		return fmt.Errorf("uninstall binary identity is unavailable: %w", err)
+	}
+	if err := verifyOwnedFileMetadata(paths.BinaryPath, binaryInfo); err != nil {
+		return err
+	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
