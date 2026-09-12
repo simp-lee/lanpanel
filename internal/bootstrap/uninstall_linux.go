@@ -657,7 +657,21 @@ func prepareOwnedAccounts(journal Journal, installation domain.Installation) (ow
 			return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is foreign")
 		}
 		sets = append(sets, set)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if errors.Is(err, os.ErrNotExist) {
+		if installation.Headscale != nil {
+			set, setErr := identity.HeadscaleAccounts(installation.InstallationID, installation.Headscale.ID)
+			if setErr != nil {
+				return ownedAccountRemoval{}, setErr
+			}
+			present, evidenceErr := identity.PartialAccountEvidencePresent(set)
+			if evidenceErr != nil {
+				return ownedAccountRemoval{}, fmt.Errorf("uninstall cannot inspect Headscale account evidence: %w", evidenceErr)
+			}
+			if present {
+				return ownedAccountRemoval{}, fmt.Errorf("uninstall Headscale account authority is missing while account evidence remains")
+			}
+		}
+	} else {
 		return ownedAccountRemoval{}, fmt.Errorf("uninstall cannot inspect Headscale account authority: %w", err)
 	}
 	for _, set := range sets {
