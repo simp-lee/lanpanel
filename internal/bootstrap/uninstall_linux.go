@@ -558,7 +558,7 @@ func verifyOwnedFileIdentity(path string, artifacts map[string]string) error {
 }
 
 func mutableCertificatePointer(path, target string) bool {
-	if !strings.HasPrefix(path, "/var/lib/lanpanel/certificates/active/") || filepath.Base(path) == "." || filepath.IsAbs(target) == false || filepath.Clean(target) != target {
+	if !strings.HasPrefix(path, "/var/lib/lanpanel/certificates/active/") || filepath.Base(path) == "." || !filepath.IsAbs(target) || filepath.Clean(target) != target {
 		return false
 	}
 	id := strings.TrimSuffix(filepath.Base(path), ".current")
