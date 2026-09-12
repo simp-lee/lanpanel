@@ -164,6 +164,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall exposure lock is unavailable: %w", err)
 	}
 	defer func() { _ = exposure.Release() }()
+	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
 	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
 		return err
 	}
@@ -309,6 +312,9 @@ func bindCurrentAuthorityArtifacts(paths Paths, journal Journal, commitBytes []b
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("uninstall authority artifact is unreadable at %q: %w", path, err)
+		}
+		if path == paths.CommitPath && release.DigestBytes(data) != release.DigestBytes(commitBytes) {
+			return fmt.Errorf("uninstall commit authority changed during teardown")
 		}
 		inventory.Artifacts[path] = release.DigestBytes(data)
 	}
