@@ -161,6 +161,11 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
+	for _, stateFile := range []string{filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json")} {
+		if err := removeOwnedPath(stateFile, nil, inventory.MutablePaths); err != nil {
+			return err
+		}
+	}
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
 	}
@@ -245,7 +250,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		})
 	}
 	for _, root := range []string{
-		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/var/lib/lanpanel/certificates/bundles", "/var/lib/lanpanel/nginx/.filetxn",
+		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/var/lib/lanpanel/nginx/.filetxn",
 	} {
 		if err := addManagedTree(root); err != nil {
 			return err
