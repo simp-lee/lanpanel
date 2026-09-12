@@ -177,6 +177,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
+	if err := verifyUnmaskTargets(ctx, inventory.Paths, inventory.Artifacts); err != nil {
+		return err
+	}
 	accountRemoval, err := prepareOwnedAccounts(journal, lifecycleInstallation)
 	if err != nil {
 		return err
