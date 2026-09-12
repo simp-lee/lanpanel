@@ -44,3 +44,18 @@ func TestUninstallNeverRemovesForeignFile(t *testing.T) {
 		t.Fatal("foreign file was accepted for deletion")
 	}
 }
+
+func TestUninstallRejectsSameContentForeignMetadata(t *testing.T) {
+	path := t.TempDir() + "/binary"
+	data := []byte("binary")
+	if err := os.WriteFile(path, data, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyOwnedFileMetadata(path, info); err == nil {
+		t.Fatal("writable same-content file metadata was accepted")
+	}
+}
