@@ -105,6 +105,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := verifyLifecycleIngressClosed(lifecycleInstallation); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
@@ -186,6 +189,18 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
+	return nil
+}
+
+func verifyLifecycleIngressClosed(installation domain.Installation) error {
+	for _, app := range installation.Resources {
+		if app.PublicationRecord.State != domain.PublicationUnpublished || app.PublicationRecord.ActivationIntent != nil || app.PublicationRecord.ContractionIntent != nil {
+			return fmt.Errorf("uninstall ingress is not closed for App %s", app.ID)
+		}
+		if app.ManagedProcess != nil && (app.ManagedProcess.Requested != domain.ProcessRequestedStopped || app.ManagedProcess.Applied != nil) {
+			return fmt.Errorf("uninstall managed process is not stopped for App %s", app.ID)
+		}
+	}
 	return nil
 }
 
