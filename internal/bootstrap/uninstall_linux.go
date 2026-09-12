@@ -399,6 +399,16 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			return err
 		}
 	}
+	if installation.Headscale != nil {
+		if err := addList(installation.Headscale.ManagedPaths, true); err != nil {
+			return err
+		}
+		if installation.Headscale.Applied != nil {
+			if err := addList([]string{installation.Headscale.Database.SQLitePath, "/var/lib/lanpanel/headscale/identity/database-uuid", "/var/lib/lanpanel/headscale/identity/snapshot.json"}, true); err != nil {
+				return err
+			}
+		}
+	}
 	if installation.Connector != nil {
 		if err := addList(append(append([]string(nil), installation.Connector.ManagedPaths...), "/var/lib/lanpanel/connector/auth"), true); err != nil {
 			return err
