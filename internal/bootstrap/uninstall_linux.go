@@ -234,7 +234,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed.")
+	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed; package and service ownership not proven by this lifecycle remain retained.")
 	return nil
 }
 
