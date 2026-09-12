@@ -170,6 +170,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
 		return err
 	}
+	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
 	lifecycleInstallation, err := readLifecycleInstallation(paths, manager.Authority())
 	if err != nil {
 		return err
@@ -232,6 +235,12 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return err
 	}
+	if err := verifyUnmaskTargets(ctx, inventory.Paths, inventory.Artifacts); err != nil {
+		return retainFence(err)
+	}
+	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
+		return err
+	}
 	if err := removeOwnedPath(paths.Journal, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
 	}
@@ -266,12 +275,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
-	}
-	if err := verifyUnmaskTargets(ctx, inventory.Paths, inventory.Artifacts); err != nil {
-		return retainFence(err)
-	}
-	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
-		return err
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		_ = stopOwnedServices(ctx, inventory.Paths)
