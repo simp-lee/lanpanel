@@ -115,9 +115,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
-	if err := accountRemoval.Remove(); err != nil {
-		return err
-	}
 	if err := exposure.Release(); err != nil {
 		return fmt.Errorf("uninstall exposure lock release failed: %w", err)
 	}
@@ -126,6 +123,11 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := manager.Close(); err != nil {
 		return fmt.Errorf("uninstall lock release failed: %w", err)
+	}
+	for _, stateFile := range []string{filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json")} {
+		if err := removeOwnedPath(stateFile, nil, inventory.MutablePaths); err != nil {
+			return err
+		}
 	}
 	for _, lockName := range []string{"mutation-admission.lock", "exposure.lock"} {
 		if err := removeOwnedLockFile(filepath.Join(paths.LockRoot, lockName)); err != nil {
@@ -138,6 +140,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		}
 	}
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return err
+	}
+	if err := accountRemoval.Remove(); err != nil {
 		return err
 	}
 	if err := verifyOwnedFileIdentity(paths.BinaryPath, inventory.Artifacts); err != nil {
@@ -160,11 +165,6 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := removeOwnedPath(paths.OwnershipRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
-	}
-	for _, stateFile := range []string{filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json")} {
-		if err := removeOwnedPath(stateFile, nil, inventory.MutablePaths); err != nil {
-			return err
-		}
 	}
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return err
@@ -250,7 +250,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		})
 	}
 	for _, root := range []string{
-		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/var/lib/lanpanel/nginx/.filetxn",
+		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/etc/lanpanel/nginx/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".lanpanel-contraction-filetxn"), "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging", "/var/lib/lanpanel/headscale/journal/.lanpanel-filetxn",
 	} {
 		if err := addManagedTree(root); err != nil {
 			return err
@@ -329,6 +329,13 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			if err := addList([]string{bundle, filepath.Join(certificates.FixedBundlesRoot, "."+filepath.Base(bundle)+".lanpanel-staging"), filepath.Join(certificates.FixedActiveRoot, artifact.CertificateID+".current"), filepath.Join("/var/lib/lanpanel/certificates/chroot", artifact.CertificateID), filepath.Join("/var/lib/lanpanel/certificates/webroot", artifact.CertificateID)}, true); err != nil {
 				return err
 			}
+			if err := addManagedTree(bundle); err != nil {
+				return err
+			}
+			if inventory.Artifacts == nil {
+				inventory.Artifacts = map[string]string{}
+			}
+			inventory.Artifacts[bundle] = ""
 		}
 	}
 	slices.Sort(inventory.Paths)
@@ -557,12 +564,14 @@ func verifyOwnedFileIdentity(path string, artifacts map[string]string) error {
 	return nil
 }
 
-func mutableCertificatePointer(path, target string) bool {
+func mutableCertificatePointer(path, target string, owned map[string]string) bool {
 	if !strings.HasPrefix(path, "/var/lib/lanpanel/certificates/active/") || filepath.Base(path) == "." || !filepath.IsAbs(target) || filepath.Clean(target) != target {
 		return false
 	}
-	id := strings.TrimSuffix(filepath.Base(path), ".current")
-	return strings.HasPrefix(target, certificates.FixedBundlesRoot+string(filepath.Separator)) && strings.HasPrefix(filepath.Base(target), id+"-")
+	if _, ok := owned[target]; ok {
+		return true
+	}
+	return false
 }
 
 func mutableEnablementTarget(path, target string) bool {
@@ -570,7 +579,11 @@ func mutableEnablementTarget(path, target string) bool {
 		return false
 	}
 	resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
-	return strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".service") || strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".socket") || strings.HasPrefix(resolved, "/etc/systemd/system/") && strings.HasSuffix(filepath.Base(resolved), ".timer")
+	base := filepath.Base(path)
+	if filepath.Base(resolved) != base {
+		return false
+	}
+	return strings.HasPrefix(resolved, "/etc/systemd/system/") || strings.HasPrefix(resolved, "/usr/lib/systemd/system/")
 }
 
 func mutableServiceOwnedPath(path string) bool {
@@ -613,7 +626,7 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 		if err == nil && target == "/dev/null" && artifacts[path] == release.DigestBytes([]byte("/dev/null")) {
 			return os.Remove(path)
 		}
-		if slices.Contains(mutable, path) && err == nil && (mutableEnablementTarget(path, target) || mutableCertificatePointer(path, target)) {
+		if slices.Contains(mutable, path) && err == nil && (mutableEnablementTarget(path, target) || mutableCertificatePointer(path, target, artifacts)) {
 			return os.Remove(path)
 		}
 		return fmt.Errorf("uninstall foreign residue at %q", path)
