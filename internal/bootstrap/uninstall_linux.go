@@ -364,6 +364,19 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			if err := addList(app.ManagedProcess.Applied.ManagedPaths, true); err != nil {
 				return err
 			}
+			applied := app.ManagedProcess.Applied
+			for path, digest := range map[string]string{
+				filepath.Join("/etc/systemd/system", derived.ServiceUnit): applied.UnitDigest,
+				filepath.Join("/etc/systemd/system", derived.SocketUnit):  applied.SocketUnitDigest,
+				filepath.Join("/etc/systemd/system", derived.PolicyUnit):  applied.PolicyDigest,
+			} {
+				if release.ValidDigest(digest) {
+					if inventory.Artifacts == nil {
+						inventory.Artifacts = map[string]string{}
+					}
+					inventory.Artifacts[path] = digest
+				}
+			}
 			for _, unit := range app.ManagedProcess.Applied.EndpointSocketUnits {
 				if unit == "" || filepath.Base(unit) != unit || strings.ContainsAny(unit, `/\\`) {
 					return fmt.Errorf("uninstall lifecycle unit identity is invalid")

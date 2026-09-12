@@ -15,6 +15,21 @@ import (
 	"time"
 )
 
+func TestUnixUpstreamRejectsInjectionAndTailnetSource(t *testing.T) {
+	base := TemporarySite{PublicIPv4: "8.8.8.8", Port: 18080, HostAuthority: "8.8.8.8:18080", UpstreamNetwork: "unix", UpstreamAddress: "/run/lanpanel/app.sock", ReadinessPath: "/ready"}
+	for _, mutate := range []func(*TemporarySite){
+		func(value *TemporarySite) { value.UpstreamAddress = "/run/lanpanel/app.sock; include /tmp/x;" },
+		func(value *TemporarySite) { value.Tailnet = true },
+		func(value *TemporarySite) { value.UpstreamSource = "127.0.0.1" },
+	} {
+		candidate := base
+		mutate(&candidate)
+		if validTemporarySite(candidate, "tcp:0.0.0.0:18080") {
+			t.Fatalf("unsafe Unix upstream accepted: %#v", candidate)
+		}
+	}
+}
+
 func TestClosedGraphRejectsForeignFilesAndContractsWithoutRestore(t *testing.T) {
 	paths, manifest := installTestGraph(t)
 	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}

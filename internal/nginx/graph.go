@@ -781,7 +781,7 @@ func validTemporarySite(site TemporarySite, listener string) bool {
 	}
 	switch site.UpstreamNetwork {
 	case "unix":
-		return filepath.IsAbs(site.UpstreamAddress) && filepath.Clean(site.UpstreamAddress) == site.UpstreamAddress
+		return !site.Tailnet && site.UpstreamSource == "" && !strings.ContainsAny(site.UpstreamAddress, "\x00\r\n;{}#$\\\"'") && filepath.IsAbs(site.UpstreamAddress) && filepath.Clean(site.UpstreamAddress) == site.UpstreamAddress
 	case "tcp":
 		host, port, err := net.SplitHostPort(site.UpstreamAddress)
 		parsed, parseErr := netip.ParseAddr(host)
@@ -803,7 +803,7 @@ func validDomainSite(site DomainSite, domains []string) bool {
 	if strings.ContainsAny(site.UpstreamAddress, " \t\r\n;{}#$\\\"") {
 		return false
 	}
-	if site.UpstreamNetwork == "unix" && (!filepath.IsAbs(site.UpstreamAddress) || filepath.Clean(site.UpstreamAddress) != site.UpstreamAddress) {
+	if site.UpstreamNetwork == "unix" && (site.Tailnet || site.UpstreamSource != "" || strings.ContainsAny(site.UpstreamAddress, "\x00\r\n;{}#$\\\"'") || !filepath.IsAbs(site.UpstreamAddress) || filepath.Clean(site.UpstreamAddress) != site.UpstreamAddress) {
 		return false
 	}
 	if site.UpstreamNetwork == "tcp" {
