@@ -263,7 +263,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		return err
 	}
 	if !present {
-		return nil
+		return fmt.Errorf("uninstall lifecycle installation authority is missing")
 	}
 	known := make(map[string]bool, len(inventory.Paths))
 	for _, path := range inventory.Paths {
@@ -285,13 +285,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			inventory.MutablePaths = append(inventory.MutablePaths, path)
 			mutable[path] = true
 		}
-		base := filepath.Base(path)
-		if strings.HasPrefix(path, "/etc/systemd/system/") && (strings.HasSuffix(base, ".service") || strings.HasSuffix(base, ".socket") || strings.HasSuffix(base, ".timer")) {
-			if inventory.Artifacts == nil {
-				inventory.Artifacts = map[string]string{}
-			}
-			inventory.Artifacts[filepath.Join("/usr/lib/systemd/system", base)] = ""
-		}
+
 		return nil
 	}
 	addList := func(values []string, mutablePath bool) error {
