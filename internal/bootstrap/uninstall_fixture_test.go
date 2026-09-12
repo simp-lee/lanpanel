@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"fmt"
 	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/identity"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *testing.T) {
@@ -33,23 +36,37 @@ func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	external := filepath.Join(t.TempDir(), "application-data")
-	if err := os.WriteFile(external, []byte("preserve"), 0o600); err != nil {
-		t.Fatal(err)
+	externalRoot := t.TempDir()
+	externalExecutable := filepath.Join(externalRoot, "app")
+	externalEnvironment := filepath.Join(externalRoot, "app.env")
+	externalHTPasswd := filepath.Join(externalRoot, "users.htpasswd")
+	externalLog := filepath.Join(externalRoot, "access.log")
+	for _, path := range []string{externalExecutable, externalEnvironment, externalHTPasswd, externalLog} {
+		if err := os.WriteFile(path, []byte("preserve"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	installFixtureState(t, paths)
+	installFixtureState(t, paths, externalExecutable, externalEnvironment, externalHTPasswd, externalLog)
 	commandLog := filepath.Join(t.TempDir(), "commands.log")
 	systemctl := filepath.Join(t.TempDir(), "systemctl")
-	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \""+commandLog+"\"\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> \""+commandLog+"\"\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
+	}
+	for _, name := range []string{"apt", "apt-get", "dpkg"} {
+		wrapper := filepath.Join(filepath.Dir(systemctl), name)
+		if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nprintf '"+name+" %s\\n' \"$*\" >> \""+commandLog+"\"\nexit 99\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var output bytes.Buffer
 	if err := uninstallCommitted(context.Background(), paths, &output); err != nil {
 		t.Fatalf("isolated uninstall failed: %v\n%s", err, output.String())
 	}
-	if _, err := os.Stat(external); err != nil {
-		t.Fatalf("external file was not preserved: %v", err)
+	for _, path := range []string{externalExecutable, externalEnvironment, externalHTPasswd, externalLog} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("external file was not preserved: %s: %v", path, err)
+		}
 	}
 	if _, err := os.Stat(paths.PersistentRoot); !os.IsNotExist(err) {
 		t.Fatalf("owned persistent root remains: %v", err)
@@ -61,6 +78,73 @@ func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *
 	if strings.Contains(string(commands), "apt") || strings.Contains(string(commands), "dpkg") {
 		t.Fatalf("APT/dpkg command was invoked: %s", commands)
 	}
+}
+
+func TestPublicUninstallFixtureRequiresExactPTYConfirmation(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned lifecycle fixture")
+	}
+	root := t.TempDir()
+	paths := testPaths(root)
+	for _, directory := range []string{paths.InstallationRoot, paths.StateRoot, filepath.Join(paths.StateRoot, ".filetxn"), paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, filepath.Dir(paths.BinaryPath), paths.SystemdRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installFixtureState(t, paths)
+	systemctl := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	master, slave := openFixturePTY(t, "UNINSTALL WRONG\n")
+	var output bytes.Buffer
+	if err := runPublicUninstallAt(nil, slave, &output, paths); err == nil || !strings.Contains(err.Error(), "exact confirmation") {
+		t.Fatalf("wrong PTY confirmation was accepted: %v", err)
+	}
+	_ = slave.Close()
+	_ = master.Close()
+	master, slave = openFixturePTY(t, "UNINSTALL LANPANEL\n")
+	output.Reset()
+	if err := runPublicUninstallAt(nil, slave, &output, paths); err != nil {
+		t.Fatalf("exact PTY confirmation failed: %v", err)
+	}
+	_ = slave.Close()
+	_ = master.Close()
+	if _, err := os.Stat(paths.PersistentRoot); !os.IsNotExist(err) {
+		t.Fatalf("public uninstall did not remove fixture root: %v", err)
+	}
+}
+
+func openFixturePTY(t *testing.T, input string) (*os.File, *os.File) {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.IoctlSetInt(int(master.Fd()), unix.TIOCSPTLCK, 0); err != nil {
+		_ = master.Close()
+		t.Fatal(err)
+	}
+	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
+	if err != nil {
+		_ = master.Close()
+		t.Fatal(err)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
+	if err != nil {
+		_ = master.Close()
+		t.Fatal(err)
+	}
+	if _, err := master.WriteString(input); err != nil {
+		_ = slave.Close()
+		_ = master.Close()
+		t.Fatal(err)
+	}
+	return master, slave
 }
 
 func TestCommittedUninstallFixtureForeignResidueFailsAndRetries(t *testing.T) {
@@ -109,7 +193,7 @@ func TestCommittedUninstallFixtureForeignResidueFailsAndRetries(t *testing.T) {
 	}
 }
 
-func installFixtureState(t *testing.T, paths Paths) {
+func installFixtureState(t *testing.T, paths Paths, externalPaths ...string) {
 	t.Helper()
 	journal := testJournal(paths.PersistentRoot)
 	planned, err := plannedBootstrapPaths(paths)
@@ -170,7 +254,7 @@ func installFixtureState(t *testing.T, paths Paths) {
 	if err := journalStore.close(); err != nil {
 		t.Fatal(err)
 	}
-	writeFixtureInstallation(t, paths)
+	writeFixtureInstallation(t, paths, externalPaths...)
 	inventory, inventoryBytes, inventoryDigest, err := buildOwnershipInventory(journal)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +321,7 @@ func installFixtureState(t *testing.T, paths Paths) {
 	_ = inventory
 }
 
-func writeFixtureInstallation(t *testing.T, paths Paths) {
+func writeFixtureInstallation(t *testing.T, paths Paths, externalPaths ...string) {
 	t.Helper()
 	manager, err := locks.Open(locks.Config{RootPath: paths.LockRoot, Owner: 0, Group: 0, Mode: 0o700})
 	if err != nil {
@@ -257,7 +341,7 @@ func writeFixtureInstallation(t *testing.T, paths Paths) {
 	if _, err := store.Initialize(context.Background(), lease); err != nil {
 		t.Fatal(err)
 	}
-	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 23456}}
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 23456}, ManagedPaths: append([]string(nil), externalPaths...)}
 	raw, err := persist.EncodeEntry(installation)
 	if err != nil {
 		t.Fatal(err)

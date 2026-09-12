@@ -36,6 +36,10 @@ import (
 // committed ownership inventory, never invokes apt/dpkg, and never recursively
 // deletes a directory containing unowned residue.
 func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
+	return runPublicUninstallAt(args, in, out, FixedPaths())
+}
+
+func runPublicUninstallAt(args []string, in io.Reader, out io.Writer, paths Paths) error {
 	if os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("uninstall requires root")
 	}
@@ -52,7 +56,6 @@ func RunPublicUninstall(args []string, in io.Reader, out io.Writer) error {
 	if _, err := unix.IoctlGetTermios(int(fdReader.Fd()), unix.TCGETS); err != nil {
 		return fmt.Errorf("uninstall confirmation requires an interactive terminal")
 	}
-	paths := FixedPaths()
 	scope, err := readUninstallScope(paths)
 	if err != nil {
 		return fmt.Errorf("uninstall fenced: %w", err)
