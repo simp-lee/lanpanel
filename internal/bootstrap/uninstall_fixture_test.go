@@ -80,6 +80,47 @@ func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *
 	}
 }
 
+func TestCommittedUninstallFixtureRejectsStartupAuthorityDrift(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned lifecycle fixture")
+	}
+	root := t.TempDir()
+	paths := testPaths(root)
+	for _, directory := range []string{paths.InstallationRoot, paths.StateRoot, filepath.Join(paths.StateRoot, ".filetxn"), paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, filepath.Dir(paths.BinaryPath), paths.SystemdRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installFixtureState(t, paths)
+	startup, err := ReadPublicStartupAuthority(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startup.Management.Address = "127.1.1.2"
+	data, err := encodeCanonical(startup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.StartupAuthority, data, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	systemctl := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	var output bytes.Buffer
+	if err := uninstallCommitted(context.Background(), paths, &output); err == nil || !strings.Contains(err.Error(), "startup authority") {
+		t.Fatalf("startup authority drift was accepted: %v", err)
+	}
+	if _, err := os.Stat(paths.CommitPath); err != nil {
+		t.Fatalf("commit authority was not retained: %v", err)
+	}
+}
+
 func TestPublicUninstallFixtureRequiresExactPTYConfirmation(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-owned lifecycle fixture")
