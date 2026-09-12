@@ -174,6 +174,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	if err := verifyRuntimeIngressClosed(ctx, lifecycleInstallation); err != nil {
 		return err
 	}
+	if err := bindCurrentAuthorityArtifacts(paths, &inventory); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
@@ -269,6 +272,27 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		return err
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed; package and service ownership not proven by this lifecycle remain retained.")
+	return nil
+}
+
+func bindCurrentAuthorityArtifacts(paths Paths, inventory *OwnershipInventory) error {
+	if inventory.Artifacts == nil {
+		inventory.Artifacts = map[string]string{}
+	}
+	for _, path := range []string{paths.Journal, paths.CommitPath, paths.StartupAuthority} {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Size() > int64(journalFileBytes) {
+			return fmt.Errorf("uninstall authority artifact is invalid at %q", path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("uninstall authority artifact is unreadable at %q: %w", path, err)
+		}
+		inventory.Artifacts[path] = release.DigestBytes(data)
+	}
 	return nil
 }
 
