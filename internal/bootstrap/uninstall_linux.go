@@ -65,7 +65,7 @@ func runPublicUninstallAt(args []string, in io.Reader, out io.Writer, paths Path
 	if !scanner.Scan() || scanner.Text() != "UNINSTALL LANPANEL" {
 		return fmt.Errorf("uninstall requires exact confirmation UNINSTALL LANPANEL")
 	}
-	return uninstallCommitted(context.Background(), paths, out)
+	return uninstallCommitted(context.Background(), paths, out, scope)
 }
 
 func readUninstallScope(paths Paths) ([]string, error) {
@@ -125,7 +125,7 @@ func readUninstallScope(paths Paths) ([]string, error) {
 	return slices.Compact(scope), nil
 }
 
-func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
+func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expectedScope ...[]string) error {
 	if err := RequireCommitted(paths); err != nil {
 		return fmt.Errorf("uninstall fenced: %w", err)
 	}
@@ -169,6 +169,11 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 	}
 	if err := augmentCurrentLifecycleOwnership(paths, manager.Authority(), &inventory); err != nil {
 		return err
+	}
+	if len(expectedScope) > 0 {
+		if !slices.Equal(inventory.Paths, expectedScope[0]) {
+			return fmt.Errorf("uninstall deletion scope changed after confirmation")
+		}
 	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
@@ -235,11 +240,8 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer) error {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return err
 	}
-	if err := verifyUnmaskTargets(ctx, inventory.Paths, inventory.Artifacts); err != nil {
-		return retainFence(err)
-	}
 	if err := unmaskOwnedServices(ctx, inventory.Paths); err != nil {
-		return err
+		return retainFence(err)
 	}
 	if err := removeOwnedPath(paths.Journal, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
@@ -667,6 +669,13 @@ func verifyUnmaskTargets(ctx context.Context, paths []string, artifacts map[stri
 		}
 		output, err := exec.CommandContext(ctx, "systemctl", "show", "--property=FragmentPath", "--value", base).Output()
 		if err != nil {
+			for _, candidate := range paths {
+				if filepath.Base(candidate) == base {
+					if _, statErr := os.Lstat(candidate); statErr == nil {
+						return fmt.Errorf("uninstall cannot inspect unit %s: %w", base, err)
+					}
+				}
+			}
 			continue
 		}
 		fragment := strings.TrimSpace(string(output))
