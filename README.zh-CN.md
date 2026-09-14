@@ -20,7 +20,7 @@ Preview release 支持使用 systemd 和 apt/dpkg 的 Debian 或 Ubuntu Linux am
 sudo ./lanpanel install
 ```
 
-程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、受信任的 detached Ed25519 签名、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。若不想手工处理 bundle，可直接复制发布页提供的版本固定命令：
+程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、受信任的 detached Ed25519 签名、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。若不想手工处理 bundle，可直接复制发布页提供的版本固定命令：
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
@@ -95,6 +95,6 @@ Plan-bound resource delete 要求 fresh unpublished closure；本机 App 还要�
 
 主机管理员可以在产品外读取自己的配置、SQLite 和数据。Configuration export 是产品支持的数据迁出能力。
 
-## 安全与发行
+## 发行
 
-参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、按发行版家族区分的 dependency manifest 和 package template、`SHA256SUMS` 以及 canonical `release.json`。用户安装说明见 [docs/INSTALLING.md](docs/INSTALLING.md)；开发和发布流程见 [docs/DEVELOPING.md](docs/DEVELOPING.md) 与 [docs/RELEASING.md](docs/RELEASING.md)。Preview 不发布 SBOM/OSV 或 live qualification 证据。
+release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、按发行版家族区分的 dependency manifest 和 package template、`SHA256SUMS` 以及 canonical `release.json`。用户安装说明见 [docs/INSTALLING.md](docs/INSTALLING.md)；开发和发布流程见 [docs/DEVELOPING.md](docs/DEVELOPING.md) 与 [docs/RELEASING.md](docs/RELEASING.md)。Preview 不发布 SBOM/OSV 或 live qualification 证据。

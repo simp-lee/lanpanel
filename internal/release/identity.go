@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const ReleaseManifestSchemaVersion = "lanpanel.release.v5"
+const ReleaseManifestSchemaVersion = "lanpanel.release.v6"
 
 const (
 	ReleaseSignaturePath  = "release.json.sig"
@@ -138,7 +138,6 @@ type ReleaseManifest struct {
 	Binary            AssetIdentity              `json:"binary"`
 	SourceArchive     AssetIdentity              `json:"source_archive"`
 	License           AssetIdentity              `json:"license"`
-	Notice            AssetIdentity              `json:"notice"`
 	Headscale         HeadscaleArtifactAuthority `json:"headscale"`
 	KnownLimitations  AssetIdentity              `json:"known_limitations"`
 	AdditionalAssets  []AssetIdentity            `json:"additional_assets"`
@@ -269,7 +268,7 @@ func releaseAssetPaths(manifest ReleaseManifest) []string {
 }
 
 func mustReleaseAssets(manifest ReleaseManifest) []AssetIdentity {
-	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.Headscale.Archive, manifest.KnownLimitations}
+	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Headscale.Archive, manifest.KnownLimitations}
 	for _, profile := range manifest.SupportedProfiles {
 		assets = append(assets, profile.PackageTemplate, profile.DependencyManifest, profile.DependencyBaseline)
 	}
@@ -315,7 +314,7 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) == 0 || len(manifest.SupportedProfiles) > 16 {
 		return fmt.Errorf("release manifest is incomplete")
 	}
-	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.Notice) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
+	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
 		return fmt.Errorf("release manifest asset authority is invalid")
 	}
 	requiredAdditional := map[string]bool{"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false}

@@ -20,7 +20,7 @@ Only clean installation is supported. From an extracted official release artifac
 sudo ./lanpanel install
 ```
 
-The artifact directory is discovered from the running binary. Its canonical manifest, trusted detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, NOTICE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. To install without manually handling the bundle, copy the version-pinned command published with the release:
+The artifact directory is discovered from the running binary. Its canonical manifest, trusted detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. To install without manually handling the bundle, copy the version-pinned command published with the release:
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
@@ -95,6 +95,6 @@ Plan-bound resource deletion requires fresh unpublished closure and, for local A
 
 Host administrators may read their own configuration, SQLite, and data outside LanPanel. Configuration export is the supported product data-exit capability.
 
-## Security and release
+## Release
 
-See [SECURITY.md](SECURITY.md). A release includes one Linux amd64 binary, source tag/archive, LICENSE, NOTICE, family-specific dependency manifests and package templates, `SHA256SUMS`, and a canonical `release.json`. User installation details are in [docs/INSTALLING.md](docs/INSTALLING.md); developer and maintainer workflows are in [docs/DEVELOPING.md](docs/DEVELOPING.md) and [docs/RELEASING.md](docs/RELEASING.md). Preview does not publish SBOM/OSV or live-qualification evidence.
+A release includes one Linux amd64 binary, source tag/archive, LICENSE, family-specific dependency manifests and package templates, `SHA256SUMS`, and a canonical `release.json`. User installation details are in [docs/INSTALLING.md](docs/INSTALLING.md); developer and maintainer workflows are in [docs/DEVELOPING.md](docs/DEVELOPING.md) and [docs/RELEASING.md](docs/RELEASING.md). Preview does not publish SBOM/OSV or live-qualification evidence.

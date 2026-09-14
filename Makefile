@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := preview-local-gate
 
-.PHONY: build test vet lint race preview-local-gate check tidy docs-build check-preview-profile-host capture-preview-profile resolve-preview-dependencies materialize-preview-dependencies build-preview-artifact package-preview-release publish-preview-github release-preview
+.PHONY: build test vet lint race preview-local-gate check tidy check-preview-profile-host capture-preview-profile resolve-preview-dependencies materialize-preview-dependencies build-preview-artifact package-preview-release publish-preview-github release-preview
 
 GO ?= go
 BINARY ?= lanpanel
@@ -67,27 +67,3 @@ publish-preview-github:
 package-preview-release:
 	@test -n "$${PREVIEW_VERSION}" && test -n "$${PREVIEW_ARTIFACT_DIR}" && test -n "$${PREVIEW_DOWNLOAD_BASE_URL}" && test -n "$${PREVIEW_OUTPUT_DIR}" || { echo 'PREVIEW_VERSION, PREVIEW_ARTIFACT_DIR, PREVIEW_DOWNLOAD_BASE_URL, and PREVIEW_OUTPUT_DIR are required' >&2; exit 2; }
 	@scripts/package-preview-release.sh "$${PREVIEW_VERSION}" "$${PREVIEW_ARTIFACT_DIR}" "$${PREVIEW_DOWNLOAD_BASE_URL}" "$${PREVIEW_OUTPUT_DIR}"
-
-docs-build:
-	@test -f README.md && test -f README.zh-CN.md && test -f docs/README.md && test -f docs/INSTALLING.md && test -f docs/DEVELOPING.md && test -f docs/RELEASING.md && test -f release-inputs/preview-target-debian.json && test -f release-inputs/preview-target-ubuntu.json && test -x scripts/check-preview-profile-host.sh && test -x scripts/generate-preview-bootstrap.sh && test -x scripts/resolve-preview-dependencies.sh && test -x scripts/materialize-preview-dependencies.sh && test -x scripts/verify-preview-release.sh && test -x scripts/package-preview-release.sh && test -x scripts/publish-preview-github.sh
-	@grep -Fq 'sudo ./lanpanel install' README.md README.zh-CN.md docs/README.md
-	@grep -Fq 'sudo lanpanel uninstall' docs/README.md
-	@grep -Fq 'scripts/generate-preview-bootstrap.sh' README.md README.zh-CN.md docs/README.md
-	@grep -Fq 'package-preview-release' docs/RELEASING.md Makefile
-	@grep -Fq 'INSTALLING.md' docs/README.md README.md
-	@grep -Fq 'DEVELOPING.md' docs/README.md README.md
-	@grep -Fq 'resolve-preview-dependencies' docs/RELEASING.md Makefile
-	@grep -Fq 'materialize-preview-dependencies' docs/DEVELOPING.md Makefile
-	@grep -Fq 'check-preview-profile-host' docs/RELEASING.md Makefile
-	@grep -Fq 'capture-preview-profile' docs/RELEASING.md Makefile
-	@grep -Fq 'IsSupportedPreviewTarget' internal/release/identity.go
-	@grep -Fq 'PREVIEW_PROFILE_TARGET=ubuntu' docs/RELEASING.md
-	@grep -Fq 'publish-preview-github' docs/RELEASING.md Makefile
-	@grep -Fq '"family":"debian"' release-inputs/preview-target-debian.json
-	@grep -Fq '"family":"ubuntu"' release-inputs/preview-target-ubuntu.json
-	@grep -Fq '"architecture":"amd64"' release-inputs/preview-target-debian.json
-	@grep -Fq 'verify-preview-release' Makefile scripts/package-preview-release.sh
-	@grep -Fq 'lanpanel-bootstrap.sh' README.md README.zh-CN.md docs/README.md
-	@! grep -Eq 'curl[^\n]*\|[[:space:]]*(sudo[[:space:]]+)?(sh|bash)' README.md README.zh-CN.md docs/README.md
-	@! grep -Eq 'lanpanel installer --bundle-dir|--release-digest|--acme-account-contact' README.md README.zh-CN.md docs/README.md
-	@! grep -Eq 'source_kind|mirror_url|offline_path|proxy_url' docs/README.md

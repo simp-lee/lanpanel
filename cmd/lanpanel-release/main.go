@@ -130,7 +130,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	if err := writeFile(filepath.Join(tmp, "lanpanel-"+tag+".tar.gz"), sourceArchive, 0o644); err != nil {
 		return err
 	}
-	for _, path := range []string{manifest.License.Path, manifest.Notice.Path, manifest.KnownLimitations.Path} {
+	for _, path := range []string{manifest.License.Path, manifest.KnownLimitations.Path} {
 		if err := copyRegular(filepath.Join(source, filepath.FromSlash(path)), filepath.Join(tmp, filepath.FromSlash(path)), 0o644); err != nil {
 			return err
 		}
@@ -216,7 +216,6 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	manifest.Binary = fileIdentity(tmp, "lanpanel")
 	manifest.SourceArchive = fileIdentity(tmp, "lanpanel-"+tag+".tar.gz")
 	manifest.License = fileIdentity(tmp, manifest.License.Path)
-	manifest.Notice = fileIdentity(tmp, manifest.Notice.Path)
 	manifest.KnownLimitations = fileIdentity(tmp, manifest.KnownLimitations.Path)
 	for i := range manifest.SupportedProfiles {
 		manifest.SupportedProfiles[i].PackageTemplate = fileIdentity(tmp, manifest.SupportedProfiles[i].PackageTemplate.Path)

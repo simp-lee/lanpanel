@@ -6,13 +6,9 @@
     "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
-    "docs:dev": "vitepress dev docs --host 127.0.0.1",
-    "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs --host 127.0.0.1",
     "test:auth": "playwright test --project=local_fixture"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.1",
-    "vitepress": "2.0.0-alpha.19"
+    "@playwright/test": "1.62.1"
   }
 }
