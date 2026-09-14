@@ -121,7 +121,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	command.Env = []string{}
 	command.ExtraFiles = []*os.File{instructionRead, inputRead}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
-	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileGoAccessShow || profileID == ProfileHeadscaleAdmin || profileID == ProfileTailscaleAdmin || profileID == ProfileHTPasswd)
+	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileGoAccessShow || profileID == ProfileHeadscaleAdmin || profileID == ProfileTailscaleAdmin)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
 	if err := ctx.Err(); err != nil {

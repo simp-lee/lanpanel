@@ -46,10 +46,23 @@ func (executor *HostExecutor) Audit(ctx context.Context, plan Plan) (Audit, erro
 }
 
 func (executor *HostExecutor) Stage(ctx context.Context, plan Plan) error {
+	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
+		return nil
+	}
 	if executor == nil || executor.Stager == nil {
 		return fmt.Errorf("package artifact stager is unavailable")
 	}
 	return executor.Stager.Stage(ctx, plan)
+}
+
+func (executor *HostExecutor) VerifyStaged(ctx context.Context, plan Plan) error {
+	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
+		return nil
+	}
+	if executor == nil || executor.Files == nil {
+		return fmt.Errorf("package staged artifact verifier is unavailable")
+	}
+	return executor.Files.validateStagedClosure(ctx, plan)
 }
 
 func (executor *HostExecutor) Prepare(ctx context.Context, plan Plan, config, sources []byte) error {
@@ -63,18 +76,33 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 	if executor == nil || executor.Launcher == nil {
 		return nil, fmt.Errorf("package simulation child is unavailable")
 	}
-	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, true), nil)
+	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, false), nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
 		return nil, fmt.Errorf("exact package simulation failed")
 	}
-	if len(result.PackageChanges) != len(plan.Packages) {
+	if len(result.PackageChanges) == 0 || len(result.PackageChanges) > 256 {
+		return nil, fmt.Errorf("package simulation returned an invalid closure")
+	}
+	flexible := false
+	for _, pkg := range plan.Packages {
+		flexible = flexible || pkg.VersionMinimum != "" || pkg.VersionMaximum != ""
+	}
+	if !flexible && len(result.PackageChanges) != len(plan.Packages) {
 		return nil, fmt.Errorf("package simulation changed the frozen closure size")
 	}
 	resolved := make([]Package, 0, len(plan.Packages))
-	for index, change := range result.PackageChanges {
-		want := plan.Packages[index]
-		if change.Name != want.Name || change.Version != want.Version {
-			return nil, fmt.Errorf("package simulation changed the frozen package identity")
+	for _, want := range plan.Packages {
+		found := false
+		for _, change := range result.PackageChanges {
+			if change.Name == want.Name {
+				if found || !PackageVersionMatches(want, change.Version) {
+					return nil, fmt.Errorf("package simulation changed the package version requirement")
+				}
+				found = true
+			}
+		}
+		if !found && !flexible {
+			return nil, fmt.Errorf("package simulation omitted required package %q", want.Name)
 		}
 		resolved = append(resolved, want)
 	}
@@ -116,8 +144,13 @@ func (executor *HostExecutor) Run(ctx context.Context, profile child.ProfileID, 
 }
 
 func (executor *HostExecutor) Observe(ctx context.Context, plan Plan) (Postcondition, error) {
-	if executor == nil || executor.Auditor == nil {
+	if executor == nil || executor.Auditor == nil || executor.Files == nil {
 		return Postcondition{}, fmt.Errorf("package postcondition observer is unavailable")
+	}
+	if plan.Mode != DistroRepository || len(plan.Repositories) != 0 {
+		if err := executor.Files.validateStagedClosure(ctx, plan); err != nil {
+			return Postcondition{}, fmt.Errorf("postcondition staged package artifact audit: %w", err)
+		}
 	}
 	return executor.Auditor.ObservePackages(ctx, plan)
 }

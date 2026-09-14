@@ -10,16 +10,12 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/child"
-	"lanpanel/internal/release"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	LifecycleVersion                    = release.SupportedHeadscaleVersion
-	preauthTimestampSerializationWindow = time.Second
-)
+const preauthTimestampSerializationWindow = time.Second
 
 type AdminRunner interface {
 	Run(context.Context, child.HeadscaleInvocation) ([]byte, error)

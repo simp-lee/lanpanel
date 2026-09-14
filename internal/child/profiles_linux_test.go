@@ -30,7 +30,7 @@ func TestInvocationCgroupNamesAreTyped(t *testing.T) {
 }
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileHTPasswd, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -67,13 +67,6 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	show, err := ResolveInvocation(ProfileHeadscaleShow, Identities{}, headscaleInvocation)
 	if err != nil || !show.Complete || len(show.Arguments) != 4 || show.Arguments[3] != "lanpanel-headscale.service" {
 		t.Fatalf("Headscale show profile=%#v error=%v", show, err)
-	}
-	htpasswd, err := ResolveInvocation(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 30000001, GID: 30000001}}, Invocation{HTPasswd: &HTPasswdInvocation{Username: "admin", Cost: 12}})
-	if err != nil || !htpasswd.Complete || !reflect.DeepEqual(htpasswd.Arguments, []string{"-n", "-i", "-B", "-C", "12", "admin"}) || htpasswd.MaximumInputBytes != 72 || htpasswd.RootTCB || htpasswd.UID != 30000001 || htpasswd.GID != 30000001 || len(htpasswd.AllowedCapabilities) != 0 {
-		t.Fatalf("typed htpasswd profile=%#v error=%v", htpasswd, err)
-	}
-	if _, err := ResolveInvocation(ProfileHTPasswd, Identities{EphemeralHTPasswd: Identity{UID: 30000001, GID: 30000001}}, Invocation{HTPasswd: &HTPasswdInvocation{Username: "admin", Cost: 10}}); err == nil {
-		t.Fatal("mutable htpasswd cost accepted")
 	}
 	if _, err := ResolveProfile(ProfileID("shell"), Identities{}); err == nil {
 		t.Fatal("unknown arbitrary executable profile was accepted")
@@ -167,7 +160,7 @@ func TestNginxProfilesFitFixedUnitCapabilityBoundary(t *testing.T) {
 
 func TestPackageInvocationsDeriveOnlyExactAPTArguments(t *testing.T) {
 	invocation := Invocation{Package: &PackageInvocation{TransactionID: "pkg_" + strings.Repeat("a", 64), LockWaitSeconds: 30, Packages: []PackageArgument{
-		{Name: "apache2-utils", Version: "2.4.62-1", Digest: strings.Repeat("b", 64), Bytes: 1024, MaximumInstalledFileBytes: 8 << 20},
+		{Name: "goaccess", Version: "1.9.3-1", Digest: strings.Repeat("b", 64), Bytes: 1024, MaximumInstalledFileBytes: 8 << 20},
 		{Name: "nginx", Version: "1.22.1-9", Digest: strings.Repeat("c", 64), Bytes: 2048, MaximumInstalledFileBytes: 16 << 20},
 	}}}
 	distro, err := ResolveInvocation(ProfileAPTTransaction, Identities{}, invocation)
@@ -302,8 +295,8 @@ func TestProcessGroupStatParsingIsExact(t *testing.T) {
 }
 
 func TestAPTSimulationReturnsOnlyCanonicalExactChanges(t *testing.T) {
-	changes, err := parseAPTSimulation([]byte("Reading package lists...\nInst nginx (1.22.1-9 Debian [amd64])\nInst apache2-utils (2.4.62-1 Debian [amd64])\nConf nginx (1.22.1-9 Debian [amd64])\n"))
-	if err != nil || len(changes) != 2 || changes[0].Name != "apache2-utils" || changes[1].Version != "1.22.1-9" {
+	changes, err := parseAPTSimulation([]byte("Reading package lists...\nInst nginx (1.22.1-9 Debian [amd64])\nInst goaccess (1.9.3-1 Debian [amd64])\nConf nginx (1.22.1-9 Debian [amd64])\n"))
+	if err != nil || len(changes) != 2 || changes[0].Name != "goaccess" || changes[1].Version != "1.22.1-9" {
 		t.Fatalf("changes=%#v error=%v", changes, err)
 	}
 	if _, err := parseAPTSimulation([]byte("Remv nginx [1.22.1]\n")); err == nil {

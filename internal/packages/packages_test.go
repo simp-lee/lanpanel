@@ -1,6 +1,7 @@
 package packages
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"lanpanel/internal/child"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/sources"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -20,6 +23,33 @@ func TestPackageNoAutostartRoleAlwaysDeniesMaintainerStarts(t *testing.T) {
 		if code := NoAutostartExitCode(arguments); code != 101 {
 			t.Fatalf("policy exit=%d for %v", code, arguments)
 		}
+	}
+}
+
+func TestUserMirrorDistroPackagePlanAcceptsVersionRange(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	plan.Repositories = nil
+	plan.Packages = clonePackages(plan.Packages)
+	for index := range plan.Packages {
+		plan.Packages[index].RepositoryID = ""
+		plan.Packages[index].RepositoryFilename = ""
+		plan.Packages[index].ArtifactDigest = ""
+		plan.Packages[index].ArtifactBytes = 0
+		plan.Packages[index].Source.Artifact.Digest = ""
+		plan.Packages[index].VersionMinimum = plan.Packages[index].Version
+		plan.Packages[index].VersionMaximum = ""
+	}
+	if err := ValidatePublicReleasePlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	if !PackageVersionMatches(plan.Packages[0], plan.Packages[0].Version) {
+		t.Fatal("minimum package version did not match")
+	}
+	changed := plan
+	changed.Packages = clonePackages(plan.Packages)
+	changed.Packages[0].VersionMinimum = "9:999"
+	if PackageVersionMatches(changed.Packages[0], plan.Packages[0].Version) {
+		t.Fatal("out-of-range package version matched")
 	}
 }
 
@@ -92,6 +122,18 @@ func TestPackagePlanBindsExactQualifiedClosureRepositoriesAndNoNetwork(t *testin
 	if err := ValidatePlan(plan); err != nil {
 		t.Fatal(err)
 	}
+	missingRepository := plan
+	missingRepository.Packages = clonePackages(plan.Packages)
+	missingRepository.Packages[0].RepositoryID = ""
+	if err := ValidatePlan(missingRepository); err == nil {
+		t.Fatal("distro package without a RepositoryID was accepted")
+	}
+	missingFilename := plan
+	missingFilename.Packages = clonePackages(plan.Packages)
+	missingFilename.Packages[0].RepositoryFilename = ""
+	if err := ValidatePlan(missingFilename); err == nil {
+		t.Fatal("distro package without the signed repository Filename was accepted")
+	}
 	offline := testPlan(t, OfflineDebs)
 	if err := ValidatePlan(offline); err != nil {
 		t.Fatal(err)
@@ -106,12 +148,6 @@ func TestPackagePlanBindsExactQualifiedClosureRepositoriesAndNoNetwork(t *testin
 	changed.NoNetwork = false
 	if err := ValidatePlan(changed); err == nil {
 		t.Fatal("offline package transaction without no-network authority was accepted")
-	}
-	apache := testPlan(t, DistroRepository)
-	apache.Packages = clonePackages(apache.Packages)
-	apache.Packages[0].Name = "apache2"
-	if err := ValidatePlan(apache); err == nil {
-		t.Fatal("Apache HTTP Server package was accepted in the closure")
 	}
 }
 
@@ -149,7 +185,29 @@ func TestAPTSourceAcceptsOptionlessLineOnlyWithAuthorizedSharedKeyring(t *testin
 	}
 }
 
-func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverridesAndRepositoryDrift(t *testing.T) {
+func TestRenderAPTConfigurationInheritsHostNetworkAuthentication(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	plan.Repositories = nil
+	for index := range plan.Packages {
+		plan.Packages[index].RepositoryID = ""
+		plan.Packages[index].RepositoryFilename = ""
+		plan.Packages[index].VersionMinimum = plan.Packages[index].Version
+	}
+	config, sources, err := RenderAPTConfiguration(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"Acquire::http::Proxy", "Acquire::https::Proxy", "Dir::Etc::netrc", "Dir::Etc::preferences"} {
+		if strings.Contains(string(config), forbidden) {
+			t.Fatalf("host APT setting %q was overridden: %s", forbidden, config)
+		}
+	}
+	if len(sources) != 0 {
+		t.Fatalf("host source list was replaced: %q", sources)
+	}
+}
+
+func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverrides(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	keyring := []byte("test keyring identity")
 	keyringDigest := fmt.Sprintf("%x", sha256.Sum256(keyring))
@@ -170,7 +228,14 @@ func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverridesAndReposi
 			t.Fatalf("standard distro hook %q was rejected: %v", allowed, err)
 		}
 	}
-	for _, hostile := range []string{`Acquire::http::Proxy "http://ambient";`, `Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `Acquire { http { Proxy "http://ambient"; }; };`, `APT::Get::AllowUnauthenticated "true";`} {
+	for _, allowed := range []string{`Acquire::http::Proxy "http://ambient";`, `Acquire { http { Proxy "http://ambient"; }; };`} {
+		changed := append([]ObservedConfig(nil), files...)
+		changed[0].Bytes = []byte(allowed)
+		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err != nil {
+			t.Fatalf("user APT proxy %q was rejected: %v", allowed, err)
+		}
+	}
+	for _, hostile := range []string{`Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `DPkg::Options { "--admindir=/tmp/other"; };`, `DPkg::Options { "--instdir=/tmp/other"; };`, `APT::Get::AllowUnauthenticated "true";`} {
 		changed := append([]ObservedConfig(nil), files...)
 		changed[0].Bytes = []byte(hostile)
 		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err == nil {
@@ -193,8 +258,8 @@ func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverridesAndReposi
 	} {
 		changed := append([]ObservedRepository(nil), repositories...)
 		change(&changed[0])
-		if err := ValidateAPTConfiguration(files, changed, plan.Repositories); err == nil {
-			t.Fatal("repository snapshot drift was accepted")
+		if err := ValidateAPTConfiguration(files, changed, plan.Repositories); err != nil {
+			t.Fatalf("obsolete repository snapshot identity blocked configuration: %v", err)
 		}
 	}
 	if err := ValidateDPKGReady(DPKGState{HalfConfigured: []string{"nginx"}}); err == nil {
@@ -209,6 +274,12 @@ func TestPostconditionRejectsRepositorySnapshotDrift(t *testing.T) {
 	if err := ValidatePostcondition(plan, executor.audit.Before, executor.observed, []string{"nginx.service"}); err != nil {
 		t.Fatal(err)
 	}
+	missingBindings := executor.observed
+	missingBindings.Repositories = append([]ObservedRepository(nil), executor.observed.Repositories...)
+	missingBindings.Repositories[0].PackageBindings = nil
+	if err := ValidatePostcondition(plan, executor.audit.Before, missingBindings, []string{"nginx.service"}); err == nil {
+		t.Fatal("postcondition accepted installed packages without signed repository bindings")
+	}
 	for _, change := range []func(*ObservedRepository){
 		func(repository *ObservedRepository) { repository.MetadataDigest = strings.Repeat("0", 64) },
 		func(repository *ObservedRepository) { repository.CutoffDigest = strings.Repeat("0", 64) },
@@ -216,8 +287,50 @@ func TestPostconditionRejectsRepositorySnapshotDrift(t *testing.T) {
 		observed := executor.observed
 		observed.Repositories = append([]ObservedRepository(nil), executor.observed.Repositories...)
 		change(&observed.Repositories[0])
-		if err := ValidatePostcondition(plan, executor.audit.Before, observed, []string{"nginx.service"}); err == nil {
-			t.Fatal("post-transaction repository snapshot drift was accepted")
+		if err := ValidatePostcondition(plan, executor.audit.Before, observed, []string{"nginx.service"}); err != nil {
+			t.Fatalf("obsolete repository snapshot identity blocked postcondition: %v", err)
+		}
+	}
+}
+
+func TestDistroArtifactVerificationBindsSignedFilenameBeforeChild(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	root := t.TempDir()
+	cache := filepath.Join(root, "var/lib/lanpanel/packages/transactions", plan.TransactionID, "archives")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := bytes.Repeat([]byte{'b'}, int(plan.Packages[0].ArtifactBytes))
+	cacheName := "goaccess_1.9.3-1_amd64.deb"
+	if err := os.WriteFile(filepath.Join(cache, cacheName), artifact, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	auditor := newTestLinuxAuditor(&auditLauncher{}, root)
+	repositories := []ObservedRepository{{ID: plan.Repositories[0].ID, PackageBindings: []RepositoryPackageBinding{{Name: plan.Packages[0].Name, Version: plan.Packages[0].Version, Architecture: plan.Packages[0].Architecture, Filename: "pool/main/a/other.deb", Size: plan.Packages[0].ArtifactBytes, Digest: plan.Packages[0].ArtifactDigest}}}}
+	if err := auditor.verifyDistroPackageArtifacts(plan, repositories); err == nil {
+		t.Fatal("distro artifact with a mismatched signed filename was accepted")
+	}
+}
+
+func TestSignedPackageIndexBindsRepositoryFilenameAndArtifactIdentity(t *testing.T) {
+	entries, err := parseRepositoryPackageIndex([]byte("Package: nginx\nVersion: 1.22.1-9\nArchitecture: amd64\nFilename: pool/main/n/nginx_1.22.1-9_amd64.deb\nSize: 2048\nSHA256: "+strings.Repeat("c", 64)+"\n"), "debian-main", "main", "amd64")
+	if err != nil || len(entries) != 1 || entries[0].Filename != "pool/main/n/nginx_1.22.1-9_amd64.deb" || entries[0].Digest != strings.Repeat("c", 64) {
+		t.Fatalf("parsed signed package entry=%#v error=%v", entries, err)
+	}
+	pkg := Package{Name: "nginx", Version: "1.22.1-9", Architecture: "amd64", RepositoryID: "debian-security", ArtifactDigest: strings.Repeat("c", 64), ArtifactBytes: 2048}
+	repositories := []ObservedRepository{{ID: "debian-main"}, {ID: "debian-security"}}
+	if err := validateExpectedRepositoryPackages([]Package{pkg}, "debian-security", repositories, nil); err == nil {
+		t.Fatal("package absent from its assigned repository was accepted")
+	}
+	wrongRepository := []ObservedRepository{{ID: "debian-main", PackageBindings: []RepositoryPackageBinding{{Name: pkg.Name, Version: pkg.Version, Architecture: pkg.Architecture, Filename: entries[0].Filename, Size: pkg.ArtifactBytes, Digest: pkg.ArtifactDigest}}}}
+	if _, err := repositoryPackageBinding(pkg, wrongRepository); err == nil {
+		t.Fatal("package binding from the wrong repository was accepted")
+	}
+	for _, field := range []string{"Filename", "Size", "SHA256"} {
+		data := "Package: nginx\nVersion: 1.22.1-9\nArchitecture: amd64\nFilename: pool/main/n/nginx_1.22.1-9_amd64.deb\nSize: 2048\nSHA256: " + strings.Repeat("c", 64) + "\n"
+		data = strings.Replace(data, field+": ", "", 1)
+		if _, err := parseRepositoryPackageIndex([]byte(data), "debian-main", "main", "amd64"); err == nil {
+			t.Fatalf("package index without %s was accepted", field)
 		}
 	}
 }
@@ -231,6 +344,17 @@ func TestRuntimeSnapshotCloneOwnsNestedPackageSlices(t *testing.T) {
 	original.Installed[1].Source.OfficialAuthorities[0] = "other.example.test"
 	if cloned.Installed[1].AffectedUnits[0] != "nginx.service" || cloned.Installed[1].PossibleListeners[0] != "tcp/443" || cloned.Installed[1].Source.OfficialAuthorities[0] != "downloads.example.test" {
 		t.Fatalf("runtime snapshot clone shared nested package slices: %#v", cloned.Installed[1])
+	}
+}
+
+func TestPackageTransactionRejectsStagedArtifactDriftBeforeChild(t *testing.T) {
+	plan := testPlan(t, OfflineDebs)
+	executor := newFakeExecutor(plan)
+	executor.verifyStagedErr = errors.New("staged artifact changed")
+	engine, result := testEngine(&memoryJournals{}, executor, &fakeMonitor{})
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.Phase != JournalMasksApplied || executor.runCount != 0 {
+		t.Fatalf("staged artifact drift reached package child: journal=%#v runs=%d err=%v", journal, executor.runCount, err)
 	}
 }
 
@@ -285,7 +409,7 @@ func TestPackageResumePreflightErrorsReturnFencedJournal(t *testing.T) {
 	}
 }
 
-func TestPackageTransactionRevalidatesRepositoryAuthorityBeforeChild(t *testing.T) {
+func TestPackageTransactionIgnoresRepositorySnapshotIdentityBeforeChild(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	executor := newFakeExecutor(plan)
 	executor.afterStage = func() {
@@ -293,8 +417,8 @@ func TestPackageTransactionRevalidatesRepositoryAuthorityBeforeChild(t *testing.
 	}
 	engine, result := testEngine(&memoryJournals{}, executor, &fakeMonitor{})
 	journal, err := engine.Execute(context.Background(), plan, result)
-	if err == nil || journal.Phase != JournalMasksApplied || executor.runCount != 0 {
-		t.Fatalf("repository drift reached package child: journal=%#v runs=%d err=%v", journal, executor.runCount, err)
+	if err != nil || journal.Phase != JournalCleaned || executor.runCount != 1 {
+		t.Fatalf("obsolete repository snapshot identity blocked package child: journal=%#v runs=%d err=%v", journal, executor.runCount, err)
 	}
 }
 
@@ -812,7 +936,7 @@ func testEngine(journals JournalStore, executor Executor, monitor Monitor) (Engi
 func testPlan(t *testing.T, mode Mode) Plan {
 	t.Helper()
 	packages := []Package{
-		{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64", ArtifactDigest: strings.Repeat("b", 64), ArtifactBytes: 1024, MaximumInstalledFileBytes: 8 << 20, AffectedUnits: []string{}, PossibleListeners: []string{}},
+		{Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64", ArtifactDigest: strings.Repeat("b", 64), ArtifactBytes: 1024, MaximumInstalledFileBytes: 8 << 20, AffectedUnits: []string{}, PossibleListeners: []string{}},
 		{Name: "nginx", Version: "1.22.1-9", Architecture: "amd64", ArtifactDigest: strings.Repeat("c", 64), ArtifactBytes: 2048, MaximumInstalledFileBytes: 16 << 20, AffectedUnits: []string{"nginx.service"}, PossibleListeners: []string{"tcp/443", "tcp/80"}},
 	}
 	noNetwork := mode != DistroRepository
@@ -820,6 +944,8 @@ func testPlan(t *testing.T, mode Mode) Plan {
 		artifact := sources.Artifact{Name: packages[index].Name, Version: packages[index].Version, OperatingOS: "linux", Architecture: "amd64", Digest: packages[index].ArtifactDigest}
 		switch mode {
 		case DistroRepository:
+			packages[index].RepositoryID = "debian-stable"
+			packages[index].RepositoryFilename = "pool/main/" + string(packages[index].Name[0]) + "/" + packages[index].Name + "_" + packages[index].Version + "_amd64.deb"
 			packages[index].Source = sources.Source{Kind: sources.OfficialDistro, Artifact: artifact, OfficialAuthorities: []string{}}
 		case StagedDebs:
 			packages[index].StagedIdentity = "sha256:" + packages[index].ArtifactDigest
@@ -920,21 +1046,22 @@ func (store *memoryJournals) Advance(_ context.Context, before, after Journal) e
 }
 
 type fakeExecutor struct {
-	audit        Audit
-	observed     Postcondition
-	profile      child.ProfileID
-	invocation   child.Invocation
-	unmasked     []string
-	unmaskCalls  [][]MaskIdentity
-	verifyCalls  [][]MaskIdentity
-	maskFunc     func([]string, string, func(string) error, func(MaskIdentity) error) (MaskResult, error)
-	afterStage   func()
-	runErr       error
-	prepareCount int
-	stageCount   int
-	resolveCount int
-	maskCount    int
-	runCount     int
+	audit           Audit
+	observed        Postcondition
+	profile         child.ProfileID
+	invocation      child.Invocation
+	unmasked        []string
+	unmaskCalls     [][]MaskIdentity
+	verifyCalls     [][]MaskIdentity
+	maskFunc        func([]string, string, func(string) error, func(MaskIdentity) error) (MaskResult, error)
+	afterStage      func()
+	runErr          error
+	verifyStagedErr error
+	prepareCount    int
+	stageCount      int
+	resolveCount    int
+	maskCount       int
+	runCount        int
 }
 
 func newFakeExecutor(plan Plan) *fakeExecutor {
@@ -952,12 +1079,17 @@ func newFakeExecutor(plan Plan) *fakeExecutor {
 		digest := fmt.Sprintf("%x", sha256.Sum256(keyring))
 		configuration = append(configuration, ObservedConfig{Path: "/etc/apt/keyrings/lanpanel.gpg", Kind: APTKeyring, UID: 0, GID: 0, Mode: 0o644, Regular: true, ParentsSafe: true, Bytes: keyring})
 		repositories = append(repositories, ObservedRepository{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: append([]string(nil), plan.Repositories[0].Components...), KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digest, MetadataDigest: plan.Repositories[0].MetadataDigest, CutoffDigest: plan.Repositories[0].CutoffDigest, Enabled: true})
+		for _, pkg := range plan.Packages {
+			repositories[0].PackageBindings = append(repositories[0].PackageBindings, RepositoryPackageBinding{Name: pkg.Name, Version: pkg.Version, Architecture: pkg.Architecture, Filename: pkg.RepositoryFilename, Size: pkg.ArtifactBytes, Digest: pkg.ArtifactDigest})
+		}
 	}
 	policy := NoAutostartPolicy{Path: "/usr/sbin/policy-rc.d", Digest: plan.NoAutostartPolicyDigest, UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, SameLanPanelBinary: true}
-	htpasswd := &FileIdentity{Path: "/usr/bin/htpasswd", UID: 0, GID: 0, Mode: 0o755, Regular: true, ParentsSafe: true, Digest: strings.Repeat("8", 64)}
-	systemPackages := append(append([]InstalledPackage(nil), before.SystemPackages...), InstalledPackage{Name: "apache2-utils", Version: plan.Packages[0].Version, Architecture: "amd64"}, InstalledPackage{Name: "nginx", Version: plan.Packages[1].Version, Architecture: "amd64"})
+	systemPackages := append([]InstalledPackage(nil), before.SystemPackages...)
+	for _, pkg := range plan.Packages {
+		systemPackages = append(systemPackages, InstalledPackage{Name: pkg.Name, Version: pkg.Version, Architecture: pkg.Architecture})
+	}
 	slices.SortFunc(systemPackages, func(left, right InstalledPackage) int { return strings.Compare(left.Name, right.Name) })
-	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Repositories: append([]ObservedRepository(nil), repositories...), Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: maskedUnits, Listeners: append([]Listener(nil), before.Listeners...), HTPasswd: htpasswd}}
+	return &fakeExecutor{audit: Audit{Configuration: configuration, Repositories: repositories, Before: before, NoAutostart: policy}, observed: Postcondition{Repositories: append([]ObservedRepository(nil), repositories...), Installed: clonePackages(plan.Packages), SystemPackages: systemPackages, Units: maskedUnits, Listeners: append([]Listener(nil), before.Listeners...)}}
 }
 
 func (executor *fakeExecutor) LockRepositories(_ context.Context, _ Plan) (func(), error) {
@@ -968,6 +1100,10 @@ func (executor *fakeExecutor) Audit(_ context.Context, _ Plan) (Audit, error) {
 	audit := executor.audit
 	audit.Before = cloneRuntimeSnapshot(executor.audit.Before)
 	return audit, nil
+}
+
+func (executor *fakeExecutor) VerifyStaged(_ context.Context, _ Plan) error {
+	return executor.verifyStagedErr
 }
 
 func (executor *fakeExecutor) Stage(_ context.Context, _ Plan) error {

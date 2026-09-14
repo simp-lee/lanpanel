@@ -65,10 +65,15 @@ func TestDependencyBaselineRejectsDowngradeFloatingAndMissingClosure(t *testing.
 		t.Fatal("dependency component accepted another package artifact identity")
 	}
 	baseline = testBaseline(time.Unix(1_700_000_000, 0).UTC())
-	if err := ValidateForOSProfile(baseline, digest("debian-12-profile"), "9.99.0"); err == nil {
-		t.Fatal("Dependency Baseline Nginx version differed from the qualified profile")
+	if err := ValidateForOSProfile(baseline, digest("debian-12-profile"), "9.99.0"); err != nil {
+		t.Fatalf("distro package changes should not invalidate the third-party baseline: %v", err)
 	}
-	baseline.Selections = baseline.Selections[1:]
+	for index, selection := range baseline.Selections {
+		if selection.Component == "lego" {
+			baseline.Selections = append(baseline.Selections[:index], baseline.Selections[index+1:]...)
+			break
+		}
+	}
 	if err := ValidateBaseline(baseline); err == nil {
 		t.Fatal("incomplete required dependency closure was accepted")
 	}
@@ -109,7 +114,7 @@ func TestDistroSelectionUsesExactQualifiedRepositoryCandidate(t *testing.T) {
 func testBaseline(cutoff time.Time) Baseline {
 	published := cutoff.Add(-time.Hour)
 	return Baseline{SchemaVersion: SchemaVersion, Cutoff: cutoff, Selections: []Selection{
-		selection("apache2-utils", SourceDistroRepository, "2.4.62-1", "apache2-utils=2.4.62-1@debian/bookworm-security", published),
+		selection("ca-certificates", SourceDistroRepository, "20230311", "ca-certificates=20230311@debian/bookworm-security", published),
 		selection("goaccess", SourceDistroRepository, "1.7-1", "goaccess=1.7-1@debian/bookworm", published),
 		selection("headscale", SourceCanonicalArtifact, "0.25.1", "https://downloads.example.test/headscale-0.25.1", published),
 		selection("lego", SourceCanonicalArtifact, "4.25.2", "https://downloads.example.test/lego-4.25.2", published),

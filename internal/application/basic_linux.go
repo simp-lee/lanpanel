@@ -10,9 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"lanpanel/internal/basic"
-	"lanpanel/internal/child"
 	"lanpanel/internal/domain"
-	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
@@ -162,7 +160,7 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	return &basicExecution{service: service, admitter: admitter, mutationSet: mutationSet, mutation: mutation, exposure: exposure, intent: intent, job: job, revision: intent.IntentGeneration}, nil
 }
 
-func (value *basicExecution) reserveHTPasswdChild(ctx context.Context, username string, password []byte) error {
+func (value *basicExecution) reserveBasicHash(ctx context.Context, username string, password []byte) error {
 	if value.mutation == nil || value.exposure == nil {
 		return fmt.Errorf("managed Basic operation locks missing")
 	}
@@ -183,7 +181,7 @@ func (value *basicExecution) reserveHTPasswdChild(ctx context.Context, username 
 	if err != nil {
 		return err
 	}
-	childRecord := operations.ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "htpasswd-" + value.job.ID, JobID: value.job.ID, InstallationID: installation.InstallationID, Operation: value.intent.Operation, Target: value.intent.Target, IntentGeneration: value.intent.IntentGeneration, Profile: string(child.ProfileHTPasswd), InputDigest: shaDigest(password), ArtifactDigest: shaDigest([]byte(username + "\x00cost=12")), Deadline: value.intent.SafetyBinding.Deadline, State: operations.ChildSubmitted, SubmittedAt: time.Now().UTC()}
+	childRecord := operations.ChildRecord{SchemaVersion: "lanpanel.child.v1", ID: "htpasswd-" + value.job.ID, JobID: value.job.ID, InstallationID: installation.InstallationID, Operation: value.intent.Operation, Target: value.intent.Target, IntentGeneration: value.intent.IntentGeneration, Profile: "htpasswd", InputDigest: shaDigest(password), ArtifactDigest: shaDigest([]byte(username + "\x00cost=12")), Deadline: value.intent.SafetyBinding.Deadline, State: operations.ChildSubmitted, SubmittedAt: time.Now().UTC()}
 	admission, err := value.service.manager.Acquire(ctx, locks.MutationAdmission)
 	if err != nil {
 		return err
@@ -211,7 +209,7 @@ func (value *basicExecution) reserveHTPasswdChild(ctx context.Context, username 
 	return nil
 }
 
-func (value *basicExecution) terminalHTPasswdChild(ctx context.Context, outcome operations.ChildOutcome, resultDigest string) error {
+func (value *basicExecution) terminalBasicHash(ctx context.Context, outcome operations.ChildOutcome, resultDigest string) error {
 	if value.child == nil {
 		return fmt.Errorf("managed Basic child missing")
 	}
@@ -229,19 +227,8 @@ func (value *basicExecution) terminalHTPasswdChild(ctx context.Context, outcome 
 	return nil
 }
 
-func hashBasic(ctx context.Context, credentialID, username string, password []byte) (basic.Generated, error) {
-	ephemeral, err := identity.EphemeralHTPasswdIdentityFor(credentialID)
-	if err != nil {
-		return basic.Generated{}, err
-	}
-	if err := identity.VerifyEphemeralHTPasswdIdentityAvailable(ephemeral, "/etc/passwd", "/etc/group"); err != nil {
-		return basic.Generated{}, err
-	}
-	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{EphemeralHTPasswd: child.Identity{UID: ephemeral.UID, GID: ephemeral.GID}})
-	if err != nil {
-		return basic.Generated{}, err
-	}
-	return basic.Hash(ctx, launcher, username, password)
+func hashBasic(_ context.Context, _ string, username string, password []byte) (basic.Generated, error) {
+	return basic.Hash(username, password)
 }
 
 func newCredentialID() (string, error) {
@@ -301,17 +288,17 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 		result.Job = completed
 		return result, terminalErr
 	}
-	if err := execution.reserveHTPasswdChild(ctx, username, password); err != nil {
+	if err := execution.reserveBasicHash(ctx, username, password); err != nil {
 		return result, err
 	}
 	generated, hashErr := hashBasic(ctx, credentialID, username, password)
-	resultDigest := shaDigest([]byte("htpasswd_failed"))
+	resultDigest := shaDigest([]byte("bcrypt_failed"))
 	outcome := operations.ChildFailed
 	if hashErr == nil {
 		resultDigest = generated.Fingerprint
 		outcome = operations.ChildSucceeded
 	}
-	if err := execution.terminalHTPasswdChild(ctx, outcome, resultDigest); err != nil {
+	if err := execution.terminalBasicHash(ctx, outcome, resultDigest); err != nil {
 		return result, err
 	}
 	if hashErr != nil {
@@ -396,17 +383,17 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor, planID string)
 		result = ManagedBasicResult{Job: completed, CredentialID: credentialID, Fingerprint: credential.Fingerprint}
 		return result, terminalErr
 	}
-	if err := execution.reserveHTPasswdChild(ctx, credential.Username, password); err != nil {
+	if err := execution.reserveBasicHash(ctx, credential.Username, password); err != nil {
 		return result, err
 	}
 	generated, hashErr := hashBasic(ctx, credentialID, credential.Username, password)
-	resultDigest := shaDigest([]byte("htpasswd_failed"))
+	resultDigest := shaDigest([]byte("bcrypt_failed"))
 	outcome := operations.ChildFailed
 	if hashErr == nil {
 		resultDigest = generated.Fingerprint
 		outcome = operations.ChildSucceeded
 	}
-	if err := execution.terminalHTPasswdChild(ctx, outcome, resultDigest); err != nil {
+	if err := execution.terminalBasicHash(ctx, outcome, resultDigest); err != nil {
 		return result, err
 	}
 	if hashErr != nil {

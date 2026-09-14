@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	PackageRequestSchemaVersion = "lanpanel.package.transaction.request.v1"
+	PackageRequestSchemaVersion = "lanpanel.package.transaction.request.v2"
 	FixedPackageRoot            = "/var/lib/lanpanel/packages"
 	FixedPackageFileStaging     = "/var/lib/lanpanel/packages/.filetxn"
 	FixedPackageJournalRoot     = "/var/lib/lanpanel/packages/journals"

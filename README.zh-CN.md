@@ -12,7 +12,7 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 
 ## 平台与安装
 
-代码目标是使用 systemd 和 apt/dpkg 的 Debian/Ubuntu Linux amd64。LanPanel 仅提供 Preview：安装执行基础主机检查、签名仓库校验、精确包版本校验和事务清理；不声称 hardened GA 或 live qualification。
+Preview release 支持使用 systemd 和 apt/dpkg 的 Debian 或 Ubuntu Linux amd64 主机。release profile 选择发行版家族和包版本范围，不再把某个具体发行版版本作为唯一兼容性依据；未知的未来 Debian/Ubuntu 版本只有在所有能力和真实功能检查通过后才会继续安装。LanPanel 仅提供 Preview：安装执行基础主机检查、签名仓库校验、包版本范围校验和事务清理；不声称 hardened GA 或 live qualification。
 
 首版只支持 clean install。从解压后的官方 release artifact 执行唯一公开 Preview 路径：
 
@@ -20,11 +20,19 @@ UI 进程是 non-root。root mutation 只能经过 peer-authenticated typed Unix
 sudo ./lanpanel install
 ```
 
-程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、Ed25519 detached signature、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。每个固定版本会发布带固定版本和 digest 的 bootstrap 脚本（仓库生成器为 `scripts/generate-preview-bootstrap.sh`）；它在受保护临时目录验证同一材料后调用该命令，不使用 pipe-to-shell 或在线 fallback。
+程序从自身所在目录发现 artifact，并在任何主机 mutation 前校验 canonical manifest、受信任的 detached Ed25519 签名、完整 checksum inventory、固定第三方资产、package template、source archive、LICENSE、NOTICE 和 Known Limitations。artifact 内部文件只是发布实现细节；用户不提供 bundle path、digest、package Plan、dependency path 或 ACME contact。若不想手工处理 bundle，可直接复制发布页提供的版本固定命令：
 
-installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、signed repository/key metadata、exact package set/version，以及 arch、systemd、apt/dpkg 健康、时钟、磁盘、path 和 listener。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
+```sh
+curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
+  -o /tmp/lanpanel-bootstrap.sh &&
+sudo /tmp/lanpanel-bootstrap.sh install
+```
 
-系统包只使用 release authority 绑定的 signed `OfficialDistro` repository 与精确 package set。Lego、Tailscale 和 Headscale 都由 release authority 绑定的资产交付；不执行第三方 installer script，也不提供 mirror、offline source、proxy 或 download fallback。
+发布的 `lanpanel-bootstrap.sh` 会下载固定 artifact，在受保护临时目录中校验内置 digest，退出时清理临时文件，然后调用同一个 `install` 命令。它由 `scripts/generate-preview-bootstrap.sh` 生成；发布页提供实际的版本固定 GitHub Release URL。它不使用 pipe-to-shell，也不提供在线 fallback。
+
+installer 会在任何 mutation 前，依据 checksum-bound release asset 构造绑定当前 host 的 package Plan 和 fresh bootstrap preflight。service bootstrap 前，installer 验证 canonical `release.json`、`SHA256SUMS`、binary/source-tree digest、dependency manifest、signed repository/key metadata、包版本范围和实际安装版本，以及 arch、systemd PID 1、cgroup v2、apt/dpkg 健康、时钟、磁盘、path、listener 和生成的 Nginx 配置。package 安装是 noninteractive 的，会 mask 可能 autostart 的 unit，并拒绝 ambient hook/proxy。
+
+系统包使用主机自己的已认证 APT 配置与 profile 版本范围要求；LanPanel 不限制用户选择 Debian/Ubuntu 镜像。Lego、Tailscale 和 Headscale 都由 release authority 绑定的资产交付；不执行第三方 installer script，也不提供 offline source 或 download fallback。
 
 ## Headscale 与 connector
 
@@ -89,4 +97,4 @@ Plan-bound resource delete 要求 fresh unpublished closure；本机 App 还要�
 
 ## 安全与发行
 
-参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、dependency manifest、public `package-template.json`、`SHA256SUMS` 和 canonical `release.json`。Preview 不发布 SBOM/OSV 或 live qualification 证据。
+参见 [SECURITY.md](SECURITY.md)。release 包含一个 Linux amd64 binary、source tag/archive、LICENSE、NOTICE、按发行版家族区分的 dependency manifest 和 package template、`SHA256SUMS` 以及 canonical `release.json`。用户安装说明见 [docs/INSTALLING.md](docs/INSTALLING.md)；开发和发布流程见 [docs/DEVELOPING.md](docs/DEVELOPING.md) 与 [docs/RELEASING.md](docs/RELEASING.md)。Preview 不发布 SBOM/OSV 或 live qualification 证据。

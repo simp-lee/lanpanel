@@ -31,18 +31,18 @@ func RenderAPTConfiguration(plan Plan) ([]byte, []byte, error) {
 		`Acquire::AllowDowngradeToInsecureRepositories "false";`,
 		`Acquire::AllowInsecureRepositories "false";`,
 		`Acquire::Retries "0";`,
-		`Acquire::http::Proxy "` + proxy + `";`,
-		`Acquire::https::Proxy "` + proxy + `";`,
 		`Acquire::http::Timeout "` + seconds + `";`,
 		`Acquire::https::Timeout "` + seconds + `";`,
 		`Dir::Cache::archives "` + root + `archives/";`,
 		`Dir::State::lists "/var/lib/apt/lists/";`,
-		`Dir::Etc::netrc "` + root + `auth.conf";`,
-		`Dir::Etc::netrcparts "-";`,
-		`Dir::Etc::preferences "` + root + `preferences";`,
-		`Dir::Etc::preferencesparts "-";`,
-		`Dir::Etc::sourceparts "-";`,
-		`Dir::Etc::sourcelist "` + sourcePath + `";`,
+	}
+	if plan.Proxy != nil {
+		lines = append(lines, `Acquire::http::Proxy "`+proxy+`";`, `Acquire::https::Proxy "`+proxy+`";`)
+	}
+	if len(plan.Repositories) != 0 {
+		lines = append(lines, `Dir::Etc::netrc "`+root+`auth.conf";`, `Dir::Etc::netrcparts "-";`, `Dir::Etc::preferences "`+root+`preferences";`, `Dir::Etc::preferencesparts "-";`)
+
+		lines = append(lines, `Dir::Etc::sourceparts "-";`, `Dir::Etc::sourcelist "`+sourcePath+`";`)
 	}
 	config := []byte(strings.Join(lines, "\n") + "\n")
 	sourceLines := []string{}

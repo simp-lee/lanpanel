@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const PackageJournalSchemaVersion = "lanpanel.package.journal.v3"
+const PackageJournalSchemaVersion = "lanpanel.package.journal.v4"
 
 type JournalPhase string
 
@@ -105,6 +105,7 @@ type Executor interface {
 	LockRepositories(context.Context, Plan) (func(), error)
 	Audit(context.Context, Plan) (Audit, error)
 	Stage(context.Context, Plan) error
+	VerifyStaged(context.Context, Plan) error
 	Prepare(context.Context, Plan, []byte, []byte) error
 	Resolve(context.Context, Plan) ([]Package, error)
 	Mask(context.Context, []string, string, func(string) error, func(MaskIdentity) error) (MaskResult, error)
@@ -177,6 +178,11 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return Journal{}, err
 	}
 	profile := child.ProfileAPTOfflineTransaction
+	staged := true
+	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
+		profile = child.ProfileAPTTransaction
+		staged = false
+	}
 	normalJournalID := "package-" + plan.TransactionID
 	childID := "package-child-" + plan.TransactionID
 	journal := Journal{SchemaVersion: PackageJournalSchemaVersion, TransactionID: plan.TransactionID, NormalJournalID: normalJournalID, ChildID: childID, JobID: plan.JobID, PlanDigest: planDigest, AuthorityDigest: authorityDigest, PackageProfile: profile, Prior: cloneRuntimeSnapshot(audit.Before), Phase: JournalPrepared, Masks: []MaskIdentity{}}
@@ -283,6 +289,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
 		return journal, fmt.Errorf("final pre-child package mask audit: %w", err)
 	}
+	if err := engine.Executor.VerifyStaged(ctx, plan); err != nil {
+		return journal, fmt.Errorf("final pre-child staged package artifact audit: %w", err)
+	}
 
 	monitoredCtx := ctx
 	stopMonitor := func() error { return nil }
@@ -305,7 +314,7 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist package child submission: %w", err)
 	}
 	journal = next
-	invocation := packageInvocation(plan, true)
+	invocation := packageInvocation(plan, staged)
 	result, runErr := engine.Executor.Run(monitoredCtx, profile, invocation)
 	monitorErr := stopMonitor()
 	monitorStopped = true
@@ -558,6 +567,9 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 			if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
 				return journal, err
 			}
+			if err := engine.Executor.VerifyStaged(ctx, plan); err != nil {
+				return journal, fmt.Errorf("pre-child staged package artifact audit: %w", err)
+			}
 			monitoredCtx := ctx
 			stopMonitor := func() error { return nil }
 			if engine.Monitor != nil {
@@ -572,7 +584,8 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 				_ = stopMonitor()
 				return journal, err
 			}
-			result, runErr := engine.Executor.Run(monitoredCtx, journal.PackageProfile, packageInvocation(plan, true))
+			staged := plan.Mode != DistroRepository || len(plan.Repositories) != 0
+			result, runErr := engine.Executor.Run(monitoredCtx, journal.PackageProfile, packageInvocation(plan, staged))
 			monitorErr := stopMonitor()
 			next = journal
 			next.Phase = JournalChildTerminal
@@ -723,7 +736,7 @@ func ValidateJournalTransition(before, after Journal) error {
 func packageInvocation(plan Plan, staged bool) child.Invocation {
 	packages := make([]child.PackageArgument, 0, len(plan.Packages))
 	for _, pkg := range plan.Packages {
-		packages = append(packages, child.PackageArgument{Name: pkg.Name, Version: pkg.Version, Digest: pkg.ArtifactDigest, Bytes: pkg.ArtifactBytes, MaximumInstalledFileBytes: pkg.MaximumInstalledFileBytes})
+		packages = append(packages, child.PackageArgument{Name: pkg.Name, Version: pkg.Version, VersionMinimum: pkg.VersionMinimum, VersionMaximum: pkg.VersionMaximum, Digest: pkg.ArtifactDigest, Bytes: pkg.ArtifactBytes, MaximumInstalledFileBytes: pkg.MaximumInstalledFileBytes})
 	}
 	return child.Invocation{Package: &child.PackageInvocation{TransactionID: plan.TransactionID, LockWaitSeconds: uint32(plan.LockWait / time.Second), Staged: staged, Packages: packages}}
 }
@@ -917,7 +930,7 @@ func packageFailureCode(runErr, monitorErr error, result child.Result) string {
 
 func reflectPackages(left, right []Package) bool {
 	return slices.EqualFunc(left, right, func(a, b Package) bool {
-		return a.Name == b.Name && a.Version == b.Version && a.Architecture == b.Architecture && a.RepositoryID == b.RepositoryID && a.ArtifactDigest == b.ArtifactDigest && a.ArtifactBytes == b.ArtifactBytes && a.MaximumInstalledFileBytes == b.MaximumInstalledFileBytes && a.StagedIdentity == b.StagedIdentity && reflect.DeepEqual(a.Source, b.Source) && slices.Equal(a.AffectedUnits, b.AffectedUnits) && slices.Equal(a.PossibleListeners, b.PossibleListeners)
+		return a.Name == b.Name && PackageVersionMatches(b, a.Version) && a.Architecture == b.Architecture && a.RepositoryID == b.RepositoryID && a.RepositoryFilename == b.RepositoryFilename && a.ArtifactDigest == b.ArtifactDigest && a.ArtifactBytes == b.ArtifactBytes && a.MaximumInstalledFileBytes == b.MaximumInstalledFileBytes && a.StagedIdentity == b.StagedIdentity && reflect.DeepEqual(a.Source, b.Source) && slices.Equal(a.AffectedUnits, b.AffectedUnits) && slices.Equal(a.PossibleListeners, b.PossibleListeners)
 	})
 }
 

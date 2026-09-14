@@ -3,6 +3,7 @@ package release
 import (
 	"crypto/ed25519"
 	"fmt"
+	"lanpanel/internal/debianversion"
 	"lanpanel/internal/packages"
 	"net/url"
 	"regexp"
@@ -10,11 +11,28 @@ import (
 	"strings"
 )
 
+const ReleaseManifestSchemaVersion = "lanpanel.release.v5"
+
 const (
-	ReleaseManifestSchemaVersion = "lanpanel.release.v3"
-	ReleaseSignaturePath         = "release.json.sig"
-	ReleaseSignatureBytes        = ed25519.SignatureSize
+	ReleaseSignaturePath  = "release.json.sig"
+	ReleaseSignatureBytes = ed25519.SignatureSize
 )
+
+// Preview release v1 supports a deliberately narrow set of clean-install targets.
+const (
+	PreviewTargetArchitecture = "amd64"
+	PreviewDebianFamily       = "debian"
+	PreviewUbuntuFamily       = "ubuntu"
+)
+
+// IsSupportedPreviewTarget validates the supported platform family and
+// architecture. The release number is observed and reported, but is not a
+// release compatibility gate; package ranges and runtime probes decide that.
+func IsSupportedPreviewTarget(profile OSProfile) bool {
+	return profile.Architecture == PreviewTargetArchitecture &&
+		(profile.Family == PreviewDebianFamily || profile.Family == PreviewUbuntuFamily) &&
+		osReleasePattern.MatchString(profile.Release)
+}
 
 type InstallKind string
 
@@ -35,10 +53,7 @@ type ArchiveMemberAuthority struct {
 	Mode        uint32        `json:"mode"`
 }
 
-const (
-	SupportedHeadscaleConfigContract = "headscale-trusted-mesh-v1"
-	SupportedHeadscaleVersion        = "0.29.0"
-)
+const SupportedHeadscaleConfigContract = "headscale-trusted-mesh-v1"
 
 var supportedHeadscaleConfigContractBytes = []byte(`{"schema_version":"lanpanel.headscale.config-contract.v1","control_backend":"isolated","database":"sqlite","policy":"trusted_mesh","privileged_endpoint":"unix"}`)
 
@@ -73,10 +88,13 @@ type ClientArtifactAuthority struct {
 }
 
 type PackageTuple struct {
-	Name         string `json:"name"`
-	Version      string `json:"version"`
-	Architecture string `json:"architecture"`
-	RepositoryID string `json:"repository_id,omitempty"`
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	VersionMinimum string `json:"version_minimum,omitempty"`
+	VersionMaximum string `json:"version_maximum,omitempty"`
+	Architecture   string `json:"architecture"`
+	// RepositoryID is the signed repository authority for this package.
+	RepositoryID string `json:"repository_id"`
 }
 
 type OSProfile struct {
@@ -85,8 +103,12 @@ type OSProfile struct {
 	Release               string                `json:"release"`
 	Architecture          string                `json:"architecture"`
 	SystemdVersion        string                `json:"systemd_version"`
+	SystemdVersionMinimum string                `json:"systemd_version_minimum,omitempty"`
+	SystemdVersionMaximum string                `json:"systemd_version_maximum,omitempty"`
 	NginxVersion          string                `json:"nginx_version"`
-	PackageSnapshotDigest string                `json:"package_snapshot_digest"`
+	NginxVersionMinimum   string                `json:"nginx_version_minimum,omitempty"`
+	NginxVersionMaximum   string                `json:"nginx_version_maximum,omitempty"`
+	PackageSnapshotDigest string                `json:"package_snapshot_digest,omitempty"`
 	Repositories          []packages.Repository `json:"repositories"`
 	Packages              []PackageTuple        `json:"packages"`
 	ManagedConfinement    ConfinementProfile    `json:"managed_confinement"`
@@ -104,22 +126,24 @@ type ConfinementProfile struct {
 }
 
 type SupportedOSProfile struct {
-	Profile OSProfile `json:"profile"`
+	Profile            OSProfile     `json:"profile"`
+	PackageTemplate    AssetIdentity `json:"package_template"`
+	DependencyManifest AssetIdentity `json:"dependency_manifest"`
+	DependencyBaseline AssetIdentity `json:"dependency_baseline"`
 }
 
 type ReleaseManifest struct {
-	SchemaVersion      string                     `json:"schema_version"`
-	ReleaseTag         string                     `json:"release_tag"`
-	Binary             AssetIdentity              `json:"binary"`
-	SourceArchive      AssetIdentity              `json:"source_archive"`
-	License            AssetIdentity              `json:"license"`
-	Notice             AssetIdentity              `json:"notice"`
-	DependencyManifest AssetIdentity              `json:"dependency_manifest"`
-	Headscale          HeadscaleArtifactAuthority `json:"headscale"`
-	KnownLimitations   AssetIdentity              `json:"known_limitations"`
-	AdditionalAssets   []AssetIdentity            `json:"additional_assets"`
-	Checksums          AssetIdentity              `json:"checksums"`
-	SupportedProfiles  []SupportedOSProfile       `json:"supported_os_profiles"`
+	SchemaVersion     string                     `json:"schema_version"`
+	ReleaseTag        string                     `json:"release_tag"`
+	Binary            AssetIdentity              `json:"binary"`
+	SourceArchive     AssetIdentity              `json:"source_archive"`
+	License           AssetIdentity              `json:"license"`
+	Notice            AssetIdentity              `json:"notice"`
+	Headscale         HeadscaleArtifactAuthority `json:"headscale"`
+	KnownLimitations  AssetIdentity              `json:"known_limitations"`
+	AdditionalAssets  []AssetIdentity            `json:"additional_assets"`
+	Checksums         AssetIdentity              `json:"checksums"`
+	SupportedProfiles []SupportedOSProfile       `json:"supported_os_profiles"`
 }
 
 type VerifiedRelease struct {
@@ -152,27 +176,40 @@ func DecodeReleaseManifest(data []byte) (*VerifiedRelease, error) {
 	return &VerifiedRelease{value: manifest, digest: DigestBytes(data)}, nil
 }
 
-// trustedReleasePublicKey is supplied by the installer binary. It is
-// deliberately not read from release material. Rotating it requires
-// publishing a new authenticated installer.
+// trustedReleasePublicKey is supplied by the installer binary. Rotating it
+// requires publishing a new authenticated installer.
 var trustedReleasePublicKey = ed25519.PublicKey{
 	0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
 	0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 }
 
-func TrustedReleasePublicKeyBytes() []byte {
-	return append([]byte(nil), trustedReleasePublicKey...)
+func TrustedReleasePublicKeyBytes() []byte { return append([]byte(nil), trustedReleasePublicKey...) }
+
+func SignCanonicalManifest(manifestBytes []byte, privateKey ed25519.PrivateKey) ([]byte, error) {
+	if _, err := DecodeReleaseManifest(manifestBytes); err != nil {
+		return nil, fmt.Errorf("manifest to sign is invalid: %w", err)
+	}
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("release signing key has an invalid size")
+	}
+	return ed25519.Sign(privateKey, manifestBytes), nil
 }
 
-// VerifyRelease verifies the unsigned integrity portion of a release. Public
-// installation must use VerifySignedRelease; this function remains useful to
-// release tooling that has already authenticated the detached signature.
+func VerifyCanonicalManifestSignature(manifestBytes, signatureBytes []byte) error {
+	if len(signatureBytes) != ReleaseSignatureBytes || !ed25519.Verify(trustedReleasePublicKey, manifestBytes, signatureBytes) {
+		return fmt.Errorf("release manifest signature is invalid")
+	}
+	return nil
+}
+
+// VerifyRelease verifies the canonical manifest and complete checksum-bound
+// asset inventory. The outer artifact digest is supplied by bootstrap.
 func VerifyRelease(expectedManifestDigest string, manifestBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
 	return verifyRelease(expectedManifestDigest, manifestBytes, nil, checksumBytes, assets, false)
 }
 
-// VerifySignedRelease authenticates canonical release manifest bytes with the
-// installer-trusted Ed25519 key and then verifies the complete inventory.
+// VerifySignedRelease additionally authenticates the exact manifest bytes with
+// the installer-trusted detached signature.
 func VerifySignedRelease(expectedManifestDigest string, manifestBytes, signatureBytes, checksumBytes []byte, assets map[string][]byte) (*VerifiedRelease, error) {
 	return verifyRelease(expectedManifestDigest, manifestBytes, signatureBytes, checksumBytes, assets, true)
 }
@@ -181,10 +218,8 @@ func verifyRelease(expectedManifestDigest string, manifestBytes, signatureBytes,
 	if !ValidDigest(expectedManifestDigest) || DigestBytes(manifestBytes) != expectedManifestDigest {
 		return nil, fmt.Errorf("release manifest differs from selected digest")
 	}
-	if requireSignature {
-		if len(signatureBytes) != ReleaseSignatureBytes || !ed25519.Verify(trustedReleasePublicKey, manifestBytes, signatureBytes) {
-			return nil, fmt.Errorf("release manifest signature is invalid")
-		}
+	if requireSignature && (len(signatureBytes) != ReleaseSignatureBytes || !ed25519.Verify(trustedReleasePublicKey, manifestBytes, signatureBytes)) {
+		return nil, fmt.Errorf("release manifest signature is invalid")
 	}
 	var manifest ReleaseManifest
 	if err := DecodeCanonical(manifestBytes, &manifest); err != nil {
@@ -193,17 +228,17 @@ func verifyRelease(expectedManifestDigest string, manifestBytes, signatureBytes,
 	if err := validateReleaseManifest(manifest); err != nil {
 		return nil, err
 	}
-	if err := verifyReleaseAssets(manifest, checksumBytes, assets, requireSignature); err != nil {
+	if err := verifyReleaseAssets(manifest, checksumBytes, assets); err != nil {
 		return nil, err
 	}
 	return &VerifiedRelease{value: manifest, digest: expectedManifestDigest}, nil
 }
 
-func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte, requireSignature bool) error {
+func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets map[string][]byte) error {
 	if DigestBytes(checksumBytes) != manifest.Checksums.Digest || uint64(len(checksumBytes)) != manifest.Checksums.Bytes {
 		return fmt.Errorf("release checksum file is invalid")
 	}
-	set, err := ParseChecksums(checksumBytes, releaseAssetPaths(manifest, requireSignature))
+	set, err := ParseChecksums(checksumBytes, releaseAssetPaths(manifest))
 	if err != nil {
 		return fmt.Errorf("release checksum inventory is invalid: %w", err)
 	}
@@ -224,20 +259,20 @@ func verifyReleaseAssets(manifest ReleaseManifest, checksumBytes []byte, assets 
 	return nil
 }
 
-func releaseAssetPaths(manifest ReleaseManifest, requireSignature ...bool) []string {
+func releaseAssetPaths(manifest ReleaseManifest) []string {
 	assets := mustReleaseAssets(manifest)
-	paths := make([]string, 0, len(assets)+1)
+	paths := make([]string, 0, len(assets))
 	for _, asset := range assets {
 		paths = append(paths, asset.Path)
-	}
-	if len(requireSignature) == 0 || requireSignature[0] {
-		paths = append(paths, ReleaseSignaturePath)
 	}
 	return paths
 }
 
 func mustReleaseAssets(manifest ReleaseManifest) []AssetIdentity {
-	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.DependencyManifest, manifest.Headscale.Archive, manifest.KnownLimitations}
+	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Notice, manifest.Headscale.Archive, manifest.KnownLimitations}
+	for _, profile := range manifest.SupportedProfiles {
+		assets = append(assets, profile.PackageTemplate, profile.DependencyManifest, profile.DependencyBaseline)
+	}
 	for _, member := range manifest.Headscale.Members {
 		assets = append(assets, member.Asset)
 	}
@@ -277,16 +312,13 @@ func releaseAssetInventory(manifest ReleaseManifest) ([]AssetIdentity, error) {
 }
 
 func validateReleaseManifest(manifest ReleaseManifest) error {
-	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) != 1 {
+	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) == 0 || len(manifest.SupportedProfiles) > 16 {
 		return fmt.Errorf("release manifest is incomplete")
 	}
-	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.Notice) != nil || validateAsset(manifest.DependencyManifest) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
+	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || validateAsset(manifest.Notice) != nil || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
 		return fmt.Errorf("release manifest asset authority is invalid")
 	}
-	requiredAdditional := map[string]bool{
-		"package-template.json": false, "dependency-baseline.json": false,
-		"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false,
-	}
+	requiredAdditional := map[string]bool{"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false}
 	seenAdditional := map[string]bool{}
 	for _, asset := range manifest.AdditionalAssets {
 		if validateAsset(asset) != nil || asset.Path == "release.json" || asset.Path == ReleaseSignaturePath || asset.Path == manifest.Checksums.Path || seenAdditional[asset.Path] {
@@ -302,22 +334,28 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 			return fmt.Errorf("release manifest required asset %q is missing", assetPath)
 		}
 	}
-	profile := manifest.SupportedProfiles[0]
-	if validateOSProfile(profile.Profile) != nil {
-		return fmt.Errorf("release manifest OS profile is invalid")
+	previousProfile := ""
+	seenFamilies := map[string]bool{}
+	for _, profile := range manifest.SupportedProfiles {
+		familyKey := profile.Profile.Family + "/" + profile.Profile.Architecture
+		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenFamilies[familyKey] {
+			return fmt.Errorf("release manifest OS profile or profile asset authority is invalid")
+		}
+		previousProfile = profile.Profile.ID
+		seenFamilies[familyKey] = true
 	}
 	return nil
 }
 
 func validateAsset(asset AssetIdentity) error {
-	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 || asset.Bytes > uint64(32<<20) {
+	if !ValidRelativePath(asset.Path) || !ValidDigest(asset.Digest) || asset.Bytes == 0 || asset.Bytes > uint64(128<<20) {
 		return fmt.Errorf("asset identity is incomplete or exceeds the installation size contract")
 	}
 	return nil
 }
 
 func validateHeadscaleAuthority(authority HeadscaleArtifactAuthority) error {
-	if authority.Version != SupportedHeadscaleVersion || !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != "tar_gzip" || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
+	if !concreteVersionPattern.MatchString(authority.Version) || authority.ArtifactIdentity == "" || authority.Archive.Path != "headscale.tar.gz" || validateAsset(authority.Archive) != nil || authority.ArchiveFormat != "tar_gzip" || authority.MaximumExtractedBytes == 0 || authority.MaximumExtractedBytes > 1<<30 || authority.InstallPath != "/usr/lib/lanpanel/dependencies/headscale" || !ValidRelativePath(authority.ExecutableAsset) || !refPattern.MatchString(authority.ConfigContract) || authority.ConfigContract != SupportedHeadscaleConfigContract || authority.ConfigContractDigest != SupportedHeadscaleConfigContractDigest() {
 		return fmt.Errorf("headscale artifact authority is incomplete")
 	}
 	if !canonicalArtifactURL(authority.ArtifactIdentity) {
@@ -361,10 +399,10 @@ func canonicalArtifactURL(value string) bool {
 }
 
 func validateOSProfile(profile OSProfile) error {
-	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" || !concreteVersionPattern.MatchString(profile.SystemdVersion) || !concreteVersionPattern.MatchString(profile.NginxVersion) || !ValidDigest(profile.PackageSnapshotDigest) {
+	if !profileIDPattern.MatchString(profile.ID) || (profile.Family != "debian" && profile.Family != "ubuntu") || !osReleasePattern.MatchString(profile.Release) || profile.Architecture != "amd64" {
 		return fmt.Errorf("OS profile platform identity is invalid")
 	}
-	if packages.ValidateRepositories(profile.Repositories) != nil {
+	if len(profile.Repositories) != 0 && packages.ValidateRepositories(profile.Repositories) != nil {
 		return fmt.Errorf("OS profile repository configuration is invalid")
 	}
 	repositoryIDs := make(map[string]bool, len(profile.Repositories))
@@ -383,12 +421,29 @@ func validateOSProfile(profile OSProfile) error {
 	previous := ""
 	for _, tuple := range profile.Packages {
 		key := tuple.Name + "\x00" + tuple.Architecture
-		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || tuple.RepositoryID != "" && (!refPattern.MatchString(tuple.RepositoryID) || !repositoryIDs[tuple.RepositoryID]) || len(profile.Repositories) > 1 && tuple.RepositoryID == "" || previous != "" && previous >= key {
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || !versionBoundsValid(tuple.Version, tuple.VersionMinimum, tuple.VersionMaximum) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || len(profile.Repositories) != 0 && (tuple.RepositoryID == "" || !refPattern.MatchString(tuple.RepositoryID) || !repositoryIDs[tuple.RepositoryID]) || previous != "" && previous >= key {
 			return fmt.Errorf("OS profile package tuple is invalid, duplicated, or unsorted")
 		}
 		previous = key
 	}
 	return validateConfinementProfile(profile.ManagedConfinement)
+}
+
+func versionBoundsValid(reference, minimum, maximum string) bool {
+	if !concreteVersionPattern.MatchString(reference) || movingVersion(reference) {
+		return false
+	}
+	if minimum == "" && maximum == "" {
+		return true
+	}
+	if minimum != "" && (!concreteVersionPattern.MatchString(minimum) || movingVersion(minimum)) || maximum != "" && (!concreteVersionPattern.MatchString(maximum) || movingVersion(maximum)) {
+		return false
+	}
+	return maximum == "" || minimum == "" || debianversion.Compare(minimum, maximum) < 0
+}
+
+func movingVersion(value string) bool {
+	return strings.EqualFold(value, "latest") || strings.EqualFold(value, "stable") || strings.EqualFold(value, "current")
 }
 
 func validateConfinementProfile(profile ConfinementProfile) error {

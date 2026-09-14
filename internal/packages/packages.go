@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"lanpanel/internal/debianversion"
 	"lanpanel/internal/sources"
 	"net/url"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -38,12 +40,15 @@ type Authority struct {
 }
 
 type Package struct {
-	Name         string `json:"name"`
-	Version      string `json:"version"`
-	Architecture string `json:"architecture"`
-	// RepositoryID binds a distro package to the signed repository authority
-	// that supplies its exact artifact. It is required for multi-repository plans.
-	RepositoryID              string         `json:"repository_id,omitempty"`
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	VersionMinimum string `json:"version_minimum,omitempty"`
+	VersionMaximum string `json:"version_maximum,omitempty"`
+	Architecture   string `json:"architecture"`
+	// RepositoryID optionally selects one repository within an explicit plan.
+	RepositoryID string `json:"repository_id"`
+	// RepositoryFilename is used only when an explicit repository plan supplies it.
+	RepositoryFilename        string         `json:"repository_filename"`
 	ArtifactDigest            string         `json:"artifact_digest"`
 	ArtifactBytes             int64          `json:"artifact_bytes"`
 	MaximumInstalledFileBytes int64          `json:"maximum_installed_file_bytes"`
@@ -60,10 +65,10 @@ type Repository struct {
 	Components    []string `json:"components"`
 	KeyringPath   string   `json:"keyring_path"`
 	KeyringDigest string   `json:"keyring_digest"`
-	// MetadataDigest identifies the exact repository InRelease metadata bytes.
-	MetadataDigest string `json:"metadata_digest"`
-	// CutoffDigest identifies the canonical Date in the repository InRelease.
-	CutoffDigest string `json:"cutoff_digest"`
+	// MetadataDigest and CutoffDigest are diagnostic evidence only; they are not
+	// release or installation authority.
+	MetadataDigest string `json:"metadata_digest,omitempty"`
+	CutoffDigest   string `json:"cutoff_digest,omitempty"`
 }
 
 type Plan struct {
@@ -111,6 +116,15 @@ type ObservedConfig struct {
 	Bytes       []byte
 }
 
+type RepositoryPackageBinding struct {
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Architecture string `json:"architecture"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
+	Digest       string `json:"digest"`
+}
+
 type ObservedRepository struct {
 	ID             string
 	URI            string
@@ -121,6 +135,9 @@ type ObservedRepository struct {
 	MetadataDigest string
 	CutoffDigest   string
 	Enabled        bool
+	// PackageBindings are derived only from the verified, signed Packages
+	// indexes. They are evidence for the local postcondition, not plan input.
+	PackageBindings []RepositoryPackageBinding `json:"package_bindings"`
 }
 
 type DPKGState struct {
@@ -173,7 +190,6 @@ type Postcondition struct {
 	Units          []UnitState
 	Listeners      []Listener
 	RetainedMasks  []string
-	HTPasswd       *FileIdentity
 }
 
 var (
@@ -198,17 +214,17 @@ func ValidateRepositories(repositories []Repository) error {
 }
 
 // ValidatePublicReleasePlan narrows the generic transaction validator to the
-// only package source exposed by the public release contract.
+// user-configured APT source exposed by the public release contract.
 func ValidatePublicReleasePlan(plan Plan) error {
 	if err := ValidatePlan(plan); err != nil {
 		return err
 	}
-	if plan.Mode != DistroRepository || plan.Proxy != nil {
-		return fmt.Errorf("public release package plan must use signed OfficialDistro without a proxy")
+	if plan.Mode != DistroRepository || plan.Proxy != nil || len(plan.Repositories) != 0 {
+		return fmt.Errorf("public release package plan must use the host's authenticated APT sources")
 	}
 	for _, pkg := range plan.Packages {
-		if pkg.Source.Kind != sources.OfficialDistro || pkg.Source.URL != "" || pkg.Source.OfflinePath != "" || len(pkg.Source.OfficialAuthorities) != 0 {
-			return fmt.Errorf("public release package source is not the release-bound OfficialDistro authority")
+		if pkg.Source.Kind != sources.OfficialDistro || pkg.Source.URL != "" || pkg.Source.OfflinePath != "" || len(pkg.Source.OfficialAuthorities) != 0 || pkg.RepositoryID != "" || pkg.RepositoryFilename != "" || pkg.VersionMinimum == "" && pkg.VersionMaximum == "" {
+			return fmt.Errorf("public release package source is not a ranged host APT source")
 		}
 	}
 	return nil
@@ -226,8 +242,8 @@ func ValidatePlan(plan Plan) error {
 	}
 	switch plan.Mode {
 	case DistroRepository:
-		if plan.NoNetwork || len(plan.Repositories) == 0 {
-			return fmt.Errorf("distro transaction lacks exact network repository authority")
+		if plan.NoNetwork {
+			return fmt.Errorf("distro transaction cannot be offline")
 		}
 	case StagedDebs:
 		if !plan.NoNetwork || len(plan.Repositories) != 0 || plan.Proxy != nil {
@@ -240,43 +256,44 @@ func ValidatePlan(plan Plan) error {
 	default:
 		return fmt.Errorf("package transaction mode is unknown")
 	}
-	if err := validateRepositories(plan.Repositories); err != nil {
-		return err
+	if len(plan.Repositories) != 0 {
+		if err := validateRepositories(plan.Repositories); err != nil {
+			return err
+		}
 	}
 	previous := ""
 	repositoryIDs := make(map[string]bool, len(plan.Repositories))
+	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
+		for _, pkg := range plan.Packages {
+			if pkg.VersionMinimum == "" && pkg.VersionMaximum == "" {
+				return fmt.Errorf("user APT package plan requires a version range")
+			}
+		}
+	}
 	for _, repository := range plan.Repositories {
 		repositoryIDs[repository.ID] = true
 	}
-	hasNginx, hasApacheUtils := false, false
+	hasNginx := false
 	for _, pkg := range plan.Packages {
-		if !packageNamePattern.MatchString(pkg.Name) || !versionPattern.MatchString(pkg.Version) || moving(pkg.Version) || pkg.Architecture != "amd64" && pkg.Architecture != "all" || pkg.RepositoryID != "" && (!refPattern.MatchString(pkg.RepositoryID) || !repositoryIDs[pkg.RepositoryID]) || len(plan.Repositories) > 1 && pkg.RepositoryID == "" || !digestPattern.MatchString(pkg.ArtifactDigest) || pkg.ArtifactBytes <= 0 || pkg.ArtifactBytes > 4<<30 || pkg.MaximumInstalledFileBytes <= 0 || pkg.MaximumInstalledFileBytes > 4<<30 || previous != "" && strings.Compare(previous, pkg.Name) >= 0 {
+		if !packageNamePattern.MatchString(pkg.Name) || !versionPattern.MatchString(pkg.Version) || moving(pkg.Version) || pkg.VersionMinimum != "" && (!versionPattern.MatchString(pkg.VersionMinimum) || moving(pkg.VersionMinimum)) || pkg.VersionMaximum != "" && (!versionPattern.MatchString(pkg.VersionMaximum) || moving(pkg.VersionMaximum) || debianversion.Compare(pkg.VersionMinimum, pkg.VersionMaximum) >= 0) || pkg.Architecture != "amd64" && pkg.Architecture != "all" || pkg.RepositoryID != "" && (!refPattern.MatchString(pkg.RepositoryID) || !repositoryIDs[pkg.RepositoryID]) || plan.Mode == DistroRepository && len(plan.Repositories) != 0 && (pkg.RepositoryID == "" || pkg.RepositoryFilename == "") || plan.Mode != DistroRepository && pkg.RepositoryFilename != "" || pkg.RepositoryFilename != "" && !validRepositoryFilename(pkg.RepositoryFilename) || (plan.Mode != DistroRepository || len(plan.Repositories) != 0) && (!digestPattern.MatchString(pkg.ArtifactDigest) || pkg.ArtifactBytes <= 0 || pkg.ArtifactBytes > 4<<30) || pkg.MaximumInstalledFileBytes <= 0 || pkg.MaximumInstalledFileBytes > 4<<30 || previous != "" && strings.Compare(previous, pkg.Name) >= 0 {
 			return fmt.Errorf("package closure is invalid, duplicated, floating, or unsorted")
 		}
 		if (plan.Mode == StagedDebs || plan.Mode == OfflineDebs) && pkg.StagedIdentity != "sha256:"+pkg.ArtifactDigest || plan.Mode == DistroRepository && pkg.StagedIdentity != "" {
 			return fmt.Errorf("package staged identity does not match transaction mode")
 		}
-		if err := sources.Validate(pkg.Source); err != nil || pkg.Source.Artifact.Name != pkg.Name || pkg.Source.Artifact.Version != pkg.Version || pkg.Source.Artifact.OperatingOS != "linux" || pkg.Source.Artifact.Architecture != pkg.Architecture || pkg.Source.Artifact.Digest != pkg.ArtifactDigest || plan.Mode == DistroRepository && pkg.Source.Kind != sources.OfficialDistro || plan.Mode == StagedDebs && pkg.Source.Kind != sources.OfficialCanonical && pkg.Source.Kind != sources.Mirror || plan.Mode == OfflineDebs && pkg.Source.Kind != sources.Offline {
+		if err := sources.Validate(pkg.Source); err != nil || pkg.Source.Artifact.Name != pkg.Name || pkg.Source.Artifact.Version != pkg.Version || pkg.Source.Artifact.OperatingOS != "linux" || pkg.Source.Artifact.Architecture != pkg.Architecture || (plan.Mode != DistroRepository || len(plan.Repositories) != 0) && pkg.Source.Artifact.Digest != pkg.ArtifactDigest || plan.Mode == DistroRepository && pkg.Source.Kind != sources.OfficialDistro || plan.Mode == StagedDebs && pkg.Source.Kind != sources.OfficialCanonical && pkg.Source.Kind != sources.Mirror || plan.Mode == OfflineDebs && pkg.Source.Kind != sources.Offline {
 			return fmt.Errorf("package source does not match its exact artifact and transaction mode")
 		}
 		if err := validateSortedUnits(pkg.AffectedUnits); err != nil || validateListeners(pkg.PossibleListeners) != nil {
 			return fmt.Errorf("package unit/listener closure is invalid")
-		}
-		if pkg.Name == "apache2-utils" {
-			hasApacheUtils = true
-			if len(pkg.AffectedUnits) != 0 || len(pkg.PossibleListeners) != 0 {
-				return fmt.Errorf("apache2-utils transaction would activate an Apache unit or listener")
-			}
-		} else if strings.HasPrefix(pkg.Name, "apache2") {
-			return fmt.Errorf("package closure contains an Apache HTTP Server package")
 		}
 		if pkg.Name == "nginx" {
 			hasNginx = true
 		}
 		previous = pkg.Name
 	}
-	if plan.FirstNginxInstall && (!hasNginx || !hasApacheUtils) {
-		return fmt.Errorf("first Nginx package closure omits nginx or apache2-utils")
+	if plan.FirstNginxInstall && !hasNginx {
+		return fmt.Errorf("first Nginx package closure omits nginx")
 	}
 	if plan.Authority.Kind != PreviewProfile || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest {
 		return fmt.Errorf("package authority does not match the install identity")
@@ -284,9 +301,9 @@ func ValidatePlan(plan Plan) error {
 	return nil
 }
 
-// ValidateAPTConfigurationBasic checks the functional APT/dpkg prerequisites
-// and signed repository observations without requiring the host's pre-existing
-// sources or distro-provided hooks to match the eventual transaction plan.
+// ValidateAPTConfigurationBasic checks functional APT/dpkg prerequisites
+// without requiring the host's pre-existing mirror or repository metadata to
+// match a release transaction plan.
 func ValidateAPTConfigurationBasic(files []ObservedConfig, repositories []ObservedRepository) error {
 	if _, err := validateAPTConfigurationFiles(files); err != nil {
 		return err
@@ -295,14 +312,17 @@ func ValidateAPTConfigurationBasic(files []ObservedConfig, repositories []Observ
 		return fmt.Errorf("APT repository configuration is unbounded")
 	}
 	for _, repository := range repositories {
-		if !repository.Enabled || repository.KeyringPath == "" || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) {
-			return fmt.Errorf("APT repository signature or metadata identity is incomplete")
+		if !repository.Enabled || repository.URI == "" || repository.Suite == "" {
+			return fmt.Errorf("APT repository configuration is incomplete")
 		}
 	}
 	return nil
 }
 
 func ValidateAPTConfiguration(files []ObservedConfig, repositories []ObservedRepository, expected []Repository) error {
+	if len(expected) == 0 {
+		return ValidateAPTConfigurationBasic(files, repositories)
+	}
 	observedKeyrings, err := validateAPTConfigurationFiles(files)
 	if err != nil {
 		return err
@@ -333,7 +353,7 @@ func validateAPTConfigurationFiles(files []ObservedConfig) (map[string]string, e
 			digest := sha256.Sum256(file.Bytes)
 			observedKeyrings[file.Path] = hex.EncodeToString(digest[:])
 		} else if forbiddenAPTConfiguration(file.Bytes) {
-			return nil, fmt.Errorf("APT/dpkg configuration contains an unsafe proxy, executable override, or dangerous option")
+			return nil, fmt.Errorf("APT/dpkg configuration contains an unsafe executable override or unauthenticated option")
 		}
 		previous = file.Path
 	}
@@ -346,7 +366,7 @@ func validateRepositoryObservations(observed []ObservedRepository, expected []Re
 	}
 	for index, repository := range observed {
 		want := expected[index]
-		if !repository.Enabled || repository.ID != want.ID || repository.URI != want.URI || repository.Suite != want.Suite || !slices.Equal(repository.Components, want.Components) || repository.KeyringPath != want.KeyringPath || repository.KeyringDigest != want.KeyringDigest || repository.MetadataDigest != want.MetadataDigest || repository.CutoffDigest != want.CutoffDigest || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) {
+		if !repository.Enabled || repository.ID != want.ID || repository.URI != want.URI || repository.Suite != want.Suite || !slices.Equal(repository.Components, want.Components) || repository.KeyringPath != want.KeyringPath || repository.KeyringDigest != want.KeyringDigest {
 			return fmt.Errorf("active repository, keyring, metadata, or cutoff identity differs from the package Plan")
 		}
 	}
@@ -364,8 +384,13 @@ func ValidatePostcondition(plan Plan, before RuntimeSnapshot, observed Postcondi
 	if err := ValidatePlan(plan); err != nil {
 		return fmt.Errorf("package postcondition plan authority is invalid")
 	}
-	if err := validateRepositoryObservations(observed.Repositories, plan.Repositories); err != nil {
-		return fmt.Errorf("package postcondition repository authority is invalid: %w", err)
+	if len(plan.Repositories) != 0 {
+		if err := validateRepositoryObservations(observed.Repositories, plan.Repositories); err != nil {
+			return fmt.Errorf("package postcondition repository authority is invalid: %w", err)
+		}
+	}
+	if err := validateInstalledRepositoryBindings(plan, observed.Repositories, observed.Installed); err != nil {
+		return fmt.Errorf("package postcondition package repository authority is invalid: %w", err)
 	}
 	if !reflectPackages(observed.Installed, plan.Packages) {
 		return fmt.Errorf("package postcondition has unexpected package closure")
@@ -403,14 +428,48 @@ func ValidatePostcondition(plan Plan, before RuntimeSnapshot, observed Postcondi
 	if !slices.Equal(observed.RetainedMasks, expectedMasks) {
 		return fmt.Errorf("package transaction did not retain its exact safety masks through verification")
 	}
-	if hasPackage(plan.Packages, "apache2-utils") {
-		if observed.HTPasswd == nil || observed.HTPasswd.Path != "/usr/bin/htpasswd" || observed.HTPasswd.UID != 0 || observed.HTPasswd.GID != 0 || observed.HTPasswd.Mode&0o022 != 0 || !observed.HTPasswd.Regular || observed.HTPasswd.Linked || !observed.HTPasswd.ParentsSafe || !digestPattern.MatchString(observed.HTPasswd.Digest) {
-			return fmt.Errorf("apache2-utils did not produce a safe exact htpasswd executable")
+	return nil
+}
+
+func validateInstalledRepositoryBindings(plan Plan, repositories []ObservedRepository, installed []Package) error {
+	if plan.Mode != DistroRepository || len(plan.Repositories) == 0 {
+		return nil
+	}
+	for _, pkg := range installed {
+		if _, err := repositoryPackageBinding(pkg, repositories); err != nil {
+			return err
 		}
-	} else if observed.HTPasswd != nil {
-		return fmt.Errorf("package postcondition contains unexpected htpasswd authority")
 	}
 	return nil
+}
+
+func repositoryPackageBinding(pkg Package, repositories []ObservedRepository) (RepositoryPackageBinding, error) {
+	repositoryID := pkg.RepositoryID
+	if repositoryID == "" && len(repositories) == 1 {
+		repositoryID = repositories[0].ID
+	}
+	matches := []RepositoryPackageBinding{}
+	for _, repository := range repositories {
+		if repository.ID != repositoryID {
+			continue
+		}
+		for _, binding := range repository.PackageBindings {
+			if !packageBindingIdentityValid(binding) {
+				continue
+			}
+			if binding.Name == pkg.Name && binding.Version == pkg.Version && binding.Architecture == pkg.Architecture && binding.Size == pkg.ArtifactBytes && binding.Digest == pkg.ArtifactDigest && (pkg.RepositoryFilename == "" || binding.Filename == pkg.RepositoryFilename) {
+				matches = append(matches, binding)
+			}
+		}
+	}
+	if len(matches) != 1 {
+		return RepositoryPackageBinding{}, fmt.Errorf("package %s=%s/%s has %d signed repository bindings", pkg.Name, pkg.Version, pkg.Architecture, len(matches))
+	}
+	return matches[0], nil
+}
+
+func packageBindingIdentityValid(binding RepositoryPackageBinding) bool {
+	return packageNamePattern.MatchString(binding.Name) && versionPattern.MatchString(binding.Version) && !moving(binding.Version) && (binding.Architecture == "amd64" || binding.Architecture == "all") && validRepositoryFilename(binding.Filename) && binding.Size > 0 && binding.Size <= 4<<30 && digestPattern.MatchString(binding.Digest)
 }
 
 func validateRepositories(repositories []Repository) error {
@@ -422,7 +481,7 @@ func validateRepositories(repositories []Repository) error {
 	for _, repository := range repositories {
 		parsed, err := url.Parse(repository.URI)
 		location := repository.URI + "\x00" + repository.Suite
-		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") && !strings.HasPrefix(repository.KeyringPath, "/usr/share/keyrings/") || !digestPattern.MatchString(repository.KeyringDigest) || !digestPattern.MatchString(repository.MetadataDigest) || !digestPattern.MatchString(repository.CutoffDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 || seenLocation[location] {
+		if !refPattern.MatchString(repository.ID) || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !cleanRootFile(repository.KeyringPath) || !strings.HasPrefix(repository.KeyringPath, "/etc/apt/") && !strings.HasPrefix(repository.KeyringPath, "/usr/share/keyrings/") || !digestPattern.MatchString(repository.KeyringDigest) || previous != "" && strings.Compare(previous, repository.ID) >= 0 || seenLocation[location] {
 			return fmt.Errorf("package repository authority is invalid, duplicated, or unsorted")
 		}
 		seenComponents := map[string]bool{}
@@ -436,6 +495,14 @@ func validateRepositories(repositories []Repository) error {
 		previous = repository.ID
 	}
 	return nil
+}
+
+func validRepositoryFilename(value string) bool {
+	if value == "" || len(value) > 1024 || !strings.HasSuffix(value, ".deb") || strings.ContainsAny(value, "\x00\r\n\\") || strings.HasPrefix(value, "/") {
+		return false
+	}
+	clean := path.Clean(value)
+	return clean == value && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../")
 }
 
 func validConfigPath(kind ConfigKind, value string) bool {
@@ -461,6 +528,9 @@ func forbiddenAPTConfiguration(data []byte) bool {
 	if strings.ContainsAny(lower, "\x00\r") {
 		return true
 	}
+	if strings.Contains(lower, "admindir") || strings.Contains(lower, "instdir") {
+		return true
+	}
 	words := []string{}
 	var token strings.Builder
 	flush := func() {
@@ -477,11 +547,8 @@ func forbiddenAPTConfiguration(data []byte) bool {
 		}
 	}
 	flush()
-	for index, word := range words {
-		if word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" {
-			return true
-		}
-		if index > 0 && (words[index-1] == "http" || words[index-1] == "https" || words[index-1] == "ftp") && word == "proxy" {
+	for _, word := range words {
+		if word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" || word == "admindir" || word == "instdir" {
 			return true
 		}
 	}
@@ -535,6 +602,16 @@ func validateInstalledPackages(packages []InstalledPackage) error {
 	return nil
 }
 
+// PackageVersionMatches reports whether an observed Debian version satisfies
+// the public package requirement. A package without bounds retains exact
+// version semantics for staged and existing transaction callers.
+func PackageVersionMatches(pkg Package, observed string) bool {
+	if pkg.VersionMinimum != "" || pkg.VersionMaximum != "" {
+		return debianversion.Satisfies(observed, pkg.VersionMinimum, pkg.VersionMaximum)
+	}
+	return observed == pkg.Version
+}
+
 func validateSystemPackageDelta(before, after []InstalledPackage, planned []Package) error {
 	if err := validateInstalledPackages(before); err != nil {
 		return err
@@ -554,9 +631,26 @@ func validateSystemPackageDelta(before, after []InstalledPackage, planned []Pack
 	for _, pkg := range planned {
 		plannedNames[pkg.Name] = pkg
 		observed, exists := current[pkg.Name]
-		if !exists || observed.Version != pkg.Version || observed.Architecture != pkg.Architecture {
+		if !exists || !PackageVersionMatches(pkg, observed.Version) || observed.Architecture != pkg.Architecture {
 			return fmt.Errorf("planned package postcondition differs from dpkg inventory")
 		}
+	}
+	flexible := false
+	for _, pkg := range planned {
+		flexible = flexible || pkg.VersionMinimum != "" || pkg.VersionMaximum != ""
+	}
+	if flexible {
+		// Native APT may add transitive dependencies, but it must not mutate
+		// unrelated packages that were already installed.
+		for name, old := range prior {
+			if _, planned := plannedNames[name]; planned {
+				continue
+			}
+			if current[name] != old {
+				return fmt.Errorf("package transaction changed an unexpected installed package")
+			}
+		}
+		return nil
 	}
 	for name, old := range prior {
 		if _, planned := plannedNames[name]; planned {

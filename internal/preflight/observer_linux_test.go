@@ -75,7 +75,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	}
 }
 
-func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
+func TestVerifyInstalledProfileIgnoresPackageVersionsAndSnapshot(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("9", 64)
 	expected := ExpectedProfile{
 		ID: "debian", VersionID: "13", Architecture: runtime.GOARCH,
@@ -94,25 +94,33 @@ func TestVerifyInstalledProfileRejectsRuntimeIdentityDrift(t *testing.T) {
 		name   string
 		change func(*InstalledProfileObservation)
 	}{
-		{name: "os_profile", change: func(value *InstalledProfileObservation) { value.Platform.VersionID = "14" }},
-		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "1:257.8-1~deb13u2" }},
-		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "1.26.3-3+deb13u2" }},
-		{name: "package_snapshot", change: func(value *InstalledProfileObservation) {
-			value.Packages.PackageSnapshotDigest = "sha256:" + strings.Repeat("8", 64)
-		}},
-		{name: "package_not_ready", change: func(value *InstalledProfileObservation) {
-			value.Packages.Ready = false
-			value.Packages.Reason = "dpkg_partial_state"
-		}},
+		{name: "systemd", change: func(value *InstalledProfileObservation) { value.Packages.SystemdVersion = "different" }},
+		{name: "nginx", change: func(value *InstalledProfileObservation) { value.Packages.NginxVersion = "different" }},
+		{name: "package_snapshot", change: func(value *InstalledProfileObservation) { value.Packages.PackageSnapshotDigest = "different" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := observed
 			test.change(&candidate)
-			err := VerifyInstalledProfile(expected, candidate)
-			if err == nil || !IsProfileDrift(err) {
-				t.Fatalf("drift was not classified: %v", err)
+			if err := VerifyInstalledProfile(expected, candidate); err != nil {
+				t.Fatalf("obsolete package identity blocked: %v", err)
 			}
 		})
+	}
+	candidate := observed
+	candidate.Platform.VersionID = "14"
+	if err := VerifyInstalledProfile(expected, candidate); err != nil {
+		t.Fatalf("OS release revision blocked family-level compatibility: %v", err)
+	}
+	candidate = observed
+	candidate.Platform.ID = "ubuntu"
+	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
+		t.Fatalf("OS family drift was not classified: %v", err)
+	}
+	candidate = observed
+	candidate.Packages.Ready = false
+	candidate.Packages.Reason = "dpkg_partial_state"
+	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
+		t.Fatalf("package readiness drift was not classified: %v", err)
 	}
 }
 
@@ -136,15 +144,15 @@ func TestParseBootstrapDPKGStatusClassifiesHeldPackages(t *testing.T) {
 
 func TestObserveInstalledPackageTuplesReturnsExactRequestedTuple(t *testing.T) {
 	status := filepath.Join(t.TempDir(), "status")
-	fixture := "Package: apache2-utils\nStatus: install ok installed\nVersion: 2.4.62-1\nArchitecture: amd64\n\nPackage: nginx\nStatus: install ok installed\nVersion: 1.26.0-1\nArchitecture: amd64\n\nPackage: unrelated\nStatus: install ok installed\nVersion: 1.0\nArchitecture: all\n"
+	fixture := "Package: goaccess\nStatus: install ok installed\nVersion: 1.9.3-1\nArchitecture: amd64\n\nPackage: nginx\nStatus: install ok installed\nVersion: 1.26.0-1\nArchitecture: amd64\n\nPackage: unrelated\nStatus: install ok installed\nVersion: 1.0\nArchitecture: all\n"
 	if err := os.WriteFile(status, []byte(fixture), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := observeInstalledPackageTuples(context.Background(), status, []string{"apache2-utils", "nginx"}, false)
-	if err != nil || len(observed) != 2 || observed[0] != (InstalledPackageTuple{Name: "apache2-utils", Version: "2.4.62-1", Architecture: "amd64"}) || observed[1] != (InstalledPackageTuple{Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}) {
+	observed, err := observeInstalledPackageTuples(context.Background(), status, []string{"goaccess", "nginx"}, false)
+	if err != nil || len(observed) != 2 || observed[0] != (InstalledPackageTuple{Name: "goaccess", Version: "1.9.3-1", Architecture: "amd64"}) || observed[1] != (InstalledPackageTuple{Name: "nginx", Version: "1.26.0-1", Architecture: "amd64"}) {
 		t.Fatalf("observed=%#v err=%v", observed, err)
 	}
-	if _, err := observeInstalledPackageTuples(context.Background(), status, []string{"nginx", "apache2-utils"}, false); err == nil {
+	if _, err := observeInstalledPackageTuples(context.Background(), status, []string{"nginx", "goaccess"}, false); err == nil {
 		t.Fatal("unsorted package selector was accepted")
 	}
 	if _, err := observeInstalledPackageTuples(context.Background(), status, []string{"missing"}, false); err == nil {

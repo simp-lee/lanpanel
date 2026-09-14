@@ -50,7 +50,7 @@ var (
 )
 
 func Validate(source Source) error {
-	if !namePattern.MatchString(source.Artifact.Name) || !versionPattern.MatchString(source.Artifact.Version) || moving(source.Artifact.Version) || source.Artifact.OperatingOS != "linux" || source.Artifact.Architecture != "amd64" && source.Artifact.Architecture != "all" || !digestPattern.MatchString(source.Artifact.Digest) {
+	if !namePattern.MatchString(source.Artifact.Name) || !versionPattern.MatchString(source.Artifact.Version) || moving(source.Artifact.Version) || source.Artifact.OperatingOS != "linux" || source.Artifact.Architecture != "amd64" && source.Artifact.Architecture != "all" || source.Kind != OfficialDistro && !digestPattern.MatchString(source.Artifact.Digest) {
 		return fmt.Errorf("source artifact identity is invalid or floating")
 	}
 	switch source.Kind {

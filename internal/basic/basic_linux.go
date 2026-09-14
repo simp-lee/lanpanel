@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/htpasswdref"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sys/unix"
 )
 
@@ -28,9 +28,6 @@ type Generated struct {
 	Password    []byte
 	Record      []byte
 	Fingerprint string
-}
-type runner interface {
-	RunInvocation(context.Context, child.ProfileID, child.Invocation, []byte) (child.Result, error)
 }
 
 func NewPassword() ([]byte, error) {
@@ -44,40 +41,32 @@ func NewPassword() ([]byte, error) {
 	return password, nil
 }
 
-func Hash(ctx context.Context, launcher runner, username string, password []byte) (Generated, error) {
-	if launcher == nil || !htpasswdref.ValidUsername(username) || len(password) == 0 || len(password) > 71 {
+func Hash(username string, password []byte) (Generated, error) {
+	if !htpasswdref.ValidUsername(username) || len(password) == 0 || len(password) > 71 {
 		return Generated{}, fmt.Errorf("managed Basic generation authority invalid")
 	}
-	input := append(append([]byte(nil), password...), '\n')
-	defer clear(input)
-	result, err := launcher.RunInvocation(ctx, child.ProfileHTPasswd, child.Invocation{HTPasswd: &child.HTPasswdInvocation{Username: username, Cost: htpasswdref.FixedCost}}, input)
-	defer clear(result.Stdout)
-	if err != nil || result.ExitCode != 0 || result.OutputCutOff || result.StderrDigest != "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
-		return Generated{}, fmt.Errorf("htpasswd child failed with redacted result: %w", err)
+	hash, err := bcrypt.GenerateFromPassword(password, htpasswdref.FixedCost)
+	if err != nil {
+		return Generated{}, fmt.Errorf("generate managed Basic bcrypt record: %w", err)
 	}
-	record := result.Stdout
-	if len(record) == 0 || len(record) > 256 {
-		return Generated{}, fmt.Errorf("htpasswd output invalid")
+	if len(hash) < 4 || string(hash[:4]) != "$2a$" {
+		return Generated{}, fmt.Errorf("generated bcrypt record has an unsupported prefix")
 	}
-	trimmed := strings.TrimRight(string(record), "\r\n")
-	if strings.ContainsAny(trimmed, "\r\n") {
-		return Generated{}, fmt.Errorf("htpasswd output authority changed")
+	hash[2] = 'y'
+	record := []byte(username + ":" + string(hash) + "\n")
+	if !htpasswdref.ValidateRecord(username, string(hash)) {
+		return Generated{}, fmt.Errorf("generated bcrypt record is invalid")
 	}
-	outputUsername, encoded, found := strings.Cut(trimmed, ":")
-	if !found || outputUsername != username || !htpasswdref.ValidateRecord(outputUsername, encoded) {
-		return Generated{}, fmt.Errorf("htpasswd output authority changed")
-	}
-	canonical := []byte(trimmed + "\n")
-	sum := sha256.Sum256(canonical)
-	return Generated{Username: username, Record: canonical, Fingerprint: "sha256:" + hex.EncodeToString(sum[:])}, nil
+	sum := sha256.Sum256(record)
+	return Generated{Username: username, Record: record, Fingerprint: "sha256:" + hex.EncodeToString(sum[:])}, nil
 }
 
-func Generate(ctx context.Context, launcher runner, username string) (Generated, error) {
+func Generate(username string) (Generated, error) {
 	password, err := NewPassword()
 	if err != nil {
 		return Generated{}, err
 	}
-	generated, err := Hash(ctx, launcher, username, password)
+	generated, err := Hash(username, password)
 	if err != nil {
 		clear(password)
 		return Generated{}, err

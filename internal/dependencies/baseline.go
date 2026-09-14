@@ -20,7 +20,7 @@ import (
 	"unicode/utf8"
 )
 
-const SchemaVersion = "lanpanel.dependency-baseline.v1"
+const SchemaVersion = "lanpanel.dependency-baseline.v2"
 
 type SourceKind string
 
@@ -75,11 +75,8 @@ var (
 )
 
 var requiredSelections = map[string]SourceKind{
-	"apache2-utils":    SourceDistroRepository,
-	"goaccess":         SourceDistroRepository,
 	"headscale":        SourceCanonicalArtifact,
 	"lego":             SourceCanonicalArtifact,
-	"nginx":            SourceDistroRepository,
 	"tailscale-client": SourceCanonicalArtifact,
 }
 
@@ -265,21 +262,15 @@ func canonicalHTTPSURL(value string) bool {
 }
 
 func ValidateForOSProfile(baseline Baseline, osProfileDigest, nginxVersion string) error {
-	if err := ValidateBaseline(baseline); err != nil || !validDigest(osProfileDigest) || !versionPattern.MatchString(nginxVersion) || floating(nginxVersion) {
-		return fmt.Errorf("dependency baseline or OS profile binding is invalid")
+	if err := ValidateBaseline(baseline); err != nil {
+		return fmt.Errorf("dependency baseline is invalid")
 	}
-	nginxMatched := false
-	for _, selection := range baseline.Selections {
-		if selection.SourceKind == SourceDistroRepository && selection.OSProfileDigest != osProfileDigest {
-			return fmt.Errorf("distribution package %q belongs to another OS profile", selection.Component)
-		}
-		if selection.Component == "nginx" {
-			nginxMatched = selection.SourceKind == SourceDistroRepository && selection.SelectedVersion == nginxVersion
-		}
-	}
-	if !nginxMatched {
-		return fmt.Errorf("dependency baseline Nginx version differs from the qualified OS profile")
-	}
+	// Distro packages are selected from the host's authenticated APT
+	// configuration. The baseline binds only the fixed canonical third-party
+	// assets; retain this signature for callers that also validate an OS
+	// profile, but no longer compare an nginx snapshot here.
+	_ = osProfileDigest
+	_ = nginxVersion
 	return nil
 }
 

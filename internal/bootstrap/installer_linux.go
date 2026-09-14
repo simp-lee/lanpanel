@@ -271,7 +271,7 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 		return "", err
 	}
 	planDigest, err := packages.PlanDigest(plan)
-	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile || !reflect.DeepEqual(plan.Repositories, installed.Profile.Repositories) {
+	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile {
 		return "", fmt.Errorf("package plan does not match installer identity")
 	}
 	if len(plan.Packages) != len(installed.Profile.Packages) {
@@ -279,7 +279,7 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	}
 	for index, pkg := range plan.Packages {
 		want := installed.Profile.Packages[index]
-		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.Architecture != want.Architecture || pkg.RepositoryID != want.RepositoryID {
+		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.VersionMinimum != want.VersionMinimum || pkg.VersionMaximum != want.VersionMaximum || pkg.Architecture != want.Architecture {
 			return "", fmt.Errorf("package plan version set differs from installer profile")
 		}
 	}
@@ -587,7 +587,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err := installFixedRuntimeAssets(ctx, &journal, request); err != nil {
 			return fmt.Errorf("bootstrap fixed runtime assets failed: %w", err)
 		}
-		if err := installNginxBaseline(ctx, &journal); err != nil {
+		if err := installNginxBaseline(ctx, &journal, strict); err != nil {
 			return fmt.Errorf("bootstrap nginx baseline failed: %w", err)
 		}
 		if journal.Paths == FixedPaths() {
@@ -809,7 +809,7 @@ func testNginxPaths(paths Paths) nginx.Paths {
 	return nginx.Paths{ConfigRoot: filepath.Join(paths.PersistentRoot, "etc-nginx"), StateRoot: filepath.Join(paths.PersistentRoot, "nginx"), AuditPath: filepath.Join(paths.PersistentRoot, "log", "nginx-rejections.log"), CertificatePath: filepath.Join(paths.InstallationRoot, "default-rejection.crt"), PrivateKeyPath: filepath.Join(paths.InstallationRoot, "default-rejection.key"), PIDPath: filepath.Join(paths.RuntimeRoot, "nginx.pid")}
 }
 
-func installNginxBaseline(ctx context.Context, journal *Journal) error {
+func installNginxBaseline(ctx context.Context, journal *Journal, strict bool) error {
 	paths := nginx.FixedPaths()
 	if journal == nil {
 		return fmt.Errorf("bootstrap journal is missing")
@@ -849,8 +849,23 @@ func installNginxBaseline(ctx context.Context, journal *Journal) error {
 			journal.ArtifactDigests[path] = digestBytes(data)
 		}
 	}
-	_, err = nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0})
-	return err
+	if _, err = nginx.Audit(paths, filetxn.Owner{UID: 0, GID: 0}); err != nil {
+		return err
+	}
+	if strict {
+		launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
+		if err != nil {
+			return err
+		}
+		result, err := launcher.Run(ctx, child.ProfileNginxTest, nil)
+		if err != nil {
+			return fmt.Errorf("validate generated nginx configuration: %w", err)
+		}
+		if result.ExitCode != 0 || result.OutputCutOff {
+			return fmt.Errorf("generated nginx configuration failed validation")
+		}
+	}
+	return nil
 }
 
 func verifyVendorNginxMask(path string) error {

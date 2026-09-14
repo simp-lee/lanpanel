@@ -70,8 +70,8 @@ func openHeadscaleLifecycle(runner managedheadscale.AdminRunner) (*headscaleLife
 		return fail(err)
 	}
 	installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
-	if err != nil || installation.Headscale == nil || !installation.Headscale.Enabled || installation.Headscale.Applied == nil || installation.Headscale.Artifact.Version != managedheadscale.LifecycleVersion {
-		return fail(errors.Join(err, fmt.Errorf("headscale %s active lifecycle authority is unavailable", managedheadscale.LifecycleVersion)))
+	if err != nil || installation.Headscale == nil || !installation.Headscale.Enabled || installation.Headscale.Applied == nil || installation.Headscale.Artifact.Version == "" {
+		return fail(errors.Join(err, fmt.Errorf("headscale active lifecycle authority is unavailable")))
 	}
 	if runner == nil {
 		runner, err = managedheadscale.NewFixedAdminRunner(installation.InstallationID, installation.Headscale.ID)

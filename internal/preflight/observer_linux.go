@@ -5,8 +5,6 @@ package preflight
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +28,7 @@ type LinuxPaths struct {
 	KernelRelease     string
 	CgroupControllers string
 	SystemdRoot       string
+	SystemdPID1       string
 	APTExecutable     string
 	DPKGExecutable    string
 	TCP               string
@@ -72,7 +71,7 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
 	}
-	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", SystemdRoot: "/run/systemd/system", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
+	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
 }
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
@@ -125,11 +124,8 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 		observed  string
 	}{
 		{"architecture", expected.Architecture, observed.Architecture},
-		{"os_profile", expected.ID + "/" + expected.VersionID, observed.Platform.ID + "/" + observed.Platform.VersionID},
+		{"os_family", expected.ID, observed.Platform.ID},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
-		{"systemd_package", expected.SystemdVersion, observed.Packages.SystemdVersion},
-		{"nginx_package", expected.NginxVersion, observed.Packages.NginxVersion},
-		{"package_snapshot", expected.PackageSnapshotDigest, observed.Packages.PackageSnapshotDigest},
 	}
 	for _, check := range checks {
 		if check.expected != check.observed {
@@ -145,60 +141,18 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 // ObserveBootstrapReadiness provides the installer's fixed read-only package
 // readiness observation without exposing a package mutation entrypoint.
 func ObserveBootstrapReadiness(ctx context.Context) (PackageObservation, error) {
-	configuration := []struct {
-		path string
-		dir  bool
-	}{
-		{"/etc/apt/apt.conf", false},
-		{"/etc/apt/apt.conf.d", true},
-		{"/etc/apt/auth.conf", false},
-		{"/etc/apt/auth.conf.d", true},
-		{"/etc/apt/sources.list", false},
-		{"/etc/apt/sources.list.d", true},
-		{"/etc/dpkg/dpkg.cfg", false},
-		{"/etc/dpkg/dpkg.cfg.d", true},
-	}
-	hasher := sha256.New()
-	for _, entry := range configuration {
-		if err := ctx.Err(); err != nil {
-			return PackageObservation{}, err
-		}
-		values, err := readBootstrapConfig(entry.path, entry.dir)
-		if err != nil {
-			return PackageObservation{}, err
-		}
-		for _, value := range values {
-			lower := strings.ToLower(string(value))
-			if strings.Contains(lower, "proxy") || strings.Contains(lower, "chroot-directory") || strings.Contains(lower, "admindir") || strings.Contains(lower, "root") && strings.Contains(lower, "::") {
-				return PackageObservation{Reason: "apt_dpkg_configuration_override"}, nil
-			}
-			_, _ = hasher.Write(value)
-		}
-	}
 	status, err := readSafeBoundedFile("/var/lib/dpkg/status", 32<<20, true)
 	if err != nil {
 		return PackageObservation{}, err
 	}
-	installed, partial, err := parseBootstrapDPKGStatus(status)
+	_, partial, err := parseBootstrapDPKGStatus(status)
 	if err != nil {
 		return PackageObservation{}, err
 	}
 	if partial {
 		return PackageObservation{Reason: "dpkg_partial_state"}, nil
 	}
-	systemdVersion, nginxVersion := "", ""
-	for _, pkg := range installed {
-		if pkg.Name == "systemd" {
-			systemdVersion = pkg.Version
-		}
-		if pkg.Name == "nginx" || pkg.Name == "nginx-core" {
-			nginxVersion = pkg.Version
-		}
-		_, _ = fmt.Fprintf(hasher, "%s=%s@%s\n", pkg.Name, pkg.Version, pkg.Architecture)
-	}
-	_, _ = hasher.Write(status)
-	snapshot := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
-	return PackageObservation{Ready: systemdVersion != "", Identity: snapshot, SystemdVersion: systemdVersion, NginxVersion: nginxVersion, PackageSnapshotDigest: snapshot}, nil
+	return PackageObservation{Ready: true, Identity: "apt-dpkg-ready"}, nil
 }
 
 type InstalledPackageTuple struct {
@@ -350,48 +304,6 @@ func parseDPKGStatusFields(value string) (string, string, string, error) {
 	return selection, errorState, packageState, nil
 }
 
-func readBootstrapConfig(path string, directory bool) ([][]byte, error) {
-	if !directory {
-		data, err := readSafeBoundedFile(path, 1<<20, true)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		return [][]byte{append([]byte(path+"\x00"), data...)}, nil
-	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = unix.Close(fd) }()
-	var stat unix.Stat_t
-	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
-		return nil, fmt.Errorf("APT/dpkg configuration directory is unsafe")
-	}
-	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", fd))
-	if err != nil {
-		return nil, err
-	}
-	slices.SortFunc(entries, func(left, right os.DirEntry) int { return strings.Compare(left.Name(), right.Name()) })
-	result := make([][]byte, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return nil, fmt.Errorf("APT/dpkg configuration contains nested directory")
-		}
-		data, err := readSafeBoundedFile(filepath.Join(path, entry.Name()), 1<<20, true)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, append([]byte(filepath.Join(path, entry.Name())+"\x00"), data...))
-	}
-	return result, nil
-}
-
 func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request ExpansionRequest) (ExpansionObservations, error) {
 	if observer == nil || observer.packageRead == nil || observer.now == nil {
 		return ExpansionObservations{}, fmt.Errorf("linux preflight observer is unavailable")
@@ -411,7 +323,11 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
-	systemd, err := observeDirectoryComponent(observer.paths.SystemdRoot)
+	systemdPath := observer.paths.SystemdPID1
+	if systemdPath == "" {
+		systemdPath = "/proc/1/comm"
+	}
+	systemd, err := observeSystemdPID1(systemdPath)
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
@@ -469,6 +385,15 @@ func (observer *LinuxObserver) readKernelRelease() (string, error) {
 		return "", fmt.Errorf("current kernel release is invalid")
 	}
 	return release, nil
+}
+
+func observeSystemdPID1(path string) (ComponentObservation, error) {
+	data, err := readBoundedProcFile(path, 128)
+	if err != nil {
+		return ComponentObservation{}, fmt.Errorf("observe systemd PID 1: %w", err)
+	}
+	identity := strings.TrimSpace(string(data))
+	return ComponentObservation{Available: identity == "systemd", Identity: identity}, nil
 }
 
 func (observer *LinuxObserver) readCgroupMode() (string, error) {
@@ -685,20 +610,6 @@ func observeDisk(path string) (DiskObservation, error) {
 		}
 		probe = parent
 	}
-}
-
-func observeDirectoryComponent(path string) (ComponentObservation, error) {
-	var stat unix.Stat_t
-	if err := unix.Lstat(path, &stat); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return ComponentObservation{}, nil
-		}
-		return ComponentObservation{}, err
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
-		return ComponentObservation{}, nil
-	}
-	return ComponentObservation{Available: true, Identity: fmt.Sprintf("%d:%d:%o", stat.Dev, stat.Ino, stat.Mode&0o7777)}, nil
 }
 
 func observeExecutableComponent(path string) (ComponentObservation, error) {

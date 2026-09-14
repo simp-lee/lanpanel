@@ -34,7 +34,7 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID
+	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID != ""
 	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
 	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
 	add("managed_confinement", confinementMatches, "unified cgroup mode required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode)
@@ -44,11 +44,8 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("systemd", observed.Systemd.Available && observed.Systemd.Identity != "", "systemd runtime and identity", observed.Systemd.Identity)
 	add("apt", observed.APT.Available && observed.APT.Identity != "", "apt capability and identity", observed.APT.Identity)
 	add("dpkg", observed.DPKG.Available && observed.DPKG.Identity != "", "dpkg capability and identity", observed.DPKG.Identity)
-	packageExact := observed.Packages.Ready && observed.Packages.Identity != "" && observed.Packages.SystemdVersion == request.Profile.SystemdVersion && observed.Packages.NginxVersion == request.Profile.NginxVersion && observed.Packages.PackageSnapshotDigest == request.Profile.PackageSnapshotDigest
-	if request.Scope == ExpansionBootstrap {
-		packageExact = observed.Packages.Ready && observed.Packages.Identity != ""
-	}
-	add("package_state", packageExact, "apt/dpkg state and exact release package profile are ready", observed.Packages.Identity+"/"+observed.Packages.SystemdVersion+"/"+observed.Packages.NginxVersion+"/"+observed.Packages.PackageSnapshotDigest+"/"+observed.Packages.Reason)
+	packageReady := observed.Packages.Ready && observed.Packages.Identity != ""
+	add("package_state", packageReady, "apt/dpkg state is ready", observed.Packages.Identity+"/"+observed.Packages.Reason)
 
 	if len(observed.DNS) != len(request.Domains) {
 		add("dns", false, "complete exact DNS observations", fmt.Sprintf("observed=%d/required=%d", len(observed.DNS), len(request.Domains)))
@@ -121,7 +118,7 @@ func canonicalDNS(values []DNSObservation) []DNSObservation {
 }
 
 func validateExpansionRequest(request ExpansionRequest) error {
-	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !versionPattern.MatchString(request.Profile.SystemdVersion) || !versionPattern.MatchString(request.Profile.NginxVersion) || !validDigest(request.Profile.PackageSnapshotDigest) || !validProfileAuthority(request.Profile) || !validManagedConfinement(request.Profile.ManagedConfinement) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
+	if !validExpansionScope(request.Scope) || !validTarget(request.Target) || request.Generation == 0 || request.Profile.Architecture != "amd64" || !validProfileAuthority(request.Profile) || !validManagedConfinement(request.Profile.ManagedConfinement) || len(request.Domains) > MaximumDomains || len(request.PublicAddresses) > MaximumPublicAddresses || len(request.BootstrapListeners) > MaximumListenerAuthority || len(request.OwnedListeners) > MaximumListenerAuthority || len(request.ManagedPaths) > MaximumManagedPaths || len(request.Disks) == 0 || len(request.Disks) > MaximumDisks || !canonicalStringSet(request.Domains, canonicalDomain) || !canonicalStringSet(request.PublicAddresses, canonicalIP) {
 		return fmt.Errorf("expansion preflight request identity or profile is invalid")
 	}
 	switch request.Scope {

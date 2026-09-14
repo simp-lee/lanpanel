@@ -12,7 +12,7 @@ The UI process is non-root. Root mutations cross a peer-authenticated, typed Uni
 
 ## Platform and installation
 
-The code targets Debian and Ubuntu Linux amd64 with systemd and apt/dpkg. LanPanel is Preview-only: installation performs basic host checks, signed repository validation, exact package-version checks, and transaction cleanup. It is not a hardened GA or live-qualified release.
+The Preview release targets Debian or Ubuntu Linux amd64 with systemd and apt/dpkg. The release profile selects the distribution family and package ranges; it does not treat a specific distribution release as the compatibility proof. Unknown future Debian or Ubuntu releases may proceed when all capability and functional checks pass. LanPanel is Preview-only: installation performs basic host checks, signed repository validation, package version-range checks, and transaction cleanup. It is not a hardened GA or live-qualified release.
 
 Only clean installation is supported. From an extracted official release artifact, run the sole public Preview path:
 
@@ -20,11 +20,19 @@ Only clean installation is supported. From an extracted official release artifac
 sudo ./lanpanel install
 ```
 
-The artifact directory is discovered from the running binary. Its canonical manifest, detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, NOTICE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. Each release publishes a generated bootstrap script with its fixed artifact version and digest (the repository generator is `scripts/generate-preview-bootstrap.sh`); it verifies the same material in a protected temporary directory and then invokes this command, never pipe-to-shell or an online fallback.
+The artifact directory is discovered from the running binary. Its canonical manifest, trusted detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, NOTICE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. To install without manually handling the bundle, copy the version-pinned command published with the release:
 
-The installer constructs the host-bound package Plan and fresh bootstrap preflight from the checksum-bound release assets before any mutation. Before service bootstrap, it verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, signed repository/key metadata, exact package set and versions, host architecture, systemd, apt/dpkg health, clock, disk, paths, and listeners. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
+```sh
+curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
+  -o /tmp/lanpanel-bootstrap.sh &&
+sudo /tmp/lanpanel-bootstrap.sh install
+```
 
-System packages use only the release-authority-bound signed `OfficialDistro` repository and exact package set. Lego, Tailscale, and Headscale are delivered as release-authority-bound assets; no third-party installer script, mirror, offline source, proxy, or download fallback is used.
+The published `lanpanel-bootstrap.sh` downloads the fixed artifact, verifies its embedded digest in a protected temporary directory, removes temporary files on exit, and invokes this same command. It is generated from `scripts/generate-preview-bootstrap.sh`; the release page provides the actual version-pinned GitHub Release URL. It never pipe-to-shell or uses an online fallback.
+
+The installer constructs the host-bound package Plan and fresh bootstrap preflight from the checksum-bound release assets before any mutation. Before service bootstrap, it verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, signed repository/key metadata, package ranges and actual installed versions, host architecture, systemd PID 1, cgroup v2, apt/dpkg health, clock, disk, paths, listeners, and generated Nginx configuration. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
+
+System packages use the host's authenticated APT configuration and profile-specific version-range requirements; LanPanel does not restrict the user's Debian/Ubuntu mirror. Lego, Tailscale, and Headscale are delivered as release-authority-bound assets; no third-party installer script, offline source, or download fallback is used.
 
 ## Headscale and connector
 
@@ -89,4 +97,4 @@ Host administrators may read their own configuration, SQLite, and data outside L
 
 ## Security and release
 
-See [SECURITY.md](SECURITY.md). A release includes one Linux amd64 binary, source tag/archive, LICENSE, NOTICE, dependency manifest, public `package-template.json`, `SHA256SUMS`, and a canonical `release.json`. Preview does not publish SBOM/OSV or live-qualification evidence.
+See [SECURITY.md](SECURITY.md). A release includes one Linux amd64 binary, source tag/archive, LICENSE, NOTICE, family-specific dependency manifests and package templates, `SHA256SUMS`, and a canonical `release.json`. User installation details are in [docs/INSTALLING.md](docs/INSTALLING.md); developer and maintainer workflows are in [docs/DEVELOPING.md](docs/DEVELOPING.md) and [docs/RELEASING.md](docs/RELEASING.md). Preview does not publish SBOM/OSV or live-qualification evidence.

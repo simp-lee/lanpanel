@@ -5,6 +5,8 @@ package packages
 import (
 	"bufio"
 	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,21 +26,25 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
+	"github.com/ulikunitz/xz"
+	"github.com/ulikunitz/xz/lzma"
 	"golang.org/x/sys/unix"
 )
 
 type LinuxAuditor struct {
-	launcher     ChildLauncher
-	aptRoot      string
-	aptListsRoot string
-	dpkgRoot     string
-	cgroupRoot   string
-	procRoot     string
-	policyPath   string
-	binaryPath   string
-	maskRoot     string
-	strict       bool
+	launcher        ChildLauncher
+	aptRoot         string
+	aptListsRoot    string
+	dpkgRoot        string
+	transactionRoot string
+	cgroupRoot      string
+	procRoot        string
+	policyPath      string
+	binaryPath      string
+	maskRoot        string
+	strict          bool
 }
 
 func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
@@ -51,11 +57,11 @@ func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 			return nil, err
 		}
 	}
-	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
+	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
 }
 
 func newTestLinuxAuditor(launcher ChildLauncher, root string) *LinuxAuditor {
-	return &LinuxAuditor{launcher: launcher, aptRoot: filepath.Join(root, "etc/apt"), aptListsRoot: filepath.Join(root, "var/lib/apt/lists"), dpkgRoot: filepath.Join(root, "var/lib/dpkg"), cgroupRoot: filepath.Join(root, "cgroup"), procRoot: filepath.Join(root, "proc"), policyPath: filepath.Join(root, "usr/sbin/policy-rc.d"), binaryPath: filepath.Join(root, "usr/lib/lanpanel/lanpanel"), maskRoot: filepath.Join(root, "etc/systemd/system")}
+	return &LinuxAuditor{launcher: launcher, aptRoot: filepath.Join(root, "etc/apt"), aptListsRoot: filepath.Join(root, "var/lib/apt/lists"), dpkgRoot: filepath.Join(root, "var/lib/dpkg"), transactionRoot: filepath.Join(root, "var/lib/lanpanel/packages/transactions"), cgroupRoot: filepath.Join(root, "cgroup"), procRoot: filepath.Join(root, "proc"), policyPath: filepath.Join(root, "usr/sbin/policy-rc.d"), binaryPath: filepath.Join(root, "usr/lib/lanpanel/lanpanel"), maskRoot: filepath.Join(root, "etc/systemd/system")}
 }
 
 func (auditor *LinuxAuditor) LockRepositoryMetadata(ctx context.Context, wait time.Duration) (func(), error) {
@@ -128,6 +134,17 @@ func (auditor *LinuxAuditor) AuditPackages(ctx context.Context, plan Plan) (Audi
 	if err != nil {
 		return Audit{}, err
 	}
+	if plan.Mode == DistroRepository {
+		present, err := auditor.distroCacheNeedsVerification(plan)
+		if err != nil {
+			return Audit{}, err
+		}
+		if present {
+			if err := auditor.verifyDistroPackageArtifacts(plan, repositories); err != nil {
+				return Audit{}, fmt.Errorf("distro package artifact authority is invalid: %w", err)
+			}
+		}
+	}
 	return Audit{Configuration: configuration, Repositories: repositories, DPKG: dpkg, Before: runtime, NoAutostart: policy}, nil
 }
 
@@ -174,18 +191,14 @@ func (auditor *LinuxAuditor) ObservePackages(ctx context.Context, plan Plan) (Po
 	if !reflectPackages(installed, plan.Packages) {
 		return Postcondition{}, fmt.Errorf("installed package closure differs from the exact Plan")
 	}
+	if err := auditor.verifyDistroPackageArtifacts(plan, repositories); err != nil {
+		return Postcondition{}, err
+	}
 	runtime, err := auditor.runtimeSnapshot(plan, installed, systemPackages)
 	if err != nil {
 		return Postcondition{}, err
 	}
 	postcondition := Postcondition{Repositories: repositories, Installed: installed, SystemPackages: runtime.SystemPackages, Units: runtime.Units, Listeners: runtime.Listeners}
-	if hasPackage(plan.Packages, "apache2-utils") {
-		identity, err := auditor.fileIdentity("/usr/bin/htpasswd")
-		if err != nil {
-			return Postcondition{}, err
-		}
-		postcondition.HTPasswd = &identity
-	}
 	finalRepositories, err := auditor.observeAPTAuthority(ctx, plan)
 	if err != nil {
 		return Postcondition{}, err
@@ -242,12 +255,27 @@ type repositoryMetadataFile struct {
 	Digest string `json:"digest"`
 }
 
+type repositoryPackageEntry struct {
+	RepositoryID string
+	Component    string
+	IndexArch    string
+	Name         string
+	Version      string
+	Architecture string
+	Filename     string
+	Size         int64
+	Digest       string
+}
+
 type repositoryReleaseFile struct {
 	Bytes  int64
 	Digest string
 }
 
-const maximumRepositoryMetadataFileBytes = 128 << 20
+const (
+	maximumRepositoryMetadataFileBytes = 128 << 20
+	maximumRepositoryPackageEntries    = 1 << 20
+)
 
 // observeRepositoryMetadata derives repository authority from the signed APT
 // metadata actually present in the local lists directory. The Plan is never
@@ -323,10 +351,15 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 				}
 			}
 		}
+		entries := []repositoryPackageEntry{}
+		entryByIdentity := map[string]repositoryPackageEntry{}
 		for _, component := range repositories[index].Components {
 			for _, architecture := range []string{"amd64", "all"} {
 				packagePrefix := prefix + aptListPart(component) + "_binary-" + architecture + "_Packages"
 				found := false
+				canonicalSet := false
+				var canonicalPackages []byte
+				canonicalName := ""
 				for _, packageFile := range metadata {
 					if !aptPackageIndexName(packageFile.Name, packagePrefix) {
 						continue
@@ -334,14 +367,45 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 					found = true
 					suffix := strings.TrimPrefix(packageFile.Name, packagePrefix)
 					releasePath := component + "/binary-" + architecture + "/Packages"
-					if err := auditor.validateRepositoryPackageIndex(packageFile, suffix, releasePath, releaseFiles); err != nil {
+					packagesBytes, err := auditor.validateRepositoryPackageIndex(packageFile, suffix, releasePath, releaseFiles)
+					if err != nil {
 						return fmt.Errorf("APT repository %q package index is not bound by its InRelease metadata: %w", repositories[index].ID, err)
+					}
+					if !canonicalSet {
+						canonicalPackages, canonicalName, canonicalSet = packagesBytes, packageFile.Name, true
+					} else if !bytes.Equal(canonicalPackages, packagesBytes) {
+						return fmt.Errorf("APT repository %q has conflicting compressed representations for package index %q", repositories[index].ID, packagePrefix)
+					}
+				}
+				if found && expectedPackages != nil {
+					parsed, err := parseRepositoryPackageIndex(canonicalPackages, repositories[index].ID, component, architecture)
+					if err != nil {
+						return fmt.Errorf("APT repository %q package index %q is malformed: %w", repositories[index].ID, canonicalName, err)
+					}
+					if len(entries)+len(parsed) > maximumRepositoryPackageEntries {
+						return fmt.Errorf("APT repository %q contains too many package stanzas", repositories[index].ID)
+					}
+					if err := appendRepositoryPackageEntries(&entries, entryByIdentity, parsed); err != nil {
+						return fmt.Errorf("APT repository %q has conflicting package stanzas: %w", repositories[index].ID, err)
 					}
 				}
 				if !found && requireIndexes && (architecture == "amd64" || allArchitectureRequired) {
 					return fmt.Errorf("APT repository %q lacks the exact %s package index for component %q", repositories[index].ID, architecture, component)
 				}
 			}
+		}
+		if expectedPackages != nil {
+			if err := validateExpectedRepositoryPackages(expectedPackages, repositories[index].ID, repositories, entries); err != nil {
+				return fmt.Errorf("APT repository %q package ownership is invalid: %w", repositories[index].ID, err)
+			}
+		}
+		bindings := entries
+		if expectedPackages != nil {
+			bindings = expectedRepositoryPackageEntries(expectedPackages, repositories[index].ID, repositories, entries)
+		}
+		repositories[index].PackageBindings = make([]RepositoryPackageBinding, 0, len(bindings))
+		for _, entry := range bindings {
+			repositories[index].PackageBindings = append(repositories[index].PackageBindings, RepositoryPackageBinding{Name: entry.Name, Version: entry.Version, Architecture: entry.Architecture, Filename: entry.Filename, Size: entry.Size, Digest: entry.Digest})
 		}
 		metadataDigest := digestBytes(release)
 		cutoffDigest, err := repositoryCutoffDigest(plaintext)
@@ -406,32 +470,240 @@ func aptPackageIndexName(name, prefix string) bool {
 	return false
 }
 
-func (auditor *LinuxAuditor) validateRepositoryPackageIndex(file repositoryMetadataFile, suffix, releasePath string, releaseFiles map[string]repositoryReleaseFile) error {
+func (auditor *LinuxAuditor) validateRepositoryPackageIndex(file repositoryMetadataFile, suffix, releasePath string, releaseFiles map[string]repositoryReleaseFile) ([]byte, error) {
+	data, _, err := auditor.readFileAndStat(filepath.Join(auditor.aptListsRoot, file.Name), maximumRepositoryMetadataFileBytes)
+	if err != nil || int64(len(data)) != file.Bytes || digestBytes(data) != file.Digest {
+		return nil, fmt.Errorf("package index changed before verification")
+	}
 	if suffix != ".lz4" {
 		releaseFile, found := releaseFiles[releasePath+suffix]
 		if !found {
-			return fmt.Errorf("stored package index representation is absent from InRelease")
+			return nil, fmt.Errorf("stored package index representation is absent from InRelease")
 		}
 		if file.Bytes != releaseFile.Bytes || file.Digest != releaseFile.Digest {
-			return fmt.Errorf("stored package index differs from its signed compressed identity")
+			return nil, fmt.Errorf("stored package index differs from its signed compressed identity")
 		}
-		return nil
+		data, err = decompressRepositoryPackageIndex(data, suffix)
+		if err != nil {
+			return nil, err
+		}
+		if releaseFile, found := releaseFiles[releasePath]; found && (int64(len(data)) != releaseFile.Bytes || digestBytes(data) != releaseFile.Digest) {
+			return nil, fmt.Errorf("package index content differs from its signed uncompressed identity")
+		}
+		return data, nil
 	}
 	if compressed, found := releaseFiles[releasePath+suffix]; found && (file.Bytes != compressed.Bytes || file.Digest != compressed.Digest) {
-		return fmt.Errorf("stored LZ4 package index differs from its signed compressed identity")
+		return nil, fmt.Errorf("stored LZ4 package index differs from its signed compressed identity")
 	}
 	releaseFile, found := releaseFiles[releasePath]
 	if !found || releaseFile.Bytes < 0 || releaseFile.Bytes > maximumRepositoryMetadataFileBytes {
-		return fmt.Errorf("LZ4 package index lacks a bounded signed uncompressed identity")
+		return nil, fmt.Errorf("LZ4 package index lacks a bounded signed uncompressed identity")
 	}
-	data, _, err := auditor.readFileAndStat(filepath.Join(auditor.aptListsRoot, file.Name), maximumRepositoryMetadataFileBytes)
-	if err != nil || int64(len(data)) != file.Bytes || digestBytes(data) != file.Digest {
-		return fmt.Errorf("LZ4 package index changed before verification")
+	data, err = decompressRepositoryPackageIndex(data, suffix)
+	if err != nil {
+		return nil, err
 	}
-	hasher := sha256.New()
-	read, err := io.Copy(hasher, io.LimitReader(lz4.NewReader(bytes.NewReader(data)), releaseFile.Bytes+1))
-	if err != nil || read != releaseFile.Bytes || hex.EncodeToString(hasher.Sum(nil)) != releaseFile.Digest {
-		return fmt.Errorf("LZ4 package index content differs from its signed uncompressed identity")
+	if int64(len(data)) != releaseFile.Bytes || digestBytes(data) != releaseFile.Digest {
+		return nil, fmt.Errorf("LZ4 package index content differs from its signed uncompressed identity")
+	}
+	return data, nil
+}
+
+func decompressRepositoryPackageIndex(data []byte, suffix string) ([]byte, error) {
+	var reader io.Reader
+	var closeReader func() error
+	switch suffix {
+	case "":
+		reader = bytes.NewReader(data)
+	case ".gz":
+		gzipReader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("decompress gzip package index: %w", err)
+		}
+		reader, closeReader = gzipReader, gzipReader.Close
+	case ".bz2":
+		reader = bzip2.NewReader(bytes.NewReader(data))
+	case ".xz":
+		xzReader, err := xz.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("decompress XZ package index: %w", err)
+		}
+		reader = xzReader
+	case ".lzma":
+		lzmaReader, err := lzma.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("decompress LZMA package index: %w", err)
+		}
+		reader = lzmaReader
+	case ".lz4":
+		reader = lz4.NewReader(bytes.NewReader(data))
+	case ".zst":
+		zstdReader, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("decompress Zstandard package index: %w", err)
+		}
+		defer zstdReader.Close()
+		reader = zstdReader
+	default:
+		return nil, fmt.Errorf("unsupported package index compression %q", suffix)
+	}
+	if closeReader != nil {
+		defer func() { _ = closeReader() }()
+	}
+	output, err := io.ReadAll(io.LimitReader(reader, maximumRepositoryMetadataFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read decompressed package index: %w", err)
+	}
+	if len(output) > maximumRepositoryMetadataFileBytes {
+		return nil, fmt.Errorf("decompressed package index exceeds its bound")
+	}
+	return output, nil
+}
+
+func parseRepositoryPackageIndex(data []byte, repositoryID, component, indexArchitecture string) ([]repositoryPackageEntry, error) {
+	if component == "" || indexArchitecture != "amd64" && indexArchitecture != "all" {
+		return nil, fmt.Errorf("package index authority is incomplete")
+	}
+	entries := []repositoryPackageEntry{}
+	identities := map[string]struct{}{}
+	fields := map[string]string{}
+	current := ""
+	flush := func() error {
+		if len(fields) == 0 {
+			return nil
+		}
+		for _, required := range []string{"Package", "Version", "Architecture", "Filename", "Size", "SHA256"} {
+			if strings.TrimSpace(fields[required]) == "" {
+				return fmt.Errorf("package stanza is missing %s", required)
+			}
+		}
+		name, version, architecture := strings.TrimSpace(fields["Package"]), strings.TrimSpace(fields["Version"]), strings.TrimSpace(fields["Architecture"])
+		filename, digest := strings.TrimSpace(fields["Filename"]), strings.TrimSpace(fields["SHA256"])
+		if !packageNamePattern.MatchString(name) || !versionPattern.MatchString(version) || moving(version) || architecture != "amd64" && architecture != "all" || indexArchitecture == "all" && architecture != "all" || !validRepositoryFilename(filename) || !digestPattern.MatchString(digest) {
+			return fmt.Errorf("package stanza identity is invalid")
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(fields["Size"]), 10, 64)
+		if err != nil || size <= 0 || size > 4<<30 {
+			return fmt.Errorf("package stanza size is invalid")
+		}
+		key := repositoryPackageKey(name, version, architecture)
+		if _, duplicate := identities[key]; duplicate {
+			return fmt.Errorf("package stanza is duplicated")
+		}
+		if len(entries) >= maximumRepositoryPackageEntries {
+			return fmt.Errorf("package index contains too many package stanzas")
+		}
+		identities[key] = struct{}{}
+		entries = append(entries, repositoryPackageEntry{RepositoryID: repositoryID, Component: component, IndexArch: indexArchitecture, Name: name, Version: version, Architecture: architecture, Filename: filename, Size: size, Digest: digest})
+		fields = map[string]string{}
+		current = ""
+		return nil
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 32<<10), 2<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasSuffix(line, "\r") {
+			return nil, fmt.Errorf("package index contains CRLF data")
+		}
+		if line == "" {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if current == "" {
+				return nil, fmt.Errorf("package continuation has no field")
+			}
+			fields[current] += "\n" + strings.TrimSpace(line)
+			continue
+		}
+		key, value, found := strings.Cut(line, ":")
+		if !found || key == "" || strings.TrimSpace(key) != key {
+			return nil, fmt.Errorf("package stanza field is malformed")
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, fmt.Errorf("package stanza duplicates %s", key)
+		}
+		fields[key], current = strings.TrimSpace(value), key
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan package index: %w", err)
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func repositoryPackageKey(name, version, architecture string) string {
+	return name + "\x00" + version + "\x00" + architecture
+}
+
+func appendRepositoryPackageEntries(destination *[]repositoryPackageEntry, identities map[string]repositoryPackageEntry, candidates []repositoryPackageEntry) error {
+	for _, candidate := range candidates {
+		key := repositoryPackageKey(candidate.Name, candidate.Version, candidate.Architecture)
+		if existing, found := identities[key]; found {
+			if existing.Filename != candidate.Filename || existing.Size != candidate.Size || existing.Digest != candidate.Digest {
+				return fmt.Errorf("package %s=%s/%s has conflicting filename, size, or digest", candidate.Name, candidate.Version, candidate.Architecture)
+			}
+			continue
+		}
+		identities[key] = candidate
+		*destination = append(*destination, candidate)
+	}
+	return nil
+}
+
+func expectedRepositoryID(pkg Package, repositories []ObservedRepository) string {
+	if pkg.RepositoryID != "" {
+		return pkg.RepositoryID
+	}
+	if len(repositories) == 1 {
+		return repositories[0].ID
+	}
+	return ""
+}
+
+func matchesRepositoryPackage(pkg Package, entry repositoryPackageEntry) bool {
+	return entry.Name == pkg.Name && entry.Version == pkg.Version && entry.Architecture == pkg.Architecture && entry.Size == pkg.ArtifactBytes && entry.Digest == pkg.ArtifactDigest && (pkg.RepositoryFilename == "" || entry.Filename == pkg.RepositoryFilename)
+}
+
+func expectedRepositoryPackageEntries(expected []Package, currentRepositoryID string, repositories []ObservedRepository, entries []repositoryPackageEntry) []repositoryPackageEntry {
+	byIdentity := make(map[string]repositoryPackageEntry, len(entries))
+	for _, entry := range entries {
+		byIdentity[repositoryPackageKey(entry.Name, entry.Version, entry.Architecture)] = entry
+	}
+	result := make([]repositoryPackageEntry, 0, len(expected))
+	for _, pkg := range expected {
+		if expectedRepositoryID(pkg, repositories) != currentRepositoryID {
+			continue
+		}
+		if entry, found := byIdentity[repositoryPackageKey(pkg.Name, pkg.Version, pkg.Architecture)]; found && matchesRepositoryPackage(pkg, entry) {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func validateExpectedRepositoryPackages(expected []Package, currentRepositoryID string, repositories []ObservedRepository, entries []repositoryPackageEntry) error {
+	byIdentity := make(map[string]repositoryPackageEntry, len(entries))
+	for _, entry := range entries {
+		byIdentity[repositoryPackageKey(entry.Name, entry.Version, entry.Architecture)] = entry
+	}
+	for _, pkg := range expected {
+		if expectedRepositoryID(pkg, repositories) != currentRepositoryID {
+			continue
+		}
+		entry, found := byIdentity[repositoryPackageKey(pkg.Name, pkg.Version, pkg.Architecture)]
+		if !found || !matchesRepositoryPackage(pkg, entry) {
+			matches := 0
+			if found {
+				matches = 1
+			}
+			return fmt.Errorf("package %s=%s/%s has %d matching signed entries", pkg.Name, pkg.Version, pkg.Architecture, matches)
+		}
 	}
 	return nil
 }
@@ -607,12 +879,34 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 		}
 	}
 	if basic {
+		// Public distro plans intentionally use the host's configured APT
+		// sources. APT remains responsible for its normal signature checks;
+		// LanPanel does not bind a mirror URI or repository snapshot.
+		if plan.Mode == DistroRepository {
+			return files, repositories, nil
+		}
 		if err := auditor.bindObservedRepositoryKeyrings(repositories, keyrings); err != nil {
 			return nil, nil, err
 		}
 	}
 	for index := range repositories {
 		repositories[index].KeyringDigest = digestBytes(keyrings[repositories[index].KeyringPath])
+	}
+	if basic && plan.Mode == DistroRepository && len(plan.Repositories) != 0 {
+		planRepositories := make([]ObservedRepository, 0, len(plan.Repositories))
+		for _, expected := range plan.Repositories {
+			keyring, found := keyrings[expected.KeyringPath]
+			if !found || len(keyring) == 0 {
+				return nil, nil, fmt.Errorf("package Plan repository %q keyring is not present on the host", expected.ID)
+			}
+			planRepositories = append(planRepositories, ObservedRepository{ID: expected.ID, URI: expected.URI, Suite: expected.Suite, Components: append([]string(nil), expected.Components...), KeyringPath: expected.KeyringPath, KeyringDigest: digestBytes(keyring), Enabled: true})
+		}
+		if err := auditor.observeRepositoryMetadata(ctx, planRepositories, keyrings, plan.Packages); err != nil {
+			return nil, nil, fmt.Errorf("package Plan repository package authority is invalid: %w", err)
+		}
+		if err := validateRepositoryObservations(planRepositories, plan.Repositories); err != nil {
+			return nil, nil, fmt.Errorf("package Plan repository metadata differs from the signed authority: %w", err)
+		}
 	}
 	var expectedPackages []Package
 	if !basic {
@@ -1010,6 +1304,112 @@ func parseDPKGStatusFields(value string) (string, string, string, error) {
 	return selection, errorState, packageState, nil
 }
 
+func (auditor *LinuxAuditor) distroCacheNeedsVerification(plan Plan) (bool, error) {
+	if auditor == nil || auditor.transactionRoot == "" {
+		return false, fmt.Errorf("distro package cache authority is unavailable")
+	}
+	cachePath := filepath.Join(auditor.transactionRoot, plan.TransactionID, "archives")
+	fd, err := openSafeDirectory(cachePath, auditor.strict)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Name() != "lock" && entry.Name() != "partial" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (auditor *LinuxAuditor) verifyDistroPackageArtifacts(plan Plan, repositories []ObservedRepository) error {
+	if plan.Mode != DistroRepository || len(plan.Repositories) == 0 {
+		return nil
+	}
+	if auditor == nil || auditor.transactionRoot == "" {
+		return fmt.Errorf("distro package artifact authority is unavailable")
+	}
+	cachePath := filepath.Join(auditor.transactionRoot, plan.TransactionID, "archives")
+	cacheFD, err := openSafeDirectory(cachePath, auditor.strict)
+	if err != nil {
+		return fmt.Errorf("open exact distro package cache: %w", err)
+	}
+	defer func() { _ = unix.Close(cacheFD) }()
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/self/fd/%d", cacheFD))
+	if err != nil {
+		return fmt.Errorf("read exact distro package cache: %w", err)
+	}
+	matched := map[string]bool{}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == "lock" || entry.Name() == "partial" {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".deb" {
+			return fmt.Errorf("distro package cache contains an unexpected member")
+		}
+		digest, bytes, err := auditor.hashFile(filepath.Join(cachePath, entry.Name()), 4<<30)
+		if err != nil {
+			return fmt.Errorf("read exact installed distro package artifact: %w", err)
+		}
+		pkg, ok := packageByDigest(plan.Packages, digest, bytes)
+		if !ok || matched[pkg.ArtifactDigest] {
+			return fmt.Errorf("installed distro package artifact is not in the frozen closure")
+		}
+		binding, err := repositoryPackageBinding(pkg, repositories)
+		if err != nil {
+			return err
+		}
+		if filepath.Base(binding.Filename) != entry.Name() {
+			return fmt.Errorf("installed distro package artifact filename differs from the signed Packages index")
+		}
+		matched[pkg.ArtifactDigest] = true
+	}
+	if len(matched) != len(plan.Packages) {
+		return fmt.Errorf("distro package cache omits a frozen package artifact")
+	}
+	return nil
+}
+
+func (auditor *LinuxAuditor) hashFile(path string, maximum int64) (string, int64, error) {
+	parent, err := openSafeDirectory(filepath.Dir(path), auditor.strict)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = unix.Close(parent) }()
+	fd, err := unix.Openat(parent, filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", 0, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return "", 0, fmt.Errorf("package artifact descriptor is invalid")
+	}
+	defer func() { _ = file.Close() }()
+	var before unix.Stat_t
+	owner, group := uint32(0), uint32(0)
+	if !auditor.strict {
+		owner, group = uint32(os.Geteuid()), uint32(os.Getegid())
+	}
+	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != owner || before.Gid != group || before.Mode&0o022 != 0 || before.Size <= 0 || before.Size > maximum {
+		return "", 0, fmt.Errorf("package artifact file identity is unsafe")
+	}
+	hasher := sha256.New()
+	read, err := io.CopyBuffer(hasher, io.LimitReader(file, maximum+1), make([]byte, 32<<10))
+	var after unix.Stat_t
+	if err != nil || read != before.Size || unix.Fstat(fd, &after) != nil || after.Dev != before.Dev || after.Ino != before.Ino || after.Size != before.Size || after.Mtim != before.Mtim {
+		return "", 0, fmt.Errorf("package artifact changed while reading")
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), read, nil
+}
+
 func (auditor *LinuxAuditor) runtimeSnapshot(plan Plan, installed []Package, systemPackages []InstalledPackage) (RuntimeSnapshot, error) {
 	entries, err := os.ReadDir(auditor.cgroupRoot)
 	if err != nil {
@@ -1071,15 +1471,6 @@ func (auditor *LinuxAuditor) noAutostartPolicy(expectedDigest string) (NoAutosta
 		return NoAutostartPolicy{}, fmt.Errorf("package no-autostart policy digest differs from Plan")
 	}
 	return NoAutostartPolicy{Path: "/usr/sbin/policy-rc.d", Digest: digest, UID: policyStat.Uid, GID: policyStat.Gid, Mode: policyStat.Mode & 0o777, Regular: policyStat.Mode&unix.S_IFMT == unix.S_IFREG, ParentsSafe: true, SameLanPanelBinary: bytes.Equal(policyDigest[:], binaryDigest[:])}, nil
-}
-
-func (auditor *LinuxAuditor) fileIdentity(path string) (FileIdentity, error) {
-	data, stat, err := auditor.readFileAndStat(path, 8<<20)
-	if err != nil {
-		return FileIdentity{}, err
-	}
-	digest := sha256.Sum256(data)
-	return FileIdentity{Path: path, UID: stat.Uid, GID: stat.Gid, Mode: stat.Mode & 0o777, Regular: stat.Mode&unix.S_IFMT == unix.S_IFREG, ParentsSafe: true, Digest: hex.EncodeToString(digest[:])}, nil
 }
 
 func (auditor *LinuxAuditor) readSafeFile(path string, maximum int64) ([]byte, error) {

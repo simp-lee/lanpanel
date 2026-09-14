@@ -2,8 +2,10 @@ package release
 
 import (
 	"fmt"
+	"lanpanel/internal/dependencies"
 	"lanpanel/internal/packages"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -12,6 +14,7 @@ import (
 // a Preview dependency identity, not a release audit report.
 type DependencyAuthority struct {
 	SchemaVersion        string                     `json:"schema_version"`
+	ProfileID            string                     `json:"profile_id"`
 	DependencyBaseline   AssetIdentity              `json:"dependency_baseline"`
 	Headscale            HeadscaleArtifactAuthority `json:"headscale"`
 	LegoVersion          string                     `json:"lego_version"`
@@ -70,10 +73,13 @@ func RehydrateInstallAuthority(value InstallIdentity) (*InstallAuthority, error)
 type PublicInstallObservation struct {
 	HostFingerprint string
 	ObservedAt      time.Time
+	OSID            string
+	OSVersionID     string
+	Architecture    string
 }
 
-func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseManifestBytes, checksumBytes []byte, assets map[string][]byte, observed PublicInstallObservation, detachedSignature []byte) (*InstallAuthority, error) {
-	verified, err := VerifySignedRelease(expectedReleaseManifestDigest, releaseManifestBytes, detachedSignature, checksumBytes, assets)
+func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseManifestBytes, signatureBytes, checksumBytes []byte, assets map[string][]byte, observed PublicInstallObservation) (*InstallAuthority, error) {
+	verified, err := VerifySignedRelease(expectedReleaseManifestDigest, releaseManifestBytes, signatureBytes, checksumBytes, assets)
 	if err != nil {
 		return nil, err
 	}
@@ -81,40 +87,60 @@ func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseM
 	if observed.HostFingerprint == "" || observed.ObservedAt.IsZero() {
 		return nil, fmt.Errorf("install host observation is missing")
 	}
-	profile := manifest.SupportedProfiles[0].Profile
+	selected, err := selectSupportedProfile(manifest, observed)
+	if err != nil {
+		return nil, err
+	}
+	profile := selected.Profile
+	if len(profile.Repositories) != 0 {
+		return nil, fmt.Errorf("public release profile must use the host's authenticated APT sources")
+	}
+	for _, pkg := range profile.Packages {
+		if pkg.RepositoryID != "" {
+			return nil, fmt.Errorf("public release profile contains fixed APT package authority")
+		}
+	}
 	profileDigest, err := ProfileDigest(profile)
 	if err != nil {
 		return nil, err
 	}
-	dependencyBytes, ok := assets[manifest.DependencyManifest.Path]
+	dependencyBytes, ok := assets[selected.DependencyManifest.Path]
 	if !ok {
 		return nil, fmt.Errorf("dependency manifest is missing")
 	}
-	dependencies, err := decodeDependencyAuthority(dependencyBytes, manifest.DependencyManifest.Digest)
+	dependencyAuthority, err := decodeDependencyAuthority(dependencyBytes, selected.DependencyManifest.Digest, profile.ID)
 	if err != nil {
 		return nil, err
 	}
-	for _, asset := range []AssetIdentity{dependencies.DependencyBaseline, dependencies.LegoArchive, dependencies.Lego, dependencies.Tailscale.Archive} {
+	if dependencyAuthority.DependencyBaseline != selected.DependencyBaseline {
+		return nil, fmt.Errorf("selected profile dependency baseline differs from its dependency manifest")
+	}
+	for _, asset := range []AssetIdentity{dependencyAuthority.DependencyBaseline, dependencyAuthority.LegoArchive, dependencyAuthority.Lego, dependencyAuthority.Tailscale.Archive} {
 		data, present := assets[asset.Path]
 		if !present || uint64(len(data)) != asset.Bytes || DigestBytes(data) != asset.Digest {
 			return nil, fmt.Errorf("dependency asset %q is missing or mismatched", asset.Path)
 		}
+		if asset == dependencyAuthority.DependencyBaseline {
+			if _, err := dependencies.DecodeBaseline(data); err != nil {
+				return nil, fmt.Errorf("dependency baseline is invalid: %w", err)
+			}
+		}
 	}
-	for _, member := range append(append([]ArchiveMemberAuthority(nil), dependencies.LegoMembers...), dependencies.Tailscale.Members...) {
+	for _, member := range append(append([]ArchiveMemberAuthority(nil), dependencyAuthority.LegoMembers...), dependencyAuthority.Tailscale.Members...) {
 		data, present := assets[member.Asset.Path]
 		if !present || uint64(len(data)) != member.Asset.Bytes || DigestBytes(data) != member.Asset.Digest {
 			return nil, fmt.Errorf("dependency member %q is missing or mismatched", member.Asset.Path)
 		}
 	}
-	if !reflect.DeepEqual(manifest.Headscale, dependencies.Headscale) {
+	if !reflect.DeepEqual(manifest.Headscale, dependencyAuthority.Headscale) {
 		return nil, fmt.Errorf("release and dependency Headscale authorities differ")
 	}
 	identity := InstallIdentity{
 		Kind: InstallPublicRelease, ReleaseTag: manifest.ReleaseTag, ReleaseManifestDigest: verified.digest,
 		Binary: manifest.Binary, Profile: profile, ProfileDigest: profileDigest, HostFingerprint: observed.HostFingerprint, AuthorityCreatedAt: observed.ObservedAt,
-		DependencyBaseline: dependencies.DependencyBaseline, DependencyManifestDigest: manifest.DependencyManifest.Digest,
-		Headscale: cloneHeadscaleAuthority(dependencies.Headscale), Lego: dependencies.Lego,
-		Tailscale: findClientExecutable(dependencies.Tailscale), TailscaleVersion: dependencies.Tailscale.Version,
+		DependencyBaseline: dependencyAuthority.DependencyBaseline, DependencyManifestDigest: selected.DependencyManifest.Digest,
+		Headscale: cloneHeadscaleAuthority(dependencyAuthority.Headscale), Lego: dependencyAuthority.Lego,
+		Tailscale: findClientExecutable(dependencyAuthority.Tailscale), TailscaleVersion: dependencyAuthority.Tailscale.Version,
 	}
 	if err := ValidateInstallIdentity(identity); err != nil {
 		return nil, err
@@ -122,7 +148,36 @@ func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseM
 	return &InstallAuthority{identity: identity}, nil
 }
 
-func decodeDependencyAuthority(data []byte, expectedDigest string) (DependencyAuthority, error) {
+func SelectSupportedProfile(manifestBytes []byte, osID, versionID, architecture string) (SupportedOSProfile, error) {
+	verified, err := DecodeReleaseManifest(manifestBytes)
+	if err != nil {
+		return SupportedOSProfile{}, err
+	}
+	return selectSupportedProfile(verified.value, PublicInstallObservation{OSID: osID, OSVersionID: versionID, Architecture: architecture})
+}
+
+func selectSupportedProfile(manifest ReleaseManifest, observed PublicInstallObservation) (SupportedOSProfile, error) {
+	if observed.OSID == "" || observed.OSVersionID == "" || observed.Architecture == "" {
+		return SupportedOSProfile{}, fmt.Errorf("install host platform observation is missing")
+	}
+	var selected SupportedOSProfile
+	for _, candidate := range manifest.SupportedProfiles {
+		profile := candidate.Profile
+		if profile.Family != observed.OSID || profile.Architecture != observed.Architecture {
+			continue
+		}
+		if selected.Profile.ID != "" {
+			return SupportedOSProfile{}, fmt.Errorf("release contains duplicate family profiles")
+		}
+		selected = candidate
+	}
+	if selected.Profile.ID == "" {
+		return SupportedOSProfile{}, fmt.Errorf("release does not support host family %s/%s", observed.OSID, observed.Architecture)
+	}
+	return selected, nil
+}
+
+func decodeDependencyAuthority(data []byte, expectedDigest, profileID string) (DependencyAuthority, error) {
 	if !ValidDigest(expectedDigest) || DigestBytes(data) != expectedDigest {
 		return DependencyAuthority{}, fmt.Errorf("dependency manifest digest changed")
 	}
@@ -130,14 +185,14 @@ func decodeDependencyAuthority(data []byte, expectedDigest string) (DependencyAu
 	if err := DecodeCanonical(data, &authority); err != nil {
 		return DependencyAuthority{}, err
 	}
-	if authority.SchemaVersion == "" || !concreteVersionPattern.MatchString(authority.LegoVersion) || !canonicalArtifactURL(authority.LegoArtifactIdentity) || validateAsset(authority.DependencyBaseline) != nil || authority.DependencyBaseline.Path != "dependency-baseline.json" || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.LegoArchive) != nil || authority.LegoArchive.Path != "lego.tar.gz" || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || len(authority.LegoMembers) != 1 || authority.LegoMembers[0].Path != "lego" || authority.LegoMembers[0].Destination != "/usr/lib/lanpanel/dependencies/lego" || authority.LegoMembers[0].Mode != 0o755 || authority.LegoMembers[0].Asset != authority.Lego || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil || authority.Tailscale.Archive.Path != "tailscale.tar.gz" {
+	if authority.SchemaVersion != "lanpanel.dependency-authority.v1" || authority.ProfileID != profileID || !concreteVersionPattern.MatchString(authority.LegoVersion) || !canonicalArtifactURL(authority.LegoArtifactIdentity) || validateAsset(authority.DependencyBaseline) != nil || !strings.HasPrefix(authority.DependencyBaseline.Path, "dependency-baseline-") || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.LegoArchive) != nil || authority.LegoArchive.Path != "lego.tar.gz" || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || len(authority.LegoMembers) != 1 || authority.LegoMembers[0].Path != "lego" || authority.LegoMembers[0].Destination != "/usr/lib/lanpanel/dependencies/lego" || authority.LegoMembers[0].Mode != 0o755 || authority.LegoMembers[0].Asset != authority.Lego || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil || authority.Tailscale.Archive.Path != "tailscale.tar.gz" {
 		return DependencyAuthority{}, fmt.Errorf("dependency manifest is invalid")
 	}
 	return authority, nil
 }
 
 func ValidateInstallIdentity(value InstallIdentity) error {
-	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" {
+	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !IsSupportedPreviewTarget(value.Profile) || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" {
 		return fmt.Errorf("installation release identity is invalid")
 	}
 	profileDigest, err := ProfileDigest(value.Profile)

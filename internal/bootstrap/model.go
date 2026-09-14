@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	JournalSchemaVersion             = "lanpanel.bootstrap.journal.v3"
+	JournalSchemaVersion             = "lanpanel.bootstrap.journal.v4"
 	BundleSchemaVersion              = "lanpanel.installation.bundle.v2"
 	CommitSchemaVersion              = "lanpanel.bootstrap.commit.v1"
 	MaximumJournalBytes              = 4 << 20

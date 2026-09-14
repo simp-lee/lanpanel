@@ -65,7 +65,7 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	writeFixture(t, root, "etc/apt/apt.conf", []byte("// no hooks\n"), 0o644)
 	writeFixture(t, root, "etc/apt/keyrings/lanpanel.gpg", keyring, 0o644)
 	writeFixture(t, root, "etc/apt/sources.list", []byte("deb [arch=amd64 signed-by=/etc/apt/keyrings/lanpanel.gpg] https://deb.example.test/debian stable main\n"), 0o644)
-	packageIndex := []byte("Package: base-files\nVersion: 1\nArchitecture: amd64\n")
+	packageIndex := []byte("Package: goaccess\nVersion: 1.9.3-1\nArchitecture: amd64\nFilename: pool/main/g/goaccess_1.9.3-1_amd64.deb\nSize: 1024\nSHA256: " + strings.Repeat("b", 64) + "\n\nPackage: nginx\nVersion: 1.22.1-9\nArchitecture: amd64\nFilename: pool/main/n/nginx_1.22.1-9_amd64.deb\nSize: 2048\nSHA256: " + strings.Repeat("c", 64) + "\n")
 	packageDigest := fmt.Sprintf("%x", sha256.Sum256(packageIndex))
 	signRelease := func(plaintext string) []byte {
 		t.Helper()
@@ -133,17 +133,8 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err == nil {
-		t.Fatal("host repository metadata was not compared with the Plan")
-	}
-	plan.Repositories[0].MetadataDigest = observedRepositories[0].MetadataDigest
-	plan.Repositories[0].CutoffDigest = observedRepositories[0].CutoffDigest
-	audit, err = auditor.AuditPackages(context.Background(), plan)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := ValidateAPTConfiguration(audit.Configuration, audit.Repositories, plan.Repositories); err != nil {
-		t.Fatal(err)
+		t.Fatalf("non-authoritative InRelease identity blocked a valid signed repository: %v", err)
 	}
 	if audit.Repositories[0].MetadataDigest != observedRepositories[0].MetadataDigest || audit.Repositories[0].CutoffDigest != observedRepositories[0].CutoffDigest {
 		t.Fatalf("audit did not return host-derived repository authority: %#v", audit.Repositories[0])

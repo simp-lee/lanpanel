@@ -14,8 +14,21 @@ import (
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
+
+func observePublicPlatform() (preflight.PlatformInfo, error) {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return preflight.PlatformInfo{}, fmt.Errorf("read host OS profile: %w", err)
+	}
+	platform := preflight.ParseOSRelease(string(data))
+	if platform.ID == "" || platform.VersionID == "" {
+		return preflight.PlatformInfo{}, fmt.Errorf("host OS profile is incomplete")
+	}
+	return platform, nil
+}
 
 func runPublicInstaller(args []string, stdout io.Writer) error {
 	if len(args) != 0 {
@@ -79,9 +92,9 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err := validateArtifactDirectory(bundleDir, paths); err != nil {
 		return nil, identity.Material{}, err
 	}
-	assetPaths := make(map[string]string, len(paths)-2)
+	assetPaths := make(map[string]string, len(paths)-3)
 	for _, path := range paths {
-		if path == "release.json" || path == "SHA256SUMS" {
+		if path == "release.json" || path == "SHA256SUMS" || path == release.ReleaseSignaturePath {
 			continue
 		}
 		assetPaths[path] = filepath.Join(bundleDir, filepath.FromSlash(path))
@@ -90,11 +103,7 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
-	checksums, err := readInstallerAssets(map[string]string{"SHA256SUMS": filepath.Join(bundleDir, "SHA256SUMS")})
-	if err != nil {
-		return nil, identity.Material{}, err
-	}
-	signature, err := readInstallerAssets(map[string]string{release.ReleaseSignaturePath: filepath.Join(bundleDir, release.ReleaseSignaturePath)})
+	checksums, err := readInstallerAssets(map[string]string{"SHA256SUMS": filepath.Join(bundleDir, "SHA256SUMS"), release.ReleaseSignaturePath: filepath.Join(bundleDir, release.ReleaseSignaturePath)})
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
@@ -102,12 +111,20 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
-	observedAt := time.Now().UTC().Truncate(time.Second)
-	authority, err := release.VerifyPublicInstallAuthority(release.DigestBytes(manifestBytes), manifestBytes, checksums["SHA256SUMS"], assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: observedAt}, signature[release.ReleaseSignaturePath])
+	platform, err := observePublicPlatform()
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
-	packageTemplateBytes, present := assets["package-template.json"]
+	observedAt := time.Now().UTC().Truncate(time.Second)
+	authority, err := release.VerifyPublicInstallAuthority(release.DigestBytes(manifestBytes), manifestBytes, checksums[release.ReleaseSignaturePath], checksums["SHA256SUMS"], assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: observedAt, OSID: platform.ID, OSVersionID: platform.VersionID, Architecture: runtime.GOARCH})
+	if err != nil {
+		return nil, identity.Material{}, err
+	}
+	selectedProfile, err := release.SelectSupportedProfile(manifestBytes, platform.ID, platform.VersionID, runtime.GOARCH)
+	if err != nil {
+		return nil, identity.Material{}, err
+	}
+	packageTemplateBytes, present := assets[selectedProfile.PackageTemplate.Path]
 	if !present {
 		return nil, identity.Material{}, fmt.Errorf("public release package template is missing")
 	}
@@ -131,7 +148,7 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 		material.Destroy()
 		return nil, identity.Material{}, err
 	}
-	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: signature[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
+	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
 	data, err := json.Marshal(input)
 	if err != nil || len(data) == 0 || len(data) > maximumPublicInstallerInputBytes {
 		material.Destroy()

@@ -3,10 +3,6 @@
 package basic
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"os"
 	"path/filepath"
@@ -15,18 +11,6 @@ import (
 
 	"golang.org/x/sys/unix"
 )
-
-type fakeRunner struct {
-	input []byte
-	inv   child.Invocation
-}
-
-func (f *fakeRunner) RunInvocation(_ context.Context, _ child.ProfileID, inv child.Invocation, input []byte) (child.Result, error) {
-	f.input = append([]byte(nil), input...)
-	f.inv = inv
-	empty := sha256.Sum256(nil)
-	return child.Result{ExitCode: 0, Stdout: []byte("admin:$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234\n"), StderrDigest: "sha256:" + hex.EncodeToString(empty[:])}, nil
-}
 
 func TestManagedBasicFreshRootCreatesPrivateFileTransactionDirectory(t *testing.T) {
 	root := t.TempDir()
@@ -82,16 +66,12 @@ func TestManagedBasicExistingDirectoryDriftFailsClosed(t *testing.T) {
 	}
 }
 
-func TestGenerateKeepsPasswordOffInvocation(t *testing.T) {
-	runner := &fakeRunner{}
-	generated, err := Generate(context.Background(), runner, "admin")
+func TestGenerateUsesFixedCostBcrypt(t *testing.T) {
+	generated, err := Generate("admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(generated.Password) != 43 || string(runner.input) != string(generated.Password)+"\n" || runner.inv.HTPasswd == nil || runner.inv.HTPasswd.Username != "admin" {
+	if len(generated.Password) != 43 || !strings.HasPrefix(string(generated.Record), "admin:$2y$12$") || strings.Contains(string(generated.Record), string(generated.Password)) {
 		t.Fatalf("generation contract failed")
-	}
-	if strings.Contains(strings.Join([]string{runner.inv.HTPasswd.Username}, " "), string(generated.Password)) {
-		t.Fatal("password entered invocation")
 	}
 }

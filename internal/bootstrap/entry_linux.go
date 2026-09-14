@@ -15,13 +15,14 @@ import (
 	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 const (
-	installerInputSchema       = "lanpanel.installer.input.v2"
+	installerInputSchema       = "lanpanel.installer.input.v4"
 	maximumInstallerInputBytes = 32 << 20
 )
 
@@ -88,12 +89,16 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if err != nil {
 		return err
 	}
+	platform, err := observePublicPlatform()
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC().Truncate(time.Second)
 	var authority *release.InstallAuthority
 	if input.Kind != release.InstallPublicRelease {
 		return fmt.Errorf("installer release kind is invalid")
 	}
-	authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now}, input.ReleaseSignature)
+	authority, err = release.VerifyPublicInstallAuthority(input.ExpectedReleaseManifestDigest, input.ReleaseManifest, input.ReleaseSignature, input.Checksums, assets, release.PublicInstallObservation{HostFingerprint: actualHost, ObservedAt: now, OSID: platform.ID, OSVersionID: platform.VersionID, Architecture: runtime.GOARCH})
 	if err == nil {
 		current, currentErr := readCurrentExecutable(authority.Identity().Binary.Bytes)
 		if currentErr != nil || uint64(len(current)) != authority.Identity().Binary.Bytes || release.DigestBytes(current) != authority.Identity().Binary.Digest {

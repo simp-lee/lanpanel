@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	SchemaVersion = "lanpanel.preflight.v1"
+	SchemaVersion = "lanpanel.preflight.v2"
 	MaximumAge    = time.Minute
 )
 
@@ -70,8 +70,12 @@ type ExpectedProfile struct {
 	VersionID             string                    `json:"version_id"`
 	Architecture          string                    `json:"architecture"`
 	SystemdVersion        string                    `json:"systemd_version"`
+	SystemdVersionMinimum string                    `json:"systemd_version_minimum,omitempty"`
+	SystemdVersionMaximum string                    `json:"systemd_version_maximum,omitempty"`
 	NginxVersion          string                    `json:"nginx_version"`
-	PackageSnapshotDigest string                    `json:"package_snapshot_digest"`
+	NginxVersionMinimum   string                    `json:"nginx_version_minimum,omitempty"`
+	NginxVersionMaximum   string                    `json:"nginx_version_maximum,omitempty"`
+	PackageSnapshotDigest string                    `json:"package_snapshot_digest,omitempty"`
 	ManagedConfinement    ManagedConfinementProfile `json:"managed_confinement"`
 	Authority             ProfileAuthority          `json:"authority"`
 }
@@ -273,10 +277,9 @@ type ContractionObservations struct {
 }
 
 var (
-	digestPattern  = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{64}$`)
-	refPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
-	versionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
-	domainPattern  = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	digestPattern = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{64}$`)
+	refPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	domainPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
 )
 
 func ExpansionRequestDigest(request ExpansionRequest) (string, error) {

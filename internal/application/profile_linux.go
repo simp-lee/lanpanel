@@ -5,6 +5,7 @@ package application
 import (
 	"context"
 	"fmt"
+	"lanpanel/internal/debianversion"
 	"lanpanel/internal/preflight"
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/release"
@@ -18,8 +19,12 @@ func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfi
 		VersionID:             profile.Release,
 		Architecture:          profile.Architecture,
 		SystemdVersion:        profile.SystemdVersion,
+		SystemdVersionMinimum: profile.SystemdVersionMinimum,
+		SystemdVersionMaximum: profile.SystemdVersionMaximum,
 		NginxVersion:          profile.NginxVersion,
-		PackageSnapshotDigest: "sha256:" + profile.PackageSnapshotDigest,
+		NginxVersionMinimum:   profile.NginxVersionMinimum,
+		NginxVersionMaximum:   profile.NginxVersionMaximum,
+		PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest),
 		ManagedConfinement: preflight.ManagedConfinementProfile{
 			SchemaVersion:         confinement.SchemaVersion,
 			KernelRelease:         confinement.KernelRelease,
@@ -33,6 +38,13 @@ func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfi
 	}
 }
 
+func prefixedProfileDigest(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "sha256:" + value
+}
+
 func verifyInstalledPackageProfile(ctx context.Context, profile release.OSProfile) error {
 	expected := expectedInstalledProfile(profile)
 	observed, err := preflight.ObserveInstalledProfile(ctx)
@@ -41,6 +53,24 @@ func verifyInstalledPackageProfile(ctx context.Context, profile release.OSProfil
 	}
 	if err := preflight.VerifyInstalledProfile(expected, observed); err != nil {
 		return err
+	}
+	packageNames := make([]string, 0, len(profile.Packages))
+	for _, packageProfile := range profile.Packages {
+		packageNames = append(packageNames, packageProfile.Name)
+	}
+	installedPackages, err := preflight.ObserveInstalledPackageTuples(ctx, packageNames)
+	if err != nil {
+		return fmt.Errorf("observe installed package versions: %w", err)
+	}
+	for index, installedPackage := range installedPackages {
+		packageProfile := profile.Packages[index]
+		inRange := debianversion.Satisfies(installedPackage.Version, packageProfile.VersionMinimum, packageProfile.VersionMaximum)
+		if packageProfile.VersionMinimum == "" && packageProfile.VersionMaximum == "" {
+			inRange = installedPackage.Version == packageProfile.Version
+		}
+		if installedPackage.Name != packageProfile.Name || installedPackage.Architecture != packageProfile.Architecture || !inRange {
+			return &preflight.ProfileDriftError{Component: "package/" + packageProfile.Name, Expected: packageProfile.Version, Observed: installedPackage.Version}
+		}
 	}
 	confinement, err := managedprocess.LoadConfinementProfile()
 	if err != nil {
