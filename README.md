@@ -1,26 +1,59 @@
-# LanPanel Community Edition
+# LanPanel
 
-LanPanel is an MIT-licensed, self-hosted Linux host manager for individuals and mutually trusted small teams. One Linux amd64 executable provides fixed installer, Management UI, helper, guard, timer, relay, and data-plane roles.
+[English](https://github.com/simp-lee/lanpanel/blob/main/README.md) | [简体中文](https://github.com/simp-lee/lanpanel/blob/main/README.zh-CN.md)
 
-## Management boundary
+LanPanel is a self-hosted Linux host manager for individuals and mutually trusted small teams. It uses a browser to manage application processes, network ingress, and an optional trusted network. It does not upload, build, or modify your application code.
 
-The loopback-only Management UI is the only supported day-to-day management interface. LanPanel has no management CLI, JSON CLI, YAML workflow, shell, terminal, or file manager. To administer remotely, use an SSH tunnel to the installation-specific exact `127/8` IPv4 address and high port shown by the installer; do not substitute `localhost`.
+> **Current status: Preview.** This release is intended for evaluation and testing. It is not a claim of production readiness, high availability, or complete qualification.
 
-Installation creates a CSPRNG admin token. An attached TTY may display it once. Non-TTY installation reports only its root-protected source path. Login creates short-lived selector/proof sessions with CSRF and exact Origin/Host checks. Token rotation invalidates existing sessions. Secrets are never placed in URLs, argv, units, plans, jobs, audit, diagnostics, subsequent WebSocket events or business messages, or release assets. The short-lived session proof is returned by login and used in authenticated HTTP headers; within WebSocket traffic, it is sent only in the authentication first frame and never in later event or business messages.
+## Is LanPanel right for you?
 
-The UI process is non-root. Root mutations cross a peer-authenticated, typed Unix-socket helper boundary. Closing or restarting the UI does not stop committed Headscale, managed processes, GoAccess, certificate timers, or application ingress.
+| Your goal | Fit |
+| --- | --- |
+| Manage applications and network ingress on one Linux host through a browser | Yes |
+| Use official Tailscale clients to join a private trusted network | Yes; LanPanel can manage the optional Headscale control plane. LanPanel itself is not a VPN client |
+| Configure Headscale, Nginx, certificates, and service lifecycle on one host | Yes; this is the main trusted-network use case |
+| Publish a same-host HTTP/WebSocket application over HTTPS | Yes, with `local_http` |
+| Publish an HTTP/WebSocket service on a fixed trusted-network node | Yes, with `tailnet_http` and a verified Tailscale connector |
+| Publish only a local application without creating a Headscale network | Yes; use `local_http` without Headscale or Tailscale |
+| Get a server terminal, file manager, general-purpose management CLI, or a generic VPN client | No; day-to-day management uses the Management UI |
+| Build multi-host HA, container/Kubernetes hosting, database hosting, OIDC/RBAC, or public TCP/UDP forwarding | No; these are outside the current scope |
 
-## Platform and installation
+## Quick start
 
-The Preview release targets Debian or Ubuntu Linux amd64 with systemd and apt/dpkg. The release profile selects the distribution family and package ranges; it does not treat a specific distribution release as the compatibility proof. Unknown future Debian or Ubuntu releases may proceed when all capability and functional checks pass. LanPanel is Preview-only: installation performs basic host checks, signed repository validation, package version-range checks, and transaction cleanup. It is not a hardened GA or live-qualified release.
+### 1. Prepare the host
 
-Only clean installation is supported. From an extracted official release artifact, run the sole public Preview path:
+The current release supports Debian or Ubuntu Linux on amd64 (x86_64) with:
 
-```text
+- `systemd`, cgroup v2, and `apt/dpkg`;
+- root or usable `sudo` access;
+- an APT mirror with signature verification enabled and a healthy package state;
+- enough disk space and available ports.
+
+Before changing the host, the installer checks the operating system, packages, ports, filesystem, and Nginx configuration. Other distributions, ARM64, and hosts that fail these checks are unsupported. An unknown future Debian/Ubuntu release proceeds only when every check passes.
+
+Installation does not require ACME or DNS operations in advance. You only need a domain, DNS, and the relevant 80/443 network access when you later publish a domain-based HTTPS application.
+
+Choose the additional preparation for the feature you plan to use:
+
+| Scenario | Additional preparation |
+| --- | --- |
+| Management UI or local app without domain publication | No Headscale or public DNS is required for the initial installation |
+| Domain-based HTTPS application | A public domain resolving to the ingress and reachable 80/443; configure the ACME contact later in the UI |
+| Headscale trusted network | A public control domain, reachable 80/443, and `3478/udp` for STUN; clients join with the official Tailscale client |
+| Tailnet application | A verified local Tailscale connector and a fixed HTTP/WebSocket upstream on the trusted network |
+
+### 2. Install
+
+Download the Preview package for the host from [GitHub Releases](https://github.com/simp-lee/lanpanel/releases), extract it, and run this command from the package directory:
+
+```sh
 sudo ./lanpanel install
 ```
 
-The artifact directory is discovered from the running binary. Its canonical manifest, trusted detached Ed25519 signature, complete checksum inventory, fixed dependency assets, package template, source archive, LICENSE, and Known Limitations are verified before host mutation. The artifact's internal files are release implementation details; users do not provide a bundle path, digest, package Plan, dependency path, or ACME contact. To install without manually handling the bundle, copy the version-pinned command published with the release:
+This is the only public installation entry point. Do not provide a bundle path, digest, package plan, dependency path, or ACME contact. The installer discovers the release materials and verifies the manifest, signature, complete checksums, fixed third-party dependencies, and host conditions before mutation; verification failure stops the installation.
+
+You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with an actual Preview tag; do not use `latest`:
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
@@ -28,73 +61,198 @@ curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-b
 sudo /tmp/lanpanel-bootstrap.sh install
 ```
 
-The published `lanpanel-bootstrap.sh` downloads the fixed artifact, verifies its embedded digest in a protected temporary directory, removes temporary files on exit, and invokes this same command. It is generated from `scripts/generate-preview-bootstrap.sh`; the release page provides the actual version-pinned GitHub Release URL. It never pipe-to-shell or uses an online fallback.
+Bootstrap verifies the release archive's SHA-256 in a protected temporary directory and then invokes the same `install` flow. It does not pipe downloaded content to a shell and has no third-party download fallback. System packages still come from the host's own APT mirror with signature verification enabled; do not disable repository signature checks or use `--allow-unauthenticated`.
 
-The installer constructs the host-bound package Plan and fresh bootstrap preflight from the checksum-bound release assets before any mutation. Before service bootstrap, it verifies the canonical `release.json`, `SHA256SUMS`, binary and source-tree digests, dependency manifest, signed repository/key metadata, package ranges and actual installed versions, host architecture, systemd PID 1, cgroup v2, apt/dpkg health, clock, disk, paths, listeners, and generated Nginx configuration. Package installation is noninteractive, masks possible autostart units, and rejects ambient hooks and proxies.
+### 3. Open the Management UI
 
-System packages use the host's authenticated APT configuration and profile-specific version-range requirements; LanPanel does not restrict the user's Debian/Ubuntu mirror. Lego, Tailscale, and Headscale are delivered as release-authority-bound assets; no third-party installer script, offline source, or download fallback is used.
+The installer prints an installation-specific `127/8` address and high port, and creates an administrator token. With a TTY, the token is shown once; without a TTY, only the path to a root-protected token file is shown. Save it as instructed.
 
-## Headscale and connector
+The Management UI listens only on the local loopback interface and is not directly exposed to the public internet. For remote administration, use an SSH tunnel to the **exact address and port** printed by the installer; do not replace it with `localhost`:
 
-Headscale is optional. App-only local publication works without any Headscale evidence. When enabled, LanPanel manages one trusted-mesh Headscale trust domain with SQLite, MagicDNS, embedded DERP/STUN, a private admin endpoint, and an independent exact-host HTTPS control ingress.
+```sh
+ssh -N -L 8080:<address shown by the installer>:<port shown by the installer> <user>@<host>
+```
 
-Headscale lifecycle is intentionally small:
+Then open `http://127.0.0.1:8080` in a browser on your computer. There is no CLI, terminal, shell, or file manager for day-to-day application management. The UI runs as a non-root process; privileged operations cross a protected typed helper boundary.
 
-- users: create and list only;
-- pre-auth keys: create, list, and revoke only; new keys are one-use, untagged, default one hour, maximum 24 hours, and displayed once;
-- devices: list and expire only;
-- the Headscale control certificate can be reissued through `headscale_certificate_reissue` when renewal is due within the 30-day window or after expiry contraction. Reissue requires a fresh 10-minute Plan and explicit `reissue` confirmation, and preserves the control identity. After expiry contraction, recovery accepts only the matching persisted local control/certificate authority and reactivates control ingress after validated atomic activation; failures leave it closed/fenced, and foreign or ambiguous state is not adopted.
+## Daily use
 
-Key revoke does not expire a registered device. Device expire does not guarantee termination of an existing TCP or UDP flow.
+- **Applications:** `local_http` manages a confined non-root HTTP/WebSocket process on this host; `tailnet_http` reaches a fixed remote node over a verified Tailscale route. LanPanel does not upload, build, install, or edit application code.
+- **Ingress:** `domain_https` provides HTTPS on ports 80/443; test-only `temporary_ip_http` uses public plaintext HTTP on a high port and does not expire automatically.
+- **Access control:** supports anonymous (`public`), application-managed (`application_managed`), and Basic (`basic`) access. Basic can use a one-time managed password or an external `htpasswd` file, with an optional CIDR restriction.
+- **Static content and logs:** supports external static directories and optional GoAccess. GoAccess uses its own access credentials and does not provide a raw-log browser.
+- **Trusted network:** Headscale is optional and manages at most one trusted network domain with MagicDNS and embedded DERP/STUN. It can manage users, one-time pre-authentication keys, and devices. Clients remain official Tailscale clients for Windows, macOS, and Debian/Ubuntu Linux; LanPanel manages at most one Tailscale connector.
 
-LanPanel manages one local Tailscale connector with a set-once HTTPS ControlURL. Verification checks the pinned client, running/logged-in state, exact ControlURL, local tailnet IPs, peers, and a kernel route through `tailscale0`. Assisted login accepts a one-time auth key from the current authenticated request, writes an owner-only job file, invokes only `--auth-key=file:<exact-path>`, and deletes the file at terminal/cancel/startup. There is no key inventory, external key adoption, discard, disconnect, automatic logout/reset/rejoin, rebind, or multi-connector action. A mismatch must be resolved outside LanPanel and verified again.
+`publish` is the only normal operation that opens or replaces application ingress. Saving configuration, starting a process, logging in to the connector, restarting, and background reconciliation do not publish implicitly. `unpublish` and `close-all` persistently close ingress; closing an ingress, expiring a device, or revoking a pre-authentication key does not guarantee immediate termination of already-established connections.
 
-## Applications and managed processes
+Domain HTTPS uses HTTP-01 or DNS-01 with Cloudflare, Route53, DigitalOcean, Google Cloud, or Tencent Cloud. For DNS-01, enter the exact provider code `cloudflare`, `route53`, `digitalocean`, `gcloud`, or `tencentcloud` in the Management UI. Set the ACME contact in the authenticated Management UI; it is checked again before the first certificate request and is not requested during installation or written to command-line arguments or logs.
 
-Each App has an immutable resource ID and either:
+## Runtime topology
 
-- `local_http`: a confined, per-resource non-root managed process reached through a protected Unix socket, release-owned relay, or PID1-owned socket activation; or
-- `tailnet_http`: one fixed non-local peer IP and port whose route is freshly proved to use Tailscale.
+LanPanel is the management layer, not a Tailscale client. The following diagrams show where traffic goes:
 
-LanPanel does not upload, build, install, or edit application code/runtime/config. Executable, arguments, working directory, environment-file reference, and write paths are typed. Shell parsing and opaque `ExecStart` are forbidden. A published local App must be explicitly unpublished before process stop. Unpublish does not guarantee termination of an existing flow.
+### Management UI
 
-## Publication
+```text
+Your browser
+    | SSH tunnel to the exact installer address and port
+    v
+Management UI (loopback only, non-root)
+    | protected typed helper
+    v
+LanPanel-managed services and state
+```
 
-`publish` is the only normal action that opens or replaces App ingress. Saving configuration, process start, connector login, Headscale deploy, restart, timer, and reconciliation never publish implicitly. Every resource starts sticky-unpublished.
+### Same-host application
 
-Supported publication modes are:
+```text
+Public user
+    | HTTP/HTTPS :80/:443
+    v
+Nginx (TLS, Host/SNI and access control)
+    | protected local target
+    v
+Non-root application process on this host
+```
 
-- `domain_https` on ports 80/443, exact TLS SNI and HTTP Host, TLS 1.2/1.3, HTTP/1.1, HTTP/2, and optional WebSocket;
-- test-only `temporary_ip_http` on one publicly routable IPv4 and high port, exact Host, public HTTP/1.1 only.
+The application port is not public. `domain_https` is the normal production-style path; `temporary_ip_http` is a test-only plaintext path on a high port.
 
-Temporary HTTP is public plaintext and does not expire automatically.
+### Tailnet application and Headscale
 
-Access modes are `public`, `application_managed`, and `basic`. Basic may use a one-time Managed Basic password or a verified external htpasswd and may add a CIDR allowlist. Static roots are external, root-owned, read-only, no-follow trees with explicit routes. Optional GoAccess uses an isolated identity, protected endpoint, independent external Basic credential, and no raw-log browser.
+```text
+Public user -- HTTP/HTTPS :80/:443 --> Nginx -- local app or Tailscale connector --> fixed peer
 
-Every ingress removes untrusted identity headers before rebuilding only `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` from the actual socket peer. The first release does not trust CDN identity headers.
+Tailscale clients -- HTTPS :443 --> Nginx --> Headscale control plane
+Tailscale clients -- HTTPS :443 --> Nginx --> embedded DERP (when direct peer paths fail)
+Tailscale clients -- UDP :3478 ---------------------------> Headscale STUN
+```
 
-The clean installer generates one installation-managed P-256 ACME account key atomically. Contact is configured or changed only in the authenticated Management UI and is validated again immediately before the first ACME request; it is never a command-line, log, or release-artifact input. ACME supports HTTP-01 and DNS-01 with exactly `cloudflare`, `route53`, `digitalocean`, `gcloud`, and `tencentcloud`. DNS credentials remain in protected files/profiles. Provider, CA, and source fallback are forbidden. Release notes distinguish real live-tested providers from deterministic fixture coverage.
+Headscale and the Tailscale connector are optional. Without them, a local application can still be published through Nginx. With them, clients use the official Tailscale client and the connector reaches only the verified fixed upstream.
 
-## Closing, recovery, deletion, and export
+## Join the trusted network (optional)
 
-`unpublish` durably closes one App; `close-all` durably closes all LanPanel-owned App ingress while normally preserving healthy Headscale control ingress. Sticky closure survives restart and reboot. Certificate expiry and uncertain activation contract ingress rather than retry remote work.
+This section applies only when Headscale is enabled. LanPanel is not a VPN client; clients use the official Tailscale client version `1.74.0` or newer.
 
-Closure verifies the owned disk graph, Nginx reload, prior-worker drain, and release-owned runtime rejection. If selective closure cannot be proved, LanPanel persists a stop fence and stops Nginx. Fail-closed Nginx stop may also interrupt Headscale control ingress.
+The platform differences are intentional: Windows uses the installed PowerShell executable, macOS can use the menu-bar app or its bundled CLI, and Debian/Ubuntu uses the `tailscaled` system service with privileged commands run through `sudo`.
 
-Startup reconciliation may only finalize an exact existing local journal or contract ingress. It never retries ACME/provider work, logs in a connector, adopts an orphan, starts an explicitly stopped process, or reopens App ingress. Unresolved orphan/unknown state remains closed. Supported next steps are diagnostics, secret-free configuration export, and clean-host rebuild—not repair.
+Before clients join, complete these two steps in the Management UI:
 
-Plan-bound resource deletion requires fresh unpublished closure and, for local Apps, a stopped cgroup/listener. It removes only exact LanPanel-managed inventory. External executable, working directory, static root, environment file, htpasswd, and log source are never deleted.
+1. Initialize the Headscale identity with a control domain and a MagicDNS namespace. These identities cannot be changed or removed after initialization.
+2. Deploy the Headscale control ingress. Choose HTTP-01 or DNS-01, enter the ACME directory URL and contact, accept the ACME terms, and provide the DNS provider profile and zone when DNS-01 is selected. Wait for this operation to complete successfully.
 
-## Explicit first-release limitations
+For each client:
 
-- No in-place upgrade, same-version reinstall, dependency maintenance, updater, rollback engine, or state/schema migration.
+1. Create a user and a one-time pre-authentication key in the Management UI. The key is shown only once; create a separate short-lived key for each device.
+2. Install the official Tailscale client for your platform.
+3. Replace `hs.example.com` and `<preauth-key>` in one of the platform examples below, then join the control domain with managed DNS enabled.
+
+#### Windows PowerShell
+
+Install Tailscale `1.74.0` or newer from <https://tailscale.com/download/windows>. On a recent Windows system, you can install it with WinGet. Run the custom login-server commands from an Administrator PowerShell:
+
+```powershell
+winget install --id Tailscale.Tailscale --exact
+```
+
+Then run:
+
+```powershell
+& "$env:ProgramFiles\Tailscale\tailscale.exe" version
+& "$env:ProgramFiles\Tailscale\tailscale.exe" up --login-server https://hs.example.com --auth-key "<preauth-key>" --accept-dns=true --hostname=laptop
+& "$env:ProgramFiles\Tailscale\tailscale.exe" status
+& "$env:ProgramFiles\Tailscale\tailscale.exe" ping peer-name.tailnet.example.com
+& "$env:ProgramFiles\Tailscale\tailscale.exe" netcheck
+```
+
+To leave the network or reconnect later:
+
+```powershell
+& "$env:ProgramFiles\Tailscale\tailscale.exe" down
+& "$env:ProgramFiles\Tailscale\tailscale.exe" up --login-server https://hs.example.com --accept-dns=true
+```
+
+#### macOS
+
+Install Tailscale `1.74.0` or newer from <https://tailscale.com/download/mac>. The standalone app is the usual choice and can add the `tailscale` command through **Settings → CLI integration**. For the Mac App Store app, the following block uses its bundled CLI directly:
+
+```sh
+TAILSCALE="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+"$TAILSCALE" version
+"$TAILSCALE" up --login-server https://hs.example.com --auth-key "<preauth-key>" --accept-dns=true --hostname=laptop
+"$TAILSCALE" set --hostname="laptop"
+"$TAILSCALE" status
+"$TAILSCALE" ping peer-name.tailnet.example.com
+"$TAILSCALE" netcheck
+```
+
+To leave the network or reconnect later (this block is standalone):
+
+```sh
+TAILSCALE="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+"$TAILSCALE" down
+"$TAILSCALE" up --login-server https://hs.example.com --accept-dns=true
+```
+
+You can also complete the same login from the Tailscale menu-bar application. If CLI integration is enabled for the standalone app, replace `"$TAILSCALE"` with `tailscale`.
+
+#### Debian/Ubuntu Linux
+
+Install Tailscale `1.74.0` or newer from the official Linux package source and check the `tailscaled` system service:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale version
+systemctl status tailscaled --no-pager --full
+sudo tailscale up --login-server https://hs.example.com --auth-key "<preauth-key>" --accept-dns=true --hostname=laptop
+sudo tailscale set --hostname="laptop"
+tailscale status
+tailscale ping peer-name.tailnet.example.com
+tailscale netcheck
+```
+
+To leave the network or reconnect later:
+
+```bash
+sudo tailscale down
+sudo tailscale up --login-server https://hs.example.com --accept-dns=true
+```
+
+4. Verify that the device appears in the Management UI, then use `tailscale status`, `tailscale ping <peer>`, and `tailscale netcheck` to verify connectivity.
+
+The Headscale control domain uses HTTPS through Nginx; embedded DERP uses the HTTPS path when direct peer connectivity is unavailable, and STUN uses `3478/udp`. Expiring a device or revoking a key does not guarantee that existing connections end immediately.
+
+For a `tailnet_http` application, configure the host connector in the Management UI after the control plane is ready: set its binding to the Headscale control URL, log in with a separate one-time pre-authentication key, and run connector verification. The connector must be verified before a fixed trusted-network upstream can be published.
+
+## Uninstall and data export
+
+After a committed installation, the only public uninstall entry point is:
+
+```sh
+sudo lanpanel uninstall
+```
+
+Before uninstalling, LanPanel shows the managed scope and requires the exact interactive confirmation `UNINSTALL LANPANEL`. It removes only files, services, accounts, and state that can be verified as LanPanel-owned. It does not remove APT/dpkg packages or external application executables, working directories, static directories, environment files, `htpasswd` files, or log sources.
+
+Use the secret-free configuration export when you need to take product configuration out of the host. It is not a product backup. A manual host copy or VM snapshot is not automatically a supported and recoverable backup.
+
+## Preview limitations
+
+- Clean installation only; no in-place upgrade, same-version reinstall, dependency maintenance, updater, rollback engine, or state/schema migration.
 - No supported product backup/restore, restore cutover, or cross-host migration. A manual host copy or VM snapshot is not automatically a supported recoverable backup.
-- No Repair, fix-host, orphan adoption, or normalization action.
-- No EdgeOne integration.
-- No ARM64 GA claim, public TCP/UDP publication, SSH/RDP/VNC, containers, Kubernetes, databases, application templates, remote API, OIDC, or RBAC.
+- No generic Repair, host repair, orphan adoption, or automatic normalization.
+- No EdgeOne integration in Preview.
+- No connector disconnect, logout, reset, rejoin, or rebind automation. Connector mismatches must be resolved outside LanPanel.
+- Without an independent remote authority, Tailnet HTTP/WebSocket is reported as not live tested.
+- Key revoke does not expire a registered device.
+- Unpublish, device expiry, and pre-authentication key revocation do not guarantee termination of existing flows.
+- Temporary public HTTP is plaintext and does not expire automatically.
+- Preview does not claim hardened GA, complete audit coverage, live qualification, or complete reproducible-release guarantees.
+- Fail-closed Nginx stop can interrupt Headscale control ingress.
 
-Host administrators may read their own configuration, SQLite, and data outside LanPanel. Configuration export is the supported product data-exit capability.
+## Developers
 
-## Release
+See the [developer guide](https://github.com/simp-lee/lanpanel/blob/main/docs/DEVELOPING.md) for development, testing, and Preview release workflows.
 
-A release includes one Linux amd64 binary, source tag/archive, LICENSE, family-specific dependency manifests and package templates, `SHA256SUMS`, and a canonical `release.json`. User installation details are in [docs/INSTALLING.md](docs/INSTALLING.md); developer and maintainer workflows are in [docs/DEVELOPING.md](docs/DEVELOPING.md) and [docs/RELEASING.md](docs/RELEASING.md). Preview does not publish SBOM/OSV or live-qualification evidence.
+## License
+
+LanPanel is released under the MIT License; see `LICENSE`.

@@ -93,6 +93,8 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	}
 	manifest := manifestValue.(release.ReleaseManifest)
 	manifest.ReleaseTag = tag
+	// The user-facing README is also the release limitation document.
+	manifest.KnownLimitations.Path = "README.md"
 	dependency := release.DependencyAuthority{SchemaVersion: "lanpanel.dependency-authority.v1"}
 	if dependencyPath != "" {
 		dependencyValue, err := readCanonical(dependencyPath, &release.DependencyAuthority{})
@@ -163,7 +165,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 			return fmt.Errorf("read package template: %w", err)
 		}
 		var packageTemplate packages.Plan
-		if err := release.DecodeCanonical(packageBytes, &packageTemplate); err != nil || releasePackageTemplateMatches(packageTemplate, profile.Profile) == false {
+		if err := release.DecodeCanonical(packageBytes, &packageTemplate); err != nil || !releasePackageTemplateMatches(packageTemplate, profile.Profile) {
 			return fmt.Errorf("package template does not match profile %s", profile.Profile.ID)
 		}
 		if err := copyRegular(baselineSource, filepath.Join(tmp, filepath.FromSlash(profile.DependencyBaseline.Path)), 0o644); err != nil {
