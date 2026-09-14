@@ -36,15 +36,17 @@ type IdentitySet struct {
 type (
 	Revalidator     func(context.Context, helperproto.Caller, helperproto.Request) error
 	ExecutionResult struct {
-		ResultDigest string
-		Secret       *helperproto.Secret
-		Action       *helperproto.ActionResult
-		Resource     *helperproto.ResourceResult
-		Headscale    *helperproto.HeadscaleResult
-		Connector    *helperproto.ConnectorResult
-		Read         *helperproto.ReadResult
-		ErrorCode    string
-		ErrorJobID   string
+		ResultDigest  string
+		Secret        *helperproto.Secret
+		Action        *helperproto.ActionResult
+		Resource      *helperproto.ResourceResult
+		Status        *helperproto.ResourceStatusResult
+		StatusCatalog *helperproto.ResourceStatusCatalog
+		Headscale     *helperproto.HeadscaleResult
+		Connector     *helperproto.ConnectorResult
+		Read          *helperproto.ReadResult
+		ErrorCode     string
+		ErrorJobID    string
 	}
 )
 
@@ -359,7 +361,7 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 		if result.ErrorCode != "" || result.ErrorJobID != "" {
 			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
 		}
-		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource, Headscale: result.Headscale, Connector: result.Connector, Read: result.Read}
+		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource, Status: result.Status, StatusCatalog: result.StatusCatalog, Headscale: result.Headscale, Connector: result.Connector, Read: result.Read}
 		return helperproto.WriteResponse(connection, request.Operation, response, result.Secret)
 	}
 }

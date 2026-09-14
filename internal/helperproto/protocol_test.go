@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"lanpanel/internal/domain"
 	"reflect"
 	"strings"
 	"testing"
@@ -181,40 +182,24 @@ func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	if err := ValidateRequest(request, now); err != nil {
 		t.Fatal(err)
 	}
-	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("status"), Resource: &ResourceResult{ResourceID: request.Action.TargetID, Status: "degraded", AccessMayRemain: true, ObservedAt: now, Reason: "external htpasswd changed", AllowedActions: []string{"unpublish", "close_all"}}}
+	status := domain.ResourceStatusResult{ResourceID: request.Action.TargetID, Name: "Local app", TargetKind: domain.AppTargetLocalHTTP, OverallStatus: domain.ResourceStatusClosed, ConfigurationStatus: domain.ConfigurationComplete, ProcessStatus: domain.ProcessRequestedStop, PublicationStatus: domain.PublicationStatusUnpublished, ConnectorStatus: domain.EvidenceNotApplicable, RouteStatus: domain.EvidenceNotApplicable, TargetStatus: domain.EvidenceUnknown, FailureCategory: domain.FailureNone, ClosureVerified: true, ClosureDigest: digest("closure"), ClosureObservedAt: now, AffectedObject: "resource/" + request.Action.TargetID, NextStep: "publish explicitly", ConfigDigest: digest("config"), ObservedAt: now, TargetObservation: &domain.TargetObservation{Validity: domain.EvidenceUnknown, ObservedAt: now, Failure: domain.FailureEvidenceMissing}}
+	status.AuthorityDigest = domain.ResourceStatusAuthorityDigest(status.ResourceID, status.ConfigDigest)
+	statusDigest, err := domain.ResourceStatusDigest(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: statusDigest, Status: (*ResourceStatusResult)(&status)}
 	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
 		t.Fatal(err)
 	}
-	response.Resource.Status = "healthy"
-	response.Resource.AllowedActions = nil
-	response.Resource.AccessMayRemain = false
-	response.Resource.CredentialID = "cred_00000000000000000000000000000001"
-	response.Resource.CredentialChanged = true
-	response.Resource.CredentialFingerprint = digest("changed")
-	response.Resource.GoAccessCredentialID = "cred_00000000000000000000000000000002"
-	response.Resource.GoAccessCredentialChanged = true
-	response.Resource.GoAccessCredentialFingerprint = digest("goaccess-changed")
-	response.Resource.Reason = "App and GoAccess external htpasswd fingerprints changed but remain valid"
-	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
-		t.Fatalf("valid changed external status rejected: %v", err)
-	}
-	response.Resource.Status = "source_verified_runtime_unknown"
-	response.Resource.Reason = "source identities exact; runtime health is not proved by source verification"
-	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
-		t.Fatalf("conservative runtime-unknown status rejected: %v", err)
-	}
-	response.Resource.Status = "healthy"
-	response.Resource.Reason = ""
+	response.Resource = &ResourceResult{ResourceID: request.Action.TargetID, Status: "healthy", ObservedAt: now, Reason: "legacy"}
 	if ValidateResponse(OperationDomainStatus, response) == nil {
-		t.Fatal("status without remediation reason accepted")
+		t.Fatal("legacy resource status response accepted")
 	}
-	response.Resource = &ResourceResult{ResourceID: request.Action.TargetID, Status: "degraded", AccessMayRemain: true, ObservedAt: now, Reason: "GoAccess retirement pending", AllowedActions: []string{"unpublish", "close_all"}, GoAccessRetirementJobID: "job-retirement", GoAccessRetirementGenerations: []uint64{2, 4}}
-	if err := ValidateResponse(OperationDomainStatus, response); err != nil {
-		t.Fatalf("pending GoAccess retirement status rejected: %v", err)
-	}
-	response.Resource.GoAccessRetirementGenerations = []uint64{4, 2}
+	response.Resource = nil
+	response.ResultDigest = digest("different")
 	if ValidateResponse(OperationDomainStatus, response) == nil {
-		t.Fatal("unsorted GoAccess retirement generations accepted")
+		t.Fatal("status response with a foreign digest accepted")
 	}
 }
 

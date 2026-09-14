@@ -46,6 +46,59 @@ type LocalSpec struct {
 	CredentialIDs       []string
 }
 
+func LocalSpecFromRequest(value domain.LocalResourceCreateRequest) LocalSpec {
+	return LocalSpec{Name: value.Name, EndpointKind: value.EndpointKind, TCPAddress: value.TCPAddress, TCPPort: value.TCPPort, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Service: domain.ManagedService{Executable: value.Executable, Arguments: append([]string(nil), value.Arguments...), WorkingDirectory: value.WorkingDirectory, EnvironmentFile: value.EnvironmentFile, WritePaths: append([]string(nil), value.WritePaths...)}, Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...)}
+}
+
+func TailnetSpecFromRequest(value domain.TailnetResourceCreateRequest) TailnetSpec {
+	return TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: value.Name, PeerIP: value.PeerIP, SourceIP: value.SourceIP, Port: value.Port, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...)}
+}
+
+// ApplyUpdate copies only mutable request fields onto the server-loaded
+// resource. It never accepts a client-supplied resource or process authority.
+func ApplyUpdate(prior domain.AppResource, value domain.ResourceUpdateRequest) (domain.AppResource, error) {
+	if err := domain.ValidateResourceUpdateRequest(value); err != nil {
+		return domain.AppResource{}, err
+	}
+	if value.TargetKind != prior.Target.Kind {
+		return domain.AppResource{}, fmt.Errorf("resource update target kind differs from authority")
+	}
+	candidate := prior
+	candidate.CredentialIDs = nil
+	switch value.TargetKind {
+	case domain.AppTargetLocalHTTP:
+		if prior.ManagedProcess == nil || value.Local == nil {
+			return domain.AppResource{}, fmt.Errorf("local resource process authority is missing")
+		}
+		local := value.Local
+		candidate.Name = local.Name
+		candidate.Target.ReadinessPath = local.ReadinessPath
+		candidate.Target.AllowedHTTPStatuses = append([]uint16(nil), local.AllowedHTTPStatuses...)
+		candidate.Target.WebSocket = local.WebSocket
+		candidate.Target.LocalHTTP = &domain.LocalHTTPTarget{EndpointKind: local.EndpointKind, TCPAddress: local.TCPAddress, TCPPort: local.TCPPort}
+		process := *prior.ManagedProcess
+		process.Service = domain.ManagedService{Executable: local.Executable, Arguments: append([]string(nil), local.Arguments...), WorkingDirectory: local.WorkingDirectory, EnvironmentFile: local.EnvironmentFile, WritePaths: append([]string(nil), local.WritePaths...)}
+		candidate.ManagedProcess = &process
+		candidate.Publication = local.Publication
+		candidate.CredentialIDs = append([]string(nil), local.CredentialIDs...)
+	case domain.AppTargetTailnetHTTP:
+		if value.Tailnet == nil {
+			return domain.AppResource{}, fmt.Errorf("tailnet update payload is missing")
+		}
+		tailnet := value.Tailnet
+		candidate.Name = tailnet.Name
+		candidate.Target.ReadinessPath = tailnet.ReadinessPath
+		candidate.Target.AllowedHTTPStatuses = append([]uint16(nil), tailnet.AllowedHTTPStatuses...)
+		candidate.Target.WebSocket = tailnet.WebSocket
+		candidate.Target.TailnetHTTP = &domain.TailnetHTTPTarget{IP: tailnet.PeerIP, SourceIP: tailnet.SourceIP, Port: tailnet.Port}
+		candidate.Publication = tailnet.Publication
+		candidate.CredentialIDs = append([]string(nil), tailnet.CredentialIDs...)
+	default:
+		return domain.AppResource{}, fmt.Errorf("resource update target kind is unsupported")
+	}
+	return candidate, nil
+}
+
 func NewLocal(spec LocalSpec, random io.Reader) (domain.AppResource, error) {
 	if spec.TargetKind != "" && spec.TargetKind != domain.AppTargetLocalHTTP {
 		return domain.AppResource{}, fmt.Errorf("local resource target kind is invalid")

@@ -1032,9 +1032,13 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err := resource.ValidateCreate(installation, candidate); err != nil {
 		return fail(err)
 	}
-	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
-		if err := verifyFreshTailnetTarget(ctx, candidate); err != nil {
-			return fail(fmt.Errorf("tailnet target requires fresh connector peer and route authority: %w", err))
+	if candidate.ManagedProcess != nil {
+		knownSecrets, inventoryErr := KnownSecretDigestsForResource(candidate)
+		if inventoryErr != nil {
+			return fail(fmt.Errorf("local service secret preflight failed: %w", inventoryErr))
+		}
+		if err := resource.ValidateServiceReferencesBeforeCommit(candidate.ManagedProcess.Service, knownSecrets); err != nil {
+			return fail(fmt.Errorf("local service preflight failed: %w", err))
 		}
 	}
 	if _, err := service.SafetyState(); err != nil {
@@ -1137,9 +1141,9 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return fail(err)
 	}
-	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
-		if err := verifyFreshTailnetTarget(ctx, candidate); err != nil {
-			return fail(fmt.Errorf("tailnet target requires fresh connector peer and route authority: %w", err))
+	if candidate.ManagedProcess != nil {
+		if err := resource.ValidateServiceReferencesBeforeCommit(candidate.ManagedProcess.Service, knownSecretDigests); err != nil {
+			return fail(fmt.Errorf("local service preflight failed: %w", err))
 		}
 	}
 	if prior.ManagedProcess != nil && prior.ManagedProcess.Applied != nil {

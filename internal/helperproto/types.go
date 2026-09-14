@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"lanpanel/internal/domain"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -118,12 +119,15 @@ type ActionPayload struct {
 	ExternalHTPasswdFile string `json:"external_htpasswd_path,omitempty"`
 }
 type ResourcePayload struct {
-	Operation       string          `json:"operation"`
-	ActorIdentity   string          `json:"actor_identity"`
-	ActorGeneration uint64          `json:"actor_generation"`
-	PlanID          string          `json:"plan_id,omitempty"`
-	Confirmation    string          `json:"confirmation,omitempty"`
-	Resource        json.RawMessage `json:"resource,omitempty"`
+	Operation       string                          `json:"operation"`
+	ActorIdentity   string                          `json:"actor_identity"`
+	ActorGeneration uint64                          `json:"actor_generation"`
+	PlanID          string                          `json:"plan_id,omitempty"`
+	Confirmation    string                          `json:"confirmation,omitempty"`
+	Resource        json.RawMessage                 `json:"resource,omitempty"`
+	Create          *domain.ResourceCreateRequest   `json:"create,omitempty"`
+	Update          *domain.ResourceUpdateRequest   `json:"update,omitempty"`
+	Publication     *domain.DomainPublicationUpdate `json:"publication,omitempty"`
 }
 
 type ActionResult struct {
@@ -226,6 +230,9 @@ type ReadResult struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
+type ResourceStatusResult = domain.ResourceStatusResult
+type ResourceStatusCatalog = domain.ResourceStatusCatalog
+
 type ResourceResult struct {
 	ResourceID                    string    `json:"resource_id"`
 	Status                        string    `json:"status,omitempty"`
@@ -246,17 +253,19 @@ type ResourceResult struct {
 	GoAccessRetirementGenerations []uint64  `json:"goaccess_retirement_generations,omitempty"`
 }
 type Response struct {
-	SchemaVersion string           `json:"schema_version"`
-	RequestID     string           `json:"request_id"`
-	Code          ResponseCode     `json:"code"`
-	ResultDigest  string           `json:"result_digest,omitempty"`
-	ErrorCode     string           `json:"error_code,omitempty"`
-	ErrorJobID    string           `json:"error_job_id,omitempty"`
-	Action        *ActionResult    `json:"action,omitempty"`
-	Resource      *ResourceResult  `json:"resource,omitempty"`
-	Headscale     *HeadscaleResult `json:"headscale,omitempty"`
-	Connector     *ConnectorResult `json:"connector,omitempty"`
-	Read          *ReadResult      `json:"read,omitempty"`
+	SchemaVersion string                 `json:"schema_version"`
+	RequestID     string                 `json:"request_id"`
+	Code          ResponseCode           `json:"code"`
+	ResultDigest  string                 `json:"result_digest,omitempty"`
+	ErrorCode     string                 `json:"error_code,omitempty"`
+	ErrorJobID    string                 `json:"error_job_id,omitempty"`
+	Action        *ActionResult          `json:"action,omitempty"`
+	Resource      *ResourceResult        `json:"resource,omitempty"`
+	Status        *ResourceStatusResult  `json:"status,omitempty"`
+	StatusCatalog *ResourceStatusCatalog `json:"status_catalog,omitempty"`
+	Headscale     *HeadscaleResult       `json:"headscale,omitempty"`
+	Connector     *ConnectorResult       `json:"connector,omitempty"`
+	Read          *ReadResult            `json:"read,omitempty"`
 }
 
 func PolicyFor(operation Operation) (Policy, bool) {
@@ -292,6 +301,9 @@ func ValidateRequest(request Request, now time.Time) error {
 	resourceOperation := request.Operation == OperationHeadscaleInitialize || request.Operation == OperationHeadscaleDeploy || request.Operation == OperationHeadscaleReissue || request.Operation == OperationHeadscaleRead || request.Operation == OperationHeadscaleMutation || request.Operation == OperationPreauthKeyPlan || request.Operation == OperationPreauthKeyCreate || request.Operation == OperationConnectorMutation || request.Operation == OperationConnectorRead || request.Operation == OperationConnectorLoginPlan || request.Operation == OperationConnectorLogin || request.Operation == OperationProductRead || request.Operation == OperationResourceDelete || request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
 	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
 		return fmt.Errorf("helper typed payload shape is invalid")
+	}
+	if request.Resource != nil && request.Operation != OperationResourceMutation && (request.Resource.Create != nil || request.Resource.Update != nil || request.Resource.Publication != nil) || request.Resource != nil && request.Operation == OperationResourceMutation && len(request.Resource.Resource) != 0 {
+		return fmt.Errorf("helper resource payload shape is invalid")
 	}
 	planAction := request.Operation == OperationApplicationPlan && (((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "") || ((request.Action.Operation == "publish" || request.Action.Operation == "unpublish" || request.Action.Operation == "resource_delete") && request.Action.TargetKind == "resource" && request.Action.TargetID != "") || ((request.Action.Operation == "managed_basic_delete" || request.Action.Operation == "managed_basic_rotate") && request.Action.TargetKind == "credential" && request.Action.TargetID != "")) && request.Action.PlanID == "" && request.Action.Confirmation == ""
 	rotationAction := request.Operation == OperationAdminTokenRotate && request.Action.Operation == "admin_token_rotate" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.PlanID != "" && request.Action.Confirmation == "rotate"
@@ -425,7 +437,19 @@ func validResourcePayload(operation Operation, value ResourcePayload) bool {
 	case OperationProductRead:
 		return (value.Operation == "status" || value.Operation == "diagnostics" || value.Operation == "configuration_export" || value.Operation == "job_list" || value.Operation == "job_detail") && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == ""
 	case OperationResourceMutation:
-		return (value.Operation == "resource_create" || value.Operation == "resource_update") && len(value.Resource) != 0
+		create := value.Operation == "resource_create" && value.Create != nil && value.Update == nil && value.Publication == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
+		update := value.Operation == "resource_update" && value.Update != nil && value.Create == nil && value.Publication == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
+		publication := value.Operation == "resource_update" && value.Publication != nil && value.Create == nil && value.Update == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
+		if create {
+			return domain.ValidateResourceCreateRequest(*value.Create) == nil
+		}
+		if update {
+			return domain.ValidateResourceUpdateRequest(*value.Update) == nil
+		}
+		if publication {
+			return domain.ValidateDomainPublicationUpdate(*value.Publication) == nil
+		}
+		return false
 	case OperationProcessLifecycle:
 		return (value.Operation == "process_start" || value.Operation == "process_stop") && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == ""
 	case OperationPublicationActivate:
@@ -602,7 +626,11 @@ func validConnectorResult(operation Operation, result *ConnectorResult) bool {
 }
 
 func validReadResult(result *ReadResult) bool {
-	return result != nil && (result.Operation == "status" || result.Operation == "diagnostics" || result.Operation == "configuration_export" || result.Operation == "job_list" || result.Operation == "job_detail") && len(result.Payload) > 0 && len(result.Payload) <= 12<<20 && json.Valid(result.Payload)
+	return result != nil && (result.Operation == "diagnostics" || result.Operation == "configuration_export" || result.Operation == "job_list" || result.Operation == "job_detail") && len(result.Payload) > 0 && len(result.Payload) <= 12<<20 && json.Valid(result.Payload)
+}
+
+func validResourceMutationResult(result ResourceResult) bool {
+	return strings.HasPrefix(result.ResourceID, "res_") && refPattern.MatchString(result.ResourceID) && result.Status == "" && !result.AccessMayRemain && result.CredentialID == "" && result.CredentialFingerprint == "" && !result.CredentialChanged && result.GoAccessCredentialID == "" && result.GoAccessCredentialFingerprint == "" && !result.GoAccessCredentialChanged && result.StaticFingerprint == "" && !result.StaticChanged && result.ObservedAt.IsZero() && result.Reason == "" && len(result.AllowedActions) == 0 && len(result.CredentialIDs) == 0 && result.GoAccessRetirementJobID == "" && len(result.GoAccessRetirementGenerations) == 0
 }
 
 func ValidateResponse(operation Operation, response Response) error {
@@ -632,6 +660,9 @@ func ValidateResponse(operation Operation, response Response) error {
 		if operation != OperationProductRead && response.Read != nil {
 			return fmt.Errorf("unrelated helper response carried product read data")
 		}
+		if operation != OperationDomainStatus && operation != OperationProductRead && response.Status != nil || operation != OperationProductRead && response.StatusCatalog != nil {
+			return fmt.Errorf("unrelated helper response carried resource status data")
+		}
 		switch operation {
 		case OperationApplicationPlan:
 			action := response.Action
@@ -660,7 +691,11 @@ func ValidateResponse(operation Operation, response Response) error {
 				return fmt.Errorf("external htpasswd response shape invalid")
 			}
 		case OperationDomainStatus:
-			if response.Resource == nil || !refPattern.MatchString(response.Resource.ResourceID) || !validDomainStatus(*response.Resource) || response.Action != nil {
+			statusDigest := ""
+			if response.Status != nil {
+				statusDigest, _ = domain.ResourceStatusDigest(*response.Status)
+			}
+			if response.Action != nil || response.Resource != nil || response.Status == nil || domain.ValidateResourceStatusResult(*response.Status) != nil || response.ResultDigest != statusDigest {
 				return fmt.Errorf("domain status response shape invalid")
 			}
 		case OperationContractionClose:
@@ -690,15 +725,24 @@ func ValidateResponse(operation Operation, response Response) error {
 				return fmt.Errorf("connector response shape invalid")
 			}
 		case OperationResourceDelete:
-			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Resource != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil {
+			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Resource != nil || response.Status != nil || response.StatusCatalog != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil {
 				return fmt.Errorf("resource delete response shape invalid")
 			}
 		case OperationProductRead:
-			if response.Action != nil || response.Resource != nil || response.Headscale != nil || response.Connector != nil || !validReadResult(response.Read) {
+			statusValid := true
+			if response.Status != nil {
+				statusDigest, _ := domain.ResourceStatusDigest(*response.Status)
+				statusValid = domain.ValidateResourceStatusResult(*response.Status) == nil && response.ResultDigest == statusDigest
+			}
+			if response.StatusCatalog != nil {
+				statusDigest, _ := domain.ResourceStatusCatalogDigest(*response.StatusCatalog)
+				statusValid = domain.ValidateResourceStatusCatalog(*response.StatusCatalog) == nil && response.ResultDigest == statusDigest
+			}
+			if response.Action != nil || response.Resource != nil || response.Headscale != nil || response.Connector != nil || !statusValid || response.Status != nil && response.StatusCatalog != nil || (response.Status != nil || response.StatusCatalog != nil) && response.Read != nil || response.Read == nil && response.Status == nil && response.StatusCatalog == nil || response.Read != nil && !validReadResult(response.Read) {
 				return fmt.Errorf("product read response shape invalid")
 			}
 		case OperationResourceMutation:
-			if response.Action != nil || response.Resource == nil || !strings.HasPrefix(response.Resource.ResourceID, "res_") || !refPattern.MatchString(response.Resource.ResourceID) {
+			if response.Action != nil || response.Status != nil || response.StatusCatalog != nil || response.Resource == nil || !validResourceMutationResult(*response.Resource) {
 				return fmt.Errorf("resource helper response shape invalid")
 			}
 		case OperationProcessLifecycle:
@@ -717,7 +761,7 @@ func ValidateResponse(operation Operation, response Response) error {
 	case ResponseRejected, ResponseFailed:
 		foreignCode := operation == OperationHeadscaleInitialize && response.ErrorCode == "foreign_database_evidence"
 		headscaleEvidence := foreignCode && strings.HasPrefix(response.ErrorJobID, "job_") && refPattern.MatchString(response.ErrorJobID)
-		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil || foreignCode != headscaleEvidence || response.ErrorJobID != "" && !headscaleEvidence {
+		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil || response.Status != nil || response.StatusCatalog != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil || foreignCode != headscaleEvidence || response.ErrorJobID != "" && !headscaleEvidence {
 			return fmt.Errorf("failed helper response is not redacted")
 		}
 	default:

@@ -10,17 +10,13 @@ import (
 	"slices"
 )
 
-const DomainPublicationUpdateSchema = "lanpanel.domain-publication.update.v1"
+const DomainPublicationUpdateSchema = domain.DomainPublicationUpdateSchema
 
-type DomainPublicationUpdate struct {
-	SchemaVersion string                        `json:"schema_version"`
-	ResourceID    string                        `json:"resource_id"`
-	Publication   domain.DomainHTTPSPublication `json:"publication"`
-}
+type DomainPublicationUpdate = domain.DomainPublicationUpdate
 
 func DomainPublicationCandidate(update DomainPublicationUpdate) (domain.AppResource, error) {
-	if update.SchemaVersion != DomainPublicationUpdateSchema || update.ResourceID == "" {
-		return domain.AppResource{}, fmt.Errorf("domain publication update invalid")
+	if err := domain.ValidateDomainPublicationUpdate(update); err != nil {
+		return domain.AppResource{}, err
 	}
 	service, err := OpenFixed()
 	if err != nil {

@@ -9,6 +9,62 @@ import (
 
 const MaxInstallationDocumentBytes = 16 << 20
 
+func DecodeResourceStatusResult(data []byte) (ResourceStatusResult, error) {
+	if len(data) == 0 {
+		return ResourceStatusResult{}, fmt.Errorf("resource status document is empty")
+	}
+	if err := rejectDuplicateJSONNames(data); err != nil {
+		return ResourceStatusResult{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var result ResourceStatusResult
+	if err := decoder.Decode(&result); err != nil {
+		return ResourceStatusResult{}, fmt.Errorf("decode resource status document: %w", err)
+	}
+	if token, err := decoder.Token(); err != io.EOF {
+		if err != nil {
+			return ResourceStatusResult{}, fmt.Errorf("decode resource status suffix: %w", err)
+		}
+		return ResourceStatusResult{}, fmt.Errorf("resource status contains another JSON value beginning with %v", token)
+	}
+	canonical, err := json.Marshal(result)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return ResourceStatusResult{}, fmt.Errorf("resource status document is not canonical")
+	}
+	if err := ValidateResourceStatusResult(result); err != nil {
+		return ResourceStatusResult{}, fmt.Errorf("validate resource status document: %w", err)
+	}
+	return result, nil
+}
+
+func DecodeResourceStatusCatalog(data []byte) (ResourceStatusCatalog, error) {
+	if len(data) == 0 {
+		return ResourceStatusCatalog{}, fmt.Errorf("resource status catalog is empty")
+	}
+	if err := rejectDuplicateJSONNames(data); err != nil {
+		return ResourceStatusCatalog{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var result ResourceStatusCatalog
+	if err := decoder.Decode(&result); err != nil {
+		return ResourceStatusCatalog{}, fmt.Errorf("decode resource status catalog: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return ResourceStatusCatalog{}, fmt.Errorf("resource status catalog contains trailing JSON")
+	}
+	canonical, err := json.Marshal(result)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return ResourceStatusCatalog{}, fmt.Errorf("resource status catalog is not canonical")
+	}
+	if err := ValidateResourceStatusCatalog(result); err != nil {
+		return ResourceStatusCatalog{}, err
+	}
+	return result, nil
+}
+
 func DecodeInstallation(data []byte) (Installation, error) {
 	if len(data) == 0 {
 		return Installation{}, fmt.Errorf("installation document is empty")

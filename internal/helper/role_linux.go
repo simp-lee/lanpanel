@@ -753,10 +753,25 @@ func RunRole(args []string) error {
 		switch request.Resource.Operation {
 		case string(domain.OperationStatus):
 			if strings.HasPrefix(request.Target, "resource/") {
-				value, err = application.ObserveDomainLiveSources(strings.TrimPrefix(request.Target, "resource/"))
-			} else {
-				value, err = application.ReadSystemStatus(ctx)
+				status, statusErr := application.ReadResourceStatus(ctx, strings.TrimPrefix(request.Target, "resource/"))
+				if statusErr != nil {
+					return ExecutionResult{}, statusErr
+				}
+				digest, digestErr := domain.ResourceStatusDigest(status)
+				if digestErr != nil {
+					return ExecutionResult{}, digestErr
+				}
+				return ExecutionResult{ResultDigest: digest, Status: (*helperproto.ResourceStatusResult)(&status)}, nil
 			}
+			catalog, catalogErr := application.ReadResourceStatusCatalog(ctx)
+			if catalogErr != nil {
+				return ExecutionResult{}, catalogErr
+			}
+			digest, digestErr := domain.ResourceStatusCatalogDigest(catalog)
+			if digestErr != nil {
+				return ExecutionResult{}, digestErr
+			}
+			return ExecutionResult{ResultDigest: digest, StatusCatalog: (*helperproto.ResourceStatusCatalog)(&catalog)}, nil
 		case string(domain.OperationDiagnostics):
 			value, err = application.ReadDiagnostics(ctx)
 		case string(domain.OperationConfigurationExport):
@@ -791,55 +806,53 @@ func RunRole(args []string) error {
 		var execution *application.ResourceExecution
 		switch request.Resource.Operation {
 		case "resource_create":
-			if request.Target != "installation" {
-				return ExecutionResult{}, fmt.Errorf("resource create target is invalid")
+			if request.Target != "installation" || request.Resource.Create == nil {
+				return ExecutionResult{}, fmt.Errorf("resource create target or payload is invalid")
 			}
-			var kind struct {
-				TargetKind domain.AppTargetKind `json:"target_kind"`
-			}
-			_ = json.Unmarshal(request.Resource.Resource, &kind)
-			if kind.TargetKind == domain.AppTargetTailnetHTTP {
-				var spec resource.TailnetSpec
-				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-				decoder.DisallowUnknownFields()
-				if err := decoder.Decode(&spec); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-					return ExecutionResult{}, fmt.Errorf("tailnet resource create payload is invalid")
-				}
-				candidate, err = resource.NewTailnet(spec, nil)
+			if request.Resource.Create.TargetKind == domain.AppTargetTailnetHTTP {
+				candidate, err = resource.NewTailnet(resource.TailnetSpecFromRequest(*request.Resource.Create.Tailnet), nil)
+			} else if request.Resource.Create.TargetKind == domain.AppTargetLocalHTTP {
+				candidate, err = resource.NewLocal(resource.LocalSpecFromRequest(*request.Resource.Create.Local), nil)
 			} else {
-				var spec resource.LocalSpec
-				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-				decoder.DisallowUnknownFields()
-				if err := decoder.Decode(&spec); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-					return ExecutionResult{}, fmt.Errorf("resource create payload is invalid")
-				}
-				candidate, err = resource.NewLocal(spec, nil)
+				return ExecutionResult{}, fmt.Errorf("resource create target kind is invalid")
 			}
 		case "resource_update":
-			var marker struct {
-				SchemaVersion string `json:"schema_version"`
-			}
-			_ = json.Unmarshal(request.Resource.Resource, &marker)
-			if marker.SchemaVersion == application.DomainPublicationUpdateSchema {
-				var update application.DomainPublicationUpdate
-				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-				decoder.DisallowUnknownFields()
-				if err := decoder.Decode(&update); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-					return ExecutionResult{}, fmt.Errorf("domain publication update payload invalid")
-				}
-				candidate, err = application.DomainPublicationCandidate(update)
-			} else {
-				decoder := json.NewDecoder(bytes.NewReader(request.Resource.Resource))
-				decoder.DisallowUnknownFields()
-				if err := decoder.Decode(&candidate); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-					return ExecutionResult{}, fmt.Errorf("resource update payload is invalid")
-				}
-			}
-			if err != nil {
-				return ExecutionResult{}, err
-			}
-			if request.Target != "resource/"+candidate.ID {
+			if !strings.HasPrefix(request.Target, "resource/") {
 				return ExecutionResult{}, fmt.Errorf("resource update target is invalid")
+			}
+			resourceID := strings.TrimPrefix(request.Target, "resource/")
+			if request.Resource.Publication != nil {
+				if request.Resource.Publication.ResourceID != resourceID {
+					return ExecutionResult{}, fmt.Errorf("domain publication target differs from helper target")
+				}
+				candidate, err = application.DomainPublicationCandidate(*request.Resource.Publication)
+			} else if request.Resource.Update != nil {
+				service, openErr := application.OpenFixed()
+				if openErr != nil {
+					return ExecutionResult{}, openErr
+				}
+				document, readErr := service.Normal().Read()
+				closeErr := service.Close()
+				if readErr != nil || closeErr != nil {
+					return ExecutionResult{}, errors.Join(readErr, closeErr)
+				}
+				installation, decodeErr := domain.DecodeInstallation(document.Entries["installations/current"])
+				if decodeErr != nil {
+					return ExecutionResult{}, decodeErr
+				}
+				found := false
+				for _, existing := range installation.Resources {
+					if existing.ID == resourceID {
+						candidate, err = resource.ApplyUpdate(existing, *request.Resource.Update)
+						found = true
+						break
+					}
+				}
+				if !found {
+					return ExecutionResult{}, fmt.Errorf("resource update target does not exist")
+				}
+			} else {
+				return ExecutionResult{}, fmt.Errorf("resource update payload is invalid")
 			}
 		default:
 			return ExecutionResult{}, fmt.Errorf("resource mutation operation is invalid")
@@ -1208,16 +1221,19 @@ func RunRole(args []string) error {
 			return fmt.Errorf("domain status caller unauthorized")
 		}
 		return nil
-	}, func(_ context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("domain status carried secret")
 		}
-		status, err := application.ObserveDomainLiveSources(request.Action.TargetID)
+		status, err := application.ReadResourceStatus(ctx, request.Action.TargetID)
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		raw, _ := json.Marshal(status)
-		return ExecutionResult{ResultDigest: digestString(string(raw)), Resource: &helperproto.ResourceResult{ResourceID: status.ResourceID, Status: status.Status, AccessMayRemain: status.AccessMayRemain, CredentialID: status.CredentialID, CredentialFingerprint: status.CredentialFingerprint, CredentialChanged: status.CredentialChanged, GoAccessCredentialID: status.GoAccessCredentialID, GoAccessCredentialFingerprint: status.GoAccessCredentialFingerprint, GoAccessCredentialChanged: status.GoAccessCredentialChanged, StaticFingerprint: status.StaticFingerprint, StaticChanged: status.StaticChanged, ObservedAt: status.ObservedAt, Reason: status.Reason, AllowedActions: append([]string(nil), status.AllowedActions...), CredentialIDs: append([]string(nil), status.CredentialIDs...), GoAccessRetirementJobID: status.GoAccessRetirementJobID, GoAccessRetirementGenerations: append([]uint64(nil), status.GoAccessRetirementGenerations...)}}, nil
+		digest, err := domain.ResourceStatusDigest(status)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		return ExecutionResult{ResultDigest: digest, Status: (*helperproto.ResourceStatusResult)(&status)}, nil
 	})
 	managedBasicDeleteHandler := ManagedBasicDeleteHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Action == nil {

@@ -977,12 +977,30 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		defer clear(data)
 		var payload any = application.ProcessMutationPayload{}
 		if resourceOperation {
-			if len(data) == 0 || !json.Valid(data) {
+			if len(data) == 0 {
 				reject(writer, http.StatusBadRequest)
 				return
 			}
-			body := append(json.RawMessage(nil), data...)
-			payload = application.ResourceMutationPayload{Resource: body}
+			if operation == domain.OperationResourceCreate {
+				var value domain.ResourceCreateRequest
+				if decodeExactJSON(data, &value) != nil || domain.ValidateResourceCreateRequest(value) != nil {
+					reject(writer, http.StatusBadRequest)
+					return
+				}
+				payload = application.ResourceMutationPayload{Create: &value}
+			} else {
+				var value domain.ResourceUpdateRequest
+				if decodeExactJSON(data, &value) == nil && domain.ValidateResourceUpdateRequest(value) == nil {
+					payload = application.ResourceMutationPayload{Update: &value}
+				} else {
+					var publication application.DomainPublicationUpdate
+					if decodeExactJSON(data, &publication) != nil || domain.ValidateDomainPublicationUpdate(publication) != nil {
+						reject(writer, http.StatusBadRequest)
+						return
+					}
+					payload = application.ResourceMutationPayload{Publication: &publication}
+				}
+			}
 		} else if len(bytes.TrimSpace(data)) != 0 {
 			reject(writer, http.StatusBadRequest)
 			return

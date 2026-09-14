@@ -210,6 +210,9 @@ func readFrame(reader io.Reader, expected frameKind, maximum int) ([]byte, error
 }
 
 func decodeCanonical(payload []byte, value any) error {
+	if err := rejectDuplicateNames(payload); err != nil {
+		return fmt.Errorf("%w: duplicate or non-canonical JSON field", ErrProtocol)
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
@@ -222,6 +225,72 @@ func decodeCanonical(payload []byte, value any) error {
 	canonical, err := json.Marshal(value)
 	if err != nil || !bytes.Equal(canonical, payload) {
 		return fmt.Errorf("%w: non-canonical JSON", ErrProtocol)
+	}
+	return nil
+}
+
+func rejectDuplicateNames(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := scanNames(decoder); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing JSON")
+	}
+	return nil
+}
+
+func scanNames(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, compound := token.(json.Delim)
+	if !compound {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := map[string]struct{}{}
+		for decoder.More() {
+			nameToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			name, ok := nameToken.(string)
+			if !ok || name == "" {
+				return fmt.Errorf("invalid JSON object name")
+			}
+			for _, character := range name {
+				if character != '_' && (character < 'a' || character > 'z') && (character < '0' || character > '9') {
+					return fmt.Errorf("non-canonical JSON object name")
+				}
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return fmt.Errorf("duplicate JSON object name")
+			}
+			seen[name] = struct{}{}
+			if err := scanNames(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim('}') {
+			return fmt.Errorf("malformed JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanNames(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim(']') {
+			return fmt.Errorf("malformed JSON array")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter")
 	}
 	return nil
 }

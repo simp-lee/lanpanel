@@ -1,0 +1,80 @@
+package domain
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestResourceCreateRequestIsClosedAndDoesNotCarryAuthority(t *testing.T) {
+	request := ResourceCreateRequest{TargetKind: AppTargetLocalHTTP, Local: &LocalResourceCreateRequest{
+		Name: "Local app", EndpointKind: LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200},
+		Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/srv/app/data"},
+		Publication: AppPublication{Kind: PublicationDomainHTTPS, DomainHTTPS: &DomainHTTPSPublication{CanonicalDomain: "app.example.test", AccessMode: AppAccessPublic}},
+	}}
+	if err := ValidateResourceCreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	mutated := request
+	mutated.Local = new(LocalResourceCreateRequest)
+	*mutated.Local = *request.Local
+	mutated.Local.EndpointKind = LocalEndpointUnixSocketActivation
+	mutated.Local.TCPPort = 8080
+	if err := ValidateResourceCreateRequest(mutated); err == nil {
+		t.Fatal("unix endpoint accepted TCP authority")
+	}
+	if err := ValidateResourceUpdateRequest(ResourceUpdateRequest{TargetKind: AppTargetLocalHTTP, Local: &LocalResourceUpdateRequest{Name: "Local app", EndpointKind: LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/srv/app/data"}, Publication: request.Local.Publication}}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("current_config_digest")) || bytes.Contains(encoded, []byte("managed_process")) {
+		t.Fatalf("request contains internal authority: %s", encoded)
+	}
+}
+
+func TestResourceStatusCanonicalDecodeRejectsUnknownDuplicateAndInvalidCombination(t *testing.T) {
+	observed := time.Now().UTC()
+	value := ResourceStatusResult{ResourceID: "res_00000000000000000000000000000001", Name: "Local app", TargetKind: AppTargetLocalHTTP, OverallStatus: ResourceStatusClosed, ConfigurationStatus: ConfigurationComplete, ProcessStatus: ProcessRequestedStop, PublicationStatus: PublicationStatusUnpublished, ConnectorStatus: EvidenceNotApplicable, RouteStatus: EvidenceNotApplicable, TargetStatus: EvidenceUnknown, FailureCategory: FailureNone, ClosureVerified: true, ClosureDigest: testDigest, ClosureObservedAt: observed, AffectedObject: "resource/res_00000000000000000000000000000001", NextStep: "publish explicitly", ConfigDigest: testDigest, ObservedAt: observed, TargetObservation: &TargetObservation{Validity: EvidenceUnknown, ObservedAt: observed, Failure: FailureEvidenceMissing}}
+	value.AuthorityDigest = ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest)
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeResourceStatusResult(data)
+	if err != nil || decoded.ResourceID != value.ResourceID {
+		t.Fatalf("canonical status decode=%#v,%v", decoded, err)
+	}
+	unknown := append(append([]byte(nil), data[:len(data)-1]...), []byte(`,"unknown":true}`)...)
+	if _, err := DecodeResourceStatusResult(unknown); err == nil {
+		t.Fatal("unknown status field accepted")
+	}
+	duplicate := append(append([]byte(nil), data[:len(data)-1]...), []byte(`,"overall_status":"closed"}`)...)
+	if _, err := DecodeResourceStatusResult(duplicate); err == nil {
+		t.Fatal("duplicate status field accepted")
+	}
+	invalid := value
+	invalid.OverallStatus = ResourceStatusUnreachable
+	if err := ValidateResourceStatusResult(invalid); err == nil {
+		t.Fatal("closed resource was relabeled unreachable")
+	}
+}
+
+func TestTailnetEvidenceStagesBindRouteAndRemainIndependent(t *testing.T) {
+	observed := time.Now().UTC()
+	connectorIdentity := TailnetConnectorIdentity("https://control.example.test", "1.0", testDigest, testDigest)
+	routeIdentity := TailnetRouteIdentity(connectorIdentity, "100.64.0.2", "100.64.0.1", 8080)
+	value := ResourceStatusResult{ResourceID: "res_00000000000000000000000000000002", Name: "Remote app", TargetKind: AppTargetTailnetHTTP, TargetPeerIP: "100.64.0.2", TargetSourceIP: "100.64.0.1", TargetPort: 8080, OverallStatus: ResourceStatusUnknown, ConfigurationStatus: ConfigurationComplete, ProcessStatus: ProcessNotApplicable, PublicationStatus: PublicationStatusUnpublished, ConnectorStatus: EvidenceFresh, RouteStatus: EvidenceFresh, TargetStatus: EvidenceFresh, FailureCategory: FailureNone, AffectedObject: "resource/res_00000000000000000000000000000002", NextStep: "publish explicitly", ConfigDigest: testDigest, ObservedAt: observed, ConnectorObservation: &ConnectorObservation{ControlURL: "https://control.example.test", ClientVersion: "1.0", ClientIdentityDigest: testDigest, LocalIdentityDigest: testDigest, Validity: ConnectorObservationFresh, ObservedAt: observed, ValidUntil: observed.Add(time.Minute)}, RouteEvidence: &RouteEvidence{PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: EvidenceFresh, ObservedAt: observed, ValidUntil: observed.Add(time.Minute), Failure: FailureNone}, TargetObservation: &TargetObservation{RouteIdentity: routeIdentity, PortConnected: true, HTTPReady: true, HTTPStatus: 200, Validity: EvidenceFresh, ObservedAt: observed, Failure: FailureNone}}
+	value.AuthorityDigest = ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest)
+	if err := ValidateResourceStatusResult(value); err != nil {
+		t.Fatal(err)
+	}
+	value.TargetObservation.RouteIdentity = "sha256:" + strings.Repeat("b", 64)
+	if err := ValidateResourceStatusResult(value); err == nil {
+		t.Fatal("target evidence was accepted for another route")
+	}
+}

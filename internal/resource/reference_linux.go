@@ -28,6 +28,59 @@ type ReferenceEvidence struct {
 	WritePathIdentities      []string
 }
 
+// ValidateServiceReferencesBeforeCommit validates external service inputs
+// before a resource is made durable. Numeric process ownership is not yet
+// available during creation, so ownership is checked again at lifecycle
+// admission by ValidateServiceReferences.
+func ValidateServiceReferencesBeforeCommit(service domain.ManagedService, knownSecretDigests map[string]struct{}) error {
+	if err := ValidateArguments(service.Arguments, knownSecretDigests); err != nil {
+		return err
+	}
+	executable, err := openExternal(service.Executable, false)
+	if err != nil {
+		return fmt.Errorf("service executable: %w", err)
+	}
+	var executableStat unix.Stat_t
+	executableErr := unix.Fstat(int(executable.Fd()), &executableStat)
+	var capability [1]byte
+	size, xerr := unix.Fgetxattr(int(executable.Fd()), "security.capability", capability[:])
+	_ = executable.Close()
+	if executableErr != nil || executableStat.Mode&unix.S_IFMT != unix.S_IFREG || executableStat.Uid != 0 || executableStat.Mode&0o022 != 0 || executableStat.Mode&0o6000 != 0 || executableStat.Mode&0o111 == 0 || executableStat.Nlink != 1 {
+		return fmt.Errorf("service executable type, owner, mode, links, or executable bit is unsafe")
+	}
+	if size > 0 && xerr == nil || xerr != nil && !errors.Is(xerr, unix.ENODATA) && !errors.Is(xerr, unix.EOPNOTSUPP) {
+		return fmt.Errorf("service executable has file capability or unverifiable xattrs")
+	}
+	working, err := openExternal(service.WorkingDirectory, true)
+	if err != nil {
+		return fmt.Errorf("service working directory: %w", err)
+	}
+	var workingStat unix.Stat_t
+	workingErr := unix.Fstat(int(working.Fd()), &workingStat)
+	_ = working.Close()
+	if workingErr != nil || workingStat.Mode&unix.S_IFMT != unix.S_IFDIR || workingStat.Uid != 0 || workingStat.Mode&0o022 != 0 {
+		return fmt.Errorf("service working directory is unsafe")
+	}
+	for _, path := range service.WritePaths {
+		file, openErr := openExternal(path, true)
+		if openErr != nil {
+			return fmt.Errorf("service write path: %w", openErr)
+		}
+		var stat unix.Stat_t
+		statErr := unix.Fstat(int(file.Fd()), &stat)
+		_ = file.Close()
+		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o002 != 0 || !pathBelow(service.WorkingDirectory, path) {
+			return fmt.Errorf("service write path type, owner, mode, or confinement is unsafe")
+		}
+	}
+	if service.EnvironmentFile != "" {
+		if _, err := validateEnvironmentFile(service.EnvironmentFile); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func ValidateServiceReferences(service domain.ManagedService, processUID uint32, knownSecretDigests map[string]struct{}) (ReferenceEvidence, error) {
 	if processUID == 0 {
 		return ReferenceEvidence{}, fmt.Errorf("managed process identity must be non-root")

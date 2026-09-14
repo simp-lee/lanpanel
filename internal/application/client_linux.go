@@ -25,19 +25,25 @@ type HelperRejection struct {
 func (value HelperRejection) Error() string { return "helper rejected request: " + value.Code }
 
 type HelperReply struct {
-	Digest    string
-	Action    *helperproto.ActionResult
-	Resource  *helperproto.ResourceResult
-	Headscale *helperproto.HeadscaleResult
-	Connector *helperproto.ConnectorResult
-	Read      *helperproto.ReadResult
-	Secret    []byte
+	Digest        string
+	Action        *helperproto.ActionResult
+	Resource      *helperproto.ResourceResult
+	Status        *helperproto.ResourceStatusResult
+	StatusCatalog *helperproto.ResourceStatusCatalog
+	Headscale     *helperproto.HeadscaleResult
+	Connector     *helperproto.ConnectorResult
+	Read          *helperproto.ReadResult
+	Secret        []byte
 }
 type (
-	HelperClient                func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error)
-	ResourceHelperClient        func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error)
-	SecretResourceHelperClient  func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string, []byte) (HelperReply, error)
-	ResourceMutationPayload     struct{ Resource any }
+	HelperClient               func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error)
+	ResourceHelperClient       func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error)
+	SecretResourceHelperClient func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string, []byte) (HelperReply, error)
+	ResourceMutationPayload    struct {
+		Create      *domain.ResourceCreateRequest
+		Update      *domain.ResourceUpdateRequest
+		Publication *domain.DomainPublicationUpdate
+	}
 	ProcessMutationPayload      struct{}
 	ConnectorLoginActionPayload struct {
 		PlanID       string `json:"plan_id,omitempty"`
@@ -157,21 +163,19 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	domainStatusAction, _ := RegisterAction(domain.OperationStatus, DomainStatusPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		if call.Target.Kind == domain.OperationTargetInstallation && resourceClient != nil {
 			reply, err := resourceClient(ctx, helperproto.OperationProductRead, helperproto.ResourcePayload{Operation: string(domain.OperationStatus), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "installation")
-			if err != nil || reply.Read == nil || len(reply.Secret) != 0 {
+			if err != nil || len(reply.Secret) != 0 {
 				return Result{}, fmt.Errorf("installation status failed")
 			}
-			var status SystemStatus
-			if err := decodeClientRead(reply.Read.Payload, &status); err != nil {
-				return Result{}, err
+			if reply.StatusCatalog == nil || reply.Read != nil {
+				return Result{}, fmt.Errorf("installation status failed")
 			}
-			return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
+			return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.StatusCatalog}, nil
 		}
 		reply, err := client(ctx, helperproto.OperationDomainStatus, helperproto.ActionPayload{Operation: "status", TargetKind: "resource", TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation})
-		if err != nil || reply.Resource == nil || reply.Resource.ResourceID != call.Target.ID || len(reply.Secret) != 0 {
+		if err != nil || len(reply.Secret) != 0 || reply.Status == nil || reply.Status.ResourceID != call.Target.ID {
 			return Result{}, fmt.Errorf("domain status failed")
 		}
-		status := DomainSourceStatus{ResourceID: reply.Resource.ResourceID, Status: reply.Resource.Status, AccessMayRemain: reply.Resource.AccessMayRemain, CredentialID: reply.Resource.CredentialID, CredentialFingerprint: reply.Resource.CredentialFingerprint, CredentialChanged: reply.Resource.CredentialChanged, GoAccessCredentialID: reply.Resource.GoAccessCredentialID, GoAccessCredentialFingerprint: reply.Resource.GoAccessCredentialFingerprint, GoAccessCredentialChanged: reply.Resource.GoAccessCredentialChanged, StaticFingerprint: reply.Resource.StaticFingerprint, StaticChanged: reply.Resource.StaticChanged, ObservedAt: reply.Resource.ObservedAt, Reason: reply.Resource.Reason, AllowedActions: append([]string(nil), reply.Resource.AllowedActions...), CredentialIDs: append([]string(nil), reply.Resource.CredentialIDs...), GoAccessRetirementJobID: reply.Resource.GoAccessRetirementJobID, GoAccessRetirementGenerations: append([]uint64(nil), reply.Resource.GoAccessRetirementGenerations...)}
-		return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
+		return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Status}, nil
 	})
 	basicCreate, _ := RegisterAction(domain.OperationManagedBasicCreate, ManagedBasicPayload{}, true, false, managedBasicAction)
 	basicRotate, _ := RegisterAction(domain.OperationManagedBasicRotate, ManagedBasicPayload{}, true, false, managedBasicAction)
@@ -416,15 +420,12 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		registrations = append(registrations, resourceDelete)
 		resourceAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ResourceMutationPayload)
-			raw, err := json.Marshal(payload.Resource)
-			if err != nil {
-				return Result{}, err
-			}
 			target := "installation"
 			if call.Operation == domain.OperationResourceUpdate {
 				target = "resource/" + call.Target.ID
 			}
-			reply, err := resourceClient(ctx, helperproto.OperationResourceMutation, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Resource: raw}, target)
+			request := helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: "submit", Create: payload.Create, Update: payload.Update, Publication: payload.Publication}
+			reply, err := resourceClient(ctx, helperproto.OperationResourceMutation, request, target)
 			if err != nil {
 				var rejection HelperRejection
 				if errors.As(err, &rejection) {

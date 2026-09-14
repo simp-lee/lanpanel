@@ -131,5 +131,5 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 			return application.HelperReply{}, err
 		}
 	}
-	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Resource: response.Resource, Headscale: response.Headscale, Connector: response.Connector, Read: response.Read, Secret: output}, nil
+	return application.HelperReply{Digest: response.ResultDigest, Action: response.Action, Resource: response.Resource, Status: response.Status, StatusCatalog: response.StatusCatalog, Headscale: response.Headscale, Connector: response.Connector, Read: response.Read, Secret: output}, nil
 }
