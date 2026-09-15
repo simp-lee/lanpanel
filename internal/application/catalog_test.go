@@ -6,6 +6,7 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -56,6 +57,31 @@ func TestPublicationClientPropagatesPartialJobResult(t *testing.T) {
 	publication, ok := result.Payload.(PublicationResult)
 	if !ok || publication.JobID != "job-partial" || publication.JobResult != "partial" {
 		t.Fatalf("partial publication result=%#v", result.Payload)
+	}
+}
+
+func TestResourceActionPreservesTypedHelperRejections(t *testing.T) {
+	expected := HelperRejection{Code: "local_process_only", JobID: "job_" + strings.Repeat("a", 64)}
+	service, err := HelperServiceWithResources(func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {
+		return HelperReply{}, errors.New("unused action client")
+	}, func(_ context.Context, operation helperproto.Operation, _ helperproto.ResourcePayload, _ string) (HelperReply, error) {
+		if operation == helperproto.OperationProcessLifecycle {
+			return HelperReply{}, expected
+		}
+		return HelperReply{}, HelperRejection{Code: "resource_delete_blocked", JobID: "job_" + strings.Repeat("b", 64)}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := Actor{Kind: ActorUI, Identity: "session", Generation: 1}
+	_, err = service.Invoke(context.Background(), actor, Call{Operation: domain.OperationProcessStart, Target: domain.OperationTarget{Kind: domain.OperationTargetResource, ID: "res_00000000000000000000000000000001"}, Payload: ProcessMutationPayload{}})
+	var rejection HelperRejection
+	if !errors.As(err, &rejection) || rejection.Code != expected.Code || rejection.JobID != expected.JobID {
+		t.Fatalf("process rejection was not preserved: %v", err)
+	}
+	_, err = service.Invoke(context.Background(), actor, Call{Operation: domain.OperationResourceDelete, Target: domain.OperationTarget{Kind: domain.OperationTargetResource, ID: "res_00000000000000000000000000000001"}, Payload: ConfirmationPayload{PlanID: "plan", Confirmation: "delete"}})
+	if !errors.As(err, &rejection) || rejection.Code != "resource_delete_blocked" {
+		t.Fatalf("delete rejection was not preserved: %v", err)
 	}
 }
 

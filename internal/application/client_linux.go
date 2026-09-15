@@ -454,7 +454,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		resourceDelete, _ := RegisterAction(domain.OperationResourceDelete, ConfirmationPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ConfirmationPayload)
 			reply, err := resourceClient(ctx, helperproto.OperationResourceDelete, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation}, "resource/"+call.Target.ID)
-			if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("resource delete failed")
+			}
+			if reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
 				return Result{}, fmt.Errorf("resource delete failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: ResourceDeleteResult{JobID: reply.Action.JobID}}, nil
@@ -484,7 +491,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		update, _ := RegisterAction(domain.OperationResourceUpdate, ResourceMutationPayload{}, true, false, resourceAction)
 		processAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			reply, err := resourceClient(ctx, helperproto.OperationProcessLifecycle, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "resource/"+call.Target.ID)
-			if err != nil || reply.Action == nil || reply.Action.JobID == "" {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("process lifecycle failed")
+			}
+			if reply.Action == nil || reply.Action.JobID == "" {
 				return Result{}, fmt.Errorf("process lifecycle failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
