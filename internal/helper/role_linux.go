@@ -59,6 +59,7 @@ func RunRole(args []string) error {
 	if len(args) != 0 || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("helper role requires its fixed root service invocation")
 	}
+	readModels := application.FixedReadModelSeams()
 	config, err := ReadIdentityConfig()
 	if err != nil {
 		return err
@@ -753,7 +754,7 @@ func RunRole(args []string) error {
 		switch request.Resource.Operation {
 		case string(domain.OperationStatus):
 			if strings.HasPrefix(request.Target, "resource/") {
-				status, statusErr := application.ReadResourceStatus(ctx, strings.TrimPrefix(request.Target, "resource/"))
+				status, statusErr := readModels.Status.ResourceStatus(ctx, strings.TrimPrefix(request.Target, "resource/"))
 				if statusErr != nil {
 					return ExecutionResult{}, statusErr
 				}
@@ -763,7 +764,7 @@ func RunRole(args []string) error {
 				}
 				return ExecutionResult{ResultDigest: digest, Status: (*helperproto.ResourceStatusResult)(&status)}, nil
 			}
-			catalog, catalogErr := application.ReadResourceStatusCatalog(ctx)
+			catalog, catalogErr := readModels.Status.ResourceStatusCatalog(ctx)
 			if catalogErr != nil {
 				return ExecutionResult{}, catalogErr
 			}
@@ -777,9 +778,15 @@ func RunRole(args []string) error {
 		case string(domain.OperationConfigurationExport):
 			value, err = application.ExportConfiguration(ctx)
 		case string(domain.OperationJobList):
-			value, err = application.ListJobs(ctx)
+			if readModels.Jobs == nil {
+				return ExecutionResult{}, fmt.Errorf("job read model unavailable")
+			}
+			value, err = readModels.Jobs.ListJobs(ctx)
 		case string(domain.OperationJobDetail):
-			value, err = application.ReadJob(ctx, strings.TrimPrefix(request.Target, "job/"))
+			if readModels.Jobs == nil {
+				return ExecutionResult{}, fmt.Errorf("job read model unavailable")
+			}
+			value, err = readModels.Jobs.ReadJob(ctx, strings.TrimPrefix(request.Target, "job/"))
 		default:
 			return ExecutionResult{}, fmt.Errorf("product read operation unavailable")
 		}

@@ -356,38 +356,78 @@ func ResourceStatusCatalogDigest(value ResourceStatusCatalog) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
+// ResourceStatusConfiguration is the editable, typed configuration snapshot
+// returned with status details. It contains no lifecycle authority or secret
+// bytes and is suitable for repopulating the management wizard.
+type ResourceStatusConfiguration struct {
+	TargetKind AppTargetKind                 `json:"target_kind"`
+	Local      *LocalResourceUpdateRequest   `json:"local,omitempty"`
+	Tailnet    *TailnetResourceUpdateRequest `json:"tailnet,omitempty"`
+}
+
+// ResourceStatusConfigurationFor projects only user-editable configuration
+// fields from a durable resource; process identities and publication authority
+// remain outside this DTO.
+func ResourceStatusConfigurationFor(resource AppResource) *ResourceStatusConfiguration {
+	switch resource.Target.Kind {
+	case AppTargetLocalHTTP:
+		if resource.Target.LocalHTTP == nil || resource.ManagedProcess == nil {
+			return nil
+		}
+		service := resource.ManagedProcess.Service
+		return &ResourceStatusConfiguration{TargetKind: AppTargetLocalHTTP, Local: &LocalResourceUpdateRequest{
+			Name: resource.Name, EndpointKind: resource.Target.LocalHTTP.EndpointKind, TCPAddress: resource.Target.LocalHTTP.TCPAddress, TCPPort: resource.Target.LocalHTTP.TCPPort,
+			ReadinessPath: resource.Target.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), resource.Target.AllowedHTTPStatuses...), WebSocket: resource.Target.WebSocket,
+			Executable: service.Executable, Arguments: append([]string(nil), service.Arguments...), WorkingDirectory: service.WorkingDirectory, EnvironmentFile: service.EnvironmentFile,
+			WritePaths: append([]string(nil), service.WritePaths...), Publication: resource.Publication, CredentialIDs: append([]string(nil), resource.CredentialIDs...),
+		}}
+	case AppTargetTailnetHTTP:
+		if resource.Target.TailnetHTTP == nil {
+			return nil
+		}
+		return &ResourceStatusConfiguration{TargetKind: AppTargetTailnetHTTP, Tailnet: &TailnetResourceUpdateRequest{
+			Name: resource.Name, PeerIP: resource.Target.TailnetHTTP.IP, SourceIP: resource.Target.TailnetHTTP.SourceIP, Port: resource.Target.TailnetHTTP.Port,
+			ReadinessPath: resource.Target.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), resource.Target.AllowedHTTPStatuses...), WebSocket: resource.Target.WebSocket,
+			Publication: resource.Publication, CredentialIDs: append([]string(nil), resource.CredentialIDs...),
+		}}
+	default:
+		return nil
+	}
+}
+
 type ResourceStatusResult struct {
-	ResourceID             string                      `json:"resource_id"`
-	Name                   string                      `json:"name"`
-	TargetKind             AppTargetKind               `json:"target_kind"`
-	TargetPeerIP           string                      `json:"target_peer_ip,omitempty"`
-	TargetSourceIP         string                      `json:"target_source_ip,omitempty"`
-	TargetPort             uint16                      `json:"target_port,omitempty"`
-	OverallStatus          ResourceStatusOverall       `json:"overall_status"`
-	ConfigurationStatus    ResourceConfigurationStatus `json:"configuration_status"`
-	ProcessRequestedStatus ResourceProcessStatus       `json:"process_requested_status"`
-	ProcessObservedStatus  ResourceProcessStatus       `json:"process_observed_status"`
-	ProcessStatus          ResourceProcessStatus       `json:"process_status"`
-	PublicationStatus      ResourcePublicationStatus   `json:"publication_status"`
-	ConnectorStatus        ResourceEvidenceStatus      `json:"connector_status"`
-	RouteStatus            ResourceEvidenceStatus      `json:"route_status"`
-	TargetStatus           ResourceEvidenceStatus      `json:"target_status"`
-	FailureCategory        ResourceFailureCategory     `json:"failure_category"`
-	AllowedActions         []ResourceAction            `json:"allowed_actions"`
-	ClosureVerified        bool                        `json:"closure_verified"`
-	ClosureDigest          string                      `json:"closure_digest"`
-	ClosureObservedAt      time.Time                   `json:"closure_observed_at"`
-	AffectedObject         string                      `json:"affected_object"`
-	NextStep               string                      `json:"next_step"`
-	LastOperation          OperationCode               `json:"last_operation"`
-	JobID                  string                      `json:"job_id"`
-	JobPending             bool                        `json:"job_pending"`
-	ConfigDigest           string                      `json:"config_digest"`
-	AuthorityDigest        string                      `json:"authority_digest"`
-	ObservedAt             time.Time                   `json:"observed_at"`
-	ConnectorObservation   *ConnectorObservation       `json:"connector_observation"`
-	RouteEvidence          *RouteEvidence              `json:"route_evidence"`
-	TargetObservation      *TargetObservation          `json:"target_observation"`
+	ResourceID             string                       `json:"resource_id"`
+	Name                   string                       `json:"name"`
+	TargetKind             AppTargetKind                `json:"target_kind"`
+	TargetPeerIP           string                       `json:"target_peer_ip,omitempty"`
+	TargetSourceIP         string                       `json:"target_source_ip,omitempty"`
+	TargetPort             uint16                       `json:"target_port,omitempty"`
+	OverallStatus          ResourceStatusOverall        `json:"overall_status"`
+	ConfigurationStatus    ResourceConfigurationStatus  `json:"configuration_status"`
+	ProcessRequestedStatus ResourceProcessStatus        `json:"process_requested_status"`
+	ProcessObservedStatus  ResourceProcessStatus        `json:"process_observed_status"`
+	ProcessStatus          ResourceProcessStatus        `json:"process_status"`
+	PublicationStatus      ResourcePublicationStatus    `json:"publication_status"`
+	ConnectorStatus        ResourceEvidenceStatus       `json:"connector_status"`
+	RouteStatus            ResourceEvidenceStatus       `json:"route_status"`
+	TargetStatus           ResourceEvidenceStatus       `json:"target_status"`
+	FailureCategory        ResourceFailureCategory      `json:"failure_category"`
+	AllowedActions         []ResourceAction             `json:"allowed_actions"`
+	ClosureVerified        bool                         `json:"closure_verified"`
+	ClosureDigest          string                       `json:"closure_digest"`
+	ClosureObservedAt      time.Time                    `json:"closure_observed_at"`
+	AffectedObject         string                       `json:"affected_object"`
+	NextStep               string                       `json:"next_step"`
+	LastOperation          OperationCode                `json:"last_operation"`
+	JobID                  string                       `json:"job_id"`
+	JobPending             bool                         `json:"job_pending"`
+	ConfigDigest           string                       `json:"config_digest"`
+	AuthorityDigest        string                       `json:"authority_digest"`
+	ObservedAt             time.Time                    `json:"observed_at"`
+	ConnectorObservation   *ConnectorObservation        `json:"connector_observation"`
+	RouteEvidence          *RouteEvidence               `json:"route_evidence"`
+	TargetObservation      *TargetObservation           `json:"target_observation"`
+	Configuration          *ResourceStatusConfiguration `json:"configuration,omitempty"`
 }
 
 func ResourceStatusAuthorityDigest(resourceID, configDigest string) string {
@@ -459,6 +499,14 @@ func ValidateResourceStatusResult(value ResourceStatusResult) error {
 		}
 		if value.RouteEvidence != nil && (value.RouteEvidence.PeerIP != value.TargetPeerIP || value.RouteEvidence.SourceIP != value.TargetSourceIP || value.RouteEvidence.Port != value.TargetPort) {
 			return fmt.Errorf("route evidence endpoint differs from resource authority")
+		}
+	}
+	if value.Configuration != nil {
+		if value.Configuration.TargetKind != value.TargetKind {
+			return fmt.Errorf("status configuration target differs from status")
+		}
+		if err := ValidateResourceUpdateRequest(ResourceUpdateRequest{TargetKind: value.Configuration.TargetKind, Local: value.Configuration.Local, Tailnet: value.Configuration.Tailnet}); err != nil {
+			return fmt.Errorf("status configuration is invalid: %w", err)
 		}
 	}
 	if value.OverallStatus == ResourceStatusClosed && !value.ClosureVerified {

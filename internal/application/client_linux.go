@@ -13,6 +13,7 @@ import (
 	"lanpanel/internal/domain"
 	managedheadscale "lanpanel/internal/headscale"
 	"lanpanel/internal/helperproto"
+	"lanpanel/internal/jobs"
 	"net/netip"
 	"time"
 )
@@ -94,18 +95,25 @@ type ContractionResult struct {
 }
 
 func HelperService(client HelperClient) (*Service, error) {
-	return HelperServiceWithResources(client, nil)
+	return HelperServiceWithResourcesAndSeams(client, nil, ReadModelSeams{})
 }
 
 func HelperServiceWithResources(client HelperClient, resourceClient ResourceHelperClient) (*Service, error) {
-	return helperServiceComplete(client, resourceClient, nil)
+	return HelperServiceWithResourcesAndSeams(client, resourceClient, ReadModelSeams{})
 }
 
 func HelperServiceComplete(client HelperClient, resourceClient ResourceHelperClient, secretResourceClient SecretResourceHelperClient) (*Service, error) {
-	return helperServiceComplete(client, resourceClient, secretResourceClient)
+	return helperServiceComplete(client, resourceClient, secretResourceClient, ReadModelSeams{})
 }
 
-func helperServiceComplete(client HelperClient, resourceClient ResourceHelperClient, secretResourceClient SecretResourceHelperClient) (*Service, error) {
+// HelperServiceWithResourcesAndSeams is the injectable typed read/probe/Job
+// boundary used by deterministic UI fixtures. Empty seams retain the fixed
+// helper-backed behavior used by production.
+func HelperServiceWithResourcesAndSeams(client HelperClient, resourceClient ResourceHelperClient, seams ReadModelSeams) (*Service, error) {
+	return helperServiceComplete(client, resourceClient, nil, seams)
+}
+
+func helperServiceComplete(client HelperClient, resourceClient ResourceHelperClient, secretResourceClient SecretResourceHelperClient, seams ReadModelSeams) (*Service, error) {
 	if client == nil {
 		return nil, fmt.Errorf("application helper client missing")
 	}
@@ -161,18 +169,32 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
 	})
 	domainStatusAction, _ := RegisterAction(domain.OperationStatus, DomainStatusPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		if seams.Status != nil {
+			if call.Target.Kind == domain.OperationTargetInstallation {
+				catalog, err := seams.Status.ResourceStatusCatalog(ctx)
+				if err != nil || domain.ValidateResourceStatusCatalog(catalog) != nil {
+					return Result{}, fmt.Errorf("installation status failed")
+				}
+				return Result{Operation: call.Operation, Target: call.Target, Payload: catalog}, nil
+			}
+			status, err := seams.Status.ResourceStatus(ctx, call.Target.ID)
+			if err != nil || status.ResourceID != call.Target.ID || domain.ValidateResourceStatusResult(status) != nil {
+				return Result{}, fmt.Errorf("domain status failed")
+			}
+			return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
+		}
 		if call.Target.Kind == domain.OperationTargetInstallation && resourceClient != nil {
 			reply, err := resourceClient(ctx, helperproto.OperationProductRead, helperproto.ResourcePayload{Operation: string(domain.OperationStatus), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "installation")
 			if err != nil || len(reply.Secret) != 0 {
 				return Result{}, fmt.Errorf("installation status failed")
 			}
-			if reply.StatusCatalog == nil || reply.Read != nil {
+			if reply.StatusCatalog == nil || reply.Read != nil || domain.ValidateResourceStatusCatalog(*reply.StatusCatalog) != nil {
 				return Result{}, fmt.Errorf("installation status failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.StatusCatalog}, nil
 		}
 		reply, err := client(ctx, helperproto.OperationDomainStatus, helperproto.ActionPayload{Operation: "status", TargetKind: "resource", TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation})
-		if err != nil || len(reply.Secret) != 0 || reply.Status == nil || reply.Status.ResourceID != call.Target.ID {
+		if err != nil || len(reply.Secret) != 0 || reply.Status == nil || reply.Status.ResourceID != call.Target.ID || domain.ValidateResourceStatusResult(*reply.Status) != nil {
 			return Result{}, fmt.Errorf("domain status failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Status}, nil
@@ -370,6 +392,26 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		})
 		registrations = append(registrations, connectorBinding, connectorVerify, connectorLogin)
 		productRead := func(ctx context.Context, actor Actor, call Call) (Result, error) {
+			if seams.Jobs != nil && call.Operation == domain.OperationJobList {
+				value, err := seams.Jobs.ListJobs(ctx)
+				if err == nil {
+					for _, record := range value.Jobs {
+						if err := jobs.Validate(record); err != nil {
+							return Result{}, err
+						}
+					}
+				}
+				return Result{Operation: call.Operation, Target: call.Target, Payload: value}, err
+			}
+			if seams.Jobs != nil && call.Operation == domain.OperationJobDetail {
+				value, err := seams.Jobs.ReadJob(ctx, call.Target.ID)
+				if err == nil {
+					if err := jobs.Validate(value.Job); err != nil {
+						return Result{}, err
+					}
+				}
+				return Result{Operation: call.Operation, Target: call.Target, Payload: value}, err
+			}
 			target := "installation"
 			if call.Target.ID != "" {
 				target = string(call.Target.Kind) + "/" + call.Target.ID
@@ -451,8 +493,20 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		stop, _ := RegisterAction(domain.OperationProcessStop, ProcessMutationPayload{}, true, false, processAction)
 		publish, _ := RegisterAction(domain.OperationPublish, ConfirmationPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(ConfirmationPayload)
+			if seams.Probe != nil {
+				if _, err := seams.Probe.ProbeResource(ctx, call.Target.ID); err != nil {
+					return Result{}, err
+				}
+			}
 			reply, err := resourceClient(ctx, helperproto.OperationPublicationActivate, helperproto.ResourcePayload{Operation: string(domain.OperationPublish), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation}, "resource/"+call.Target.ID)
-			if err != nil || reply.Action == nil || reply.Action.JobID == "" || reply.Action.JobResult != "succeeded" && reply.Action.JobResult != "partial" {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("publication activation failed")
+			}
+			if reply.Action == nil || reply.Action.JobID == "" || reply.Action.JobResult != "succeeded" && reply.Action.JobResult != "partial" {
 				return Result{}, fmt.Errorf("publication activation failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: PublicationResult{JobID: reply.Action.JobID, JobResult: reply.Action.JobResult, PublicURL: reply.Action.PublicURL}}, nil

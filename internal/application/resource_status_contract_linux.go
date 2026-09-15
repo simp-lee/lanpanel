@@ -142,6 +142,7 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		NextStep:            "refresh status and follow the available resource action",
 		JobID:               resource.PublicationRecord.LastJobID,
 		ConfigDigest:        resource.CurrentConfigDigest,
+		Configuration:       domain.ResourceStatusConfigurationFor(resource),
 		ObservedAt:          observedAt.UTC(),
 	}
 	result.AuthorityDigest = domain.ResourceStatusAuthorityDigest(result.ResourceID, result.ConfigDigest)

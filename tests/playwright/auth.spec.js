@@ -14,6 +14,11 @@ test.beforeAll(async()=>{
 });
 test.afterAll(async()=>{if(!running())return;signalFixture('SIGTERM');await Promise.race([fixtureExit,new Promise(resolve=>setTimeout(resolve,5000))]);if(running()){signalFixture('SIGKILL');await fixtureExit}});
 async function login(page,token='admin'){await page.goto(origin);await page.locator('input[name=token]').fill(token);await page.locator('button').first().click();await expect(page.locator('#status')).toHaveText('Authenticated')}
+async function fixturePost(request,path,body={}){const response=await request.post(controlOrigin+path,{data:body});expect(response.ok(),`${path} returned ${response.status()}`).toBeTruthy();return response}
+async function resetFixture(request){await fixturePost(request,'/fixture/reset')}
+async function fixtureScenario(request,scenario){await fixturePost(request,'/fixture/scenario',{scenario})}
+async function fixtureState(request){return await (await request.get(controlOrigin+'/fixture/state')).json()}
+async function fixtureCounters(request){return await (await request.get(controlOrigin+'/fixture/counters')).json()}
 test('LP-AUTH-001 real UI stores host-only selector and memory credentials',async({page,context})=>{await login(page);const cookies=await context.cookies();expect(cookies).toHaveLength(1);expect(cookies[0]).toMatchObject({name:'lanpanel_session',httpOnly:true,sameSite:'Strict',secure:false});expect(await page.evaluate(()=>sessionStorage.getItem('lp.proof'))).toHaveLength(64);expect(await page.evaluate(()=>sessionStorage.getItem('lp.csrf'))).toHaveLength(64)});
 test('LP-AUTH-002 real UI logout clears selector and browser credentials',async({page,context})=>{await login(page);await page.locator('#logout').click();await page.waitForURL(origin+'/');expect(await context.cookies()).toHaveLength(0);await page.waitForFunction(()=>sessionStorage.length===0)});
 test('LP-AUTH-003 real UI Host Origin CSRF and response defenses fail closed',async({request})=>{let bad=await request.post(origin+'/login',{headers:{Origin:'http://127.0.0.1:1','Content-Type':'application/x-www-form-urlencoded'},data:'token=admin'});expect(bad.status()).toBe(403);let response=await request.get(origin+'/',{headers:{Host:'example.invalid'}});expect(response.status()).toBe(421);response=await request.get(origin+'/');expect(response.headers()['cache-control']).toBe('no-store, private');expect(response.headers()['content-security-policy']).not.toContain('unsafe-inline');expect(response.headers()['x-frame-options']).toBe('DENY')});
@@ -40,6 +45,60 @@ test('LP-HEADSCALE-003 preauth key creation submits canonical terminal JSON and 
     '{"plan_id":"plan-fixture","confirmation":"create","expiration_seconds":3600}',
   ]);
 });
+test('LP-APP-LOCAL-001 structured local wizard saves stopped and unpublished without side effects',async({page,request})=>{
+  await resetFixture(request); await login(page);
+  await page.locator('#resource-create-open').click();
+  const form=page.locator('#resource-create');
+  await form.locator('input[name=name]').fill('Created local');
+  await form.locator('input[name=executable]').fill('/usr/local/bin/fixture-app');
+  await form.locator('input[name=working_directory]').fill('/srv/fixture-app');
+  await form.locator('select[name=endpoint_kind]').selectOption('tcp_socket_activation');
+  await expect(form.locator('#create-tcp-fields')).toBeVisible();
+  await form.locator('input[name=tcp_address]').fill('127.0.0.1'); await form.locator('input[name=tcp_port]').fill('18080');
+  await form.locator('select[name=endpoint_kind]').selectOption('relay_unix');
+  await expect(form.locator('#create-tcp-fields')).toBeHidden();
+  await form.locator('select[name=endpoint_kind]').selectOption('unix_socket_activation');
+  await form.locator('input[name=canonical_domain]').fill('created.example.test');
+  await form.locator('button[type=submit]').click();
+  await expect(page.locator('#status')).toHaveText('Application saved; resource remains stopped and unpublished');
+  const card=page.locator('#resource-list article').filter({hasText:'Created local'});
+  await expect(card).toContainText('local_http'); await expect(card).toContainText('closed'); await expect(card).toContainText('stopped'); await expect(card).toContainText('unpublished');
+  await card.getByRole('button',{name:'Edit configuration'}).click(); const update=page.locator('#resource-update-json'); await expect(update).toBeVisible(); await expect(update.locator('input[name=executable]')).toHaveValue('/usr/local/bin/fixture-app'); await update.locator('input[name=name]').fill('Edited local'); await update.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Configuration saved; resource remains stopped and unpublished'); const editedCard=page.locator('#resource-list article').filter({hasText:'Edited local'}); await expect(editedCard).toContainText('stopped'); await expect(editedCard).toContainText('unpublished');
+  const state=await fixtureState(request); expect(state.resource_count).toBe(3); expect(state.resource_ids).toContain('res_00000000000000000000000000000003');
+  const counters=await fixtureCounters(request); expect(counters).toEqual({process_start:0,process_stop:0,acme_requests:0,dns_requests:0,tailscale_commands:0,remote_commands:0,connector_logins:0,connector_verifies:0});
+  await editedCard.getByRole('button',{name:'Start process'}).click();
+  await expect(page.locator('#status')).toContainText('job_');
+  expect((await fixtureCounters(request)).process_start).toBe(1);
+  const listResponse=page.waitForResponse(response=>response.url().endsWith('/api/actions/job_list')); await page.locator('#product-reads button[data-read="job_list"]').click(); const jobList=await (await listResponse).json(); const startJob=jobList.jobs.find(job=>job.operation==='process_start'); expect(startJob.result).toBe('succeeded'); const detail=page.locator('#job-detail'); await detail.locator('input[name=job_id]').fill(startJob.id); const detailResponse=page.waitForResponse(response=>response.url().includes('/api/actions/job_detail?job_id=')); await detail.locator('button').click(); const jobDetail=await (await detailResponse).json(); expect(jobDetail.job.id).toBe(startJob.id); expect(jobDetail.job.result).toBe('succeeded');
+});
+test('LP-APP-LOCAL-002 browser and authoritative validation do not create a resource',async({page,request})=>{
+  await resetFixture(request); await login(page); await page.locator('#resource-create-open').click();
+  const form=page.locator('#resource-create'); await form.locator('input[name=name]').fill('Rejected local'); await form.locator('input[name=canonical_domain]').fill('rejected.example.test');
+  await form.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Executable and working directory are required for local_http');
+  expect((await fixtureState(request)).resource_count).toBe(2);
+  await fixtureScenario(request,'create-preflight-failure');
+  await form.locator('input[name=executable]').fill('/usr/local/bin/fixture-app'); await form.locator('input[name=working_directory]').fill('/srv/fixture-app'); await form.locator('button[type=submit]').click();
+  await expect(page.locator('#status')).toHaveText('authoritative_preflight_failed'); expect((await fixtureState(request)).resource_count).toBe(2);
+});
+test('LP-APP-TAILNET-001 fixed remote wizard keeps evidence stages separate and hides process actions',async({page,request})=>{
+  await resetFixture(request); await login(page); await page.locator('#resource-create-open').click();
+  const form=page.locator('#resource-create'); await form.locator('select[name=target_kind]').selectOption('tailnet_http');
+  await expect(form.locator('#create-local-fields')).toBeHidden(); await expect(form.locator('#create-tailnet-fields')).toBeVisible();
+  await expect(form.locator('input[name=executable]')).toBeHidden(); await expect(form.locator('input[name=working_directory]')).toBeHidden();
+  await form.locator('input[name=name]').fill('Created tailnet'); await form.locator('input[name=peer_ip]').fill('100.64.0.2'); await form.locator('input[name=source_ip]').fill('100.64.0.1'); await form.locator('input[name=remote_port]').fill('8080'); await form.locator('input[name=canonical_domain]').fill('tailnet.example.test');
+  await form.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Application saved; resource remains stopped and unpublished');
+  const card=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(card).toContainText('tailnet_http'); await expect(card).toContainText('unknown'); await expect(card).not.toContainText('Start process');
+  await card.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText('Connector: unverified'); await expect(page.locator('#detail-evidence')).toContainText('route: unverified'); await expect(page.locator('#detail-evidence')).toContainText('target: unknown');
+  await fixtureScenario(request,'tailnet-ready'); await page.locator('#refresh-status').click();
+  const readyCard=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(readyCard).toContainText('closed'); await expect(readyCard.getByRole('button',{name:'Publish'})).toBeVisible();
+  const planResponse=page.waitForResponse(response=>response.url().includes('/api/actions/publish/plan?resource_id=res_00000000000000000000000000000003'));
+  const dialogPromise=page.waitForEvent('dialog'); await readyCard.getByRole('button',{name:'Publish'}).click(); await planResponse; const dialog=await dialogPromise; await fixtureScenario(request,'tailnet-revalidation-failure'); await dialog.accept();
+  await expect(page.locator('#status')).toHaveText('target_preflight_failed');
+  await fixtureScenario(request,'tailnet-ready'); await page.locator('#refresh-status').click(); page.once('dialog',dialog=>dialog.accept()); await readyCard.getByRole('button',{name:'Publish'}).click(); await expect(page.locator('#status')).toContainText('Publication job job_');
+  for (const [scenario,evidence] of [['tailnet-connector-failure','Connector: unreachable'],['tailnet-route-failure','route: unreachable'],['tailnet-target-failure','target: unreachable']]) { await fixtureScenario(request,scenario); await page.locator('#refresh-status').click(); const failedCard=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(failedCard).toContainText('unreachable'); await failedCard.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText(evidence); }
+  const counters=await fixtureCounters(request); expect(counters.process_start).toBe(0); expect(counters.process_stop).toBe(0); expect(counters.acme_requests).toBe(0); expect(counters.dns_requests).toBe(0); expect(counters.tailscale_commands).toBe(0); expect(counters.remote_commands).toBe(0); expect(counters.connector_logins).toBe(0); expect(counters.connector_verifies).toBe(0);
+});
+
 test('LP-ACTION-002 final typed management controls are discoverable after login', async ({ page }) => {
   await login(page)
   for (const id of ['resource-create','resource-update-json','process-control','resource-delete','headscale-user-create','headscale-key-create','headscale-key-revoke','headscale-device-expire','headscale-reads','connector-binding','connector-login','connector-verify','product-reads','job-detail']) {
