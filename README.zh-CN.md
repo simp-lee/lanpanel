@@ -87,6 +87,10 @@ ssh -N -L 8080:<安装器显示的地址>:<安装器显示的端口> <用户>@<�
 
 域名 HTTPS 使用 HTTP-01，或使用 Cloudflare、Route53、DigitalOcean、Google Cloud、Tencent Cloud 的 DNS-01。使用 DNS-01 时，在 Management UI 的 provider 字段中填写准确的代码：`cloudflare`、`route53`、`digitalocean`、`gcloud` 或 `tencentcloud`。ACME 联系方式在登录后的 Management UI 中设置，首次申请证书前会再次校验；安装阶段不会要求输入，也不会把它写进命令行或日志。
 
+Management UI 不提供 `tailnet_http` 的远端进程控制：它只保存固定的 peer/source/port，并在发布前分别观察 connector、route 和 target evidence。它不会部署文件、运行远程 Shell，也不承诺终止远端已有服务。撤销发布、设备过期和撤销预授权密钥会在适用范围内阻止新的正常路径使用，但已经建立的 TCP/WebSocket 连接可能继续存在；LanPanel 不承诺立即终止这些连接。
+
+仓库提供可重复的浏览器 fixture 门禁。使用 checkout 时，先准备 Node 依赖和固定版本的 Chromium，再运行 `make playwright-fixture-gate`（`npm ci`，然后 `npx playwright install chromium`）。fixture 只使用内存中的 typed resource、status、probe、Job 和副作用计数；它不验证真实持久化、Nginx、进程、DNS、ACME、Tailscale 或远程命令。
+
 ## 运行拓扑
 
 LanPanel 是管理层，不是 Tailscale 客户端。下面的图示说明了流量的基本路径：

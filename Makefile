@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := preview-local-gate
 
-.PHONY: build test vet lint race preview-local-gate check tidy check-preview-profile-host capture-preview-profile resolve-preview-dependencies materialize-preview-dependencies build-preview-artifact package-preview-release publish-preview-github release-preview
+.PHONY: build test vet lint race playwright-fixture-gate preview-local-gate check tidy check-preview-profile-host capture-preview-profile resolve-preview-dependencies materialize-preview-dependencies build-preview-artifact package-preview-release publish-preview-github release-preview
 
 GO ?= go
 BINARY ?= lanpanel
@@ -27,6 +27,10 @@ lint:
 
 race:
 	$(GO) test -race -count=1 $(PKGS)
+
+playwright-fixture-gate:
+	@test -x node_modules/.bin/playwright || { echo 'run npm ci before the Playwright fixture gate' >&2; exit 2; }
+	@LANPANEL_PLAYWRIGHT_FIXTURE=1 npm run test:auth
 
 preview-local-gate: test vet lint race
 

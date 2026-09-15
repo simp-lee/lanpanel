@@ -24,6 +24,18 @@ make check                 # 完整质量门禁
 
 `make check` 会依次执行测试、`vet`、Lint 和 race 测试。提交代码前应至少运行一次；CI 使用相同的 Preview 质量门禁。`make tidy` 只在确实需要调整依赖时使用。
 
+### 浏览器 fixture 门禁
+
+结构化应用向导的可重复浏览器验证使用单独的 fixture 门禁。首次运行先安装 Node 依赖和 Playwright Chromium：
+
+```sh
+npm ci
+npx playwright install chromium
+make playwright-fixture-gate
+```
+
+`make playwright-fixture-gate` 的唯一测试入口是 `LANPANEL_PLAYWRIGHT_FIXTURE=1 npm run test:auth`。Playwright spec 会启动一个 Go fixture，等待本机 readiness；启动超时、Go fixture 退出、测试失败或 browser failure 都以非零状态传播，`afterAll` 会清理 fixture。fixture 使用内存 typed resource/status/probe/Job 和副作用计数，不连接真实持久化、Nginx、应用进程、ACME、DNS、Tailscale 或远程命令；因此它验证 UI/helper/application 合同，不替代真实主机或外部服务资格验证。CI 先运行 `make preview-local-gate`，再执行 `npm ci`、固定 Chromium 安装和同一个 `make playwright-fixture-gate`，不会启动第二个 fixture。
+
 不要提交下载的第三方二进制、`dist/` 输出、发布包、Bootstrap、GitHub Token 或签名私钥。下载的依赖只应放在被忽略的 `dist/dependencies/` 中。
 
 ## 目录约定

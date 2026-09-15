@@ -87,6 +87,10 @@ Then open `http://127.0.0.1:8080` in a browser on your computer. There is no CLI
 
 Domain HTTPS uses HTTP-01 or DNS-01 with Cloudflare, Route53, DigitalOcean, Google Cloud, or Tencent Cloud. For DNS-01, enter the exact provider code `cloudflare`, `route53`, `digitalocean`, `gcloud`, or `tencentcloud` in the Management UI. Set the ACME contact in the authenticated Management UI; it is checked again before the first certificate request and is not requested during installation or written to command-line arguments or logs.
 
+The Management UI does not provide remote process control for `tailnet_http`: it stores a fixed peer/source/port and observes connector, route, and target evidence before publication. It does not deploy files, run a remote shell, or promise to terminate an existing remote service. Unpublish, device expiry, and pre-authentication-key revocation prevent new normal-path use where applicable, but existing TCP/WebSocket connections may persist; LanPanel does not promise immediate termination.
+
+For repeatable browser checks, the repository provides a fixture-only gate. From a checkout, prepare Node dependencies and the pinned Chromium browser, then run `make playwright-fixture-gate` (`npm ci`, followed by `npx playwright install chromium`). The fixture uses in-memory typed resources, status, probes, Jobs, and side-effect counters; it does not qualify real persistence, Nginx, processes, DNS, ACME, Tailscale, or remote commands.
+
 ## Runtime topology
 
 LanPanel is the management layer, not a Tailscale client. The following diagrams show where traffic goes:
