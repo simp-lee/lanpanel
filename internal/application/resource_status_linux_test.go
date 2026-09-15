@@ -11,9 +11,75 @@ import (
 	"lanpanel/internal/nginx"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
+
+func TestTypedStatusProjectionDistinguishesClosureHealthAndUnreachable(t *testing.T) {
+	now := time.Now().UTC()
+	local := recoveryLocalResource(t)
+	local.PublicationRecord.State = domain.PublicationUnpublished
+	closed, err := ProjectObservedResourceStatus(local, now, ResourceStatusEvidence{NginxHealthy: true, ProcessStatus: domain.ProcessStopped})
+	if err != nil || closed.OverallStatus != domain.ResourceStatusClosed || !closed.ClosureVerified {
+		t.Fatalf("closed status=%#v error=%v", closed, err)
+	}
+	unknown, err := ProjectObservedResourceStatus(local, now, ResourceStatusEvidence{ProcessStatus: domain.ProcessStopped})
+	if err != nil || unknown.OverallStatus != domain.ResourceStatusUnknown || unknown.ClosureVerified {
+		t.Fatalf("unproved closure status=%#v error=%v", unknown, err)
+	}
+
+	healthyLocal := recoveryLocalResource(t)
+	healthyLocal.PublicationRecord.State = domain.PublicationPublished
+	healthyLocal.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{Kind: domain.PublicationTemporaryHTTP, ConfigDigest: healthyLocal.CurrentConfigDigest}
+	healthyLocal.PublicationRecord.LastAppliedDigest = &healthyLocal.CurrentConfigDigest
+	healthyLocal.ManagedProcess.Requested = domain.ProcessRequestedRunning
+	healthyLocalTarget := &domain.TargetObservation{PortConnected: true, HTTPReady: true, HTTPStatus: 200, Validity: domain.EvidenceFresh, ObservedAt: now, Failure: domain.FailureNone}
+	healthy, err := ProjectObservedResourceStatus(healthyLocal, now, ResourceStatusEvidence{NginxHealthy: true, ManifestContains: true, ProcessStatus: domain.ProcessRunning, TargetObservation: healthyLocalTarget})
+	if err != nil || healthy.OverallStatus != domain.ResourceStatusHealthy {
+		t.Fatalf("healthy status=%#v error=%v", healthy, err)
+	}
+
+	tailnet := recoveryTailnetResource()
+	tailnet.PublicationRecord.State = domain.PublicationPublished
+	tailnet.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{Kind: domain.PublicationTemporaryHTTP}
+	clientDigest := recoveryDigest("client")
+	localDigest := recoveryDigest("local")
+	connectorIdentity := domain.TailnetConnectorIdentity("https://control.example.test", "1.0", clientDigest, localDigest)
+	routeIdentity := domain.TailnetRouteIdentity(connectorIdentity, "100.64.0.2", "100.64.0.1", 8080)
+	connector := &domain.ConnectorObservation{ControlURL: "https://control.example.test", ClientVersion: "1.0", ClientIdentityDigest: clientDigest, LocalIdentityDigest: localDigest, Validity: domain.ConnectorObservationFresh, ObservedAt: now, ValidUntil: now.Add(time.Minute)}
+	route := &domain.RouteEvidence{PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: domain.EvidenceUnreachable, ObservedAt: now, ValidUntil: now, Failure: domain.FailurePeerOffline}
+	unreachable, err := ProjectObservedResourceStatus(tailnet, now, ResourceStatusEvidence{NginxHealthy: true, ManifestContains: true, ConnectorObservation: connector, RouteEvidence: route})
+	if err != nil || unreachable.OverallStatus != domain.ResourceStatusUnreachable || unreachable.RouteStatus != domain.EvidenceUnreachable {
+		t.Fatalf("unreachable status=%#v error=%v", unreachable, err)
+	}
+
+	tailnetClosed := recoveryTailnetResource()
+	closedTailnet, err := ProjectObservedResourceStatus(tailnetClosed, now, ResourceStatusEvidence{NginxHealthy: true})
+	if err != nil || closedTailnet.OverallStatus != domain.ResourceStatusClosed || !slices.Contains(closedTailnet.AllowedActions, domain.ResourceActionDelete) {
+		t.Fatalf("tailnet closure status=%#v error=%v", closedTailnet, err)
+	}
+
+	fenced := recoveryLocalResource(t)
+	fenced.PublicationRecord.State = domain.PublicationPublished
+	fenced.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{Kind: domain.PublicationTemporaryHTTP, ConfigDigest: fenced.CurrentConfigDigest}
+	fenced.PublicationRecord.LastAppliedDigest = &fenced.CurrentConfigDigest
+	fenced.ManagedProcess.Requested = domain.ProcessRequestedRunning
+	fencedStatus, err := ProjectObservedResourceStatus(fenced, now, ResourceStatusEvidence{NginxFailure: domain.FailurePublication, NginxFenced: true, ProcessStatus: domain.ProcessRunning})
+	if err != nil || fencedStatus.PublicationStatus != domain.PublicationStatusFenced || !slices.Equal(fencedStatus.AllowedActions, []domain.ResourceAction{domain.ResourceActionRefresh}) {
+		t.Fatalf("fenced status=%#v error=%v", fencedStatus, err)
+	}
+
+	drift := recoveryLocalResource(t)
+	drift.PublicationRecord.State = domain.PublicationPublished
+	drift.PublicationRecord.LastAppliedBundle = &domain.PublicationBundle{Kind: domain.PublicationTemporaryHTTP, ConfigDigest: recoveryDigest("prior-config")}
+	drift.PublicationRecord.LastAppliedDigest = &drift.PublicationRecord.LastAppliedBundle.ConfigDigest
+	drift.ManagedProcess.Requested = domain.ProcessRequestedRunning
+	driftStatus, err := ProjectObservedResourceStatus(drift, now, ResourceStatusEvidence{NginxHealthy: true, ManifestContains: true, ProcessStatus: domain.ProcessRunning, TargetObservation: healthyLocalTarget})
+	if err != nil || driftStatus.OverallStatus != domain.ResourceStatusUnknown || slices.Contains(driftStatus.AllowedActions, domain.ResourceActionRepublish) {
+		t.Fatalf("drift status=%#v error=%v", driftStatus, err)
+	}
+}
 
 func TestUnpublishedProcessFailuresRemainDiagnostic(t *testing.T) {
 	for _, scenario := range []string{"stopped", "stopped_with_endpoint", "running_but_dead"} {

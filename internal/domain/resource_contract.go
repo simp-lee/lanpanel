@@ -241,6 +241,19 @@ const (
 	EvidenceUnknown       ResourceEvidenceStatus = "unknown"
 )
 
+type ResourceAction string
+
+const (
+	ResourceActionEdit      ResourceAction = "edit"
+	ResourceActionRefresh   ResourceAction = "refresh"
+	ResourceActionStart     ResourceAction = "start"
+	ResourceActionStop      ResourceAction = "stop"
+	ResourceActionPublish   ResourceAction = "publish"
+	ResourceActionUnpublish ResourceAction = "unpublish"
+	ResourceActionRepublish ResourceAction = "republish"
+	ResourceActionDelete    ResourceAction = "delete"
+)
+
 type ResourceFailureCategory string
 
 const (
@@ -251,6 +264,7 @@ const (
 	FailureEvidenceMissing   ResourceFailureCategory = "evidence_missing"
 	FailureEvidenceExpired   ResourceFailureCategory = "evidence_expired"
 	FailureEvidenceMismatch  ResourceFailureCategory = "evidence_mismatch"
+	FailureCertificate       ResourceFailureCategory = "certificate_invalid"
 	FailureConnectorDown     ResourceFailureCategory = "connector_unreachable"
 	FailureRouteDown         ResourceFailureCategory = "route_unreachable"
 	FailurePeerOffline       ResourceFailureCategory = "peer_offline"
@@ -322,6 +336,9 @@ func ValidateResourceStatusCatalog(value ResourceStatusCatalog) error {
 		if prior != "" && prior >= resource.ResourceID {
 			return fmt.Errorf("resource status catalog is not sorted")
 		}
+		if resource.ObservedAt.After(value.ObservedAt) {
+			return fmt.Errorf("resource status is observed after catalog")
+		}
 		if err := ValidateResourceStatusResult(resource); err != nil {
 			return err
 		}
@@ -340,33 +357,37 @@ func ResourceStatusCatalogDigest(value ResourceStatusCatalog) (string, error) {
 }
 
 type ResourceStatusResult struct {
-	ResourceID           string                      `json:"resource_id"`
-	Name                 string                      `json:"name"`
-	TargetKind           AppTargetKind               `json:"target_kind"`
-	TargetPeerIP         string                      `json:"target_peer_ip,omitempty"`
-	TargetSourceIP       string                      `json:"target_source_ip,omitempty"`
-	TargetPort           uint16                      `json:"target_port,omitempty"`
-	OverallStatus        ResourceStatusOverall       `json:"overall_status"`
-	ConfigurationStatus  ResourceConfigurationStatus `json:"configuration_status"`
-	ProcessStatus        ResourceProcessStatus       `json:"process_status"`
-	PublicationStatus    ResourcePublicationStatus   `json:"publication_status"`
-	ConnectorStatus      ResourceEvidenceStatus      `json:"connector_status"`
-	RouteStatus          ResourceEvidenceStatus      `json:"route_status"`
-	TargetStatus         ResourceEvidenceStatus      `json:"target_status"`
-	FailureCategory      ResourceFailureCategory     `json:"failure_category"`
-	ClosureVerified      bool                        `json:"closure_verified"`
-	ClosureDigest        string                      `json:"closure_digest"`
-	ClosureObservedAt    time.Time                   `json:"closure_observed_at"`
-	AffectedObject       string                      `json:"affected_object"`
-	NextStep             string                      `json:"next_step"`
-	LastOperation        OperationCode               `json:"last_operation"`
-	JobID                string                      `json:"job_id"`
-	ConfigDigest         string                      `json:"config_digest"`
-	AuthorityDigest      string                      `json:"authority_digest"`
-	ObservedAt           time.Time                   `json:"observed_at"`
-	ConnectorObservation *ConnectorObservation       `json:"connector_observation"`
-	RouteEvidence        *RouteEvidence              `json:"route_evidence"`
-	TargetObservation    *TargetObservation          `json:"target_observation"`
+	ResourceID             string                      `json:"resource_id"`
+	Name                   string                      `json:"name"`
+	TargetKind             AppTargetKind               `json:"target_kind"`
+	TargetPeerIP           string                      `json:"target_peer_ip,omitempty"`
+	TargetSourceIP         string                      `json:"target_source_ip,omitempty"`
+	TargetPort             uint16                      `json:"target_port,omitempty"`
+	OverallStatus          ResourceStatusOverall       `json:"overall_status"`
+	ConfigurationStatus    ResourceConfigurationStatus `json:"configuration_status"`
+	ProcessRequestedStatus ResourceProcessStatus       `json:"process_requested_status"`
+	ProcessObservedStatus  ResourceProcessStatus       `json:"process_observed_status"`
+	ProcessStatus          ResourceProcessStatus       `json:"process_status"`
+	PublicationStatus      ResourcePublicationStatus   `json:"publication_status"`
+	ConnectorStatus        ResourceEvidenceStatus      `json:"connector_status"`
+	RouteStatus            ResourceEvidenceStatus      `json:"route_status"`
+	TargetStatus           ResourceEvidenceStatus      `json:"target_status"`
+	FailureCategory        ResourceFailureCategory     `json:"failure_category"`
+	AllowedActions         []ResourceAction            `json:"allowed_actions"`
+	ClosureVerified        bool                        `json:"closure_verified"`
+	ClosureDigest          string                      `json:"closure_digest"`
+	ClosureObservedAt      time.Time                   `json:"closure_observed_at"`
+	AffectedObject         string                      `json:"affected_object"`
+	NextStep               string                      `json:"next_step"`
+	LastOperation          OperationCode               `json:"last_operation"`
+	JobID                  string                      `json:"job_id"`
+	JobPending             bool                        `json:"job_pending"`
+	ConfigDigest           string                      `json:"config_digest"`
+	AuthorityDigest        string                      `json:"authority_digest"`
+	ObservedAt             time.Time                   `json:"observed_at"`
+	ConnectorObservation   *ConnectorObservation       `json:"connector_observation"`
+	RouteEvidence          *RouteEvidence              `json:"route_evidence"`
+	TargetObservation      *TargetObservation          `json:"target_observation"`
 }
 
 func ResourceStatusAuthorityDigest(resourceID, configDigest string) string {
@@ -394,10 +415,10 @@ func ResourceStatusDigest(value ResourceStatusResult) (string, error) {
 }
 
 func ValidateResourceStatusResult(value ResourceStatusResult) error {
-	if !strings.HasPrefix(value.ResourceID, "res_") || !idPattern.MatchString(value.ResourceID) || validateDisplayName(value.Name) != nil || value.TargetKind != AppTargetLocalHTTP && value.TargetKind != AppTargetTailnetHTTP || !validSHA256Digest(value.ConfigDigest) || value.AuthorityDigest != ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest) || value.ObservedAt.IsZero() || !validOpaqueTargetID(value.AffectedObject) || !validStatusText(value.NextStep) || !validOpaqueTargetID(value.JobID) && value.JobID != "" || value.LastOperation != "" && func() bool { _, err := ParseOperationCode(string(value.LastOperation)); return err != nil }() || value.ClosureVerified && (!validSHA256Digest(value.ClosureDigest) || value.ClosureObservedAt.IsZero()) || !value.ClosureVerified && (value.ClosureDigest != "" || !value.ClosureObservedAt.IsZero()) {
+	if !strings.HasPrefix(value.ResourceID, "res_") || !idPattern.MatchString(value.ResourceID) || validateDisplayName(value.Name) != nil || value.TargetKind != AppTargetLocalHTTP && value.TargetKind != AppTargetTailnetHTTP || !validSHA256Digest(value.ConfigDigest) || value.AuthorityDigest != ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest) || value.ObservedAt.IsZero() || !validOpaqueTargetID(value.AffectedObject) || !validStatusText(value.NextStep) || !validOpaqueTargetID(value.JobID) && value.JobID != "" || value.JobPending && value.JobID == "" || value.LastOperation != "" && func() bool { _, err := ParseOperationCode(string(value.LastOperation)); return err != nil }() || value.ClosureVerified && (!validSHA256Digest(value.ClosureDigest) || value.ClosureObservedAt.IsZero()) || !value.ClosureVerified && (value.ClosureDigest != "" || !value.ClosureObservedAt.IsZero()) {
 		return fmt.Errorf("resource status identity is invalid")
 	}
-	if !validResourceStatusOverall(value.OverallStatus) || !validResourceConfiguration(value.ConfigurationStatus) || !validResourceProcess(value.ProcessStatus) || !validResourcePublication(value.PublicationStatus) || !validEvidenceStatus(value.ConnectorStatus) || !validEvidenceStatus(value.RouteStatus) || !validEvidenceStatus(value.TargetStatus) || !validFailure(value.FailureCategory) {
+	if !validResourceStatusOverall(value.OverallStatus) || !validResourceConfiguration(value.ConfigurationStatus) || !validResourceProcess(value.ProcessRequestedStatus) || !validResourceProcess(value.ProcessObservedStatus) || !validResourceProcess(value.ProcessStatus) || !validResourcePublication(value.PublicationStatus) || !validEvidenceStatus(value.ConnectorStatus) || !validEvidenceStatus(value.RouteStatus) || !validEvidenceStatus(value.TargetStatus) || !validFailure(value.FailureCategory) || !validResourceActions(value.AllowedActions) {
 		return fmt.Errorf("resource status enum is invalid")
 	}
 	if err := validateStatusCombination(value); err != nil {
@@ -459,21 +480,45 @@ func validStatusText(value string) bool {
 func validResourceStatusOverall(value ResourceStatusOverall) bool {
 	return value == ResourceStatusClosed || value == ResourceStatusHealthy || value == ResourceStatusDegraded || value == ResourceStatusUnreachable || value == ResourceStatusUnknown
 }
+
 func validResourceConfiguration(value ResourceConfigurationStatus) bool {
 	return value == ConfigurationComplete || value == ConfigurationIncomplete || value == ConfigurationInvalid || value == ConfigurationUnknown
 }
+
 func validResourceProcess(value ResourceProcessStatus) bool {
 	return value == ProcessNotApplicable || value == ProcessRequestedRun || value == ProcessRequestedStop || value == ProcessRunning || value == ProcessStopped || value == ProcessStarting || value == ProcessStopping || value == ProcessUnknown
 }
+
 func validResourcePublication(value ResourcePublicationStatus) bool {
 	return value == PublicationStatusPublished || value == PublicationStatusUnpublished || value == PublicationStatusActivating || value == PublicationStatusContracting || value == PublicationStatusFenced || value == PublicationStatusUnknown
 }
+
 func validEvidenceStatus(value ResourceEvidenceStatus) bool {
 	return value == EvidenceNotApplicable || value == EvidenceUnverified || value == EvidenceFresh || value == EvidenceExpired || value == EvidenceUnreachable || value == EvidenceUnknown
 }
+
+func validResourceActions(values []ResourceAction) bool {
+	if values == nil {
+		return false
+	}
+	prior := ResourceAction("")
+	for _, value := range values {
+		switch value {
+		case ResourceActionEdit, ResourceActionRefresh, ResourceActionStart, ResourceActionStop, ResourceActionPublish, ResourceActionUnpublish, ResourceActionRepublish, ResourceActionDelete:
+		default:
+			return false
+		}
+		if prior != "" && prior >= value {
+			return false
+		}
+		prior = value
+	}
+	return true
+}
+
 func validFailure(value ResourceFailureCategory) bool {
 	switch value {
-	case FailureNone, FailureConfiguration, FailureAuthorityMissing, FailureAuthorityConflict, FailureEvidenceMissing, FailureEvidenceExpired, FailureEvidenceMismatch, FailureConnectorDown, FailureRouteDown, FailurePeerOffline, FailureTargetDown, FailureTargetNotReady, FailureHTTPStatus, FailureWebSocket, FailureProcess, FailurePublication, FailureOperation:
+	case FailureNone, FailureConfiguration, FailureAuthorityMissing, FailureAuthorityConflict, FailureEvidenceMissing, FailureEvidenceExpired, FailureEvidenceMismatch, FailureCertificate, FailureConnectorDown, FailureRouteDown, FailurePeerOffline, FailureTargetDown, FailureTargetNotReady, FailureHTTPStatus, FailureWebSocket, FailureProcess, FailurePublication, FailureOperation:
 		return true
 	default:
 		return false
@@ -492,29 +537,56 @@ func validateStatusFreshness(value ResourceStatusResult, now time.Time) error {
 			return fmt.Errorf("fresh connector observation is stale for status")
 		}
 	}
-	if value.ConnectorObservation != nil && value.ConnectorObservation.Validity == ConnectorObservationExpired && value.ConnectorObservation.ValidUntil.After(now) {
-		return fmt.Errorf("expired connector observation is not expired for status")
+	if value.ConnectorObservation != nil && value.ConnectorObservation.Validity != ConnectorObservationMissing {
+		if value.ConnectorObservation.ObservedAt.After(now) || now.Sub(value.ConnectorObservation.ObservedAt) > 5*time.Minute {
+			return fmt.Errorf("connector observation is stale or from the future")
+		}
+		if value.ConnectorObservation.Validity == ConnectorObservationExpired && value.ConnectorObservation.ValidUntil.After(now) {
+			return fmt.Errorf("expired connector observation is not expired for status")
+		}
 	}
 	if value.RouteEvidence != nil && value.RouteEvidence.Validity != EvidenceUnverified && value.RouteEvidence.Validity != EvidenceUnknown {
-		if value.RouteEvidence.ObservedAt.After(value.ObservedAt) || now.Sub(value.RouteEvidence.ObservedAt) > 5*time.Minute {
-			return fmt.Errorf("route evidence is observed after status")
+		if value.RouteEvidence.ObservedAt.After(value.ObservedAt) || value.RouteEvidence.ObservedAt.After(now) || now.Sub(value.RouteEvidence.ObservedAt) > 5*time.Minute {
+			return fmt.Errorf("route evidence is stale or observed after status")
 		}
 		if value.RouteEvidence.Validity == EvidenceFresh && !value.RouteEvidence.ValidUntil.After(now) || value.RouteEvidence.Validity == EvidenceExpired && value.RouteEvidence.ValidUntil.After(now) {
 			return fmt.Errorf("route evidence freshness does not match status")
 		}
 	}
-	if value.TargetObservation != nil && (value.TargetObservation.ObservedAt.After(value.ObservedAt) || now.Sub(value.TargetObservation.ObservedAt) > 5*time.Minute) {
-		return fmt.Errorf("target observation is observed after status")
+	if value.TargetObservation != nil {
+		if value.TargetObservation.ObservedAt.After(value.ObservedAt) || value.TargetObservation.ObservedAt.After(now) || now.Sub(value.TargetObservation.ObservedAt) > 5*time.Minute {
+			return fmt.Errorf("target observation is stale or observed after status")
+		}
 	}
 	if value.TargetKind == AppTargetTailnetHTTP && value.TargetStatus == EvidenceFresh && (value.TargetObservation == nil || value.TargetObservation.RouteIdentity == "") {
 		return fmt.Errorf("fresh target observation lacks route identity")
+	}
+	if value.TargetStatus == EvidenceUnreachable && (value.TargetObservation == nil || value.TargetObservation.Validity != EvidenceUnreachable) {
+		return fmt.Errorf("unreachable target status lacks unreachable observation")
+	}
+	if value.RouteStatus == EvidenceUnreachable && (value.RouteEvidence == nil || value.RouteEvidence.Validity != EvidenceUnreachable) {
+		return fmt.Errorf("unreachable route status lacks unreachable evidence")
 	}
 	return nil
 }
 
 func validateStatusCombination(value ResourceStatusResult) error {
-	if value.OverallStatus == ResourceStatusClosed && (value.PublicationStatus != PublicationStatusUnpublished || value.FailureCategory != FailureNone) || value.OverallStatus == ResourceStatusHealthy && (value.PublicationStatus != PublicationStatusPublished || value.ConfigurationStatus != ConfigurationComplete || value.FailureCategory != FailureNone || value.TargetStatus != EvidenceFresh) || value.OverallStatus == ResourceStatusHealthy && value.TargetKind == AppTargetLocalHTTP && (value.ProcessStatus != ProcessRunning || value.ConnectorStatus != EvidenceNotApplicable || value.RouteStatus != EvidenceNotApplicable) || value.OverallStatus == ResourceStatusHealthy && value.TargetKind == AppTargetTailnetHTTP && (value.ProcessStatus != ProcessNotApplicable || value.ConnectorStatus != EvidenceFresh || value.RouteStatus != EvidenceFresh) || value.OverallStatus == ResourceStatusUnreachable && (value.TargetKind != AppTargetTailnetHTTP || value.FailureCategory == FailureNone || value.ConnectorStatus != EvidenceUnreachable && value.RouteStatus != EvidenceUnreachable && value.TargetStatus != EvidenceUnreachable) || value.OverallStatus == ResourceStatusUnreachable && value.FailureCategory != FailureTargetDown && value.FailureCategory != FailureRouteDown && value.FailureCategory != FailureConnectorDown && value.FailureCategory != FailurePeerOffline {
+	if value.TargetKind == AppTargetLocalHTTP {
+		if value.ProcessRequestedStatus != ProcessRequestedRun && value.ProcessRequestedStatus != ProcessRequestedStop || value.ProcessObservedStatus != ProcessUnknown && value.ProcessObservedStatus != ProcessRunning && value.ProcessObservedStatus != ProcessStopped && value.ProcessObservedStatus != ProcessStarting && value.ProcessObservedStatus != ProcessStopping || value.ProcessStatus == ProcessNotApplicable {
+			return fmt.Errorf("local status process state is invalid")
+		}
+	} else if value.ProcessRequestedStatus != ProcessNotApplicable || value.ProcessObservedStatus != ProcessNotApplicable || value.ProcessStatus != ProcessNotApplicable {
+		return fmt.Errorf("tailnet status carries local process state")
+	}
+	if value.ProcessObservedStatus != ProcessUnknown && value.ProcessObservedStatus != value.ProcessStatus {
+		return fmt.Errorf("observed process state differs from effective process state")
+	}
+	failureRequired := value.OverallStatus == ResourceStatusDegraded || value.OverallStatus == ResourceStatusUnreachable || value.OverallStatus == ResourceStatusUnknown
+	if failureRequired && value.FailureCategory == FailureNone || value.OverallStatus == ResourceStatusClosed && (value.PublicationStatus != PublicationStatusUnpublished || value.FailureCategory != FailureNone) || value.OverallStatus == ResourceStatusHealthy && (value.PublicationStatus != PublicationStatusPublished || value.ConfigurationStatus != ConfigurationComplete || value.FailureCategory != FailureNone || value.TargetStatus != EvidenceFresh) || value.OverallStatus == ResourceStatusDegraded && value.PublicationStatus != PublicationStatusPublished || value.OverallStatus == ResourceStatusHealthy && value.TargetKind == AppTargetLocalHTTP && (value.ProcessStatus != ProcessRunning || value.ConnectorStatus != EvidenceNotApplicable || value.RouteStatus != EvidenceNotApplicable) || value.OverallStatus == ResourceStatusHealthy && value.TargetKind == AppTargetTailnetHTTP && (value.ProcessStatus != ProcessNotApplicable || value.ConnectorStatus != EvidenceFresh || value.RouteStatus != EvidenceFresh) || value.OverallStatus == ResourceStatusUnreachable && (value.TargetKind != AppTargetTailnetHTTP || value.PublicationStatus != PublicationStatusPublished || value.ConnectorStatus != EvidenceUnreachable && value.RouteStatus != EvidenceUnreachable && value.TargetStatus != EvidenceUnreachable) || value.OverallStatus == ResourceStatusUnreachable && value.FailureCategory != FailureTargetDown && value.FailureCategory != FailureRouteDown && value.FailureCategory != FailureConnectorDown && value.FailureCategory != FailurePeerOffline {
 		return fmt.Errorf("resource status overall and substate combination is invalid")
+	}
+	if value.JobPending && value.OverallStatus != ResourceStatusUnknown || (value.PublicationStatus == PublicationStatusActivating || value.PublicationStatus == PublicationStatusContracting || value.PublicationStatus == PublicationStatusFenced) && value.OverallStatus != ResourceStatusUnknown {
+		return fmt.Errorf("in-progress or fenced resource status is not unknown")
 	}
 	if value.TargetKind == AppTargetTailnetHTTP && value.TargetStatus == EvidenceFresh && value.RouteStatus != EvidenceFresh {
 		return fmt.Errorf("tailnet target evidence is not bound to fresh route evidence")
@@ -533,7 +605,41 @@ func validateStatusCombination(value ResourceStatusResult) error {
 	if value.ConnectorStatus == EvidenceNotApplicable && value.TargetKind == AppTargetTailnetHTTP || value.RouteStatus == EvidenceNotApplicable && value.TargetKind == AppTargetTailnetHTTP {
 		return fmt.Errorf("tailnet status omits required evidence stages")
 	}
+	return validateStatusActions(value)
+}
+
+func validateStatusActions(value ResourceStatusResult) error {
+	if !hasResourceAction(value.AllowedActions, ResourceActionRefresh) {
+		return fmt.Errorf("resource status cannot be refreshed")
+	}
+	transient := value.JobPending || value.PublicationStatus == PublicationStatusUnknown || value.PublicationStatus == PublicationStatusActivating || value.PublicationStatus == PublicationStatusContracting || value.PublicationStatus == PublicationStatusFenced
+	if transient && (len(value.AllowedActions) != 1 || value.AllowedActions[0] != ResourceActionRefresh) {
+		return fmt.Errorf("transient resource status carries conflicting actions")
+	}
+	if value.TargetKind == AppTargetTailnetHTTP && (hasResourceAction(value.AllowedActions, ResourceActionStart) || hasResourceAction(value.AllowedActions, ResourceActionStop)) {
+		return fmt.Errorf("tailnet status carries process actions")
+	}
+	if hasResourceAction(value.AllowedActions, ResourceActionStart) && (value.TargetKind != AppTargetLocalHTTP || value.ProcessRequestedStatus != ProcessRequestedStop || value.ProcessObservedStatus != ProcessStopped) || hasResourceAction(value.AllowedActions, ResourceActionStop) && (value.TargetKind != AppTargetLocalHTTP || value.ProcessRequestedStatus != ProcessRequestedRun || value.ProcessObservedStatus != ProcessRunning) {
+		return fmt.Errorf("resource process action differs from current state")
+	}
+	publishable := value.OverallStatus == ResourceStatusClosed && value.PublicationStatus == PublicationStatusUnpublished && value.ConfigurationStatus == ConfigurationComplete && (value.TargetKind == AppTargetLocalHTTP && value.ProcessStatus == ProcessRunning && value.TargetStatus == EvidenceFresh || value.TargetKind == AppTargetTailnetHTTP && value.ConnectorStatus == EvidenceFresh && value.RouteStatus == EvidenceFresh && value.TargetStatus == EvidenceFresh)
+	if hasResourceAction(value.AllowedActions, ResourceActionPublish) && !publishable || hasResourceAction(value.AllowedActions, ResourceActionUnpublish) && value.PublicationStatus != PublicationStatusPublished || hasResourceAction(value.AllowedActions, ResourceActionRepublish) && (value.PublicationStatus != PublicationStatusPublished || value.OverallStatus != ResourceStatusHealthy && value.OverallStatus != ResourceStatusDegraded) {
+		return fmt.Errorf("resource publication action differs from current state")
+	}
+	processClosed := value.TargetKind == AppTargetTailnetHTTP && value.ProcessStatus == ProcessNotApplicable || value.TargetKind == AppTargetLocalHTTP && value.ProcessStatus == ProcessStopped
+	if hasResourceAction(value.AllowedActions, ResourceActionDelete) && (!value.ClosureVerified || value.PublicationStatus != PublicationStatusUnpublished || !processClosed) {
+		return fmt.Errorf("resource delete action lacks closure")
+	}
 	return nil
+}
+
+func hasResourceAction(values []ResourceAction, wanted ResourceAction) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func validateConnectorObservation(value ConnectorObservation) error {
@@ -577,7 +683,7 @@ func validateRouteEvidence(value RouteEvidence) error {
 }
 
 func validateTargetObservation(value TargetObservation) error {
-	if !validEvidenceStatus(value.Validity) || value.ObservedAt.IsZero() || value.HTTPStatus > 599 || !validFailure(value.Failure) || value.Validity == EvidenceFresh && (!value.PortConnected || !value.HTTPReady || value.WebSocketRequired && !value.WebSocketReady || value.Failure != FailureNone) || value.WebSocketReady && !value.HTTPReady || value.HTTPReady && value.HTTPStatus < 100 {
+	if !validEvidenceStatus(value.Validity) || value.ObservedAt.IsZero() || value.HTTPStatus > 599 || !validFailure(value.Failure) || value.Validity == EvidenceFresh && (!value.PortConnected || !value.HTTPReady || value.WebSocketRequired && !value.WebSocketReady || value.Failure != FailureNone) || value.Validity == EvidenceUnreachable && value.Failure == FailureNone || value.WebSocketReady && !value.HTTPReady || value.HTTPReady && value.HTTPStatus < 100 {
 		return fmt.Errorf("target observation is invalid")
 	}
 	if value.RouteIdentity != "" && !validSHA256Digest(value.RouteIdentity) {

@@ -159,58 +159,13 @@ func loadInstalledReleaseIdentity() (release.InstallIdentity, error) {
 	return readCommittedReleaseIdentity()
 }
 
-func verifyFreshTailnetTarget(ctx context.Context, resource domain.AppResource) error {
-	if resource.Target.Kind != domain.AppTargetTailnetHTTP || resource.Target.TailnetHTTP == nil {
-		return fmt.Errorf("tailnet target authority is missing")
-	}
-	verified, err := VerifyConnector(ctx, nil, nil)
-	if err != nil {
-		return err
-	}
-	address, err := netip.ParseAddr(resource.Target.TailnetHTTP.IP)
-	if err != nil {
-		return err
-	}
-	if err := managedconnector.VerifyPeer(verified.Observation, address, time.Now().UTC()); err != nil {
-		return err
-	}
-	source, err := netip.ParseAddr(resource.Target.TailnetHTTP.SourceIP)
-	if err != nil || !slices.Contains(verified.Observation.LocalIPs, source) {
-		return fmt.Errorf("tailnet source IP is not a fresh local connector identity")
-	}
-	return nil
-}
-
 func probeResourceTarget(ctx context.Context, resource domain.AppResource) (target.Evidence, error) {
 	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
 		verified, err := VerifyConnector(ctx, nil, nil)
 		if err != nil {
 			return target.Evidence{}, err
 		}
-		address, err := netip.ParseAddr(resource.Target.TailnetHTTP.IP)
-		if err != nil {
-			return target.Evidence{}, err
-		}
-		if err := managedconnector.VerifyPeer(verified.Observation, address, time.Now().UTC()); err != nil {
-			return target.Evidence{}, err
-		}
-		source, sourceErr := netip.ParseAddr(resource.Target.TailnetHTTP.SourceIP)
-		if sourceErr != nil || !slices.Contains(verified.Observation.LocalIPs, source) {
-			return target.Evidence{}, fmt.Errorf("tailnet source IP is not a fresh local connector identity")
-		}
-		endpointIdentity := tailnetEndpointIdentity(verified.Observation, source, address, resource.Target.TailnetHTTP.Port)
-		accessMode := domain.AppAccessPublic
-		hostName := "lanpanel-target.invalid"
-		if resource.Publication.DomainHTTPS != nil {
-			accessMode = resource.Publication.DomainHTTPS.AccessMode
-			hostName = resource.Publication.DomainHTTPS.CanonicalDomain
-		}
-		request := target.ProbeRequest{ResourceID: resource.ID, ConfigDigest: resource.CurrentConfigDigest, EndpointIdentity: endpointIdentity, Target: resource.Target, AccessMode: accessMode, Host: hostName}
-		transport, err := target.NewTailnetTransport(address.String(), resource.Target.TailnetHTTP.SourceIP, resource.Target.TailnetHTTP.Port, endpointIdentity)
-		if err != nil {
-			return target.Evidence{}, err
-		}
-		return target.Probe(ctx, request, transport)
+		return probeTailnetResourceTarget(ctx, resource, verified.Observation)
 	}
 	if resource.ManagedProcess == nil {
 		return target.Evidence{}, fmt.Errorf("local target managed process missing")
@@ -257,6 +212,36 @@ func probeResourceTarget(ctx context.Context, resource domain.AppResource) (targ
 		return target.Probe(ctx, request, transport)
 	}
 	transport, err := target.NewUnixTransport(bundle.FrontendEndpoint, endpointIdentity, bundle.FrontendUID, bundle.FrontendGID, bundle.FrontendMode)
+	if err != nil {
+		return target.Evidence{}, err
+	}
+	return target.Probe(ctx, request, transport)
+}
+
+func probeTailnetResourceTarget(ctx context.Context, resource domain.AppResource, observation managedconnector.Observation) (target.Evidence, error) {
+	if resource.Target.Kind != domain.AppTargetTailnetHTTP || resource.Target.TailnetHTTP == nil {
+		return target.Evidence{}, fmt.Errorf("tailnet target authority is missing")
+	}
+	address, err := netip.ParseAddr(resource.Target.TailnetHTTP.IP)
+	if err != nil {
+		return target.Evidence{}, err
+	}
+	if err := managedconnector.VerifyPeer(observation, address, time.Now().UTC()); err != nil {
+		return target.Evidence{}, err
+	}
+	source, sourceErr := netip.ParseAddr(resource.Target.TailnetHTTP.SourceIP)
+	if sourceErr != nil || !slices.Contains(observation.LocalIPs, source) {
+		return target.Evidence{}, fmt.Errorf("tailnet source IP is not a fresh local connector identity")
+	}
+	endpointIdentity := tailnetEndpointIdentity(observation, source, address, resource.Target.TailnetHTTP.Port)
+	accessMode := domain.AppAccessPublic
+	hostName := "lanpanel-target.invalid"
+	if resource.Publication.DomainHTTPS != nil {
+		accessMode = resource.Publication.DomainHTTPS.AccessMode
+		hostName = resource.Publication.DomainHTTPS.CanonicalDomain
+	}
+	request := target.ProbeRequest{ResourceID: resource.ID, ConfigDigest: resource.CurrentConfigDigest, EndpointIdentity: endpointIdentity, Target: resource.Target, AccessMode: accessMode, Host: hostName}
+	transport, err := target.NewTailnetTransport(address.String(), resource.Target.TailnetHTTP.SourceIP, resource.Target.TailnetHTTP.Port, endpointIdentity)
 	if err != nil {
 		return target.Evidence{}, err
 	}

@@ -53,7 +53,7 @@ func TestNestedResourceMutationUnknownAndDuplicateFieldsAreRejected(t *testing.T
 	if _, _, err := ReadRequest(bytes.NewReader(payload)); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("nested unknown field error=%v", err)
 	}
-	if strings.Contains(string(wire.Bytes()), "managed_process") {
+	if strings.Contains(wire.String(), "managed_process") {
 		t.Fatal("typed mutation wire contains process authority")
 	}
 }

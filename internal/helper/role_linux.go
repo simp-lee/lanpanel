@@ -809,11 +809,12 @@ func RunRole(args []string) error {
 			if request.Target != "installation" || request.Resource.Create == nil {
 				return ExecutionResult{}, fmt.Errorf("resource create target or payload is invalid")
 			}
-			if request.Resource.Create.TargetKind == domain.AppTargetTailnetHTTP {
+			switch request.Resource.Create.TargetKind {
+			case domain.AppTargetTailnetHTTP:
 				candidate, err = resource.NewTailnet(resource.TailnetSpecFromRequest(*request.Resource.Create.Tailnet), nil)
-			} else if request.Resource.Create.TargetKind == domain.AppTargetLocalHTTP {
+			case domain.AppTargetLocalHTTP:
 				candidate, err = resource.NewLocal(resource.LocalSpecFromRequest(*request.Resource.Create.Local), nil)
-			} else {
+			default:
 				return ExecutionResult{}, fmt.Errorf("resource create target kind is invalid")
 			}
 		case "resource_update":

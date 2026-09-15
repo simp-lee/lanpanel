@@ -6,9 +6,38 @@ import (
 	"context"
 	"fmt"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/jobs"
+	"lanpanel/internal/persist"
+	"net/netip"
 	"sort"
 	"time"
 )
+
+type ResourceStatusEvidence struct {
+	NginxHealthy         bool
+	NginxGeneration      string
+	ManifestContains     bool
+	NginxFailure         domain.ResourceFailureCategory
+	NginxFenced          bool
+	ProcessStatus        domain.ResourceProcessStatus
+	ProcessFailure       domain.ResourceFailureCategory
+	ConnectorObservation *domain.ConnectorObservation
+	ConnectorFailure     domain.ResourceFailureCategory
+	RouteEvidence        *domain.RouteEvidence
+	RouteFailure         domain.ResourceFailureCategory
+	TargetObservation    *domain.TargetObservation
+	TargetFailure        domain.ResourceFailureCategory
+	PublicationFailure   domain.ResourceFailureCategory
+	SourceChecked        bool
+	SourceHealthy        bool
+	SourceFailure        domain.ResourceFailureCategory
+	CertificateChecked   bool
+	CertificateHealthy   bool
+	CertificateFailure   domain.ResourceFailureCategory
+	JobPending           bool
+	JobID                string
+	LastOperation        domain.OperationCode
+}
 
 // ReadResourceStatus returns the fixed, non-secret status projection for one
 // resource. Runtime probes are intentionally owned by the status coordinator;
@@ -41,7 +70,13 @@ func ReadResourceStatus(ctx context.Context, resourceID string) (domain.Resource
 	if resource == nil {
 		return domain.ResourceStatusResult{}, fmt.Errorf("resource %q does not exist", resourceID)
 	}
-	return ProjectResourceStatus(*resource, time.Now().UTC())
+	probeStartedAt := time.Now().UTC()
+	manifest, nginxHealthy, nginxFailure, nginxFenced := observeNginxStatusForResource(ctx, service, installation)
+	evidence := observeTypedResourceEvidence(ctx, *resource, probeStartedAt, manifest, nginxHealthy, nil)
+	evidence.JobPending, evidence.JobID, evidence.LastOperation = observeResourceJob(document, *resource)
+	evidence.NginxFailure = nginxFailure
+	evidence.NginxFenced = nginxFenced
+	return ProjectObservedResourceStatus(*resource, time.Now().UTC(), evidence)
 }
 
 // ReadResourceStatusCatalog returns typed status entries without reading an
@@ -63,16 +98,23 @@ func ReadResourceStatusCatalog(ctx context.Context) (domain.ResourceStatusCatalo
 	if err != nil {
 		return domain.ResourceStatusCatalog{}, err
 	}
-	observedAt := time.Now().UTC()
-	catalog := domain.ResourceStatusCatalog{InstallationID: installation.InstallationID, ObservedAt: observedAt}
+	probeStartedAt := time.Now().UTC()
+	manifest, nginxHealthy, nginxFailure, nginxFenced := observeNginxStatusForResource(ctx, service, installation)
+	connectorCache := &typedConnectorCache{}
+	catalog := domain.ResourceStatusCatalog{InstallationID: installation.InstallationID, Resources: []domain.ResourceStatusResult{}}
 	for _, resource := range installation.Resources {
-		status, statusErr := ProjectResourceStatus(resource, observedAt)
+		evidence := observeTypedResourceEvidence(ctx, resource, probeStartedAt, manifest, nginxHealthy, connectorCache)
+		evidence.JobPending, evidence.JobID, evidence.LastOperation = observeResourceJob(document, resource)
+		evidence.NginxFailure = nginxFailure
+		evidence.NginxFenced = nginxFenced
+		status, statusErr := ProjectObservedResourceStatus(resource, time.Now().UTC(), evidence)
 		if statusErr != nil {
 			return domain.ResourceStatusCatalog{}, statusErr
 		}
 		catalog.Resources = append(catalog.Resources, status)
 	}
 	sort.Slice(catalog.Resources, func(i, j int) bool { return catalog.Resources[i].ResourceID < catalog.Resources[j].ResourceID })
+	catalog.ObservedAt = time.Now().UTC()
 	if err := domain.ValidateResourceStatusCatalog(catalog); err != nil {
 		return domain.ResourceStatusCatalog{}, err
 	}
@@ -93,7 +135,7 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		TargetKind:          resource.Target.Kind,
 		OverallStatus:       domain.ResourceStatusUnknown,
 		ConfigurationStatus: domain.ConfigurationComplete,
-		PublicationStatus:   projectPublicationStatus(resource.PublicationRecord.State),
+		PublicationStatus:   projectPublicationStatus(resource.PublicationRecord),
 		FailureCategory:     domain.FailureEvidenceMissing,
 		LastOperation:       resource.PublicationRecord.LastOperation,
 		AffectedObject:      "resource/" + resource.ID,
@@ -103,7 +145,9 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		ObservedAt:          observedAt.UTC(),
 	}
 	result.AuthorityDigest = domain.ResourceStatusAuthorityDigest(result.ResourceID, result.ConfigDigest)
-	if resource.ManagedProcess != nil {
+	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil {
+		result.ProcessRequestedStatus = projectProcessRequestedStatus(*resource.ManagedProcess)
+		result.ProcessObservedStatus = domain.ProcessUnknown
 		result.ProcessStatus = projectProcessStatus(*resource.ManagedProcess)
 		if result.LastOperation == "" {
 			result.LastOperation = resource.ManagedProcess.LastOperation
@@ -112,7 +156,13 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 			result.JobID = resource.ManagedProcess.LastJobID
 		}
 	} else {
+		result.ProcessRequestedStatus = domain.ProcessNotApplicable
+		result.ProcessObservedStatus = domain.ProcessNotApplicable
 		result.ProcessStatus = domain.ProcessNotApplicable
+		if resource.Target.Kind == domain.AppTargetTailnetHTTP && resource.ManagedProcess != nil {
+			result.ConfigurationStatus = domain.ConfigurationInvalid
+			result.FailureCategory = domain.FailureConfiguration
+		}
 	}
 	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
 		result.ConnectorStatus = domain.EvidenceUnverified
@@ -124,10 +174,10 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 			result.FailureCategory = domain.FailureConfiguration
 			result.OverallStatus = domain.ResourceStatusUnknown
 		} else {
-			result.TargetPeerIP = resource.Target.TailnetHTTP.IP
-			result.TargetSourceIP = resource.Target.TailnetHTTP.SourceIP
+			result.TargetPeerIP = canonicalStatusIP(resource.Target.TailnetHTTP.IP)
+			result.TargetSourceIP = canonicalStatusIP(resource.Target.TailnetHTTP.SourceIP)
 			result.TargetPort = resource.Target.TailnetHTTP.Port
-			result.RouteEvidence = &domain.RouteEvidence{PeerIP: resource.Target.TailnetHTTP.IP, SourceIP: resource.Target.TailnetHTTP.SourceIP, Port: resource.Target.TailnetHTTP.Port, Validity: domain.EvidenceUnverified, Failure: domain.FailureEvidenceMissing}
+			result.RouteEvidence = &domain.RouteEvidence{PeerIP: result.TargetPeerIP, SourceIP: result.TargetSourceIP, Port: result.TargetPort, Validity: domain.EvidenceUnverified, Failure: domain.FailureEvidenceMissing}
 		}
 		result.TargetObservation = &domain.TargetObservation{WebSocketRequired: resource.Target.WebSocket.Enabled, Validity: domain.EvidenceUnknown, ObservedAt: observedAt.UTC(), Failure: domain.FailureEvidenceMissing}
 		result.NextStep = "verify the connector, route, and fixed remote target before publishing"
@@ -137,22 +187,380 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		result.TargetStatus = domain.EvidenceUnknown
 		result.TargetObservation = &domain.TargetObservation{WebSocketRequired: resource.Target.WebSocket.Enabled, Validity: domain.EvidenceUnknown, ObservedAt: observedAt.UTC(), Failure: domain.FailureEvidenceMissing}
 	}
+	if result.PublicationStatus == domain.PublicationStatusPublished && resource.PublicationRecord.LastAppliedBundle != nil && (resource.PublicationRecord.LastAppliedDigest == nil || *resource.PublicationRecord.LastAppliedDigest != resource.PublicationRecord.LastAppliedBundle.ConfigDigest || resource.CurrentConfigDigest != resource.PublicationRecord.LastAppliedBundle.ConfigDigest) {
+		result.ConfigurationStatus = domain.ConfigurationUnknown
+		result.FailureCategory = domain.FailureAuthorityConflict
+		result.NextStep = "republish the current configuration after a fresh preflight"
+	}
+	result.AllowedActions = projectResourceActions(resource, result)
 	if err := domain.ValidateResourceStatusResult(result); err != nil {
 		return domain.ResourceStatusResult{}, err
 	}
 	return result, nil
 }
 
-func projectPublicationStatus(value domain.PublicationState) domain.ResourcePublicationStatus {
-	switch value {
+// ProjectObservedResourceStatus combines the durable resource authority with
+// independently collected evidence. It never interprets a missing probe as a
+// successful observation.
+func ProjectObservedResourceStatus(resource domain.AppResource, observedAt time.Time, evidence ResourceStatusEvidence) (domain.ResourceStatusResult, error) {
+	result, err := ProjectResourceStatus(resource, observedAt)
+	if err != nil {
+		return domain.ResourceStatusResult{}, err
+	}
+	if evidence.JobID != "" {
+		result.JobID = evidence.JobID
+	}
+	if evidence.LastOperation != "" {
+		result.LastOperation = evidence.LastOperation
+	}
+	if evidence.JobPending {
+		result.JobPending = true
+		result.NextStep = "wait for the current Job to finish, then refresh status"
+	}
+	if evidence.ProcessStatus != "" {
+		result.ProcessObservedStatus = evidence.ProcessStatus
+		result.ProcessStatus = evidence.ProcessStatus
+	} else if resource.Target.Kind == domain.AppTargetLocalHTTP && result.ProcessRequestedStatus != domain.ProcessNotApplicable {
+		result.ProcessObservedStatus = domain.ProcessUnknown
+		if hasStatusFailure(evidence.ProcessFailure) {
+			result.ProcessStatus = domain.ProcessUnknown
+			result.FailureCategory = evidence.ProcessFailure
+		}
+	}
+	if hasStatusFailure(evidence.NginxFailure) {
+		result.FailureCategory = evidence.NginxFailure
+	}
+	if evidence.NginxFenced {
+		result.PublicationStatus = domain.PublicationStatusFenced
+		result.FailureCategory = domain.FailurePublication
+	}
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP {
+		projectTailnetEvidence(&result, evidence)
+	} else {
+		projectLocalEvidence(&result, resource, evidence)
+	}
+	if evidence.NginxFenced {
+		result.PublicationStatus = domain.PublicationStatusFenced
+		result.FailureCategory = domain.FailurePublication
+	} else if hasStatusFailure(evidence.NginxFailure) {
+		result.FailureCategory = evidence.NginxFailure
+	}
+	runtimeObserved := resource.Target.Kind == domain.AppTargetTailnetHTTP && result.ProcessStatus == domain.ProcessNotApplicable || resource.Target.Kind == domain.AppTargetLocalHTTP && (result.ProcessStatus == domain.ProcessRunning || result.ProcessStatus == domain.ProcessStopped)
+	if result.FailureCategory == domain.FailureEvidenceMissing && evidence.NginxHealthy && evidence.ManifestContains && result.TargetStatus == domain.EvidenceFresh && publicationEvidenceHealthy(result, evidence) {
+		result.FailureCategory = domain.FailureNone
+	}
+	if !result.JobPending && result.PublicationStatus == domain.PublicationStatusUnpublished && runtimeObserved && evidence.NginxHealthy && !hasStatusFailure(evidence.NginxFailure) && !evidence.NginxFenced && !evidence.ManifestContains {
+		result.ClosureVerified = true
+		result.ClosureDigest = digestLifecycle(struct {
+			ResourceID      string
+			ConfigDigest    string
+			NginxGeneration string
+		}{resource.ID, resource.CurrentConfigDigest, evidence.NginxGeneration})
+		result.ClosureObservedAt = result.ObservedAt
+		result.NextStep = "start or publish explicitly when the resource is ready"
+	}
+	result.OverallStatus = projectOverallStatus(resource, result, evidence)
+	if !result.JobPending {
+		result.NextStep = projectStatusNextStep(result)
+	}
+	if result.OverallStatus == domain.ResourceStatusDegraded && (result.FailureCategory == domain.FailureEvidenceMissing || result.FailureCategory == domain.FailureNone) {
+		result.FailureCategory = domain.FailureEvidenceMismatch
+	}
+	if result.OverallStatus == domain.ResourceStatusHealthy || result.OverallStatus == domain.ResourceStatusClosed {
+		result.FailureCategory = domain.FailureNone
+	} else if result.OverallStatus == domain.ResourceStatusUnknown && result.FailureCategory == domain.FailureNone {
+		if result.JobPending {
+			result.FailureCategory = domain.FailureOperation
+		} else {
+			result.FailureCategory = domain.FailureEvidenceMissing
+		}
+	}
+	result.AllowedActions = projectResourceActions(resource, result)
+	if err := domain.ValidateResourceStatusResult(result); err != nil {
+		return domain.ResourceStatusResult{}, err
+	}
+	return result, nil
+}
+
+func canonicalStatusIP(value string) string {
+	address, err := netip.ParseAddr(value)
+	if err != nil {
+		return value
+	}
+	return address.String()
+}
+
+func observeResourceJob(document persist.Document, resource domain.AppResource) (bool, string, domain.OperationCode) {
+	ids := make([]string, 0, 2)
+	if resource.PublicationRecord.LastJobID != "" {
+		ids = append(ids, resource.PublicationRecord.LastJobID)
+	}
+	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil && resource.ManagedProcess.LastJobID != "" && (len(ids) == 0 || ids[0] != resource.ManagedProcess.LastJobID) {
+		ids = append(ids, resource.ManagedProcess.LastJobID)
+	}
+	var latest jobs.Record
+	for _, id := range ids {
+		record, err := jobs.LoadEntries(document.Entries, id)
+		if err != nil || latest.ID != "" && !record.StartedAt.After(latest.StartedAt) {
+			continue
+		}
+		latest = record
+	}
+	if latest.ID == "" {
+		return false, "", ""
+	}
+	return latest.Status == jobs.StatusReserved || latest.Status == jobs.StatusRunning, latest.ID, domain.OperationCode(latest.Operation)
+}
+
+func hasStatusFailure(value domain.ResourceFailureCategory) bool {
+	return value != "" && value != domain.FailureNone
+}
+
+func projectLocalEvidence(result *domain.ResourceStatusResult, resource domain.AppResource, evidence ResourceStatusEvidence) {
+	if evidence.TargetObservation != nil {
+		result.TargetObservation = evidence.TargetObservation
+		result.TargetStatus = evidence.TargetObservation.Validity
+	} else if hasStatusFailure(evidence.TargetFailure) {
+		result.TargetStatus = domain.EvidenceUnreachable
+		result.TargetObservation = &domain.TargetObservation{WebSocketRequired: resource.Target.WebSocket.Enabled, Validity: domain.EvidenceUnreachable, ObservedAt: result.ObservedAt, Failure: evidence.TargetFailure}
+	}
+	if evidence.SourceChecked {
+		if evidence.SourceHealthy && result.FailureCategory == domain.FailureEvidenceMissing {
+			result.FailureCategory = domain.FailureNone
+		} else if !evidence.SourceHealthy && hasStatusFailure(evidence.SourceFailure) {
+			result.FailureCategory = evidence.SourceFailure
+		}
+	}
+	if evidence.CertificateChecked && !evidence.CertificateHealthy && hasStatusFailure(evidence.CertificateFailure) {
+		result.FailureCategory = evidence.CertificateFailure
+	}
+	if hasStatusFailure(evidence.PublicationFailure) {
+		result.FailureCategory = evidence.PublicationFailure
+	}
+	if hasStatusFailure(evidence.ProcessFailure) {
+		result.FailureCategory = evidence.ProcessFailure
+	}
+	if hasStatusFailure(evidence.TargetFailure) {
+		result.FailureCategory = evidence.TargetFailure
+	}
+	if evidence.TargetObservation != nil && hasStatusFailure(evidence.TargetObservation.Failure) {
+		result.FailureCategory = evidence.TargetObservation.Failure
+	}
+}
+
+func projectTailnetEvidence(result *domain.ResourceStatusResult, evidence ResourceStatusEvidence) {
+	if evidence.ConnectorObservation != nil {
+		result.ConnectorObservation = evidence.ConnectorObservation
+		switch evidence.ConnectorObservation.Validity {
+		case domain.ConnectorObservationFresh:
+			result.ConnectorStatus = domain.EvidenceFresh
+		case domain.ConnectorObservationExpired:
+			result.ConnectorStatus = domain.EvidenceExpired
+		default:
+			result.ConnectorStatus = domain.EvidenceUnknown
+		}
+	} else if evidence.ConnectorFailure == domain.FailureConnectorDown {
+		result.ConnectorStatus = domain.EvidenceUnreachable
+		result.ConnectorObservation = &domain.ConnectorObservation{Validity: domain.ConnectorObservationMissing}
+	} else if hasStatusFailure(evidence.ConnectorFailure) {
+		result.ConnectorStatus = domain.EvidenceUnknown
+		result.ConnectorObservation = &domain.ConnectorObservation{Validity: domain.ConnectorObservationMissing}
+	}
+	if evidence.RouteEvidence != nil {
+		result.RouteEvidence = evidence.RouteEvidence
+		result.RouteStatus = evidence.RouteEvidence.Validity
+	} else if hasStatusFailure(evidence.RouteFailure) {
+		result.RouteStatus = domain.EvidenceUnknown
+		validity := domain.EvidenceUnknown
+		var connectorIdentity, routeIdentity string
+		if (evidence.RouteFailure == domain.FailureRouteDown || evidence.RouteFailure == domain.FailurePeerOffline) && result.ConnectorStatus == domain.EvidenceFresh && result.ConnectorObservation != nil {
+			connectorIdentity = domain.TailnetConnectorIdentity(result.ConnectorObservation.ControlURL, result.ConnectorObservation.ClientVersion, result.ConnectorObservation.ClientIdentityDigest, result.ConnectorObservation.LocalIdentityDigest)
+			routeIdentity = domain.TailnetRouteIdentity(connectorIdentity, result.TargetPeerIP, result.TargetSourceIP, result.TargetPort)
+			validity = domain.EvidenceUnreachable
+			result.RouteStatus = validity
+		}
+		result.RouteEvidence = &domain.RouteEvidence{PeerIP: result.TargetPeerIP, SourceIP: result.TargetSourceIP, Port: result.TargetPort, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: validity, ObservedAt: func() time.Time {
+			if validity == domain.EvidenceUnreachable {
+				return result.ObservedAt
+			}
+			return time.Time{}
+		}(), ValidUntil: func() time.Time {
+			if validity == domain.EvidenceUnreachable {
+				return result.ObservedAt
+			}
+			return time.Time{}
+		}(), Failure: evidence.RouteFailure}
+	}
+	if evidence.TargetObservation != nil {
+		result.TargetObservation = evidence.TargetObservation
+		result.TargetStatus = evidence.TargetObservation.Validity
+	} else if hasStatusFailure(evidence.TargetFailure) {
+		result.TargetStatus = domain.EvidenceUnreachable
+		result.TargetObservation = &domain.TargetObservation{Validity: domain.EvidenceUnreachable, ObservedAt: result.ObservedAt, Failure: evidence.TargetFailure}
+	}
+	result.FailureCategory = selectTailnetFailure(evidence, *result)
+}
+
+func selectTailnetFailure(evidence ResourceStatusEvidence, result domain.ResourceStatusResult) domain.ResourceFailureCategory {
+	routeFailure := evidence.RouteFailure
+	if result.RouteEvidence != nil && hasStatusFailure(result.RouteEvidence.Failure) {
+		routeFailure = result.RouteEvidence.Failure
+	}
+	targetFailure := evidence.TargetFailure
+	if result.TargetObservation != nil && hasStatusFailure(result.TargetObservation.Failure) {
+		targetFailure = result.TargetObservation.Failure
+	}
+	for _, failure := range []domain.ResourceFailureCategory{evidence.ConnectorFailure, routeFailure, targetFailure} {
+		if failure == domain.FailureConnectorDown || failure == domain.FailureRouteDown || failure == domain.FailurePeerOffline || failure == domain.FailureTargetDown {
+			return failure
+		}
+	}
+	for _, failure := range []domain.ResourceFailureCategory{evidence.NginxFailure, evidence.ConnectorFailure, routeFailure, targetFailure, evidence.SourceFailure, evidence.CertificateFailure, evidence.PublicationFailure} {
+		if hasStatusFailure(failure) {
+			return failure
+		}
+	}
+	return result.FailureCategory
+}
+
+func projectOverallStatus(resource domain.AppResource, result domain.ResourceStatusResult, evidence ResourceStatusEvidence) domain.ResourceStatusOverall {
+	if result.JobPending {
+		return domain.ResourceStatusUnknown
+	}
+	if result.PublicationStatus != domain.PublicationStatusPublished {
+		if result.ClosureVerified {
+			return domain.ResourceStatusClosed
+		}
+		return domain.ResourceStatusUnknown
+	}
+	if resource.Target.Kind == domain.AppTargetTailnetHTTP && tailnetNetworkUnreachable(result, evidence) {
+		return domain.ResourceStatusUnreachable
+	}
+	processHealthy := result.TargetKind == domain.AppTargetTailnetHTTP && result.ProcessStatus == domain.ProcessNotApplicable || result.TargetKind == domain.AppTargetLocalHTTP && result.ProcessStatus == domain.ProcessRunning
+	if result.ConfigurationStatus == domain.ConfigurationComplete && result.FailureCategory == domain.FailureNone && evidence.NginxHealthy && evidence.ManifestContains && processHealthy && result.TargetStatus == domain.EvidenceFresh && publicationEvidenceHealthy(result, evidence) {
+		return domain.ResourceStatusHealthy
+	}
+	if evidence.NginxFailure == domain.FailureEvidenceMismatch || evidence.ConnectorFailure == domain.FailureEvidenceMismatch || evidence.RouteFailure == domain.FailureEvidenceMismatch || evidence.TargetFailure == domain.FailureEvidenceMismatch || result.RouteEvidence != nil && result.RouteEvidence.Failure == domain.FailureEvidenceMismatch || result.TargetObservation != nil && result.TargetObservation.Failure == domain.FailureEvidenceMismatch || result.FailureCategory == domain.FailureAuthorityMissing || result.FailureCategory == domain.FailureAuthorityConflict || result.FailureCategory == domain.FailureEvidenceMissing || result.FailureCategory == domain.FailureEvidenceExpired || result.FailureCategory == domain.FailurePublication || result.FailureCategory == domain.FailureOperation {
+		return domain.ResourceStatusUnknown
+	}
+	if result.ConfigurationStatus == domain.ConfigurationUnknown || result.ConfigurationStatus == domain.ConfigurationInvalid || result.PublicationStatus == domain.PublicationStatusUnknown || result.PublicationStatus == domain.PublicationStatusActivating || result.PublicationStatus == domain.PublicationStatusContracting || result.ProcessStatus == domain.ProcessUnknown || result.ProcessStatus == domain.ProcessStarting || result.ProcessStatus == domain.ProcessStopping || result.TargetStatus == domain.EvidenceUnknown || result.TargetStatus == domain.EvidenceExpired || resource.Target.Kind == domain.AppTargetTailnetHTTP && (result.ConnectorStatus == domain.EvidenceUnknown || result.ConnectorStatus == domain.EvidenceExpired || result.RouteStatus == domain.EvidenceUnknown || result.RouteStatus == domain.EvidenceExpired) {
+		return domain.ResourceStatusUnknown
+	}
+	return domain.ResourceStatusDegraded
+}
+
+func projectStatusNextStep(result domain.ResourceStatusResult) string {
+	switch result.OverallStatus {
+	case domain.ResourceStatusClosed:
+		return "resource is closed; start or publish explicitly when ready"
+	case domain.ResourceStatusHealthy:
+		return "no action is required; refresh status to recheck evidence"
+	case domain.ResourceStatusDegraded:
+		return "review the failure category and remediate before republishing"
+	case domain.ResourceStatusUnreachable:
+		return "restore fixed connector, route, or target reachability, then refresh status"
+	default:
+		return "refresh status and resolve missing, stale, or conflicting evidence"
+	}
+}
+
+func tailnetNetworkUnreachable(result domain.ResourceStatusResult, evidence ResourceStatusEvidence) bool {
+	if result.ConnectorStatus == domain.EvidenceUnreachable && evidence.ConnectorFailure == domain.FailureConnectorDown {
+		return true
+	}
+	if result.RouteStatus == domain.EvidenceUnreachable {
+		failure := evidence.RouteFailure
+		if result.RouteEvidence != nil {
+			failure = result.RouteEvidence.Failure
+		}
+		if failure == domain.FailureRouteDown || failure == domain.FailurePeerOffline {
+			return true
+		}
+	}
+	if result.TargetStatus == domain.EvidenceUnreachable {
+		failure := evidence.TargetFailure
+		if result.TargetObservation != nil {
+			failure = result.TargetObservation.Failure
+		}
+		return failure == domain.FailureTargetDown
+	}
+	return false
+}
+
+func publicationEvidenceHealthy(result domain.ResourceStatusResult, evidence ResourceStatusEvidence) bool {
+	if result.TargetKind == domain.AppTargetTailnetHTTP && (result.ConnectorStatus != domain.EvidenceFresh || result.RouteStatus != domain.EvidenceFresh) {
+		return false
+	}
+	if hasStatusFailure(evidence.PublicationFailure) || evidence.SourceChecked && !evidence.SourceHealthy || evidence.CertificateChecked && !evidence.CertificateHealthy {
+		return false
+	}
+	return true
+}
+
+func projectResourceActions(resource domain.AppResource, status domain.ResourceStatusResult) []domain.ResourceAction {
+	if status.JobPending {
+		return []domain.ResourceAction{domain.ResourceActionRefresh}
+	}
+	if status.PublicationStatus == domain.PublicationStatusUnknown || status.PublicationStatus == domain.PublicationStatusActivating || status.PublicationStatus == domain.PublicationStatusContracting || status.PublicationStatus == domain.PublicationStatusFenced {
+		return []domain.ResourceAction{domain.ResourceActionRefresh}
+	}
+	actions := []domain.ResourceAction{domain.ResourceActionRefresh}
+	if status.PublicationStatus != domain.PublicationStatusActivating && status.PublicationStatus != domain.PublicationStatusContracting && status.PublicationStatus != domain.PublicationStatusFenced {
+		actions = append(actions, domain.ResourceActionEdit)
+	}
+	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil {
+		switch status.ProcessRequestedStatus {
+		case domain.ProcessRequestedRun:
+			if status.ProcessObservedStatus == domain.ProcessRunning {
+				actions = append(actions, domain.ResourceActionStop)
+			}
+		case domain.ProcessRequestedStop:
+			if status.ProcessObservedStatus == domain.ProcessStopped {
+				actions = append(actions, domain.ResourceActionStart)
+			}
+		}
+	}
+	if status.PublicationStatus == domain.PublicationStatusPublished {
+		actions = append(actions, domain.ResourceActionUnpublish)
+		if status.OverallStatus == domain.ResourceStatusHealthy || status.OverallStatus == domain.ResourceStatusDegraded {
+			actions = append(actions, domain.ResourceActionRepublish)
+		}
+	} else if status.OverallStatus == domain.ResourceStatusClosed && status.PublicationStatus == domain.PublicationStatusUnpublished && (resource.Target.Kind == domain.AppTargetLocalHTTP && status.ProcessStatus == domain.ProcessRunning && status.TargetStatus == domain.EvidenceFresh || resource.Target.Kind == domain.AppTargetTailnetHTTP && status.ConnectorStatus == domain.EvidenceFresh && status.RouteStatus == domain.EvidenceFresh && status.TargetStatus == domain.EvidenceFresh) {
+		actions = append(actions, domain.ResourceActionPublish)
+	}
+	processClosed := status.TargetKind == domain.AppTargetTailnetHTTP && status.ProcessStatus == domain.ProcessNotApplicable || status.TargetKind == domain.AppTargetLocalHTTP && status.ProcessStatus == domain.ProcessStopped
+	if status.ClosureVerified && status.PublicationStatus == domain.PublicationStatusUnpublished && processClosed {
+		actions = append(actions, domain.ResourceActionDelete)
+	}
+	sort.Slice(actions, func(i, j int) bool { return actions[i] < actions[j] })
+	return actions
+}
+
+func projectPublicationStatus(value domain.PublicationRecord) domain.ResourcePublicationStatus {
+	if value.ActivationIntent != nil {
+		return domain.PublicationStatusActivating
+	}
+	if value.ContractionIntent != nil {
+		return domain.PublicationStatusContracting
+	}
+	switch value.State {
 	case domain.PublicationPublished:
 		return domain.PublicationStatusPublished
 	case domain.PublicationUnpublished:
 		return domain.PublicationStatusUnpublished
-	case domain.PublicationActivating:
-		return domain.PublicationStatusActivating
 	default:
 		return domain.PublicationStatusUnknown
+	}
+}
+
+func projectProcessRequestedStatus(value domain.ManagedProcess) domain.ResourceProcessStatus {
+	switch value.Requested {
+	case domain.ProcessRequestedRunning:
+		return domain.ProcessRequestedRun
+	case domain.ProcessRequestedStopped:
+		return domain.ProcessRequestedStop
+	default:
+		return domain.ProcessUnknown
 	}
 }
 

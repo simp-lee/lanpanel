@@ -272,6 +272,45 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 	return result, nil
 }
 
+func observeNginxStatusForResource(ctx context.Context, service *FixedService, installation domain.Installation) (nginx.Manifest, bool, domain.ResourceFailureCategory, bool) {
+	if service == nil {
+		return nginx.Manifest{}, false, domain.FailureAuthorityMissing, false
+	}
+	state, err := service.safety.Read()
+	if err != nil {
+		return nginx.Manifest{}, false, domain.FailureAuthorityMissing, false
+	}
+	installed, err := loadInstalledReleaseIdentity()
+	if err != nil {
+		return nginx.Manifest{}, false, domain.FailureAuthorityMissing, false
+	}
+	if err := verifyInstalledPackageProfile(ctx, installed.Profile); err != nil {
+		return nginx.Manifest{}, false, domain.FailureAuthorityConflict, false
+	}
+	manifest, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+	if err != nil {
+		return manifest, false, domain.FailureEvidenceMismatch, false
+	}
+	listeners := expectedNginxRuntimeListeners(manifest)
+	snapshot, err := (closure.ProcObserver{UnitCgroup: "/system.slice/lanpanel-nginx.service", Executable: "/usr/sbin/nginx", ExpectedArgv: "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;", PIDPath: nginx.FixedPaths().PIDPath, Generation: manifest.GenerationID, OwnedListeners: listeners}).Observe(ctx)
+	if err != nil || closure.VerifyServing(snapshot, manifest.GenerationID, listeners) != nil {
+		return manifest, false, domain.FailureEvidenceMismatch, false
+	}
+	ownershipAuthority, err := fixedOwnershipAuthority(service.ownership)
+	if err != nil {
+		return manifest, false, domain.FailureAuthorityConflict, false
+	}
+	decision := nginx.Guard(nginx.GuardInput{Action: nginx.GuardStart, Manifest: manifest, Safety: state, Installation: &installation, Ownership: ownershipAuthority, Now: time.Now().UTC()})
+	if !decision.Allowed {
+		reason := strings.ToLower(decision.Reason)
+		if strings.Contains(reason, "fence") || strings.Contains(reason, "contraction") || strings.Contains(reason, "closing") || strings.Contains(reason, "deleting") {
+			return manifest, false, domain.FailurePublication, true
+		}
+		return manifest, false, domain.FailureEvidenceMismatch, false
+	}
+	return manifest, true, domain.FailureNone, false
+}
+
 func expectedNginxRuntimeListeners(manifest nginx.Manifest) []string {
 	listeners := []string{"tcp:0.0.0.0:80", "tcp:0.0.0.0:443", "tcp::::80", "tcp::::443"}
 	for _, entry := range manifest.Entries {
@@ -286,6 +325,23 @@ func expectedNginxRuntimeListeners(manifest nginx.Manifest) []string {
 func manifestContainsResource(manifest nginx.Manifest, resourceID string) bool {
 	for _, entry := range manifest.Entries {
 		if entry.ResourceID == resourceID {
+			return true
+		}
+	}
+	return false
+}
+
+func manifestMatchesResource(manifest nginx.Manifest, resource domain.AppResource) bool {
+	bundle := resource.PublicationRecord.LastAppliedBundle
+	if bundle == nil || resource.PublicationRecord.LastAppliedDigest == nil || *resource.PublicationRecord.LastAppliedDigest != bundle.ConfigDigest || bundle.SiteIdentity == "" || bundle.Generation == 0 {
+		return false
+	}
+	kind := nginx.EntryApp
+	if bundle.Kind == domain.PublicationTemporaryHTTP {
+		kind = nginx.EntryTemporary
+	}
+	for _, entry := range manifest.Entries {
+		if entry.ResourceID == resource.ID && entry.Kind == kind && entry.Digest == bundle.SiteIdentity && entry.Generation == bundle.Generation {
 			return true
 		}
 	}

@@ -230,8 +230,10 @@ type ReadResult struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-type ResourceStatusResult = domain.ResourceStatusResult
-type ResourceStatusCatalog = domain.ResourceStatusCatalog
+type (
+	ResourceStatusResult  = domain.ResourceStatusResult
+	ResourceStatusCatalog = domain.ResourceStatusCatalog
+)
 
 type ResourceResult struct {
 	ResourceID                    string    `json:"resource_id"`
@@ -457,48 +459,6 @@ func validResourcePayload(operation Operation, value ResourcePayload) bool {
 	default:
 		return false
 	}
-}
-
-func validCredentialStatusIDs(values []string) bool {
-	if len(values) > 128 {
-		return false
-	}
-	prior := ""
-	for _, value := range values {
-		if !strings.HasPrefix(value, "cred_") || !refPattern.MatchString(value) || prior != "" && prior >= value {
-			return false
-		}
-		prior = value
-	}
-	return true
-}
-
-func validStatusCredential(id, fingerprint string, changed bool) bool {
-	if id == "" || fingerprint == "" {
-		return id == "" && fingerprint == "" && !changed
-	}
-	return strings.HasPrefix(id, "cred_") && refPattern.MatchString(id) && digestPattern.MatchString(fingerprint)
-}
-
-func validDomainStatus(value ResourceResult) bool {
-	if value.Status != "healthy" && value.Status != "degraded" && value.Status != "unknown" && value.Status != "source_verified_runtime_unknown" || value.ObservedAt.IsZero() || !validDisplay(value.Reason) || !validStatusCredential(value.CredentialID, value.CredentialFingerprint, value.CredentialChanged) || !validStatusCredential(value.GoAccessCredentialID, value.GoAccessCredentialFingerprint, value.GoAccessCredentialChanged) || (value.StaticFingerprint != "" && !digestPattern.MatchString(value.StaticFingerprint)) || !validCredentialStatusIDs(value.CredentialIDs) || value.StaticChanged && value.StaticFingerprint == "" {
-		return false
-	}
-	retirement := value.GoAccessRetirementJobID != "" || len(value.GoAccessRetirementGenerations) != 0
-	if retirement {
-		if !refPattern.MatchString(value.GoAccessRetirementJobID) || value.Reason != "GoAccess retirement pending" || len(value.GoAccessRetirementGenerations) == 0 || len(value.GoAccessRetirementGenerations) > 128 {
-			return false
-		}
-		prior := uint64(0)
-		for _, generation := range value.GoAccessRetirementGenerations {
-			if generation <= prior {
-				return false
-			}
-			prior = generation
-		}
-	}
-	degradedActions := len(value.AllowedActions) == 2 && value.AllowedActions[0] == "unpublish" && value.AllowedActions[1] == "close_all"
-	return value.Status == "degraded" && value.AccessMayRemain && degradedActions && (!retirement || value.Reason == "GoAccess retirement pending") || (value.Status == "healthy" || value.Status == "unknown" || value.Status == "source_verified_runtime_unknown") && !value.AccessMayRemain && !value.StaticChanged && len(value.AllowedActions) == 0 && !retirement
 }
 
 func validDisplay(value string) bool {
