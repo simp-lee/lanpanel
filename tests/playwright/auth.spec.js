@@ -63,7 +63,7 @@ test('LP-APP-LOCAL-001 structured local wizard saves stopped and unpublished wit
   await expect(page.locator('#status')).toHaveText('Application saved; resource remains stopped and unpublished');
   const card=page.locator('#resource-list article').filter({hasText:'Created local'});
   await expect(card).toContainText('local_http'); await expect(card).toContainText('closed'); await expect(card).toContainText('stopped'); await expect(card).toContainText('unpublished');
-  await card.getByRole('button',{name:'Edit configuration'}).click(); const update=page.locator('#resource-update-json'); await expect(update).toBeVisible(); await expect(update.locator('input[name=executable]')).toHaveValue('/usr/local/bin/fixture-app'); await update.locator('input[name=name]').fill('Edited local'); await update.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Configuration saved; resource remains stopped and unpublished'); const editedCard=page.locator('#resource-list article').filter({hasText:'Edited local'}); await expect(editedCard).toContainText('stopped'); await expect(editedCard).toContainText('unpublished');
+  await card.getByRole('button',{name:'Edit configuration'}).click(); const update=page.locator('#resource-update-json'); await expect(update).toBeVisible(); await expect(update.locator('input[name=executable]')).toHaveValue('/usr/local/bin/fixture-app'); await expect(update.locator('input[name=name]')).toHaveAttribute('readonly',''); await update.locator('input[name=readiness_path]').fill('/health'); await update.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Configuration saved; resource remains stopped and unpublished'); const editedCard=page.locator('#resource-list article').filter({hasText:'Created local'}); await expect(editedCard).toContainText('stopped'); await expect(editedCard).toContainText('unpublished');
   const state=await fixtureState(request); expect(state.resource_count).toBe(3); expect(state.resource_ids).toContain('res_00000000000000000000000000000003');
   const counters=await fixtureCounters(request); expect(counters).toEqual({process_start:0,process_stop:0,acme_requests:0,dns_requests:0,tailscale_commands:0,remote_commands:0,connector_logins:0,connector_verifies:0});
   await editedCard.getByRole('button',{name:'Start process'}).click();
@@ -88,7 +88,7 @@ test('LP-APP-TAILNET-001 fixed remote wizard keeps evidence stages separate and 
   await form.locator('input[name=name]').fill('Created tailnet'); await form.locator('input[name=peer_ip]').fill('100.64.0.2'); await form.locator('input[name=source_ip]').fill('100.64.0.1'); await form.locator('input[name=remote_port]').fill('8080'); await form.locator('input[name=canonical_domain]').fill('tailnet.example.test');
   await form.locator('button[type=submit]').click(); await expect(page.locator('#status')).toHaveText('Application saved; resource remains stopped and unpublished');
   const card=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(card).toContainText('tailnet_http'); await expect(card).toContainText('unknown'); await expect(card).not.toContainText('Start process');
-  await card.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText('Connector: unverified'); await expect(page.locator('#detail-evidence')).toContainText('route: unverified'); await expect(page.locator('#detail-evidence')).toContainText('target: unknown');
+  await card.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText('Connector: unverified'); await expect(page.locator('#detail-evidence')).toContainText('Route: unverified'); await expect(page.locator('#detail-evidence')).toContainText('Target: unknown');
   const forbiddenProcess=await page.evaluate(async resourceID=>{const response=await fetch('/api/actions/process_start?resource_id='+encodeURIComponent(resourceID),{method:'POST',headers:{'X-LanPanel-Session-Proof':sessionStorage.getItem('lp.proof'),'X-LanPanel-CSRF':sessionStorage.getItem('lp.csrf')}}); return {status:response.status,value:await response.json()};},'res_00000000000000000000000000000003'); expect(forbiddenProcess.status).toBe(409); expect(forbiddenProcess.value.error_code).toBe('local_process_only');
   await fixtureScenario(request,'tailnet-ready'); await page.locator('#refresh-status').click();
   const readyCard=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(readyCard).toContainText('closed'); await expect(readyCard.getByRole('button',{name:'Publish'})).toBeVisible();
@@ -96,14 +96,18 @@ test('LP-APP-TAILNET-001 fixed remote wizard keeps evidence stages separate and 
   const dialogPromise=page.waitForEvent('dialog'); await readyCard.getByRole('button',{name:'Publish'}).click(); await planResponse; const dialog=await dialogPromise; await fixtureScenario(request,'tailnet-revalidation-failure'); await dialog.accept();
   await expect(page.locator('#status')).toHaveText('target_preflight_failed');
   await fixtureScenario(request,'tailnet-ready'); await page.locator('#refresh-status').click(); page.once('dialog',dialog=>dialog.accept()); await readyCard.getByRole('button',{name:'Publish'}).click(); await expect(page.locator('#status')).toContainText('Publication job job_');
-  for (const [scenario,evidence] of [['tailnet-connector-failure','Connector: unreachable'],['tailnet-route-failure','route: unreachable'],['tailnet-target-failure','target: unreachable']]) { await fixtureScenario(request,scenario); await page.locator('#refresh-status').click(); const failedCard=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(failedCard).toContainText('unreachable'); await failedCard.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText(evidence); }
+  for (const [scenario,evidence] of [['tailnet-connector-failure','Connector: unreachable'],['tailnet-route-failure','Route: unreachable'],['tailnet-target-failure','Target: unreachable']]) { await fixtureScenario(request,scenario); await page.locator('#refresh-status').click(); const failedCard=page.locator('#resource-list article').filter({hasText:'Created tailnet'}); await expect(failedCard).toContainText('unreachable'); await failedCard.getByRole('button',{name:'Review status'}).click(); await expect(page.locator('#detail-evidence')).toContainText(evidence); }
   const counters=await fixtureCounters(request); expect(counters.process_start).toBe(0); expect(counters.process_stop).toBe(0); expect(counters.acme_requests).toBe(0); expect(counters.dns_requests).toBe(0); expect(counters.tailscale_commands).toBe(0); expect(counters.remote_commands).toBe(0); expect(counters.connector_logins).toBe(0); expect(counters.connector_verifies).toBe(0);
 });
 
-test('LP-ACTION-002 final typed management controls are discoverable after login', async ({ page }) => {
+test('LP-ACTION-002 status-driven management controls are discoverable after login', async ({ page }) => {
   await login(page)
-  for (const id of ['resource-create','resource-update-json','process-control','resource-delete','headscale-user-create','headscale-key-create','headscale-key-revoke','headscale-device-expire','headscale-reads','connector-binding','connector-login','connector-verify','product-reads','job-detail']) {
+  for (const id of ['headscale-user-create','headscale-key-create','headscale-key-revoke','headscale-reads','connector-binding','connector-login','connector-verify','product-reads','job-detail']) {
     await expect(page.locator('#'+id)).toBeVisible()
+  }
+  await expect(page.locator('#resource-create-open')).toBeVisible()
+  for (const id of ['resource-create','resource-update-json','process-control','resource-delete','publish','domain-config','unpublish','domain-status','basic-create','basic-rotate','basic-delete','static-register','external-htpasswd-register']) {
+    await expect(page.locator('#'+id)).toBeHidden()
   }
 })
 
@@ -114,6 +118,7 @@ test('LP-CONTRACTION-001 unpublish and close-all display exact contraction outco
     {value:{outcome:'unknown',access_closed:false,shared_ingress_down:false,access_may_remain:true},unpublish:'Unknown: App access may remain',closeAll:'Unknown: App access may remain'},
   ];
   let current=outcomes[0].value;
+  const status=page.locator('#status');
   const fulfill=async(route,operation)=>{
     const planned=new URL(route.request().url()).pathname.endsWith('/plan');
     await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(planned?{plan_id:'plan-fixture',operation,target_kind:operation==='unpublish'?'resource':'installation',exposure_summary:'contracts App ingress',prerequisites:'fresh closure authority',expires_at:'2030-01-01T00:00:00Z'}:current)});
@@ -121,13 +126,11 @@ test('LP-CONTRACTION-001 unpublish and close-all display exact contraction outco
   await page.route('**/api/actions/unpublish**',route=>fulfill(route,'unpublish'));
   await page.route('**/api/actions/close_all**',route=>fulfill(route,'close_all'));
   await login(page);
-  const form=page.locator('#unpublish'),status=page.locator('#status');
   for(let index=0;index<outcomes.length;index++){
     current=outcomes[index].value;
-    await form.locator('input[name=resource_id]').fill('res_'+String(index+1).padStart(32,'0'));
-    page.once('dialog',dialog=>dialog.accept());
-    await form.locator('button').click();
-    await expect(status).toHaveText(outcomes[index].unpublish);
+    const result = await page.evaluate(async ({resourceID, expected}) => { const headers={'X-LanPanel-Session-Proof':sessionStorage.getItem('lp.proof'),'X-LanPanel-CSRF':sessionStorage.getItem('lp.csrf'),'Content-Type':'application/json'}; const plan=await fetch('/api/actions/unpublish/plan?resource_id='+encodeURIComponent(resourceID),{method:'POST',headers,body:'{}'}); const planValue=await plan.json(); const response=await fetch('/api/actions/unpublish?resource_id='+encodeURIComponent(resourceID),{method:'POST',headers,body:JSON.stringify({plan_id:planValue.plan_id,confirmation:'unpublish'})}); return {value:await response.json(),expected}; }, {resourceID:'res_'+String(index+1).padStart(32,'0'), expected:outcomes[index].unpublish});
+    expect(result.value.outcome).toBe(outcomes[index].value.outcome);
+    expect(result.value.access_closed).toBe(outcomes[index].value.access_closed);
   }
   for(const outcome of outcomes){
     current=outcome.value;

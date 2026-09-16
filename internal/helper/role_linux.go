@@ -804,7 +804,7 @@ func RunRole(args []string) error {
 			return fmt.Errorf("resource mutation caller is unauthorized")
 		}
 		return nil
-	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (output ExecutionResult, resultErr error) {
 		if secret != nil || request.Resource == nil {
 			return ExecutionResult{}, fmt.Errorf("resource mutation carried secret or omitted payload")
 		}
@@ -878,6 +878,43 @@ func RunRole(args []string) error {
 				return ExecutionResult{}, err
 			}
 		}
+		contact := ""
+		if candidate.Publication.DomainHTTPS != nil && candidate.Publication.DomainHTTPS.Certificate != nil {
+			contact = candidate.Publication.DomainHTTPS.Certificate.AccountEmail
+		}
+		contactChanged := false
+		committed := false
+		if contact != "" {
+			priorContact, contactErr := acmeaccount.ReadContact()
+			priorContactPresent := contactErr == nil
+			switch {
+			case contactErr == nil && priorContact == contact:
+			case contactErr == nil:
+				if err := acmeaccount.WriteContact(contact); err != nil {
+					return ExecutionResult{}, err
+				}
+				contactChanged = true
+			case errors.Is(contactErr, os.ErrNotExist):
+				if err := acmeaccount.WriteContact(contact); err != nil {
+					return ExecutionResult{}, err
+				}
+				contactChanged = true
+			default:
+				return ExecutionResult{}, contactErr
+			}
+			if contactChanged {
+				defer func() {
+					if committed {
+						return
+					}
+					if priorContactPresent {
+						_ = acmeaccount.WriteContact(priorContact)
+					} else {
+						_ = os.Remove(acmeaccount.ManagedContactPath)
+					}
+				}()
+			}
+		}
 		if request.Resource.Operation == "resource_create" {
 			execution, err = application.BeginResourceCreate(ctx, actor, candidate)
 		} else {
@@ -896,11 +933,7 @@ func RunRole(args []string) error {
 			_ = unix.Kill(os.Getpid(), unix.SIGTERM)
 			return ExecutionResult{}, err
 		}
-		if candidate.Publication.DomainHTTPS != nil && candidate.Publication.DomainHTTPS.Certificate != nil && candidate.Publication.DomainHTTPS.Certificate.AccountEmail != "" {
-			if err := acmeaccount.WriteContact(candidate.Publication.DomainHTTPS.Certificate.AccountEmail); err != nil {
-				return ExecutionResult{}, err
-			}
-		}
+		committed = true
 		digest, err := resource.ConfigDigest(candidate)
 		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID}}, err
 	})
