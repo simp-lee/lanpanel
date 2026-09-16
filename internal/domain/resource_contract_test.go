@@ -40,6 +40,7 @@ func TestResourceCreateRequestIsClosedAndDoesNotCarryAuthority(t *testing.T) {
 func TestResourceStatusCanonicalDecodeRejectsUnknownDuplicateAndInvalidCombination(t *testing.T) {
 	observed := time.Now().UTC()
 	value := ResourceStatusResult{ResourceID: "res_00000000000000000000000000000001", Name: "Local app", TargetKind: AppTargetLocalHTTP, OverallStatus: ResourceStatusClosed, ConfigurationStatus: ConfigurationComplete, ProcessRequestedStatus: ProcessRequestedStop, ProcessObservedStatus: ProcessStopped, ProcessStatus: ProcessStopped, PublicationStatus: PublicationStatusUnpublished, ConnectorStatus: EvidenceNotApplicable, RouteStatus: EvidenceNotApplicable, TargetStatus: EvidenceUnknown, FailureCategory: FailureNone, AllowedActions: []ResourceAction{ResourceActionRefresh}, ClosureVerified: true, ClosureDigest: testDigest, ClosureObservedAt: observed, AffectedObject: "resource/res_00000000000000000000000000000001", NextStep: "publish explicitly", ConfigDigest: testDigest, ObservedAt: observed, TargetObservation: &TargetObservation{Validity: EvidenceUnknown, ObservedAt: observed, Failure: FailureEvidenceMissing}}
+	value.Dependencies = []ResourceDependencyStatus{{ID: "cred_00000000000000000000000000000001", Kind: DependencyManagedBasic, State: DependencyAvailable, OwnerResourceID: value.ResourceID, Fingerprint: testDigest}}
 	value.AuthorityDigest = ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest)
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -56,6 +57,11 @@ func TestResourceStatusCanonicalDecodeRejectsUnknownDuplicateAndInvalidCombinati
 	duplicate := append(append([]byte(nil), data[:len(data)-1]...), []byte(`,"overall_status":"closed"}`)...)
 	if _, err := DecodeResourceStatusResult(duplicate); err == nil {
 		t.Fatal("duplicate status field accepted")
+	}
+	invalidDependency := value
+	invalidDependency.Dependencies = []ResourceDependencyStatus{{ID: "cred_00000000000000000000000000000001", Kind: DependencyManagedBasic, State: DependencyAvailable, OwnerResourceID: "res_00000000000000000000000000000002", Fingerprint: testDigest}}
+	if err := ValidateResourceStatusResult(invalidDependency); err == nil {
+		t.Fatal("dependency from another resource was accepted")
 	}
 	invalid := value
 	invalid.OverallStatus = ResourceStatusUnreachable

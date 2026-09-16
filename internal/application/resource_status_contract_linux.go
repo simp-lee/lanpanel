@@ -76,7 +76,15 @@ func ReadResourceStatus(ctx context.Context, resourceID string) (domain.Resource
 	evidence.JobPending, evidence.JobID, evidence.LastOperation = observeResourceJob(document, *resource)
 	evidence.NginxFailure = nginxFailure
 	evidence.NginxFenced = nginxFenced
-	return ProjectObservedResourceStatus(*resource, time.Now().UTC(), evidence)
+	result, err := ProjectObservedResourceStatus(*resource, time.Now().UTC(), evidence)
+	if err != nil {
+		return domain.ResourceStatusResult{}, err
+	}
+	result.Dependencies = resourceDependencyStatuses(installation, *resource)
+	if err := domain.ValidateResourceStatusResult(result); err != nil {
+		return domain.ResourceStatusResult{}, err
+	}
+	return result, nil
 }
 
 // ReadResourceStatusCatalog returns typed status entries without reading an
@@ -111,6 +119,10 @@ func ReadResourceStatusCatalog(ctx context.Context) (domain.ResourceStatusCatalo
 		if statusErr != nil {
 			return domain.ResourceStatusCatalog{}, statusErr
 		}
+		status.Dependencies = resourceDependencyStatuses(installation, resource)
+		if err := domain.ValidateResourceStatusResult(status); err != nil {
+			return domain.ResourceStatusCatalog{}, err
+		}
 		catalog.Resources = append(catalog.Resources, status)
 	}
 	sort.Slice(catalog.Resources, func(i, j int) bool { return catalog.Resources[i].ResourceID < catalog.Resources[j].ResourceID })
@@ -119,6 +131,48 @@ func ReadResourceStatusCatalog(ctx context.Context) (domain.ResourceStatusCatalo
 		return domain.ResourceStatusCatalog{}, err
 	}
 	return catalog, nil
+}
+
+func resourceDependencyStatuses(installation domain.Installation, resource domain.AppResource) []domain.ResourceDependencyStatus {
+	boundCredentials := map[string]bool{}
+	for _, id := range resource.CredentialIDs {
+		boundCredentials[id] = true
+	}
+	if publication := resource.Publication.DomainHTTPS; publication != nil {
+		boundCredentials[publication.CredentialID] = true
+		boundCredentials[publication.GoAccess.CredentialID] = true
+	}
+	dependencies := make([]domain.ResourceDependencyStatus, 0)
+	for _, credential := range installation.Credentials {
+		if credential.OwnerResourceID != resource.ID || credential.Kind != "managed_basic" && credential.Kind != "external_htpasswd" {
+			continue
+		}
+		state := domain.DependencyAvailable
+		if boundCredentials[credential.ID] {
+			state = domain.DependencyBound
+		}
+		kind := domain.DependencyExternalHTPasswd
+		if credential.Kind == "managed_basic" {
+			kind = domain.DependencyManagedBasic
+		}
+		dependencies = append(dependencies, domain.ResourceDependencyStatus{ID: credential.ID, Kind: kind, State: state, OwnerResourceID: resource.ID, Fingerprint: credential.Fingerprint})
+	}
+	for _, root := range installation.StaticRoots {
+		if root.OwnerResourceID != resource.ID {
+			continue
+		}
+		state := domain.DependencyAvailable
+		if resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.StaticRootID == root.ID {
+			state = domain.DependencyBound
+		}
+		dependencies = append(dependencies, domain.ResourceDependencyStatus{ID: root.ID, Kind: domain.DependencyStaticRoot, State: state, OwnerResourceID: resource.ID, Fingerprint: root.Fingerprint})
+	}
+	sort.Slice(dependencies, func(i, j int) bool {
+		left := string(dependencies[i].Kind) + "\x00" + dependencies[i].ID
+		right := string(dependencies[j].Kind) + "\x00" + dependencies[j].ID
+		return left < right
+	})
+	return dependencies
 }
 
 // ProjectResourceStatus maps durable authority to a conservative fixed

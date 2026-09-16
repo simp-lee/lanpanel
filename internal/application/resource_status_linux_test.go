@@ -81,6 +81,20 @@ func TestTypedStatusProjectionDistinguishesClosureHealthAndUnreachable(t *testin
 	}
 }
 
+func TestResourceDependencyStatusExposesBoundAndAvailableNonSecrets(t *testing.T) {
+	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", CredentialIDs: []string{"cred_00000000000000000000000000000001"}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CredentialID: "cred_00000000000000000000000000000001", StaticRootID: "static_00000000000000000000000000000001", GoAccess: domain.GoAccessPublication{Enabled: true, CredentialID: "cred_00000000000000000000000000000002"}}}}
+	installation := domain.Installation{Credentials: []domain.Credential{{ID: "cred_00000000000000000000000000000001", Kind: "managed_basic", OwnerResourceID: resource.ID, Fingerprint: recoveryDigest("basic")}, {ID: "cred_00000000000000000000000000000002", Kind: "external_htpasswd", OwnerResourceID: resource.ID, Fingerprint: recoveryDigest("htpasswd")}, {ID: "cred_00000000000000000000000000000003", Kind: "external_htpasswd", OwnerResourceID: resource.ID, Fingerprint: recoveryDigest("available")}}, StaticRoots: []domain.StaticContentRoot{{ID: "static_00000000000000000000000000000001", OwnerResourceID: resource.ID, Fingerprint: recoveryDigest("static")}}}
+	dependencies := resourceDependencyStatuses(installation, resource)
+	if len(dependencies) != 4 || dependencies[0].Kind != domain.DependencyExternalHTPasswd || dependencies[0].State != domain.DependencyBound || dependencies[1].Kind != domain.DependencyExternalHTPasswd || dependencies[1].State != domain.DependencyAvailable || dependencies[2].Kind != domain.DependencyManagedBasic || dependencies[2].State != domain.DependencyBound || dependencies[3].Kind != domain.DependencyStaticRoot || dependencies[3].State != domain.DependencyBound {
+		t.Fatalf("unexpected dependency projection: %#v", dependencies)
+	}
+	for _, dependency := range dependencies {
+		if dependency.OwnerResourceID != resource.ID || dependency.Fingerprint == "" {
+			t.Fatalf("dependency omitted authority identity: %#v", dependency)
+		}
+	}
+}
+
 func TestUnpublishedProcessFailuresRemainDiagnostic(t *testing.T) {
 	for _, scenario := range []string{"stopped", "stopped_with_endpoint", "running_but_dead"} {
 		t.Run(scenario, func(t *testing.T) {

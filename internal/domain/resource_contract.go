@@ -356,6 +356,32 @@ func ResourceStatusCatalogDigest(value ResourceStatusCatalog) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
+type ResourceDependencyKind string
+
+const (
+	DependencyManagedBasic     ResourceDependencyKind = "managed_basic"
+	DependencyExternalHTPasswd ResourceDependencyKind = "external_htpasswd"
+	DependencyStaticRoot       ResourceDependencyKind = "static_root"
+)
+
+type ResourceDependencyState string
+
+const (
+	DependencyBound     ResourceDependencyState = "bound"
+	DependencyAvailable ResourceDependencyState = "available"
+)
+
+// ResourceDependencyStatus exposes only non-secret identities that the
+// structured publication wizard may select. It never carries passwords,
+// external file contents, or credential paths.
+type ResourceDependencyStatus struct {
+	ID              string                  `json:"id"`
+	Kind            ResourceDependencyKind  `json:"kind"`
+	State           ResourceDependencyState `json:"state"`
+	OwnerResourceID string                  `json:"owner_resource_id"`
+	Fingerprint     string                  `json:"fingerprint"`
+}
+
 // ResourceStatusConfiguration is the editable, typed configuration snapshot
 // returned with status details. It contains no lifecycle authority or secret
 // bytes and is suitable for repopulating the management wizard.
@@ -428,6 +454,7 @@ type ResourceStatusResult struct {
 	RouteEvidence          *RouteEvidence               `json:"route_evidence"`
 	TargetObservation      *TargetObservation           `json:"target_observation"`
 	Configuration          *ResourceStatusConfiguration `json:"configuration,omitempty"`
+	Dependencies           []ResourceDependencyStatus   `json:"dependencies,omitempty"`
 }
 
 func ResourceStatusAuthorityDigest(resourceID, configDigest string) string {
@@ -501,6 +528,9 @@ func ValidateResourceStatusResult(value ResourceStatusResult) error {
 			return fmt.Errorf("route evidence endpoint differs from resource authority")
 		}
 	}
+	if err := validateResourceDependencies(value.Dependencies, value.ResourceID); err != nil {
+		return err
+	}
 	if value.Configuration != nil {
 		if value.Configuration.TargetKind != value.TargetKind {
 			return fmt.Errorf("status configuration target differs from status")
@@ -517,6 +547,33 @@ func ValidateResourceStatusResult(value ResourceStatusResult) error {
 	}
 	if err := validateStatusFreshness(value, time.Now().UTC()); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateResourceDependencies(values []ResourceDependencyStatus, resourceID string) error {
+	prior := ""
+	for _, value := range values {
+		if value.OwnerResourceID != resourceID || value.State != DependencyBound && value.State != DependencyAvailable || !validSHA256Digest(value.Fingerprint) {
+			return fmt.Errorf("resource dependency authority is invalid")
+		}
+		switch value.Kind {
+		case DependencyManagedBasic, DependencyExternalHTPasswd:
+			if !strings.HasPrefix(value.ID, "cred_") || !idPattern.MatchString(value.ID) {
+				return fmt.Errorf("resource credential dependency identity is invalid")
+			}
+		case DependencyStaticRoot:
+			if !staticRootIDPattern.MatchString(value.ID) {
+				return fmt.Errorf("resource static dependency identity is invalid")
+			}
+		default:
+			return fmt.Errorf("resource dependency kind is invalid")
+		}
+		key := string(value.Kind) + "\x00" + value.ID
+		if prior != "" && prior >= key {
+			return fmt.Errorf("resource dependencies are not sorted")
+		}
+		prior = key
 	}
 	return nil
 }
