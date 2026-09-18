@@ -356,18 +356,30 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 				response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseRejected, ErrorCode: result.ErrorCode, ErrorJobID: result.ErrorJobID}
 				return helperproto.WriteResponse(connection, request.Operation, response, nil)
 			}
-			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
+			failureCode := result.ErrorCode
+			if failureCode == "" {
+				failureCode = "execution_failed"
+			}
+			return server.writeFailure(connection, request.Operation, request.RequestID, failureCode, result.ErrorJobID)
 		}
 		if result.ErrorCode != "" || result.ErrorJobID != "" {
-			return server.writeFailure(connection, request.Operation, request.RequestID, "execution_failed")
+			failureCode := result.ErrorCode
+			if failureCode == "" {
+				failureCode = "execution_failed"
+			}
+			return server.writeFailure(connection, request.Operation, request.RequestID, failureCode, result.ErrorJobID)
 		}
 		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource, Status: result.Status, StatusCatalog: result.StatusCatalog, Headscale: result.Headscale, Connector: result.Connector, Read: result.Read}
 		return helperproto.WriteResponse(connection, request.Operation, response, result.Secret)
 	}
 }
 
-func (server *Server) writeFailure(connection *net.UnixConn, operation helperproto.Operation, requestID, code string) error {
-	response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: requestID, Code: helperproto.ResponseRejected, ErrorCode: code}
+func (server *Server) writeFailure(connection *net.UnixConn, operation helperproto.Operation, requestID, code string, jobIDs ...string) error {
+	jobID := ""
+	if len(jobIDs) != 0 {
+		jobID = jobIDs[0]
+	}
+	response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: requestID, Code: helperproto.ResponseRejected, ErrorCode: code, ErrorJobID: jobID}
 	return helperproto.WriteResponse(connection, operation, response, nil)
 }
 

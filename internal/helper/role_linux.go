@@ -317,12 +317,12 @@ func RunRole(args []string) error {
 			action := &helperproto.ActionResult{JobID: normalExecution.Authority.JobID, JobResult: string(result.Outcome), ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
 			if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 				if runErr != nil {
-					return ExecutionResult{}, runErr
+					return ExecutionResult{ErrorJobID: normalExecution.Authority.JobID}, runErr
 				}
 				return ExecutionResult{ResultDigest: inventoryDigest, Action: action}, nil
 			}
 			if runErr != nil {
-				return ExecutionResult{}, runErr
+				return ExecutionResult{ErrorJobID: normalExecution.Authority.JobID}, runErr
 			}
 			return ExecutionResult{ResultDigest: result.ClosureDigest, Action: action}, nil
 		}
@@ -932,7 +932,7 @@ func RunRole(args []string) error {
 		}
 		if err != nil {
 			_ = unix.Kill(os.Getpid(), unix.SIGTERM)
-			return ExecutionResult{}, err
+			return ExecutionResult{ErrorJobID: commit.ID}, err
 		}
 		committed = true
 		digest, err := resource.ConfigDigest(candidate)

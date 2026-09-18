@@ -730,8 +730,8 @@ func ValidateResponse(operation Operation, response Response) error {
 		}
 	case ResponseRejected, ResponseFailed:
 		foreignCode := operation == OperationHeadscaleInitialize && response.ErrorCode == "foreign_database_evidence"
-		headscaleEvidence := foreignCode && strings.HasPrefix(response.ErrorJobID, "job_") && refPattern.MatchString(response.ErrorJobID)
-		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil || response.Status != nil || response.StatusCatalog != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil || foreignCode != headscaleEvidence || response.ErrorJobID != "" && !headscaleEvidence {
+		headscaleEvidence := foreignCode && jobIDPattern.MatchString(response.ErrorJobID)
+		if response.ResultDigest != "" || !refPattern.MatchString(response.ErrorCode) || response.Action != nil || response.Resource != nil || response.Status != nil || response.StatusCatalog != nil || response.Headscale != nil || response.Connector != nil || response.Read != nil || foreignCode != headscaleEvidence || response.ErrorJobID != "" && !jobIDPattern.MatchString(response.ErrorJobID) {
 			return fmt.Errorf("failed helper response is not redacted")
 		}
 	default:

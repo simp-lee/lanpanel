@@ -47,6 +47,18 @@ func TestResourceMutationResponseCarriesCommittedJobIdentityAndResult(t *testing
 	}
 }
 
+func TestRejectedResponseMayCarryValidatedJobIdentity(t *testing.T) {
+	jobID := "job_" + strings.Repeat("a", 64)
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "resource-failure", Code: ResponseRejected, ErrorCode: "authoritative_preflight_failed", ErrorJobID: jobID}
+	if err := ValidateResponse(OperationResourceMutation, response); err != nil {
+		t.Fatal(err)
+	}
+	response.ErrorJobID = "not-a-job"
+	if ValidateResponse(OperationResourceMutation, response) == nil {
+		t.Fatal("rejected response accepted an invalid Job identity")
+	}
+}
+
 func TestContractionResponseCarriesJobOrExplicitEmergencyPlan(t *testing.T) {
 	jobID := "job_" + strings.Repeat("a", 64)
 	response := Response{SchemaVersion: SchemaVersion, RequestID: "contraction-result", Code: ResponseSucceeded, ResultDigest: "sha256:" + strings.Repeat("b", 64), Action: &ActionResult{JobID: jobID, JobResult: "partial", ContractionOutcome: "partial", AccessClosed: true, SharedIngressDown: true}}

@@ -111,7 +111,7 @@ func TestHeadscaleInitializationRequestAndResponseAreClosed(t *testing.T) {
 	if err := ValidateResponse(OperationHeadscaleInitialize, response); err != nil {
 		t.Fatal(err)
 	}
-	failure := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseRejected, ErrorCode: "foreign_database_evidence", ErrorJobID: "job_00000000000000000000000000000001"}
+	failure := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseRejected, ErrorCode: "foreign_database_evidence", ErrorJobID: "job_0000000000000000000000000000000000000000000000000000000000000001"}
 	if err := ValidateResponse(OperationHeadscaleInitialize, failure); err != nil {
 		t.Fatal(err)
 	}
