@@ -617,7 +617,7 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 			}
 			backend.resources[id] = &playwrightFixtureResource{id: id, name: name, kind: kind, configuration: configuration, lastOperation: domain.OperationResourceCreate, jobID: jobID}
 			backend.recordJobLocked(jobID, string(domain.OperationResourceCreate), "installation", jobs.ResultSucceeded, "")
-			return application.HelperReply{Digest: fixtureDigest(id), Resource: &helperproto.ResourceResult{ResourceID: id}}, nil
+			return application.HelperReply{Digest: fixtureDigest(id), Resource: &helperproto.ResourceResult{ResourceID: id, JobID: fixtureJobID("create-" + id), JobResult: "succeeded"}}, nil
 		}
 		if payload.Update != nil {
 			id := strings.TrimPrefix(target, "resource/")
@@ -636,7 +636,7 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 			resource.lastOperation = domain.OperationResourceUpdate
 			resource.jobID = jobID
 			backend.recordJobLocked(jobID, string(domain.OperationResourceUpdate), "resource/"+id, jobs.ResultSucceeded, "")
-			return application.HelperReply{Digest: fixtureDigest(id + ":update"), Resource: &helperproto.ResourceResult{ResourceID: id}}, nil
+			return application.HelperReply{Digest: fixtureDigest(id + ":update"), Resource: &helperproto.ResourceResult{ResourceID: id, JobID: fixtureJobID("update-" + id), JobResult: "succeeded"}}, nil
 		}
 		return application.HelperReply{}, fmt.Errorf("fixture mutation is empty")
 	case helperproto.OperationProcessLifecycle:

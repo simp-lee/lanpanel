@@ -30,6 +30,23 @@ func TestResourceMutationUsesTypedOneOfAndRejectsRawResourceJSON(t *testing.T) {
 	}
 }
 
+func TestResourceMutationResponseCarriesCommittedJobIdentityAndResult(t *testing.T) {
+	jobID := "job_" + strings.Repeat("a", 64)
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "resource-result", Code: ResponseSucceeded, ResultDigest: "sha256:" + strings.Repeat("a", 64), Resource: &ResourceResult{ResourceID: "res_00000000000000000000000000000001", JobID: jobID, JobResult: "succeeded"}}
+	if err := ValidateResponse(OperationResourceMutation, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Resource.JobID = ""
+	if ValidateResponse(OperationResourceMutation, response) == nil {
+		t.Fatal("resource mutation response without committed Job identity was accepted")
+	}
+	response.Resource.JobID = jobID
+	response.Resource.JobResult = "failed"
+	if ValidateResponse(OperationResourceMutation, response) == nil {
+		t.Fatal("resource mutation response without successful terminal result was accepted")
+	}
+}
+
 func TestNestedResourceMutationUnknownAndDuplicateFieldsAreRejected(t *testing.T) {
 	now := time.Now().UTC()
 	create := domain.ResourceCreateRequest{TargetKind: domain.AppTargetTailnetHTTP, Tailnet: &domain.TailnetResourceCreateRequest{Name: "remote", PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "remote.example.test", AccessMode: domain.AppAccessPublic}}}}

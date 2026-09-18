@@ -924,10 +924,11 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, err
 		}
 		defer func() { _ = execution.Close() }()
+		var commit jobs.Record
 		if request.Resource.Operation == "resource_create" {
-			_, err = execution.CommitCreate(ctx)
+			commit, err = execution.CommitCreate(ctx)
 		} else {
-			_, err = execution.CommitUpdate(ctx)
+			commit, err = execution.CommitUpdate(ctx)
 		}
 		if err != nil {
 			_ = unix.Kill(os.Getpid(), unix.SIGTERM)
@@ -935,7 +936,7 @@ func RunRole(args []string) error {
 		}
 		committed = true
 		digest, err := resource.ConfigDigest(candidate)
-		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID}}, err
+		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID, JobID: commit.ID, JobResult: string(commit.Result)}}, err
 	})
 	processHandler := ProcessLifecycleHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil || !strings.HasPrefix(request.Target, "resource/") {

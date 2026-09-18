@@ -103,6 +103,7 @@ var policies = map[Operation]Policy{
 
 var (
 	refPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	jobIDPattern  = regexp.MustCompile(`^job_[0-9a-f]{64}$`)
 	digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
@@ -237,6 +238,8 @@ type (
 
 type ResourceResult struct {
 	ResourceID                    string    `json:"resource_id"`
+	JobID                         string    `json:"job_id"`
+	JobResult                     string    `json:"job_result"`
 	Status                        string    `json:"status,omitempty"`
 	AccessMayRemain               bool      `json:"access_may_remain,omitempty"`
 	CredentialID                  string    `json:"credential_id,omitempty"`
@@ -590,7 +593,7 @@ func validReadResult(result *ReadResult) bool {
 }
 
 func validResourceMutationResult(result ResourceResult) bool {
-	return strings.HasPrefix(result.ResourceID, "res_") && refPattern.MatchString(result.ResourceID) && result.Status == "" && !result.AccessMayRemain && result.CredentialID == "" && result.CredentialFingerprint == "" && !result.CredentialChanged && result.GoAccessCredentialID == "" && result.GoAccessCredentialFingerprint == "" && !result.GoAccessCredentialChanged && result.StaticFingerprint == "" && !result.StaticChanged && result.ObservedAt.IsZero() && result.Reason == "" && len(result.AllowedActions) == 0 && len(result.CredentialIDs) == 0 && result.GoAccessRetirementJobID == "" && len(result.GoAccessRetirementGenerations) == 0
+	return strings.HasPrefix(result.ResourceID, "res_") && refPattern.MatchString(result.ResourceID) && jobIDPattern.MatchString(result.JobID) && result.JobResult == "succeeded" && result.Status == "" && !result.AccessMayRemain && result.CredentialID == "" && result.CredentialFingerprint == "" && !result.CredentialChanged && result.GoAccessCredentialID == "" && result.GoAccessCredentialFingerprint == "" && !result.GoAccessCredentialChanged && result.StaticFingerprint == "" && !result.StaticChanged && result.ObservedAt.IsZero() && result.Reason == "" && len(result.AllowedActions) == 0 && len(result.CredentialIDs) == 0 && result.GoAccessRetirementJobID == "" && len(result.GoAccessRetirementGenerations) == 0
 }
 
 func ValidateResponse(operation Operation, response Response) error {

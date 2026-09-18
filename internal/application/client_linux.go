@@ -482,10 +482,10 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				}
 				return Result{}, fmt.Errorf("resource mutation failed")
 			}
-			if reply.Resource == nil || reply.Resource.ResourceID == "" {
+			if reply.Resource == nil || reply.Resource.ResourceID == "" || reply.Resource.JobID == "" || reply.Resource.JobResult != "succeeded" {
 				return Result{}, fmt.Errorf("resource mutation failed")
 			}
-			return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Resource}, nil
+			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Resource.JobID, Payload: *reply.Resource}, nil
 		}
 		create, _ := RegisterAction(domain.OperationResourceCreate, ResourceMutationPayload{}, true, false, resourceAction)
 		update, _ := RegisterAction(domain.OperationResourceUpdate, ResourceMutationPayload{}, true, false, resourceAction)
