@@ -314,7 +314,7 @@ func RunRole(args []string) error {
 		if normalErr == nil {
 			inventoryDigest := normalExecution.Inventory.Digest
 			result, runErr := normalExecution.Run(ctx)
-			action := &helperproto.ActionResult{ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
+			action := &helperproto.ActionResult{JobID: normalExecution.Authority.JobID, JobResult: string(result.Outcome), ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
 			if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 				if runErr != nil {
 					return ExecutionResult{}, runErr
@@ -339,7 +339,7 @@ func RunRole(args []string) error {
 		}
 		defer func(ignore func() error) { _ = ignore() }(service.Close)
 		result, runErr := service.Run(ctx, plan.GlobalGeneration, plan.InventoryDigest)
-		action := &helperproto.ActionResult{ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
+		action := &helperproto.ActionResult{PlanID: request.Action.PlanID, Emergency: true, ContractionOutcome: string(result.Outcome), AccessClosed: result.AccessClosed, SharedIngressDown: result.SharedIngressDown, AccessMayRemain: result.AccessMayRemain}
 		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
 			return ExecutionResult{ResultDigest: plan.InventoryDigest, Action: action}, nil
 		}

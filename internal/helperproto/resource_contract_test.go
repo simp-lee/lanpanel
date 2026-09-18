@@ -47,6 +47,22 @@ func TestResourceMutationResponseCarriesCommittedJobIdentityAndResult(t *testing
 	}
 }
 
+func TestContractionResponseCarriesJobOrExplicitEmergencyPlan(t *testing.T) {
+	jobID := "job_" + strings.Repeat("a", 64)
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "contraction-result", Code: ResponseSucceeded, ResultDigest: "sha256:" + strings.Repeat("b", 64), Action: &ActionResult{JobID: jobID, JobResult: "partial", ContractionOutcome: "partial", AccessClosed: true, SharedIngressDown: true}}
+	if err := ValidateResponse(OperationContractionClose, response); err != nil {
+		t.Fatal(err)
+	}
+	response.Action.JobID = ""
+	if ValidateResponse(OperationContractionClose, response) == nil {
+		t.Fatal("contraction response without Job identity was accepted")
+	}
+	response.Action = &ActionResult{PlanID: "plan_emergency", Emergency: true, ContractionOutcome: "unknown", AccessMayRemain: true}
+	if err := ValidateResponse(OperationContractionClose, response); err != nil {
+		t.Fatalf("explicit emergency contraction response rejected: %v", err)
+	}
+}
+
 func TestNestedResourceMutationUnknownAndDuplicateFieldsAreRejected(t *testing.T) {
 	now := time.Now().UTC()
 	create := domain.ResourceCreateRequest{TargetKind: domain.AppTargetTailnetHTTP, Tailnet: &domain.TailnetResourceCreateRequest{Name: "remote", PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "remote.example.test", AccessMode: domain.AppAccessPublic}}}}

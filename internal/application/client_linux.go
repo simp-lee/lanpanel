@@ -88,10 +88,14 @@ type RotationResult struct {
 	Token       []byte
 }
 type ContractionResult struct {
-	Outcome           string
-	AccessClosed      bool
-	SharedIngressDown bool
-	AccessMayRemain   bool
+	JobID             string `json:"job_id,omitempty"`
+	JobResult         string `json:"job_result,omitempty"`
+	PlanID            string `json:"plan_id,omitempty"`
+	Emergency         bool   `json:"emergency,omitempty"`
+	Outcome           string `json:"outcome"`
+	AccessClosed      bool   `json:"access_closed"`
+	SharedIngressDown bool   `json:"shared_ingress_down"`
+	AccessMayRemain   bool   `json:"access_may_remain"`
 }
 
 func HelperService(client HelperClient) (*Service, error) {
@@ -205,11 +209,11 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	contractionAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(ConfirmationPayload)
 		reply, err := client(ctx, helperproto.OperationContractionClose, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation})
-		if err != nil || reply.Action == nil || reply.Action.ContractionOutcome == "" || len(reply.Secret) != 0 {
+		if err != nil || reply.Action == nil || reply.Action.ContractionOutcome == "" || !reply.Action.Emergency && (reply.Action.JobID == "" || reply.Action.JobResult == "") || reply.Action.Emergency && reply.Action.PlanID == "" || len(reply.Secret) != 0 {
 			clear(reply.Secret)
 			return Result{}, fmt.Errorf("close-all contraction failed")
 		}
-		return Result{Operation: call.Operation, Target: call.Target, Payload: ContractionResult{Outcome: reply.Action.ContractionOutcome, AccessClosed: reply.Action.AccessClosed, SharedIngressDown: reply.Action.SharedIngressDown, AccessMayRemain: reply.Action.AccessMayRemain}}, nil
+		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: ContractionResult{JobID: reply.Action.JobID, JobResult: reply.Action.JobResult, PlanID: reply.Action.PlanID, Emergency: reply.Action.Emergency, Outcome: reply.Action.ContractionOutcome, AccessClosed: reply.Action.AccessClosed, SharedIngressDown: reply.Action.SharedIngressDown, AccessMayRemain: reply.Action.AccessMayRemain}}, nil
 	}
 	closeAll, _ := RegisterAction("close_all", ConfirmationPayload{}, true, false, contractionAction)
 	unpublish, _ := RegisterAction("unpublish", ConfirmationPayload{}, true, false, contractionAction)

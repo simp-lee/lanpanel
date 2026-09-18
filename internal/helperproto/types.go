@@ -146,6 +146,7 @@ type ActionResult struct {
 	AccessClosed       bool      `json:"access_closed,omitempty"`
 	SharedIngressDown  bool      `json:"shared_ingress_down,omitempty"`
 	AccessMayRemain    bool      `json:"access_may_remain,omitempty"`
+	Emergency          bool      `json:"emergency,omitempty"`
 	PublicURL          string    `json:"public_url,omitempty"`
 }
 type Request struct {
@@ -606,7 +607,7 @@ func ValidateResponse(operation Operation, response Response) error {
 			return fmt.Errorf("successful helper response is incomplete")
 		}
 		headscaleTerminalResult := response.Action != nil && response.Action.PlanID == "" && response.Action.JobID != "" && response.Action.JobResult == "succeeded" && (operation == OperationHeadscaleDeploy || operation == OperationHeadscaleReissue)
-		if operation != OperationPublicationActivate && !headscaleTerminalResult && response.Action != nil && response.Action.JobResult != "" {
+		if operation != OperationPublicationActivate && operation != OperationContractionClose && !headscaleTerminalResult && response.Action != nil && response.Action.JobResult != "" {
 			return fmt.Errorf("unrelated helper response carried a job result")
 		}
 		if operation != OperationDomainStatus && response.Resource != nil && (response.Resource.GoAccessRetirementJobID != "" || len(response.Resource.GoAccessRetirementGenerations) != 0) {
@@ -625,6 +626,9 @@ func ValidateResponse(operation Operation, response Response) error {
 		}
 		if operation != OperationDomainStatus && operation != OperationProductRead && response.Status != nil || operation != OperationProductRead && response.StatusCatalog != nil {
 			return fmt.Errorf("unrelated helper response carried resource status data")
+		}
+		if operation != OperationContractionClose && response.Action != nil && response.Action.Emergency {
+			return fmt.Errorf("unrelated helper response carried emergency contraction data")
 		}
 		switch operation {
 		case OperationApplicationPlan:
@@ -662,7 +666,10 @@ func ValidateResponse(operation Operation, response Response) error {
 				return fmt.Errorf("domain status response shape invalid")
 			}
 		case OperationContractionClose:
-			if response.Action == nil || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.JobID != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || !validContractionOutcome(response.Action.ContractionOutcome, response.Action.AccessClosed, response.Action.SharedIngressDown, response.Action.AccessMayRemain) {
+			action := response.Action
+			normal := action != nil && action.PlanID == "" && action.JobResult != "" && jobIDPattern.MatchString(action.JobID) && (action.JobResult == "succeeded" || action.JobResult == "partial" || action.JobResult == "unknown")
+			emergency := action != nil && action.Emergency && action.JobID == "" && action.JobResult == "" && refPattern.MatchString(action.PlanID)
+			if action == nil || !normal && !emergency || action.Confirmation != "" || action.Operation != "" || action.TargetKind != "" || action.TargetID != "" || action.ExposureSummary != "" || action.Prerequisites != "" || !action.ExpiresAt.IsZero() || !validContractionOutcome(action.ContractionOutcome, action.AccessClosed, action.SharedIngressDown, action.AccessMayRemain) {
 				return fmt.Errorf("contraction response shape is invalid")
 			}
 		case OperationHeadscaleInitialize:

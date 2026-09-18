@@ -549,7 +549,7 @@ func (backend *playwrightFixtureBackend) applicationCall(_ context.Context, oper
 		}
 		return application.HelperReply{Digest: digest, Status: (*helperproto.ResourceStatusResult)(&status)}, nil
 	case helperproto.OperationContractionClose:
-		return application.HelperReply{Digest: fixtureDigest("contraction"), Action: &helperproto.ActionResult{ContractionOutcome: "succeeded", AccessClosed: true}}, nil
+		return application.HelperReply{Digest: fixtureDigest("contraction"), Action: &helperproto.ActionResult{JobID: fixtureJobID("contraction"), JobResult: "succeeded", ContractionOutcome: "succeeded", AccessClosed: true}}, nil
 	default:
 		return application.HelperReply{}, fmt.Errorf("unsupported fixture action %q", operation)
 	}
@@ -679,7 +679,7 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 		resource.lastOperation = domain.OperationUnpublish
 		resource.jobID = fixtureJobID("unpublish-" + id)
 		backend.recordJobLocked(resource.jobID, string(domain.OperationUnpublish), "resource/"+id, jobs.ResultSucceeded, "")
-		return application.HelperReply{Digest: fixtureDigest(resource.jobID), Action: &helperproto.ActionResult{JobID: resource.jobID, ContractionOutcome: "succeeded", AccessClosed: true}}, nil
+		return application.HelperReply{Digest: fixtureDigest(resource.jobID), Action: &helperproto.ActionResult{JobID: resource.jobID, JobResult: "succeeded", ContractionOutcome: "succeeded", AccessClosed: true}}, nil
 	case helperproto.OperationResourceDelete:
 		id := strings.TrimPrefix(target, "resource/")
 		if backend.resources[id] == nil {
