@@ -1180,7 +1180,13 @@ func ExecuteHeadscaleCertificateReissue(ctx context.Context, actor Actor, payloa
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	defer func() { returnErr = errors.Join(returnErr, execution.Close()) }()
+	defer func() {
+		returnErr = errors.Join(returnErr, execution.Close())
+		if returnErr != nil {
+			record = jobs.Record{ID: execution.JobID}
+			returnErr = MutationJobError{JobID: execution.JobID, Err: returnErr}
+		}
+	}()
 	abort := func(cause error) (jobs.Record, error) {
 		return jobs.Record{}, execution.Abort(context.WithoutCancel(ctx), cause)
 	}

@@ -41,7 +41,7 @@ func exactDeleteOwnershipID(resourceID string, record ownership.Record) bool {
 	return err == nil && len(record.Listeners) == 0 && len(record.Paths) == 1 && record.Paths[0].Kind == ownership.PathService && record.Paths[0].Path == paths.ResourceRoot && record.Paths[0].IdentityDigest == ownership.PathIdentity(resourceID, ownership.PathService, paths.ResourceRoot)
 }
 
-func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTarget, payload ConfirmationPayload) (ResourceDeleteResult, error) {
+func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTarget, payload ConfirmationPayload) (result ResourceDeleteResult, resultErr error) {
 	if target.Kind != domain.OperationTargetResource || payload.PlanID == "" || payload.Confirmation != "delete" {
 		return ResourceDeleteResult{}, fmt.Errorf("resource delete confirmation invalid")
 	}
@@ -92,8 +92,17 @@ func DeleteResource(ctx context.Context, actor Actor, target domain.OperationTar
 	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceDelete, Target: "resource/" + target.ID, ActorIdentity: actorID, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: target.ID, CandidateDigest: resource.CurrentConfigDigest, CandidateBundle: owned.Checksum, PlanID: plan.ID}, ResourceDelete: &deleteBinding, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if admitErr != nil || releaseErr != nil {
+		if job.ID != "" {
+			return ResourceDeleteResult{JobID: job.ID}, MutationJobError{JobID: job.ID, Err: errors.Join(admitErr, releaseErr)}
+		}
 		return ResourceDeleteResult{}, errors.Join(admitErr, releaseErr)
 	}
+	defer func() {
+		if resultErr != nil {
+			result.JobID = job.ID
+			resultErr = MutationJobError{JobID: job.ID, Err: resultErr}
+		}
+	}()
 	set, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		return ResourceDeleteResult{}, rejectReservedResourceDelete(ctx, service, admitter, job.ID, err)

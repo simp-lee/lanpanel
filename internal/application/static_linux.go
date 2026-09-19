@@ -49,7 +49,13 @@ func RegisterStaticRoot(ctx context.Context, resourceID, path, actor string) (re
 	if err != nil {
 		return result, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.Close())
+		if resultErr != nil {
+			result.Job = execution.job
+			resultErr = MutationJobError{JobID: execution.job.ID, Err: resultErr}
+		}
+	}()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "static_root_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "static_root_revalidation_failed", err)

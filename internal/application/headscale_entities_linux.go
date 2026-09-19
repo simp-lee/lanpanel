@@ -112,7 +112,7 @@ func ListHeadscaleDevices(ctx context.Context, runner managedheadscale.AdminRunn
 	return HeadscaleDevicesResult{Devices: devices}, err
 }
 
-func CreateHeadscaleUser(ctx context.Context, actor Actor, payload HeadscaleUserPayload, runner managedheadscale.AdminRunner) (HeadscaleUserResult, error) {
+func CreateHeadscaleUser(ctx context.Context, actor Actor, payload HeadscaleUserPayload, runner managedheadscale.AdminRunner) (result HeadscaleUserResult, resultErr error) {
 	if payload.Name == "" {
 		return HeadscaleUserResult{}, fmt.Errorf("headscale user name is required")
 	}
@@ -126,7 +126,13 @@ func CreateHeadscaleUser(ctx context.Context, actor Actor, payload HeadscaleUser
 	if err != nil {
 		return HeadscaleUserResult{}, err
 	}
-	defer func(ignore func() error) { _ = ignore() }(execution.close)
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.close())
+		if resultErr != nil {
+			result.JobID = execution.jobID
+			resultErr = MutationJobError{JobID: execution.jobID, Err: resultErr}
+		}
+	}()
 	user, runErr := managedheadscale.CreateUser(ctx, authority.runner, authority.installation.Headscale.ID, payload.Name)
 	if runErr != nil {
 		return HeadscaleUserResult{}, errors.Join(runErr, execution.fail(ctx, "headscale_user_create_failed"))
@@ -163,7 +169,7 @@ func CreateHeadscaleLifecyclePlan(ctx context.Context, actor Actor, operation do
 	return authority.service.plans.Create(ctx, admission, authority.documentRev, spec)
 }
 
-func CreateHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (HeadscaleKeyResult, error) {
+func CreateHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (result HeadscaleKeyResult, resultErr error) {
 	if payload.PlanID == "" || payload.Confirmation != "create" || payload.ExpirationSeconds == 0 || payload.ExpirationSeconds > 24*60*60 {
 		return HeadscaleKeyResult{}, fmt.Errorf("preauth key confirmation or expiration is invalid")
 	}
@@ -180,7 +186,13 @@ func CreateHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.O
 	if err != nil {
 		return HeadscaleKeyResult{}, err
 	}
-	defer func(ignore func() error) { _ = ignore() }(execution.close)
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.close())
+		if resultErr != nil {
+			result.JobID = execution.jobID
+			resultErr = MutationJobError{JobID: execution.jobID, Err: resultErr}
+		}
+	}()
 	userID, _ := strconv.ParseUint(target.ID, 10, 64)
 	key, secret, runErr := managedheadscale.CreatePreauthKey(ctx, authority.runner, authority.installation.Headscale.ID, userID, time.Duration(payload.ExpirationSeconds)*time.Second)
 	if runErr != nil {
@@ -194,7 +206,7 @@ func CreateHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.O
 	return HeadscaleKeyResult{JobID: execution.jobID, Key: key, Secret: secret}, nil
 }
 
-func RevokeHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (HeadscaleKeyResult, error) {
+func RevokeHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (result HeadscaleKeyResult, resultErr error) {
 	if payload.PlanID == "" || payload.Confirmation != "revoke" {
 		return HeadscaleKeyResult{}, fmt.Errorf("preauth key revoke confirmation is invalid")
 	}
@@ -211,7 +223,13 @@ func RevokeHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.O
 	if err != nil {
 		return HeadscaleKeyResult{}, err
 	}
-	defer func(ignore func() error) { _ = ignore() }(execution.close)
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.close())
+		if resultErr != nil {
+			result.JobID = execution.jobID
+			resultErr = MutationJobError{JobID: execution.jobID, Err: resultErr}
+		}
+	}()
 	id, _ := strconv.ParseUint(target.ID, 10, 64)
 	key, runErr := managedheadscale.RevokePreauthKey(ctx, authority.runner, authority.installation.Headscale.ID, id)
 	if runErr != nil {
@@ -223,7 +241,7 @@ func RevokeHeadscalePreauthKey(ctx context.Context, actor Actor, target domain.O
 	return HeadscaleKeyResult{JobID: execution.jobID, Key: key}, nil
 }
 
-func ExpireHeadscaleDevice(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (HeadscaleDeviceResult, error) {
+func ExpireHeadscaleDevice(ctx context.Context, actor Actor, target domain.OperationTarget, payload HeadscaleLifecyclePayload, runner managedheadscale.AdminRunner) (result HeadscaleDeviceResult, resultErr error) {
 	if payload.PlanID == "" || payload.Confirmation != "expire" {
 		return HeadscaleDeviceResult{}, fmt.Errorf("device expiry confirmation is invalid")
 	}
@@ -240,7 +258,13 @@ func ExpireHeadscaleDevice(ctx context.Context, actor Actor, target domain.Opera
 	if err != nil {
 		return HeadscaleDeviceResult{}, err
 	}
-	defer func(ignore func() error) { _ = ignore() }(execution.close)
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.close())
+		if resultErr != nil {
+			result.JobID = execution.jobID
+			resultErr = MutationJobError{JobID: execution.jobID, Err: resultErr}
+		}
+	}()
 	id, _ := strconv.ParseUint(target.ID, 10, 64)
 	device, runErr := managedheadscale.ExpireDevice(ctx, authority.runner, authority.installation.Headscale.ID, id)
 	if runErr != nil {

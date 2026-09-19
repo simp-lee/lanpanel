@@ -37,7 +37,7 @@ type ConnectorVerifyResult struct {
 }
 type ConnectorLoginExecutor func(context.Context, string, string) error
 
-func SetConnectorBinding(ctx context.Context, actor Actor, payload ConnectorBindingPayload) (ConnectorMutationResult, error) {
+func SetConnectorBinding(ctx context.Context, actor Actor, payload ConnectorBindingPayload) (result ConnectorMutationResult, resultErr error) {
 	if !canonicalConnectorControlURL(payload.ControlURL) {
 		return ConnectorMutationResult{}, fmt.Errorf("connector ControlURL is invalid")
 	}
@@ -85,8 +85,17 @@ func SetConnectorBinding(ctx context.Context, actor Actor, payload ConnectorBind
 	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ConnectorBindingSet, Target: "connector", ActorIdentity: actorID, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{CandidateDigest: configDigest, CandidateBundle: configDigest}, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if admitErr != nil || releaseErr != nil {
+		if job.ID != "" {
+			return ConnectorMutationResult{JobID: job.ID}, MutationJobError{JobID: job.ID, Err: errors.Join(admitErr, releaseErr)}
+		}
 		return ConnectorMutationResult{}, errors.Join(admitErr, releaseErr)
 	}
+	defer func() {
+		if resultErr != nil {
+			result.JobID = job.ID
+			resultErr = MutationJobError{JobID: job.ID, Err: resultErr}
+		}
+	}()
 	set, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		return ConnectorMutationResult{}, rejectReservedConnectorMutation(ctx, service, admitter, job.ID, err)
@@ -182,7 +191,7 @@ func CreateConnectorLoginPlan(ctx context.Context, actor Actor) (plans.Plan, err
 	return service.plans.Create(ctx, admission, document.Revision, plans.Spec{Operation: string(domain.OperationConnectorLogin), Target: plans.Target{Kind: plans.TargetConnector}, ActorIdentity: actorID, Config: plans.DigestBinding{Applicable: true, Digest: digest}, ExposureSummary: "assisted login to fixed ControlURL " + installation.Connector.ControlURL, Prerequisites: "one-time auth key is consumed from this request and never persisted", Lifetime: 10 * time.Minute})
 }
 
-func ExecuteConnectorLogin(ctx context.Context, actor Actor, payload ConnectorLoginPayload, login ConnectorLoginExecutor, runner managedconnector.Runner, route managedconnector.RouteObserver) (ConnectorMutationResult, error) {
+func ExecuteConnectorLogin(ctx context.Context, actor Actor, payload ConnectorLoginPayload, login ConnectorLoginExecutor, runner managedconnector.Runner, route managedconnector.RouteObserver) (result ConnectorMutationResult, resultErr error) {
 	if payload.PlanID == "" || payload.Confirmation != "login" || login == nil {
 		return ConnectorMutationResult{}, fmt.Errorf("connector login confirmation is invalid")
 	}
@@ -219,8 +228,17 @@ func ExecuteConnectorLogin(ctx context.Context, actor Actor, payload ConnectorLo
 	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ConnectorLogin, Target: "connector", ActorIdentity: actorID, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{CandidateDigest: digest, CandidateBundle: digest, PlanID: plan.ID}, ExpectedRevision: document.Revision})
 	releaseErr := admission.Release()
 	if admitErr != nil || releaseErr != nil {
+		if job.ID != "" {
+			return ConnectorMutationResult{JobID: job.ID}, MutationJobError{JobID: job.ID, Err: errors.Join(admitErr, releaseErr)}
+		}
 		return ConnectorMutationResult{}, errors.Join(admitErr, releaseErr)
 	}
+	defer func() {
+		if resultErr != nil {
+			result.JobID = job.ID
+			resultErr = MutationJobError{JobID: job.ID, Err: resultErr}
+		}
+	}()
 	set, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
 	if err != nil {
 		return ConnectorMutationResult{}, rejectReservedConnectorMutation(ctx, service, admitter, job.ID, err)

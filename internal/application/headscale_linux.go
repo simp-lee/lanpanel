@@ -64,6 +64,10 @@ func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInit
 	defer func() {
 		if execution != nil {
 			err = errors.Join(err, execution.Close())
+			if err != nil {
+				result = jobs.Record{ID: execution.JobID}
+				err = MutationJobError{JobID: execution.JobID, Err: err}
+			}
 		}
 	}()
 	paths := managedheadscale.FixedPaths()

@@ -971,13 +971,15 @@ func removeCreateJournal(path string) error {
 	return directory.Sync()
 }
 
-type ResourceJobError struct {
+type MutationJobError struct {
 	JobID string
 	Err   error
 }
 
-func (err ResourceJobError) Error() string { return err.Err.Error() }
-func (err ResourceJobError) Unwrap() error { return err.Err }
+func (err MutationJobError) Error() string { return err.Err.Error() }
+func (err MutationJobError) Unwrap() error { return err.Err }
+
+type ResourceJobError = MutationJobError
 
 type ResourceExecution struct {
 	Service     *FixedService

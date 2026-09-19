@@ -73,7 +73,13 @@ func RegisterExternalHTPasswd(ctx context.Context, resourceID, path, actor strin
 	if err != nil {
 		return ExternalHTPasswdResult{}, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.Close())
+		if resultErr != nil {
+			result.Job = execution.job
+			resultErr = MutationJobError{JobID: execution.job.ID, Err: resultErr}
+		}
+	}()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "external_htpasswd_not_registered", Status: jobs.PostconditionVerified, Identity: identity.Fingerprint}, "external_htpasswd_revalidation_failed", err)

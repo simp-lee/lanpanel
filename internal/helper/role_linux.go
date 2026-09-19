@@ -56,6 +56,14 @@ type IdentityConfig struct {
 
 // RunRole starts the fixed root helper role. Component operations remain
 // unavailable until their owning package registers a complete typed handler.
+func mutationExecutionFailure(err error) (ExecutionResult, error) {
+	var jobErr application.MutationJobError
+	if errors.As(err, &jobErr) && jobErr.JobID != "" {
+		return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: jobErr.JobID}, err
+	}
+	return ExecutionResult{}, err
+}
+
 func RunRole(args []string) error {
 	if len(args) != 0 || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("helper role requires its fixed root service invocation")
@@ -428,7 +436,7 @@ func RunRole(args []string) error {
 			if errors.Is(err, managedheadscale.ErrForeignEvidence) {
 				return ExecutionResult{ErrorCode: "foreign_database_evidence", ErrorJobID: job.ID}, err
 			}
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: authorityDigest, Action: &helperproto.ActionResult{JobID: job.ID, Operation: string(domain.OperationHeadscaleInitialize), TargetKind: string(domain.OperationTargetInstallation), TargetID: headscaleID}}, nil
 	})
@@ -462,7 +470,7 @@ func RunRole(args []string) error {
 		}
 		record, err := application.ExecuteHeadscaleDeploy(ctx, actor, application.HeadscaleDeployPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation, Certificate: config})
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(record.ID), Action: &helperproto.ActionResult{JobID: record.ID, JobResult: string(record.Result), Operation: string(domain.OperationHeadscaleControlDeploy), TargetKind: "headscale", TargetID: "headscale"}}, nil
 	})
@@ -496,7 +504,7 @@ func RunRole(args []string) error {
 		}
 		record, err := application.ExecuteHeadscaleCertificateReissue(ctx, actor, application.HeadscaleReissuePayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation, Certificate: config})
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(record.ID), Action: &helperproto.ActionResult{JobID: record.ID, JobResult: string(record.Result), Operation: string(domain.OperationHeadscaleReissue), TargetKind: "headscale", TargetID: "headscale"}}, nil
 	})
@@ -553,7 +561,7 @@ func RunRole(args []string) error {
 			}
 			value, err := application.CreateHeadscaleUser(ctx, actor, payload, nil)
 			if err != nil {
-				return ExecutionResult{}, err
+				return mutationExecutionFailure(err)
 			}
 			user := helperUser(value.User)
 			result.JobID, result.User = value.JobID, &user
@@ -576,14 +584,14 @@ func RunRole(args []string) error {
 			if operation == domain.OperationPreauthKeyRevoke {
 				value, err := application.RevokeHeadscalePreauthKey(ctx, actor, target, payload, nil)
 				if err != nil {
-					return ExecutionResult{}, err
+					return mutationExecutionFailure(err)
 				}
 				key := helperKey(value.Key)
 				result.JobID, result.Key = value.JobID, &key
 			} else {
 				value, err := application.ExpireHeadscaleDevice(ctx, actor, target, payload, nil)
 				if err != nil {
-					return ExecutionResult{}, err
+					return mutationExecutionFailure(err)
 				}
 				device := helperDevice(value.Device)
 				result.JobID, result.Device = value.JobID, &device
@@ -636,12 +644,12 @@ func RunRole(args []string) error {
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
 		value, err := application.CreateHeadscalePreauthKey(ctx, actor, target, payload, nil)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		output, err := helperproto.NewOutputSecret(value.Secret)
 		clear(value.Secret)
 		if err != nil {
-			return ExecutionResult{}, err
+			return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: value.JobID}, err
 		}
 		key := helperKey(value.Key)
 		return ExecutionResult{ResultDigest: digestString(value.JobID), Secret: output, Headscale: &helperproto.HeadscaleResult{Operation: string(domain.OperationPreauthKeyCreate), JobID: value.JobID, Key: &key}}, nil
@@ -662,7 +670,7 @@ func RunRole(args []string) error {
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
 		value, err := application.SetConnectorBinding(ctx, actor, payload)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(value.JobID), Connector: &helperproto.ConnectorResult{Operation: string(domain.OperationConnectorBindingSet), JobID: value.JobID}}, nil
 	})
@@ -720,7 +728,7 @@ func RunRole(args []string) error {
 		}
 		value, err := application.ExecuteConnectorLogin(ctx, actor, payload, login, nil, nil)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(value.JobID), Connector: &helperproto.ConnectorResult{Operation: string(domain.OperationConnectorLogin), JobID: value.JobID}}, nil
 	})
@@ -737,7 +745,7 @@ func RunRole(args []string) error {
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
 		value, err := application.DeleteResource(ctx, actor, domain.OperationTarget{Kind: domain.OperationTargetResource, ID: id}, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(value.JobID), Action: &helperproto.ActionResult{JobID: value.JobID}}, nil
 	})
@@ -1254,12 +1262,12 @@ func RunRole(args []string) error {
 			result, err = application.RotateManagedBasic(ctx, request.Action.TargetID, actor, request.Action.PlanID)
 		}
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		defer clear(result.Password)
 		output, err := helperproto.NewOutputSecret(result.Password)
 		if err != nil {
-			return ExecutionResult{}, err
+			return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: result.Job.ID}, err
 		}
 		return ExecutionResult{ResultDigest: result.Fingerprint, Secret: output, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: request.Action.Operation, TargetKind: "credential", TargetID: result.CredentialID}}, nil
 	})
@@ -1275,7 +1283,7 @@ func RunRole(args []string) error {
 		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
 		result, err := application.RegisterStaticRoot(ctx, request.Action.TargetID, request.Action.StaticRoot, actor)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: result.Root.Fingerprint, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: "static_root_register", TargetKind: "static", TargetID: result.Root.ID}}, nil
 	})
@@ -1291,7 +1299,7 @@ func RunRole(args []string) error {
 		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
 		result, err := application.RegisterExternalHTPasswd(ctx, request.Action.TargetID, request.Action.ExternalHTPasswdFile, actor)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: result.Fingerprint, Action: &helperproto.ActionResult{JobID: result.Job.ID, Operation: "external_htpasswd_register", TargetKind: "credential", TargetID: result.CredentialID}}, nil
 	})
@@ -1326,7 +1334,7 @@ func RunRole(args []string) error {
 		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
 		record, err := application.DeleteManagedBasic(ctx, request.Action.TargetID, actor, request.Action.PlanID)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		return ExecutionResult{ResultDigest: digestString(request.Action.TargetID), Action: &helperproto.ActionResult{JobID: record.ID, Operation: "managed_basic_delete", TargetKind: "credential", TargetID: request.Action.TargetID}}, nil
 	})

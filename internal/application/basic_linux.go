@@ -281,7 +281,13 @@ func CreateManagedBasic(ctx context.Context, resourceID, username, actor string)
 		return result, err
 	}
 	var password []byte
-	defer func() { finalizeManagedBasic(&resultErr, password, execution.Close) }()
+	defer func() {
+		finalizeManagedBasic(&resultErr, password, execution.Close)
+		if resultErr != nil {
+			result.Job = execution.job
+			resultErr = MutationJobError{JobID: execution.job.ID, Err: resultErr}
+		}
+	}()
 	password, err = basic.NewPassword()
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_created", Status: jobs.PostconditionVerified, Identity: credentialID}, "managed_basic_generation_failed", err)
@@ -363,7 +369,13 @@ func RotateManagedBasic(ctx context.Context, credentialID, actor, planID string)
 		return result, err
 	}
 	var password []byte
-	defer func() { finalizeManagedBasic(&resultErr, password, execution.Close) }()
+	defer func() {
+		finalizeManagedBasic(&resultErr, password, execution.Close)
+		if resultErr != nil {
+			result.Job = execution.job
+			resultErr = MutationJobError{JobID: execution.job.ID, Err: resultErr}
+		}
+	}()
 	lockedInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		completed, terminalErr := execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_rotated", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "managed_basic_revalidation_failed", err)
@@ -513,7 +525,13 @@ func DeleteManagedBasic(ctx context.Context, credentialID, actor, planID string)
 	if err != nil {
 		return record, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, execution.Close()) }()
+	defer func() {
+		resultErr = errors.Join(resultErr, execution.Close())
+		if resultErr != nil {
+			record = execution.job
+			resultErr = MutationJobError{JobID: execution.job.ID, Err: resultErr}
+		}
+	}()
 	freshInstallation, err := loadBasicInstallation(execution.service)
 	if err != nil {
 		return execution.completeNoEffect(ctx, jobs.Postcondition{Kind: "managed_basic_not_deleted", Status: jobs.PostconditionVerified, Identity: credential.Fingerprint}, "plan_consumption_rejected", err)
