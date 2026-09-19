@@ -1074,8 +1074,14 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return nil, err
 	}
+	var admitter *operations.Admitter
 	admittedJobID := ""
+	reservationActive := false
 	fail := func(cause error) (*ResourceExecution, error) {
+		if reservationActive {
+			cause = rejectReservedMutation(ctx, service, admitter, admittedJobID, "resource_create_not_started", cause)
+			reservationActive = false
+		}
 		_ = service.Close()
 		if admittedJobID != "" {
 			return nil, ResourceJobError{JobID: admittedJobID, Err: cause}
@@ -1113,7 +1119,7 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if _, err := service.SafetyState(); err != nil {
 		return fail(err)
 	}
-	admitter, err := service.resourceAdmitter()
+	admitter, err = service.resourceAdmitter()
 	if err != nil {
 		return fail(err)
 	}
@@ -1129,6 +1135,7 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
 	}
+	reservationActive = true
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
 	if err != nil {
 		return fail(err)
@@ -1150,6 +1157,7 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 		_ = mutationSet.Close()
 		return fail(err)
 	}
+	reservationActive = false
 	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate}, nil
 }
 
@@ -1175,8 +1183,14 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return nil, err
 	}
+	var admitter *operations.Admitter
 	admittedJobID := ""
+	reservationActive := false
 	fail := func(cause error) (*ResourceExecution, error) {
+		if reservationActive {
+			cause = rejectReservedMutation(ctx, service, admitter, admittedJobID, "resource_update_not_started", cause)
+			reservationActive = false
+		}
 		_ = service.Close()
 		if admittedJobID != "" {
 			return nil, ResourceJobError{JobID: admittedJobID, Err: cause}
@@ -1257,7 +1271,7 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 			return fail(validateErr)
 		}
 	}
-	admitter, err := service.resourceAdmitter()
+	admitter, err = service.resourceAdmitter()
 	if err != nil {
 		return fail(err)
 	}
@@ -1273,6 +1287,7 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
 	}
+	reservationActive = true
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
 	if err != nil {
 		return fail(err)
@@ -1294,6 +1309,7 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 		_ = mutationSet.Close()
 		return fail(err)
 	}
+	reservationActive = false
 	priorCopy := *prior
 	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate, Prior: &priorCopy}, nil
 }
