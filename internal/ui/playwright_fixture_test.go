@@ -144,7 +144,13 @@ func fixturePublication(domainName string) domain.AppPublication {
 }
 
 func fixtureLocalConfiguration(name string) *domain.ResourceStatusConfiguration {
-	return &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetLocalHTTP, Local: &domain.LocalResourceUpdateRequest{Name: name, EndpointKind: domain.LocalEndpointUnixSocketActivation, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, WebSocket: domain.WebSocketReadiness{}, Executable: "/usr/local/bin/fixture-app", WorkingDirectory: "/srv/fixture-app", WritePaths: []string{}, Publication: fixturePublication("fixture.example.test")}}
+	publication := fixturePublication("fixture.example.test")
+	publication.DomainHTTPS.AccessMode = domain.AppAccessBasic
+	publication.DomainHTTPS.CredentialID = "cred_0000000000000000000000000000000a"
+	publication.DomainHTTPS.StaticRootID = "static_0000000000000000000000000000000a"
+	publication.DomainHTTPS.StaticMappings = []domain.StaticMapping{{URLPath: "/assets/", RelativePath: "public/assets", Directory: true}}
+	publication.DomainHTTPS.GoAccess = domain.GoAccessPublication{Enabled: true, CredentialID: "cred_0000000000000000000000000000000b", DashboardPath: "/analytics/", WebSocketPath: "/live"}
+	return &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetLocalHTTP, Local: &domain.LocalResourceUpdateRequest{Name: name, EndpointKind: domain.LocalEndpointUnixSocketActivation, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, WebSocket: domain.WebSocketReadiness{}, Executable: "/usr/local/bin/fixture-app", WorkingDirectory: "/srv/fixture-app", WritePaths: []string{}, Publication: publication, CredentialIDs: []string{"cred_0000000000000000000000000000000a", "cred_0000000000000000000000000000000b"}}}
 }
 
 func fixtureTailnetConfiguration(name string) *domain.ResourceStatusConfiguration {
@@ -744,12 +750,14 @@ func (backend *playwrightFixtureBackend) controlHandler(server *Server, shutdown
 		}
 		backend.mu.Lock()
 		state := struct {
-			Scenario      string   `json:"scenario"`
-			ResourceCount int      `json:"resource_count"`
-			ResourceIDs   []string `json:"resource_ids"`
-		}{Scenario: backend.scenario, ResourceCount: len(backend.resources)}
-		for id := range backend.resources {
+			Scenario       string                                         `json:"scenario"`
+			ResourceCount  int                                            `json:"resource_count"`
+			ResourceIDs    []string                                       `json:"resource_ids"`
+			Configurations map[string]*domain.ResourceStatusConfiguration `json:"configurations"`
+		}{Scenario: backend.scenario, ResourceCount: len(backend.resources), Configurations: map[string]*domain.ResourceStatusConfiguration{}}
+		for id, resource := range backend.resources {
 			state.ResourceIDs = append(state.ResourceIDs, id)
+			state.Configurations[id] = resource.configuration
 		}
 		backend.mu.Unlock()
 		for i := 0; i < len(state.ResourceIDs); i++ {
