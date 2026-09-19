@@ -146,7 +146,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			helperOperation = helperproto.OperationManagedBasicDelete
 		}
 		reply, err := client(ctx, helperOperation, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation, Username: payload.Username})
-		if err != nil || reply.Action == nil || reply.Action.JobID == "" {
+		if err != nil {
+			var rejection HelperRejection
+			if errors.As(err, &rejection) {
+				clear(reply.Secret)
+				return Result{}, err
+			}
+		}
+		if reply.Action == nil || reply.Action.JobID == "" {
 			clear(reply.Secret)
 			return Result{}, fmt.Errorf("managed Basic action failed")
 		}
@@ -159,7 +166,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	staticRootAction, _ := RegisterAction(domain.OperationStaticRootRegister, StaticRootPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(StaticRootPayload)
 		reply, err := client(ctx, helperproto.OperationStaticRootRegister, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: payload.Confirmation, StaticRoot: payload.Path})
-		if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+		if err != nil {
+			var rejection HelperRejection
+			if errors.As(err, &rejection) {
+				return Result{}, err
+			}
+			return Result{}, fmt.Errorf("static root registration failed")
+		}
+		if reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
 			return Result{}, fmt.Errorf("static root registration failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
@@ -167,7 +181,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	externalHTPasswdAction, _ := RegisterAction(domain.OperationExternalHTPasswdRegister, StaticRootPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(StaticRootPayload)
 		reply, err := client(ctx, helperproto.OperationExternalHTPasswdRegister, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: payload.Confirmation, ExternalHTPasswdFile: payload.Path})
-		if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+		if err != nil {
+			var rejection HelperRejection
+			if errors.As(err, &rejection) {
+				return Result{}, err
+			}
+			return Result{}, fmt.Errorf("external htpasswd registration failed")
+		}
+		if reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
 			return Result{}, fmt.Errorf("external htpasswd registration failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil

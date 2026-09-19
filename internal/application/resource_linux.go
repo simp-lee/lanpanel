@@ -971,6 +971,14 @@ func removeCreateJournal(path string) error {
 	return directory.Sync()
 }
 
+type ResourceJobError struct {
+	JobID string
+	Err   error
+}
+
+func (err ResourceJobError) Error() string { return err.Err.Error() }
+func (err ResourceJobError) Unwrap() error { return err.Err }
+
 type ResourceExecution struct {
 	Service     *FixedService
 	Admitter    *operations.Admitter
@@ -1007,12 +1015,58 @@ func (directConfirmation) VerifyConfirmation(plans.Plan, string, string, time.Ti
 	return "", fmt.Errorf("direct UI action has no Plan")
 }
 
+func RejectResourceMutation(ctx context.Context, actor Actor, operation operations.Type, target, resourceID, code string) (string, error) {
+	if operation != operations.ResourceCreate && operation != operations.ResourceUpdate || target == "" || resourceID == "" || code == "" {
+		return "", fmt.Errorf("resource mutation rejection identity is invalid")
+	}
+	service, err := OpenFixed()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = service.Close() }()
+	document, err := service.Normal().Read()
+	if err != nil {
+		return "", err
+	}
+	authority, err := actorAuthority(actor)
+	if err != nil {
+		return "", err
+	}
+	admitter, err := service.resourceAdmitter()
+	if err != nil {
+		return "", err
+	}
+	admission, err := service.Manager().Acquire(ctx, locks.MutationAdmission)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = admission.Release() }()
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operation, Target: target, ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{ResourceID: resourceID}, ExpectedRevision: document.Revision})
+	if err != nil {
+		if job.ID != "" {
+			return job.ID, nil
+		}
+		return "", err
+	}
+	if err := admitter.RejectReservation(ctx, admission, document.Revision+1, job.ID, code); err != nil {
+		return job.ID, err
+	}
+	return job.ID, nil
+}
+
 func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppResource) (*ResourceExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*ResourceExecution, error) { _ = service.Close(); return nil, cause }
+	admittedJobID := ""
+	fail := func(cause error) (*ResourceExecution, error) {
+		_ = service.Close()
+		if admittedJobID != "" {
+			return nil, ResourceJobError{JobID: admittedJobID, Err: cause}
+		}
+		return nil, cause
+	}
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -1053,6 +1107,9 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 		return fail(err)
 	}
 	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceCreate, Target: "installation", ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{ResourceID: candidate.ID}, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
@@ -1103,7 +1160,14 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*ResourceExecution, error) { _ = service.Close(); return nil, cause }
+	admittedJobID := ""
+	fail := func(cause error) (*ResourceExecution, error) {
+		_ = service.Close()
+		if admittedJobID != "" {
+			return nil, ResourceJobError{JobID: admittedJobID, Err: cause}
+		}
+		return nil, cause
+	}
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -1187,6 +1251,9 @@ func BeginResourceUpdate(ctx context.Context, actor Actor, candidate domain.AppR
 		return fail(err)
 	}
 	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceUpdate, Target: "resource/" + candidate.ID, ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{ResourceID: candidate.ID, CandidateDigest: candidate.CurrentConfigDigest, CandidateBundle: prior.CurrentConfigDigest}, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))

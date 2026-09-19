@@ -23,6 +23,7 @@ import (
 	"lanpanel/internal/helperproto"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
+	"lanpanel/internal/operations"
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/renewal"
 	"lanpanel/internal/resource"
@@ -811,6 +812,31 @@ func RunRole(args []string) error {
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
 		var candidate domain.AppResource
 		var execution *application.ResourceExecution
+		resourceMutationFailure := func(cause error) (ExecutionResult, error) {
+			var admitted application.ResourceJobError
+			if errors.As(cause, &admitted) && admitted.JobID != "" {
+				return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: admitted.JobID}, cause
+			}
+			operation := operations.ResourceCreate
+			resourceID := candidate.ID
+			if request.Resource.Operation == "resource_update" {
+				operation = operations.ResourceUpdate
+				if resourceID == "" {
+					resourceID = strings.TrimPrefix(request.Target, "resource/")
+				}
+			}
+			if resourceID == "" && operation == operations.ResourceCreate {
+				resourceID = "resource-create"
+			}
+			if resourceID == "" {
+				return ExecutionResult{}, cause
+			}
+			jobID, jobErr := application.RejectResourceMutation(ctx, actor, operation, request.Target, resourceID, "authoritative_preflight_failed")
+			if jobID == "" {
+				return ExecutionResult{}, errors.Join(cause, jobErr)
+			}
+			return ExecutionResult{ErrorCode: "authoritative_preflight_failed", ErrorJobID: jobID}, errors.Join(cause, jobErr)
+		}
 		switch request.Resource.Operation {
 		case "resource_create":
 			if request.Target != "installation" || request.Resource.Create == nil {
@@ -866,16 +892,16 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, fmt.Errorf("resource mutation operation is invalid")
 		}
 		if err != nil {
-			return ExecutionResult{}, err
+			return resourceMutationFailure(err)
 		}
 		secretDigests, err := application.KnownSecretDigestsForResource(candidate)
 		if err != nil {
-			return ExecutionResult{}, err
+			return resourceMutationFailure(err)
 		}
 		if candidate.ManagedProcess != nil {
 			err = resource.ValidateArguments(candidate.ManagedProcess.Service.Arguments, secretDigests)
 			if err != nil {
-				return ExecutionResult{}, err
+				return resourceMutationFailure(err)
 			}
 		}
 		contact := ""
@@ -891,16 +917,16 @@ func RunRole(args []string) error {
 			case contactErr == nil && priorContact == contact:
 			case contactErr == nil:
 				if err := acmeaccount.WriteContact(contact); err != nil {
-					return ExecutionResult{}, err
+					return resourceMutationFailure(err)
 				}
 				contactChanged = true
 			case errors.Is(contactErr, os.ErrNotExist):
 				if err := acmeaccount.WriteContact(contact); err != nil {
-					return ExecutionResult{}, err
+					return resourceMutationFailure(err)
 				}
 				contactChanged = true
 			default:
-				return ExecutionResult{}, contactErr
+				return resourceMutationFailure(contactErr)
 			}
 			if contactChanged {
 				defer func() {
@@ -921,7 +947,7 @@ func RunRole(args []string) error {
 			execution, err = application.BeginResourceUpdate(ctx, actor, candidate, secretDigests)
 		}
 		if err != nil {
-			return ExecutionResult{}, err
+			return resourceMutationFailure(err)
 		}
 		defer func() { _ = execution.Close() }()
 		var commit jobs.Record
@@ -936,7 +962,10 @@ func RunRole(args []string) error {
 		}
 		committed = true
 		digest, err := resource.ConfigDigest(candidate)
-		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID, JobID: commit.ID, JobResult: string(commit.Result)}}, err
+		if err != nil {
+			return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: execution.JobID}, err
+		}
+		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID, JobID: commit.ID, JobResult: string(commit.Result)}}, nil
 	})
 	processHandler := ProcessLifecycleHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil || !strings.HasPrefix(request.Target, "resource/") {
@@ -956,6 +985,11 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{}, err
 		}
+		defer func() {
+			if resultErr != nil && output.ErrorJobID == "" {
+				output.ErrorJobID = execution.JobID
+			}
+		}()
 		host, err := managedprocess.NewFixedHost()
 		if err != nil {
 			commitErr := execution.CommitNoEffect(ctx)
@@ -1191,6 +1225,9 @@ func RunRole(args []string) error {
 			}
 			if resultErr != nil {
 				resultErr = contractPublicationProcessViolation(ctx, resultErr)
+			}
+			if resultErr != nil && output.ErrorJobID == "" {
+				output.ErrorJobID = execution.JobID
 			}
 		}()
 		job, err := execution.Run(ctx)
@@ -1643,6 +1680,9 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 		}
 		if resultErr != nil {
 			resultErr = contractPublicationProcessViolation(ctx, resultErr)
+		}
+		if resultErr != nil && output.ErrorJobID == "" {
+			output.ErrorJobID = execution.JobID
 		}
 	}()
 	abort := func(cause error) (ExecutionResult, error) {

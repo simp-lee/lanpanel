@@ -652,7 +652,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, invokeErr := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: application.EmptyPayload{}})
 		if invokeErr != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(invokeErr, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -857,7 +857,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, invokeErr := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: domain.OperationTarget{Kind: domain.OperationTargetHeadscale}, Payload: payload})
 		if invokeErr != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(invokeErr, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -887,7 +887,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, invokeErr := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: domain.OperationTarget{Kind: domain.OperationTargetHeadscale}, Payload: payload})
 		if invokeErr != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(invokeErr, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -900,7 +900,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: application.DomainStatusPayload{}})
 		if err != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(err, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -921,7 +921,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
 		if err != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(err, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -956,7 +956,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
 		if err != nil {
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(err, http.StatusServiceUnavailable)
 			return
 		}
 		if value, ok := result.Payload.(application.ManagedBasicActionResult); ok {
@@ -980,12 +980,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
 		if err != nil {
-			var rejected application.HelperRejection
-			if errors.As(err, &rejected) && rejected.Code == "foreign_database_evidence" {
-				s.sessionStatusJSON(writer, principal, http.StatusConflict, map[string]string{"error_code": rejected.Code, "job_id": rejected.JobID})
-				return
-			}
-			reject(writer, http.StatusServiceUnavailable)
+			actionFailure(err, http.StatusServiceUnavailable)
 			return
 		}
 		s.sessionJSON(writer, principal, result.Payload)

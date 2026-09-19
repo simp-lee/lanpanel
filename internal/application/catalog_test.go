@@ -85,6 +85,36 @@ func TestResourceActionPreservesTypedHelperRejections(t *testing.T) {
 	}
 }
 
+func TestDependencyActionsPreserveTypedRejectionWithoutJob(t *testing.T) {
+	service, err := HelperServiceWithResources(func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {
+		return HelperReply{}, HelperRejection{Code: "connector_required"}
+	}, func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error) {
+		return HelperReply{}, HelperRejection{Code: "connector_required"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := Actor{Kind: ActorUI, Identity: "session", Generation: 1}
+	target := domain.OperationTarget{Kind: domain.OperationTargetResource, ID: "res_00000000000000000000000000000001"}
+	cases := []struct {
+		name string
+		call Call
+	}{
+		{name: "managed basic", call: Call{Operation: domain.OperationManagedBasicCreate, Target: target, Payload: ManagedBasicPayload{Username: "alice", Confirmation: "generate"}}},
+		{name: "static root", call: Call{Operation: domain.OperationStaticRootRegister, Target: target, Payload: StaticRootPayload{Path: "/srv/app", Confirmation: "register"}}},
+		{name: "external htpasswd", call: Call{Operation: domain.OperationExternalHTPasswdRegister, Target: target, Payload: StaticRootPayload{Path: "/srv/app/.htpasswd", Confirmation: "register"}}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := service.Invoke(context.Background(), actor, test.call)
+			var rejection HelperRejection
+			if !errors.As(err, &rejection) || rejection.Code != "connector_required" || rejection.JobID != "" {
+				t.Fatalf("typed rejection was not preserved: %v", err)
+			}
+		})
+	}
+}
+
 func TestIncompleteActionsRemainUnavailable(t *testing.T) {
 	service, _ := New(nil)
 	call := Call{Operation: domain.OperationAdminTokenRotate, Target: domain.OperationTarget{Kind: domain.OperationTargetInstallation}, Payload: ConfirmationPayload{}}

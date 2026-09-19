@@ -115,7 +115,7 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		if responseSecret != nil {
 			responseSecret.Destroy()
 		}
-		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected && response.ErrorJobID != "" {
+		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected && (response.ErrorCode != "" || response.ErrorJobID != "") {
 			return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
 		}
 		return application.HelperReply{}, fmt.Errorf("helper request rejected")
