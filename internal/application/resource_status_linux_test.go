@@ -39,6 +39,9 @@ func TestTypedStatusProjectionDistinguishesClosureHealthAndUnreachable(t *testin
 	if err != nil || healthy.OverallStatus != domain.ResourceStatusHealthy {
 		t.Fatalf("healthy status=%#v error=%v", healthy, err)
 	}
+	if slices.Contains(healthy.AllowedActions, domain.ResourceActionStop) {
+		t.Fatal("published local resource exposed standalone stop action")
+	}
 
 	tailnet := recoveryTailnetResource()
 	tailnet.PublicationRecord.State = domain.PublicationPublished

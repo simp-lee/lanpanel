@@ -71,7 +71,14 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*PublicationExecution, error) { _ = service.Close(); return nil, cause }
+	admittedJobID := ""
+	fail := func(cause error) (*PublicationExecution, error) {
+		_ = service.Close()
+		if admittedJobID != "" {
+			return nil, MutationJobError{JobID: admittedJobID, Err: cause}
+		}
+		return nil, cause
+	}
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -134,6 +141,9 @@ func BeginPublication(ctx context.Context, actor Actor, envelopeTarget string, p
 	}
 	binding := operations.SafetyBinding{ResourceID: resource.ID, PlanID: plan.ID, IntentGeneration: generation, CandidateDigest: candidate.Bundle.ConfigDigest, CandidateBundle: candidate.BundleDigest, Deadline: plan.ExpiresAt}
 	job, admitErr := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.Publish, Target: "resource/" + resource.ID, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	var admissionCleanupErr error
 	if admitErr != nil && job.ID != "" {
 		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)

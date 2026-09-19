@@ -56,7 +56,20 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*CloseAllExecution, error) { _ = service.Close(); return nil, cause }
+	var admitter *operations.Admitter
+	admittedJobID := ""
+	reservationActive := false
+	fail := func(cause error) (*CloseAllExecution, error) {
+		if reservationActive {
+			cause = rejectReservedMutation(ctx, service, admitter, admittedJobID, "plan_consumption_rejected", cause)
+			reservationActive = false
+		}
+		_ = service.Close()
+		if admittedJobID != "" {
+			return nil, MutationJobError{JobID: admittedJobID, Err: cause}
+		}
+		return nil, cause
+	}
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -69,7 +82,7 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 	if err != nil || plan.Operation != string(operation) || plan.ActorIdentity != authority || plan.Target.Kind != plans.TargetKind(target.Kind) || plan.Target.ID != target.ID || payload.Confirmation != confirmation {
 		return fail(fmt.Errorf("contraction confirmation is invalid"))
 	}
-	admitter, err := service.Admitter(plan)
+	admitter, err = service.Admitter(plan)
 	if err != nil {
 		return fail(err)
 	}
@@ -98,6 +111,9 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 		global = false
 	}
 	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operationType, Target: operationTarget, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: binding, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	releaseErr := admission.Release()
 	if err != nil {
 		return fail(err)
@@ -105,6 +121,7 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 	if releaseErr != nil {
 		return fail(releaseErr)
 	}
+	reservationActive = true
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: "/var/lib/lanpanel/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
 	if err != nil {
 		return fail(err)
@@ -152,6 +169,7 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 		_ = mutationSet.Close()
 		return fail(err)
 	}
+	reservationActive = false
 	goaccessIDs := goAccessContractionInventory(freshInstallation, resourceIDs)
 	ownershipAuthority := map[string]string{}
 	if freshOwnership.Complete {

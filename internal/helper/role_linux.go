@@ -336,7 +336,7 @@ func RunRole(args []string) error {
 			return ExecutionResult{ResultDigest: result.ClosureDigest, Action: action}, nil
 		}
 		if request.Action.Operation == "unpublish" {
-			return ExecutionResult{}, normalErr
+			return mutationExecutionFailure(normalErr)
 		}
 		plan, err := contractionPlans.Consume(request.Action.PlanID, request.Action.ActorIdentity, request.Action.ActorGeneration, request.Action.Confirmation, time.Now().UTC())
 		if err != nil {
@@ -991,7 +991,7 @@ func RunRole(args []string) error {
 		}
 		execution, err := application.BeginProcess(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, resourceID, start)
 		if err != nil {
-			return ExecutionResult{}, err
+			return mutationExecutionFailure(err)
 		}
 		defer func() {
 			if resultErr != nil && output.ErrorJobID == "" {
@@ -1224,7 +1224,7 @@ func RunRole(args []string) error {
 		}
 		execution, err := application.BeginPublication(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 		if err != nil {
-			return ExecutionResult{}, contractPublicationProcessViolation(ctx, err)
+			return mutationExecutionFailure(contractPublicationProcessViolation(ctx, err))
 		}
 		defer func() {
 			closeErr := execution.Close()
@@ -1680,7 +1680,7 @@ func contractPublicationProcessViolation(ctx context.Context, cause error) error
 func executeDomainPublication(ctx context.Context, request helperproto.Request) (output ExecutionResult, resultErr error) {
 	execution, err := application.BeginCertificateIssue(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 	if err != nil {
-		return ExecutionResult{}, contractPublicationProcessViolation(ctx, err)
+		return mutationExecutionFailure(contractPublicationProcessViolation(ctx, err))
 	}
 	defer func() {
 		if closeErr := execution.Close(); closeErr != nil {

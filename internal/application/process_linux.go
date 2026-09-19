@@ -38,7 +38,20 @@ func BeginProcess(ctx context.Context, actor Actor, resourceID string, start boo
 	if err != nil {
 		return nil, err
 	}
-	fail := func(cause error) (*ProcessExecution, error) { _ = service.Close(); return nil, cause }
+	var admitter *operations.Admitter
+	admittedJobID := ""
+	reservationActive := false
+	fail := func(cause error) (*ProcessExecution, error) {
+		if reservationActive {
+			cause = rejectReservedMutation(ctx, service, admitter, admittedJobID, "process_lifecycle_not_started", cause)
+			reservationActive = false
+		}
+		_ = service.Close()
+		if admittedJobID != "" {
+			return nil, MutationJobError{JobID: admittedJobID, Err: cause}
+		}
+		return nil, cause
+	}
 	authority, err := actorAuthority(actor)
 	if err != nil {
 		return fail(err)
@@ -77,7 +90,7 @@ func BeginProcess(ctx context.Context, actor Actor, resourceID string, start boo
 	} else if candidate.PublicationRecord.State != domain.PublicationUnpublished || candidate.PublicationRecord.ActivationIntent != nil || candidate.PublicationRecord.ContractionIntent != nil {
 		return fail(fmt.Errorf("published or transitional resource rejects standalone stop"))
 	}
-	admitter, err := service.resourceAdmitter()
+	admitter, err = service.resourceAdmitter()
 	if err != nil {
 		return fail(err)
 	}
@@ -86,10 +99,14 @@ func BeginProcess(ctx context.Context, actor Actor, resourceID string, start boo
 		return fail(err)
 	}
 	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operation, Target: "resource/" + resourceID, ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{ResourceID: resourceID}, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(errors.Join(err, releaseErr))
 	}
+	reservationActive = true
 	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
 	if err != nil {
 		return fail(err)
@@ -111,6 +128,7 @@ func BeginProcess(ctx context.Context, actor Actor, resourceID string, start boo
 		_ = mutationSet.Close()
 		return fail(err)
 	}
+	reservationActive = false
 	return &ProcessExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: *candidate, Operation: operation}, nil
 }
 

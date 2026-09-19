@@ -981,6 +981,19 @@ func (err MutationJobError) Unwrap() error { return err.Err }
 
 type ResourceJobError = MutationJobError
 
+func rejectReservedMutation(ctx context.Context, service *FixedService, admitter *operations.Admitter, jobID, code string, cause error) error {
+	admission, acquireErr := service.Manager().Acquire(context.WithoutCancel(ctx), locks.MutationAdmission)
+	if acquireErr != nil {
+		return errors.Join(cause, acquireErr)
+	}
+	defer func() { _ = admission.Release() }()
+	document, readErr := service.Normal().Read()
+	if readErr != nil {
+		return errors.Join(cause, readErr)
+	}
+	return errors.Join(cause, admitter.RejectReservation(context.WithoutCancel(ctx), admission, document.Revision, jobID, code))
+}
+
 type ResourceExecution struct {
 	Service     *FixedService
 	Admitter    *operations.Admitter

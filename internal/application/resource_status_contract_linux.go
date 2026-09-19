@@ -563,7 +563,7 @@ func projectResourceActions(resource domain.AppResource, status domain.ResourceS
 	if status.PublicationStatus != domain.PublicationStatusActivating && status.PublicationStatus != domain.PublicationStatusContracting && status.PublicationStatus != domain.PublicationStatusFenced {
 		actions = append(actions, domain.ResourceActionEdit)
 	}
-	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil {
+	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil && status.PublicationStatus == domain.PublicationStatusUnpublished {
 		switch status.ProcessRequestedStatus {
 		case domain.ProcessRequestedRun:
 			if status.ProcessObservedStatus == domain.ProcessRunning {

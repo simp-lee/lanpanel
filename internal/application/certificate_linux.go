@@ -111,6 +111,7 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 	var mutation *operations.MutationLease
 	var exposure *locks.Lease
 	var childRecord operations.ChildRecord
+	admittedJobID := ""
 	fail := func(cause error) (*CertificateExecution, error) {
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
 		mutation = nil
@@ -123,6 +124,9 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 			releaseErr = errors.Join(releaseErr, cleanup())
 		}
 		releaseErr = errors.Join(releaseErr, service.Close())
+		if admittedJobID != "" {
+			return nil, MutationJobError{JobID: admittedJobID, Err: errors.Join(cause, releaseErr)}
+		}
 		return nil, errors.Join(cause, releaseErr)
 	}
 	legoDigest, err := loadCertificateLegoDigest()
@@ -237,6 +241,9 @@ func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget stri
 		return fail(err)
 	}
 	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.Publish, Target: "resource/" + resource.ID, ActorIdentity: authority, PlanID: plan.ID, Source: operations.AdmissionPlan, SafetyBinding: operations.SafetyBinding{ResourceID: resource.ID, PlanID: plan.ID, IntentGeneration: generation, CandidateDigest: prepared.Safety.SANIdentity, CandidateBundle: bindingDigest, ChallengeMethod: string(binding.Method), CertificateIdentity: certificateID, Deadline: plan.ExpiresAt}, ExpectedRevision: document.Revision})
+	if job.ID != "" {
+		admittedJobID = job.ID
+	}
 	releaseErr := admission.Release()
 	if err != nil || releaseErr != nil {
 		return fail(fmt.Errorf("certificate admission: %v %v", err, releaseErr))
