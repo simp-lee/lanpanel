@@ -115,11 +115,8 @@ func helperExchange(ctx context.Context, operation helperproto.Operation, action
 		if responseSecret != nil {
 			responseSecret.Destroy()
 		}
-		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected {
-			switch response.ErrorCode {
-			case "foreign_database_evidence", "headscale_not_configured", "connector_required", "package_identity_drift":
-				return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
-			}
+		if err == nil && response.RequestID == request.RequestID && response.Code == helperproto.ResponseRejected && response.ErrorJobID != "" {
+			return application.HelperReply{}, application.HelperRejection{Code: response.ErrorCode, JobID: response.ErrorJobID}
 		}
 		return application.HelperReply{}, fmt.Errorf("helper request rejected")
 	}

@@ -932,7 +932,7 @@ func RunRole(args []string) error {
 		}
 		if err != nil {
 			_ = unix.Kill(os.Getpid(), unix.SIGTERM)
-			return ExecutionResult{ErrorJobID: commit.ID}, err
+			return ExecutionResult{ErrorJobID: execution.JobID}, err
 		}
 		committed = true
 		digest, err := resource.ConfigDigest(candidate)
