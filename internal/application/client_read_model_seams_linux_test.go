@@ -52,7 +52,7 @@ func seamTestStatus(now time.Time) domain.ResourceStatusResult {
 		ResourceID: resourceID, Name: "Seam app", TargetKind: domain.AppTargetLocalHTTP,
 		OverallStatus: domain.ResourceStatusClosed, ConfigurationStatus: domain.ConfigurationComplete,
 		ProcessRequestedStatus: domain.ProcessRequestedStop, ProcessObservedStatus: domain.ProcessStopped, ProcessStatus: domain.ProcessStopped,
-		PublicationStatus: domain.PublicationStatusUnpublished, ConnectorStatus: domain.EvidenceNotApplicable, RouteStatus: domain.EvidenceNotApplicable, TargetStatus: domain.EvidenceUnknown,
+		PublicationStatus: domain.PublicationStatusUnpublished, ConnectorBindingStatus: domain.ConnectorBindingNotApplicable, ConnectorStatus: domain.EvidenceNotApplicable, RouteStatus: domain.EvidenceNotApplicable, TargetStatus: domain.EvidenceUnknown,
 		FailureCategory: domain.FailureNone, AllowedActions: []domain.ResourceAction{domain.ResourceActionRefresh}, ClosureVerified: true, ClosureDigest: configDigest, ClosureObservedAt: now,
 		AffectedObject: "resource/" + resourceID, NextStep: "refresh status", ConfigDigest: configDigest, AuthorityDigest: domain.ResourceStatusAuthorityDigest(resourceID, configDigest), ObservedAt: now,
 		TargetObservation: &domain.TargetObservation{Validity: domain.EvidenceUnknown, ObservedAt: now, Failure: domain.FailureEvidenceMissing},

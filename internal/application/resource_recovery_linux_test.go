@@ -508,7 +508,7 @@ func recoveryLocalResource(t *testing.T) domain.AppResource {
 	value.ManagedProcess.Applied = &domain.ProcessBundle{Generation: 1, ConfigDigest: value.CurrentConfigDigest, UnitDigest: recoveryDigest("unit"), SocketUnitDigest: recoveryDigest("socket"), PolicyDigest: recoveryDigest("policy"), AccountDigest: recoveryDigest("account"), ExecutableDigest: recoveryDigest("executable"), WorkingDirectoryIdentity: recoveryDigest("working-directory"), Cgroup: "/sys/fs/cgroup/lanpanel-local-app", FrontendEndpoint: "/run/lanpanel/local-app.sock", EndpointSocketUnits: []string{"lanpanel-local-app.socket"}, ApplicationUID: 1000, ApplicationGID: 1000, FrontendGID: 33, FrontendMode: 0o660, ManagedPaths: append([]string(nil), value.ManagedPaths...)}
 	value.ManagedProcess.LastOperation = domain.OperationProcessStop
 	value.ManagedProcess.LastOperationResult = domain.OperationSucceeded
-	value.ManagedProcess.LastJobID = "job_prior_process"
+	value.ManagedProcess.LastJobID = "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	return value
 }
 

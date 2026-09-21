@@ -41,9 +41,46 @@ func TestSharedReadinessSkipsDisabledWebSocketAndRejectsRedirect(t *testing.T) {
 	}
 	request.Target.ReadinessPath = "/redirect"
 	request.Target.AllowedHTTPStatuses = []uint16{200}
-	if _, err := Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tcp/" + address}); err == nil {
-		t.Fatal("redirect became readiness success")
+	evidence, err = Probe(context.Background(), request, dialTransport{address, request.EndpointIdentity + "/tcp/" + address})
+	if err == nil || evidence.HTTPStatus != http.StatusFound || evidence.ObservedAt.IsZero() || evidence.Digest == "" {
+		t.Fatalf("disallowed HTTP response lost partial evidence: evidence=%#v error=%v", evidence, err)
 	}
+}
+
+func TestReadinessReturnsHTTPPartialEvidenceOnWebSocketFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for count := 0; count < 2; count++ {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			request, readErr := http.ReadRequest(bufioReader(connection))
+			if readErr != nil {
+				_ = connection.Close()
+				return
+			}
+			if request.URL.Path == "/ready" {
+				_, _ = io.WriteString(connection, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+			} else {
+				_, _ = io.WriteString(connection, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+			}
+			_ = connection.Close()
+		}
+	}()
+	request := validProbeRequest(listener.Addr().String())
+	request.Target.WebSocket = domain.WebSocketReadiness{Enabled: true, Path: "/ws"}
+	evidence, err := Probe(context.Background(), request, dialTransport{listener.Addr().String(), request.EndpointIdentity + "/tcp/" + listener.Addr().String()})
+	if err == nil || evidence.HTTPStatus != http.StatusNoContent || evidence.WebSocketStatus != http.StatusServiceUnavailable || evidence.ObservedAt.IsZero() || evidence.Digest == "" {
+		t.Fatalf("WebSocket failure lost partial HTTP evidence: evidence=%#v error=%v", evidence, err)
+	}
+	<-done
 }
 
 func TestHTTPReadinessRequiresExplicitlyConfiguredAuthenticationStatus(t *testing.T) {

@@ -14,29 +14,32 @@ import (
 )
 
 type ResourceStatusEvidence struct {
-	NginxHealthy         bool
-	NginxGeneration      string
-	ManifestContains     bool
-	NginxFailure         domain.ResourceFailureCategory
-	NginxFenced          bool
-	ProcessStatus        domain.ResourceProcessStatus
-	ProcessFailure       domain.ResourceFailureCategory
-	ConnectorObservation *domain.ConnectorObservation
-	ConnectorFailure     domain.ResourceFailureCategory
-	RouteEvidence        *domain.RouteEvidence
-	RouteFailure         domain.ResourceFailureCategory
-	TargetObservation    *domain.TargetObservation
-	TargetFailure        domain.ResourceFailureCategory
-	PublicationFailure   domain.ResourceFailureCategory
-	SourceChecked        bool
-	SourceHealthy        bool
-	SourceFailure        domain.ResourceFailureCategory
-	CertificateChecked   bool
-	CertificateHealthy   bool
-	CertificateFailure   domain.ResourceFailureCategory
-	JobPending           bool
-	JobID                string
-	LastOperation        domain.OperationCode
+	ConnectorBindingStatus domain.ConnectorBindingStatus
+	NginxHealthy           bool
+	NginxGeneration        string
+	ManifestContains       bool
+	NginxFailure           domain.ResourceFailureCategory
+	NginxFenced            bool
+	ProcessStatus          domain.ResourceProcessStatus
+	ProcessFailure         domain.ResourceFailureCategory
+	ConnectorObservation   *domain.ConnectorObservation
+	ConnectorFailure       domain.ResourceFailureCategory
+	RouteEvidence          *domain.RouteEvidence
+	RouteFailure           domain.ResourceFailureCategory
+	TargetObservation      *domain.TargetObservation
+	TargetFailure          domain.ResourceFailureCategory
+	PublicationFailure     domain.ResourceFailureCategory
+	SourceChecked          bool
+	SourceHealthy          bool
+	SourceFailure          domain.ResourceFailureCategory
+	CertificateChecked     bool
+	CertificateHealthy     bool
+	CertificateFailure     domain.ResourceFailureCategory
+	JobPending             bool
+	JobID                  string
+	JobResult              domain.OperationResult
+	JobErrorCode           domain.JobErrorCode
+	LastOperation          domain.OperationCode
 }
 
 // ReadResourceStatus returns the fixed, non-secret status projection for one
@@ -73,7 +76,8 @@ func ReadResourceStatus(ctx context.Context, resourceID string) (domain.Resource
 	probeStartedAt := time.Now().UTC()
 	manifest, nginxHealthy, nginxFailure, nginxFenced := observeNginxStatusForResource(ctx, service, installation)
 	evidence := observeTypedResourceEvidence(ctx, *resource, probeStartedAt, manifest, nginxHealthy, nil)
-	evidence.JobPending, evidence.JobID, evidence.LastOperation = observeResourceJob(document, *resource)
+	evidence.ConnectorBindingStatus = connectorBindingStatus(installation, *resource)
+	evidence.JobPending, evidence.JobID, evidence.LastOperation, evidence.JobResult, evidence.JobErrorCode = observeResourceJob(document, *resource)
 	evidence.NginxFailure = nginxFailure
 	evidence.NginxFenced = nginxFenced
 	result, err := ProjectObservedResourceStatus(*resource, time.Now().UTC(), evidence)
@@ -112,7 +116,8 @@ func ReadResourceStatusCatalog(ctx context.Context) (domain.ResourceStatusCatalo
 	catalog := domain.ResourceStatusCatalog{InstallationID: installation.InstallationID, Resources: []domain.ResourceStatusResult{}}
 	for _, resource := range installation.Resources {
 		evidence := observeTypedResourceEvidence(ctx, resource, probeStartedAt, manifest, nginxHealthy, connectorCache)
-		evidence.JobPending, evidence.JobID, evidence.LastOperation = observeResourceJob(document, resource)
+		evidence.ConnectorBindingStatus = connectorBindingStatus(installation, resource)
+		evidence.JobPending, evidence.JobID, evidence.LastOperation, evidence.JobResult, evidence.JobErrorCode = observeResourceJob(document, resource)
 		evidence.NginxFailure = nginxFailure
 		evidence.NginxFenced = nginxFenced
 		status, statusErr := ProjectObservedResourceStatus(resource, time.Now().UTC(), evidence)
@@ -131,6 +136,16 @@ func ReadResourceStatusCatalog(ctx context.Context) (domain.ResourceStatusCatalo
 		return domain.ResourceStatusCatalog{}, err
 	}
 	return catalog, nil
+}
+
+func connectorBindingStatus(installation domain.Installation, resource domain.AppResource) domain.ConnectorBindingStatus {
+	if resource.Target.Kind != domain.AppTargetTailnetHTTP {
+		return domain.ConnectorBindingNotApplicable
+	}
+	if installation.Connector == nil {
+		return domain.ConnectorBindingMissing
+	}
+	return domain.ConnectorBindingBound
 }
 
 func resourceDependencyStatuses(installation domain.Installation, resource domain.AppResource) []domain.ResourceDependencyStatus {
@@ -180,24 +195,31 @@ func resourceDependencyStatuses(installation domain.Installation, resource domai
 // callers must preserve the authority digest and provide closure evidence before
 // claiming a closed overall state.
 func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (domain.ResourceStatusResult, error) {
+	return projectResourceStatus(resource, observedAt, true)
+}
+
+func projectResourceStatus(resource domain.AppResource, observedAt time.Time, validate bool) (domain.ResourceStatusResult, error) {
 	if observedAt.IsZero() {
 		return domain.ResourceStatusResult{}, fmt.Errorf("resource status observation time is invalid")
 	}
 	result := domain.ResourceStatusResult{
-		ResourceID:          resource.ID,
-		Name:                resource.Name,
-		TargetKind:          resource.Target.Kind,
-		OverallStatus:       domain.ResourceStatusUnknown,
-		ConfigurationStatus: domain.ConfigurationComplete,
-		PublicationStatus:   projectPublicationStatus(resource.PublicationRecord),
-		FailureCategory:     domain.FailureEvidenceMissing,
-		LastOperation:       resource.PublicationRecord.LastOperation,
-		AffectedObject:      "resource/" + resource.ID,
-		NextStep:            "refresh status and follow the available resource action",
-		JobID:               resource.PublicationRecord.LastJobID,
-		ConfigDigest:        resource.CurrentConfigDigest,
-		Configuration:       domain.ResourceStatusConfigurationFor(resource),
-		ObservedAt:          observedAt.UTC(),
+		ResourceID:             resource.ID,
+		Name:                   resource.Name,
+		TargetKind:             resource.Target.Kind,
+		OverallStatus:          domain.ResourceStatusUnknown,
+		ConfigurationStatus:    domain.ConfigurationComplete,
+		PublicationStatus:      projectPublicationStatus(resource.PublicationRecord),
+		ConnectorBindingStatus: domain.ConnectorBindingUnknown,
+		FailureCategory:        domain.FailureEvidenceMissing,
+		LastOperation:          resource.PublicationRecord.LastOperation,
+		AffectedObject:         "resource/" + resource.ID,
+		NextStep:               "refresh status and follow the available resource action",
+		JobID:                  resource.PublicationRecord.LastJobID,
+		JobPending:             resource.PublicationRecord.LastJobID != "" && resource.PublicationRecord.LastOperationResult == "",
+		JobResult:              resource.PublicationRecord.LastOperationResult,
+		ConfigDigest:           resource.CurrentConfigDigest,
+		Configuration:          domain.ResourceStatusConfigurationFor(resource),
+		ObservedAt:             observedAt.UTC(),
 	}
 	result.AuthorityDigest = domain.ResourceStatusAuthorityDigest(result.ResourceID, result.ConfigDigest)
 	if resource.Target.Kind == domain.AppTargetLocalHTTP && resource.ManagedProcess != nil {
@@ -207,8 +229,12 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		if result.LastOperation == "" {
 			result.LastOperation = resource.ManagedProcess.LastOperation
 		}
-		if result.JobID == "" {
+		if result.JobID == "" || resource.ManagedProcess.LastJobID != "" && resource.ManagedProcess.LastOperationResult == "" {
 			result.JobID = resource.ManagedProcess.LastJobID
+			result.JobResult = resource.ManagedProcess.LastOperationResult
+		}
+		if resource.ManagedProcess.LastJobID != "" && resource.ManagedProcess.LastOperationResult == "" {
+			result.JobPending = true
 		}
 	} else {
 		result.ProcessRequestedStatus = domain.ProcessNotApplicable
@@ -237,6 +263,7 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		result.TargetObservation = &domain.TargetObservation{WebSocketRequired: resource.Target.WebSocket.Enabled, Validity: domain.EvidenceUnknown, ObservedAt: observedAt.UTC(), Failure: domain.FailureEvidenceMissing}
 		result.NextStep = "verify the connector, route, and fixed remote target before publishing"
 	} else {
+		result.ConnectorBindingStatus = domain.ConnectorBindingNotApplicable
 		result.ConnectorStatus = domain.EvidenceNotApplicable
 		result.RouteStatus = domain.EvidenceNotApplicable
 		result.TargetStatus = domain.EvidenceUnknown
@@ -248,8 +275,10 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 		result.NextStep = "republish the current configuration after a fresh preflight"
 	}
 	result.AllowedActions = projectResourceActions(resource, result)
-	if err := domain.ValidateResourceStatusResult(result); err != nil {
-		return domain.ResourceStatusResult{}, err
+	if validate {
+		if err := domain.ValidateResourceStatusResult(result); err != nil {
+			return domain.ResourceStatusResult{}, err
+		}
 	}
 	return result, nil
 }
@@ -258,12 +287,18 @@ func ProjectResourceStatus(resource domain.AppResource, observedAt time.Time) (d
 // independently collected evidence. It never interprets a missing probe as a
 // successful observation.
 func ProjectObservedResourceStatus(resource domain.AppResource, observedAt time.Time, evidence ResourceStatusEvidence) (domain.ResourceStatusResult, error) {
-	result, err := ProjectResourceStatus(resource, observedAt)
+	result, err := projectResourceStatus(resource, observedAt, false)
 	if err != nil {
 		return domain.ResourceStatusResult{}, err
 	}
+	if evidence.ConnectorBindingStatus != "" {
+		result.ConnectorBindingStatus = evidence.ConnectorBindingStatus
+	}
 	if evidence.JobID != "" {
 		result.JobID = evidence.JobID
+		result.JobPending = evidence.JobPending
+		result.JobResult = evidence.JobResult
+		result.JobErrorCode = evidence.JobErrorCode
 	}
 	if evidence.LastOperation != "" {
 		result.LastOperation = evidence.LastOperation
@@ -345,7 +380,7 @@ func canonicalStatusIP(value string) string {
 	return address.String()
 }
 
-func observeResourceJob(document persist.Document, resource domain.AppResource) (bool, string, domain.OperationCode) {
+func observeResourceJob(document persist.Document, resource domain.AppResource) (bool, string, domain.OperationCode, domain.OperationResult, domain.JobErrorCode) {
 	ids := make([]string, 0, 2)
 	if resource.PublicationRecord.LastJobID != "" {
 		ids = append(ids, resource.PublicationRecord.LastJobID)
@@ -362,9 +397,13 @@ func observeResourceJob(document persist.Document, resource domain.AppResource) 
 		latest = record
 	}
 	if latest.ID == "" {
-		return false, "", ""
+		return false, "", "", "", ""
 	}
-	return latest.Status == jobs.StatusReserved || latest.Status == jobs.StatusRunning, latest.ID, domain.OperationCode(latest.Operation)
+	pending := latest.Status == jobs.StatusReserved || latest.Status == jobs.StatusRunning
+	if pending {
+		return true, latest.ID, domain.OperationCode(latest.Operation), "", ""
+	}
+	return false, latest.ID, domain.OperationCode(latest.Operation), domain.OperationResult(latest.Result), domain.JobErrorCode(latest.ErrorCode)
 }
 
 func hasStatusFailure(value domain.ResourceFailureCategory) bool {
@@ -434,7 +473,12 @@ func projectTailnetEvidence(result *domain.ResourceStatusResult, evidence Resour
 			validity = domain.EvidenceUnreachable
 			result.RouteStatus = validity
 		}
-		result.RouteEvidence = &domain.RouteEvidence{PeerIP: result.TargetPeerIP, SourceIP: result.TargetSourceIP, Port: result.TargetPort, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: validity, ObservedAt: func() time.Time {
+		var peerOnline *bool
+		if evidence.RouteFailure == domain.FailurePeerOffline {
+			offline := false
+			peerOnline = &offline
+		}
+		result.RouteEvidence = &domain.RouteEvidence{PeerIP: result.TargetPeerIP, SourceIP: result.TargetSourceIP, Port: result.TargetPort, PeerOnline: peerOnline, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: validity, ObservedAt: func() time.Time {
 			if validity == domain.EvidenceUnreachable {
 				return result.ObservedAt
 			}
@@ -553,7 +597,7 @@ func publicationEvidenceHealthy(result domain.ResourceStatusResult, evidence Res
 }
 
 func projectResourceActions(resource domain.AppResource, status domain.ResourceStatusResult) []domain.ResourceAction {
-	if status.JobPending {
+	if status.JobPending || status.OverallStatus == domain.ResourceStatusUnknown {
 		return []domain.ResourceAction{domain.ResourceActionRefresh}
 	}
 	if status.PublicationStatus == domain.PublicationStatusUnknown || status.PublicationStatus == domain.PublicationStatusActivating || status.PublicationStatus == domain.PublicationStatusContracting || status.PublicationStatus == domain.PublicationStatusFenced {

@@ -74,19 +74,6 @@ func Probe(ctx context.Context, request ProbeRequest, transport Transport) (Evid
 	if expected := targetTransportIdentity(request.Target); expected == "" || transport.Identity() != request.EndpointIdentity+"/"+expected {
 		return Evidence{}, fmt.Errorf("target readiness transport does not match configured endpoint")
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, TotalTimeout)
-	defer cancel()
-	httpStatus, err := probeHTTP(probeCtx, request, transport)
-	if err != nil {
-		return Evidence{}, err
-	}
-	websocketStatus := 0
-	if request.Target.WebSocket.Enabled {
-		websocketStatus, err = probeWebSocket(probeCtx, request, transport)
-		if err != nil {
-			return Evidence{}, err
-		}
-	}
 	now := time.Now().UTC()
 	if request.Now != nil {
 		now = request.Now().UTC()
@@ -94,11 +81,28 @@ func Probe(ctx context.Context, request ProbeRequest, transport Transport) (Evid
 	if now.IsZero() {
 		return Evidence{}, fmt.Errorf("target readiness observation time is invalid")
 	}
-	evidence := Evidence{ResourceID: request.ResourceID, ConfigDigest: request.ConfigDigest, EndpointIdentity: request.EndpointIdentity, TransportIdentity: transport.Identity(), HTTPStatus: httpStatus, WebSocketStatus: websocketStatus, ObservedAt: now}
+	evidence := Evidence{ResourceID: request.ResourceID, ConfigDigest: request.ConfigDigest, EndpointIdentity: request.EndpointIdentity, TransportIdentity: transport.Identity(), ObservedAt: now}
+	probeCtx, cancel := context.WithTimeout(ctx, TotalTimeout)
+	defer cancel()
+	var err error
+	evidence.HTTPStatus, err = probeHTTP(probeCtx, request, transport)
+	if err != nil {
+		return withEvidenceDigest(evidence), err
+	}
+	if request.Target.WebSocket.Enabled {
+		evidence.WebSocketStatus, err = probeWebSocket(probeCtx, request, transport)
+		if err != nil {
+			return withEvidenceDigest(evidence), err
+		}
+	}
+	return withEvidenceDigest(evidence), nil
+}
+
+func withEvidenceDigest(evidence Evidence) Evidence {
 	identity := strings.Join([]string{evidence.ResourceID, evidence.ConfigDigest, evidence.EndpointIdentity, evidence.TransportIdentity, fmt.Sprint(evidence.HTTPStatus), fmt.Sprint(evidence.WebSocketStatus)}, "\x00")
 	sum := sha256.Sum256([]byte(identity))
 	evidence.Digest = "sha256:" + hex.EncodeToString(sum[:])
-	return evidence, nil
+	return evidence
 }
 
 func probeHTTP(ctx context.Context, request ProbeRequest, transport Transport) (int, error) {

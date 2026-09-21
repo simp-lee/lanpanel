@@ -241,6 +241,15 @@ const (
 	EvidenceUnknown       ResourceEvidenceStatus = "unknown"
 )
 
+type ConnectorBindingStatus string
+
+const (
+	ConnectorBindingNotApplicable ConnectorBindingStatus = "not_applicable"
+	ConnectorBindingMissing       ConnectorBindingStatus = "missing"
+	ConnectorBindingBound         ConnectorBindingStatus = "bound"
+	ConnectorBindingUnknown       ConnectorBindingStatus = "unknown"
+)
+
 type ResourceAction string
 
 const (
@@ -300,6 +309,7 @@ type RouteEvidence struct {
 	PeerIP                  string                  `json:"peer_ip"`
 	SourceIP                string                  `json:"source_ip"`
 	Port                    uint16                  `json:"port"`
+	PeerOnline              *bool                   `json:"peer_online"`
 	ConnectorIdentityDigest string                  `json:"connector_identity_digest"`
 	RouteIdentity           string                  `json:"route_identity"`
 	Validity                ResourceEvidenceStatus  `json:"validity"`
@@ -421,6 +431,24 @@ func ResourceStatusConfigurationFor(resource AppResource) *ResourceStatusConfigu
 	}
 }
 
+type JobErrorCode string
+
+var resourceStatusJobErrorCodes = map[JobErrorCode]struct{}{
+	"activation_contracted": {}, "activation_restored_prior": {}, "admin_token_delivery_failed": {}, "admin_token_rotation_failed": {},
+	"admin_token_rotation_interrupted": {}, "admin_token_source_unknown": {}, "binding_refresh_failed": {}, "certificate_remote_failed": {},
+	"certificate_handoff_interrupted": {}, "certificate_executor_interrupted": {}, "certificate_setup_failed": {}, "confirmation_invalid": {},
+	"confirmation_rejected": {}, "exact_reconciliation_closed": {}, "interrupted_lifecycle_contracted": {}, "managed_basic_interrupted": {},
+	"managed_basic_hash_failed": {}, "managed_basic_generation_failed": {}, "managed_basic_revalidation_failed": {}, "static_root_registration_interrupted": {},
+	"static_root_revalidation_failed": {}, "temporary_http_activation_recovery": {}, "temporary_http_no_effect": {}, "external_htpasswd_registration_interrupted": {},
+	"external_htpasswd_revalidation_failed": {}, "foreign_database_evidence": {}, "goaccess_retirement_recovery": {}, "goaccess_staging_restored_prior": {},
+	"goaccess_stop_failed": {}, "headscale_control_stop_fenced": {}, "headscale_deploy_revalidation_failed": {}, "headscale_user_create_failed": {},
+	"preauth_key_create_failed": {}, "preauth_key_revoke_failed": {}, "device_expire_failed": {}, "connector_login_failed": {}, "connector_login_unknown": {},
+	"headscale_lifecycle_interrupted": {}, "headscale_journal_failed": {}, "connector_mutation_interrupted": {}, "normal_revision_changed": {},
+	"plan_consumption_rejected": {}, "planless_start_rejected": {}, "process_lifecycle_not_started": {}, "preflight_rejected": {},
+	"publication_revalidation_failed": {}, "contraction_authority_failed": {}, "resource_create_not_started": {}, "resource_delete_not_started": {},
+	"resource_update_not_started": {}, "safety_authority_changed": {}, "safety_recheck_unavailable": {}, "safety_refresh_failed": {},
+}
+
 type ResourceStatusResult struct {
 	ResourceID             string                       `json:"resource_id"`
 	Name                   string                       `json:"name"`
@@ -434,6 +462,7 @@ type ResourceStatusResult struct {
 	ProcessObservedStatus  ResourceProcessStatus        `json:"process_observed_status"`
 	ProcessStatus          ResourceProcessStatus        `json:"process_status"`
 	PublicationStatus      ResourcePublicationStatus    `json:"publication_status"`
+	ConnectorBindingStatus ConnectorBindingStatus       `json:"connector_binding_status"`
 	ConnectorStatus        ResourceEvidenceStatus       `json:"connector_status"`
 	RouteStatus            ResourceEvidenceStatus       `json:"route_status"`
 	TargetStatus           ResourceEvidenceStatus       `json:"target_status"`
@@ -447,6 +476,8 @@ type ResourceStatusResult struct {
 	LastOperation          OperationCode                `json:"last_operation"`
 	JobID                  string                       `json:"job_id"`
 	JobPending             bool                         `json:"job_pending"`
+	JobResult              OperationResult              `json:"job_result"`
+	JobErrorCode           JobErrorCode                 `json:"job_error_code"`
 	ConfigDigest           string                       `json:"config_digest"`
 	AuthorityDigest        string                       `json:"authority_digest"`
 	ObservedAt             time.Time                    `json:"observed_at"`
@@ -482,10 +513,10 @@ func ResourceStatusDigest(value ResourceStatusResult) (string, error) {
 }
 
 func ValidateResourceStatusResult(value ResourceStatusResult) error {
-	if !strings.HasPrefix(value.ResourceID, "res_") || !idPattern.MatchString(value.ResourceID) || validateDisplayName(value.Name) != nil || value.TargetKind != AppTargetLocalHTTP && value.TargetKind != AppTargetTailnetHTTP || !validSHA256Digest(value.ConfigDigest) || value.AuthorityDigest != ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest) || value.ObservedAt.IsZero() || !validOpaqueTargetID(value.AffectedObject) || !validStatusText(value.NextStep) || !validOpaqueTargetID(value.JobID) && value.JobID != "" || value.JobPending && value.JobID == "" || value.LastOperation != "" && func() bool { _, err := ParseOperationCode(string(value.LastOperation)); return err != nil }() || value.ClosureVerified && (!validSHA256Digest(value.ClosureDigest) || value.ClosureObservedAt.IsZero()) || !value.ClosureVerified && (value.ClosureDigest != "" || !value.ClosureObservedAt.IsZero()) {
+	if !strings.HasPrefix(value.ResourceID, "res_") || !idPattern.MatchString(value.ResourceID) || validateDisplayName(value.Name) != nil || value.TargetKind != AppTargetLocalHTTP && value.TargetKind != AppTargetTailnetHTTP || !validSHA256Digest(value.ConfigDigest) || value.AuthorityDigest != ResourceStatusAuthorityDigest(value.ResourceID, value.ConfigDigest) || value.ObservedAt.IsZero() || !validOpaqueTargetID(value.AffectedObject) || !validStatusText(value.NextStep) || !validJobID(value.JobID) && value.JobID != "" || value.JobPending && value.JobID == "" || value.JobResult != "" && value.JobID == "" || value.JobID != "" && !value.JobPending && value.JobResult == "" || value.JobResult != "" && func() bool { _, err := ParseOperationResult(string(value.JobResult)); return err != nil }() || value.JobResult != "" && value.JobResult != OperationSucceeded && value.JobErrorCode == "" || value.JobErrorCode != "" && (!validJobErrorCode(value.JobErrorCode) || value.JobResult == "" || value.JobResult == OperationSucceeded) || value.JobPending && (value.JobResult != "" || value.JobErrorCode != "") || value.LastOperation != "" && func() bool { _, err := ParseOperationCode(string(value.LastOperation)); return err != nil }() || value.ClosureVerified && (!validSHA256Digest(value.ClosureDigest) || value.ClosureObservedAt.IsZero()) || !value.ClosureVerified && (value.ClosureDigest != "" || !value.ClosureObservedAt.IsZero()) {
 		return fmt.Errorf("resource status identity is invalid")
 	}
-	if !validResourceStatusOverall(value.OverallStatus) || !validResourceConfiguration(value.ConfigurationStatus) || !validResourceProcess(value.ProcessRequestedStatus) || !validResourceProcess(value.ProcessObservedStatus) || !validResourceProcess(value.ProcessStatus) || !validResourcePublication(value.PublicationStatus) || !validEvidenceStatus(value.ConnectorStatus) || !validEvidenceStatus(value.RouteStatus) || !validEvidenceStatus(value.TargetStatus) || !validFailure(value.FailureCategory) || !validResourceActions(value.AllowedActions) {
+	if !validResourceStatusOverall(value.OverallStatus) || !validResourceConfiguration(value.ConfigurationStatus) || !validResourceProcess(value.ProcessRequestedStatus) || !validResourceProcess(value.ProcessObservedStatus) || !validResourceProcess(value.ProcessStatus) || !validResourcePublication(value.PublicationStatus) || !validConnectorBindingStatus(value.ConnectorBindingStatus) || !validEvidenceStatus(value.ConnectorStatus) || !validEvidenceStatus(value.RouteStatus) || !validEvidenceStatus(value.TargetStatus) || !validFailure(value.FailureCategory) || !validResourceActions(value.AllowedActions) {
 		return fmt.Errorf("resource status enum is invalid")
 	}
 	if err := validateStatusCombination(value); err != nil {
@@ -512,8 +543,11 @@ func ValidateResourceStatusResult(value ResourceStatusResult) error {
 	} else if value.TargetStatus != EvidenceNotApplicable && value.TargetStatus != EvidenceUnknown {
 		return fmt.Errorf("status lacks target observation")
 	}
-	if value.TargetKind == AppTargetLocalHTTP && (value.ConnectorStatus != EvidenceNotApplicable || value.RouteStatus != EvidenceNotApplicable || value.ConnectorObservation != nil || value.RouteEvidence != nil) {
+	if value.TargetKind == AppTargetLocalHTTP && (value.ConnectorBindingStatus != ConnectorBindingNotApplicable || value.ConnectorStatus != EvidenceNotApplicable || value.RouteStatus != EvidenceNotApplicable || value.ConnectorObservation != nil || value.RouteEvidence != nil) {
 		return fmt.Errorf("local status carries tailnet evidence")
+	}
+	if value.TargetKind == AppTargetTailnetHTTP && !validTailnetConnectorBindingStatus(value.ConnectorBindingStatus) {
+		return fmt.Errorf("tailnet status connector binding state is invalid")
 	}
 	if value.TargetKind == AppTargetLocalHTTP && (value.TargetPeerIP != "" || value.TargetSourceIP != "" || value.TargetPort != 0) {
 		return fmt.Errorf("local status carries tailnet endpoint authority")
@@ -582,6 +616,23 @@ func validStatusText(value string) bool {
 	return len(value) > 0 && len(value) <= 4096 && !strings.ContainsAny(value, "\x00\r\n")
 }
 
+func validJobID(value string) bool {
+	if len(value) != len("job_")+64 || !strings.HasPrefix(value, "job_") {
+		return false
+	}
+	digits := value[len("job_"):]
+	if strings.ToLower(digits) != digits {
+		return false
+	}
+	_, err := hex.DecodeString(digits)
+	return err == nil
+}
+
+func validJobErrorCode(value JobErrorCode) bool {
+	_, ok := resourceStatusJobErrorCodes[value]
+	return ok
+}
+
 func validResourceStatusOverall(value ResourceStatusOverall) bool {
 	return value == ResourceStatusClosed || value == ResourceStatusHealthy || value == ResourceStatusDegraded || value == ResourceStatusUnreachable || value == ResourceStatusUnknown
 }
@@ -600,6 +651,14 @@ func validResourcePublication(value ResourcePublicationStatus) bool {
 
 func validEvidenceStatus(value ResourceEvidenceStatus) bool {
 	return value == EvidenceNotApplicable || value == EvidenceUnverified || value == EvidenceFresh || value == EvidenceExpired || value == EvidenceUnreachable || value == EvidenceUnknown
+}
+
+func validConnectorBindingStatus(value ConnectorBindingStatus) bool {
+	return value == ConnectorBindingNotApplicable || value == ConnectorBindingMissing || value == ConnectorBindingBound || value == ConnectorBindingUnknown
+}
+
+func validTailnetConnectorBindingStatus(value ConnectorBindingStatus) bool {
+	return value == ConnectorBindingMissing || value == ConnectorBindingBound || value == ConnectorBindingUnknown
 }
 
 func validResourceActions(values []ResourceAction) bool {
@@ -717,7 +776,7 @@ func validateStatusActions(value ResourceStatusResult) error {
 	if !hasResourceAction(value.AllowedActions, ResourceActionRefresh) {
 		return fmt.Errorf("resource status cannot be refreshed")
 	}
-	transient := value.JobPending || value.PublicationStatus == PublicationStatusUnknown || value.PublicationStatus == PublicationStatusActivating || value.PublicationStatus == PublicationStatusContracting || value.PublicationStatus == PublicationStatusFenced
+	transient := value.JobPending || value.OverallStatus == ResourceStatusUnknown || value.PublicationStatus == PublicationStatusUnknown || value.PublicationStatus == PublicationStatusActivating || value.PublicationStatus == PublicationStatusContracting || value.PublicationStatus == PublicationStatusFenced
 	if transient && (len(value.AllowedActions) != 1 || value.AllowedActions[0] != ResourceActionRefresh) {
 		return fmt.Errorf("transient resource status carries conflicting actions")
 	}
@@ -772,11 +831,17 @@ func validateRouteEvidence(value RouteEvidence) error {
 	if peerErr != nil || sourceErr != nil || !peer.IsGlobalUnicast() || !source.IsGlobalUnicast() || peer.IsLoopback() || source.IsLoopback() || peer.BitLen() != source.BitLen() || value.Port == 0 || !validEvidenceStatus(value.Validity) || !validFailure(value.Failure) {
 		return fmt.Errorf("route evidence authority is invalid")
 	}
+	if value.Failure == FailurePeerOffline && (value.Validity != EvidenceUnreachable || value.PeerOnline == nil || *value.PeerOnline) {
+		return fmt.Errorf("peer offline route evidence lacks offline peer observation")
+	}
 	if value.Validity == EvidenceUnverified || value.Validity == EvidenceUnknown {
-		if value.ConnectorIdentityDigest != "" || value.RouteIdentity != "" || !value.ObservedAt.IsZero() || !value.ValidUntil.IsZero() {
+		if value.PeerOnline != nil || value.ConnectorIdentityDigest != "" || value.RouteIdentity != "" || !value.ObservedAt.IsZero() || !value.ValidUntil.IsZero() {
 			return fmt.Errorf("unverified route evidence carries freshness authority")
 		}
 		return nil
+	}
+	if value.Validity == EvidenceFresh && (value.PeerOnline == nil || !*value.PeerOnline) {
+		return fmt.Errorf("fresh route evidence lacks online peer observation")
 	}
 	if !validSHA256Digest(value.ConnectorIdentityDigest) || !validSHA256Digest(value.RouteIdentity) || value.ObservedAt.IsZero() || value.ValidUntil.IsZero() || value.ValidUntil.Before(value.ObservedAt) {
 		return fmt.Errorf("route evidence freshness authority is invalid")

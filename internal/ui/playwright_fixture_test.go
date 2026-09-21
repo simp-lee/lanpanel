@@ -199,6 +199,8 @@ func fixtureJobID(seed string) string {
 
 func fixtureIdentity(seed string) string { return fixtureDigest(seed) }
 
+func fixturePeerOnline(value bool) *bool { return &value }
+
 func fixtureConnector(now time.Time) *domain.ConnectorObservation {
 	return &domain.ConnectorObservation{
 		ControlURL:           "https://connector.example.test",
@@ -219,6 +221,7 @@ func fixtureRoute(connector *domain.ConnectorObservation, now time.Time) *domain
 		Port:                    8080,
 		ConnectorIdentityDigest: connectorID,
 		RouteIdentity:           domain.TailnetRouteIdentity(connectorID, "100.64.0.2", "100.64.0.1", 8080),
+		PeerOnline:              fixturePeerOnline(true),
 		Validity:                domain.EvidenceFresh,
 		ObservedAt:              now.Add(-time.Second),
 		ValidUntil:              now.Add(time.Minute),
@@ -248,6 +251,9 @@ func fixtureStatus(resource playwrightFixtureResource, scenario string) domain.R
 		JobID:               resource.jobID,
 		Configuration:       resource.configuration,
 	}
+	if resource.jobID != "" {
+		status.JobResult = domain.OperationSucceeded
+	}
 	if resource.kind == domain.AppTargetLocalHTTP {
 		status.ProcessRequestedStatus = domain.ProcessRequestedStop
 		status.ProcessObservedStatus = domain.ProcessStopped
@@ -257,6 +263,7 @@ func fixtureStatus(resource playwrightFixtureResource, scenario string) domain.R
 			status.ProcessObservedStatus = domain.ProcessRunning
 			status.ProcessStatus = domain.ProcessRunning
 		}
+		status.ConnectorBindingStatus = domain.ConnectorBindingNotApplicable
 		status.ConnectorStatus = domain.EvidenceNotApplicable
 		status.RouteStatus = domain.EvidenceNotApplicable
 		if resource.published {
@@ -279,7 +286,7 @@ func fixtureStatus(resource playwrightFixtureResource, scenario string) domain.R
 			status.TargetStatus = domain.EvidenceFresh
 			status.TargetObservation = &domain.TargetObservation{PortConnected: true, HTTPReady: true, HTTPStatus: 200, Validity: domain.EvidenceFresh, ObservedAt: now, Failure: domain.FailureNone}
 			status.OverallStatus = domain.ResourceStatusUnknown
-			status.AllowedActions = []domain.ResourceAction{domain.ResourceActionEdit, domain.ResourceActionRefresh}
+			status.AllowedActions = []domain.ResourceAction{domain.ResourceActionRefresh}
 		}
 		return status
 	}
@@ -290,6 +297,7 @@ func fixtureStatus(resource playwrightFixtureResource, scenario string) domain.R
 	status.TargetPeerIP = "100.64.0.2"
 	status.TargetSourceIP = "100.64.0.1"
 	status.TargetPort = 8080
+	status.ConnectorBindingStatus = domain.ConnectorBindingBound
 	status.ConnectorObservation = &domain.ConnectorObservation{Validity: domain.ConnectorObservationMissing}
 	status.ConnectorStatus = domain.EvidenceUnverified
 	status.RouteEvidence = &domain.RouteEvidence{PeerIP: status.TargetPeerIP, SourceIP: status.TargetSourceIP, Port: status.TargetPort, Validity: domain.EvidenceUnverified, Failure: domain.FailureEvidenceMissing}
@@ -366,10 +374,14 @@ func fixtureStatus(resource playwrightFixtureResource, scenario string) domain.R
 		status.NextStep = "publish explicitly after fresh connector, route, and target evidence"
 		status.AllowedActions = []domain.ResourceAction{domain.ResourceActionDelete, domain.ResourceActionEdit, domain.ResourceActionPublish, domain.ResourceActionRefresh}
 	} else if !resource.published {
-		status.AllowedActions = []domain.ResourceAction{domain.ResourceActionEdit, domain.ResourceActionRefresh}
+		status.AllowedActions = []domain.ResourceAction{domain.ResourceActionRefresh}
 	}
 	if resource.published {
-		status.AllowedActions = []domain.ResourceAction{domain.ResourceActionEdit, domain.ResourceActionRefresh, domain.ResourceActionUnpublish}
+		if status.OverallStatus == domain.ResourceStatusUnknown {
+			status.AllowedActions = []domain.ResourceAction{domain.ResourceActionRefresh}
+		} else {
+			status.AllowedActions = []domain.ResourceAction{domain.ResourceActionEdit, domain.ResourceActionRefresh, domain.ResourceActionUnpublish}
+		}
 		if status.OverallStatus == domain.ResourceStatusHealthy {
 			status.AllowedActions = []domain.ResourceAction{domain.ResourceActionEdit, domain.ResourceActionRefresh, domain.ResourceActionRepublish, domain.ResourceActionUnpublish}
 		}
@@ -396,7 +408,7 @@ func (backend *playwrightFixtureBackend) ProbeResource(ctx context.Context, id s
 	if err != nil {
 		return application.ResourceStatusEvidence{}, err
 	}
-	evidence := application.ResourceStatusEvidence{ProcessStatus: status.ProcessStatus, ConnectorObservation: status.ConnectorObservation, RouteEvidence: status.RouteEvidence, TargetObservation: status.TargetObservation, JobPending: status.JobPending, JobID: status.JobID, LastOperation: status.LastOperation}
+	evidence := application.ResourceStatusEvidence{ConnectorBindingStatus: status.ConnectorBindingStatus, ProcessStatus: status.ProcessStatus, ConnectorObservation: status.ConnectorObservation, RouteEvidence: status.RouteEvidence, TargetObservation: status.TargetObservation, JobPending: status.JobPending, JobID: status.JobID, JobResult: status.JobResult, JobErrorCode: status.JobErrorCode, LastOperation: status.LastOperation}
 	if status.TargetKind == domain.AppTargetTailnetHTTP && (status.ConnectorStatus != domain.EvidenceFresh || status.RouteStatus != domain.EvidenceFresh || status.TargetStatus != domain.EvidenceFresh) {
 		jobID := fixtureJobID("revalidation-" + id)
 		backend.mu.Lock()
@@ -567,7 +579,7 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 	switch operation {
 	case helperproto.OperationHeadscaleInitialize:
 		if strings.Contains(string(payload.Resource), `"control_domain":"foreign.example.test"`) {
-			return application.HelperReply{}, application.HelperRejection{Code: "foreign_database_evidence", JobID: "job_foreign_headscale_fixture"}
+			return application.HelperReply{}, application.HelperRejection{Code: "foreign_database_evidence", JobID: fixtureJobID("foreign-headscale")}
 		}
 		if strings.Contains(string(payload.Resource), `"control_domain":"blocked.example.test"`) && backend.barrier != nil {
 			if err := backend.barrier.wait(ctx); err != nil {

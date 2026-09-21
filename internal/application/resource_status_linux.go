@@ -128,7 +128,7 @@ func observeTypedTarget(ctx context.Context, resource domain.AppResource, observ
 	}
 	if err != nil {
 		failure := typedTargetFailure(err)
-		return &domain.TargetObservation{RouteIdentity: routeIdentity, WebSocketRequired: resource.Target.WebSocket.Enabled, Validity: domain.EvidenceUnreachable, ObservedAt: observedAt, Failure: failure}, failure
+		return targetObservationFromEvidence(resource, routeIdentity, observed, observedAt, failure), failure
 	}
 	webSocketReady := observed.WebSocketStatus == 101
 	if !webSocketReady && resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.AccessMode == domain.AppAccessApplicationManaged && (observed.WebSocketStatus == 401 || observed.WebSocketStatus == 403) {
@@ -167,6 +167,19 @@ func typedConnectorFailure(err error) domain.ResourceFailureCategory {
 	return domain.FailureConnectorDown
 }
 
+func targetObservationFromEvidence(resource domain.AppResource, routeIdentity string, observed target.Evidence, observedAt time.Time, failure domain.ResourceFailureCategory) *domain.TargetObservation {
+	if observed.ObservedAt.IsZero() {
+		observed.ObservedAt = observedAt
+	}
+	portConnected := observed.HTTPStatus > 0
+	httpReady := portConnected && failure != domain.FailureHTTPStatus
+	httpStatus := 0
+	if observed.HTTPStatus >= 100 && observed.HTTPStatus <= 599 {
+		httpStatus = observed.HTTPStatus
+	}
+	return &domain.TargetObservation{RouteIdentity: routeIdentity, PortConnected: portConnected, HTTPReady: httpReady, WebSocketRequired: resource.Target.WebSocket.Enabled, HTTPStatus: uint16(httpStatus), Validity: domain.EvidenceUnreachable, ObservedAt: observed.ObservedAt, Failure: failure}
+}
+
 func typedTargetFailure(err error) domain.ResourceFailureCategory {
 	message := strings.ToLower(err.Error())
 	switch {
@@ -198,6 +211,14 @@ func typedRouteEvidence(resource domain.AppResource, observed managedconnector.O
 	if peerErr != nil || sourceErr != nil || !slices.Contains(observed.LocalIPs, source) {
 		return &domain.RouteEvidence{PeerIP: peerIP, SourceIP: sourceIP, Port: target.Port, Validity: domain.EvidenceUnknown, Failure: domain.FailureEvidenceMismatch}, domain.FailureEvidenceMismatch
 	}
+	var peerOnline *bool
+	for _, candidate := range observed.Peers {
+		if candidate.IP == peer {
+			value := candidate.Online
+			peerOnline = &value
+			break
+		}
+	}
 	connectorIdentity := domain.TailnetConnectorIdentity(connector.ControlURL, connector.ClientVersion, connector.ClientIdentityDigest, connector.LocalIdentityDigest)
 	routeIdentity := domain.TailnetRouteIdentity(connectorIdentity, peer.String(), source.String(), target.Port)
 	if err := managedconnector.VerifyPeer(observed, peer, now); err != nil {
@@ -218,9 +239,12 @@ func typedRouteEvidence(resource domain.AppResource, observed managedconnector.O
 			connectorIdentity, routeIdentity = "", ""
 			observedAt, validUntil = time.Time{}, time.Time{}
 		}
-		return &domain.RouteEvidence{PeerIP: peer.String(), SourceIP: source.String(), Port: target.Port, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: validity, ObservedAt: observedAt, ValidUntil: validUntil, Failure: failure}, failure
+		if validity == domain.EvidenceUnknown {
+			peerOnline = nil
+		}
+		return &domain.RouteEvidence{PeerIP: peer.String(), SourceIP: source.String(), Port: target.Port, PeerOnline: peerOnline, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: validity, ObservedAt: observedAt, ValidUntil: validUntil, Failure: failure}, failure
 	}
-	return &domain.RouteEvidence{PeerIP: peer.String(), SourceIP: source.String(), Port: target.Port, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: domain.EvidenceFresh, ObservedAt: observed.ObservedAt, ValidUntil: observed.ValidUntil, Failure: domain.FailureNone}, domain.FailureNone
+	return &domain.RouteEvidence{PeerIP: peer.String(), SourceIP: source.String(), Port: target.Port, PeerOnline: peerOnline, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: domain.EvidenceFresh, ObservedAt: observed.ObservedAt, ValidUntil: observed.ValidUntil, Failure: domain.FailureNone}, domain.FailureNone
 }
 
 func fixedResourceStatusObservers() resourceStatusObservers {

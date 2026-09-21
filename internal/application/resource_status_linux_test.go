@@ -4,11 +4,15 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/diagnostics"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/jobs"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/persist"
+	"lanpanel/internal/target"
 	"os"
 	"path/filepath"
 	"slices"
@@ -51,10 +55,15 @@ func TestTypedStatusProjectionDistinguishesClosureHealthAndUnreachable(t *testin
 	connectorIdentity := domain.TailnetConnectorIdentity("https://control.example.test", "1.0", clientDigest, localDigest)
 	routeIdentity := domain.TailnetRouteIdentity(connectorIdentity, "100.64.0.2", "100.64.0.1", 8080)
 	connector := &domain.ConnectorObservation{ControlURL: "https://control.example.test", ClientVersion: "1.0", ClientIdentityDigest: clientDigest, LocalIdentityDigest: localDigest, Validity: domain.ConnectorObservationFresh, ObservedAt: now, ValidUntil: now.Add(time.Minute)}
-	route := &domain.RouteEvidence{PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: domain.EvidenceUnreachable, ObservedAt: now, ValidUntil: now, Failure: domain.FailurePeerOffline}
+	offline := false
+	route := &domain.RouteEvidence{PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, PeerOnline: &offline, ConnectorIdentityDigest: connectorIdentity, RouteIdentity: routeIdentity, Validity: domain.EvidenceUnreachable, ObservedAt: now, ValidUntil: now, Failure: domain.FailurePeerOffline}
 	unreachable, err := ProjectObservedResourceStatus(tailnet, now, ResourceStatusEvidence{NginxHealthy: true, ManifestContains: true, ConnectorObservation: connector, RouteEvidence: route})
-	if err != nil || unreachable.OverallStatus != domain.ResourceStatusUnreachable || unreachable.RouteStatus != domain.EvidenceUnreachable {
+	if err != nil || unreachable.OverallStatus != domain.ResourceStatusUnreachable || unreachable.RouteStatus != domain.EvidenceUnreachable || unreachable.RouteEvidence == nil || unreachable.RouteEvidence.PeerOnline == nil || *unreachable.RouteEvidence.PeerOnline {
 		t.Fatalf("unreachable status=%#v error=%v", unreachable, err)
+	}
+	bound, err := ProjectObservedResourceStatus(tailnet, now, ResourceStatusEvidence{ConnectorBindingStatus: domain.ConnectorBindingBound})
+	if err != nil || bound.ConnectorBindingStatus != domain.ConnectorBindingBound {
+		t.Fatalf("connector binding status=%#v error=%v", bound, err)
 	}
 
 	tailnetClosed := recoveryTailnetResource()
@@ -81,6 +90,90 @@ func TestTypedStatusProjectionDistinguishesClosureHealthAndUnreachable(t *testin
 	driftStatus, err := ProjectObservedResourceStatus(drift, now, ResourceStatusEvidence{NginxHealthy: true, ManifestContains: true, ProcessStatus: domain.ProcessRunning, TargetObservation: healthyLocalTarget})
 	if err != nil || driftStatus.OverallStatus != domain.ResourceStatusUnknown || slices.Contains(driftStatus.AllowedActions, domain.ResourceActionRepublish) {
 		t.Fatalf("drift status=%#v error=%v", driftStatus, err)
+	}
+}
+
+func TestTypedTargetStatusPreservesPartialProbeEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	resource := recoveryLocalResource(t)
+	resource.Target.WebSocket.Enabled = true
+
+	httpFailure := targetObservationFromEvidence(resource, "", target.Evidence{HTTPStatus: 503, ObservedAt: now}, now, domain.FailureHTTPStatus)
+	if !httpFailure.PortConnected || httpFailure.HTTPReady || httpFailure.HTTPStatus != 503 || httpFailure.WebSocketReady || httpFailure.Validity != domain.EvidenceUnreachable || httpFailure.Failure != domain.FailureHTTPStatus {
+		t.Fatalf("disallowed HTTP evidence was not preserved: %#v", httpFailure)
+	}
+
+	webSocketFailure := targetObservationFromEvidence(resource, "", target.Evidence{HTTPStatus: 204, WebSocketStatus: 503, ObservedAt: now}, now, domain.FailureWebSocket)
+	if !webSocketFailure.PortConnected || !webSocketFailure.HTTPReady || webSocketFailure.HTTPStatus != 204 || webSocketFailure.WebSocketReady || webSocketFailure.Failure != domain.FailureWebSocket {
+		t.Fatalf("partial HTTP readiness was not preserved after WebSocket failure: %#v", webSocketFailure)
+	}
+
+	noResponse := targetObservationFromEvidence(resource, "", target.Evidence{}, now, domain.FailureTargetDown)
+	if noResponse.PortConnected || noResponse.HTTPReady || noResponse.HTTPStatus != 0 {
+		t.Fatalf("no-response probe was reported as connected: %#v", noResponse)
+	}
+
+	invalidStatus := targetObservationFromEvidence(resource, "", target.Evidence{HTTPStatus: 700, ObservedAt: now}, now, domain.FailureHTTPStatus)
+	if !invalidStatus.PortConnected || invalidStatus.HTTPReady || invalidStatus.HTTPStatus != 0 {
+		t.Fatalf("out-of-contract HTTP status was projected: %#v", invalidStatus)
+	}
+}
+
+func TestTypedStatusPreservesTerminalJobEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	resource := recoveryTailnetResource()
+	jobID := "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, test := range []struct {
+		name   string
+		result domain.OperationResult
+		error  string
+	}{
+		{name: "succeeded", result: domain.OperationSucceeded},
+		{name: "failed", result: domain.OperationFailed, error: "preflight_rejected"},
+		{name: "partial", result: domain.OperationPartial, error: "temporary_http_activation_recovery"},
+		{name: "interrupted", result: domain.OperationInterrupted, error: "headscale_lifecycle_interrupted"},
+		{name: "unknown", result: domain.OperationUnknown, error: "goaccess_retirement_recovery"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status, err := ProjectObservedResourceStatus(resource, now, ResourceStatusEvidence{JobID: jobID, JobResult: test.result, JobErrorCode: domain.JobErrorCode(test.error)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.JobID != jobID || status.JobResult != test.result || status.JobErrorCode != domain.JobErrorCode(test.error) || status.JobPending {
+				t.Fatalf("terminal job evidence was not projected: %#v", status)
+			}
+		})
+	}
+
+	pending, err := ProjectObservedResourceStatus(resource, now, ResourceStatusEvidence{JobID: jobID, JobPending: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending.JobPending || pending.JobResult != "" || pending.JobErrorCode != "" {
+		t.Fatalf("pending job retained terminal evidence: %#v", pending)
+	}
+
+	fallback := recoveryTailnetResource()
+	fallback.PublicationRecord.LastOperation = domain.OperationPublish
+	fallback.PublicationRecord.LastJobID = jobID
+	fallback.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	fallbackStatus, err := ProjectResourceStatus(fallback, now)
+	if err != nil || fallbackStatus.JobResult != domain.OperationSucceeded || fallbackStatus.JobID != jobID {
+		t.Fatalf("durable resource result was not retained: %#v, %v", fallbackStatus, err)
+	}
+
+	terminal := jobs.Record{SchemaVersion: jobs.SchemaVersion, ID: jobID, Operation: string(domain.OperationPublish), Target: "resource/" + resource.ID, ActorIdentity: "test", StartedAt: now.Add(-time.Minute), Status: jobs.StatusTerminal, Result: jobs.ResultPartial, ModifiedPaths: []string{}, Postconditions: []jobs.Postcondition{{Kind: "recovery", Status: jobs.PostconditionKnown, Identity: resource.ID}}, ErrorCode: "temporary_http_activation_recovery"}
+	ended := now.Add(-time.Second)
+	terminal.EndedAt = &ended
+	raw, err := persist.EncodeEntry(terminal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource.PublicationRecord.LastJobID = jobID
+	resource.PublicationRecord.LastOperation = domain.OperationPublish
+	pendingObserved, observedID, observedOperation, observedResult, observedError := observeResourceJob(persist.Document{Entries: map[string]json.RawMessage{"jobs/" + jobID: raw}}, resource)
+	if pendingObserved || observedID != jobID || observedOperation != domain.OperationPublish || observedResult != domain.OperationPartial || observedError != domain.JobErrorCode(terminal.ErrorCode) {
+		t.Fatalf("durable job evidence was not observed: %v %q %q %q %q", pendingObserved, observedID, observedOperation, observedResult, observedError)
 	}
 }
 
