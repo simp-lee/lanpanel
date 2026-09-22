@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -121,56 +120,91 @@ func VerifyWebrootEmpty(certificateID string, uid, gid uint32) error {
 	if !certificateIDPattern(certificateID) || uid == 0 || gid == 0 {
 		return fmt.Errorf("ACME webroot identity invalid")
 	}
-	root := filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID)
-	info, err := os.Lstat(root)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("ACME webroot missing or unsafe")
+	return verifyWebrootEmptyAt(filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID), uid, gid)
+}
+
+func verifyWebrootEmptyAt(root string, uid, gid uint32) (resultErr error) {
+	rootFD, err := openDirectoryPathNoFollow(root)
+	if err != nil {
+		return fmt.Errorf("ACME webroot missing or unsafe: %w", err)
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uid || stat.Gid != gid {
-		return fmt.Errorf("ACME webroot owner changed")
+	defer func() { _ = unix.Close(rootFD) }()
+	if err := validateACMEWebrootFD(rootFD, uid, gid); err != nil {
+		return err
 	}
-	entries, err := os.ReadDir(root)
+	rootSeal, err := sealDirectory(rootFD)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, restoreDirectorySeal(rootFD, rootSeal)) }()
+	entries, err := readDirectoryFD(rootFD)
 	if err != nil {
 		return err
 	}
 	if len(entries) == 0 {
 		return nil
 	}
-	if len(entries) != 1 || entries[0].Name() != ".well-known" || !entries[0].IsDir() {
+	if len(entries) != 1 || entries[0].Name() != ".well-known" {
 		return fmt.Errorf("ACME webroot inventory unexpected")
 	}
-	wellKnown := filepath.Join(root, ".well-known")
-	challenge := filepath.Join(wellKnown, "acme-challenge")
-	for _, path := range []string{wellKnown, challenge} {
-		info, err := os.Lstat(path)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("ACME challenge directory unsafe")
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != uid || stat.Gid != gid || info.Mode().Perm()&0o022 != 0 {
-			return fmt.Errorf("ACME challenge directory owner changed")
-		}
+	wellKnownFD, err := openDirectoryAtNoFollow(rootFD, ".well-known")
+	if err != nil {
+		return fmt.Errorf("ACME challenge directory unsafe: %w", err)
 	}
-	tokens, err := os.ReadDir(challenge)
+	defer func() { _ = unix.Close(wellKnownFD) }()
+	if err := validateHTTP01ChallengeDirectoryFD(wellKnownFD, uid, gid); err != nil {
+		return err
+	}
+	wellKnownSeal, err := sealDirectory(wellKnownFD)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, restoreDirectorySeal(wellKnownFD, wellKnownSeal))
+		}
+	}()
+	entries, err = readDirectoryFD(wellKnownFD)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 || entries[0].Name() != "acme-challenge" {
+		return fmt.Errorf("ACME webroot inventory unexpected")
+	}
+	challengeFD, err := openDirectoryAtNoFollow(wellKnownFD, "acme-challenge")
+	if err != nil {
+		return fmt.Errorf("ACME challenge directory unsafe: %w", err)
+	}
+	defer func() { _ = unix.Close(challengeFD) }()
+	if err := validateHTTP01ChallengeDirectoryFD(challengeFD, uid, gid); err != nil {
+		return err
+	}
+	challengeSeal, err := sealDirectory(challengeFD)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, restoreDirectorySeal(challengeFD, challengeSeal))
+		}
+	}()
+	tokens, err := readDirectoryFD(challengeFD)
 	if err != nil {
 		return err
 	}
 	if len(tokens) != 0 {
 		return fmt.Errorf("ACME challenge token cleanup unproved")
 	}
-	if err := os.Remove(challenge); err != nil {
+	if err := unix.Unlinkat(wellKnownFD, "acme-challenge", unix.AT_REMOVEDIR); err != nil {
 		return err
 	}
-	if err := os.Remove(wellKnown); err != nil {
+	if err := unix.Unlinkat(rootFD, ".well-known", unix.AT_REMOVEDIR); err != nil {
 		return err
 	}
-	directory, err := os.Open(root)
-	if err != nil {
+	if err := restoreDirectorySeal(rootFD, rootSeal); err != nil {
 		return err
 	}
-	defer func(ignore func() error) { _ = ignore() }(directory.Close)
-	return directory.Sync()
+	return unix.Fsync(rootFD)
 }
 
 func RemoveWebroot(certificateID string, uid, gid uint32) error {
@@ -182,58 +216,176 @@ func RemoveWebroot(certificateID string, uid, gid uint32) error {
 }
 
 func removeOwnedTree(root string, uid, gid uint32, remaining int) error {
-	info, err := os.Lstat(root)
-	if errors.Is(err, os.ErrNotExist) {
+	parentFD, err := openDirectoryPathNoFollow(filepath.Dir(root))
+	if errors.Is(err, unix.ENOENT) {
 		return nil
 	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("ACME cleanup root invalid")
+	if err != nil {
+		return fmt.Errorf("ACME cleanup root invalid: %w", err)
 	}
-	var walk func(string) error
-	walk = func(path string) error {
-		if remaining <= 0 {
-			return fmt.Errorf("ACME cleanup inventory unbounded")
-		}
-		remaining--
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			childPath := filepath.Join(path, entry.Name())
-			info, err := os.Lstat(childPath)
-			if err != nil {
-				return err
-			}
-			stat, ok := info.Sys().(*syscall.Stat_t)
-			if !ok || (stat.Uid != 0 && stat.Uid != uid) || (stat.Gid != 0 && stat.Gid != gid) || info.Mode().Perm()&0o022 != 0 || info.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("ACME cleanup member identity invalid")
-			}
-			if info.IsDir() {
-				if err := walk(childPath); err != nil {
-					return err
-				}
-			} else if !info.Mode().IsRegular() {
-				return fmt.Errorf("ACME cleanup member type invalid")
-			}
-			if err := os.Remove(childPath); err != nil {
-				return err
-			}
-		}
+	defer func() { _ = unix.Close(parentFD) }()
+
+	rootFD, err := openDirectoryAtNoFollow(parentFD, filepath.Base(root))
+	if errors.Is(err, unix.ENOENT) {
 		return nil
 	}
-	if err := walk(root); err != nil {
-		return err
+	if err != nil {
+		return fmt.Errorf("ACME cleanup root invalid: %w", err)
 	}
-	if err := os.Remove(root); err != nil {
-		return err
+	removeErr := removeOwnedDirectoryAt(parentFD, filepath.Base(root), rootFD, uid, gid, &remaining)
+	closeErr := unix.Close(rootFD)
+	if removeErr != nil {
+		return errors.Join(removeErr, closeErr)
 	}
-	parent, err := os.Open(filepath.Dir(root))
+	if closeErr != nil {
+		return closeErr
+	}
+	return unix.Fsync(parentFD)
+}
+
+func removeOwnedDirectoryAt(parentFD int, name string, directoryFD int, uid, gid uint32, remaining *int) (resultErr error) {
+	if *remaining <= 0 {
+		return fmt.Errorf("ACME cleanup inventory unbounded")
+	}
+	*remaining--
+	seal, err := sealDirectory(directoryFD)
 	if err != nil {
 		return err
 	}
-	defer func(ignore func() error) { _ = ignore() }(parent.Close)
-	return parent.Sync()
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, restoreDirectorySeal(directoryFD, seal))
+		}
+	}()
+	entries, err := readDirectoryFD(directoryFD)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		childFD, err := unix.Openat(directoryFD, entry.Name(), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+		if err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		statErr := unix.Fstat(childFD, &stat)
+		memberValid := statErr == nil && (stat.Uid == 0 || stat.Uid == uid) && (stat.Gid == 0 || stat.Gid == gid) && stat.Mode&0o022 == 0
+		memberType := stat.Mode & unix.S_IFMT
+		if !memberValid {
+			_ = unix.Close(childFD)
+			return fmt.Errorf("ACME cleanup member identity invalid")
+		}
+		if memberType == unix.S_IFDIR {
+			childErr := removeOwnedDirectoryAt(directoryFD, entry.Name(), childFD, uid, gid, remaining)
+			closeErr := unix.Close(childFD)
+			if childErr != nil {
+				return errors.Join(childErr, closeErr)
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			continue
+		}
+		if memberType != unix.S_IFREG {
+			_ = unix.Close(childFD)
+			return fmt.Errorf("ACME cleanup member type invalid")
+		}
+		if err := unix.Close(childFD); err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(directoryFD, entry.Name(), 0); err != nil {
+			return err
+		}
+	}
+	if err := unix.Fsync(directoryFD); err != nil {
+		return err
+	}
+	if parentFD >= 0 {
+		if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func openDirectoryPathNoFollow(path string) (int, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return -1, fmt.Errorf("directory path invalid")
+	}
+	current, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		closeErr := unix.Close(current)
+		if openErr != nil {
+			return -1, errors.Join(openErr, closeErr)
+		}
+		if closeErr != nil {
+			_ = unix.Close(next)
+			return -1, closeErr
+		}
+		current = next
+	}
+	return current, nil
+}
+
+func openDirectoryAtNoFollow(parentFD int, name string) (int, error) {
+	return unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+}
+
+type directorySeal struct {
+	uid, gid uint32
+	mode     uint32
+	changed  bool
+}
+
+func sealDirectory(directoryFD int) (directorySeal, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(directoryFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return directorySeal{}, fmt.Errorf("ACME cleanup directory identity invalid")
+	}
+	seal := directorySeal{uid: stat.Uid, gid: stat.Gid, mode: stat.Mode & 0o7777}
+	if os.Geteuid() != 0 {
+		return seal, nil
+	}
+	if stat.Uid != 0 || stat.Gid != 0 {
+		if err := unix.Fchown(directoryFD, 0, 0); err != nil {
+			return directorySeal{}, err
+		}
+		seal.changed = true
+	}
+	if err := unix.Fchmod(directoryFD, seal.mode&^0o222); err != nil {
+		return directorySeal{}, errors.Join(err, restoreDirectorySeal(directoryFD, seal))
+	}
+	return seal, nil
+}
+
+func restoreDirectorySeal(directoryFD int, seal directorySeal) error {
+	var result error
+	if seal.changed {
+		result = errors.Join(result, unix.Fchown(directoryFD, int(seal.uid), int(seal.gid)))
+	}
+	return errors.Join(result, unix.Fchmod(directoryFD, seal.mode))
+}
+
+func readDirectoryFD(directoryFD int) ([]os.DirEntry, error) {
+	duplicate, err := unix.Dup(directoryFD)
+	if err != nil {
+		return nil, err
+	}
+	unix.CloseOnExec(duplicate)
+	directory := os.NewFile(uintptr(duplicate), "acme-directory")
+	if directory == nil {
+		_ = unix.Close(duplicate)
+		return nil, fmt.Errorf("ACME directory descriptor unavailable")
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	return entries, errors.Join(readErr, closeErr)
 }
 
 func (stage Stage) Close() error {

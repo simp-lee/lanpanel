@@ -23,6 +23,10 @@ const (
 	Tar     Format = "tar"
 	TarGzip Format = "tar_gzip"
 	Zip     Format = "zip"
+
+	tarBlockSize      = 512
+	tarRecordSize     = 20 * tarBlockSize // GNU tar's explicit --blocking-factor=20 contract.
+	maximumTarPadding = tarRecordSize - 2*tarBlockSize
 )
 
 type Member struct {
@@ -61,14 +65,6 @@ func Extract(data []byte, spec Spec) (map[string][]byte, error) {
 		if err != nil || closeErr != nil || input.Len() != 0 || int64(len(uncompressed)) > spec.MaximumExtractedBytes+(1<<20) {
 			return nil, fmt.Errorf("read bounded complete gzip stream")
 		}
-		if int64(len(data)) > totalPhysicalBound(expected) {
-			return nil, fmt.Errorf("gzip archive exceeds declared physical bounds")
-		}
-		for _, member := range expected {
-			if int64(len(data)) > member.MaximumPhysicalBytes {
-				return nil, fmt.Errorf("gzip archive cannot prove a member physical byte bound")
-			}
-		}
 		return extractTarExact(uncompressed, expected, spec.MaximumExtractedBytes)
 	case Zip:
 		return extractZip(data, expected, spec.MaximumExtractedBytes)
@@ -87,7 +83,7 @@ func validateSpec(data []byte, spec Spec) (map[string]Member, error) {
 	casefold := map[string]bool{}
 	for _, member := range members {
 		folded := strings.ToLower(member.Path)
-		if !validMemberPath(member.Path) || member.MaximumBytes < 0 || member.MaximumBytes > spec.MaximumExtractedBytes || member.MaximumPhysicalBytes <= 0 || member.MaximumPhysicalBytes > spec.MaximumArchiveBytes || !filepath.IsAbs(member.Destination) || filepath.Clean(member.Destination) != member.Destination || member.Metadata.Mode.Perm() == 0 || member.Metadata.Mode&0o7000 != 0 || expected[member.Path].Path != "" || casefold[folded] {
+		if !validMemberPath(member.Path) || member.MaximumBytes < 0 || member.MaximumBytes > spec.MaximumExtractedBytes || member.MaximumPhysicalBytes <= 0 || !filepath.IsAbs(member.Destination) || filepath.Clean(member.Destination) != member.Destination || member.Metadata.Mode.Perm() == 0 || member.Metadata.Mode&0o7000 != 0 || expected[member.Path].Path != "" || casefold[folded] {
 			return nil, fmt.Errorf("archive member manifest is invalid or colliding")
 		}
 		expected[member.Path] = member
@@ -103,7 +99,20 @@ func extractTarExact(data []byte, expected map[string]Member, maximumTotal int64
 		return nil, err
 	}
 	if reader.Len() != 0 {
-		return nil, fmt.Errorf("tar archive contains trailing bytes")
+		if reader.Len() > maximumTarPadding || reader.Len()%tarBlockSize != 0 {
+			return nil, fmt.Errorf("tar archive contains trailing bytes")
+		}
+		padding, readErr := io.ReadAll(reader)
+		allZero := true
+		for _, value := range padding {
+			if value != 0 {
+				allZero = false
+				break
+			}
+		}
+		if readErr != nil || !allZero {
+			return nil, fmt.Errorf("tar archive contains trailing bytes")
+		}
 	}
 	return result, nil
 }
@@ -121,8 +130,11 @@ func extractTar(reader io.Reader, expected map[string]Member, maximumTotal int64
 			return nil, fmt.Errorf("read tar archive")
 		}
 		member, known := expected[header.Name]
-		physical := ((header.Size + 511) / 512) * 512
-		if !known || !validMemberPath(header.Name) || header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > member.MaximumBytes || physical > member.MaximumPhysicalBytes || len(header.PAXRecords) != 0 || header.Format == tar.FormatPAX || !header.AccessTime.IsZero() || !header.ChangeTime.IsZero() || header.Devmajor != 0 || header.Devminor != 0 || header.Mode&0o7000 != 0 {
+		if !known || !validMemberPath(header.Name) || header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > member.MaximumBytes || len(header.PAXRecords) != 0 || header.Format == tar.FormatPAX || !header.AccessTime.IsZero() || !header.ChangeTime.IsZero() || header.Devmajor != 0 || header.Devminor != 0 || header.Mode&0o7000 != 0 {
+			return nil, fmt.Errorf("tar archive contains unexpected type, metadata, member, or size")
+		}
+		physical, physicalOK := tarPhysicalBytes(header.Size)
+		if !physicalOK || physical > member.MaximumPhysicalBytes {
 			return nil, fmt.Errorf("tar archive contains unexpected type, metadata, member, or size")
 		}
 		if _, duplicate := result[header.Name]; duplicate {
@@ -197,15 +209,11 @@ func declaredMember(members []Member, name string) (Member, bool) {
 	return Member{}, false
 }
 
-func totalPhysicalBound(expected map[string]Member) int64 {
-	var total int64 = 64 // gzip and tar framing allowance fixed by the parser.
-	for _, member := range expected {
-		if member.MaximumPhysicalBytes > 1<<62-total {
-			return 1 << 62
-		}
-		total += member.MaximumPhysicalBytes
+func tarPhysicalBytes(size int64) (int64, bool) {
+	if size < 0 || size > 1<<63-1-511 {
+		return 0, false
 	}
-	return total
+	return ((size + 511) / 512) * 512, true
 }
 
 func requireComplete(result map[string][]byte, expected map[string]Member) (map[string][]byte, error) {

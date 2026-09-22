@@ -39,7 +39,8 @@ for name in lego tailscale headscale; do
       fetch "$source_url" "$output/$executable_path"
       verify "$output/$executable_path" "$executable_digest"
       chmod 755 "$output/$executable_path"
-      tar --create --format=ustar --owner=0 --group=0 --numeric-owner --mode=755 \
+      # Keep the generated archive on the parser's GNU tar padding contract.
+      tar --create --format=ustar --blocking-factor=20 --owner=0 --group=0 --numeric-owner --mode=755 \
         --mtime='UTC 1970-01-01' --directory="$output" --file="$output/headscale.tar" headscale
       gzip -n -c "$output/headscale.tar" > "$output/$archive_path"
       rm -f "$output/headscale.tar"

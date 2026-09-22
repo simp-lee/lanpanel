@@ -24,6 +24,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lanpanel-publish.XXXXXXXX")
 cleanup() { rm -rf -- "$tmp"; }
 trap cleanup EXIT
 archive_digest=$(sha256sum "$archive" | awk '{print $1}')
+bootstrap_digest=$(sha256sum "$bootstrap" | awk '{print $1}')
 base="https://github.com/$repo/releases/download/$tag"
 expected_archive_url="$base/$archive_name"
 bootstrap_url="$base/lanpanel-bootstrap.sh"
@@ -35,13 +36,16 @@ embedded_digest=$(sed -n "s/^readonly LANPANEL_PREVIEW_SHA256='\([0-9a-f]*\)'$/\
 # Keep the release draft until the uploaded asset bytes have been checked.
 gh release create "$tag" --repo "$repo" --draft --title "LanPanel $tag" --notes "LanPanel Preview $tag" "$archive" "$bootstrap"
 gh release download "$tag" --repo "$repo" --pattern "$archive_name" --dir "$tmp" --clobber
+gh release download "$tag" --repo "$repo" --pattern "lanpanel-bootstrap.sh" --dir "$tmp" --clobber
 [ "$(sha256sum "$tmp/$archive_name" | awk '{print $1}')" = "$archive_digest" ] || { echo "GitHub asset differs from local archive" >&2; exit 1; }
+[ "$(sha256sum "$tmp/lanpanel-bootstrap.sh" | awk '{print $1}')" = "$bootstrap_digest" ] || { echo "GitHub asset differs from local bootstrap" >&2; exit 1; }
 gh release edit "$tag" --repo "$repo" --draft=false
 
 fetch="$tmp/public.tar.gz"
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 -o "$fetch" "$expected_archive_url"
 [ "$(sha256sum "$fetch" | awk '{print $1}')" = "$archive_digest" ] || { echo "public GitHub archive differs after release publication" >&2; exit 1; }
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 -o "$tmp/public-bootstrap.sh" "$bootstrap_url"
+[ "$(sha256sum "$tmp/public-bootstrap.sh" | awk '{print $1}')" = "$bootstrap_digest" ] || { echo "public GitHub bootstrap differs after release publication" >&2; exit 1; }
 public_url=$(sed -n "s/^readonly LANPANEL_PREVIEW_URL='\(.*\)'$/\1/p" "$tmp/public-bootstrap.sh")
 public_digest=$(sed -n "s/^readonly LANPANEL_PREVIEW_SHA256='\([0-9a-f]*\)'$/\1/p" "$tmp/public-bootstrap.sh")
 [ "$public_url" = "$expected_archive_url" ] && [ "$public_digest" = "$archive_digest" ] || { echo "public bootstrap is not bound to the published archive" >&2; exit 1; }

@@ -157,11 +157,12 @@ func (m *Manager) Detach(principal Principal, socket Socket) {
 
 func (m *Manager) Send(principal Principal, fingerprint string, send SocketSender) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	value, ok := m.entries[principal.Selector]
 	if m.closed || !ok || expired(value, m.now().UTC()) || principal.Generation != m.generation || value.generation != m.generation || fingerprint != m.fingerprint || send == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("socket session expired")
 	}
+	m.mu.Unlock()
 	return send()
 }
 

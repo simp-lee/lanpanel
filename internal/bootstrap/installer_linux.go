@@ -290,6 +290,10 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	return planDigest, nil
 }
 
+func tarMemberPhysicalBytes(size uint64) int64 {
+	return int64((size + 511) / 512 * 512)
+}
+
 func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Request) error {
 	if journal == nil || release.ValidateInstallIdentity(journal.Release) != nil || len(request.HeadscaleBytes) == 0 {
 		return fmt.Errorf("fixed runtime asset authority is incomplete")
@@ -298,7 +302,7 @@ func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Re
 	members := make([]managedarchive.Member, 0, len(authority.Members))
 	for _, member := range authority.Members {
 		members = append(members, managedarchive.Member{
-			Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(authority.Archive.Bytes),
+			Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: tarMemberPhysicalBytes(member.Asset.Bytes),
 			Destination: member.Destination, Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: os.FileMode(member.Mode)},
 		})
 	}

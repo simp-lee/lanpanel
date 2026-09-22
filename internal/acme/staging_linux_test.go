@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -97,6 +98,79 @@ func TestPrepareStageRejectsCredentialChangedAfterBindingAndCleansResidue(t *tes
 		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("changed credential left stage residue %q: %v", path, statErr)
 		}
+	}
+}
+
+func TestVerifyWebrootEmptyRemovesManagedHierarchyAndRestoresRoot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root ownership transitions are unavailable")
+	}
+	base := protectedTestDir(t)
+	root := filepath.Join(base, "cert_00000000000000000000000000000000")
+	uid, gid := uint32(2200000), uint32(2200000)
+	if err := os.MkdirAll(filepath.Join(root, ".well-known", "acme-challenge"), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{root, filepath.Join(root, ".well-known"), filepath.Join(root, ".well-known", "acme-challenge")} {
+		if err := os.Chown(directory, int(uid), int(gid)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := verifyWebrootEmptyAt(root, uid, gid); err != nil {
+		t.Fatalf("managed empty webroot was not removed: %v", err)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uid || stat.Gid != gid || info.Mode().Perm() != 0o711 {
+		t.Fatalf("webroot identity was not restored: info=%#v stat=%#v", info, stat)
+	}
+	if _, err := os.Lstat(filepath.Join(root, ".well-known")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed challenge hierarchy remains: %v", err)
+	}
+}
+
+func TestRemoveOwnedTreeFailureRestoresSealedRoot(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root ownership transitions are unavailable")
+	}
+	base := protectedTestDir(t)
+	root := filepath.Join(base, "cert_00000000000000000000000000000000")
+	uid, gid := uint32(2200000), uint32(2200000)
+	if err := os.Mkdir(root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(root, int(uid), int(gid)); err != nil {
+		t.Fatal(err)
+	}
+	member := filepath.Join(root, "foreign")
+	if err := os.WriteFile(member, []byte("foreign"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(member, int(uid), int(gid)); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnedTree(root, uid, gid, 16); err == nil {
+		t.Fatal("unsafe cleanup inventory was accepted")
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uid || stat.Gid != gid || info.Mode().Perm() != 0o711 {
+		t.Fatalf("failed cleanup did not restore root identity: info=%#v stat=%#v", info, stat)
+	}
+	if err := os.Chmod(member, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnedTree(root, uid, gid, 16); err != nil {
+		t.Fatalf("restored cleanup could not retry: %v", err)
 	}
 }
 

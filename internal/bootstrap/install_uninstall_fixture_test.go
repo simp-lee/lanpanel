@@ -3,11 +3,9 @@
 package bootstrap
 
 import (
-	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"lanpanel/internal/child"
@@ -272,23 +270,30 @@ func mustPlanDigest(plan packages.Plan) string {
 
 func lifecycleHeadscaleArchive(t *testing.T) ([]byte, []byte) {
 	t.Helper()
-	member := make([]byte, 2048)
-	for index := 0; index < len(member); index += sha256.Size {
-		digest := sha256.Sum256([]byte(fmt.Sprintf("lifecycle-member-%d", index)))
-		copy(member[index:], digest[:])
+	version, err := exec.Command("tar", "--version").Output()
+	if err != nil || !bytes.Contains(version, []byte("GNU tar")) {
+		t.Skip("GNU tar is not available")
 	}
-	var raw bytes.Buffer
-	writer := tar.NewWriter(&raw)
-	if err := writer.WriteHeader(&tar.Header{Name: "headscale", Mode: 0o755, Size: int64(len(member)), Typeflag: tar.TypeReg}); err != nil {
+	directory := t.TempDir()
+	member := bytes.Repeat([]byte("x"), 64<<10)
+	memberPath := filepath.Join(directory, "headscale")
+	if err := os.WriteFile(memberPath, member, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = writer.Write(member)
-	if err := writer.Close(); err != nil {
+	tarPath := filepath.Join(directory, "headscale.tar")
+	command := exec.Command("tar", "--create", "--format=ustar", "--blocking-factor=20", "--owner=0", "--group=0", "--numeric-owner", "--mode=755", "--mtime=UTC 1970-01-01", "--directory", directory, "--file", tarPath, "headscale")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("GNU tar failed: %v: %s", err, output)
+	}
+	raw, err := os.ReadFile(tarPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var compressed bytes.Buffer
 	gzipWriter := gzip.NewWriter(&compressed)
-	_, _ = gzipWriter.Write(raw.Bytes())
+	if _, err := gzipWriter.Write(raw); err != nil {
+		t.Fatal(err)
+	}
 	if err := gzipWriter.Close(); err != nil {
 		t.Fatal(err)
 	}

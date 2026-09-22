@@ -75,15 +75,37 @@ type actionLease struct {
 type socket struct {
 	connection *websocket.Conn
 	mu         sync.Mutex
+	stateMu    sync.Mutex
+	closed     bool
 }
 
 func (s *socket) Close() error {
-	return s.connection.CloseNow()
+	return s.closeWith(websocket.StatusGoingAway, "", true)
+}
+
+func (s *socket) closeWith(code websocket.StatusCode, reason string, immediate bool) error {
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.stateMu.Unlock()
+	if immediate {
+		return s.connection.CloseNow()
+	}
+	return s.connection.Close(code, reason)
 }
 
 func (s *socket) Write(ctx context.Context, payload []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stateMu.Lock()
+	closed := s.closed
+	s.stateMu.Unlock()
+	if closed {
+		return net.ErrClosed
+	}
 	return s.connection.Write(ctx, websocket.MessageText, payload)
 }
 
@@ -422,12 +444,13 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	if err != nil {
 		return
 	}
-	defer func() { _ = connection.Close(websocket.StatusNormalClosure, "closed") }()
+	managed := &socket{connection: connection}
+	defer func() { _ = managed.closeWith(websocket.StatusNormalClosure, "closed", false) }()
 	authContext, cancel := context.WithTimeout(request.Context(), 5*time.Second)
 	defer cancel()
 	kind, payload, err := connection.Read(authContext)
 	if err != nil || kind != websocket.MessageText || len(payload) == 0 || len(payload) > maximumWebSocketAuthBytes {
-		_ = connection.Close(websocket.StatusPolicyViolation, "authentication required")
+		_ = managed.closeWith(websocket.StatusPolicyViolation, "authentication required", false)
 		return
 	}
 	var frame struct {
@@ -436,7 +459,7 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	}
 	if decodeExactJSON(payload, &frame) != nil || frame.Type != "auth" || frame.Proof == "" {
 		clear(payload)
-		_ = connection.Close(websocket.StatusPolicyViolation, "authentication required")
+		_ = managed.closeWith(websocket.StatusPolicyViolation, "authentication required", false)
 		return
 	}
 	clear(payload)
@@ -458,7 +481,6 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		s.barrier.RUnlock()
 		return
 	}
-	managed := &socket{connection: connection}
 	if s.config.Sessions.Attach(principal, managed) != nil {
 		s.barrier.RUnlock()
 		return
@@ -467,9 +489,7 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 	defer s.config.Sessions.Detach(principal, managed)
 	sendContext, sendCancel := context.WithTimeout(request.Context(), 5*time.Second)
 	defer sendCancel()
-	s.barrier.RLock()
 	sendErr := s.config.Sessions.Send(principal, fingerprint, func() error { return managed.Write(sendContext, []byte(`{"type":"ready"}`)) })
-	s.barrier.RUnlock()
 	if sendErr != nil {
 		return
 	}

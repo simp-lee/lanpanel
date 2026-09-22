@@ -15,31 +15,11 @@ import (
 	"time"
 )
 
-type inputAsset struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Bytes  uint64 `json:"bytes"`
-}
-type dependencySource struct {
-	URL    string     `json:"url"`
-	Format string     `json:"format"`
-	Asset  inputAsset `json:"asset"`
-}
-type dependencyInput struct {
-	Name           string           `json:"name"`
-	Version        string           `json:"version"`
-	MetadataSource string           `json:"metadata_source"`
-	MetadataDigest string           `json:"metadata_digest"`
-	PublishedAt    time.Time        `json:"published_at"`
-	Source         dependencySource `json:"source"`
-	Archive        inputAsset       `json:"archive"`
-	Executable     inputAsset       `json:"executable"`
-	Member         string           `json:"member"`
-}
-type dependencyInputs struct {
-	SchemaVersion string            `json:"schema_version"`
-	Dependencies  []dependencyInput `json:"dependencies"`
-}
+type (
+	inputAsset       = release.DependencyInputAsset
+	dependencyInput  = release.DependencyInput
+	dependencyInputs = release.DependencyInputs
+)
 
 func main() {
 	var source, inputsPath, manifestPath, dependencyPath, packagePath, baselinePath, profileInputDir, signingKeyPath, output, tag, verifyDir string
@@ -84,7 +64,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 		return fmt.Errorf("dependency inputs: %w", err)
 	}
 	resolved := inputs.(dependencyInputs)
-	if resolved.SchemaVersion != "lanpanel.dependency-inputs.v1" || len(resolved.Dependencies) != 3 {
+	if resolved.SchemaVersion != release.DependencyInputsSchemaVersion || len(resolved.Dependencies) != 3 {
 		return fmt.Errorf("dependency inputs are incomplete")
 	}
 	manifestValue, err := readCanonical(manifestPath, &release.ReleaseManifest{})

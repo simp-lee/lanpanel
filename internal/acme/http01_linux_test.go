@@ -66,6 +66,16 @@ func TestHTTP01TokenFileIsExactAndContentBound(t *testing.T) {
 	if err := removeHTTP01TokenAt(root, uid, gid, presentation); err == nil {
 		t.Fatal("cleanup removed a token whose exact content identity changed")
 	}
+	for _, directory := range []string{root, filepath.Join(root, ".well-known"), filepath.Join(root, ".well-known", "acme-challenge")} {
+		info, err := os.Stat(directory)
+		mode := os.FileMode(0)
+		if info != nil {
+			mode = info.Mode().Perm()
+		}
+		if err != nil || mode != 0o711 {
+			t.Fatalf("failed cleanup changed directory mode for %s: mode=%#o error=%v", directory, mode, err)
+		}
+	}
 	if err := os.WriteFile(path, []byte(presentation.KeyAuthorization), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +87,52 @@ func TestHTTP01TokenFileIsExactAndContentBound(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, ".well-known")); !os.IsNotExist(err) {
 		t.Fatalf("challenge directories remain after cleanup: %v", err)
+	}
+}
+
+func TestHTTP01TokenCleanupDoesNotFollowIntermediateSymlink(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cert_00000000000000000000000000000001")
+	if err := os.Mkdir(root, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	presentation := NewHTTP01Presentation("app.example.test", "abcdefghijklmnopqrstuv", "abcdefghijklmnopqrstuv.account-thumbprint")
+	if err := writeHTTP01TokenAt(root, uid, gid, presentation); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	outsideChallenge := filepath.Join(outside, "acme-challenge")
+	if err := os.MkdirAll(outsideChallenge, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	outsideToken := filepath.Join(outsideChallenge, presentation.Token)
+	if err := os.WriteFile(outsideToken, []byte(presentation.KeyAuthorization), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wellKnown := filepath.Join(root, ".well-known")
+	original := filepath.Join(root, ".well-known.original")
+	if err := os.Rename(wellKnown, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, wellKnown); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeHTTP01TokenAt(root, uid, gid, presentation); err == nil {
+		t.Fatal("cleanup followed an intermediate symlink")
+	}
+	data, err := os.ReadFile(outsideToken)
+	if err != nil || string(data) != presentation.KeyAuthorization {
+		t.Fatalf("intermediate symlink target changed: %q, %v", data, err)
+	}
+	if err := os.Remove(wellKnown); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(original, wellKnown); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeHTTP01TokenAt(root, uid, gid, presentation); err != nil {
+		t.Fatal(err)
 	}
 }
 

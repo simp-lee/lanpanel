@@ -6,6 +6,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"lanpanel/internal/filetxn"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -43,6 +46,48 @@ func TestArchiveExtractsOnlyExactDeclaredRegularMembers(t *testing.T) {
 	spec.Format = Zip
 	if _, err := Extract(zipBytes.Bytes(), spec); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestArchiveAcceptsGNUtarRecordPadding(t *testing.T) {
+	version, err := exec.Command("tar", "--version").Output()
+	if err != nil || !bytes.Contains(version, []byte("GNU tar")) {
+		t.Skip("GNU tar is not available")
+	}
+	directory := t.TempDir()
+	content := bytes.Repeat([]byte("x"), 64<<10)
+	if err := os.WriteFile(filepath.Join(directory, "headscale"), content, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tarPath := filepath.Join(directory, "headscale.tar")
+	command := exec.Command("tar", "--create", "--format=ustar", "--blocking-factor=20", "--owner=0", "--group=0", "--numeric-owner", "--mode=755", "--mtime=UTC 1970-01-01", "--directory", directory, "--file", tarPath, "headscale")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("GNU tar failed: %v: %s", err, output)
+	}
+	raw, err := os.ReadFile(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	if _, err := gzipWriter.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	physical := int64((len(content) + 511) / 512 * 512)
+	if int64(compressed.Len()) >= physical {
+		t.Fatalf("fixture does not exercise separate compressed and member bounds: archive=%d member=%d", compressed.Len(), physical)
+	}
+	member := Member{Path: "headscale", MaximumBytes: int64(len(content)), MaximumPhysicalBytes: physical, Destination: "/var/lib/lanpanel/headscale", Metadata: filetxn.Metadata{Owner: filetxn.Owner{UID: 0, GID: 0}, Mode: 0o755}}
+	extracted, err := Extract(compressed.Bytes(), Spec{Format: TarGzip, MaximumArchiveBytes: int64(compressed.Len()), MaximumExtractedBytes: int64(len(content)), MaximumMembers: 1, Members: []Member{member}})
+	if err != nil || !bytes.Equal(extracted["headscale"], content) {
+		t.Fatalf("GNU tar archive was not accepted: extracted=%d error=%v", len(extracted["headscale"]), err)
+	}
+	overpadded := append(append([]byte(nil), raw...), make([]byte, maximumTarPadding+tarBlockSize)...)
+	if _, err := Extract(overpadded, Spec{Format: Tar, MaximumArchiveBytes: int64(len(overpadded)), MaximumExtractedBytes: int64(len(content)), MaximumMembers: 1, Members: []Member{member}}); err == nil {
+		t.Fatal("oversized tar record padding was accepted")
 	}
 }
 

@@ -422,6 +422,20 @@ type ProtectedListener struct {
 	inode    uint64
 }
 
+// CleanupStaleSocket removes the fixed helper socket only when it has the
+// installed socket metadata and no process is accepting connections on it.
+func CleanupStaleSocket(socketGroup uint32) error {
+	path := FixedSocketPath
+	if os.Geteuid() != 0 || socketGroup == 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("helper socket cleanup requires root, its fixed path, and a dedicated client group")
+	}
+	parent := filepath.Dir(path)
+	if err := validateRootParentChain(parent, socketGroup, 0o710); err != nil {
+		return fmt.Errorf("helper socket parent is unsafe: %w", err)
+	}
+	return cleanupStaleSocket(path, 0, socketGroup)
+}
+
 func ListenProtected(socketGroup uint32) (*ProtectedListener, error) {
 	path := FixedSocketPath
 	if os.Geteuid() != 0 || socketGroup == 0 || !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -431,8 +445,8 @@ func ListenProtected(socketGroup uint32) (*ProtectedListener, error) {
 	if err := validateRootParentChain(parent, socketGroup, 0o710); err != nil {
 		return nil, fmt.Errorf("helper socket parent is unsafe: %w", err)
 	}
-	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("helper socket path already exists")
+	if err := cleanupStaleSocket(path, 0, socketGroup); err != nil {
+		return nil, err
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
@@ -451,10 +465,70 @@ func ListenProtected(socketGroup uint32) (*ProtectedListener, error) {
 		return fail(err)
 	}
 	var stat syscall.Stat_t
-	if err := syscall.Lstat(path, &stat); err != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFSOCK || stat.Uid != 0 || stat.Gid != socketGroup || stat.Mode&0o777 != 0o660 {
+	if err := syscall.Lstat(path, &stat); err != nil || !expectedHelperSocketMetadata(&stat, 0, socketGroup) {
 		return fail(fmt.Errorf("helper socket identity verification failed"))
 	}
 	return &ProtectedListener{listener: listener, path: path, device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
+func cleanupStaleSocket(path string, socketUID, socketGroup uint32) error {
+	var initial syscall.Stat_t
+	if err := syscall.Lstat(path, &initial); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect existing helper socket: %w", err)
+	}
+	if !expectedHelperSocketMetadata(&initial, socketUID, socketGroup) {
+		return fmt.Errorf("helper socket path exists with foreign metadata")
+	}
+
+	connection, err := net.DialTimeout("unix", path, time.Second)
+	if err == nil {
+		_ = connection.Close()
+		return fmt.Errorf("helper socket path is active")
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("helper socket probe failed: %w", err)
+	}
+	inUse, err := helperSocketInUse(path)
+	if err != nil {
+		return fmt.Errorf("inspect helper socket holders: %w", err)
+	}
+	if inUse {
+		return fmt.Errorf("helper socket path is active")
+	}
+
+	var current syscall.Stat_t
+	if err := syscall.Lstat(path, &current); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("reinspect existing helper socket: %w", err)
+	}
+	if !expectedHelperSocketMetadata(&current, socketUID, socketGroup) || current.Dev != initial.Dev || current.Ino != initial.Ino {
+		return fmt.Errorf("helper socket changed during stale cleanup")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale helper socket: %w", err)
+	}
+	return nil
+}
+
+func expectedHelperSocketMetadata(stat *syscall.Stat_t, socketUID, socketGroup uint32) bool {
+	return stat != nil && stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK && stat.Uid == socketUID && stat.Gid == socketGroup && stat.Mode&0o7777 == 0o660
+}
+
+func helperSocketInUse(path string) (bool, error) {
+	data, err := os.ReadFile("/proc/net/unix")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 8 && fields[len(fields)-1] == path {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func validateRootParentChain(path string, finalGID uint32, finalMode uint32) error {

@@ -94,6 +94,60 @@ func TestRestartDoesNotReissueCredentials(t *testing.T) {
 	}
 }
 
+func TestSendDoesNotHoldManagerLockDuringCallback(t *testing.T) {
+	manager, err := New("fp", Options{Random: bytes.NewReader(make([]byte, 96))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	credentials, err := manager.Issue("origin", "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := manager.Authenticate(credentials.Selector, credentials.Proof, credentials.CSRF, "origin", "fp", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCallback := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseCallback()
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- manager.Send(principal, "fp", func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("send callback did not start")
+	}
+
+	logoutDone := make(chan struct{})
+	go func() {
+		manager.Logout(principal)
+		close(logoutDone)
+	}()
+	select {
+	case <-logoutDone:
+	case <-time.After(time.Second):
+		t.Fatal("Logout waited for the send callback")
+	}
+	releaseCallback()
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatalf("Send returned an error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Send did not finish after callback release")
+	}
+}
+
 func TestCloseIsTerminalAndClosesAttachedSocketOnce(t *testing.T) {
 	manager, err := New("fp", Options{Random: bytes.NewReader(make([]byte, 192))})
 	if err != nil {

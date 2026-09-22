@@ -175,6 +175,102 @@ func TestProtectedPathsRejectUnsafeParentChains(t *testing.T) {
 	}
 }
 
+func TestStaleHelperSocketIsRemovedButActiveAndForeignPathsAreRejected(t *testing.T) {
+	owner := uint32(os.Geteuid())
+	group := uint32(os.Getegid())
+	prepare := func(path string) (*net.UnixListener, error) {
+		listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			return nil, err
+		}
+		listener.SetUnlinkOnClose(false)
+		if err := os.Chmod(path, 0o660); err != nil {
+			_ = listener.Close()
+			_ = os.Remove(path)
+			return nil, err
+		}
+		if err := os.Chown(path, int(owner), int(group)); err != nil {
+			_ = listener.Close()
+			_ = os.Remove(path)
+			return nil, err
+		}
+		return listener, nil
+	}
+
+	t.Run("stale", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "helper.sock")
+		listener, err := prepare(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanupStaleSocket(path, owner, group); err != nil {
+			t.Fatalf("stale socket was not removed: %v", err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale socket remains, lstat error=%v", err)
+		}
+	})
+
+	t.Run("active", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "helper.sock")
+		listener, err := prepare(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = listener.Close()
+			_ = os.Remove(path)
+		}()
+		if err := cleanupStaleSocket(path, owner, group); err == nil {
+			t.Fatal("active helper socket was removed")
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("active helper socket disappeared: %v", err)
+		}
+		inUse, err := helperSocketInUse(path)
+		if err != nil || !inUse {
+			t.Fatalf("active helper socket holder was not detected: inUse=%t error=%v", inUse, err)
+		}
+	})
+
+	t.Run("foreign socket metadata", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "helper.sock")
+		listener, err := prepare(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = listener.Close()
+			_ = os.Remove(path)
+		}()
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanupStaleSocket(path, owner, group); err == nil {
+			t.Fatal("foreign socket metadata was removed")
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("foreign socket disappeared: %v", err)
+		}
+	})
+
+	t.Run("foreign path", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "helper.sock")
+		if err := os.WriteFile(path, []byte("foreign"), 0o660); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanupStaleSocket(path, owner, group); err == nil {
+			t.Fatal("foreign path was removed")
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("foreign path disappeared: %v", err)
+		}
+	})
+}
+
 func TestProtectedListenerFailsClosedOutsideInstalledRootPath(t *testing.T) {
 	listener, err := ListenProtected(uint32(os.Getegid()))
 	if os.Geteuid() != 0 && err == nil {

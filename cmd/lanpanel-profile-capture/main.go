@@ -35,25 +35,6 @@ func (v *stringList) Set(value string) error {
 	return nil
 }
 
-type dependencyInput struct {
-	Name           string    `json:"name"`
-	Version        string    `json:"version"`
-	MetadataSource string    `json:"metadata_source"`
-	MetadataDigest string    `json:"metadata_digest"`
-	PublishedAt    time.Time `json:"published_at"`
-	Source         struct {
-		URL   string `json:"url"`
-		Asset struct {
-			SHA256 string `json:"sha256"`
-		} `json:"asset"`
-	} `json:"source"`
-}
-
-type dependencyInputs struct {
-	SchemaVersion string            `json:"schema_version"`
-	Dependencies  []dependencyInput `json:"dependencies"`
-}
-
 type aptRecord struct {
 	Version      string
 	Architecture string
@@ -166,14 +147,17 @@ func buildBaseline(dependencyPath string) (dependencies.Baseline, error) {
 	if err != nil {
 		return dependencies.Baseline{}, fmt.Errorf("dependency inputs: %w", err)
 	}
-	var inputs dependencyInputs
+	var inputs release.DependencyInputs
 	if err := release.DecodeCanonical(data, &inputs); err != nil {
 		return dependencies.Baseline{}, fmt.Errorf("dependency inputs are not canonical: %w", err)
+	}
+	if inputs.SchemaVersion != release.DependencyInputsSchemaVersion {
+		return dependencies.Baseline{}, fmt.Errorf("dependency inputs have unsupported schema %q", inputs.SchemaVersion)
 	}
 	cutoff := time.Now().UTC().Truncate(time.Second)
 	selections := make([]dependencies.Selection, 0, 3)
 	for _, name := range []string{"headscale", "lego", "tailscale"} {
-		var dep dependencyInput
+		var dep release.DependencyInput
 		for _, candidate := range inputs.Dependencies {
 			if candidate.Name == name {
 				dep = candidate

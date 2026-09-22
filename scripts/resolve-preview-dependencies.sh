@@ -79,11 +79,12 @@ verify "$work/headscale" "$work/headscale-checksums" "$headscale_name"
 chmod 755 "$work/headscale"
 # Upstream distributes a raw executable; the installation contract uses a
 # single-member archive. Keep its identity separate from the upstream binary.
-tar --create --format=ustar --owner=0 --group=0 --numeric-owner --mode=755 \
+# The archive parser accepts GNU tar's zero-filled 20-block record padding.
+tar --create --format=ustar --blocking-factor=20 --owner=0 --group=0 --numeric-owner --mode=755 \
   --mtime='UTC 1970-01-01' --directory="$work" --file="$work/headscale.tar" headscale
 gzip -n -c "$work/headscale.tar" > "$work/headscale.tar.gz"
 
-jq -cn \
+jq -cjn \
   --arg lv "$lego_version" --arg lu "$lego_url" --arg lm "https://api.github.com/repos/go-acme/lego/releases/latest" --arg ld "$(sha256sum "$work/lego-release.json" | awk '{print $1}')" --arg lp "$(jq -er '.published_at' "$work/lego-release.json")" \
   --arg tv "$tailscale_version" --arg tu "$tailscale_url" --arg tm "$tailscale_member" --arg tmmeta "https://api.github.com/repos/tailscale/tailscale/releases/latest" --arg td "$(sha256sum "$work/tailscale-release.json" | awk '{print $1}')" --arg tp "$(jq -er '.published_at' "$work/tailscale-release.json")" \
   --arg hv "$headscale_version" --arg hu "$headscale_url" --arg hm "https://api.github.com/repos/juanfont/headscale/releases/latest" --arg hd "$(sha256sum "$work/headscale-release.json" | awk '{print $1}')" --arg hp "$(jq -er '.published_at' "$work/headscale-release.json")" \

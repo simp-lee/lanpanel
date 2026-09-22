@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	xacme "golang.org/x/crypto/acme"
@@ -211,21 +210,31 @@ func WriteHTTP01Token(certificateID string, uid, gid uint32, presentation HTTP01
 }
 
 func writeHTTP01TokenAt(root string, uid, gid uint32, presentation HTTP01Presentation) error {
-	if err := validateHTTP01Webroot(root, uid, gid); err != nil {
+	rootFD, err := openDirectoryPathNoFollow(root)
+	if err != nil {
+		return fmt.Errorf("HTTP-01 webroot identity invalid: %w", err)
+	}
+	if err := validateHTTP01WebrootFD(rootFD, uid, gid); err != nil {
+		_ = unix.Close(rootFD)
 		return err
 	}
-	wellKnown := filepath.Join(root, ".well-known")
-	challengeRoot := filepath.Join(wellKnown, "acme-challenge")
-	for _, path := range []string{wellKnown, challengeRoot} {
-		if err := ensureStageDirectory(path, uid, gid); err != nil {
-			return err
-		}
-		if err := os.Chmod(path, 0o711); err != nil {
-			return err
-		}
+	wellKnownFD, err := ensureHTTP01DirectoryAt(rootFD, ".well-known", uid, gid, 0o711)
+	if err != nil {
+		_ = unix.Close(rootFD)
+		return err
 	}
-	path := filepath.Join(challengeRoot, presentation.Token)
-	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	challengeFD, err := ensureHTTP01DirectoryAt(wellKnownFD, "acme-challenge", uid, gid, 0o711)
+	if err != nil {
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+		return err
+	}
+	defer func() {
+		_ = unix.Close(challengeFD)
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+	}()
+	fd, err := unix.Openat(challengeFD, presentation.Token, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return err
 	}
@@ -240,10 +249,10 @@ func writeHTTP01TokenAt(root string, uid, gid uint32, presentation HTTP01Present
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if err := errors.Join(writeErr, ownerErr, modeErr, syncErr, closeErr); err != nil {
-		_ = os.Remove(path)
+		_ = unix.Unlinkat(challengeFD, presentation.Token, 0)
 		return err
 	}
-	return syncDirectory(challengeRoot)
+	return unix.Fsync(challengeFD)
 }
 
 func VerifyHTTP01Token(certificateID string, uid, gid uint32, presentation HTTP01Presentation) error {
@@ -268,11 +277,20 @@ func verifyHTTP01TokenAt(root string, uid, gid uint32, presentation HTTP01Presen
 }
 
 func verifyHTTP01TokenDigestAt(root string, uid, gid uint32, token, keyAuthorizationDigest string) error {
-	if err := validateHTTP01Webroot(root, uid, gid); err != nil {
+	rootFD, wellKnownFD, challengeFD, err := openHTTP01ChallengeDirectories(root, uid, gid)
+	if err != nil {
 		return err
 	}
-	path := filepath.Join(root, ".well-known", "acme-challenge", token)
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+	defer func() {
+		_ = unix.Close(challengeFD)
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+	}()
+	return verifyHTTP01TokenFD(challengeFD, uid, gid, token, keyAuthorizationDigest)
+}
+
+func verifyHTTP01TokenFD(challengeFD int, uid, gid uint32, token, keyAuthorizationDigest string) error {
+	fd, err := unix.Openat(challengeFD, token, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
@@ -305,29 +323,83 @@ func RemoveHTTP01Token(certificateID string, uid, gid uint32, presentation HTTP0
 	return removeHTTP01TokenAt(filepath.Join("/var/lib/lanpanel/certificates/webroot", certificateID), uid, gid, presentation)
 }
 
-func removeHTTP01TokenAt(root string, uid, gid uint32, presentation HTTP01Presentation) error {
-	if err := verifyHTTP01TokenAt(root, uid, gid, presentation); err != nil {
+func removeHTTP01TokenAt(root string, uid, gid uint32, presentation HTTP01Presentation) (resultErr error) {
+	rootFD, err := openDirectoryPathNoFollow(root)
+	if err != nil {
+		return fmt.Errorf("HTTP-01 webroot identity invalid: %w", err)
+	}
+	defer func() { _ = unix.Close(rootFD) }()
+	if err := validateHTTP01WebrootFD(rootFD, uid, gid); err != nil {
 		return err
 	}
-	challengeRoot := filepath.Join(root, ".well-known", "acme-challenge")
-	path := filepath.Join(challengeRoot, presentation.Token)
-	if err := os.Remove(path); err != nil {
+	rootSeal, err := sealDirectory(rootFD)
+	if err != nil {
 		return err
 	}
-	if err := syncDirectory(challengeRoot); err != nil {
+	defer func() { resultErr = errors.Join(resultErr, restoreDirectorySeal(rootFD, rootSeal)) }()
+
+	wellKnownFD, err := openDirectoryAtNoFollow(rootFD, ".well-known")
+	if err != nil {
+		return fmt.Errorf("HTTP-01 challenge directory unsafe: %w", err)
+	}
+	defer func() { _ = unix.Close(wellKnownFD) }()
+	if err := validateHTTP01ChallengeDirectoryFD(wellKnownFD, uid, gid); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(challengeRoot)
+	wellKnownSeal, err := sealDirectory(wellKnownFD)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, restoreDirectorySeal(wellKnownFD, wellKnownSeal))
+		}
+	}()
+
+	challengeFD, err := openDirectoryAtNoFollow(wellKnownFD, "acme-challenge")
+	if err != nil {
+		return fmt.Errorf("HTTP-01 challenge directory unsafe: %w", err)
+	}
+	defer func() { _ = unix.Close(challengeFD) }()
+	if err := validateHTTP01ChallengeDirectoryFD(challengeFD, uid, gid); err != nil {
+		return err
+	}
+	challengeSeal, err := sealDirectory(challengeFD)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, restoreDirectorySeal(challengeFD, challengeSeal))
+		}
+	}()
+	if err := verifyHTTP01TokenFD(challengeFD, uid, gid, presentation.Token, presentation.KeyAuthorizationDigest); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(challengeFD, presentation.Token, 0); err != nil {
+		return err
+	}
+	if err := unix.Fsync(challengeFD); err != nil {
+		return err
+	}
+	entries, err := readDirectoryFD(challengeFD)
 	if err != nil || len(entries) != 0 {
 		return errors.Join(err, fmt.Errorf("HTTP-01 token directory is not empty after exact cleanup"))
 	}
-	if err := os.Remove(challengeRoot); err != nil {
+	if err := unix.Unlinkat(wellKnownFD, "acme-challenge", unix.AT_REMOVEDIR); err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Dir(challengeRoot)); err != nil {
+	entries, err = readDirectoryFD(wellKnownFD)
+	if err != nil || len(entries) != 0 {
+		return errors.Join(err, fmt.Errorf("HTTP-01 challenge parent is not empty after exact cleanup"))
+	}
+	if err := unix.Unlinkat(rootFD, ".well-known", unix.AT_REMOVEDIR); err != nil {
 		return err
 	}
-	return syncDirectory(root)
+	if err := restoreDirectorySeal(rootFD, rootSeal); err != nil {
+		return err
+	}
+	return unix.Fsync(rootFD)
 }
 
 func loadHTTP01AccountKey(binding Binding) (*ecdsa.PrivateKey, error) {
@@ -405,14 +477,93 @@ func writeOwnedStageFile(path string, data []byte, mode os.FileMode, uid, gid ui
 	return errors.Join(writeErr, ownerErr, modeErr, syncErr, closeErr)
 }
 
-func validateHTTP01Webroot(root string, uid, gid uint32) error {
-	info, err := os.Lstat(root)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o711 {
+func ensureHTTP01DirectoryAt(parentFD int, name string, uid, gid uint32, mode uint32) (int, error) {
+	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
+		return -1, err
+	}
+	fd, err := openDirectoryAtNoFollow(parentFD, name)
+	if err != nil {
+		return -1, err
+	}
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("ACME stage directory unsafe")
+	}
+	if err := unix.Fchown(fd, int(uid), int(gid)); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	if err := unix.Fchmod(fd, mode); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func openHTTP01ChallengeDirectories(root string, uid, gid uint32) (rootFD, wellKnownFD, challengeFD int, err error) {
+	rootFD, err = openDirectoryPathNoFollow(root)
+	if err != nil {
+		return -1, -1, -1, fmt.Errorf("HTTP-01 webroot identity invalid: %w", err)
+	}
+	if err = validateHTTP01WebrootFD(rootFD, uid, gid); err != nil {
+		_ = unix.Close(rootFD)
+		return -1, -1, -1, err
+	}
+	wellKnownFD, err = openDirectoryAtNoFollow(rootFD, ".well-known")
+	if err != nil {
+		_ = unix.Close(rootFD)
+		return -1, -1, -1, fmt.Errorf("HTTP-01 challenge directory unsafe: %w", err)
+	}
+	if err = validateHTTP01ChallengeDirectoryFD(wellKnownFD, uid, gid); err != nil {
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+		return -1, -1, -1, err
+	}
+	challengeFD, err = openDirectoryAtNoFollow(wellKnownFD, "acme-challenge")
+	if err != nil {
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+		return -1, -1, -1, fmt.Errorf("HTTP-01 challenge directory unsafe: %w", err)
+	}
+	if err = validateHTTP01ChallengeDirectoryFD(challengeFD, uid, gid); err != nil {
+		_ = unix.Close(challengeFD)
+		_ = unix.Close(wellKnownFD)
+		_ = unix.Close(rootFD)
+		return -1, -1, -1, err
+	}
+	return rootFD, wellKnownFD, challengeFD, nil
+}
+
+func validateACMEWebrootFD(fd int, uid, gid uint32) error {
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("ACME webroot identity invalid")
+	}
+	if stat.Uid != uid || stat.Gid != gid {
+		return fmt.Errorf("ACME webroot owner changed")
+	}
+	return nil
+}
+
+func validateHTTP01WebrootFD(fd int, uid, gid uint32) error {
+	if err := validateACMEWebrootFD(fd, uid, gid); err != nil {
+		return fmt.Errorf("HTTP-01 webroot identity invalid: %w", err)
+	}
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&0o777 != 0o711 {
 		return fmt.Errorf("HTTP-01 webroot identity invalid")
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uid || stat.Gid != gid {
-		return fmt.Errorf("HTTP-01 webroot owner changed")
+	return nil
+}
+
+func validateHTTP01ChallengeDirectoryFD(fd int, uid, gid uint32) error {
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
+		return fmt.Errorf("ACME challenge directory unsafe")
+	}
+	if stat.Uid != uid || stat.Gid != gid {
+		return fmt.Errorf("ACME challenge directory owner changed")
 	}
 	return nil
 }

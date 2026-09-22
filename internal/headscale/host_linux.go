@@ -238,13 +238,17 @@ func validateInstallRequest(request InstallRequest) error {
 	return nil
 }
 
+func tarMemberPhysicalBytes(size uint64) int64 {
+	return int64((size + 511) / 512 * 512)
+}
+
 func verifyOrInstallExecutable(ctx context.Context, request InstallRequest) error {
 	authority := request.Release.Headscale
 	members := make([]managedarchive.Member, 0, len(authority.Members))
 	for _, member := range authority.Members {
-		members = append(members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: int64(authority.MaximumExtractedBytes), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: request.Owner, Mode: os.FileMode(member.Mode)}})
+		members = append(members, managedarchive.Member{Path: member.Path, MaximumBytes: int64(member.Asset.Bytes), MaximumPhysicalBytes: tarMemberPhysicalBytes(member.Asset.Bytes), Destination: member.Destination, Metadata: filetxn.Metadata{Owner: request.Owner, Mode: os.FileMode(member.Mode)}})
 	}
-	extracted, err := managedarchive.Extract(request.ArchiveBytes, managedarchive.Spec{Format: managedarchive.Format(authority.ArchiveFormat), MaximumArchiveBytes: int64(authority.MaximumExtractedBytes), MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(members), Members: members})
+	extracted, err := managedarchive.Extract(request.ArchiveBytes, managedarchive.Spec{Format: managedarchive.Format(authority.ArchiveFormat), MaximumArchiveBytes: int64(authority.Archive.Bytes), MaximumExtractedBytes: int64(authority.MaximumExtractedBytes), MaximumMembers: len(members), Members: members})
 	if err != nil {
 		return err
 	}
