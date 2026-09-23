@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/domain"
+	"lanpanel/internal/htpasswdref"
 	"lanpanel/internal/reservations"
 	"path/filepath"
 	"slices"
@@ -20,38 +21,40 @@ const (
 )
 
 type TailnetSpec struct {
-	TargetKind          domain.AppTargetKind      `json:"target_kind"`
-	Name                string                    `json:"name"`
-	PeerIP              string                    `json:"peer_ip"`
-	SourceIP            string                    `json:"source_ip"`
-	Port                uint16                    `json:"port"`
-	ReadinessPath       string                    `json:"readiness_path"`
-	WebSocket           domain.WebSocketReadiness `json:"websocket"`
-	AllowedHTTPStatuses []uint16                  `json:"allowed_http_statuses"`
-	Publication         domain.AppPublication     `json:"publication"`
-	CredentialIDs       []string                  `json:"credential_ids,omitempty"`
+	TargetKind           domain.AppTargetKind      `json:"target_kind"`
+	Name                 string                    `json:"name"`
+	PeerIP               string                    `json:"peer_ip"`
+	SourceIP             string                    `json:"source_ip"`
+	Port                 uint16                    `json:"port"`
+	ReadinessPath        string                    `json:"readiness_path"`
+	WebSocket            domain.WebSocketReadiness `json:"websocket"`
+	AllowedHTTPStatuses  []uint16                  `json:"allowed_http_statuses"`
+	Publication          domain.AppPublication     `json:"publication"`
+	CredentialIDs        []string                  `json:"credential_ids,omitempty"`
+	ManagedBasicUsername string                    `json:"managed_basic_username,omitempty"`
 }
 
 type LocalSpec struct {
-	TargetKind          domain.AppTargetKind `json:"target_kind,omitempty"`
-	Name                string
-	EndpointKind        domain.LocalEndpointKind
-	TCPAddress          string
-	TCPPort             uint16
-	ReadinessPath       string
-	WebSocket           domain.WebSocketReadiness
-	AllowedHTTPStatuses []uint16
-	Service             domain.ManagedService
-	Publication         domain.AppPublication
-	CredentialIDs       []string
+	TargetKind           domain.AppTargetKind `json:"target_kind,omitempty"`
+	Name                 string
+	EndpointKind         domain.LocalEndpointKind
+	TCPAddress           string
+	TCPPort              uint16
+	ReadinessPath        string
+	WebSocket            domain.WebSocketReadiness
+	AllowedHTTPStatuses  []uint16
+	Service              domain.ManagedService
+	Publication          domain.AppPublication
+	CredentialIDs        []string
+	ManagedBasicUsername string
 }
 
 func LocalSpecFromRequest(value domain.LocalResourceCreateRequest) LocalSpec {
-	return LocalSpec{Name: value.Name, EndpointKind: value.EndpointKind, TCPAddress: value.TCPAddress, TCPPort: value.TCPPort, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Service: domain.ManagedService{Executable: value.Executable, Arguments: append([]string(nil), value.Arguments...), WorkingDirectory: value.WorkingDirectory, EnvironmentFile: value.EnvironmentFile, WritePaths: append([]string(nil), value.WritePaths...)}, Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...)}
+	return LocalSpec{Name: value.Name, EndpointKind: value.EndpointKind, TCPAddress: value.TCPAddress, TCPPort: value.TCPPort, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Service: domain.ManagedService{Executable: value.Executable, Arguments: append([]string(nil), value.Arguments...), WorkingDirectory: value.WorkingDirectory, EnvironmentFile: value.EnvironmentFile, WritePaths: append([]string(nil), value.WritePaths...)}, Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...), ManagedBasicUsername: value.ManagedBasicUsername}
 }
 
 func TailnetSpecFromRequest(value domain.TailnetResourceCreateRequest) TailnetSpec {
-	return TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: value.Name, PeerIP: value.PeerIP, SourceIP: value.SourceIP, Port: value.Port, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...)}
+	return TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: value.Name, PeerIP: value.PeerIP, SourceIP: value.SourceIP, Port: value.Port, ReadinessPath: value.ReadinessPath, WebSocket: value.WebSocket, AllowedHTTPStatuses: append([]uint16(nil), value.AllowedHTTPStatuses...), Publication: value.Publication, CredentialIDs: append([]string(nil), value.CredentialIDs...), ManagedBasicUsername: value.ManagedBasicUsername}
 }
 
 // ApplyUpdate copies only mutable request fields onto the server-loaded
@@ -99,12 +102,43 @@ func ApplyUpdate(prior domain.AppResource, value domain.ResourceUpdateRequest) (
 	return candidate, nil
 }
 
+func prepareManagedBasic(publication domain.AppPublication, credentialIDs []string, username string, random io.Reader) (domain.AppPublication, []string, error) {
+	ids := append([]string(nil), credentialIDs...)
+	if username == "" {
+		return publication, ids, nil
+	}
+	if !htpasswdref.ValidUsername(username) || publication.Kind != domain.PublicationDomainHTTPS || publication.DomainHTTPS == nil || publication.DomainHTTPS.AccessMode != domain.AppAccessBasic || publication.DomainHTTPS.CredentialID != "" {
+		return domain.AppPublication{}, nil, fmt.Errorf("managed Basic publication is invalid")
+	}
+	candidate := publication
+	domainHTTPS := *publication.DomainHTTPS
+	domainHTTPS.CredentialID = "cred_00000000000000000000000000000000"
+	candidate.DomainHTTPS = &domainHTTPS
+	if err := domain.ValidateAppPublication(candidate); err != nil {
+		return domain.AppPublication{}, nil, err
+	}
+	credentialID, err := newID(random, "cred_")
+	if err != nil {
+		return domain.AppPublication{}, nil, fmt.Errorf("generate managed Basic credential identity: %w", err)
+	}
+	value := *publication.DomainHTTPS
+	value.CredentialID = credentialID
+	publication.DomainHTTPS = &value
+	ids = append(ids, credentialID)
+	slices.Sort(ids)
+	return publication, ids, nil
+}
+
 func NewLocal(spec LocalSpec, random io.Reader) (domain.AppResource, error) {
 	if spec.TargetKind != "" && spec.TargetKind != domain.AppTargetLocalHTTP {
 		return domain.AppResource{}, fmt.Errorf("local resource target kind is invalid")
 	}
 	if random == nil {
 		random = rand.Reader
+	}
+	publication, credentialIDs, err := prepareManagedBasic(spec.Publication, spec.CredentialIDs, spec.ManagedBasicUsername, random)
+	if err != nil {
+		return domain.AppResource{}, err
 	}
 	resourceID, err := newID(random, "res_")
 	if err != nil {
@@ -124,13 +158,16 @@ func NewLocal(spec LocalSpec, random io.Reader) (domain.AppResource, error) {
 	}
 	target := domain.AppTarget{Kind: domain.AppTargetLocalHTTP, ReadinessPath: spec.ReadinessPath, WebSocket: spec.WebSocket, AllowedHTTPStatuses: statuses, LocalHTTP: &domain.LocalHTTPTarget{EndpointKind: spec.EndpointKind, TCPAddress: spec.TCPAddress, TCPPort: spec.TCPPort}}
 	process := &domain.ManagedProcess{ID: processID, Requested: domain.ProcessRequestedStopped, Service: spec.Service}
-	resource := domain.AppResource{ID: resourceID, Name: spec.Name, Lifecycle: domain.LifecycleActive, Target: target, Publication: spec.Publication, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, ManagedProcess: process, CredentialIDs: append([]string(nil), spec.CredentialIDs...), ManagedPaths: paths.ManagedPaths()}
+	resource := domain.AppResource{ID: resourceID, Name: spec.Name, Lifecycle: domain.LifecycleActive, Target: target, Publication: publication, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, ManagedProcess: process, CredentialIDs: credentialIDs, ManagedPaths: paths.ManagedPaths()}
 	digest, err := ConfigDigest(resource)
 	if err != nil {
 		return domain.AppResource{}, err
 	}
 	resource.CurrentConfigDigest = digest
 	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}, Resources: []domain.AppResource{resource}}
+	if spec.ManagedBasicUsername != "" {
+		installation.Credentials = []domain.Credential{{ID: publication.DomainHTTPS.CredentialID, Kind: "managed_basic", OwnerResourceID: resource.ID, Username: spec.ManagedBasicUsername, ManagedPath: "/etc/lanpanel-public/basic/" + publication.DomainHTTPS.CredentialID + ".htpasswd", Fingerprint: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}}
+	}
 	if err := domain.ValidateInstallation(installation); err != nil {
 		return domain.AppResource{}, err
 	}
@@ -144,6 +181,10 @@ func NewTailnet(spec TailnetSpec, random io.Reader) (domain.AppResource, error) 
 	if spec.TargetKind != domain.AppTargetTailnetHTTP {
 		return domain.AppResource{}, fmt.Errorf("tailnet resource target kind is invalid")
 	}
+	publication, credentialIDs, err := prepareManagedBasic(spec.Publication, spec.CredentialIDs, spec.ManagedBasicUsername, random)
+	if err != nil {
+		return domain.AppResource{}, err
+	}
 	resourceID, err := newID(random, "res_")
 	if err != nil {
 		return domain.AppResource{}, err
@@ -152,7 +193,7 @@ func NewTailnet(spec TailnetSpec, random io.Reader) (domain.AppResource, error) 
 	if len(statuses) == 0 {
 		statuses = []uint16{200, 204}
 	}
-	resource := domain.AppResource{ID: resourceID, Name: spec.Name, Lifecycle: domain.LifecycleActive, Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: spec.ReadinessPath, AllowedHTTPStatuses: statuses, WebSocket: spec.WebSocket, TailnetHTTP: &domain.TailnetHTTPTarget{IP: spec.PeerIP, SourceIP: spec.SourceIP, Port: spec.Port}}, Publication: spec.Publication, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, CredentialIDs: append([]string(nil), spec.CredentialIDs...), ManagedPaths: []string{}}
+	resource := domain.AppResource{ID: resourceID, Name: spec.Name, Lifecycle: domain.LifecycleActive, Target: domain.AppTarget{Kind: domain.AppTargetTailnetHTTP, ReadinessPath: spec.ReadinessPath, AllowedHTTPStatuses: statuses, WebSocket: spec.WebSocket, TailnetHTTP: &domain.TailnetHTTPTarget{IP: spec.PeerIP, SourceIP: spec.SourceIP, Port: spec.Port}}, Publication: publication, PublicationRecord: domain.PublicationRecord{State: domain.PublicationUnpublished, UnpublishedGeneration: 1}, CredentialIDs: credentialIDs, ManagedPaths: []string{}}
 	resource.CurrentConfigDigest, err = ConfigDigest(resource)
 	if err != nil {
 		return domain.AppResource{}, err
@@ -183,6 +224,19 @@ func ConfigDigest(resource domain.AppResource) (string, error) {
 }
 
 func ValidateCreate(current domain.Installation, candidate domain.AppResource) error {
+	return validateCreate(current, candidate)
+}
+
+func ValidateCreateWithCredential(current domain.Installation, candidate domain.AppResource, credential domain.Credential) error {
+	if credential.Kind != "managed_basic" || credential.OwnerResourceID != candidate.ID || candidate.Publication.DomainHTTPS == nil || candidate.Publication.DomainHTTPS.CredentialID != credential.ID || !slices.Contains(candidate.CredentialIDs, credential.ID) {
+		return fmt.Errorf("managed Basic create authority does not match resource")
+	}
+	next := current
+	next.Credentials = append(append([]domain.Credential(nil), current.Credentials...), credential)
+	return validateCreate(next, candidate)
+}
+
+func validateCreate(current domain.Installation, candidate domain.AppResource) error {
 	if candidate.Target.Kind == domain.AppTargetTailnetHTTP {
 		if err := domain.RequireConnector(current); err != nil {
 			return err

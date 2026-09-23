@@ -57,6 +57,7 @@ const (
 	OperationProductRead              Operation = "product_read"
 	OperationResourceDelete           Operation = "resource_delete"
 	OperationResourceMutation         Operation = "resource_mutation"
+	OperationResourceMutationSecret   Operation = "resource_mutation_secret"
 	OperationProcessLifecycle         Operation = "process_lifecycle"
 	OperationPublicationActivate      Operation = "publication_activate"
 )
@@ -97,6 +98,7 @@ var policies = map[Operation]Policy{
 	OperationProductRead:              {Callers: []Caller{CallerUI}},
 	OperationResourceDelete:           {Callers: []Caller{CallerUI}},
 	OperationResourceMutation:         {Callers: []Caller{CallerUI}},
+	OperationResourceMutationSecret:   {Callers: []Caller{CallerUI}, SecretOutput: true},
 	OperationProcessLifecycle:         {Callers: []Caller{CallerUI}},
 	OperationPublicationActivate:      {Callers: []Caller{CallerUI}, MaximumDuration: 11 * time.Minute},
 }
@@ -304,11 +306,11 @@ func ValidateRequest(request Request, now time.Time) error {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
 	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose || request.Operation == OperationManagedBasicGenerate || request.Operation == OperationManagedBasicDelete || request.Operation == OperationStaticRootRegister || request.Operation == OperationExternalHTPasswdRegister || request.Operation == OperationDomainStatus
-	resourceOperation := request.Operation == OperationHeadscaleInitialize || request.Operation == OperationHeadscaleDeploy || request.Operation == OperationHeadscaleReissue || request.Operation == OperationHeadscaleRead || request.Operation == OperationHeadscaleMutation || request.Operation == OperationPreauthKeyPlan || request.Operation == OperationPreauthKeyCreate || request.Operation == OperationConnectorMutation || request.Operation == OperationConnectorRead || request.Operation == OperationConnectorLoginPlan || request.Operation == OperationConnectorLogin || request.Operation == OperationProductRead || request.Operation == OperationResourceDelete || request.Operation == OperationResourceMutation || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
+	resourceOperation := request.Operation == OperationHeadscaleInitialize || request.Operation == OperationHeadscaleDeploy || request.Operation == OperationHeadscaleReissue || request.Operation == OperationHeadscaleRead || request.Operation == OperationHeadscaleMutation || request.Operation == OperationPreauthKeyPlan || request.Operation == OperationPreauthKeyCreate || request.Operation == OperationConnectorMutation || request.Operation == OperationConnectorRead || request.Operation == OperationConnectorLoginPlan || request.Operation == OperationConnectorLogin || request.Operation == OperationProductRead || request.Operation == OperationResourceDelete || request.Operation == OperationResourceMutation || request.Operation == OperationResourceMutationSecret || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
 	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
 		return fmt.Errorf("helper typed payload shape is invalid")
 	}
-	if request.Resource != nil && request.Operation != OperationResourceMutation && (request.Resource.Create != nil || request.Resource.Update != nil || request.Resource.Publication != nil) || request.Resource != nil && request.Operation == OperationResourceMutation && len(request.Resource.Resource) != 0 {
+	if request.Resource != nil && request.Operation != OperationResourceMutation && request.Operation != OperationResourceMutationSecret && (request.Resource.Create != nil || request.Resource.Update != nil || request.Resource.Publication != nil) || request.Resource != nil && (request.Operation == OperationResourceMutation || request.Operation == OperationResourceMutationSecret) && len(request.Resource.Resource) != 0 {
 		return fmt.Errorf("helper resource payload shape is invalid")
 	}
 	planAction := request.Operation == OperationApplicationPlan && (((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "") || ((request.Action.Operation == "publish" || request.Action.Operation == "unpublish" || request.Action.Operation == "resource_delete") && request.Action.TargetKind == "resource" && request.Action.TargetID != "") || ((request.Action.Operation == "managed_basic_delete" || request.Action.Operation == "managed_basic_rotate") && request.Action.TargetKind == "credential" && request.Action.TargetID != "")) && request.Action.PlanID == "" && request.Action.Confirmation == ""
@@ -339,7 +341,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationHeadscaleInitialize && request.Operation != OperationHeadscaleDeploy && request.Operation != OperationHeadscaleReissue && request.Operation != OperationHeadscaleRead && request.Operation != OperationHeadscaleMutation && request.Operation != OperationPreauthKeyPlan && request.Operation != OperationPreauthKeyCreate && request.Operation != OperationConnectorMutation && request.Operation != OperationConnectorRead && request.Operation != OperationConnectorLoginPlan && request.Operation != OperationConnectorLogin && request.Operation != OperationProductRead && request.Operation != OperationResourceDelete && request.Operation != OperationResourceMutation && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
+	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationHeadscaleInitialize && request.Operation != OperationHeadscaleDeploy && request.Operation != OperationHeadscaleReissue && request.Operation != OperationHeadscaleRead && request.Operation != OperationHeadscaleMutation && request.Operation != OperationPreauthKeyPlan && request.Operation != OperationPreauthKeyCreate && request.Operation != OperationConnectorMutation && request.Operation != OperationConnectorRead && request.Operation != OperationConnectorLoginPlan && request.Operation != OperationConnectorLogin && request.Operation != OperationProductRead && request.Operation != OperationResourceDelete && request.Operation != OperationResourceMutation && request.Operation != OperationResourceMutationSecret && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -400,7 +402,7 @@ func validOperationTarget(operation Operation, target string) bool {
 		return target == "installation" || exactID && (kind == "resource" || kind == "job")
 	case OperationResourceDelete:
 		return exactID && kind == "resource"
-	case OperationResourceMutation:
+	case OperationResourceMutation, OperationResourceMutationSecret:
 		return target == "installation" || exactID && kind == "resource"
 	case OperationProcessLifecycle, OperationPublicationActivate:
 		return exactID && kind == "resource"
@@ -442,8 +444,12 @@ func validResourcePayload(operation Operation, value ResourcePayload) bool {
 		return value.Operation == "resource_delete" && len(value.Resource) == 0 && refPattern.MatchString(value.PlanID) && value.Confirmation == "delete"
 	case OperationProductRead:
 		return (value.Operation == "status" || value.Operation == "diagnostics" || value.Operation == "configuration_export" || value.Operation == "job_list" || value.Operation == "job_detail") && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == ""
-	case OperationResourceMutation:
+	case OperationResourceMutation, OperationResourceMutationSecret:
 		create := value.Operation == "resource_create" && value.Create != nil && value.Update == nil && value.Publication == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
+		managedBasicCreate := create && (value.Create.Local != nil && value.Create.Local.ManagedBasicUsername != "" || value.Create.Tailnet != nil && value.Create.Tailnet.ManagedBasicUsername != "")
+		if operation == OperationResourceMutationSecret && !managedBasicCreate || operation == OperationResourceMutation && managedBasicCreate {
+			return false
+		}
 		update := value.Operation == "resource_update" && value.Update != nil && value.Create == nil && value.Publication == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
 		publication := value.Operation == "resource_update" && value.Publication != nil && value.Create == nil && value.Update == nil && len(value.Resource) == 0 && value.PlanID == "" && value.Confirmation == "submit"
 		if create {
@@ -593,8 +599,12 @@ func validReadResult(result *ReadResult) bool {
 	return result != nil && (result.Operation == "diagnostics" || result.Operation == "configuration_export" || result.Operation == "job_list" || result.Operation == "job_detail") && len(result.Payload) > 0 && len(result.Payload) <= 12<<20 && json.Valid(result.Payload)
 }
 
-func validResourceMutationResult(result ResourceResult) bool {
-	return strings.HasPrefix(result.ResourceID, "res_") && refPattern.MatchString(result.ResourceID) && jobIDPattern.MatchString(result.JobID) && result.JobResult == "succeeded" && result.Status == "" && !result.AccessMayRemain && result.CredentialID == "" && result.CredentialFingerprint == "" && !result.CredentialChanged && result.GoAccessCredentialID == "" && result.GoAccessCredentialFingerprint == "" && !result.GoAccessCredentialChanged && result.StaticFingerprint == "" && !result.StaticChanged && result.ObservedAt.IsZero() && result.Reason == "" && len(result.AllowedActions) == 0 && len(result.CredentialIDs) == 0 && result.GoAccessRetirementJobID == "" && len(result.GoAccessRetirementGenerations) == 0
+func validResourceMutationResult(result ResourceResult, managedBasic bool) bool {
+	credentialValid := result.CredentialID == "" && result.CredentialFingerprint == ""
+	if managedBasic {
+		credentialValid = strings.HasPrefix(result.CredentialID, "cred_") && refPattern.MatchString(result.CredentialID) && digestPattern.MatchString(result.CredentialFingerprint)
+	}
+	return strings.HasPrefix(result.ResourceID, "res_") && refPattern.MatchString(result.ResourceID) && jobIDPattern.MatchString(result.JobID) && result.JobResult == "succeeded" && result.Status == "" && !result.AccessMayRemain && credentialValid && !result.CredentialChanged && result.GoAccessCredentialID == "" && result.GoAccessCredentialFingerprint == "" && !result.GoAccessCredentialChanged && result.StaticFingerprint == "" && !result.StaticChanged && result.ObservedAt.IsZero() && result.Reason == "" && len(result.AllowedActions) == 0 && len(result.CredentialIDs) == 0 && result.GoAccessRetirementJobID == "" && len(result.GoAccessRetirementGenerations) == 0
 }
 
 func ValidateResponse(operation Operation, response Response) error {
@@ -711,8 +721,8 @@ func ValidateResponse(operation Operation, response Response) error {
 			if response.Action != nil || response.Resource != nil || response.Headscale != nil || response.Connector != nil || !statusValid || response.Status != nil && response.StatusCatalog != nil || (response.Status != nil || response.StatusCatalog != nil) && response.Read != nil || response.Read == nil && response.Status == nil && response.StatusCatalog == nil || response.Read != nil && !validReadResult(response.Read) {
 				return fmt.Errorf("product read response shape invalid")
 			}
-		case OperationResourceMutation:
-			if response.Action != nil || response.Status != nil || response.StatusCatalog != nil || response.Resource == nil || !validResourceMutationResult(*response.Resource) {
+		case OperationResourceMutation, OperationResourceMutationSecret:
+			if response.Action != nil || response.Status != nil || response.StatusCatalog != nil || response.Resource == nil || !validResourceMutationResult(*response.Resource, operation == OperationResourceMutationSecret) {
 				return fmt.Errorf("resource helper response shape invalid")
 			}
 		case OperationProcessLifecycle:

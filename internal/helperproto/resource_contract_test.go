@@ -30,6 +30,25 @@ func TestResourceMutationUsesTypedOneOfAndRejectsRawResourceJSON(t *testing.T) {
 	}
 }
 
+func TestOrdinaryResourceMutationRejectsManagedBasicSecretPayload(t *testing.T) {
+	now := time.Now().UTC()
+	create := domain.ResourceCreateRequest{TargetKind: domain.AppTargetLocalHTTP, Local: &domain.LocalResourceCreateRequest{
+		Name: "basic", EndpointKind: domain.LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200},
+		Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/srv/app/data"}, ManagedBasicUsername: "alice",
+		Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "basic.example.test", AccessMode: domain.AppAccessBasic}},
+	}}
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "basic-create", Operation: OperationResourceMutation, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Resource: &ResourcePayload{Operation: "resource_create", ActorIdentity: "session", ActorGeneration: 1, Confirmation: "submit", Create: &create}}
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err == nil {
+		t.Fatal("ordinary resource mutation accepted managed Basic secret payload")
+	}
+	request.Operation = OperationResourceMutationSecret
+	request.InputDigest, _ = ApplicationInputDigest(request)
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatalf("secret resource mutation rejected managed Basic payload: %v", err)
+	}
+}
+
 func TestResourceMutationResponseCarriesCommittedJobIdentityAndResult(t *testing.T) {
 	jobID := "job_" + strings.Repeat("a", 64)
 	response := Response{SchemaVersion: SchemaVersion, RequestID: "resource-result", Code: ResponseSucceeded, ResultDigest: "sha256:" + strings.Repeat("a", 64), Resource: &ResourceResult{ResourceID: "res_00000000000000000000000000000001", JobID: jobID, JobResult: "succeeded"}}

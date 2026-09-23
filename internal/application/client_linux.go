@@ -82,6 +82,14 @@ type PublicationResult struct {
 	JobResult string `json:"job_result"`
 	PublicURL string `json:"public_url"`
 }
+type ResourceCreateResult struct {
+	ResourceID            string `json:"resource_id"`
+	JobID                 string `json:"job_id"`
+	JobResult             string `json:"job_result"`
+	CredentialID          string `json:"credential_id,omitempty"`
+	CredentialFingerprint string `json:"credential_fingerprint,omitempty"`
+	Password              []byte `json:"password,omitempty"`
+}
 type RotationResult struct {
 	Fingerprint string
 	JobID       string
@@ -124,7 +132,15 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	plan, _ := RegisterAction("plan", PlanPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(PlanPayload)
 		reply, err := client(ctx, helperproto.OperationApplicationPlan, helperproto.ActionPayload{Operation: string(payload.Operation), TargetKind: string(payload.Target.Kind), TargetID: payload.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation})
-		if err != nil || reply.Action == nil || reply.Action.PlanID == "" {
+		if err != nil {
+			var rejection HelperRejection
+			clear(reply.Secret)
+			if errors.As(err, &rejection) {
+				return Result{}, err
+			}
+			return Result{}, fmt.Errorf("application Plan failed")
+		}
+		if reply.Action == nil || reply.Action.PlanID == "" {
 			clear(reply.Secret)
 			return Result{}, fmt.Errorf("application Plan failed")
 		}
@@ -267,7 +283,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				confirmation = "plan"
 			}
 			reply, err := resourceClient(ctx, helperproto.OperationHeadscaleDeploy, helperproto.ResourcePayload{Operation: "headscale_deploy", ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: confirmation, Resource: raw}, "headscale")
-			if err != nil || reply.Action == nil || len(reply.Secret) != 0 {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("headscale control deploy failed")
+			}
+			if reply.Action == nil || len(reply.Secret) != 0 {
 				return Result{}, fmt.Errorf("headscale control deploy failed")
 			}
 			if payload.PlanID == "" {
@@ -287,7 +310,14 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				confirmation = "plan"
 			}
 			reply, err := resourceClient(ctx, helperproto.OperationHeadscaleReissue, helperproto.ResourcePayload{Operation: "headscale_reissue", ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: confirmation, Resource: raw}, "headscale")
-			if err != nil || reply.Action == nil || len(reply.Secret) != 0 {
+			if err != nil {
+				var rejection HelperRejection
+				if errors.As(err, &rejection) {
+					return Result{}, err
+				}
+				return Result{}, fmt.Errorf("headscale certificate reissue failed")
+			}
+			if reply.Action == nil || len(reply.Secret) != 0 {
 				return Result{}, fmt.Errorf("headscale certificate reissue failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: *reply.Action}, nil
@@ -499,16 +529,34 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				target = "resource/" + call.Target.ID
 			}
 			request := helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: "submit", Create: payload.Create, Update: payload.Update, Publication: payload.Publication}
-			reply, err := resourceClient(ctx, helperproto.OperationResourceMutation, request, target)
+			helperOperation := helperproto.OperationResourceMutation
+			managedBasicCreate := call.Operation == domain.OperationResourceCreate && payload.Create != nil && (payload.Create.Local != nil && payload.Create.Local.ManagedBasicUsername != "" || payload.Create.Tailnet != nil && payload.Create.Tailnet.ManagedBasicUsername != "")
+			if managedBasicCreate {
+				helperOperation = helperproto.OperationResourceMutationSecret
+			}
+			reply, err := resourceClient(ctx, helperOperation, request, target)
 			if err != nil {
 				var rejection HelperRejection
+				clear(reply.Secret)
 				if errors.As(err, &rejection) {
 					return Result{}, err
 				}
 				return Result{}, fmt.Errorf("resource mutation failed")
 			}
 			if reply.Resource == nil || reply.Resource.ResourceID == "" || reply.Resource.JobID == "" || reply.Resource.JobResult != "succeeded" {
+				clear(reply.Secret)
 				return Result{}, fmt.Errorf("resource mutation failed")
+			}
+			if managedBasicCreate {
+				if len(reply.Secret) == 0 || reply.Resource.CredentialID == "" || reply.Resource.CredentialFingerprint == "" {
+					clear(reply.Secret)
+					return Result{}, fmt.Errorf("managed Basic resource creation secret missing")
+				}
+				return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Resource.JobID, Payload: ResourceCreateResult{ResourceID: reply.Resource.ResourceID, JobID: reply.Resource.JobID, JobResult: reply.Resource.JobResult, CredentialID: reply.Resource.CredentialID, CredentialFingerprint: reply.Resource.CredentialFingerprint, Password: reply.Secret}}, nil
+			}
+			if len(reply.Secret) != 0 {
+				clear(reply.Secret)
+				return Result{}, fmt.Errorf("resource mutation returned unexpected secret")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Resource.JobID, Payload: *reply.Resource}, nil
 		}

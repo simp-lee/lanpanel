@@ -178,6 +178,10 @@ func ResourceMutationHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationResourceMutation, r, e)
 }
 
+func ResourceMutationSecretHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationResourceMutationSecret, r, e)
+}
+
 func ProcessLifecycleHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationProcessLifecycle, r, e)
 }

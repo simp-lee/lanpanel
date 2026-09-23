@@ -25,6 +25,22 @@ func TestFreshResourceHasStableUnpublishedStoppedIdentity(t *testing.T) {
 	}
 }
 
+func TestNewLocalManagedBasicDeclaresCredentialForAtomicCreate(t *testing.T) {
+	spec := LocalSpec{Name: "Basic", EndpointKind: domain.LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, Service: domain.ManagedService{Executable: "/usr/local/bin/example", WorkingDirectory: "/srv/example", WritePaths: []string{"/srv/example/data"}}, ManagedBasicUsername: "alice", Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "basic.example.test", AccessMode: domain.AppAccessBasic}}}
+	value, err := NewLocal(spec, bytes.NewReader(bytes.Repeat([]byte{3}, 48)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Publication.DomainHTTPS == nil || value.Publication.DomainHTTPS.CredentialID == "" || len(value.CredentialIDs) != 1 || value.CredentialIDs[0] != value.Publication.DomainHTTPS.CredentialID {
+		t.Fatalf("resource=%#v", value)
+	}
+	credential := domain.Credential{ID: value.Publication.DomainHTTPS.CredentialID, Kind: "managed_basic", OwnerResourceID: value.ID, Username: "alice", ManagedPath: "/etc/lanpanel-public/basic/" + value.Publication.DomainHTTPS.CredentialID + ".htpasswd", Fingerprint: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}}
+	if err := ValidateCreateWithCredential(installation, value, credential); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTailnetResourceHasNoLocalProcessAndRequiresConnectorBinding(t *testing.T) {
 	spec := TailnetSpec{TargetKind: domain.AppTargetTailnetHTTP, Name: "Peer App", PeerIP: "100.64.0.2", SourceIP: "100.64.0.1", Port: 8080, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200}, Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "peer.example.test", AccessMode: domain.AppAccessPublic}}}
 	value, err := NewTailnet(spec, bytes.NewReader(bytes.Repeat([]byte{3}, 16)))

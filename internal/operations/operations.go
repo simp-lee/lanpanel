@@ -225,7 +225,8 @@ type HeadscaleDeployCompleteCommit struct {
 }
 
 type ResourceCreateCommit struct {
-	Resource domain.AppResource
+	Resource   domain.AppResource
+	Credential *domain.Credential
 }
 
 type ProcessStateCommit struct {
@@ -328,6 +329,7 @@ type AdmitRequest struct {
 	Target           string
 	ActorIdentity    string
 	PlanID           string
+	OperationBinding string
 	Source           AdmissionSource
 	SafetyBinding    SafetyBinding
 	HeadscaleBinding *HeadscaleInitializationBinding
@@ -561,6 +563,9 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err := validateAdmissionSource(request.Operation, request.Source, request.PlanID); err != nil {
 		return jobs.Record{}, err
 	}
+	if request.OperationBinding != "" && (request.Operation != ResourceCreate || !exactDigest(request.OperationBinding)) {
+		return jobs.Record{}, fmt.Errorf("operation binding is invalid")
+	}
 	if err := validateSafetyTargetBinding(request); err != nil {
 		return jobs.Record{}, err
 	}
@@ -598,7 +603,7 @@ func (admitter *Admitter) Admit(ctx context.Context, admission *locks.Lease, req
 	if err != nil {
 		return jobs.Record{}, err
 	}
-	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, ResourceDelete: request.ResourceDelete, CreatedAt: observedNow}
+	reservation := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: request.PlanID, OperationBinding: request.OperationBinding, AdmissionSource: request.Source, Operation: request.Operation, Target: request.Target, Phase: PhaseReserved, SafetyDigest: digest, SafetyBinding: request.SafetyBinding, HeadscaleBinding: request.HeadscaleBinding, HeadscaleDeploy: request.HeadscaleDeploy, ResourceDelete: request.ResourceDelete, CreatedAt: observedNow}
 	_, _, err = admitter.normal.Update(ctx, admission, request.ExpectedRevision, func(transaction *persist.Transaction) error {
 		switch request.Operation {
 		case ResourceCreate, ResourceUpdate, Publish, ProcessStart, HeadscaleInitialize, HeadscaleDeploy:
@@ -4744,7 +4749,18 @@ func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *Mu
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || commit.Resource.ID == "" {
 		return fmt.Errorf("resource creation commit requires exact authority")
 	}
-	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+	candidateDigest, err := appresource.ConfigDigest(commit.Resource)
+	if err != nil {
+		return fmt.Errorf("resource creation candidate config identity: %w", err)
+	}
+	credentialBinding := ""
+	if commit.Credential != nil {
+		credentialBinding, err = canonicalValueDigest(*commit.Credential)
+		if err != nil {
+			return err
+		}
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
 		intent, err := loadReservation(transaction, jobID)
 		if err != nil {
 			return err
@@ -4755,6 +4771,22 @@ func (admitter *Admitter) CommitResourceCreate(ctx context.Context, mutation *Mu
 		installation, err := loadInstallation(transaction)
 		if err != nil {
 			return err
+		}
+		if intent.SafetyBinding.CandidateDigest != "" && (intent.SafetyBinding.CandidateDigest != candidateDigest || commit.Resource.CurrentConfigDigest != candidateDigest) {
+			return fmt.Errorf("resource creation candidate authority is invalid")
+		}
+		if commit.Credential != nil {
+			credential := *commit.Credential
+			if credential.Kind != "managed_basic" || credential.OwnerResourceID != commit.Resource.ID || commit.Resource.Publication.DomainHTTPS == nil || commit.Resource.Publication.DomainHTTPS.CredentialID != credential.ID || !slices.Contains(commit.Resource.CredentialIDs, credential.ID) || !exactDigest(credential.Fingerprint) || intent.OperationBinding != credentialBinding || intent.SafetyBinding.CandidateDigest != candidateDigest {
+				return fmt.Errorf("resource creation managed Basic authority is invalid")
+			}
+			for _, current := range installation.Credentials {
+				if current.ID == credential.ID {
+					return fmt.Errorf("resource creation credential ID collision")
+				}
+			}
+			installation.Credentials = append(installation.Credentials, credential)
+			slices.SortFunc(installation.Credentials, func(a, b domain.Credential) int { return strings.Compare(a.ID, b.ID) })
 		}
 		installation.Resources = append(installation.Resources, commit.Resource)
 		raw, err := persist.EncodeEntry(installation)
@@ -7123,14 +7155,32 @@ func validateCredentialTransition(before, after persist.Document, oldInstallatio
 				return err
 			}
 			jobID := ""
+			resourceCreate := false
 			if err := exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
-				matches := intent.Operation == ManagedBasicCreate && intent.Target == "resource/"+candidate.OwnerResourceID && intent.SafetyBinding.ResourceID == candidate.OwnerResourceID && intent.OperationBinding == binding
-				if matches {
-					jobID = intent.JobID
+				if intent.Operation == ManagedBasicCreate {
+					matches := intent.Target == "resource/"+candidate.OwnerResourceID && intent.SafetyBinding.ResourceID == candidate.OwnerResourceID && intent.OperationBinding == binding
+					if matches {
+						jobID = intent.JobID
+					}
+					return matches
 				}
-				return matches
+				if intent.Operation != ResourceCreate || intent.Target != "installation" || intent.SafetyBinding.ResourceID != candidate.OwnerResourceID || intent.SafetyBinding.CandidateDigest == "" || !exactDigest(intent.SafetyBinding.CandidateDigest) || intent.OperationBinding != binding {
+					return false
+				}
+				for _, resource := range newInstallation.Resources {
+					if resource.ID != candidate.OwnerResourceID {
+						continue
+					}
+					resourceDigest, digestErr := appresource.ConfigDigest(resource)
+					resourceCreate = digestErr == nil && resourceDigest == intent.SafetyBinding.CandidateDigest && resource.Publication.DomainHTTPS != nil && resource.Publication.DomainHTTPS.CredentialID == candidate.ID && slices.Contains(resource.CredentialIDs, candidate.ID)
+					return resourceCreate
+				}
+				return false
 			}); err != nil {
 				return err
+			}
+			if resourceCreate {
+				return nil
 			}
 			return requireManagedBasicCandidateChildEntries(after.Entries, jobID, candidate.Fingerprint)
 		case "external_htpasswd":
@@ -8221,6 +8271,12 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 	if request.Operation == HeadscaleInitialize && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) {
 			return fmt.Errorf("authenticated Headscale initialization requires exact config and release authority")
+		}
+		return nil
+	}
+	if request.Operation == ResourceCreate && request.Source == AdmissionUI {
+		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || binding.CandidateDigest != "" && !exactDigest(binding.CandidateDigest) || binding.CandidateBundle != "" || request.OperationBinding != "" && !exactDigest(request.OperationBinding) {
+			return fmt.Errorf("authenticated resource creation binding is invalid")
 		}
 		return nil
 	}

@@ -93,6 +93,36 @@ func testServer(t *testing.T) *Server {
 	return server
 }
 
+func TestRejectUsesJSONErrorContract(t *testing.T) {
+	writer := httptest.NewRecorder()
+	reject(writer, http.StatusBadRequest)
+	if writer.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d", writer.Code)
+	}
+	if got := writer.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content type=%q", got)
+	}
+	var response errorResponse
+	if err := json.NewDecoder(writer.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "Bad Request" || response.ErrorCode != "bad_request" {
+		t.Fatalf("response=%#v", response)
+	}
+}
+
+func TestRejectWithErrorRedactsInternalCause(t *testing.T) {
+	writer := httptest.NewRecorder()
+	rejectWithError(writer, http.StatusServiceUnavailable, errors.New("private credential contents"))
+	var response errorResponse
+	if err := json.NewDecoder(writer.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "Service Unavailable" || response.ErrorCode != "service_unavailable" || strings.Contains(writer.Body.String(), "private credential contents") {
+		t.Fatalf("response=%#v body=%s", response, writer.Body.String())
+	}
+}
+
 func TestLoginLogoutAreAuditedWithoutCredentials(t *testing.T) {
 	server := testServer(t)
 	sink, ok := server.config.Audit.(*audit.MemorySink)
@@ -742,7 +772,10 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 	if response.Code != http.StatusOK {
 		t.Fatal(response.Code)
 	}
-	for _, id := range []string{"headscale-initialize", "headscale-control", "headscale-reissue", "resource-create", "resource-update-json", "process-control", "resource-delete", "headscale-user-create", "headscale-key-create", "headscale-key-revoke", "headscale-device-expire", "headscale-reads", "connector-binding", "connector-login", "connector-verify", "product-reads", "job-detail", "domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
+	if strings.Contains(response.Body.String(), "Changing or disconnecting the connector") || strings.Contains(response.Body.String(), "disconnecting the connector") {
+		t.Fatal("connector UI still advertises an unavailable rebinding/disconnect operation")
+	}
+	for _, id := range []string{"headscale-initialize", "headscale-control", "headscale-reissue", "resource-create", "resource-update-json", "process-control", "resource-delete", "headscale-user-create", "headscale-key-create", "headscale-key-revoke", "headscale-device-expire", "headscale-reads", "connector-binding", "connector-login", "connector-verify", "product-reads", "job-detail", "action-result", "system-status", "system-status-summary", "system-status-detail", "domain-config", "basic-create", "basic-rotate", "basic-delete", "static-register", "external-htpasswd-register", "domain-status", "unpublish"} {
 		if !strings.Contains(response.Body.String(), `id="`+id+`"`) {
 			t.Fatalf("management control %s missing", id)
 		}
@@ -766,7 +799,7 @@ func TestManagementPageExposesDomainCredentialStaticAndContractionControls(t *te
 			t.Fatalf("removed Headscale source field %s is still exposed", field)
 		}
 	}
-	for _, required := range []string{"trusted_mesh", "/api/actions/headscale_initialize", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence"} {
+	for _, required := range []string{"trusted_mesh", "/api/actions/headscale_initialize", "cannot be changed or removed", "control service and ingress remain inactive", "foreign Headscale database, account, or artifact evidence", "system_status", "applySystemContext", "refreshSystemStatus", "renderActionResult", "JSON.stringify(displayValue, null, 2)"} {
 		if !strings.Contains(response.Body.String(), required) && !strings.Contains(appJS, required) {
 			t.Fatalf("Headscale initialization warning/action missing %q", required)
 		}

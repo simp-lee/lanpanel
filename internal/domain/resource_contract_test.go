@@ -10,6 +10,26 @@ import (
 
 func boolPointer(value bool) *bool { return &value }
 
+func TestResourceCreateRequestSupportsManagedBasicCreation(t *testing.T) {
+	request := ResourceCreateRequest{TargetKind: AppTargetLocalHTTP, Local: &LocalResourceCreateRequest{
+		Name: "Basic app", EndpointKind: LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200},
+		Executable: "/usr/local/bin/app", WorkingDirectory: "/srv/app", WritePaths: []string{"/srv/app/data"}, ManagedBasicUsername: "alice",
+		Publication: AppPublication{Kind: PublicationDomainHTTPS, DomainHTTPS: &DomainHTTPSPublication{CanonicalDomain: "basic.example.test", AccessMode: AppAccessBasic}},
+	}}
+	if err := ValidateResourceCreateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Local.ManagedBasicUsername = ""
+	if err := ValidateResourceCreateRequest(request); err == nil {
+		t.Fatal("basic creation without a managed username was accepted")
+	}
+	request.Local.ManagedBasicUsername = "alice"
+	request.Local.Publication.DomainHTTPS.AccessMode = AppAccessPublic
+	if err := ValidateResourceCreateRequest(request); err == nil {
+		t.Fatal("managed Basic username on public publication was accepted")
+	}
+}
+
 func TestResourceCreateRequestIsClosedAndDoesNotCarryAuthority(t *testing.T) {
 	request := ResourceCreateRequest{TargetKind: AppTargetLocalHTTP, Local: &LocalResourceCreateRequest{
 		Name: "Local app", EndpointKind: LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200},

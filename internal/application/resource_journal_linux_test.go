@@ -4,13 +4,63 @@ package application
 
 import (
 	"encoding/json"
+	"lanpanel/internal/basic"
+	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	"lanpanel/internal/resource"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestManagedBasicCreateJournalAndSecretLifetime(t *testing.T) {
+	candidate, err := resource.NewLocal(resource.LocalSpec{
+		Name: "Basic", EndpointKind: domain.LocalEndpointRelayUnix, ReadinessPath: "/ready", AllowedHTTPStatuses: []uint16{200},
+		Service:              domain.ManagedService{Executable: "/usr/local/bin/basic", WorkingDirectory: "/srv/basic", WritePaths: []string{"/srv/basic/data"}},
+		ManagedBasicUsername: "alice", Publication: domain.AppPublication{Kind: domain.PublicationDomainHTTPS, DomainHTTPS: &domain.DomainHTTPSPublication{CanonicalDomain: "basic.example.test", AccessMode: domain.AppAccessBasic}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := basic.Hash("alice", []byte("test-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := domain.Credential{ID: candidate.Publication.DomainHTTPS.CredentialID, Kind: "managed_basic", OwnerResourceID: candidate.ID, Username: "alice", ManagedPath: basic.Path(candidate.Publication.DomainHTTPS.CredentialID), Fingerprint: generated.Fingerprint}
+	installation := domain.Installation{SchemaVersion: domain.InstallationSchemaVersion, InstallationID: "ins_00000000000000000000000000000001", Management: domain.ManagementAuthority{Address: "127.1.1.1", Port: 49152}}
+	journal := ResourceCreateJournal{SchemaVersion: resourceCreateJournalSchema, JobID: "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ResourceID: candidate.ID, Resource: candidate, Phase: "prepared", ManagedBasic: &credential}
+	if err := validateResourceCreateJournal(journal); err != nil {
+		t.Fatalf("managed Basic journal rejected: %v", err)
+	}
+	if err := validateRecoveryResourceCreate(installation, journal); err != nil {
+		t.Fatalf("managed Basic recovery authority rejected: %v", err)
+	}
+	invalid := journal
+	invalidCredential := credential
+	invalidCredential.ManagedPath = "/tmp/other.htpasswd"
+	invalid.ManagedBasic = &invalidCredential
+	if err := validateResourceCreateJournal(invalid); err == nil {
+		t.Fatal("managed Basic journal accepted a path outside its authority")
+	}
+
+	execution := &ResourceExecution{ManagedBasic: &credential, ManagedBasicRecord: []byte("record"), ManagedBasicPassword: []byte("password")}
+	id, password, ok := execution.ManagedBasicSecret()
+	if !ok || id != credential.ID || string(password) != "password" {
+		t.Fatalf("secret=%q id=%q ok=%v", password, id, ok)
+	}
+	password[0] = 'X'
+	if string(execution.ManagedBasicPassword) != "password" {
+		t.Fatal("secret accessor exposed mutable execution storage")
+	}
+	if err := execution.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if execution.ManagedBasicRecord != nil || execution.ManagedBasicPassword != nil {
+		t.Fatal("managed Basic secret material was retained after close")
+	}
+}
 
 func TestResourceJournalReadersRequireCanonicalSafeFiles(t *testing.T) {
 	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}

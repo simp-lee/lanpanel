@@ -427,7 +427,7 @@ func validateSecretResult(operation string, value SecretResult) error {
 		}
 		return nil
 	}
-	if operation == "managed_basic_create" || operation == "managed_basic_rotate" {
+	if operation == "managed_basic_create" || operation == "managed_basic_rotate" || operation == "resource_create" {
 		if value.Kind != "managed_basic" || value.Remedy != "rotate_again" {
 			return fmt.Errorf("managed Basic remedy is invalid")
 		}

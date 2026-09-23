@@ -611,7 +611,7 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 			return application.HelperReply{}, err
 		}
 		return application.HelperReply{Digest: func() string { value, _ := domain.ResourceStatusCatalogDigest(catalog); return value }(), StatusCatalog: (*helperproto.ResourceStatusCatalog)(&catalog)}, nil
-	case helperproto.OperationResourceMutation:
+	case helperproto.OperationResourceMutation, helperproto.OperationResourceMutationSecret:
 		if (backend.scenario == "create-preflight-failure" && payload.Create != nil) || (backend.scenario == "update-preflight-failure" && payload.Update != nil) {
 			jobID := fixtureJobID("preflight")
 			backend.recordJobLocked(jobID, payload.Operation, target, jobs.ResultFailed, "preflight_rejected")
@@ -629,13 +629,35 @@ func (backend *playwrightFixtureBackend) resourceCall(ctx context.Context, opera
 			jobID := fixtureJobID("create-" + id)
 			configuration := fixtureTailnetConfiguration(name)
 			if payload.Create.Local != nil {
-				configuration = &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetLocalHTTP, Local: &domain.LocalResourceUpdateRequest{Name: payload.Create.Local.Name, EndpointKind: payload.Create.Local.EndpointKind, TCPAddress: payload.Create.Local.TCPAddress, TCPPort: payload.Create.Local.TCPPort, ReadinessPath: payload.Create.Local.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), payload.Create.Local.AllowedHTTPStatuses...), WebSocket: payload.Create.Local.WebSocket, Executable: payload.Create.Local.Executable, Arguments: append([]string(nil), payload.Create.Local.Arguments...), WorkingDirectory: payload.Create.Local.WorkingDirectory, EnvironmentFile: payload.Create.Local.EnvironmentFile, WritePaths: append([]string(nil), payload.Create.Local.WritePaths...), Publication: payload.Create.Local.Publication, CredentialIDs: append([]string(nil), payload.Create.Local.CredentialIDs...)}}
+				publication := payload.Create.Local.Publication
+				credentialIDs := append([]string(nil), payload.Create.Local.CredentialIDs...)
+				if operation == helperproto.OperationResourceMutationSecret {
+					value := *publication.DomainHTTPS
+					value.CredentialID = "cred_00000000000000000000000000000001"
+					publication.DomainHTTPS = &value
+					credentialIDs = append(credentialIDs, value.CredentialID)
+				}
+				configuration = &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetLocalHTTP, Local: &domain.LocalResourceUpdateRequest{Name: payload.Create.Local.Name, EndpointKind: payload.Create.Local.EndpointKind, TCPAddress: payload.Create.Local.TCPAddress, TCPPort: payload.Create.Local.TCPPort, ReadinessPath: payload.Create.Local.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), payload.Create.Local.AllowedHTTPStatuses...), WebSocket: payload.Create.Local.WebSocket, Executable: payload.Create.Local.Executable, Arguments: append([]string(nil), payload.Create.Local.Arguments...), WorkingDirectory: payload.Create.Local.WorkingDirectory, EnvironmentFile: payload.Create.Local.EnvironmentFile, WritePaths: append([]string(nil), payload.Create.Local.WritePaths...), Publication: publication, CredentialIDs: credentialIDs}}
 			} else if payload.Create.Tailnet != nil {
-				configuration = &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetTailnetHTTP, Tailnet: &domain.TailnetResourceUpdateRequest{Name: payload.Create.Tailnet.Name, PeerIP: payload.Create.Tailnet.PeerIP, SourceIP: payload.Create.Tailnet.SourceIP, Port: payload.Create.Tailnet.Port, ReadinessPath: payload.Create.Tailnet.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), payload.Create.Tailnet.AllowedHTTPStatuses...), WebSocket: payload.Create.Tailnet.WebSocket, Publication: payload.Create.Tailnet.Publication, CredentialIDs: append([]string(nil), payload.Create.Tailnet.CredentialIDs...)}}
+				publication := payload.Create.Tailnet.Publication
+				credentialIDs := append([]string(nil), payload.Create.Tailnet.CredentialIDs...)
+				if operation == helperproto.OperationResourceMutationSecret {
+					value := *publication.DomainHTTPS
+					value.CredentialID = "cred_00000000000000000000000000000001"
+					publication.DomainHTTPS = &value
+					credentialIDs = append(credentialIDs, value.CredentialID)
+				}
+				configuration = &domain.ResourceStatusConfiguration{TargetKind: domain.AppTargetTailnetHTTP, Tailnet: &domain.TailnetResourceUpdateRequest{Name: payload.Create.Tailnet.Name, PeerIP: payload.Create.Tailnet.PeerIP, SourceIP: payload.Create.Tailnet.SourceIP, Port: payload.Create.Tailnet.Port, ReadinessPath: payload.Create.Tailnet.ReadinessPath, AllowedHTTPStatuses: append([]uint16(nil), payload.Create.Tailnet.AllowedHTTPStatuses...), WebSocket: payload.Create.Tailnet.WebSocket, Publication: publication, CredentialIDs: credentialIDs}}
 			}
 			backend.resources[id] = &playwrightFixtureResource{id: id, name: name, kind: kind, configuration: configuration, lastOperation: domain.OperationResourceCreate, jobID: jobID}
 			backend.recordJobLocked(jobID, string(domain.OperationResourceCreate), "installation", jobs.ResultSucceeded, "")
-			return application.HelperReply{Digest: fixtureDigest(id), Resource: &helperproto.ResourceResult{ResourceID: id, JobID: fixtureJobID("create-" + id), JobResult: "succeeded"}}, nil
+			result := &helperproto.ResourceResult{ResourceID: id, JobID: fixtureJobID("create-" + id), JobResult: "succeeded"}
+			if operation == helperproto.OperationResourceMutationSecret {
+				result.CredentialID = "cred_00000000000000000000000000000001"
+				result.CredentialFingerprint = fixtureDigest("basic")
+				return application.HelperReply{Digest: fixtureDigest(id), Resource: result, Secret: []byte("fixture-password")}, nil
+			}
+			return application.HelperReply{Digest: fixtureDigest(id), Resource: result}, nil
 		}
 		if payload.Update != nil {
 			id := strings.TrimPrefix(target, "resource/")

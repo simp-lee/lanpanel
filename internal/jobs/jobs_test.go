@@ -18,6 +18,22 @@ func TestSecretResultRejectsReplayableContent(t *testing.T) {
 	}
 }
 
+func TestResourceCreateAcceptsManagedBasicSecretResult(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	record, err := NewReserved(Spec{Operation: "resource_create", Target: "installation", ActorIdentity: "session"}, now, bytes.NewReader(bytes.Repeat([]byte{7}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err = Start(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := Finish(record, Completion{Result: ResultSucceeded, Postconditions: []Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: PostconditionVerified, Identity: "sha256:" + strings.Repeat("b", 64)}}, SecretResult: &SecretResult{Kind: "managed_basic", ObjectID: "cred_00000000000000000000000000000001", Fingerprint: "sha256:" + strings.Repeat("a", 64), DeliveryAttempted: true, Remedy: "rotate_again"}}, now.Add(time.Second))
+	if err != nil || finished.SecretResult == nil {
+		t.Fatalf("resource create secret result rejected: record=%#v err=%v", finished, err)
+	}
+}
+
 func TestPostconditionLogicalKeysAreUnique(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	newRunning := func(seed byte) Record {

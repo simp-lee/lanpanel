@@ -14,34 +14,36 @@ import (
 // resource. Resource and process identities, applied bundles, and lifecycle
 // state are deliberately not part of this request.
 type LocalResourceCreateRequest struct {
-	Name                string             `json:"name"`
-	EndpointKind        LocalEndpointKind  `json:"endpoint_kind"`
-	TCPAddress          string             `json:"tcp_address,omitempty"`
-	TCPPort             uint16             `json:"tcp_port,omitempty"`
-	ReadinessPath       string             `json:"readiness_path"`
-	AllowedHTTPStatuses []uint16           `json:"allowed_http_statuses"`
-	WebSocket           WebSocketReadiness `json:"websocket"`
-	Executable          string             `json:"executable"`
-	Arguments           []string           `json:"arguments"`
-	WorkingDirectory    string             `json:"working_directory"`
-	EnvironmentFile     string             `json:"environment_file,omitempty"`
-	WritePaths          []string           `json:"write_paths"`
-	Publication         AppPublication     `json:"publication"`
-	CredentialIDs       []string           `json:"credential_ids,omitempty"`
+	Name                 string             `json:"name"`
+	EndpointKind         LocalEndpointKind  `json:"endpoint_kind"`
+	TCPAddress           string             `json:"tcp_address,omitempty"`
+	TCPPort              uint16             `json:"tcp_port,omitempty"`
+	ReadinessPath        string             `json:"readiness_path"`
+	AllowedHTTPStatuses  []uint16           `json:"allowed_http_statuses"`
+	WebSocket            WebSocketReadiness `json:"websocket"`
+	Executable           string             `json:"executable"`
+	Arguments            []string           `json:"arguments"`
+	WorkingDirectory     string             `json:"working_directory"`
+	EnvironmentFile      string             `json:"environment_file,omitempty"`
+	WritePaths           []string           `json:"write_paths"`
+	Publication          AppPublication     `json:"publication"`
+	CredentialIDs        []string           `json:"credential_ids,omitempty"`
+	ManagedBasicUsername string             `json:"managed_basic_username,omitempty"`
 }
 
 // TailnetResourceCreateRequest is a fixed remote upstream declaration. It
 // contains no local process or remote-control fields.
 type TailnetResourceCreateRequest struct {
-	Name                string             `json:"name"`
-	PeerIP              string             `json:"peer_ip"`
-	SourceIP            string             `json:"source_ip"`
-	Port                uint16             `json:"port"`
-	ReadinessPath       string             `json:"readiness_path"`
-	AllowedHTTPStatuses []uint16           `json:"allowed_http_statuses"`
-	WebSocket           WebSocketReadiness `json:"websocket"`
-	Publication         AppPublication     `json:"publication"`
-	CredentialIDs       []string           `json:"credential_ids,omitempty"`
+	Name                 string             `json:"name"`
+	PeerIP               string             `json:"peer_ip"`
+	SourceIP             string             `json:"source_ip"`
+	Port                 uint16             `json:"port"`
+	ReadinessPath        string             `json:"readiness_path"`
+	AllowedHTTPStatuses  []uint16           `json:"allowed_http_statuses"`
+	WebSocket            WebSocketReadiness `json:"websocket"`
+	Publication          AppPublication     `json:"publication"`
+	CredentialIDs        []string           `json:"credential_ids,omitempty"`
+	ManagedBasicUsername string             `json:"managed_basic_username,omitempty"`
 }
 
 const DomainPublicationUpdateSchema = "lanpanel.domain-publication.update.v1"
@@ -113,12 +115,12 @@ func ValidateResourceCreateRequest(value ResourceCreateRequest) error {
 		if value.Local == nil || value.Tailnet != nil {
 			return fmt.Errorf("local resource request must contain only local")
 		}
-		return validateLocalRequest(value.Local.Name, value.Local.EndpointKind, value.Local.TCPAddress, value.Local.TCPPort, value.Local.ReadinessPath, value.Local.AllowedHTTPStatuses, value.Local.WebSocket, value.Local.Executable, value.Local.Arguments, value.Local.WorkingDirectory, value.Local.EnvironmentFile, value.Local.WritePaths, value.Local.Publication, value.Local.CredentialIDs)
+		return validateLocalRequest(value.Local.Name, value.Local.EndpointKind, value.Local.TCPAddress, value.Local.TCPPort, value.Local.ReadinessPath, value.Local.AllowedHTTPStatuses, value.Local.WebSocket, value.Local.Executable, value.Local.Arguments, value.Local.WorkingDirectory, value.Local.EnvironmentFile, value.Local.WritePaths, value.Local.Publication, value.Local.CredentialIDs, value.Local.ManagedBasicUsername, true)
 	case AppTargetTailnetHTTP:
 		if value.Tailnet == nil || value.Local != nil {
 			return fmt.Errorf("tailnet resource request must contain only tailnet")
 		}
-		return validateTailnetRequest(value.Tailnet.Name, value.Tailnet.PeerIP, value.Tailnet.SourceIP, value.Tailnet.Port, value.Tailnet.ReadinessPath, value.Tailnet.AllowedHTTPStatuses, value.Tailnet.WebSocket, value.Tailnet.Publication, value.Tailnet.CredentialIDs)
+		return validateTailnetRequest(value.Tailnet.Name, value.Tailnet.PeerIP, value.Tailnet.SourceIP, value.Tailnet.Port, value.Tailnet.ReadinessPath, value.Tailnet.AllowedHTTPStatuses, value.Tailnet.WebSocket, value.Tailnet.Publication, value.Tailnet.CredentialIDs, value.Tailnet.ManagedBasicUsername, true)
 	default:
 		return fmt.Errorf("resource request target kind %q is unsupported", value.TargetKind)
 	}
@@ -130,18 +132,18 @@ func ValidateResourceUpdateRequest(value ResourceUpdateRequest) error {
 		if value.Local == nil || value.Tailnet != nil {
 			return fmt.Errorf("local resource update must contain only local")
 		}
-		return validateLocalRequest(value.Local.Name, value.Local.EndpointKind, value.Local.TCPAddress, value.Local.TCPPort, value.Local.ReadinessPath, value.Local.AllowedHTTPStatuses, value.Local.WebSocket, value.Local.Executable, value.Local.Arguments, value.Local.WorkingDirectory, value.Local.EnvironmentFile, value.Local.WritePaths, value.Local.Publication, value.Local.CredentialIDs)
+		return validateLocalRequest(value.Local.Name, value.Local.EndpointKind, value.Local.TCPAddress, value.Local.TCPPort, value.Local.ReadinessPath, value.Local.AllowedHTTPStatuses, value.Local.WebSocket, value.Local.Executable, value.Local.Arguments, value.Local.WorkingDirectory, value.Local.EnvironmentFile, value.Local.WritePaths, value.Local.Publication, value.Local.CredentialIDs, "", false)
 	case AppTargetTailnetHTTP:
 		if value.Tailnet == nil || value.Local != nil {
 			return fmt.Errorf("tailnet resource update must contain only tailnet")
 		}
-		return validateTailnetRequest(value.Tailnet.Name, value.Tailnet.PeerIP, value.Tailnet.SourceIP, value.Tailnet.Port, value.Tailnet.ReadinessPath, value.Tailnet.AllowedHTTPStatuses, value.Tailnet.WebSocket, value.Tailnet.Publication, value.Tailnet.CredentialIDs)
+		return validateTailnetRequest(value.Tailnet.Name, value.Tailnet.PeerIP, value.Tailnet.SourceIP, value.Tailnet.Port, value.Tailnet.ReadinessPath, value.Tailnet.AllowedHTTPStatuses, value.Tailnet.WebSocket, value.Tailnet.Publication, value.Tailnet.CredentialIDs, "", false)
 	default:
 		return fmt.Errorf("resource update target kind %q is unsupported", value.TargetKind)
 	}
 }
 
-func validateLocalRequest(name string, endpoint LocalEndpointKind, address string, port uint16, readiness string, statuses []uint16, websocket WebSocketReadiness, executable string, arguments []string, workingDirectory string, environmentFile string, writePaths []string, publication AppPublication, credentialIDs []string) error {
+func validateLocalRequest(name string, endpoint LocalEndpointKind, address string, port uint16, readiness string, statuses []uint16, websocket WebSocketReadiness, executable string, arguments []string, workingDirectory string, environmentFile string, writePaths []string, publication AppPublication, credentialIDs []string, managedBasicUsername string, creating bool) error {
 	if err := validateDisplayName(name); err != nil {
 		return fmt.Errorf("name: %w", err)
 	}
@@ -152,23 +154,37 @@ func validateLocalRequest(name string, endpoint LocalEndpointKind, address strin
 	if err := validateManagedService(service); err != nil {
 		return fmt.Errorf("service: %w", err)
 	}
-	if err := validatePublication(publication); err != nil {
+	if err := validateCreatePublication(publication, managedBasicUsername, creating); err != nil {
 		return err
 	}
 	return validateRequestCredentialIDs(credentialIDs)
 }
 
-func validateTailnetRequest(name, peerText, sourceText string, port uint16, readiness string, statuses []uint16, websocket WebSocketReadiness, publication AppPublication, credentialIDs []string) error {
+func validateTailnetRequest(name, peerText, sourceText string, port uint16, readiness string, statuses []uint16, websocket WebSocketReadiness, publication AppPublication, credentialIDs []string, managedBasicUsername string, creating bool) error {
 	if err := validateDisplayName(name); err != nil {
 		return fmt.Errorf("name: %w", err)
 	}
 	if err := validateTarget(AppTarget{Kind: AppTargetTailnetHTTP, ReadinessPath: readiness, AllowedHTTPStatuses: statuses, WebSocket: websocket, TailnetHTTP: &TailnetHTTPTarget{IP: peerText, SourceIP: sourceText, Port: port}}); err != nil {
 		return err
 	}
-	if err := validatePublication(publication); err != nil {
+	if err := validateCreatePublication(publication, managedBasicUsername, creating); err != nil {
 		return err
 	}
 	return validateRequestCredentialIDs(credentialIDs)
+}
+
+func validateCreatePublication(publication AppPublication, username string, creating bool) error {
+	if username == "" {
+		return validatePublication(publication)
+	}
+	if !creating || publication.Kind != PublicationDomainHTTPS || publication.DomainHTTPS == nil || publication.DomainHTTPS.AccessMode != AppAccessBasic || publication.DomainHTTPS.CredentialID != "" || !validBasicUsername(username) {
+		return fmt.Errorf("managed Basic username is only valid for a new basic domain publication")
+	}
+	candidate := publication
+	domainHTTPS := *publication.DomainHTTPS
+	domainHTTPS.CredentialID = "cred_00000000000000000000000000000000"
+	candidate.DomainHTTPS = &domainHTTPS
+	return validatePublication(candidate)
 }
 
 func validateRequestCredentialIDs(values []string) error {

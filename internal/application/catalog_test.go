@@ -60,6 +60,26 @@ func TestPublicationClientPropagatesPartialJobResult(t *testing.T) {
 	}
 }
 
+func TestPlanPreservesTypedHelperRejections(t *testing.T) {
+	expected := HelperRejection{Code: "certificate_preflight_failed", JobID: "job_" + strings.Repeat("a", 64)}
+	service, err := HelperService(func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {
+		return HelperReply{}, expected
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := domain.OperationTarget{Kind: domain.OperationTargetInstallation}
+	_, err = service.Invoke(context.Background(), Actor{Kind: ActorUI, Identity: "session", Generation: 1}, Call{
+		Operation: domain.OperationPlan,
+		Target:    installation,
+		Payload:   PlanPayload{Operation: domain.OperationAdminTokenRotate, Target: installation},
+	})
+	var rejection HelperRejection
+	if !errors.As(err, &rejection) || rejection.Code != expected.Code || rejection.JobID != expected.JobID {
+		t.Fatalf("Plan rejection was not preserved: %v", err)
+	}
+}
+
 func TestResourceActionPreservesTypedHelperRejections(t *testing.T) {
 	expected := HelperRejection{Code: "local_process_only", JobID: "job_" + strings.Repeat("a", 64)}
 	service, err := HelperServiceWithResources(func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {

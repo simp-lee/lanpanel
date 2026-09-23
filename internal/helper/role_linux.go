@@ -817,6 +817,17 @@ func RunRole(args []string) error {
 		if secret != nil || request.Resource == nil {
 			return ExecutionResult{}, fmt.Errorf("resource mutation carried secret or omitted payload")
 		}
+		managedBasicUsername := ""
+		if request.Resource.Create != nil {
+			if request.Resource.Create.Local != nil {
+				managedBasicUsername = request.Resource.Create.Local.ManagedBasicUsername
+			} else if request.Resource.Create.Tailnet != nil {
+				managedBasicUsername = request.Resource.Create.Tailnet.ManagedBasicUsername
+			}
+		}
+		if request.Operation == helperproto.OperationResourceMutationSecret && managedBasicUsername == "" || request.Operation == helperproto.OperationResourceMutation && managedBasicUsername != "" {
+			return ExecutionResult{}, fmt.Errorf("resource mutation Basic secret operation does not match payload")
+		}
 		actor := application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}
 		var candidate domain.AppResource
 		var execution *application.ResourceExecution
@@ -950,7 +961,11 @@ func RunRole(args []string) error {
 			}
 		}
 		if request.Resource.Operation == "resource_create" {
-			execution, err = application.BeginResourceCreate(ctx, actor, candidate)
+			if managedBasicUsername != "" {
+				execution, err = application.BeginResourceCreateWithManagedBasic(ctx, actor, candidate, managedBasicUsername)
+			} else {
+				execution, err = application.BeginResourceCreate(ctx, actor, candidate)
+			}
 		} else {
 			execution, err = application.BeginResourceUpdate(ctx, actor, candidate, secretDigests)
 		}
@@ -973,8 +988,24 @@ func RunRole(args []string) error {
 		if err != nil {
 			return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: execution.JobID}, err
 		}
-		return ExecutionResult{ResultDigest: digest, Resource: &helperproto.ResourceResult{ResourceID: candidate.ID, JobID: commit.ID, JobResult: string(commit.Result)}}, nil
+		result := &helperproto.ResourceResult{ResourceID: candidate.ID, JobID: commit.ID, JobResult: string(commit.Result)}
+		var outputSecret *helperproto.Secret
+		if managedBasicUsername != "" {
+			credentialID, password, ok := execution.ManagedBasicSecret()
+			if !ok {
+				return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: execution.JobID}, fmt.Errorf("managed Basic creation secret missing")
+			}
+			outputSecret, err = helperproto.NewOutputSecret(password)
+			clear(password)
+			if err != nil {
+				return ExecutionResult{ErrorCode: "execution_failed", ErrorJobID: execution.JobID}, err
+			}
+			result.CredentialID = credentialID
+			result.CredentialFingerprint = execution.ManagedBasic.Fingerprint
+		}
+		return ExecutionResult{ResultDigest: digest, Secret: outputSecret, Resource: result}, nil
 	})
+	resourceMutationSecretHandler := ResourceMutationSecretHandler(resourceMutationHandler.handler.revalidate, resourceMutationHandler.handler.execute)
 	processHandler := ProcessLifecycleHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
 		if caller != helperproto.CallerUI || request.Resource == nil || request.Action != nil || !strings.HasPrefix(request.Target, "resource/") {
 			return fmt.Errorf("process lifecycle caller is unauthorized")
@@ -1372,7 +1403,7 @@ func RunRole(args []string) error {
 		}
 		return fmt.Errorf("startup recovery is incomplete")
 	}
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, headscaleReadHandler, headscaleMutationHandler, preauthPlanHandler, preauthCreateHandler, connectorMutationHandler, connectorReadHandler, connectorPlanHandler, connectorLoginHandler, resourceDeleteHandler, productReadHandler, resourceMutationHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, headscaleDeployHandler, headscaleReissueHandler, renewalHandler, profileHandler}, Options{MutationGate: mutationGate})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, headscaleReadHandler, headscaleMutationHandler, preauthPlanHandler, preauthCreateHandler, connectorMutationHandler, connectorReadHandler, connectorPlanHandler, connectorLoginHandler, resourceDeleteHandler, productReadHandler, resourceMutationHandler, resourceMutationSecretHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, headscaleDeployHandler, headscaleReissueHandler, renewalHandler, profileHandler}, Options{MutationGate: mutationGate})
 	if err != nil {
 		return err
 	}

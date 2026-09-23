@@ -53,8 +53,9 @@ type DiagnosticIssue struct {
 	Guidance       string `json:"guidance"`
 }
 type DiagnosticsResult struct {
-	ObservedAt time.Time         `json:"observed_at"`
-	Issues     []DiagnosticIssue `json:"issues"`
+	ObservedAt   time.Time         `json:"observed_at"`
+	SystemStatus SystemStatus      `json:"system_status"`
+	Issues       []DiagnosticIssue `json:"issues"`
 }
 type ConfigurationExport struct {
 	SchemaVersion string              `json:"schema_version"`
@@ -358,7 +359,7 @@ func ReadDiagnostics(ctx context.Context) (DiagnosticsResult, error) {
 		observation.Resources = append(observation.Resources, manageddiagnostics.ResourceObservation{ResourceID: resource.ResourceID, Status: resource.ObservedStatus, Reason: resource.Reason})
 	}
 	issues := manageddiagnostics.Build(observation)
-	result := DiagnosticsResult{ObservedAt: status.ObservedAt, Issues: make([]DiagnosticIssue, len(issues))}
+	result := DiagnosticsResult{ObservedAt: status.ObservedAt, SystemStatus: status, Issues: make([]DiagnosticIssue, len(issues))}
 	for index, issue := range issues {
 		result.Issues[index] = DiagnosticIssue{Code: issue.Code, Responsibility: issue.Responsibility, Summary: issue.Summary, Guidance: issue.Guidance}
 	}

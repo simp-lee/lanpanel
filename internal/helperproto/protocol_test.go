@@ -175,6 +175,16 @@ func TestHeadscaleDeployAndReissueTerminalResponses(t *testing.T) {
 	}
 }
 
+func TestManagedBasicResourceCreateResponseCarriesTypedCredentialIdentity(t *testing.T) {
+	response := Response{SchemaVersion: SchemaVersion, RequestID: "resource-create-secret", Code: ResponseSucceeded, ResultDigest: digest("resource"), Resource: &ResourceResult{ResourceID: "res_00000000000000000000000000000001", JobID: "job_" + strings.Repeat("0", 63) + "1", JobResult: "succeeded", CredentialID: "cred_00000000000000000000000000000001", CredentialFingerprint: digest("credential")}}
+	if err := ValidateResponse(OperationResourceMutationSecret, response); err != nil {
+		t.Fatal(err)
+	}
+	if ValidateResponse(OperationResourceMutation, response) == nil {
+		t.Fatal("ordinary resource mutation accepted credential identity")
+	}
+}
+
 func TestDomainStatusRequestAndResponseAreTyped(t *testing.T) {
 	now := time.Now().UTC()
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "domain-status", Operation: OperationDomainStatus, Target: "resource/res_00000000000000000000000000000001", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{Operation: "status", TargetKind: "resource", TargetID: "res_00000000000000000000000000000001", ActorIdentity: "session-one", ActorGeneration: 1}}
@@ -358,7 +368,7 @@ func TestFinalCallerOperationMatrixIsClosed(t *testing.T) {
 		"admin_token_rotate", "admin_token_rotate_reconcile", "certificate_renew", "managed_basic_generate",
 		"managed_basic_delete", "static_root_register", "external_htpasswd_register", "domain_status",
 		"contraction_close", "startup_contraction", "headscale_initialize", "headscale_deploy",
-		"headscale_reissue", "headscale_read", "headscale_mutation", "preauth_key_plan", "preauth_key_create", "connector_mutation", "connector_read", "connector_login_plan", "connector_login", "product_read", "resource_delete", "resource_mutation", "process_lifecycle", "publication_activate",
+		"headscale_reissue", "headscale_read", "headscale_mutation", "preauth_key_plan", "preauth_key_create", "connector_mutation", "connector_read", "connector_login_plan", "connector_login", "product_read", "resource_delete", "resource_mutation", "resource_mutation_secret", "process_lifecycle", "publication_activate",
 	}
 	if len(policies) != len(expected) {
 		t.Fatalf("final helper operations=%d, want %d", len(policies), len(expected))

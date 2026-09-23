@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"lanpanel/internal/basic"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
+	"lanpanel/internal/htpasswdref"
 	"lanpanel/internal/identity"
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
@@ -190,12 +192,14 @@ func removeJournal(path string) error {
 }
 
 type ResourceCreateJournal struct {
-	SchemaVersion   string             `json:"schema_version"`
-	JobID           string             `json:"job_id"`
-	ResourceID      string             `json:"resource_id"`
-	Resource        domain.AppResource `json:"resource"`
-	Phase           string             `json:"phase"`
-	OwnershipDigest string             `json:"ownership_digest,omitempty"`
+	SchemaVersion          string             `json:"schema_version"`
+	JobID                  string             `json:"job_id"`
+	ResourceID             string             `json:"resource_id"`
+	Resource               domain.AppResource `json:"resource"`
+	Phase                  string             `json:"phase"`
+	OwnershipDigest        string             `json:"ownership_digest,omitempty"`
+	ManagedBasic           *domain.Credential `json:"managed_basic,omitempty"`
+	ManagedBasicFileStored bool               `json:"managed_basic_file_stored,omitempty"`
 }
 
 const (
@@ -244,6 +248,13 @@ func validateResourceCreateJournal(value ResourceCreateJournal) error {
 	}
 	if value.Phase == "prepared" && value.OwnershipDigest != "" || value.Phase != "prepared" && !validCreateDigest(value.OwnershipDigest) {
 		return fmt.Errorf("resource create journal ownership binding is invalid")
+	}
+	if value.ManagedBasic != nil {
+		credential := value.ManagedBasic
+		publication := value.Resource.Publication.DomainHTTPS
+		if credential.Kind != "managed_basic" || credential.OwnerResourceID != value.ResourceID || publication == nil || publication.AccessMode != domain.AppAccessBasic || publication.CredentialID != credential.ID || !slices.Contains(value.Resource.CredentialIDs, credential.ID) || credential.ManagedPath != basic.Path(credential.ID) || credential.ExternalPath != "" || !validCreateDigest(credential.Fingerprint) {
+			return fmt.Errorf("resource create journal managed Basic authority is invalid")
+		}
 	}
 	return nil
 }
@@ -769,6 +780,9 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 		if journal.Phase != "prepared" || safetyResource != nil || normalResource != nil {
 			return fmt.Errorf("resource create journal %s has contradictory residual authority", journal.ResourceID)
 		}
+		if err := removeManagedBasicFile(ctx, journal); err != nil {
+			return err
+		}
 		if intent.Phase == operations.PhaseTerminal {
 			if !exactNoEffectResourceCreate(job, journal) {
 				return fmt.Errorf("resource create no-effect result is inconsistent")
@@ -792,6 +806,9 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 	}
 	if !exactCreateOwnership(owned, journal.Resource) {
 		return fmt.Errorf("resource create ownership authority differs from journal")
+	}
+	if err := verifyManagedBasicFile(journal); err != nil {
+		return err
 	}
 	switch journal.Phase {
 	case "prepared":
@@ -841,7 +858,7 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 		if err != nil {
 			return err
 		}
-		if err := admitter.CommitResourceCreate(ctx, mutation, exposure, document.Revision, journal.JobID, operations.ResourceCreateCommit{Resource: journal.Resource}); err != nil {
+		if err := admitter.CommitResourceCreate(ctx, mutation, exposure, document.Revision, journal.JobID, operations.ResourceCreateCommit{Resource: journal.Resource, Credential: journal.ManagedBasic}); err != nil {
 			return err
 		}
 		document, err = service.normal.Read()
@@ -868,8 +885,15 @@ func reconcileResourceCreateWithRuntime(ctx context.Context, path string, runtim
 	if err != nil {
 		return err
 	}
-	if _, err := admitter.Complete(ctx, mutation, exposure, document.Revision, journal.JobID, "complete", nil, []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: journal.Resource.CurrentConfigDigest}}, ""); err != nil {
-		return err
+	postconditions := []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: journal.Resource.CurrentConfigDigest}}
+	var completionErr error
+	if journal.ManagedBasic != nil {
+		_, completionErr = admitter.CompleteWithSecret(ctx, mutation, exposure, document.Revision, journal.JobID, "complete", []string{journal.ManagedBasic.ManagedPath}, postconditions, "", &jobs.SecretResult{Kind: "managed_basic", ObjectID: journal.ManagedBasic.ID, Fingerprint: journal.ManagedBasic.Fingerprint, DeliveryAttempted: true, Remedy: "rotate_again"})
+	} else {
+		_, completionErr = admitter.Complete(ctx, mutation, exposure, document.Revision, journal.JobID, "complete", nil, postconditions, "")
+	}
+	if completionErr != nil {
+		return completionErr
 	}
 	removeJournal = true
 	return nil
@@ -921,7 +945,59 @@ func initialResourceSafety(resourceID, ownershipDigest string) safety.ResourceSa
 	return safety.ResourceSafety{ResourceID: resourceID, GenerationSequence: 1, State: safety.ResourceActive, Ownership: safety.OwnershipOwned, OwnershipDigest: ownershipDigest, StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 1, Reason: "initial"}}
 }
 
+func removeManagedBasicFile(ctx context.Context, journal ResourceCreateJournal) error {
+	if journal.ManagedBasic == nil {
+		return nil
+	}
+	if _, err := os.Lstat(journal.ManagedBasic.ManagedPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	gid, err := nginxGroupGID()
+	if err != nil {
+		return err
+	}
+	return basic.Delete(ctx, journal.ManagedBasic.ID, gid)
+}
+
+func verifyManagedBasicFile(journal ResourceCreateJournal) error {
+	if journal.ManagedBasic == nil {
+		return nil
+	}
+	gid, err := nginxGroupGID()
+	if err != nil {
+		return err
+	}
+	observed, validateErr := htpasswdref.Validate(journal.ManagedBasic.ManagedPath, gid)
+	if validateErr != nil || observed.Fingerprint != journal.ManagedBasic.Fingerprint {
+		return errors.Join(validateErr, fmt.Errorf("managed Basic file authority differs from resource create journal"))
+	}
+	return nil
+}
+
 func validateRecoveryResourceCreate(installation domain.Installation, journal ResourceCreateJournal) error {
+	if existing := findNormalResource(installation, journal.ResourceID); existing != nil {
+		if journal.ManagedBasic != nil {
+			found := false
+			for _, credential := range installation.Credentials {
+				if credential.ID == journal.ManagedBasic.ID {
+					if credential != *journal.ManagedBasic {
+						return fmt.Errorf("resource create journal managed Basic credential changed")
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("resource create journal managed Basic credential is missing")
+			}
+		}
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return fmt.Errorf("resource create recovery installation authority is invalid: %w", err)
+		}
+		return nil
+	}
 	base := installation
 	base.Resources = make([]domain.AppResource, 0, len(installation.Resources))
 	for _, existing := range installation.Resources {
@@ -929,7 +1005,22 @@ func validateRecoveryResourceCreate(installation domain.Installation, journal Re
 			base.Resources = append(base.Resources, existing)
 		}
 	}
-	if err := resource.ValidateCreate(base, journal.Resource); err != nil {
+	if journal.ManagedBasic != nil {
+		base.Credentials = make([]domain.Credential, 0, len(installation.Credentials))
+		for _, existing := range installation.Credentials {
+			if existing.ID == journal.ManagedBasic.ID {
+				if existing != *journal.ManagedBasic {
+					return fmt.Errorf("resource create journal managed Basic credential changed")
+				}
+				continue
+			}
+			base.Credentials = append(base.Credentials, existing)
+		}
+
+		if err := resource.ValidateCreateWithCredential(base, journal.Resource, *journal.ManagedBasic); err != nil {
+			return fmt.Errorf("resource create journal authority is invalid: %w", err)
+		}
+	} else if err := resource.ValidateCreate(base, journal.Resource); err != nil {
 		return fmt.Errorf("resource create journal authority is invalid: %w", err)
 	}
 	return nil
@@ -995,15 +1086,25 @@ func rejectReservedMutation(ctx context.Context, service *FixedService, admitter
 }
 
 type ResourceExecution struct {
-	Service     *FixedService
-	Admitter    *operations.Admitter
-	MutationSet *operations.MutationSet
-	Mutation    *operations.MutationLease
-	Exposure    *locks.Lease
-	JobID       string
-	Revision    uint64
-	Resource    domain.AppResource
-	Prior       *domain.AppResource
+	Service              *FixedService
+	Admitter             *operations.Admitter
+	MutationSet          *operations.MutationSet
+	Mutation             *operations.MutationLease
+	Exposure             *locks.Lease
+	JobID                string
+	Revision             uint64
+	Resource             domain.AppResource
+	Prior                *domain.AppResource
+	ManagedBasic         *domain.Credential
+	ManagedBasicRecord   []byte
+	ManagedBasicPassword []byte
+}
+
+func (execution *ResourceExecution) ManagedBasicSecret() (string, []byte, bool) {
+	if execution == nil || execution.ManagedBasic == nil || len(execution.ManagedBasicPassword) == 0 {
+		return "", nil, false
+	}
+	return execution.ManagedBasic.ID, append([]byte(nil), execution.ManagedBasicPassword...), true
 }
 
 func (s *FixedService) resourceAdmitter() (*operations.Admitter, error) {
@@ -1070,6 +1171,23 @@ func RejectResourceMutation(ctx context.Context, actor Actor, operation operatio
 }
 
 func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppResource) (*ResourceExecution, error) {
+	return beginResourceCreate(ctx, actor, candidate, "")
+}
+
+func BeginResourceCreateWithManagedBasic(ctx context.Context, actor Actor, candidate domain.AppResource, username string) (*ResourceExecution, error) {
+	return beginResourceCreate(ctx, actor, candidate, username)
+}
+
+func beginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppResource, username string) (*ResourceExecution, error) {
+	var managedBasic *domain.Credential
+	var managedBasicRecord, managedBasicPassword []byte
+	keepManagedBasic := false
+	defer func() {
+		if !keepManagedBasic {
+			clear(managedBasicRecord)
+			clear(managedBasicPassword)
+		}
+	}()
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err
@@ -1104,7 +1222,23 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return fail(err)
 	}
-	if err := resource.ValidateCreate(installation, candidate); err != nil {
+	if username != "" {
+		if candidate.Publication.DomainHTTPS == nil || candidate.Publication.DomainHTTPS.AccessMode != domain.AppAccessBasic || candidate.Publication.DomainHTTPS.CredentialID == "" || !slices.Contains(candidate.CredentialIDs, candidate.Publication.DomainHTTPS.CredentialID) {
+			return fail(fmt.Errorf("managed Basic create authority does not match resource"))
+		}
+		generated, generateErr := basic.Generate(username)
+		if generateErr != nil {
+			return fail(generateErr)
+		}
+		managedBasicPassword = generated.Password
+		managedBasicRecord = generated.Record
+		managedBasic = &domain.Credential{ID: candidate.Publication.DomainHTTPS.CredentialID, Kind: "managed_basic", OwnerResourceID: candidate.ID, Username: username, ManagedPath: basic.Path(candidate.Publication.DomainHTTPS.CredentialID), Fingerprint: generated.Fingerprint}
+	}
+	if managedBasic != nil {
+		if err := resource.ValidateCreateWithCredential(installation, candidate, *managedBasic); err != nil {
+			return fail(err)
+		}
+	} else if err := resource.ValidateCreate(installation, candidate); err != nil {
 		return fail(err)
 	}
 	if candidate.ManagedProcess != nil {
@@ -1123,11 +1257,20 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 	if err != nil {
 		return fail(err)
 	}
+	operationBinding := ""
+	safetyBinding := operations.SafetyBinding{ResourceID: candidate.ID}
+	if managedBasic != nil {
+		operationBinding, err = managedBasicCredentialBinding(*managedBasic)
+		if err != nil {
+			return fail(err)
+		}
+		safetyBinding.CandidateDigest = candidate.CurrentConfigDigest
+	}
 	admission, err := service.Manager().Acquire(ctx, locks.MutationAdmission)
 	if err != nil {
 		return fail(err)
 	}
-	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceCreate, Target: "installation", ActorIdentity: authority, Source: operations.AdmissionUI, SafetyBinding: operations.SafetyBinding{ResourceID: candidate.ID}, ExpectedRevision: document.Revision})
+	job, err := admitter.Admit(ctx, admission, operations.AdmitRequest{Operation: operations.ResourceCreate, Target: "installation", ActorIdentity: authority, OperationBinding: operationBinding, Source: operations.AdmissionUI, SafetyBinding: safetyBinding, ExpectedRevision: document.Revision})
 	if job.ID != "" {
 		admittedJobID = job.ID
 	}
@@ -1158,7 +1301,8 @@ func BeginResourceCreate(ctx context.Context, actor Actor, candidate domain.AppR
 		return fail(err)
 	}
 	reservationActive = false
-	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate}, nil
+	keepManagedBasic = true
+	return &ResourceExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, JobID: job.ID, Revision: intent.IntentGeneration, Resource: candidate, ManagedBasic: managedBasic, ManagedBasicRecord: managedBasicRecord, ManagedBasicPassword: managedBasicPassword}, nil
 }
 
 func publicationOnlyResourceUpdate(prior, candidate domain.AppResource) bool {
@@ -1348,9 +1492,23 @@ func (execution *ResourceExecution) CommitCreate(ctx context.Context) (jobs.Reco
 	if err := execution.Admitter.ValidateActive(ctx, execution.Mutation, execution.Exposure, execution.JobID); err != nil {
 		return jobs.Record{}, err
 	}
-	journal := ResourceCreateJournal{SchemaVersion: resourceCreateJournalSchema, JobID: execution.JobID, ResourceID: execution.Resource.ID, Resource: execution.Resource, Phase: "prepared"}
+	journal := ResourceCreateJournal{SchemaVersion: resourceCreateJournalSchema, JobID: execution.JobID, ResourceID: execution.Resource.ID, Resource: execution.Resource, Phase: "prepared", ManagedBasic: execution.ManagedBasic}
 	if err := writeCreateJournal(ctx, journal); err != nil {
 		return jobs.Record{}, err
+	}
+	if execution.ManagedBasic != nil {
+		gid, gidErr := nginxGroupGID()
+		if gidErr != nil {
+			return jobs.Record{}, gidErr
+		}
+		stored, storeErr := basic.Store(ctx, execution.ManagedBasic.ID, execution.ManagedBasicRecord, gid)
+		if storeErr != nil || stored != execution.ManagedBasic.ManagedPath {
+			return jobs.Record{}, fmt.Errorf("managed Basic path changed: %w", storeErr)
+		}
+		journal.ManagedBasicFileStored = true
+		if err := writeCreateJournal(ctx, journal); err != nil {
+			return jobs.Record{}, err
+		}
 	}
 	paths, err := resource.DerivePaths(execution.Resource.ID)
 	if err != nil {
@@ -1383,19 +1541,25 @@ func (execution *ResourceExecution) CommitCreate(ctx context.Context) (jobs.Reco
 	if err := writeCreateJournal(ctx, journal); err != nil {
 		return jobs.Record{}, err
 	}
-	if err := execution.Admitter.CommitResourceCreate(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.ResourceCreateCommit{Resource: execution.Resource}); err != nil {
+	if err := execution.Admitter.CommitResourceCreate(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, operations.ResourceCreateCommit{Resource: execution.Resource, Credential: execution.ManagedBasic}); err != nil {
 		return jobs.Record{}, err
 	}
 	execution.Revision++
-	job, err := execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", nil, []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: execution.Resource.CurrentConfigDigest}}, "")
-	closeErr := execution.Close()
-	if err == nil && closeErr == nil {
+	postconditions := []jobs.Postcondition{{Kind: "resource_persisted_unpublished_stopped", Status: jobs.PostconditionVerified, Identity: execution.Resource.CurrentConfigDigest}}
+	var job jobs.Record
+	if execution.ManagedBasic != nil {
+		job, err = execution.Admitter.CompleteWithSecret(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", []string{execution.ManagedBasic.ManagedPath}, postconditions, "", &jobs.SecretResult{Kind: "managed_basic", ObjectID: execution.ManagedBasic.ID, Fingerprint: execution.ManagedBasic.Fingerprint, DeliveryAttempted: true, Remedy: "rotate_again"})
+	} else {
+		job, err = execution.Admitter.Complete(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "complete", nil, postconditions, "")
+	}
+	releaseErr := execution.closeResources()
+	if err == nil && releaseErr == nil {
 		err = removeCreateJournal(resourceCreateJournalPath(execution.Resource.ID))
 	}
-	return job, errors.Join(err, closeErr)
+	return job, errors.Join(err, releaseErr)
 }
 
-func (execution *ResourceExecution) Close() error {
+func (execution *ResourceExecution) closeResources() error {
 	if execution == nil {
 		return nil
 	}
@@ -1408,6 +1572,18 @@ func (execution *ResourceExecution) Close() error {
 	}
 	execution.Mutation = nil
 	execution.Exposure = nil
+	return err
+}
+
+func (execution *ResourceExecution) Close() error {
+	if execution == nil {
+		return nil
+	}
+	err := execution.closeResources()
+	clear(execution.ManagedBasicRecord)
+	clear(execution.ManagedBasicPassword)
+	execution.ManagedBasicRecord = nil
+	execution.ManagedBasicPassword = nil
 	return err
 }
 
