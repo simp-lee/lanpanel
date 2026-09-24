@@ -119,6 +119,17 @@ func OpenEmergency(ctx context.Context) (*EmergencyService, error) {
 	return service, nil
 }
 
+func (service *EmergencyService) StartAllowed() (bool, error) {
+	if service == nil || service.closed || service.emergency == nil {
+		return false, fmt.Errorf("emergency contraction service is closed")
+	}
+	authority, err := service.emergency.Authority()
+	if err != nil {
+		return false, err
+	}
+	return authority.StopFence == nil && authority.GlobalClose.Phase == safety.GlobalCloseNone, nil
+}
+
 func (service *EmergencyService) Snapshot() (EmergencySnapshot, error) {
 	if service == nil || service.closed {
 		return EmergencySnapshot{}, fmt.Errorf("emergency contraction service is closed")

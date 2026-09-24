@@ -52,6 +52,11 @@ type RuntimeObserver interface {
 	Observe(context.Context) (RuntimeSnapshot, error)
 }
 
+var (
+	errKernelThread         = errors.New("kernel thread")
+	errInaccessibleNonNginx = errors.New("inaccessible non-Nginx process")
+)
+
 type ProcObserver struct {
 	ProcRoot       string
 	UnitCgroup     string
@@ -89,6 +94,9 @@ func (observer ProcObserver) Observe(ctx context.Context) (RuntimeSnapshot, erro
 		}
 		identity, err := observeProcess(observer.ProcRoot, pid)
 		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if errors.Is(err, errKernelThread) || errors.Is(err, errInaccessibleNonNginx) {
 			continue
 		}
 		if err != nil {
@@ -232,6 +240,17 @@ func observeProcess(procRoot string, pid int) (ProcessIdentity, error) {
 	}
 	executable, err := os.Readlink(filepath.Join(root, "exe"))
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) && processComm(stat) != "nginx" {
+			return ProcessIdentity{}, errInaccessibleNonNginx
+		}
+		status, statusErr := os.ReadFile(filepath.Join(root, "status"))
+		if statusErr == nil {
+			for _, line := range bytes.Split(status, []byte{'\n'}) {
+				if bytes.Equal(line, []byte("Kthread:\t1")) {
+					return ProcessIdentity{}, errKernelThread
+				}
+			}
+		}
 		return ProcessIdentity{}, err
 	}
 	commands, err := os.ReadFile(filepath.Join(root, "cmdline"))
@@ -254,6 +273,15 @@ func observeProcess(procRoot string, pid int) (ProcessIdentity, error) {
 		return ProcessIdentity{}, fmt.Errorf("process lacks exact unified cgroup")
 	}
 	return ProcessIdentity{PID: pid, ParentPID: parent, StartTicks: start, Executable: executable, Arguments: arguments, Cgroup: cgroup, State: state}, nil
+}
+
+func processComm(payload []byte) string {
+	opening := bytes.IndexByte(payload, '(')
+	closing := bytes.LastIndexByte(payload, ')')
+	if opening < 0 || closing <= opening {
+		return ""
+	}
+	return string(payload[opening+1 : closing])
 }
 
 func parseProcessStat(payload []byte) (int, string, uint64, error) {

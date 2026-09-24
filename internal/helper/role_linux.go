@@ -373,23 +373,13 @@ func RunRole(args []string) error {
 			return ExecutionResult{}, fmt.Errorf("startup contraction carried secret")
 		}
 		headscaleErr := application.ReconcileHeadscaleInitialization(ctx)
-		if headscaleErr == nil {
-			if normal, normalErr := application.OpenFixed(); normalErr == nil {
-				allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
-				recoveryErr := normal.PendingPublicationRecovery()
-				_ = normal.Close()
-				if guardErr == nil && recoveryErr == nil && allowed {
-					return ExecutionResult{ResultDigest: request.InputDigest}, nil
-				}
-			}
-		}
 		service, err := contraction.OpenEmergency(ctx)
 		if err != nil {
 			return ExecutionResult{}, err
 		}
-		defer func(ignore func() error) { _ = ignore() }(service.Close)
 		snapshot, err := service.Snapshot()
 		if err != nil {
+			_ = service.Close()
 			return ExecutionResult{}, err
 		}
 		if recoverErr := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); recoverErr == nil {
@@ -400,6 +390,33 @@ func RunRole(args []string) error {
 				return ExecutionResult{}, reconcileErr
 			}
 			return ExecutionResult{ResultDigest: snapshot.Inventory.Digest}, nil
+		}
+		startAllowed, authorityErr := service.StartAllowed()
+		if authorityErr != nil {
+			_ = service.Close()
+			return ExecutionResult{}, authorityErr
+		}
+		if closeErr := service.Close(); closeErr != nil {
+			return ExecutionResult{}, closeErr
+		}
+		if headscaleErr == nil && startAllowed {
+			if normal, normalErr := application.OpenFixed(); normalErr == nil {
+				allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+				recoveryErr := normal.PendingPublicationRecovery()
+				_ = normal.Close()
+				if guardErr == nil && recoveryErr == nil && allowed {
+					return ExecutionResult{ResultDigest: request.InputDigest}, nil
+				}
+			}
+		}
+		service, err = contraction.OpenEmergency(ctx)
+		if err != nil {
+			return ExecutionResult{}, err
+		}
+		defer func(ignore func() error) { _ = ignore() }(service.Close)
+		snapshot, err = service.Snapshot()
+		if err != nil {
+			return ExecutionResult{}, err
 		}
 		result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
 		if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
@@ -1421,15 +1438,40 @@ func RunRole(args []string) error {
 }
 
 func reconcileStartupContraction(ctx context.Context) error {
-	if normal, err := application.OpenFixed(); err == nil {
-		allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
-		publicationErr := normal.PendingPublicationRecovery()
-		_ = normal.Close()
-		if guardErr == nil && publicationErr == nil && allowed {
-			return nil
+	service, err := contraction.OpenEmergency(ctx)
+	if err != nil {
+		return err
+	}
+	snapshot, err := service.Snapshot()
+	if err != nil {
+		_ = service.Close()
+		return err
+	}
+	if err := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); err == nil {
+		if err := service.Close(); err != nil {
+			return err
+		}
+		return application.ReconcileTerminalNginxContraction(ctx)
+	}
+	startAllowed, err := service.StartAllowed()
+	if err != nil {
+		_ = service.Close()
+		return err
+	}
+	if err := service.Close(); err != nil {
+		return err
+	}
+	if startAllowed {
+		if normal, err := application.OpenFixed(); err == nil {
+			allowed, guardErr := normal.NginxStartAllowed(time.Now().UTC())
+			publicationErr := normal.PendingPublicationRecovery()
+			_ = normal.Close()
+			if guardErr == nil && publicationErr == nil && allowed {
+				return nil
+			}
 		}
 	}
-	service, err := contraction.OpenEmergency(ctx)
+	service, err = contraction.OpenEmergency(ctx)
 	if err != nil {
 		return err
 	}
@@ -1443,12 +1485,9 @@ func reconcileStartupContraction(ctx context.Context) error {
 		}
 		return application.ReconcileTerminalNginxContraction(ctx)
 	}
-	snapshot, err := service.Snapshot()
+	snapshot, err = service.Snapshot()
 	if err != nil {
 		return err
-	}
-	if err := service.RecoverClosed(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest); err == nil {
-		return reconcileOwnership(nil)
 	}
 	result, runErr := service.Run(ctx, snapshot.GlobalGeneration, snapshot.Inventory.Digest)
 	if result.Outcome == contraction.OutcomePartial || result.Outcome == contraction.OutcomeUnknown {
