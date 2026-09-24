@@ -597,6 +597,9 @@ func readLifecycleInstallation(paths Paths, authority locks.Authority) (domain.I
 		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := operations.Register(store); err != nil {
+		return domain.Installation{}, fmt.Errorf("uninstall lifecycle schema is unavailable: %w", err)
+	}
 	document, err := store.Read()
 	if err != nil {
 		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unreadable: %w", err)
