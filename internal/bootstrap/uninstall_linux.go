@@ -16,6 +16,7 @@ import (
 	"lanpanel/internal/identity"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/operations"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/process"
 	"lanpanel/internal/release"
@@ -379,6 +380,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		return fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	if err := operations.Register(store); err != nil {
+		return fmt.Errorf("uninstall lifecycle schema is unavailable: %w", err)
+	}
 	document, err := store.Read()
 	if err != nil {
 		return fmt.Errorf("uninstall lifecycle state is unreadable: %w", err)
