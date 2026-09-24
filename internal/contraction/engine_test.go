@@ -4,10 +4,33 @@ import (
 	"context"
 	"errors"
 	"lanpanel/internal/closure"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRemoveEmptyNginxTestPID(t *testing.T) {
+	path := t.TempDir() + "/nginx.pid"
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeEmptyNginxTestPID(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty test PID remains: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("123"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeEmptyNginxTestPID(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("non-empty PID was removed: %v", err)
+	}
+}
 
 type traceAuthority struct {
 	steps     []string

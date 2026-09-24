@@ -10,6 +10,7 @@ import (
 	"lanpanel/internal/closure"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
+	"os"
 	"time"
 )
 
@@ -114,7 +115,22 @@ func (host Host) TestClosedGraph(ctx context.Context) error {
 	if err := host.run(ctx, child.ProfileNginxDump); err != nil {
 		return err
 	}
-	return host.run(ctx, child.ProfileNginxTest)
+	testErr := host.run(ctx, child.ProfileNginxTest)
+	if cleanupErr := removeEmptyNginxTestPID(host.Paths.PIDPath); testErr != nil || cleanupErr != nil {
+		return errors.Join(testErr, cleanupErr)
+	}
+	return nil
+}
+
+func removeEmptyNginxTestPID(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		return err
+	}
+	return os.Remove(path)
 }
 
 func (host Host) ReloadAndDrain(ctx context.Context) error {

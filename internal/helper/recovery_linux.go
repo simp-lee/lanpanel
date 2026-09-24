@@ -44,7 +44,10 @@ func RunStartupRecovery(args []string) error {
 		return fmt.Errorf("startup recovery returned a secret")
 	}
 	if err != nil || response.RequestID != request.RequestID || response.Code != helperproto.ResponseSucceeded {
-		return fmt.Errorf("startup recovery was rejected: %w", err)
+		if err != nil {
+			return fmt.Errorf("startup recovery was rejected: %w", err)
+		}
+		return fmt.Errorf("startup recovery was rejected: response=%s error=%s", response.Code, response.ErrorCode)
 	}
 	return nil
 }
