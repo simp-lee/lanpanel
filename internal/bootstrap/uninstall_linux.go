@@ -469,7 +469,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		})
 	}
 	if paths == FixedPaths() {
-		if err := addList([]string{nginx.FixedPaths().AuditPath}, true); err != nil {
+		auditPath := nginx.FixedPaths().AuditPath
+		delete(inventory.Artifacts, auditPath)
+		if err := addList([]string{auditPath}, true); err != nil {
 			return err
 		}
 	}
