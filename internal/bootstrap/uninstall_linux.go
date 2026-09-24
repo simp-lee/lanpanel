@@ -688,6 +688,12 @@ func verifyUnmaskTargets(ctx context.Context, paths []string, artifacts map[stri
 			continue
 		}
 		fragment := strings.TrimSpace(string(output))
+		if fragment == filepath.Join("/run/systemd/system", base) {
+			target, linkErr := os.Readlink(fragment)
+			if linkErr == nil && target == "/dev/null" {
+				continue
+			}
+		}
 		if fragment != "" && !owned[fragment] {
 			return fmt.Errorf("uninstall cannot clear fence for foreign unit %s", base)
 		}
