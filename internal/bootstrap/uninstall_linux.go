@@ -881,10 +881,13 @@ func mutableCertificatePointer(path, target string, owned map[string]string) boo
 }
 
 func mutableEnablementTarget(path, target string, artifacts map[string]string) bool {
-	if target == "" || filepath.IsAbs(target) || filepath.Clean(target) != target || strings.Contains(target, "\\x00") {
+	if target == "" || filepath.Clean(target) != target || strings.Contains(target, "\\x00") {
 		return false
 	}
-	resolved := filepath.Clean(filepath.Join(filepath.Dir(path), target))
+	resolved := target
+	if !filepath.IsAbs(target) {
+		resolved = filepath.Clean(filepath.Join(filepath.Dir(path), target))
+	}
 	base := filepath.Base(path)
 	if filepath.Base(resolved) != base {
 		return false
