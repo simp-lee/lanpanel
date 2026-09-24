@@ -325,7 +325,20 @@ func validMasterArguments(actual, expected string) bool {
 	if actual == expected {
 		return true
 	}
-	return actual == "nginx: master process "+strings.ReplaceAll(expected, "\x00", " ")
+	title := "nginx: master process " + strings.ReplaceAll(expected, "\x00", " ")
+	if actual == title {
+		return true
+	}
+	const globalDirective = "daemon off;"
+	if !strings.HasSuffix(title, globalDirective) {
+		return false
+	}
+	prefix := strings.TrimSuffix(title, globalDirective)
+	if !strings.HasPrefix(actual, prefix) {
+		return false
+	}
+	truncated := strings.TrimPrefix(actual, prefix)
+	return truncated != "" && truncated != globalDirective && strings.HasPrefix(globalDirective, truncated)
 }
 
 func readMasterPID(path string) (int, error) {

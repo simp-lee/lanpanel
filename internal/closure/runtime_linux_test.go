@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,6 +176,24 @@ func TestProcessSocketInodesRejectsReusedPIDIdentity(t *testing.T) {
 	}
 	if inodes[91] {
 		t.Fatal("socket from a reused PID was attributed to the stale Nginx process")
+	}
+}
+
+func TestValidMasterArgumentsAcceptsUbuntuNginxTitleTruncation(t *testing.T) {
+	expected := "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;"
+	title := "nginx: master process " + strings.ReplaceAll(expected, "\x00", " ")
+	if !validMasterArguments(title, expected) {
+		t.Fatal("full Nginx process title was rejected")
+	}
+	truncated := strings.TrimSuffix(title, "on off;")
+	if !validMasterArguments(truncated, expected) {
+		t.Fatalf("truncated Nginx process title was rejected: %q", truncated)
+	}
+	if validMasterArguments(strings.TrimSuffix(title, " -g daemon off;")+" -g x", expected) {
+		t.Fatal("altered prefix before the fixed global directive was accepted")
+	}
+	if validMasterArguments(strings.TrimSuffix(title, ";")+"x", expected) {
+		t.Fatal("altered Nginx global directive was accepted")
 	}
 }
 
