@@ -162,14 +162,15 @@ func InitializeHeadscale(ctx context.Context, actor Actor, payload HeadscaleInit
 }
 
 type bootstrapCommitWire struct {
-	SchemaVersion   string    `json:"schema_version"`
-	AttemptID       string    `json:"attempt_id"`
-	InstallationID  string    `json:"installation_id"`
-	GenerationID    string    `json:"generation_id"`
-	JournalSequence uint64    `json:"journal_sequence"`
-	BundleDigest    string    `json:"bundle_digest"`
-	ArtifactDigest  string    `json:"artifact_inventory_digest"`
-	CommittedAt     time.Time `json:"committed_at"`
+	SchemaVersion            string    `json:"schema_version"`
+	AttemptID                string    `json:"attempt_id"`
+	InstallationID           string    `json:"installation_id"`
+	GenerationID             string    `json:"generation_id"`
+	JournalSequence          uint64    `json:"journal_sequence"`
+	BundleDigest             string    `json:"bundle_digest"`
+	ArtifactDigest           string    `json:"artifact_inventory_digest"`
+	OwnershipInventoryDigest string    `json:"ownership_inventory_digest"`
+	CommittedAt              time.Time `json:"committed_at"`
 }
 
 type installationBundleWire struct {
@@ -194,7 +195,7 @@ func sameHeadscalePreflightPolicy(left, right preflight.ExpansionRequest) bool {
 func readCommittedInstallationAuthority() (installationBundleWire, error) {
 	commitBytes, err := readProtectedBytes("/var/lib/lanpanel/bootstrap-commit.json", 0o644)
 	var commit bootstrapCommitWire
-	if err != nil || decodeProtectedCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != "lanpanel.bootstrap.commit.v1" || !identity.ValidateAttemptID(commit.AttemptID) || !identity.ValidateInstallationID(commit.InstallationID) || !identity.ValidateGenerationID(commit.GenerationID) || commit.JournalSequence == 0 || !release.ValidDigest(commit.BundleDigest) || !release.ValidDigest(commit.ArtifactDigest) || commit.CommittedAt.IsZero() {
+	if err != nil || decodeProtectedCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != "lanpanel.bootstrap.commit.v1" || !identity.ValidateAttemptID(commit.AttemptID) || !identity.ValidateInstallationID(commit.InstallationID) || !identity.ValidateGenerationID(commit.GenerationID) || commit.JournalSequence == 0 || !release.ValidDigest(commit.BundleDigest) || !release.ValidDigest(commit.ArtifactDigest) || !release.ValidDigest(commit.OwnershipInventoryDigest) || commit.CommittedAt.IsZero() {
 		return installationBundleWire{}, fmt.Errorf("bootstrap commit authority is unavailable")
 	}
 	bundleBytes, err := readProtectedBytes("/var/lib/lanpanel/installation/bundle.json", 0o600)
