@@ -459,7 +459,10 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 	case ProfileAPTDownload:
 		arguments = append(arguments, "--download-only")
 	case ProfileAPTSimulate:
-		arguments = append(arguments, "--simulate", "--no-download")
+		arguments = append(arguments, "--simulate")
+		if invocation.Package.Staged {
+			arguments = append(arguments, "--no-download")
+		}
 	case ProfileAPTOfflineTransaction:
 		arguments = append(arguments, "--no-download")
 	}

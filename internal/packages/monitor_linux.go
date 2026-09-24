@@ -114,7 +114,7 @@ func (monitor *LinuxMonitor) observe() (monitorObservation, error) {
 		return monitorObservation{}, fmt.Errorf("enumerate systemd package monitor cgroups: %w", err)
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || !unitPattern.MatchString(entry.Name()) {
 			continue
 		}
 		active, err := cgroupHasProcesses(filepath.Join(monitor.cgroupRoot, entry.Name(), "cgroup.procs"))

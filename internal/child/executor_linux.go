@@ -399,7 +399,12 @@ func applyProfile(profile Profile, hasInput bool) error {
 		}
 		limits[unix.RLIMIT_CPU] = unix.Rlimit{Cur: cpuSeconds, Max: cpuSeconds}
 		limits[unix.RLIMIT_FSIZE] = unix.Rlimit{Cur: maximumFileBytes, Max: maximumFileBytes}
-		limits[unix.RLIMIT_NOFILE] = unix.Rlimit{Cur: 32, Max: 32}
+		maximumOpenFiles := uint64(32)
+		switch profile.ID {
+		case ProfileAPTDownload, ProfileAPTSimulate, ProfileAPTTransaction, ProfileAPTOfflineTransaction:
+			maximumOpenFiles = 1024
+		}
+		limits[unix.RLIMIT_NOFILE] = unix.Rlimit{Cur: maximumOpenFiles, Max: maximumOpenFiles}
 		limits[unix.RLIMIT_NPROC] = unix.Rlimit{Cur: 32, Max: 32}
 	}
 	for resource, limit := range limits {

@@ -53,7 +53,7 @@ func renderArtifacts(journal Journal) (map[string][]byte, error) {
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-management.socket"): []byte("[Unit]\nDescription=LanPanel reserved Management authority\nBefore=lanpanel-ui.service\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\nListenStream=" + authority + "\nFileDescriptorName=lanpanel-management-" + socketGeneration + "\nSocketMode=0600\nRemoveOnStop=no\nService=lanpanel-ui.service\n\n[Install]\nWantedBy=sockets.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-ui.service"):        []byte(serviceUnit("LanPanel Management UI", accounts[identity.RoleUI], binary+" ui", "LANPANEL_SOCKET_GENERATION="+socketGeneration, "lanpanel-management.socket")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-runtime.service"):   []byte("[Unit]\nDescription=LanPanel volatile runtime directory\nBefore=lanpanel-helper.service lanpanel-management.socket\n\n[Service]\nType=oneshot\nExecStart=" + binary + " runtime-guard\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
-		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nKillMode=control-group\nDelegate=yes\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /var/log/lanpanel /run/lanpanel /run/lanpanel-goaccess /etc/lanpanel /etc/lanpanel-public /etc/systemd/system /etc/sysusers.d /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/.pwd.lock /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
+		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service"):    []byte("[Unit]\nDescription=LanPanel privileged helper\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=" + binary + " helper\nUser=root\nGroup=root\nKillMode=control-group\nDelegate=yes\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/var/lib/lanpanel /var/lib/lanpanel.bootstrap-journal /var/log/lanpanel /run/lanpanel /run/lanpanel-goaccess /etc/lanpanel /etc/lanpanel-public /etc/systemd/system /etc/sysusers.d /etc/passwd /etc/group /etc/shadow /etc/gshadow /etc/.pwd.lock /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr /opt /lib /lib64 /boot\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.service"):     []byte(serviceUnit("LanPanel timer dispatcher", accounts[identity.RoleTimer], binary+" timer", "", "")),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.timer"):       []byte("[Unit]\nDescription=LanPanel persistent timer\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=" + fixedTimerPeriod + "\nPersistent=true\nUnit=lanpanel-timer.service\n\n[Install]\nWantedBy=timers.target\n"),
 		filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service"):  []byte("[Unit]\nDescription=LanPanel startup contraction recovery\nConditionPathExists=" + journal.Paths.CommitPath + "\nAfter=local-fs.target lanpanel-helper.service\nRequires=lanpanel-helper.service\nBefore=lanpanel-nginx.service\n\n[Service]\nType=oneshot\nExecStart=" + binary + " startup-recovery\nUser=" + fmt.Sprint(accounts[identity.RoleRecovery].UID) + "\nGroup=" + fmt.Sprint(accounts[identity.RoleRecovery].GID) + "\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nProtectHome=yes\nRestrictSUIDSGID=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nUMask=0077\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n"),
@@ -95,7 +95,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	}
 	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 {
+	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 && !(path == "/var/log/lanpanel" && parentStat.Mode&0o002 == 0) {
 		return false, fmt.Errorf("bootstrap directory parent is unsafe for %q", path)
 	}
 	created := false
@@ -224,11 +224,22 @@ func putOrVerifyTargetFile(ctx context.Context, path string, data []byte, mode o
 	if err != nil {
 		return err
 	}
+	if filepath.Dir(path) == "/var/log/lanpanel" {
+		return putOrVerifyRootFileWithMode(ctx, "/var/log/lanpanel", 0o711, staging, path, data, mode)
+	}
 	return putOrVerifyRootFile(ctx, "/", staging, path, data, mode)
 }
 
 func putOrVerifyRootFile(ctx context.Context, root, staging, path string, data []byte, mode os.FileMode) error {
-	err := putRootFile(ctx, root, staging, path, data, mode, filetxn.CreateOnly)
+	rootMode := os.FileMode(0o700)
+	if root == "/" {
+		rootMode = 0o755
+	}
+	return putOrVerifyRootFileWithMode(ctx, root, rootMode, staging, path, data, mode)
+}
+
+func putOrVerifyRootFileWithMode(ctx context.Context, root string, rootMode os.FileMode, staging, path string, data []byte, mode os.FileMode) error {
+	err := putRootFileWithRootMode(ctx, root, rootMode, staging, path, data, mode, filetxn.CreateOnly)
 	if !errors.Is(err, os.ErrExist) {
 		return err
 	}
@@ -240,12 +251,20 @@ func putOrVerifyRootFile(ctx context.Context, root, staging, path string, data [
 }
 
 func putRootFile(ctx context.Context, root, staging, path string, data []byte, mode os.FileMode, disposition filetxn.Disposition) error {
-	owner := filetxn.Owner{UID: 0, GID: 0}
 	rootMode := os.FileMode(0o700)
 	if root == "/" {
 		rootMode = 0o755
 	}
-	store, err := filetxn.Open(filetxn.Config{RootPath: root, Root: filetxn.Metadata{Owner: owner, Mode: rootMode}, StagingPath: staging, Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}}, filetxn.Options{})
+	return putRootFileWithRootMode(ctx, root, rootMode, staging, path, data, mode, disposition)
+}
+
+func putRootFileWithRootMode(ctx context.Context, root string, rootMode os.FileMode, staging, path string, data []byte, mode os.FileMode, disposition filetxn.Disposition) error {
+	owner := filetxn.Owner{UID: 0, GID: 0}
+	parentsMode := os.FileMode(0o755)
+	if root != "/" {
+		parentsMode = rootMode
+	}
+	store, err := filetxn.Open(filetxn.Config{RootPath: root, Root: filetxn.Metadata{Owner: owner, Mode: rootMode}, StagingPath: staging, Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: parentsMode}}, filetxn.Options{})
 	if err != nil {
 		return err
 	}

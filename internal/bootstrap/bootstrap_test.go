@@ -24,6 +24,22 @@ import (
 	"time"
 )
 
+func TestFixedHelperServiceAllowsBootstrapJournalWrites(t *testing.T) {
+	journal := testJournal(t.TempDir())
+	journal.Accounts.Identities = make([]identity.AccountIdentity, len(journal.Accounts.Specs))
+	for index, spec := range journal.Accounts.Specs {
+		journal.Accounts.Identities[index] = identity.AccountIdentity{Role: spec.Role, User: spec.User, UID: uint32(10000 + index), Group: spec.Group, GID: uint32(11000 + index)}
+	}
+	artifacts, err := renderArtifacts(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service")])
+	if !strings.Contains(unit, "ReadWritePaths=/var/lib/lanpanel /var/lib/lanpanel.bootstrap-journal ") {
+		t.Fatalf("helper unit does not allow bootstrap journal writes: %s", unit)
+	}
+}
+
 func TestCommittedReleaseRejectsManagedACMEAccountKeyReplacement(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-owned installation authority test")

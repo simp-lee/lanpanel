@@ -769,6 +769,9 @@ func createBootstrapDirectories(journal Journal) error {
 		}
 	}
 	if journal.Paths == FixedPaths() {
+		if _, err := ensureDirectory("/etc/sysusers.d", owner, 0o755); err != nil {
+			return err
+		}
 		if _, err := ensureDirectory("/var/log/lanpanel/goaccess", owner, 0o711); err != nil {
 			return err
 		}
@@ -844,7 +847,13 @@ func installNginxBaseline(ctx context.Context, journal *Journal, strict bool) er
 		return err
 	}
 	for path, data := range baseline.Files {
-		if err := putOrVerifyTargetFile(ctx, path, data, 0o600); err != nil {
+		var err error
+		if filepath.Dir(path) == paths.ConfigRoot {
+			err = putOrVerifyRootFile(ctx, paths.ConfigRoot, paths.StagingPath(), path, data, 0o600)
+		} else {
+			err = putOrVerifyTargetFile(ctx, path, data, 0o600)
+		}
+		if err != nil {
 			return err
 		}
 		// Main and sanitizer are immutable release assets. The manifest and
@@ -922,6 +931,9 @@ func installVendorNginxMask(systemdRoot string) error {
 
 func rejectForeignNginxAuthority() error {
 	for _, path := range []string{"/etc/nginx/sites-enabled/default", "/etc/systemd/system/nginx.service.d", "/run/systemd/system.control/nginx.service", "/run/systemd/system.control/nginx.service.d", "/run/systemd/transient/nginx.service", "/run/systemd/transient/nginx.service.d", "/run/systemd/system.attached/nginx.service", "/run/systemd/system.attached/nginx.service.d", "/run/systemd/generator.early/nginx.service", "/run/systemd/generator.early/nginx.service.d", "/run/systemd/system/nginx.service", "/run/systemd/system/nginx.service.d", "/run/systemd/generator/nginx.service", "/run/systemd/generator/nginx.service.d", "/usr/local/lib/systemd/system/nginx.service", "/usr/local/lib/systemd/system/nginx.service.d", "/run/systemd/generator.late/nginx.service", "/run/systemd/generator.late/nginx.service.d"} {
+		if path == "/etc/nginx/sites-enabled/default" && canonicalNginxPackageSite(path) {
+			continue
+		}
 		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("foreign Nginx site or unit authority exists at %q", path)
 		}
@@ -941,12 +953,24 @@ func rejectForeignNginxAuthority() error {
 	return nil
 }
 
+func canonicalNginxPackageSite(path string) bool {
+	target, err := os.Readlink(path)
+	if err != nil || target != "/etc/nginx/sites-available/default" {
+		return false
+	}
+	info, err := os.Lstat(target)
+	return err == nil && info.Mode().IsRegular()
+}
+
 func writeHelperIdentities(ctx context.Context, journal Journal) error {
 	ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
 	timer, _ := identity.IdentityFor(journal.Accounts, identity.RoleTimer)
 	recovery, _ := identity.IdentityFor(journal.Accounts, identity.RoleRecovery)
-	payload := map[string]any{"schema_version": "lanpanel.helper.identities.v1", "socket_group": ui.GID, "identities": helper.IdentitySet{UI: helper.PeerIdentity{UID: ui.UID, GID: ui.GID}, Timer: helper.PeerIdentity{UID: timer.UID, GID: timer.GID}, Recovery: helper.PeerIdentity{UID: recovery.UID, GID: recovery.GID}}}
-	data, _ := encodeCanonical(payload)
+	payload := helper.IdentityConfig{SchemaVersion: "lanpanel.helper.identities.v1", SocketGroup: ui.GID, Identities: helper.IdentitySet{UI: helper.PeerIdentity{UID: ui.UID, GID: ui.GID}, Timer: helper.PeerIdentity{UID: timer.UID, GID: timer.GID}, Recovery: helper.PeerIdentity{UID: recovery.UID, GID: recovery.GID}}}
+	data, err := encodeCanonical(payload)
+	if err != nil {
+		return err
+	}
 	return putOrVerifyTargetFile(ctx, helper.FixedIdentityConfigPath, data, 0o600)
 }
 

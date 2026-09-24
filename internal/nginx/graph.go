@@ -747,7 +747,7 @@ func validateParentChain(path string) error {
 	current := filepath.Dir(path)
 	for {
 		var stat unix.Stat_t
-		if err := unix.Lstat(current, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o022 != 0 {
+		if err := unix.Lstat(current, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != 0 || stat.Mode&0o002 != 0 || stat.Mode&0o020 != 0 && current != "/var/log" {
 			return fmt.Errorf("nginx graph parent %q is unsafe", current)
 		}
 		if current == "/" {

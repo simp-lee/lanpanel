@@ -511,7 +511,7 @@ func validConfigPath(kind ConfigKind, value string) bool {
 	}
 	switch kind {
 	case APTConfig:
-		return value == "/etc/apt/apt.conf" || strings.HasPrefix(value, "/etc/apt/apt.conf.d/")
+		return value == "/etc/apt/apt.conf" || strings.HasPrefix(value, "/etc/apt/apt.conf.d/") || value == "/etc/apt/auth.conf" || strings.HasPrefix(value, "/etc/apt/auth.conf.d/") || value == "/etc/apt/preferences" || strings.HasPrefix(value, "/etc/apt/preferences.d/")
 	case APTSource:
 		return value == "/etc/apt/sources.list" || strings.HasPrefix(value, "/etc/apt/sources.list.d/")
 	case APTKeyring:

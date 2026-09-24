@@ -51,13 +51,14 @@ func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 	if launcher == nil {
 		return nil, fmt.Errorf("package auditor requires the typed child launcher")
 	}
-	paths := []string{"/etc/apt", "/etc/dpkg", "/usr/share/keyrings", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", "/proc/net", "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
+	procRoot := filepath.Join("/proc", strconv.Itoa(os.Getpid()), "net")
+	paths := []string{"/etc/apt", "/etc/dpkg", "/usr/share/keyrings", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", procRoot, "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
 	for _, path := range paths {
 		if err := validateAuditorParent(path); err != nil {
 			return nil, err
 		}
 	}
-	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
+	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: procRoot, policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
 }
 
 func newTestLinuxAuditor(launcher ChildLauncher, root string) *LinuxAuditor {
@@ -1417,7 +1418,7 @@ func (auditor *LinuxAuditor) runtimeSnapshot(plan Plan, installed []Package, sys
 	}
 	unitNames := affectedUnits(plan.Packages)
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() && unitPattern.MatchString(entry.Name()) {
 			unitNames = append(unitNames, entry.Name())
 		}
 	}
@@ -1432,7 +1433,7 @@ func (auditor *LinuxAuditor) runtimeSnapshot(plan Plan, installed []Package, sys
 		masked := false
 		if target, err := os.Readlink(filepath.Join(auditor.maskRoot, name)); err == nil {
 			masked = target == "/dev/null"
-		} else if !errors.Is(err, os.ErrNotExist) {
+		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.EINVAL) {
 			return RuntimeSnapshot{}, fmt.Errorf("observe systemd unit mask: %w", err)
 		}
 		units = append(units, UnitState{Name: name, Active: active, Masked: masked})
@@ -1456,7 +1457,7 @@ func (auditor *LinuxAuditor) runtimeSnapshot(plan Plan, installed []Package, sys
 }
 
 func (auditor *LinuxAuditor) noAutostartPolicy(expectedDigest string) (NoAutostartPolicy, error) {
-	policy, policyStat, err := auditor.readFileAndStat(auditor.policyPath, 8<<20)
+	policy, policyStat, err := auditor.readFileAndStat(auditor.policyPath, filetxn.MaximumContentBytes)
 	if err != nil {
 		return NoAutostartPolicy{}, err
 	}
