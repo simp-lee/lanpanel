@@ -105,6 +105,49 @@ func TestResourceActionPreservesTypedHelperRejections(t *testing.T) {
 	}
 }
 
+func TestHelperBackedActionsPreserveTypedRejections(t *testing.T) {
+	expected := HelperRejection{Code: "typed_helper_rejection", JobID: "job_" + strings.Repeat("c", 64)}
+	service, err := HelperServiceComplete(
+		func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {
+			return HelperReply{}, expected
+		},
+		func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string) (HelperReply, error) {
+			return HelperReply{}, expected
+		},
+		func(context.Context, helperproto.Operation, helperproto.ResourcePayload, string, []byte) (HelperReply, error) {
+			return HelperReply{}, expected
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := Actor{Kind: ActorUI, Identity: "session", Generation: 1}
+	resource := domain.OperationTarget{Kind: domain.OperationTargetResource, ID: "res_00000000000000000000000000000001"}
+	cases := []struct {
+		name string
+		call Call
+	}{
+		{name: "admin token rotation", call: Call{Operation: domain.OperationAdminTokenRotate, Target: domain.OperationTarget{Kind: domain.OperationTargetInstallation}, Payload: ConfirmationPayload{PlanID: "plan", Confirmation: "rotate"}}},
+		{name: "status", call: Call{Operation: domain.OperationStatus, Target: resource, Payload: DomainStatusPayload{}}},
+		{name: "close all", call: Call{Operation: domain.OperationCloseAll, Target: domain.OperationTarget{Kind: domain.OperationTargetInstallation}, Payload: ConfirmationPayload{PlanID: "plan", Confirmation: "close"}}},
+		{name: "headscale user", call: Call{Operation: domain.OperationHeadscaleUserCreate, Target: domain.OperationTarget{Kind: domain.OperationTargetHeadscale}, Payload: HeadscaleUserPayload{Name: "alice"}}},
+		{name: "headscale lifecycle", call: Call{Operation: domain.OperationPreauthKeyCreate, Target: domain.OperationTarget{Kind: domain.OperationTargetHeadscaleUser, ID: "1"}, Payload: HeadscaleLifecyclePayload{PlanID: "plan", Confirmation: "create"}}},
+		{name: "connector binding", call: Call{Operation: domain.OperationConnectorBindingSet, Target: domain.OperationTarget{Kind: domain.OperationTargetConnector}, Payload: ConnectorBindingPayload{ControlURL: "https://control.example.test"}}},
+		{name: "connector verify", call: Call{Operation: domain.OperationConnectorVerify, Target: domain.OperationTarget{Kind: domain.OperationTargetConnector}, Payload: EmptyPayload{}}},
+		{name: "connector login", call: Call{Operation: domain.OperationConnectorLogin, Target: domain.OperationTarget{Kind: domain.OperationTargetConnector}, Payload: ConnectorLoginActionPayload{PlanID: "plan", Confirmation: "login", AuthKey: []byte("key")}}},
+		{name: "product read", call: Call{Operation: domain.OperationDiagnostics, Target: domain.OperationTarget{Kind: domain.OperationTargetInstallation}, Payload: EmptyPayload{}}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := service.Invoke(context.Background(), actor, test.call)
+			var rejection HelperRejection
+			if !errors.As(err, &rejection) || rejection.Code != expected.Code || rejection.JobID != expected.JobID {
+				t.Fatalf("typed rejection was not preserved: %v", err)
+			}
+		})
+	}
+}
+
 func TestDependencyActionsPreserveTypedRejectionWithoutJob(t *testing.T) {
 	service, err := HelperServiceWithResources(func(context.Context, helperproto.Operation, helperproto.ActionPayload) (HelperReply, error) {
 		return HelperReply{}, HelperRejection{Code: "connector_required"}

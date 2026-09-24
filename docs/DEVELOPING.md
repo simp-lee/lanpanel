@@ -36,6 +36,18 @@ make playwright-fixture-gate
 
 `make playwright-fixture-gate` 的唯一测试入口是 `LANPANEL_PLAYWRIGHT_FIXTURE=1 npm run test:auth`。Playwright spec 会启动一个 Go fixture，等待本机 readiness；启动超时、Go fixture 退出、测试失败或 browser failure 都以非零状态传播，`afterAll` 会清理 fixture。fixture 使用内存 typed resource/status/probe/Job 和副作用计数，不连接真实持久化、Nginx、应用进程、ACME、DNS、Tailscale 或远程命令；因此它验证 UI/helper/application 合同，不替代真实主机或外部服务资格验证。CI 先运行 `make preview-local-gate`，再执行 `npm ci`、固定 Chromium 安装和同一个 `make playwright-fixture-gate`，不会启动第二个 fixture。
 
+### 真实主机和外部依赖验收（人工，非 CI）
+
+要验证主机和外部依赖，必须使用 Debian/Ubuntu amd64 的可销毁云主机或 VM；这项验收不应加入确定性 CI 门禁。先做快照，只使用测试域名和测试凭据。记录安装器输出的 Management 地址和端口，并通过 SSH 隧道连接这个准确地址。
+
+1. 安装前后保存 `systemctl --failed`、`systemctl status lanpanel-helper lanpanel-ui lanpanel-nginx lanpanel-recovery --no-pager --full`、`systemctl is-enabled lanpanel-helper lanpanel-ui lanpanel-nginx lanpanel-timer.timer`、`ss -ltnup` 和 `journalctl -u 'lanpanel-*' --since -5min`。确认 `/run/lanpanel/helper.sock` 是 root 所有、仅 helper client group 可读写、权限为 `0660` 的 Unix socket；确认 UI 和应用进程不是 root。
+2. 在 UI 创建由临时 HTTP/WebSocket 测试程序提供服务的 `local_http`。保存后重启，确认 resource、停止/未发布状态、Job 历史和配置仍在；再验证编辑、启动、readiness/status、停止、发布、HTTPS 请求、撤销发布和删除。检查进程 UID/cgroup、监听端口、Nginx 配置检查/重载，并确认删除 resource 不会删除外部可执行文件或工作目录。
+3. 验证预期的 helper rejection，例如对 `tailnet_http` 请求启动进程。浏览器 Network 响应和 UI 状态必须包含 HTTP 409、typed `error_code` 和 `job_id`；打开该 Job，确认终态失败及修复指引。`service_unavailable` 不能作为替代结果。
+4. 执行成功和失败的创建、编辑、发布、撤销发布、删除、进程、Token 轮换、Headscale、Connector 操作，并制造一次取消。以 root 用 `jq` 检查 `/var/lib/lanpanel-management-audit/events.json`，确认每个请求有正确的 `operation`、target、非敏感 actor、UTC 时间、`succeeded`/`failed`/`cancelled` 结果和适用的 typed error code；重启后文件仍是合法 JSON，且不含 token、密码、auth key、私钥或 credential 内容。
+5. 使用测试域名和 ACME staging 账户分别验证 HTTP-01 和支持的 DNS-01 provider：DNS 解析、challenge 创建/清理、证书签发、Nginx 重载、续期 timer 以及 HTTPS/SNI/Host 行为。首次验证不要使用生产凭据。
+6. 准备第二台测试节点，安装支持版本的 Tailscale 客户端，验证 Headscale 初始化、控制入口、用户/密钥/设备生命周期、客户端加入、`tailscale status`、`tailscale ping` 和 `tailscale netcheck`。绑定并登录 Connector，完成验证后发布固定 `tailnet_http` endpoint，测试 connector、route、target、HTTP 和 WebSocket 的失败/恢复场景；确认没有远端进程控制或远程 Shell/命令执行。
+7. 在安装完成、local 发布完成、Headscale/Connector 配置完成等关键边界重启，重复状态和公网探测，并保存带 release/host 标识的 systemd、网络、DNS、证书、Tailscale、Job 和审计输出。真实主机结果才是资格证据；Playwright fixture 通过本身不能证明这些边界。
+
 不要提交下载的第三方二进制、`dist/` 输出、发布包、Bootstrap、GitHub Token 或签名私钥。下载的依赖只应放在被忽略的 `dist/dependencies/` 中。
 
 ## 目录约定

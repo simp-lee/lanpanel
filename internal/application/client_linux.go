@@ -25,6 +25,16 @@ type HelperRejection struct {
 
 func (value HelperRejection) Error() string { return "helper rejected request: " + value.Code }
 
+func helperFailure(err error, message string) error {
+	if err != nil {
+		var rejection HelperRejection
+		if errors.As(err, &rejection) {
+			return err
+		}
+	}
+	return fmt.Errorf("%s", message)
+}
+
 type HelperReply struct {
 	Digest        string
 	Action        *helperproto.ActionResult
@@ -151,7 +161,7 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		reply, err := client(ctx, helperproto.OperationAdminTokenRotate, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation})
 		if err != nil || reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) == 0 {
 			clear(reply.Secret)
-			return Result{}, fmt.Errorf("admin token rotation failed")
+			return Result{}, helperFailure(err, "admin token rotation failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: RotationResult{reply.Digest, reply.Action.JobID, reply.Secret}}, nil
 	})
@@ -163,11 +173,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		}
 		reply, err := client(ctx, helperOperation, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation, Username: payload.Username})
 		if err != nil {
-			var rejection HelperRejection
-			if errors.As(err, &rejection) {
-				clear(reply.Secret)
-				return Result{}, err
-			}
+			clear(reply.Secret)
+			return Result{}, helperFailure(err, "managed Basic action failed")
 		}
 		if reply.Action == nil || reply.Action.JobID == "" {
 			clear(reply.Secret)
@@ -214,20 +221,21 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			if call.Target.Kind == domain.OperationTargetInstallation {
 				catalog, err := seams.Status.ResourceStatusCatalog(ctx)
 				if err != nil || domain.ValidateResourceStatusCatalog(catalog) != nil {
-					return Result{}, fmt.Errorf("installation status failed")
+					return Result{}, helperFailure(err, "installation status failed")
 				}
 				return Result{Operation: call.Operation, Target: call.Target, Payload: catalog}, nil
 			}
 			status, err := seams.Status.ResourceStatus(ctx, call.Target.ID)
 			if err != nil || status.ResourceID != call.Target.ID || domain.ValidateResourceStatusResult(status) != nil {
-				return Result{}, fmt.Errorf("domain status failed")
+				return Result{}, helperFailure(err, "domain status failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, Payload: status}, nil
 		}
 		if call.Target.Kind == domain.OperationTargetInstallation && resourceClient != nil {
 			reply, err := resourceClient(ctx, helperproto.OperationProductRead, helperproto.ResourcePayload{Operation: string(domain.OperationStatus), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "installation")
 			if err != nil || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("installation status failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "installation status failed")
 			}
 			if reply.StatusCatalog == nil || reply.Read != nil || domain.ValidateResourceStatusCatalog(*reply.StatusCatalog) != nil {
 				return Result{}, fmt.Errorf("installation status failed")
@@ -236,7 +244,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		}
 		reply, err := client(ctx, helperproto.OperationDomainStatus, helperproto.ActionPayload{Operation: "status", TargetKind: "resource", TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation})
 		if err != nil || len(reply.Secret) != 0 || reply.Status == nil || reply.Status.ResourceID != call.Target.ID || domain.ValidateResourceStatusResult(*reply.Status) != nil {
-			return Result{}, fmt.Errorf("domain status failed")
+			clear(reply.Secret)
+			return Result{}, helperFailure(err, "domain status failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Status}, nil
 	})
@@ -248,7 +257,7 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		reply, err := client(ctx, helperproto.OperationContractionClose, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), TargetID: call.Target.ID, ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: payload.Confirmation})
 		if err != nil || reply.Action == nil || reply.Action.ContractionOutcome == "" || !reply.Action.Emergency && (reply.Action.JobID == "" || reply.Action.JobResult == "") || reply.Action.Emergency && reply.Action.PlanID == "" || len(reply.Secret) != 0 {
 			clear(reply.Secret)
-			return Result{}, fmt.Errorf("close-all contraction failed")
+			return Result{}, helperFailure(err, "close-all contraction failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: ContractionResult{JobID: reply.Action.JobID, JobResult: reply.Action.JobResult, PlanID: reply.Action.PlanID, Emergency: reply.Action.Emergency, Outcome: reply.Action.ContractionOutcome, AccessClosed: reply.Action.AccessClosed, SharedIngressDown: reply.Action.SharedIngressDown, AccessMayRemain: reply.Action.AccessMayRemain}}, nil
 	}
@@ -326,7 +335,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 		headscaleRead := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			reply, err := resourceClient(ctx, helperproto.OperationHeadscaleRead, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "headscale")
 			if err != nil || reply.Headscale == nil || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("headscale read failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "headscale read failed")
 			}
 			switch call.Operation {
 			case domain.OperationHeadscaleUserList:
@@ -347,7 +357,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			raw, _ := json.Marshal(payload)
 			reply, err := resourceClient(ctx, helperproto.OperationHeadscaleMutation, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: "create", Resource: raw}, "headscale")
 			if err != nil || reply.Headscale == nil || reply.Headscale.User == nil || reply.Headscale.JobID == "" || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("headscale user create failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "headscale user create failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Headscale.JobID, Payload: HeadscaleUserResult{JobID: reply.Headscale.JobID, User: clientUser(*reply.Headscale.User)}}, nil
 		})
@@ -371,7 +382,7 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			reply, err := resourceClient(ctx, operation, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, PlanID: payload.PlanID, Confirmation: confirmation, Resource: raw}, target)
 			if err != nil || reply.Headscale == nil {
 				clear(reply.Secret)
-				return Result{}, fmt.Errorf("headscale lifecycle action failed")
+				return Result{}, helperFailure(err, "headscale lifecycle action failed")
 			}
 			if payload.PlanID == "" {
 				clear(reply.Secret)
@@ -407,14 +418,16 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			raw, _ := json.Marshal(payload)
 			reply, err := resourceClient(ctx, helperproto.OperationConnectorMutation, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: "set", Resource: raw}, "connector")
 			if err != nil || reply.Connector == nil || reply.Connector.JobID == "" || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("connector binding failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "connector binding failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Connector.JobID, Payload: ConnectorMutationResult{JobID: reply.Connector.JobID}}, nil
 		})
 		connectorVerify, _ := RegisterAction(domain.OperationConnectorVerify, EmptyPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			reply, err := resourceClient(ctx, helperproto.OperationConnectorRead, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, "connector")
 			if err != nil || reply.Connector == nil || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("connector verify failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "connector verify failed")
 			}
 			observation, err := clientConnectorObservation(*reply.Connector)
 			if err != nil {
@@ -430,7 +443,7 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 				reply, err := resourceClient(ctx, helperproto.OperationConnectorLoginPlan, resource, "connector")
 				clear(payload.AuthKey)
 				if err != nil || reply.Connector == nil {
-					return Result{}, fmt.Errorf("connector login Plan failed")
+					return Result{}, helperFailure(err, "connector login Plan failed")
 				}
 				return Result{Operation: call.Operation, Target: call.Target, Payload: *reply.Connector}, nil
 			}
@@ -441,7 +454,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			reply, err := secretResourceClient(ctx, helperproto.OperationConnectorLogin, resource, "connector", payload.AuthKey)
 			clear(payload.AuthKey)
 			if err != nil || reply.Connector == nil || reply.Connector.JobID == "" || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("connector login failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "connector login failed")
 			}
 			return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Connector.JobID, Payload: ConnectorMutationResult{JobID: reply.Connector.JobID}}, nil
 		})
@@ -473,7 +487,8 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			}
 			reply, err := resourceClient(ctx, helperproto.OperationProductRead, helperproto.ResourcePayload{Operation: string(call.Operation), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation}, target)
 			if err != nil || reply.Read == nil || reply.Read.Operation != string(call.Operation) || len(reply.Secret) != 0 {
-				return Result{}, fmt.Errorf("product read failed")
+				clear(reply.Secret)
+				return Result{}, helperFailure(err, "product read failed")
 			}
 			var payload any
 			switch call.Operation {

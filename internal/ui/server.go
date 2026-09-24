@@ -427,6 +427,20 @@ func (s *Server) appendAudit(record audit.Record) error {
 	return s.config.Audit.Append(record)
 }
 
+func auditTarget(target domain.OperationTarget) string {
+	if target.ID == "" {
+		return string(target.Kind)
+	}
+	return string(target.Kind) + "/" + target.ID
+}
+
+func (s *Server) appendActionAudit(operation domain.OperationCode, target domain.OperationTarget, actor, result, errorCode string) error {
+	if errorCode == "" && result == "failed" {
+		errorCode = "action_failed"
+	}
+	return s.appendAudit(audit.Record{Operation: string(operation), Target: auditTarget(target), Actor: actor, At: time.Now().UTC(), Result: result, ErrorCode: errorCode, Paths: []string{}})
+}
+
 func (s *Server) current(writer http.ResponseWriter, request *http.Request) {
 	s.barrier.RLock()
 	defer s.barrier.RUnlock()
@@ -637,6 +651,9 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	if connectorBindingOperation || connectorVerifyOperation || connectorLoginOperation {
 		target = domain.OperationTarget{Kind: domain.OperationTargetConnector}
 	}
+	if headscaleControlOperation || headscaleReissueOperation {
+		target = domain.OperationTarget{Kind: domain.OperationTargetHeadscale}
+	}
 	if operation == domain.OperationPreauthKeyCreate {
 		id, ok := firstExact(query["user_id"])
 		if !ok {
@@ -677,6 +694,10 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	principal, ok := s.authenticate(request, true)
 	s.barrier.Unlock()
 	if !ok {
+		if auditErr := s.appendActionAudit(operation, target, "unknown", "failed", "authentication_failed"); auditErr != nil {
+			reject(writer, http.StatusServiceUnavailable)
+			return
+		}
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
@@ -686,7 +707,15 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		valid := s.config.Sessions.Valid(principal)
 		s.barrier.RUnlock()
 		if !valid {
+			if auditErr := s.appendActionAudit(operation, target, s.config.Sessions.Identity(principal), "failed", "authentication_failed"); auditErr != nil {
+				reject(writer, http.StatusServiceUnavailable)
+				return
+			}
 			reject(writer, http.StatusUnauthorized)
+			return
+		}
+		if auditErr := s.appendActionAudit(operation, target, s.config.Sessions.Identity(principal), "failed", "action_conflict"); auditErr != nil {
+			reject(writer, http.StatusServiceUnavailable)
 			return
 		}
 		reject(writer, http.StatusConflict)
@@ -694,12 +723,26 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	}
 	request = request.WithContext(lease.ctx)
 	if !s.revalidateAction(lease) {
+		auditErr := s.appendActionAudit(operation, target, s.config.Sessions.Identity(principal), "cancelled", "action_cancelled")
+		s.endAction(lease)
+		if auditErr != nil {
+			reject(writer, http.StatusServiceUnavailable)
+			return
+		}
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
+	responseWriter := writer
+	bufferedWriter := &actionResponseWriter{header: make(http.Header)}
+	writer = bufferedWriter
 	actionFailed := false
+	actionErrorCode := ""
+	actionErrorTyped := false
+	secretResponse := false
+	auditActor := s.config.Sessions.Identity(principal)
 	reject := func(writer http.ResponseWriter, status int) {
 		actionFailed = true
+		actionErrorCode = httpErrorCode(status)
 		rejectWithError(writer, status, nil)
 	}
 	progressAction := !planRoute && progressOperation(operation)
@@ -716,6 +759,28 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}()
 	}
 	defer func() {
+		result := "succeeded"
+		if actionFailed {
+			result = "failed"
+		}
+		if lease.ctx.Err() != nil {
+			result = "cancelled"
+			if !actionErrorTyped {
+				actionErrorCode = "action_cancelled"
+			}
+		}
+		if auditErr := s.appendActionAudit(operation, target, auditActor, result, actionErrorCode); auditErr != nil {
+			if secretResponse {
+				_, _ = bufferedWriter.commit(responseWriter)
+			} else {
+				actionFailed = true
+				actionErrorCode = httpErrorCode(http.StatusServiceUnavailable)
+				bufferedWriter.discard()
+				rejectWithError(responseWriter, http.StatusServiceUnavailable, nil)
+			}
+		} else {
+			_, _ = bufferedWriter.commit(responseWriter)
+		}
 		if progressAction {
 			close(actionDone)
 			<-heartbeatDone
@@ -737,9 +802,12 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		actionFailed = true
 		var rejected application.HelperRejection
 		if errors.As(err, &rejected) {
+			actionErrorCode = rejected.Code
+			actionErrorTyped = true
 			s.sessionStatusJSON(writer, principal, http.StatusConflict, map[string]string{"error": rejected.Code, "error_code": rejected.Code, "job_id": rejected.JobID})
 			return
 		}
+		actionErrorCode = httpErrorCode(status)
 		rejectWithError(writer, status, err)
 	}
 	if planRoute && (headscaleOperation || headscaleReadOperation || headscaleUserCreateOperation || connectorBindingOperation || connectorVerifyOperation || productReadOperation || resourceOperation || processOperation || staticOperation || statusOperation || basicOperation && operation != domain.OperationManagedBasicDelete && operation != domain.OperationManagedBasicRotate) {
@@ -944,6 +1012,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		}
 		if operation == domain.OperationPreauthKeyCreate {
 			if value, ok := result.Payload.(application.HeadscaleKeyResult); ok {
+				secretResponse = len(value.Secret) != 0
 				defer clear(value.Secret)
 				result.Payload = value
 			}
@@ -1078,6 +1147,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		if value, ok := result.Payload.(application.ManagedBasicActionResult); ok {
+			secretResponse = len(value.Password) != 0
 			defer clear(value.Password)
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -1148,6 +1218,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		if value, ok := result.Payload.(application.ResourceCreateResult); ok {
+			secretResponse = len(value.Password) != 0
 			defer clear(value.Password)
 		}
 		s.sessionJSON(writer, principal, result.Payload)
@@ -1181,6 +1252,8 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		actionFailed = true
 		var rejected application.HelperRejection
 		if errors.As(err, &rejected) {
+			actionErrorCode = rejected.Code
+			actionErrorTyped = true
 			s.sessionStatusJSON(writer, principal, http.StatusConflict, map[string]string{"error": rejected.Code, "error_code": rejected.Code, "job_id": rejected.JobID})
 			return
 		}
@@ -1198,6 +1271,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 			}
 			s.barrier.Unlock()
 		}
+		actionErrorCode = httpErrorCode(http.StatusServiceUnavailable)
 		rejectWithError(writer, http.StatusServiceUnavailable, err)
 		return
 	}
@@ -1258,6 +1332,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	s.config.Sessions.CommitTokenRotation(rotation.Fingerprint)
+	secretResponse = true
 	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(struct {
@@ -1307,6 +1382,47 @@ func securityHeaders(writer http.ResponseWriter) {
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
+}
+
+type actionResponseWriter struct {
+	header      http.Header
+	body        bytes.Buffer
+	status      int
+	wroteHeader bool
+}
+
+func (writer *actionResponseWriter) Header() http.Header { return writer.header }
+
+func (writer *actionResponseWriter) WriteHeader(status int) {
+	if writer.wroteHeader {
+		return
+	}
+	writer.status = status
+	writer.wroteHeader = true
+}
+
+func (writer *actionResponseWriter) Write(payload []byte) (int, error) {
+	if !writer.wroteHeader {
+		writer.WriteHeader(http.StatusOK)
+	}
+	return writer.body.Write(payload)
+}
+
+func (writer *actionResponseWriter) discard() {
+	writer.header = make(http.Header)
+	writer.body.Reset()
+	writer.status = 0
+	writer.wroteHeader = false
+}
+
+func (writer *actionResponseWriter) commit(destination http.ResponseWriter) (int, error) {
+	for key, values := range writer.header {
+		destination.Header()[key] = append([]string(nil), values...)
+	}
+	if writer.wroteHeader {
+		destination.WriteHeader(writer.status)
+	}
+	return destination.Write(writer.body.Bytes())
 }
 
 type errorResponse struct {

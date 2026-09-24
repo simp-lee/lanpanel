@@ -26,6 +26,7 @@ import (
 type (
 	verifier        struct{ fp string }
 	failingVerifier struct{}
+	failingAudit    struct{}
 	normalProfile   struct{}
 	gatedVerifier   struct {
 		fp                     string
@@ -42,6 +43,7 @@ func (failingVerifier) Verify(context.Context, []byte) (string, error) {
 	return "", errors.New("invalid token")
 }
 func (failingVerifier) Source(context.Context) (string, error) { return "fp", nil }
+func (failingAudit) Append(audit.Record) error                 { return errors.New("audit unavailable") }
 
 func (v *gatedVerifier) Verify(ctx context.Context, _ []byte) (string, error) {
 	v.enterOnce.Do(func() { close(v.entered) })
@@ -158,6 +160,122 @@ func TestLoginLogoutAreAuditedWithoutCredentials(t *testing.T) {
 	}
 	if strings.Contains(loginWriter.Body.String()+logoutWriter.Body.String(), "admin") {
 		t.Fatal("audit response exposed credential")
+	}
+}
+
+func TestActionAuditRecordsSuccessAndTypedFailure(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		if call.Payload.(application.ConnectorBindingPayload).ControlURL == "https://reject.example.test" {
+			return application.Result{}, application.HelperRejection{Code: "connector_already_bound", JobID: "job_rejected"}
+		}
+		return application.Result{Operation: call.Operation, Target: call.Target, JobID: "job_bound", Payload: application.ConnectorMutationResult{JobID: "job_bound"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(controlURL string) *httptest.ResponseRecorder {
+		value := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/connector_binding_set", strings.NewReader(`{"control_url":"`+controlURL+`"}`))
+		value.Header.Set("Origin", server.origin())
+		value.Header.Set(session.ProofHeader, credentials.Proof)
+		value.Header.Set(session.CSRFHeader, credentials.CSRF)
+		value.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+		writer := httptest.NewRecorder()
+		server.ServeHTTP(writer, value)
+		return writer
+	}
+	if writer := request("https://control.example.test"); writer.Code != http.StatusOK {
+		t.Fatalf("successful action status=%d body=%s", writer.Code, writer.Body.String())
+	}
+	if writer := request("https://reject.example.test"); writer.Code != http.StatusConflict {
+		t.Fatalf("rejected action status=%d body=%s", writer.Code, writer.Body.String())
+	}
+	records := server.config.Audit.(*audit.MemorySink).Records()
+	if len(records) != 2 || records[0].Operation != string(domain.OperationConnectorBindingSet) || records[0].Target != "connector" || records[0].Actor != "fp" || records[0].Result != "succeeded" {
+		t.Fatalf("success audit records=%#v", records)
+	}
+	if records[1].Result != "failed" || records[1].ErrorCode != "connector_already_bound" {
+		t.Fatalf("typed failure audit record=%#v", records[1])
+	}
+}
+
+func TestActionAuditFailureFailsClosed(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := application.RegisterAction(domain.OperationConnectorBindingSet, application.ConnectorBindingPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: application.ConnectorMutationResult{JobID: "job_bound"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Audit = failingAudit{}
+	request := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/connector_binding_set", strings.NewReader(`{"control_url":"https://control.example.test"}`))
+	request.Header.Set("Origin", server.origin())
+	request.Header.Set(session.ProofHeader, credentials.Proof)
+	request.Header.Set(session.CSRFHeader, credentials.CSRF)
+	request.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+	writer := httptest.NewRecorder()
+	server.ServeHTTP(writer, request)
+	if writer.Code != http.StatusServiceUnavailable {
+		t.Fatalf("audit failure status=%d body=%s", writer.Code, writer.Body.String())
+	}
+}
+
+func TestHeadscaleActionAuditUsesHeadscaleTarget(t *testing.T) {
+	server := testServer(t)
+	credentials, err := server.config.Sessions.Issue(server.origin(), "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := application.RegisterAction(domain.OperationHeadscaleControlDeploy, application.HeadscaleDeployPayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: map[string]string{"job_id": "job_headscale"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reissue, err := application.RegisterAction(domain.OperationHeadscaleReissue, application.HeadscaleReissuePayload{}, true, false, func(_ context.Context, _ application.Actor, call application.Call) (application.Result, error) {
+		return application.Result{Operation: call.Operation, Target: call.Target, Payload: map[string]string{"job_id": "job_reissue"}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.config.Actions, err = application.New([]application.Registration{control, reissue})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(operation, confirmation string) {
+		body := `{"plan_id":"plan_fixture","confirmation":"` + confirmation + `","certificate":{"challenge_method":"","directory_url":"https://acme.example.test/directory","account_email":"","terms_accepted":true}}`
+		value := httptest.NewRequest(http.MethodPost, server.origin()+"/api/actions/"+operation, strings.NewReader(body))
+		value.Header.Set("Origin", server.origin())
+		value.Header.Set(session.ProofHeader, credentials.Proof)
+		value.Header.Set(session.CSRFHeader, credentials.CSRF)
+		value.AddCookie(&http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector})
+		writer := httptest.NewRecorder()
+		server.ServeHTTP(writer, value)
+		if writer.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", operation, writer.Code, writer.Body.String())
+		}
+	}
+	request("headscale_control_deploy", "deploy")
+	request("headscale_certificate_reissue", "reissue")
+	records := server.config.Audit.(*audit.MemorySink).Records()
+	if len(records) != 2 || records[0].Target != "headscale" || records[1].Target != "headscale" {
+		t.Fatalf("headscale audit records=%#v", records)
 	}
 }
 
@@ -406,6 +524,10 @@ func TestActionDispatchRejectsRotationAfterRequestValidation(t *testing.T) {
 	}
 	if writer.Code != http.StatusServiceUnavailable {
 		t.Fatalf("canceled action status=%d", writer.Code)
+	}
+	records := server.config.Audit.(*audit.MemorySink).Records()
+	if len(records) != 1 || records[0].Operation != string(domain.OperationConnectorBindingSet) || records[0].Result != "cancelled" || records[0].ErrorCode != "action_cancelled" {
+		t.Fatalf("canceled action audit records=%#v", records)
 	}
 	select {
 	case rotationLease := <-rotation:

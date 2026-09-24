@@ -54,7 +54,9 @@ func (value *playwrightVerifier) Source(context.Context) (string, error) {
 	return current.fingerprint, nil
 }
 
-type playwrightProfile struct{}
+type playwrightProfile struct {
+	emergency atomic.Bool
+}
 
 type playwrightActionBarrier struct {
 	started     chan struct{}
@@ -81,7 +83,12 @@ func (barrier *playwrightActionBarrier) unblock() {
 	barrier.releaseOnce.Do(func() { close(barrier.release) })
 }
 
-func (playwrightProfile) Current(context.Context) (Profile, error) { return ProfileNormal, nil }
+func (profile *playwrightProfile) Current(context.Context) (Profile, error) {
+	if profile.emergency.Load() {
+		return ProfileEmergency, nil
+	}
+	return ProfileNormal, nil
+}
 
 const (
 	playwrightLocalResourceID   = "res_00000000000000000000000000000001"
@@ -130,6 +137,7 @@ type playwrightFixtureBackend struct {
 	counters  playwrightFixtureCounters
 	barrier   *playwrightActionBarrier
 	verifier  *playwrightVerifier
+	profile   *playwrightProfile
 }
 
 var (
@@ -174,17 +182,23 @@ func (backend *playwrightFixtureBackend) reset() {
 	backend.nextID = 3
 	backend.scenario = "default"
 	backend.counters.reset()
+	if backend.profile != nil {
+		backend.profile.emergency.Store(false)
+	}
 }
 
 func (backend *playwrightFixtureBackend) setScenario(scenario string) error {
 	switch scenario {
-	case "default", "tailnet-ready", "tailnet-connector-failure", "tailnet-route-failure", "tailnet-target-failure", "tailnet-revalidation-failure", "create-preflight-failure", "update-preflight-failure":
+	case "default", "tailnet-ready", "tailnet-connector-failure", "tailnet-route-failure", "tailnet-target-failure", "tailnet-revalidation-failure", "create-preflight-failure", "update-preflight-failure", "emergency":
 	default:
 		return fmt.Errorf("unknown fixture scenario")
 	}
 	backend.mu.Lock()
 	backend.scenario = scenario
 	backend.mu.Unlock()
+	if backend.profile != nil {
+		backend.profile.emergency.Store(scenario == "emergency")
+	}
 	return nil
 }
 
@@ -856,6 +870,8 @@ func TestPlaywrightFixture(t *testing.T) {
 	}
 	defer manager.Close()
 	backend := newPlaywrightFixtureBackend()
+	profile := &playwrightProfile{}
+	backend.profile = profile
 	backend.verifier = verifier
 	actionBarrier := newPlaywrightActionBarrier()
 	backend.barrier = actionBarrier
@@ -871,7 +887,7 @@ func TestPlaywrightFixture(t *testing.T) {
 	// Keep the fixture on replaceable typed application/helper seams:
 	// status, probe, Job, and side-effect observations remain deterministic and
 	// no raw resource JSON or live process/connector boundary is used.
-	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: verifier, Sessions: manager, Profile: playwrightProfile{}, Actions: actions, Audit: audit.NewMemorySink()})
+	server, err := New(Config{Listener: listener, Authority: authority, InstallationFingerprint: "0123456789abcdef", Verifier: verifier, Sessions: manager, Profile: profile, Actions: actions, Audit: audit.NewMemorySink()})
 	if err != nil {
 		t.Fatal(err)
 	}
