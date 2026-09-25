@@ -70,7 +70,7 @@ func runPublicUninstallAt(args []string, in io.Reader, out io.Writer, paths Path
 }
 
 func readUninstallScope(paths Paths) ([]string, error) {
-	if err := RequireCommitted(paths); err != nil {
+	if err := requireUninstallCommitted(paths); err != nil {
 		return nil, err
 	}
 	commitBytes, err := readCommittedArtifact(paths.CommitPath, MaximumJournalBytes, 0o644)
@@ -127,7 +127,7 @@ func readUninstallScope(paths Paths) ([]string, error) {
 }
 
 func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expectedScope ...[]string) error {
-	if err := RequireCommitted(paths); err != nil {
+	if err := requireUninstallCommitted(paths); err != nil {
 		return fmt.Errorf("uninstall fenced: %w", err)
 	}
 	commitBytes, err := readCommittedArtifact(paths.CommitPath, MaximumJournalBytes, 0o644)
@@ -294,6 +294,39 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed; package and service ownership not proven by this lifecycle remain retained.")
 	return nil
+}
+
+func requireUninstallCommitted(paths Paths) error {
+	if os.Geteuid() != 0 {
+		return requirePublicStartupAuthority(paths)
+	}
+	if paths.PersistentRoot == "" {
+		paths = FixedPaths()
+	}
+	commitBytes, err := readCommittedArtifact(paths.CommitPath, MaximumJournalBytes, 0o644)
+	if err != nil {
+		return fmt.Errorf("bootstrap final commit is missing or unsafe: %w", err)
+	}
+	var commit Commit
+	if decodeCanonical(commitBytes, &commit) != nil || commit.SchemaVersion != CommitSchemaVersion || !release.ValidDigest(commit.OwnershipDigest) {
+		return fmt.Errorf("bootstrap final commit is invalid")
+	}
+	store, journal, err := openJournal(paths.Journal, 0, 0)
+	if err != nil {
+		return fmt.Errorf("bootstrap fence is active or missing: %w", err)
+	}
+	defer func() { _ = store.close() }()
+	if (journal.Phase != PhaseActivated && journal.Phase != PhaseCommitted) || !release.ValidDigest(journal.FinalCommitDigest) || digestBytes(commitBytes) != journal.FinalCommitDigest || commit.AttemptID != journal.AttemptID || commit.InstallationID != journal.InstallationID || commit.GenerationID != journal.GenerationID {
+		return fmt.Errorf("bootstrap fence is active")
+	}
+	if err := verifyCommittedBundle(paths, journal, commit); err != nil {
+		bundleMissing := errors.Is(err, os.ErrNotExist)
+		_, publicErr := os.Lstat(publicCommandPath(paths))
+		if !bundleMissing || !os.IsNotExist(publicErr) {
+			return err
+		}
+	}
+	return verifyCommittedOwnership(paths, journal, commit)
 }
 
 func bindCurrentAuthorityArtifacts(paths Paths, journal Journal, commitBytes []byte, inventory *OwnershipInventory) error {
