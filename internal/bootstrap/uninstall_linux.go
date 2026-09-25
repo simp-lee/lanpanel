@@ -993,7 +993,7 @@ func (removal ownedAccountRemoval) Remove() error {
 	}
 	for name := range users {
 		if _, lookupErr := osuser.Lookup(name); lookupErr == nil {
-			if err := exec.Command("userdel", "--system", name).Run(); err != nil {
+			if err := exec.Command("userdel", name).Run(); err != nil {
 				return fmt.Errorf("uninstall could not remove owned account %s: %w", name, err)
 			}
 		} else if _, ok := lookupErr.(osuser.UnknownUserError); !ok {
