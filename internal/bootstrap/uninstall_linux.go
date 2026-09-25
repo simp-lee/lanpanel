@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -966,6 +967,18 @@ func mutableServiceOwnedPath(path string) bool {
 	return false
 }
 
+func managedPublicDirectory(path string, stat *syscall.Stat_t) bool {
+	if stat == nil || path != "/etc/lanpanel-public" && path != "/etc/lanpanel-public/basic" || stat.Uid != 0 {
+		return false
+	}
+	group, err := osuser.LookupGroup("www-data")
+	if err != nil {
+		return false
+	}
+	gid, err := strconv.ParseUint(group.Gid, 10, 32)
+	return err == nil && stat.Gid == uint32(gid)
+}
+
 func removeOwnedLockFile(path string) error {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1017,7 +1030,8 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 		if info.Mode()&0o022 != 0 {
 			return fmt.Errorf("uninstall foreign directory metadata at %q", path)
 		}
-		if stat, ok := info.Sys().(*syscall.Stat_t); !ok || (stat.Uid != 0 || stat.Gid != 0) && !mutableServiceOwnedPath(path) {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || (stat.Uid != 0 || stat.Gid != 0) && !mutableServiceOwnedPath(path) && !managedPublicDirectory(path, stat) {
 			return fmt.Errorf("uninstall foreign directory ownership at %q", path)
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
