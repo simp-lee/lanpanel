@@ -269,7 +269,19 @@ func (store *EmergencyStore) Commit(lease *locks.Lease, role ClearRole, expected
 	return committer.Commit(role, expectedSequence, next)
 }
 
+func (store *EmergencyStore) commitReservedStopFenceClearProof(lease *locks.Lease, expectedSequence uint64, next EmergencyState) error {
+	committer, err := store.PrepareCommit(lease)
+	if err != nil {
+		return err
+	}
+	return committer.commit(RoleJournalConvergence, expectedSequence, next, true)
+}
+
 func (committer *EmergencyCommitter) Commit(role ClearRole, expectedSequence uint64, next EmergencyState) error {
+	return committer.commit(role, expectedSequence, next, false)
+}
+
+func (committer *EmergencyCommitter) commit(role ClearRole, expectedSequence uint64, next EmergencyState, allowReservedStopFenceClear bool) error {
 	if committer == nil || committer.used || committer.store == nil || !committer.lease.Active(locks.Exposure) {
 		return ErrEmergencyState
 	}
@@ -293,7 +305,7 @@ func (committer *EmergencyCommitter) Commit(role ClearRole, expectedSequence uin
 	if store.closed || store.current.Sequence != expectedSequence || next.Sequence != expectedSequence+1 {
 		return ErrEmergencySequence
 	}
-	if !validEmergencyTransition(role, store.current, next) {
+	if !validEmergencyTransition(role, store.current, next) && !(allowReservedStopFenceClear && validReservedStopFenceClearTransition(store.current, next)) {
 		return ErrEmergencyState
 	}
 	clear(store.slot[:])
@@ -400,6 +412,10 @@ func sameEmergencyObject(actual, expected unix.Stat_t) bool {
 
 func sameEmergencyDirectory(actual, expected unix.Stat_t) bool {
 	return actual.Dev == expected.Dev && actual.Ino == expected.Ino && actual.Mode == expected.Mode && actual.Uid == expected.Uid && actual.Gid == expected.Gid
+}
+
+func validReservedStopFenceClearTransition(current, next EmergencyState) bool {
+	return current.StopFence == nil && next.StopFence == nil && current.StopFenceSequence != 0 && current.ReservedStopFenceKind != StopFenceContraction && next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest && current.ClearProof == nil && next.ClearProof != nil && next.ClearProof.StopFenceGeneration == current.StopFenceSequence && validEmergencyClearProof(next.ClearProof, current)
 }
 
 func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool {

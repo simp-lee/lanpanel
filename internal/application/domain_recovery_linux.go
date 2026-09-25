@@ -1099,6 +1099,13 @@ func convergeInterruptedDomainActivation(ctx context.Context, service *FixedServ
 	next := fresh
 	next.Revision++
 	next.StopFence = nil
+	authority, err := service.safety.EmergencyAuthority()
+	if err != nil {
+		return err
+	}
+	next.AuthoritySequence = authority.Sequence
+	next.GlobalClose = authority.GlobalClose
+	next.StopFenceSequence = authority.StopFenceSequence
 	next.Resources = append([]safety.ResourceSafety(nil), fresh.Resources...)
 	unpublished := make(map[string]uint64, len(next.Resources))
 	found := false

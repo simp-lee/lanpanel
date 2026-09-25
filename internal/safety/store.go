@@ -411,6 +411,20 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err != nil {
 		return filetxn.Result{}, err
 	}
+	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && authority.ClearProof == nil && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
+	if supersededReservation {
+		if proof.StopFence == nil || !validStopClearProof(*current.StopFence, next, proof.StopFence) {
+			return filetxn.Result{}, fmt.Errorf("superseded activation fence lacks exact convergence proof")
+		}
+		nextAuthority := authority
+		nextAuthority.Sequence++
+		nextAuthority.ClearProof = &EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: next.StopFenceSequence, StopFenceDigest: proof.StopFence.FenceDigest, InventoryDigest: proof.StopFence.InventoryDigest, OwnedGraphDigest: proof.StopFence.OwnedGraphDigest, RuntimeClosureDigest: proof.StopFence.RuntimeClosureDigest, NginxTestPassed: proof.StopFence.NginxTestPassed, RuntimeClosed: proof.StopFence.RuntimeClosed}
+		if err := store.config.Emergency.commitReservedStopFenceClearProof(lease, authority.Sequence, nextAuthority); err != nil {
+			return filetxn.Result{}, err
+		}
+		authority = nextAuthority
+		next.AuthoritySequence = authority.Sequence
+	}
 	if next.AuthoritySequence != authority.Sequence || next.GlobalClose != authority.GlobalClose || next.StopFenceSequence != authority.StopFenceSequence {
 		return filetxn.Result{}, fmt.Errorf("normal safety state does not bind the current emergency generation authority")
 	}
