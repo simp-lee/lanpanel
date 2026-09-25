@@ -21,6 +21,7 @@ import (
 	"lanpanel/internal/process"
 	"lanpanel/internal/release"
 	appresource "lanpanel/internal/resource"
+	"lanpanel/internal/safety"
 	"os"
 	"os/exec"
 	osuser "os/user"
@@ -438,6 +439,35 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	}
 	if !present {
 		return fmt.Errorf("uninstall lifecycle installation authority is missing")
+	}
+	refreshArtifact := func(path string, verify func() error) error {
+		if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+			return nil
+		} else if statErr != nil {
+			return statErr
+		}
+		if verify != nil {
+			if err := verify(); err != nil {
+				return err
+			}
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if inventory.Artifacts == nil {
+			inventory.Artifacts = map[string]string{}
+		}
+		inventory.Artifacts[path] = release.DigestBytes(data)
+		return nil
+	}
+	if err := refreshArtifact(filepath.Join(paths.StateRoot, "normal.json"), nil); err != nil {
+		return fmt.Errorf("uninstall normal state is unavailable: %w", err)
+	}
+	if err := refreshArtifact(filepath.Join(paths.SafetyRoot, "state.json"), func() error {
+		return safety.VerifyStateFile(filepath.Join(paths.SafetyRoot, "state.json"), structOwner())
+	}); err != nil {
+		return fmt.Errorf("uninstall safety state is unavailable: %w", err)
 	}
 	known := make(map[string]bool, len(inventory.Paths))
 	for _, path := range inventory.Paths {

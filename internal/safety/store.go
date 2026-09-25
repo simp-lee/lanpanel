@@ -189,6 +189,55 @@ func (store *Store) Close() error { return errors.Join(store.txn.Close(), unix.C
 
 func (store *Store) Read() (State, error) { return store.read(true) }
 
+// VerifyStateFile validates the persisted safety document without requiring
+// the emergency and ownership stores to be open. It is used only while
+// resuming an already-authorized teardown whose staging directories may have
+// been removed by an earlier teardown attempt.
+func VerifyStateFile(path string, owner filetxn.Owner) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("safety state path is invalid")
+	}
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Base(path))
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("wrap independent safety state descriptor")
+	}
+	defer func(ignore func() error) { _ = ignore() }(file.Close)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Nlink != 1 || stat.Size > maxStateBytes {
+		return fmt.Errorf("independent safety state has unsafe type, owner, mode, links, or size")
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, maxStateBytes+1))
+	decoder.DisallowUnknownFields()
+	var state State
+	if err := decoder.Decode(&state); err != nil {
+		return fmt.Errorf("decode independent safety state: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("independent safety state contains trailing data")
+	}
+	if err := Validate(state); err != nil {
+		return err
+	}
+	checksum := state.Checksum
+	state.Checksum = ""
+	expected, err := stateChecksum(state)
+	if err != nil {
+		return err
+	}
+	if checksum != expected {
+		return fmt.Errorf("independent safety state checksum mismatch")
+	}
+	return nil
+}
+
 // ReadForContraction retains checksum and emergency high-water validation but
 // deliberately does not treat a damaged ownership tree as authority to narrow
 // ingress. The caller must force fallback stop when ownership is incomplete.
