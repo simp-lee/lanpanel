@@ -409,6 +409,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	if inventory == nil {
 		return fmt.Errorf("uninstall lifecycle inventory is missing")
 	}
+	if _, err := ensureDirectory(filepath.Join(paths.StateRoot, ".filetxn"), structOwner(), 0o700); err != nil {
+		return fmt.Errorf("uninstall lifecycle staging is unavailable: %w", err)
+	}
 	store, err := persist.Open(persist.Config{RootPath: paths.StateRoot, StagingPath: filepath.Join(paths.StateRoot, ".filetxn"), StatePath: filepath.Join(paths.StateRoot, "normal.json"), Owner: structOwner(), LockAuthority: authority})
 	if err != nil {
 		return fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
