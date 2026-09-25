@@ -1063,6 +1063,25 @@ func mutableServiceOwnedPath(path string) bool {
 	return false
 }
 
+func removeEmptyManagedRuntimeApps() error {
+	path := "/run/lanpanel/apps"
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&0o022 != 0 {
+		return fmt.Errorf("uninstall foreign runtime app staging")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 || stat.Gid != 0 {
+		return fmt.Errorf("uninstall foreign runtime app staging ownership")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return nil
+}
+
 func managedPublicDirectory(path string, stat *syscall.Stat_t) bool {
 	if stat == nil || path != "/etc/lanpanel-public" && path != "/etc/lanpanel-public/basic" || stat.Uid != 0 {
 		return false
@@ -1131,6 +1150,14 @@ func removeOwnedPath(path string, artifacts map[string]string, mutable []string)
 			return fmt.Errorf("uninstall foreign directory ownership at %q", path)
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if errors.Is(err, syscall.ENOTEMPTY) && path == "/run/lanpanel" {
+				if cleanupErr := removeEmptyManagedRuntimeApps(); cleanupErr == nil {
+					cleanupErr = os.Remove(path)
+					if cleanupErr == nil || errors.Is(cleanupErr, os.ErrNotExist) {
+						return nil
+					}
+				}
+			}
 			// Non-empty managed roots may contain external application data; retain
 			// them rather than recursively deleting user files.
 			if errors.Is(err, syscall.ENOTEMPTY) {
