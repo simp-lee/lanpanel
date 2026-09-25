@@ -1173,7 +1173,7 @@ func RunRole(args []string) error {
 			if err != nil {
 				return ExecutionResult{}, err
 			}
-			if _, err := host.Install(ctx, resourceID, units); err != nil {
+			if _, err := host.Install(ctx, resourceID, installationID, units); err != nil {
 				return ExecutionResult{}, err
 			}
 			journal.Phase = "activating"

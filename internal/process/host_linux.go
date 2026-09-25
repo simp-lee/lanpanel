@@ -105,7 +105,7 @@ func LoadConfinementProfile() (confinement.Profile, error) {
 	return profile, nil
 }
 
-func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) ([]string, error) {
+func (host Host) Install(ctx context.Context, resourceID, installationID string, units UnitSet) ([]string, error) {
 	if host.Launcher == nil {
 		return nil, fmt.Errorf("managed-process host launcher is missing")
 	}
@@ -154,7 +154,14 @@ func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) 
 		if err := ensureRootDirectory(staging, 0o700); err != nil {
 			return modified, err
 		}
-		store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: owner, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}}, filetxn.Options{})
+		parents := filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}
+		if item.path == paths.SysusersFile {
+			parents, err = resourceSysusersDirectoryPolicy(installationID)
+			if err != nil {
+				return modified, err
+			}
+		}
+		store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: owner, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: parents}, filetxn.Options{})
 		if err != nil {
 			return modified, err
 		}
@@ -170,7 +177,7 @@ func (host Host) Install(ctx context.Context, resourceID string, units UnitSet) 
 			_ = store.Close()
 			return modified, statErr
 		}
-		_, err = store.Put(ctx, filetxn.Request{Path: item.path, Parents: filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner}, AllowedMode: 0o755}, Existing: &metadata, New: metadata, MaxBytes: int64(len(item.data))}, item.data, disposition)
+		_, err = store.Put(ctx, filetxn.Request{Path: item.path, Parents: parents, Existing: &metadata, New: metadata, MaxBytes: int64(len(item.data))}, item.data, disposition)
 		closeErr := store.Close()
 		if err != nil || closeErr != nil {
 			return modified, errors.Join(err, closeErr)
@@ -582,22 +589,14 @@ func parseShowProperties(data []byte) (map[string][]string, error) {
 	return result, nil
 }
 
-func putManagedFile(ctx context.Context, path string, data []byte, mode os.FileMode, installationID string) error {
-	if err := ensureRootDirectory(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	staging := filepath.Join(filepath.Dir(path), ".lanpanel-filetxn")
-	if err := ensureRootDirectory(staging, 0o700); err != nil {
-		return err
-	}
+func resourceSysusersDirectoryPolicy(installationID string) (filetxn.DirectoryPolicy, error) {
 	owner := filetxn.Owner{UID: 0, GID: 0}
-	allowedParents := []filetxn.Owner{owner}
 	if installationID == "" {
-		return fmt.Errorf("managed-process installation identity is missing")
+		return filetxn.DirectoryPolicy{}, fmt.Errorf("managed-process installation identity is missing")
 	}
 	accounts, err := identity.InstallationAccounts(installationID)
 	if err != nil {
-		return err
+		return filetxn.DirectoryPolicy{}, err
 	}
 	var uiGroup string
 	for _, spec := range accounts.Specs {
@@ -607,18 +606,32 @@ func putManagedFile(ctx context.Context, path string, data []byte, mode os.FileM
 		}
 	}
 	if uiGroup == "" {
-		return fmt.Errorf("managed-process UI account authority is missing")
+		return filetxn.DirectoryPolicy{}, fmt.Errorf("managed-process UI account authority is missing")
 	}
 	group, err := user.LookupGroup(uiGroup)
 	if err != nil {
-		return err
+		return filetxn.DirectoryPolicy{}, err
 	}
 	gid, err := strconv.ParseUint(group.Gid, 10, 32)
 	if err != nil || gid == 0 {
-		return fmt.Errorf("managed-process UI group identity is invalid")
+		return filetxn.DirectoryPolicy{}, fmt.Errorf("managed-process UI group identity is invalid")
 	}
-	allowedParents = append(allowedParents, filetxn.Owner{UID: 0, GID: uint32(gid)})
-	parents := filetxn.DirectoryPolicy{AllowedOwners: allowedParents, AllowedMode: 0o755}
+	return filetxn.DirectoryPolicy{AllowedOwners: []filetxn.Owner{owner, {UID: 0, GID: uint32(gid)}}, AllowedMode: 0o755}, nil
+}
+
+func putManagedFile(ctx context.Context, path string, data []byte, mode os.FileMode, installationID string) error {
+	if err := ensureRootDirectory(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	staging := filepath.Join(filepath.Dir(path), ".lanpanel-filetxn")
+	if err := ensureRootDirectory(staging, 0o700); err != nil {
+		return err
+	}
+	owner := filetxn.Owner{UID: 0, GID: 0}
+	parents, err := resourceSysusersDirectoryPolicy(installationID)
+	if err != nil {
+		return err
+	}
 	store, err := filetxn.Open(filetxn.Config{RootPath: "/", Root: filetxn.Metadata{Owner: owner, Mode: 0o755}, StagingPath: staging, Staging: filetxn.Metadata{Owner: owner, Mode: 0o700}, StagingParents: parents}, filetxn.Options{})
 	if err != nil {
 		return err
