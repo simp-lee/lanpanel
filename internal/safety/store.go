@@ -411,7 +411,7 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err != nil {
 		return filetxn.Result{}, err
 	}
-	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && authority.ClearProof == nil && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
+	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0) && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
 	if supersededReservation {
 		if proof.StopFence == nil || !validStopClearProof(*current.StopFence, next, proof.StopFence) {
 			return filetxn.Result{}, fmt.Errorf("superseded activation fence lacks exact convergence proof")
