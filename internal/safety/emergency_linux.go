@@ -305,7 +305,7 @@ func (committer *EmergencyCommitter) commit(role ClearRole, expectedSequence uin
 	if store.closed || store.current.Sequence != expectedSequence || next.Sequence != expectedSequence+1 {
 		return ErrEmergencySequence
 	}
-	if !validEmergencyTransition(role, store.current, next) && !(allowReservedStopFenceClear && validReservedStopFenceClearTransition(store.current, next)) {
+	if !validEmergencyTransition(role, store.current, next) && (!allowReservedStopFenceClear || !validReservedStopFenceClearTransition(store.current, next)) {
 		return ErrEmergencyState
 	}
 	clear(store.slot[:])
