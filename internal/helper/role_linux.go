@@ -100,10 +100,12 @@ func RunRole(args []string) error {
 		recordRecovery("journal-less certificate intents", application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
 		recordRecovery("unstarted certificate journals", application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
 	}
+	// Resource-create recovery must establish the safety identity before
+	// certificate recovery reads the shared safety authority.
+	recordRecovery("resource creates", application.ReconcileResourceCreates(context.Background()))
 	recordRecovery("completed certificate renewals", application.ReconcileCompletedCertificateRenewals(context.Background()))
 	recordRecovery("interrupted domain publications", application.ReconcileInterruptedDomainPublications(context.Background()))
 	recordRecovery("certificate expiries", application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))
-	recordRecovery("resource creates", application.ReconcileResourceCreates(context.Background()))
 	recordRecovery("resource updates", application.ReconcileResourceUpdates(context.Background()))
 	recordRecovery("journal-less processes", application.ReconcileJournalLessProcesses(context.Background()))
 	if host, hostErr := managedprocess.NewFixedHost(); hostErr == nil {
