@@ -38,6 +38,9 @@ func TestFixedHelperServiceAllowsBootstrapJournalWrites(t *testing.T) {
 	if !strings.Contains(unit, "ReadWritePaths=/var/lib/lanpanel /var/lib/lanpanel.bootstrap-journal ") {
 		t.Fatalf("helper unit does not allow bootstrap journal writes: %s", unit)
 	}
+	if !strings.Contains(unit, " /boot /etc\n") {
+		t.Fatalf("helper unit does not allow sysusers account database writes: %s", unit)
+	}
 	nginxUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service")])
 	if !strings.Contains(nginxUnit, " /var/lib/lanpanel.bootstrap-journal /var/lib/lanpanel/locks") {
 		t.Fatalf("Nginx unit does not allow bootstrap journal reads: %s", nginxUnit)
