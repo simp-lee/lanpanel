@@ -44,7 +44,6 @@ type Result struct {
 	ExitCode       int
 	StdoutDigest   string
 	Stdout         []byte
-	Stderr         []byte
 	StderrDigest   string
 	OutputCutOff   bool
 	PackageChanges []PackageChange
@@ -202,7 +201,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	if command.ProcessState != nil {
 		exitCode = command.ProcessState.ExitCode()
 	}
-	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), Stdout: stdout.Bytes(), StderrDigest: stderr.Digest(), Stderr: stderr.Bytes(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
+	result := Result{ExitCode: exitCode, StdoutDigest: stdout.Digest(), Stdout: stdout.Bytes(), StderrDigest: stderr.Digest(), OutputCutOff: stdout.CutOff() || stderr.CutOff(), PackageChanges: []PackageChange{}}
 	stdout.Destroy()
 	stderr.Destroy()
 	if profileID == ProfileAPTSimulate && exitCode == 0 && !result.OutputCutOff {
