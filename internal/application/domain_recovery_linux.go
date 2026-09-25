@@ -323,6 +323,41 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			}
 			continue
 		}
+		if authority.Reactivating != nil && resource.PublicationRecord.State == domain.PublicationUnpublished && activationIntent == nil {
+			record, err := jobs.LoadEntries(document.Entries, resource.PublicationRecord.LastJobID)
+			if err != nil || record.Result != jobs.ResultInterrupted || len(record.Postconditions) != 1 || record.Postconditions[0].Kind != "interrupted_activation_contracted" {
+				return fmt.Errorf("reactivating interrupted publication evidence changed")
+			}
+			mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.manager.Authority()})
+			if err != nil {
+				return err
+			}
+			mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resource.ID, service.manager)
+			if err == nil {
+				host, hostErr := activation.NewFixedHost()
+				err = hostErr
+				if hostErr == nil {
+					err = host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID)
+				}
+				if err == nil {
+					generation := authority.GenerationSequence + 1
+					err = convergeInterruptedDomainActivation(ctx, service, exposure, resource.ID, generation, record.Postconditions[0].Identity, authority.Reactivating.PlanID)
+					if err == nil {
+						_, err = contractClosedPublicationOwnership(ctx, service, exposure, resource.ID, resource.PublicationRecord.LastJobID, generation)
+					}
+				}
+			}
+			releaseErr := operations.ReleaseExposure(mutation, exposure)
+			closeErr := mutationSet.Close()
+			if err := errors.Join(err, releaseErr, closeErr); err != nil {
+				return err
+			}
+			state, err = readPublicationRecoverySafety(ctx, service)
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		if authority.Reactivating != nil && resource.PublicationRecord.State == domain.PublicationPublished && activationIntent == nil {
 			if err := convergeCommittedDomainPublication(ctx, service, resource, *authority.Reactivating); err != nil {
 				return err
@@ -386,6 +421,12 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_ = mutationSet.Close()
 			return err
 		}
+		activationFencePresent := fresh.StopFence != nil
+		if activationFencePresent && (fresh.StopFence.Kind != safety.StopFenceIngressActivation || fresh.StopFence.Scope.Kind != "app" || fresh.StopFence.Scope.ResourceID != resource.ID || fresh.StopFence.IngressActivation == nil || fresh.StopFence.IngressActivation.IntentRef != activationIntent.PlanID || fresh.StopFence.IngressActivation.CandidateGeneration != activationIntent.Generation || fresh.StopFence.IngressActivation.PriorGeneration+1 != activationIntent.Generation) {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("interrupted domain activation stop fence authority changed")
+		}
 		owned, ownerErr := service.ownership.Read(resource.ID)
 		if ownerErr != nil {
 			_ = operations.ReleaseExposure(mutation, exposure)
@@ -442,7 +483,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_ = mutationSet.Close()
 			return fmt.Errorf("reactivating publication safety resource missing")
 		}
-		if safetyChanged {
+		if safetyChanged && !activationFencePresent {
 			if _, err := service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{}); err != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
@@ -479,7 +520,14 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			err = host.AcknowledgeContraction(context.WithoutCancel(ctx), resource.ID)
 		}
 		if err == nil && pointerErr == nil {
-			err = convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, generation, result.RuntimeDigest, "interrupted_domain_activation")
+			if activationFencePresent {
+				err = convergeInterruptedDomainActivation(ctx, service, exposure, resource.ID, generation, result.RuntimeDigest, activationIntent.PlanID)
+				if err == nil {
+					_, err = contractClosedPublicationOwnership(ctx, service, exposure, resource.ID, activationIntent.JobID, generation)
+				}
+			} else {
+				err = convergeInterruptedDomainClosing(ctx, service, exposure, resource.ID, generation, result.RuntimeDigest, "interrupted_domain_activation")
+			}
 		}
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
 		closeErr := mutationSet.Close()
@@ -1012,6 +1060,67 @@ func stopRecoveredGoAccess(ctx context.Context, service *FixedService, exposure 
 			err = errors.Join(err, currentErr)
 		}
 	}
+	return err
+}
+
+func convergeInterruptedDomainActivation(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID string, generation uint64, runtimeDigest, planID string) error {
+	if service == nil || exposure == nil || resourceID == "" || generation == 0 || planID == "" || runtimeDigest == "" {
+		return fmt.Errorf("interrupted domain activation convergence authority is incomplete")
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	_, resource, err := loadCertificateResource(document.Entries, resourceID)
+	if err != nil {
+		return err
+	}
+	if resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.LastJobID == "" {
+		return fmt.Errorf("interrupted domain activation normal state changed")
+	}
+	record, err := jobs.LoadEntries(document.Entries, resource.PublicationRecord.LastJobID)
+	if err != nil {
+		return err
+	}
+	if record.Status != jobs.StatusTerminal || record.Result != jobs.ResultInterrupted || len(record.Postconditions) != 1 || record.Postconditions[0].Kind != "interrupted_activation_contracted" || record.Postconditions[0].Identity != runtimeDigest {
+		return fmt.Errorf("interrupted domain activation job evidence changed")
+	}
+	fresh, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if generation <= 1 || fresh.StopFence == nil || fresh.StopFence.Kind != safety.StopFenceIngressActivation || fresh.StopFence.Scope.Kind != "app" || fresh.StopFence.Scope.ResourceID != resourceID || fresh.StopFence.IngressActivation == nil || fresh.StopFence.IngressActivation.IntentRef != planID || fresh.StopFence.IngressActivation.CandidateGeneration != generation-1 || fresh.StopFence.IngressActivation.PriorGeneration+1 != generation-1 {
+		return fmt.Errorf("interrupted domain activation stop fence changed")
+	}
+	fence := *fresh.StopFence
+	next := fresh
+	next.Revision++
+	next.StopFence = nil
+	next.Resources = append([]safety.ResourceSafety(nil), fresh.Resources...)
+	unpublished := make(map[string]uint64, len(next.Resources))
+	found := false
+	for index := range next.Resources {
+		item := &next.Resources[index]
+		if item.ResourceID == resourceID {
+			if item.Reactivating == nil || item.Reactivating.Generation != generation-1 || item.Reactivating.PlanID != planID {
+				return fmt.Errorf("interrupted domain activation reactivation authority changed")
+			}
+			item.GenerationSequence = generation
+			item.Reactivating = nil
+			item.Closing = nil
+			item.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: "interrupted_domain_activation"}
+			found = true
+		}
+		if item.StickyUnpublished == nil || item.ChallengePending != nil || item.Reactivating != nil {
+			return fmt.Errorf("interrupted domain activation stop fence does not cover every resource")
+		}
+		unpublished[item.ResourceID] = item.StickyUnpublished.Generation
+	}
+	if !found {
+		return fmt.Errorf("interrupted domain activation safety resource missing")
+	}
+	proof := &safety.StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, FenceDigest: safety.StopFenceDigest(fence), JournalRef: fence.IngressActivation.IntentRef, InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: runtimeDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}
+	_, err = service.safety.Commit(ctx, exposure, safety.RoleJournalConvergence, fresh.Revision, next, safety.TransitionProof{StopFence: proof})
 	return err
 }
 
