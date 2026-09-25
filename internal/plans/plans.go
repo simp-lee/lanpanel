@@ -487,7 +487,7 @@ func Match(plan Plan, binding Binding, now time.Time) error {
 		return fmt.Errorf("Plan binding changed")
 	}
 	for _, evidence := range binding.Evidence {
-		if evidence.ObservedAt.After(now) || evidence.ObservedAt.Before(plan.CreatedAt) || now.Sub(evidence.ObservedAt) > MaximumEvidenceAge {
+		if evidence.ObservedAt.After(now) || now.Sub(evidence.ObservedAt) > MaximumEvidenceAge {
 			return fmt.Errorf("Plan prerequisite evidence is stale")
 		}
 	}

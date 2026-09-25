@@ -944,6 +944,10 @@ func (s *FixedService) createDomainPublishPlan(ctx context.Context, authority st
 	if err != nil {
 		return plans.Plan{}, err
 	}
+	preflightEvidence.Digest, err = headscalePreflightObservationDigest(preflightResult)
+	if err != nil {
+		return plans.Plan{}, err
+	}
 	readiness, err := probeResourceTarget(ctx, resource)
 	if err != nil {
 		return plans.Plan{}, err

@@ -72,6 +72,48 @@ func TestTemporaryPublicationPlanRequiresFreshEvidenceDigests(t *testing.T) {
 	}
 }
 
+func TestDomainPublicationPlanAllowsFreshClockObservation(t *testing.T) {
+	now := time.Now().UTC()
+	_, result := headscaleDeployPreflight(t, now)
+	result.Scope = string(preflight.ExpansionDomainHTTPS)
+	result.Target = "resource/res_00000000000000000000000000000001"
+	result.ObservedAt = now
+	result.ValidUntil = now.Add(preflight.MaximumAge)
+	preflightEvidence, err := result.PlanEvidence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflightEvidence.Digest, err = headscalePreflightObservationDigest(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := domain.AppResource{ID: "res_00000000000000000000000000000001", CurrentConfigDigest: deployTestDigest("config"), PublicationRecord: domain.PublicationRecord{UnpublishedGeneration: 1}}
+	ready := target.Evidence{ResourceID: resource.ID, ConfigDigest: resource.CurrentConfigDigest, Digest: deployTestDigest("ready"), ObservedAt: now}
+	source := plans.Evidence{Kind: "domain_sources", Identity: "resource/" + resource.ID, Generation: 1, Digest: deployTestDigest("sources"), ObservedAt: now}
+	plan := plans.Plan{Operation: string(domain.OperationPublish), Target: plans.Target{Kind: plans.TargetResource, ID: resource.ID}, ActorIdentity: "ui/session/generation/1", Config: plans.DigestBinding{Applicable: true, Digest: resource.CurrentConfigDigest}, Evidence: []plans.Evidence{preflightEvidence, {Kind: "target_readiness", Identity: "resource/" + resource.ID, Generation: 0, Digest: ready.Digest, ObservedAt: now}, {Kind: "acme_binding", Identity: "resource/" + resource.ID, Generation: 2, Digest: deployTestDigest("acme"), ObservedAt: now}, source}}
+	fresh := result
+	fresh.ObservedAt = now.Add(-time.Second)
+	fresh.ValidUntil = fresh.ObservedAt.Add(preflight.MaximumAge)
+	for index := range fresh.Findings {
+		if fresh.Findings[index].Code == "trusted_clock" {
+			fresh.Findings[index].Identity = "kernel/" + fresh.ObservedAt.Format(time.RFC3339Nano)
+		}
+	}
+	freshReady := ready
+	freshReady.ObservedAt = fresh.ObservedAt
+	freshSource := source
+	freshSource.ObservedAt = fresh.ObservedAt
+	if !domainPublicationPlanMatches(plan, resource, fresh, freshReady, deployTestDigest("acme"), freshSource) {
+		t.Fatal("fresh trusted-clock observation invalidated semantic domain publication Plan")
+	}
+	changed := fresh
+	changed.Findings = append([]preflight.Finding(nil), fresh.Findings...)
+	changed.Findings[0].Identity = deployTestDigest("changed-preflight")
+	if domainPublicationPlanMatches(plan, resource, changed, freshReady, deployTestDigest("acme"), freshSource) {
+		t.Fatal("changed domain preflight retained Plan authority")
+	}
+}
+
 func TestFailedPublicationStopsNginxDespiteReloadOrContractionFailure(t *testing.T) {
 	host := &publicationFailureHostProbe{exhaustReload: true}
 	_, reloadErr, stopErr := shutdownFailedPublicationRuntime(host, nil, 10*time.Millisecond, time.Second)

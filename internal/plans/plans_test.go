@@ -205,6 +205,18 @@ func TestPlanDisplayTextIsBounded(t *testing.T) {
 	}
 }
 
+func TestMatchAllowsEvidenceObservedBeforePlanCreation(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	plan := validPlan(now.Add(time.Second))
+	binding := bindingFor(plan)
+	if err := Validate(plan, plan.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := Match(plan, binding, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("Match rejected evidence observed before Plan creation: %v", err)
+	}
+}
+
 func validSpec(now time.Time) Spec {
 	return Spec{Operation: "publish", Target: Target{Kind: TargetResource, ID: "app-one"}, ActorIdentity: "session-one", Config: DigestBinding{Applicable: true, Digest: digestFor("config")}, Applied: DigestBinding{Applicable: true, Digest: digestFor("applied")}, Evidence: []Evidence{{Kind: "config", Identity: "app-one", Generation: 1, Digest: digestFor("evidence"), ObservedAt: now}}, ExposureSummary: "expands_ingress", Prerequisites: "qualified", Lifetime: MaximumLifetime}
 }

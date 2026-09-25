@@ -108,6 +108,11 @@ func domainPublicationPlanMatches(plan plans.Plan, resource domain.AppResource, 
 	if err != nil {
 		return false
 	}
+	semanticDigest, err := headscalePreflightObservationDigest(result)
+	if err != nil {
+		return false
+	}
+	preflightEvidence.Digest = semanticDigest
 	matchedPreflight, matchedReadiness, matchedACME, matchedSources := false, false, false, false
 	for _, evidence := range plan.Evidence {
 		switch {
