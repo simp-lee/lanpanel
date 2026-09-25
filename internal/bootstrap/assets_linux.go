@@ -95,7 +95,7 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	}
 	defer func() { _ = unix.Close(parentFD) }()
 	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 && !(path == "/var/log/lanpanel" && parentStat.Mode&0o002 == 0) {
+	if err := unix.Fstat(parentFD, &parentStat); err != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Mode&0o022 != 0 && (path != "/var/log/lanpanel" || parentStat.Mode&0o002 != 0) {
 		return false, fmt.Errorf("bootstrap directory parent is unsafe for %q", path)
 	}
 	created := false
