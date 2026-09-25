@@ -153,6 +153,14 @@ func verifyEffectiveDirectives(directives []string, effective map[string][]strin
 		if listProperty(name) {
 			actual = splitPropertyValues(actual)
 			values = splitPropertyValues(values)
+			if name == "BindReadOnlyPaths" || name == "BindPaths" {
+				for index := range actual {
+					actual[index] = canonicalMountValue(actual[index])
+				}
+				for index := range values {
+					values[index] = canonicalMountValue(values[index])
+				}
+			}
 		}
 		slices.Sort(actual)
 		slices.Sort(values)
@@ -259,6 +267,18 @@ func listProperty(name string) bool {
 		return true
 	}
 	return false
+}
+
+func canonicalMountValue(value string) string {
+	parts := strings.Split(value, ":")
+	switch len(parts) {
+	case 1:
+		return value + ":" + value + ":rbind"
+	case 2:
+		return value + ":rbind"
+	default:
+		return value
+	}
 }
 
 func splitPropertyValues(values []string) []string {
