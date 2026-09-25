@@ -138,11 +138,6 @@ func Execute(args []string) error {
 		}
 		environment = append(environment, values...)
 	}
-	for capability := 0; capability <= 63; capability++ {
-		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && err != unix.EINVAL && err != unix.EPERM {
-			return err
-		}
-	}
 	if err := unix.Setgroups(nil); err != nil {
 		return err
 	}
@@ -157,6 +152,11 @@ func Execute(args []string) error {
 	}
 	if os.Geteuid() != int(authority.UID) || os.Getegid() != int(authority.GID) {
 		return fmt.Errorf("managed executor failed to enter exact identity")
+	}
+	for capability := 0; capability <= 63; capability++ {
+		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && err != unix.EINVAL && err != unix.EPERM {
+			return err
+		}
 	}
 	if err := dropManagedCapabilities(); err != nil {
 		return err
