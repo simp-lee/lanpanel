@@ -81,33 +81,38 @@ func RunRole(args []string) error {
 	deleteRecoveryErr := application.ReconcileResourceDeletes(context.Background())
 	adminRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
 	var otherRecoveryErr error
-	recordRecovery := func(err error) { otherRecoveryErr = errors.Join(otherRecoveryErr, err) }
-	recordRecovery(deleteRecoveryErr)
-	recordRecovery(application.ReconcileStaticRootRegistrations(context.Background()))
+	recordRecovery := func(label string, err error) {
+		if err != nil {
+			log.Printf("startup recovery %s: %v", label, err)
+		}
+		otherRecoveryErr = errors.Join(otherRecoveryErr, err)
+	}
+	recordRecovery("resource deletes", deleteRecoveryErr)
+	recordRecovery("static roots", application.ReconcileStaticRootRegistrations(context.Background()))
 	connectorCleanupErr := cleanupConnectorLoginSecrets()
-	recordRecovery(connectorCleanupErr)
+	recordRecovery("connector cleanup", connectorCleanupErr)
 	childClosure, childErr := child.ObserveExclusiveCurrentCgroup()
-	recordRecovery(childErr)
+	recordRecovery("child cgroup", childErr)
 	if childErr == nil {
-		recordRecovery(application.ReconcileInterruptedEntityMutations(context.Background(), childClosure, connectorCleanupErr))
-		recordRecovery(application.ReconcileManagedBasic(context.Background(), childClosure))
-		recordRecovery(application.ReconcileCertificateChallenges(context.Background(), childClosure))
-		recordRecovery(application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
-		recordRecovery(application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
+		recordRecovery("entity mutations", application.ReconcileInterruptedEntityMutations(context.Background(), childClosure, connectorCleanupErr))
+		recordRecovery("managed Basic", application.ReconcileManagedBasic(context.Background(), childClosure))
+		recordRecovery("certificate challenges", application.ReconcileCertificateChallenges(context.Background(), childClosure))
+		recordRecovery("journal-less certificate intents", application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
+		recordRecovery("unstarted certificate journals", application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
 	}
-	recordRecovery(application.ReconcileCompletedCertificateRenewals(context.Background()))
-	recordRecovery(application.ReconcileInterruptedDomainPublications(context.Background()))
-	recordRecovery(application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))
-	recordRecovery(application.ReconcileResourceCreates(context.Background()))
-	recordRecovery(application.ReconcileResourceUpdates(context.Background()))
-	recordRecovery(application.ReconcileJournalLessProcesses(context.Background()))
+	recordRecovery("completed certificate renewals", application.ReconcileCompletedCertificateRenewals(context.Background()))
+	recordRecovery("interrupted domain publications", application.ReconcileInterruptedDomainPublications(context.Background()))
+	recordRecovery("certificate expiries", application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))
+	recordRecovery("resource creates", application.ReconcileResourceCreates(context.Background()))
+	recordRecovery("resource updates", application.ReconcileResourceUpdates(context.Background()))
+	recordRecovery("journal-less processes", application.ReconcileJournalLessProcesses(context.Background()))
 	if host, hostErr := managedprocess.NewFixedHost(); hostErr == nil {
-		recordRecovery(managedprocess.ReconcileJournals(context.Background(), host, application.ReconcileInterruptedProcess))
+		recordRecovery("process journals", managedprocess.ReconcileJournals(context.Background(), host, application.ReconcileInterruptedProcess))
 	} else {
-		recordRecovery(hostErr)
+		recordRecovery("managed process host", hostErr)
 	}
-	recordRecovery(reconcileStartupContraction(context.Background()))
-	recordRecovery(application.ReconcileTerminalNginxContraction(context.Background()))
+	recordRecovery("startup contraction", reconcileStartupContraction(context.Background()))
+	recordRecovery("terminal Nginx contraction", application.ReconcileTerminalNginxContraction(context.Background()))
 	if recoveryErr := errors.Join(adminRecoveryErr, otherRecoveryErr); recoveryErr != nil {
 		log.Printf("startup recovery incomplete: %v", recoveryErr)
 	}
