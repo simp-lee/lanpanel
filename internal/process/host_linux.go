@@ -60,7 +60,7 @@ func (host Host) InstallAccounts(ctx context.Context, set identity.ResourceAccou
 	}
 	result, runErr := host.Launcher.RunInvocation(ctx, child.ProfileResourceAccounts, child.Invocation{Resource: &child.ResourceInvocation{ResourceID: set.ResourceID}}, nil)
 	if runErr != nil || result.ExitCode != 0 || result.OutputCutOff {
-		return identity.ResourceAccountSet{}, []string{paths.SysusersFile}, fmt.Errorf("resource account creation failed: %w; stderr=%q", runErr, string(result.Stderr))
+		return identity.ResourceAccountSet{}, []string{paths.SysusersFile}, fmt.Errorf("resource account creation failed: %w; stdout=%q stderr=%q", runErr, string(result.Stdout), string(result.Stderr))
 	}
 	present, identities, err = identity.InspectResourceAccountFiles(set, "/etc/passwd", "/etc/group", "/etc/shadow")
 	if err != nil || !present {
