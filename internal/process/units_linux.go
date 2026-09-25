@@ -14,7 +14,6 @@ import (
 	"lanpanel/internal/resource"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -178,7 +177,7 @@ func relayBackend(relay bool, value string) string {
 	}
 	return ""
 }
-func escapeSystemd(value string) string { return strconv.Quote(value) }
+func escapeSystemd(value string) string { return value }
 func digest(value []byte) string {
 	sum := sha256.Sum256(value)
 	return "sha256:" + hex.EncodeToString(sum[:])
