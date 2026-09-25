@@ -295,7 +295,11 @@ func TestProcessGroupStatParsingIsExact(t *testing.T) {
 }
 
 func TestAPTSimulationReturnsOnlyCanonicalExactChanges(t *testing.T) {
-	changes, err := parseAPTSimulation([]byte("Reading package lists...\nInst nginx (1.22.1-9 Debian [amd64])\nInst goaccess (1.9.3-1 Debian [amd64])\nConf nginx (1.22.1-9 Debian [amd64])\n"))
+	changes, err := parseAPTSimulation([]byte("Reading package lists...\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"))
+	if err != nil || len(changes) != 0 {
+		t.Fatalf("no-op changes=%#v error=%v", changes, err)
+	}
+	changes, err = parseAPTSimulation([]byte("Reading package lists...\nInst nginx (1.22.1-9 Debian [amd64])\nInst goaccess (1.9.3-1 Debian [amd64])\nConf nginx (1.22.1-9 Debian [amd64])\n"))
 	if err != nil || len(changes) != 2 || changes[0].Name != "goaccess" || changes[1].Version != "1.22.1-9" {
 		t.Fatalf("changes=%#v error=%v", changes, err)
 	}

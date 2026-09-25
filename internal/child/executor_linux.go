@@ -758,7 +758,7 @@ func parseAPTSimulation(output []byte) ([]PackageChange, error) {
 		}
 		changes = append(changes, PackageChange{Name: name, Version: version})
 	}
-	if err := scanner.Err(); err != nil || len(changes) == 0 || len(changes) > 256 {
+	if err := scanner.Err(); err != nil || len(changes) > 256 {
 		return nil, fmt.Errorf("APT simulation output is missing, malformed, or unbounded")
 	}
 	slices.SortFunc(changes, func(left, right PackageChange) int { return strings.Compare(left.Name, right.Name) })
