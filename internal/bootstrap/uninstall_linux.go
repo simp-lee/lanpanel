@@ -418,6 +418,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	if inventory == nil {
 		return fmt.Errorf("uninstall lifecycle inventory is missing")
 	}
+	if _, err := os.Lstat(filepath.Join(paths.StateRoot, "normal.json")); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
+	}
 	if _, err := ensureDirectory(filepath.Join(paths.StateRoot, ".filetxn"), structOwner(), 0o700); err != nil {
 		return fmt.Errorf("uninstall lifecycle staging is unavailable: %w", err)
 	}
@@ -703,6 +708,11 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 func structOwner() filetxn.Owner { return filetxn.Owner{UID: 0, GID: 0} }
 
 func readLifecycleInstallation(paths Paths, authority locks.Authority) (domain.Installation, error) {
+	if _, err := os.Lstat(filepath.Join(paths.StateRoot, "normal.json")); errors.Is(err, os.ErrNotExist) {
+		return domain.Installation{}, nil
+	} else if err != nil {
+		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
+	}
 	store, err := persist.Open(persist.Config{RootPath: paths.StateRoot, StagingPath: filepath.Join(paths.StateRoot, ".filetxn"), StatePath: filepath.Join(paths.StateRoot, "normal.json"), Owner: structOwner(), LockAuthority: authority})
 	if err != nil {
 		return domain.Installation{}, fmt.Errorf("uninstall lifecycle state is unavailable: %w", err)
@@ -890,8 +900,11 @@ func prepareOwnedAccounts(journal Journal, installation domain.Installation) (ow
 		}
 	}
 	removal := ownedAccountRemoval{sets: sets}
+	resourceSets := make(map[string]bool)
 	for _, resource := range installation.Resources {
-		set, err := identity.ResourceAccounts(installation.InstallationID, resource.ID, resource.ManagedProcess != nil && resource.ManagedProcess.Applied != nil && resource.ManagedProcess.Applied.RelayRequired)
+		relay := resource.ManagedProcess != nil && resource.ManagedProcess.Applied != nil && resource.ManagedProcess.Applied.RelayRequired
+		resourceSets[resource.ID] = relay
+		set, err := identity.ResourceAccounts(installation.InstallationID, resource.ID, relay)
 		if err != nil {
 			return ownedAccountRemoval{}, err
 		}
@@ -916,7 +929,48 @@ func prepareOwnedAccounts(journal Journal, installation domain.Installation) (ow
 			removal.resourceSets = append(removal.resourceSets, ga)
 		}
 	}
+	if err := recoverOwnedResourceAccounts(journal.InstallationID, resourceSets, &removal); err != nil {
+		return ownedAccountRemoval{}, err
+	}
 	return removal, nil
+}
+
+func recoverOwnedResourceAccounts(installationID string, known map[string]bool, removal *ownedAccountRemoval) error {
+	data, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return fmt.Errorf("uninstall cannot inspect resource account authority: %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.SplitN(line, ":", 7)
+		if len(fields) != 7 {
+			continue
+		}
+		comment := strings.Fields(fields[4])
+		if len(comment) != 4 || comment[0] != "LanPanel" || comment[1] != installationID || !strings.HasPrefix(comment[2], "res_") || comment[3] != "application" && comment[3] != "relay" {
+			continue
+		}
+		resourceID := comment[2]
+		relay := comment[3] == "relay"
+		if existing, ok := known[resourceID]; ok {
+			if existing || !relay {
+				continue
+			}
+		}
+		set, err := identity.ResourceAccounts(installationID, resourceID, relay)
+		if err != nil {
+			return err
+		}
+		present, identities, err := identity.InspectResourceAccountFiles(set, "/etc/passwd", "/etc/group", "/etc/shadow")
+		if err != nil {
+			return fmt.Errorf("uninstall resource account ownership is incomplete: %w", err)
+		}
+		if present {
+			set.Identities = identities
+			removal.resourceSets = append(removal.resourceSets, set)
+			known[resourceID] = relay
+		}
+	}
+	return nil
 }
 
 func (removal ownedAccountRemoval) Remove() error {
