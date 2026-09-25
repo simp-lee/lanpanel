@@ -468,6 +468,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			return add(path, true)
 		})
 	}
+	if err := add(filepath.Join(paths.PersistentRoot, "installation", "acme-account.contact"), true); err != nil {
+		return err
+	}
 	if paths == FixedPaths() {
 		auditPath := nginx.FixedPaths().AuditPath
 		delete(inventory.Artifacts, auditPath)
