@@ -77,8 +77,11 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 		return nil, fmt.Errorf("package simulation child is unavailable")
 	}
 	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, false), nil)
-	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
-		return nil, fmt.Errorf("exact package simulation failed")
+	if err != nil {
+		return nil, fmt.Errorf("exact package simulation failed: %w", err)
+	}
+	if result.ExitCode != 0 || result.OutputCutOff {
+		return nil, fmt.Errorf("exact package simulation failed: exit code %d, output cut off %t", result.ExitCode, result.OutputCutOff)
 	}
 	if len(result.PackageChanges) == 0 {
 		if plan.Mode == DistroRepository && !plan.FirstNginxInstall {
