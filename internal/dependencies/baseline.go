@@ -293,6 +293,9 @@ func onlyDigitsAndDots(value string) bool {
 }
 
 func floating(value string) bool {
+	if pinnedTailscaleStableArtifact(value) {
+		return false
+	}
 	lower := strings.ToLower(value)
 	if parsed, err := url.Parse(lower); err == nil && parsed.Scheme != "" {
 		lower = parsed.Path
@@ -330,6 +333,19 @@ func decodeCanonical(data []byte, destination any) error {
 func digestBytes(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+func pinnedTailscaleStableArtifact(value string) bool {
+	parsed, err := url.Parse(strings.ToLower(value))
+	if err != nil || parsed.Scheme != "https" || parsed.Host != "pkgs.tailscale.com" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path == "" || path.Dir(parsed.Path) != "/stable" {
+		return false
+	}
+	name := path.Base(parsed.Path)
+	if !strings.HasPrefix(name, "tailscale_") || !strings.HasSuffix(name, "_amd64.tgz") {
+		return false
+	}
+	version := strings.TrimSuffix(strings.TrimPrefix(name, "tailscale_"), "_amd64.tgz")
+	return versionPattern.MatchString(version)
 }
 
 func validDigest(value string) bool {

@@ -171,7 +171,8 @@ func buildBaseline(dependencyPath string) (dependencies.Baseline, error) {
 		if name == "tailscale" {
 			component = "tailscale-client"
 		}
-		selections = append(selections, dependencies.Selection{Component: component, SourceKind: dependencies.SourceCanonicalArtifact, SelectedVersion: dep.Version, LatestStableVersion: dep.Version, LatestStablePublishedAt: dep.PublishedAt.UTC(), MetadataSource: dep.MetadataSource, MetadataSnapshotDigest: dep.MetadataDigest, OperatingSystem: "linux", Architecture: "amd64", ArtifactIdentity: dep.Source.URL, ArtifactDigest: dep.Source.Asset.SHA256})
+		metadataSource := strings.TrimSuffix(dep.MetadataSource, "/latest") + "/tags/v" + dep.Version
+		selections = append(selections, dependencies.Selection{Component: component, SourceKind: dependencies.SourceCanonicalArtifact, SelectedVersion: dep.Version, LatestStableVersion: dep.Version, LatestStablePublishedAt: dep.PublishedAt.UTC(), MetadataSource: metadataSource, MetadataSnapshotDigest: dep.MetadataDigest, OperatingSystem: "linux", Architecture: "amd64", ArtifactIdentity: dep.Source.URL, ArtifactDigest: dep.Source.Asset.SHA256})
 	}
 	sort.Slice(selections, func(left, right int) bool { return selections[left].Component < selections[right].Component })
 	return dependencies.Baseline{SchemaVersion: dependencies.SchemaVersion, Cutoff: cutoff, Selections: selections}, nil
@@ -240,7 +241,7 @@ func packagePlanValue(name string, record aptRecord) packages.Package {
 	units, listeners := []string{}, []string{}
 	switch name {
 	case "nginx":
-		units, listeners = []string{"nginx.service"}, []string{"tcp/80", "tcp/443"}
+		units, listeners = []string{"nginx.service"}, []string{"tcp/443", "tcp/80"}
 	}
 	return packages.Package{Name: name, Version: record.Version, VersionMinimum: packageMinimum(name), Architecture: record.Architecture, MaximumInstalledFileBytes: 4 << 30, AffectedUnits: units, PossibleListeners: listeners, Source: sources.Source{Kind: sources.OfficialDistro, Artifact: sources.Artifact{Name: name, Version: record.Version, OperatingOS: "linux", Architecture: record.Architecture}}}
 }

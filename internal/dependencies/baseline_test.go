@@ -60,6 +60,15 @@ func TestDependencyBaselineRejectsDowngradeFloatingAndMissingClosure(t *testing.
 		t.Fatal("floating latest artifact was accepted")
 	}
 	baseline = testBaseline(time.Unix(1_700_000_000, 0).UTC())
+	for index := range baseline.Selections {
+		if baseline.Selections[index].Component == "tailscale-client" {
+			baseline.Selections[index].ArtifactIdentity = "https://pkgs.tailscale.com/stable/tailscale_1.82.0_amd64.tgz"
+		}
+	}
+	if err := ValidateBaseline(baseline); err != nil {
+		t.Fatalf("version-pinned Tailscale stable artifact was rejected: %v", err)
+	}
+	baseline = testBaseline(time.Unix(1_700_000_000, 0).UTC())
 	baseline.Selections[1].ArtifactIdentity = "nginx=1.22.1-9@debian/bookworm-security"
 	if err := ValidateBaseline(baseline); err == nil {
 		t.Fatal("dependency component accepted another package artifact identity")
