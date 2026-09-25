@@ -11,6 +11,7 @@ import (
 	"lanpanel/internal/acmeaccount"
 	"lanpanel/internal/child"
 	"lanpanel/internal/identity"
+	"lanpanel/internal/nginx"
 	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
@@ -99,6 +100,11 @@ func TestFixedManagedACMEAccountKeyIsPlannedAndBundleBound(t *testing.T) {
 	}
 	if !slices.Contains(planned, paths.ACMEAccountKey) {
 		t.Fatal("managed ACME account key is absent from bootstrap inventory")
+	}
+	for _, path := range []string{nginx.FixedPaths().MainPath(), nginx.FixedPaths().SanitizerPath(), nginx.FixedPaths().ManifestPath()} {
+		if !slices.Contains(planned, path) {
+			t.Fatalf("managed Nginx file is absent from bootstrap inventory: %s", path)
+		}
 	}
 	journal := testJournal(t.TempDir())
 	fingerprint, _ := identity.Fingerprint(journal.InstallationID)

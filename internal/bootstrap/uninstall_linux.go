@@ -472,7 +472,22 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		return err
 	}
 	if paths == FixedPaths() {
-		auditPath := nginx.FixedPaths().AuditPath
+		nginxPaths := nginx.FixedPaths()
+		startup, err := ReadPublicStartupAuthority(paths)
+		if err != nil {
+			return fmt.Errorf("uninstall startup authority is unavailable: %w", err)
+		}
+		manifest, err := nginx.Audit(nginxPaths, structOwner())
+		if err != nil {
+			return fmt.Errorf("uninstall Nginx graph is unavailable: %w", err)
+		}
+		if manifest.InstallationID != startup.InstallationID {
+			return fmt.Errorf("uninstall Nginx graph identity differs from the committed installation")
+		}
+		if err := addList([]string{nginxPaths.MainPath(), nginxPaths.SanitizerPath(), nginxPaths.ManifestPath()}, true); err != nil {
+			return err
+		}
+		auditPath := nginxPaths.AuditPath
 		delete(inventory.Artifacts, auditPath)
 		if err := addList([]string{auditPath}, true); err != nil {
 			return err
