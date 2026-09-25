@@ -80,7 +80,13 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {
 		return nil, fmt.Errorf("exact package simulation failed")
 	}
-	if len(result.PackageChanges) == 0 || len(result.PackageChanges) > 256 {
+	if len(result.PackageChanges) == 0 {
+		if plan.Mode == DistroRepository && !plan.FirstNginxInstall {
+			return append([]Package(nil), plan.Packages...), nil
+		}
+		return nil, fmt.Errorf("package simulation returned an invalid closure")
+	}
+	if len(result.PackageChanges) > 256 {
 		return nil, fmt.Errorf("package simulation returned an invalid closure")
 	}
 	flexible := false

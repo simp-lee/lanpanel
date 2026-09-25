@@ -158,6 +158,12 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	if reflectPackages(changedResolved, plan.Packages) {
 		t.Fatal("package postcondition ignored repository ownership")
 	}
+	plan.FirstNginxInstall = false
+	emptyLauncher := &auditLauncher{emptySimulation: true}
+	resolved, err = (&HostExecutor{Auditor: auditor, Launcher: emptyLauncher}).Resolve(context.Background(), plan)
+	if err != nil || !reflectPackages(resolved, plan.Packages) {
+		t.Fatalf("no-op distro package resolution failed: resolved=%#v error=%v", resolved, err)
+	}
 
 	writeFixture(t, root, "etc/apt/apt.conf", []byte(`DPkg::Pre-Invoke { "needrestart"; };`), 0o644)
 	audit, err = auditor.AuditPackages(context.Background(), plan)
@@ -278,11 +284,13 @@ func writeFixture(t *testing.T, root, relative string, data []byte, mode os.File
 	}
 }
 
-type auditLauncher struct{}
+type auditLauncher struct {
+	emptySimulation bool
+}
 
-func (*auditLauncher) RunInvocation(_ context.Context, profile child.ProfileID, invocation child.Invocation, _ []byte) (child.Result, error) {
+func (launcher *auditLauncher) RunInvocation(_ context.Context, profile child.ProfileID, invocation child.Invocation, _ []byte) (child.Result, error) {
 	result := child.Result{ExitCode: 0, StdoutDigest: "sha256:" + strings.Repeat("1", 64), StderrDigest: "sha256:" + strings.Repeat("2", 64), PackageChanges: []child.PackageChange{}}
-	if profile == child.ProfileAPTSimulate {
+	if profile == child.ProfileAPTSimulate && !launcher.emptySimulation {
 		for _, pkg := range invocation.Package.Packages {
 			result.PackageChanges = append(result.PackageChanges, child.PackageChange{Name: pkg.Name, Version: pkg.Version})
 		}
