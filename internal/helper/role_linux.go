@@ -29,6 +29,7 @@ import (
 	"lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/secrets"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -107,6 +108,9 @@ func RunRole(args []string) error {
 	}
 	recordRecovery(reconcileStartupContraction(context.Background()))
 	recordRecovery(application.ReconcileTerminalNginxContraction(context.Background()))
+	if recoveryErr := errors.Join(adminRecoveryErr, otherRecoveryErr); recoveryErr != nil {
+		log.Printf("startup recovery incomplete: %v", recoveryErr)
+	}
 	var tokenMu sync.Mutex
 	contractionPlans := newEmergencyPlanStore()
 	applicationHandler := ApplicationPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
@@ -1042,6 +1046,9 @@ func RunRole(args []string) error {
 			return mutationExecutionFailure(err)
 		}
 		defer func() {
+			if resultErr != nil {
+				log.Printf("process lifecycle %s for %s failed: %v", request.Resource.Operation, resourceID, resultErr)
+			}
 			if resultErr != nil && output.ErrorJobID == "" {
 				output.ErrorJobID = execution.JobID
 			}
