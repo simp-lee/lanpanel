@@ -352,12 +352,13 @@ func verifyRuntimeIngressClosed(ctx context.Context, paths Paths, installation d
 	if paths == FixedPaths() {
 		graph, err := nginx.Audit(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
 		if err != nil {
+			graph, err = nginx.VerifyConfigIdentity(nginx.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
+		}
+		if err != nil {
 			return fmt.Errorf("uninstall ingress graph is unavailable: %w", err)
 		}
-		for _, entry := range graph.Entries {
-			if entry.Kind == nginx.EntryApp || entry.Kind == nginx.EntryTemporary {
-				return fmt.Errorf("uninstall ingress graph still serves %s", entry.ResourceID)
-			}
+		if len(graph.Entries) != 0 {
+			return fmt.Errorf("uninstall ingress graph still contains active entries")
 		}
 	}
 	for _, app := range installation.Resources {
@@ -477,12 +478,18 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		if err != nil {
 			return fmt.Errorf("uninstall startup authority is unavailable: %w", err)
 		}
-		manifest, err := nginx.Audit(nginxPaths, structOwner())
-		if err != nil {
-			return fmt.Errorf("uninstall Nginx graph is unavailable: %w", err)
+		manifest, auditErr := nginx.Audit(nginxPaths, structOwner())
+		if auditErr != nil {
+			manifest, auditErr = nginx.VerifyConfigIdentity(nginxPaths, structOwner())
+		}
+		if auditErr != nil {
+			return fmt.Errorf("uninstall Nginx graph is unavailable: %w", auditErr)
 		}
 		if manifest.InstallationID != startup.InstallationID {
 			return fmt.Errorf("uninstall Nginx graph identity differs from the committed installation")
+		}
+		if len(manifest.Entries) != 0 {
+			return fmt.Errorf("uninstall Nginx graph still contains active entries")
 		}
 		if err := addList([]string{nginxPaths.MainPath(), nginxPaths.SanitizerPath(), nginxPaths.ManifestPath()}, true); err != nil {
 			return err

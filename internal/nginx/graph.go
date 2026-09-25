@@ -337,15 +337,64 @@ func Audit(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	if err := validateGraphBoundary(paths, owner); err != nil {
 		return Manifest{}, err
 	}
+	manifest, err := readManifest(paths, owner)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := auditManifestGraph(paths, owner, manifest, nil); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+// VerifyConfigIdentity validates the fixed Nginx configuration files and
+// manifest without requiring the certificate, runtime state, or include
+// directories that a completed teardown may already have removed.
+func VerifyConfigIdentity(paths Paths, owner filetxn.Owner) (Manifest, error) {
+	if err := validatePaths(paths); err != nil {
+		return Manifest{}, err
+	}
+	if err := validateDirectory(paths.ConfigRoot, owner); err != nil {
+		return Manifest{}, err
+	}
+	manifest, err := readManifest(paths, owner)
+	if err != nil {
+		return Manifest{}, err
+	}
+	main, err := readRegular(paths.MainPath(), owner, 0o600, MaximumGraphFileSize)
+	if err != nil || digest(main) != manifest.MainDigest || string(main) != renderMain(paths) {
+		if err != nil {
+			return Manifest{}, err
+		}
+		return Manifest{}, fmt.Errorf("nginx main config differs from the closed graph")
+	}
+	sanitizer, err := readRegular(paths.SanitizerPath(), owner, 0o600, MaximumGraphFileSize)
+	if err != nil || digest(sanitizer) != manifest.SanitizerDigest || string(sanitizer) != renderSanitizer() {
+		if err != nil {
+			return Manifest{}, err
+		}
+		return Manifest{}, fmt.Errorf("nginx sanitizer differs from the closed graph")
+	}
+	entries, err := os.ReadDir(paths.ConfigRoot)
+	if err != nil {
+		return Manifest{}, err
+	}
+	allowed := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true}
+	for _, entry := range entries {
+		if !allowed[entry.Name()] {
+			return Manifest{}, fmt.Errorf("foreign Nginx root graph entry %q", entry.Name())
+		}
+	}
+	return manifest, nil
+}
+
+func readManifest(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	manifestBytes, err := readRegular(paths.ManifestPath(), owner, 0o600, MaximumGraphFileSize)
 	if err != nil {
 		return Manifest{}, err
 	}
 	manifest, err := DecodeManifest(manifestBytes)
 	if err != nil {
-		return Manifest{}, err
-	}
-	if err := auditManifestGraph(paths, owner, manifest, nil); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil

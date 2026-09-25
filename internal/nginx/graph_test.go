@@ -30,6 +30,39 @@ func TestUnixUpstreamRejectsInjectionAndTailnetSource(t *testing.T) {
 	}
 }
 
+func TestConfigIdentitySurvivesPartialTeardown(t *testing.T) {
+	paths, _ := installTestGraph(t)
+	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	manifest, err := Audit(paths, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries = nil
+	data, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMode(t, paths.ManifestPath(), data, 0o600)
+	if err := os.Remove(paths.CertificatePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(paths.PrivateKeyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(paths.StateRoot); err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
+		if err := os.RemoveAll(filepath.Join(paths.ConfigRoot, directory)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verified, err := VerifyConfigIdentity(paths, owner)
+	if err != nil || verified.InstallationID != manifest.InstallationID || len(verified.Entries) != 0 {
+		t.Fatalf("partial teardown config identity=%#v err=%v", verified, err)
+	}
+}
+
 func TestClosedGraphRejectsForeignFilesAndContractsWithoutRestore(t *testing.T) {
 	paths, manifest := installTestGraph(t)
 	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
