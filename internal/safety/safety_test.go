@@ -465,6 +465,25 @@ func TestSafetyStoreBindsEmergencyHighWaterAndOwnership(t *testing.T) {
 	}
 }
 
+func TestEmergencyStopFenceReservationRejectsDigestReplacement(t *testing.T) {
+	store, emergency, manager, lease := newSafetyStore(t)
+	defer closeSafetyStore(t, store, emergency, manager, lease)
+	first, err := ReserveEmergencyStopFenceGeneration(lease, emergency, RoleIngressActivation, StopFenceIngressActivation, digest("first"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReserveEmergencyStopFenceGeneration(lease, emergency, RoleIngressActivation, StopFenceIngressActivation, digest("second"), 0); err == nil {
+		t.Fatal("reservation digest replacement was accepted")
+	}
+	current, err := emergency.Authority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Sequence != first.Sequence || current.StopFenceSequence != first.StopFenceSequence || current.ReservedStopFenceDigest != first.ReservedStopFenceDigest {
+		t.Fatalf("reservation changed after rejection: %#v", current)
+	}
+}
+
 func TestEmergencyBackingDirectoryAllowsExpectedChildLinkChanges(t *testing.T) {
 	emergency, manager, lease, path := newEmergencyStore(t)
 	defer func() {

@@ -503,10 +503,13 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 		if contractErr != nil {
 			snapshot, stopErr := stopRecoveredNginxBounded(host)
 			goaccessErr := stopRecoveredGoAccessBounded(service, exposure, resource)
-			observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
-			fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
-			fenceErr := service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
-			cancelFence()
+			var fenceErr error
+			if !activationFencePresent {
+				observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
+				fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
+				fenceErr = service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
+				cancelFence()
+			}
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
 			return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)

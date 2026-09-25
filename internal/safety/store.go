@@ -142,8 +142,11 @@ func ReserveEmergencyStopFenceGeneration(lease *locks.Lease, emergency *Emergenc
 	if current.StopFence != nil {
 		return EmergencyState{}, fmt.Errorf("emergency stop fence is already active")
 	}
-	if current.StopFenceSequence == expectedNormalSequence+1 && current.ReservedStopFenceKind == kind && current.ReservedStopFenceDigest == reservationDigest {
-		return current, nil
+	if current.StopFenceSequence == expectedNormalSequence+1 {
+		if current.ReservedStopFenceKind == kind && current.ReservedStopFenceDigest == reservationDigest {
+			return current, nil
+		}
+		return EmergencyState{}, fmt.Errorf("emergency stop-fence reservation does not match existing reservation")
 	}
 	if current.StopFenceSequence != expectedNormalSequence {
 		return EmergencyState{}, fmt.Errorf("emergency stop-fence reservation does not match expected normal high-water")

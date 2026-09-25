@@ -199,6 +199,9 @@ func (s *FixedService) WriteIngressActivationFence(ctx context.Context, lease *l
 	if err != nil {
 		return err
 	}
+	if state.StopFence != nil {
+		return fmt.Errorf("ingress activation fence is already active")
+	}
 	inventory, err := s.ownership.Inventory()
 	if err != nil {
 		return err
