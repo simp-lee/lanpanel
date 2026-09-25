@@ -584,6 +584,18 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 			return err
 		}
 	}
+	if entries, err := os.ReadDir(paths.LockRoot); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !regexp.MustCompile(`^mutation-[0-9a-f]{64}\.lock$`).MatchString(entry.Name()) {
+				continue
+			}
+			if err := add(filepath.Join(paths.LockRoot, entry.Name()), true); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	for _, root := range []string{
 		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.PersistentRoot, ".lanpanel-filetxn"), "/etc/.lanpanel-filetxn", "/usr/local/bin/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel/.lanpanel-filetxn", "/usr/lib/lanpanel/.lanpanel-filetxn", "/usr/sbin/.lanpanel-filetxn", "/etc/sysusers.d/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-filetxn", "/etc/lanpanel-public/basic/.txn", filepath.Join(paths.SafetyRoot, "process", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-create", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-update", ".filetxn"), filepath.Join(paths.SafetyRoot, "managed-basic", ".filetxn"), filepath.Join(paths.SafetyRoot, "process"), filepath.Join(paths.SafetyRoot, "resource-create"), filepath.Join(paths.SafetyRoot, "resource-update"), filepath.Join(paths.SafetyRoot, "managed-basic"), "/run/lanpanel/apps", "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/etc/lanpanel/nginx/.lanpanel-filetxn", "/var/log/lanpanel/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".lanpanel-contraction-filetxn"), "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging", "/var/lib/lanpanel/headscale/journal/.lanpanel-filetxn",
 	} {
