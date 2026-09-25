@@ -523,9 +523,10 @@ func terminalizeInterruptedContractions(ctx context.Context, normal *persist.Sto
 					resource.PublicationRecord.GoAccessRetirementAuthorityDigest = digest
 				}
 				if intent.Operation == Publish && resource.ID == intent.SafetyBinding.ResourceID {
-					if resource.PublicationRecord.ActivationIntent != nil && resource.PublicationRecord.ActivationIntent.JobID == jobID {
-						resource.PublicationRecord.ActivationIntent = nil
+					if resource.PublicationRecord.ActivationIntent == nil || resource.PublicationRecord.ActivationIntent.JobID != jobID {
+						continue
 					}
+					resource.PublicationRecord.ActivationIntent = nil
 					resource.PublicationRecord.State = domain.PublicationUnpublished
 					resource.PublicationRecord.LastOperation = domain.OperationPublish
 					resource.PublicationRecord.LastOperationResult = domain.OperationResult(result)

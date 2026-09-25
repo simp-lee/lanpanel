@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/jobs"
+	"lanpanel/internal/locks"
 	"lanpanel/internal/persist"
+	"lanpanel/internal/plans"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -28,6 +31,144 @@ func TestPendingClosedRecoveryRejectsChangedConsumedAuthority(t *testing.T) {
 	}
 	if found, present, err := pendingClosedRecovery(document, closure, safetyDigest); err != nil || !present || found.JobID != intent.JobID {
 		t.Fatalf("exact consumed startup authority was not reusable: found=%#v present=%t err=%v", found, present, err)
+	}
+}
+
+func TestTerminalizePublishWithoutActivationPreservesPublication(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	normal, manager, admission, mutationSet := newOperationStores(t)
+	defer func() { _ = normal.Close(); _ = manager.Close(); _ = mutationSet.Close() }()
+	if err := Register(normal); err != nil {
+		t.Fatal(err)
+	}
+	installation := operationStateInstallation()
+	planID := "plan_" + strings.Repeat("2", 64)
+	plan := plans.Plan{SchemaVersion: plans.SchemaVersion, ID: planID, Operation: string(Publish), Target: plans.Target{Kind: plans.TargetResource, ID: installation.Resources[0].ID}, ActorIdentity: "startup-recovery", ExposureSummary: "exposure", Prerequisites: "prerequisites", CreatedAt: now, ExpiresAt: now.Add(time.Minute), NonceDigest: testDigest("confirmation")}
+	rawInstallation, err := persist.EncodeEntry(installation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawPlan, err := persist.EncodeEntry(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 1, func(transaction *persist.Transaction) error {
+		if err := transaction.Create("installations/current", rawInstallation); err != nil {
+			return err
+		}
+		return transaction.Create("plans/"+plan.ID, rawPlan)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	admission, err = manager.Acquire(context.Background(), locks.MutationAdmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + installation.Resources[0].ID, ActorIdentity: "startup-recovery"}, now, bytes.NewReader(bytes.Repeat([]byte{1}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservedAt := now
+	plan.ReservedAt, plan.ReservedByJob = &reservedAt, job.ID
+	rawPlan, err = persist.EncodeEntry(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: job.ID, PlanID: planID, OperationBinding: testDigest("binding"), AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + installation.Resources[0].ID, Phase: PhaseReserved, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: installation.Resources[0].ID}, CreatedAt: now}
+	rawIntent, err := persist.EncodeEntry(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 2, func(transaction *persist.Transaction) error {
+		if err := transaction.Replace("plans/"+plan.ID, rawPlan); err != nil {
+			return err
+		}
+		if err := jobs.Put(transaction, job); err != nil {
+			return err
+		}
+		return transaction.Create(reservationKey(job.ID), rawIntent)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	admission, err = manager.Acquire(context.Background(), locks.MutationAdmission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = jobs.Start(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumedAt := now
+	plan.ConsumedAt, plan.ConsumedByJob = &consumedAt, job.ID
+	rawPlan, err = persist.EncodeEntry(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent.Phase = PhaseLocalIntent
+	intent.IntentGeneration = 3
+	intent.Consumption = &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("closure"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}
+	rawIntent, err = persist.EncodeEntry(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normal.Update(context.Background(), admission, 3, func(transaction *persist.Transaction) error {
+		if err := transaction.Replace("plans/"+plan.ID, rawPlan); err != nil {
+			return err
+		}
+		if err := jobs.Replace(transaction, job); err != nil {
+			return err
+		}
+		return transaction.Replace(reservationKey(job.ID), rawIntent)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Release(); err != nil {
+		t.Fatal(err)
+	}
+	exposure, err := manager.Acquire(context.Background(), locks.Exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = exposure.Release() }()
+	before, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := terminalizeInterruptedContractions(context.Background(), normal, exposure, before, nil, testDigest("closure"), now)
+	if err != nil || !changed {
+		t.Fatalf("reentered publish recovery did not terminalize: changed=%t err=%v", changed, err)
+	}
+	after, err := normal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeInstallation, err := domain.DecodeInstallation(before.Entries["installations/current"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInstallation, err := domain.DecodeInstallation(after.Entries["installations/current"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforeInstallation.Resources[0].PublicationRecord, afterInstallation.Resources[0].PublicationRecord) {
+		t.Fatalf("reentered publish without activation rewrote publication record: before=%#v after=%#v", beforeInstallation.Resources[0].PublicationRecord, afterInstallation.Resources[0].PublicationRecord)
+	}
+	recoveredIntent, err := loadReservationEntries(after.Entries, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredJob, err := jobs.LoadEntries(after.Entries, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveredIntent.Phase != PhaseTerminal || recoveredJob.Status != jobs.StatusTerminal || recoveredJob.Result != jobs.ResultInterrupted {
+		t.Fatalf("reentered publish evidence was not terminalized: intent=%#v job=%#v", recoveredIntent, recoveredJob)
 	}
 }
 
