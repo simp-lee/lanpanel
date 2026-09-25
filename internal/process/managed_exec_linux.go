@@ -139,7 +139,7 @@ func Execute(args []string) error {
 		environment = append(environment, values...)
 	}
 	for capability := 0; capability <= 63; capability++ {
-		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && err != unix.EINVAL {
+		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && err != unix.EINVAL && err != unix.EPERM {
 			return err
 		}
 	}
