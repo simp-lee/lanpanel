@@ -146,6 +146,38 @@ func (service *EmergencyService) Snapshot() (EmergencySnapshot, error) {
 	return EmergencySnapshot{Inventory: inventory, GlobalGeneration: authority.GlobalClose.Generation}, nil
 }
 
+func projectEmergencyContractionFence(emergencyFence safety.EmergencyStopFence, existing *safety.StopFence, state safety.State, authorities []safety.MarkerGeneration) safety.StopFence {
+	createdAt := time.Unix(emergencyFence.ObservedUnix, 0).UTC()
+	if existing != nil && existing.Kind == safety.StopFenceContraction && existing.FenceGeneration == emergencyFence.Generation {
+		createdAt = existing.CreatedAt
+	}
+	scope := safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}
+	return safety.StopFence{
+		Kind:              safety.StopFenceContraction,
+		OriginOperation:   emergencyFence.OriginOperation,
+		Scope:             scope,
+		FenceGeneration:   emergencyFence.Generation,
+		CreatedAt:         createdAt,
+		SafetyGenerations: projectedFenceSafetyGenerations(scope, state),
+		OwnedGraphDigest:  emergencyFence.OwnedGraphDigest,
+		InventoryDigest:   emergencyFence.InventoryDigest,
+		Observation: safety.StopObservation{
+			MasterStopped:    emergencyFence.MasterStopped,
+			WorkersStopped:   emergencyFence.WorkersStopped,
+			ListenersStopped: emergencyFence.ListenersStopped,
+			ObservedAt:       time.Unix(emergencyFence.ObservedUnix, 0).UTC(),
+		},
+		AccessMayRemain: emergencyFence.AccessMayRemain,
+		Contraction: &safety.ContractionFence{
+			Authorities:            append([]safety.MarkerGeneration(nil), authorities...),
+			OwnershipDigest:        emergencyFence.OwnershipDigest,
+			OperationRef:           emergencyFence.OperationRef,
+			SafetyIntentID:         emergencyFence.SafetyIntentID,
+			SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration,
+		},
+	}
+}
+
 func projectedFenceSafetyGenerations(scope safety.FenceScope, state safety.State) []safety.MarkerGeneration {
 	result := []safety.MarkerGeneration{}
 	if state.GlobalClose.Phase != safety.GlobalCloseNone {
@@ -322,8 +354,7 @@ func (service *EmergencyService) RecoverClosed(ctx context.Context, expectedGlob
 		projectedState.AuthoritySequence = authority.Sequence
 		projectedState.GlobalClose = authority.GlobalClose
 		projectedState.StopFenceSequence = authority.StopFenceSequence
-		scope := safety.FenceScope{Kind: emergencyFence.ScopeKind, ResourceID: emergencyFence.ResourceID}
-		projected := safety.StopFence{Kind: safety.StopFenceContraction, OriginOperation: emergencyFence.OriginOperation, Scope: scope, FenceGeneration: emergencyFence.Generation, CreatedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC(), SafetyGenerations: projectedFenceSafetyGenerations(scope, projectedState), OwnedGraphDigest: emergencyFence.OwnedGraphDigest, InventoryDigest: emergencyFence.InventoryDigest, Observation: safety.StopObservation{MasterStopped: emergencyFence.MasterStopped, WorkersStopped: emergencyFence.WorkersStopped, ListenersStopped: emergencyFence.ListenersStopped, ObservedAt: time.Unix(emergencyFence.ObservedUnix, 0).UTC()}, AccessMayRemain: emergencyFence.AccessMayRemain, Contraction: &safety.ContractionFence{Authorities: append([]safety.MarkerGeneration(nil), authorities...), OwnershipDigest: emergencyFence.OwnershipDigest, OperationRef: emergencyFence.OperationRef, SafetyIntentID: emergencyFence.SafetyIntentID, SafetyIntentGeneration: emergencyFence.SafetyIntentGeneration}}
+		projected := projectEmergencyContractionFence(*emergencyFence, state.StopFence, projectedState, authorities)
 		projectedState.StopFence = &projected
 		if _, err := service.safetyStore.Commit(ctx, service.exposure, safety.RoleContraction, state.Revision, projectedState, safety.TransitionProof{}); err != nil {
 			return fmt.Errorf("project emergency fence into normal safety: %w", err)

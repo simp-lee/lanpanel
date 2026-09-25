@@ -4,11 +4,28 @@ import (
 	"context"
 	"errors"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/safety"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestProjectEmergencyContractionFencePreservesCreatedAt(t *testing.T) {
+	createdAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	projected := projectEmergencyContractionFence(safety.EmergencyStopFence{
+		ScopeKind:        "app",
+		ResourceID:       "res_one",
+		Generation:       7,
+		ObservedUnix:     createdAt.Add(10 * time.Minute).Unix(),
+		MasterStopped:    true,
+		WorkersStopped:   true,
+		ListenersStopped: true,
+	}, &safety.StopFence{Kind: safety.StopFenceContraction, FenceGeneration: 7, CreatedAt: createdAt}, safety.State{}, nil)
+	if !projected.CreatedAt.Equal(createdAt) {
+		t.Fatalf("created_at changed during same-generation projection: got %s want %s", projected.CreatedAt, createdAt)
+	}
+}
 
 func TestRemoveEmptyNginxTestPID(t *testing.T) {
 	path := t.TempDir() + "/nginx.pid"
