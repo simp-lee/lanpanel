@@ -373,13 +373,13 @@ func (store *EmergencyStore) revalidateBacking() error {
 	if err := unix.Fstat(store.dirFD, &directory); err != nil {
 		return err
 	}
-	if !sameEmergencyObject(directory, store.dirStat) {
+	if !sameEmergencyDirectory(directory, store.dirStat) {
 		return fmt.Errorf("emergency backing directory identity changed")
 	}
 	if err := rawLstat(store.dirCString, &directory); err != nil {
 		return err
 	}
-	if !sameEmergencyObject(directory, store.dirStat) {
+	if !sameEmergencyDirectory(directory, store.dirStat) {
 		return fmt.Errorf("emergency backing directory identity changed")
 	}
 	return nil
@@ -395,7 +395,11 @@ func rawLstat(path []byte, stat *unix.Stat_t) error {
 }
 
 func sameEmergencyObject(actual, expected unix.Stat_t) bool {
-	return actual.Dev == expected.Dev && actual.Ino == expected.Ino && actual.Mode == expected.Mode && actual.Uid == expected.Uid && actual.Gid == expected.Gid && actual.Nlink == expected.Nlink
+	return sameEmergencyDirectory(actual, expected) && actual.Nlink == expected.Nlink
+}
+
+func sameEmergencyDirectory(actual, expected unix.Stat_t) bool {
+	return actual.Dev == expected.Dev && actual.Ino == expected.Ino && actual.Mode == expected.Mode && actual.Uid == expected.Uid && actual.Gid == expected.Gid
 }
 
 func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool {

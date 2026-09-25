@@ -465,6 +465,27 @@ func TestSafetyStoreBindsEmergencyHighWaterAndOwnership(t *testing.T) {
 	}
 }
 
+func TestEmergencyBackingDirectoryAllowsExpectedChildLinkChanges(t *testing.T) {
+	emergency, manager, lease, path := newEmergencyStore(t)
+	defer func() {
+		_ = emergency.Close()
+		_ = lease.Release()
+		_ = manager.Close()
+	}()
+	child := filepath.Join(filepath.Dir(path), "operation")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Remove(child); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("remove test child: %v", err)
+		}
+	}()
+	if _, err := emergency.Authority(); err != nil {
+		t.Fatalf("directory link-count change invalidated emergency backing: %v", err)
+	}
+}
+
 func TestEmergencyBackingPersistsExactContractionOrigin(t *testing.T) {
 	store, manager, lease, path := newEmergencyStore(t)
 	fence := EmergencyStopFence{Kind: StopFenceContraction, OriginOperation: "emergency_close_all", ScopeKind: "installation", Generation: 1, GlobalGeneration: 1, SafetyIntentID: "emergency_close_all", SafetyIntentGeneration: 1, OwnershipDigest: digest("owner"), OwnedGraphDigest: digest("graph"), InventoryDigest: digest("inventory"), ObservedUnix: time.Now().Unix(), AccessMayRemain: true}
