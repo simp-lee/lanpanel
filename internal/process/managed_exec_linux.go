@@ -139,33 +139,33 @@ func Execute(args []string) error {
 		environment = append(environment, values...)
 	}
 	if err := unix.Setgroups(nil); err != nil {
-		return err
+		return fmt.Errorf("clear supplementary groups: %w", err)
 	}
 	if err := unix.Prctl(unix.PR_SET_KEEPCAPS, 0, 0, 0, 0); err != nil {
-		return err
+		return fmt.Errorf("disable capability retention: %w", err)
 	}
 	if err := unix.Setresgid(int(authority.GID), int(authority.GID), int(authority.GID)); err != nil {
-		return err
+		return fmt.Errorf("enter managed group: %w", err)
 	}
 	if err := unix.Setresuid(int(authority.UID), int(authority.UID), int(authority.UID)); err != nil {
-		return err
+		return fmt.Errorf("enter managed user: %w", err)
 	}
 	if os.Geteuid() != int(authority.UID) || os.Getegid() != int(authority.GID) {
 		return fmt.Errorf("managed executor failed to enter exact identity")
 	}
 	for capability := 0; capability <= 63; capability++ {
 		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(capability), 0, 0, 0); err != nil && err != unix.EINVAL && err != unix.EPERM {
-			return err
+			return fmt.Errorf("drop capability %d from bounding set: %w", capability, err)
 		}
 	}
 	if err := dropManagedCapabilities(); err != nil {
-		return err
+		return fmt.Errorf("drop managed capabilities: %w", err)
 	}
 	if err := unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0); err != nil {
-		return err
+		return fmt.Errorf("clear ambient capabilities: %w", err)
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return err
+		return fmt.Errorf("set no-new-privileges: %w", err)
 	}
 	endpoint := authority.Endpoint
 	if endpointEnv != "" {
