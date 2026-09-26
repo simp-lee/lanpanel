@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/locks"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/operations"
+	"lanpanel/internal/ownership"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/process"
 	"lanpanel/internal/release"
@@ -219,6 +220,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 			continue // remove authority files only after every other postcondition.
 		}
 		if err := removeOwnedPath(path, inventory.Artifacts, inventory.MutablePaths); err != nil {
+			if retainExternalResourcePath(path, paths.PersistentRoot, lifecycleInstallation) {
+				continue
+			}
 			return err
 		}
 	}
@@ -287,7 +291,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 	if err := removeOwnedPath(paths.LockRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
 		return retainFence(err)
 	}
-	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil {
+	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil && !retainExternalResourcePath(paths.PersistentRoot, paths.PersistentRoot, lifecycleInstallation) {
 		return retainFence(err)
 	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
@@ -553,6 +557,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	}
 	if paths == FixedPaths() {
 		nginxPaths := nginx.FixedPaths()
+		if err := addList([]string{nginxPaths.StateRoot, filepath.Join(nginxPaths.StateRoot, ".lanpanel-contraction-filetxn")}, true); err != nil {
+			return err
+		}
 		startup, err := ReadPublicStartupAuthority(paths)
 		if err != nil {
 			return fmt.Errorf("uninstall startup authority is unavailable: %w", err)
@@ -596,6 +603,62 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// Resource ownership records are created after installation and therefore
+	// are not present in the immutable installation inventory. Add the records
+	// for resources still authorized by normal state before auditing the managed
+	// records tree; records for deleted or foreign resources remain fenced.
+	for _, app := range installation.Resources {
+		if err := add(filepath.Join(paths.OwnershipRoot, "records", app.ID+".json"), true); err != nil {
+			return err
+		}
+	}
+	// The emergency authority is intentionally mutable: every fail-closed
+	// transition advances its fixed-format slots. Verify the current authority
+	// against normal safety and ownership state, then bind its current digest
+	// for this authorized teardown instead of treating an expected transition as
+	// foreign residue.
+	emergencyPath := filepath.Join(paths.SafetyRoot, "emergency")
+	if _, statErr := os.Lstat(emergencyPath); statErr == nil {
+		ownershipStore, openErr := ownership.Open(ownership.Config{
+			RootPath:      paths.OwnershipRoot,
+			StagingPath:   filepath.Join(paths.OwnershipRoot, ".filetxn"),
+			RecordsPath:   filepath.Join(paths.OwnershipRoot, "records"),
+			Owner:         structOwner(),
+			Policy:        ownership.FixedPolicy(),
+			LockAuthority: authority,
+		})
+		if openErr != nil {
+			return fmt.Errorf("uninstall ownership authority is unavailable: %w", openErr)
+		}
+		emergency, openErr := safety.OpenEmergency(emergencyPath, structOwner(), safety.EmergencyOptions{LockAuthority: authority})
+		if openErr != nil {
+			_ = ownershipStore.Close()
+			return fmt.Errorf("uninstall emergency authority is unavailable: %w", openErr)
+		}
+		safetyStore, openErr := safety.OpenStore(safety.StoreConfig{
+			RootPath:      paths.SafetyRoot,
+			StagingPath:   filepath.Join(paths.SafetyRoot, ".filetxn"),
+			StatePath:     filepath.Join(paths.SafetyRoot, "state.json"),
+			Owner:         structOwner(),
+			Emergency:     emergency,
+			LockAuthority: authority,
+			Ownership:     ownershipStore,
+		})
+		if openErr == nil {
+			_, openErr = safetyStore.Read()
+			_ = safetyStore.Close()
+		}
+		_ = emergency.Close()
+		_ = ownershipStore.Close()
+		if openErr != nil {
+			return fmt.Errorf("uninstall safety authority is unavailable: %w", openErr)
+		}
+		if err := refreshArtifact(emergencyPath, nil); err != nil {
+			return fmt.Errorf("uninstall emergency authority is unavailable: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
 	for _, root := range []string{
 		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.PersistentRoot, ".lanpanel-filetxn"), "/etc/.lanpanel-filetxn", "/usr/local/bin/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel/.lanpanel-filetxn", "/usr/lib/lanpanel/.lanpanel-filetxn", "/usr/sbin/.lanpanel-filetxn", "/etc/sysusers.d/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-filetxn", "/etc/lanpanel-public/basic/.txn", filepath.Join(paths.SafetyRoot, "process", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-create", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-update", ".filetxn"), filepath.Join(paths.SafetyRoot, "managed-basic", ".filetxn"), filepath.Join(paths.SafetyRoot, "process"), filepath.Join(paths.SafetyRoot, "resource-create"), filepath.Join(paths.SafetyRoot, "resource-update"), filepath.Join(paths.SafetyRoot, "managed-basic"), "/run/lanpanel/apps", "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/etc/lanpanel/nginx/.lanpanel-filetxn", "/var/log/lanpanel/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".lanpanel-contraction-filetxn"), "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging", "/var/lib/lanpanel/headscale/journal/.lanpanel-filetxn",
 	} {
@@ -630,7 +693,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		if err != nil {
 			return err
 		}
-		if err := addList(derived.ManagedPaths(), true); err != nil {
+		if err := addList(append(append([]string(nil), derived.ManagedPaths()...), process.AuthorityPath(app.ID), filepath.Join(derived.ResourceRoot, ".lanpanel-filetxn"), filepath.Dir(derived.SysusersFile), filepath.Dir(derived.ResourceRoot)), true); err != nil {
 			return err
 		}
 		for _, link := range []string{
@@ -1133,6 +1196,40 @@ func verifyOwnedFileMetadata(path string, info os.FileInfo) error {
 		return fmt.Errorf("uninstall foreign file ownership at %q", path)
 	}
 	return nil
+}
+
+func retainExternalResourcePath(path, persistentRoot string, installation domain.Installation) bool {
+	if path == "" || persistentRoot == "" || path != filepath.Clean(path) || persistentRoot != filepath.Clean(persistentRoot) {
+		return false
+	}
+	resourceParent := filepath.Join(persistentRoot, "resources")
+	knownRoots := make(map[string]struct{}, len(installation.Resources))
+	for _, app := range installation.Resources {
+		knownRoots[filepath.Join(resourceParent, app.ID)] = struct{}{}
+	}
+	if _, known := knownRoots[path]; known {
+		return true
+	}
+	if path != resourceParent && path != persistentRoot {
+		return false
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil || len(entries) == 0 {
+		return false
+	}
+	if path == resourceParent {
+		for _, entry := range entries {
+			candidate := filepath.Join(resourceParent, entry.Name())
+			if _, known := knownRoots[candidate]; !known || !entry.IsDir() {
+				return false
+			}
+		}
+		return true
+	}
+	if len(entries) != 1 || entries[0].Name() != "resources" || !entries[0].IsDir() {
+		return false
+	}
+	return retainExternalResourcePath(resourceParent, persistentRoot, installation)
 }
 
 func removeOwnedPath(path string, artifacts map[string]string, mutable []string) error {

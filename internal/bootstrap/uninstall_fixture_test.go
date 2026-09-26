@@ -217,6 +217,28 @@ func TestCommittedUninstallFixtureLateUnmaskFailureKeepsBinary(t *testing.T) {
 	}
 }
 
+func TestRetainExternalResourcePathAcceptsOnlyAuthorizedResourceRoots(t *testing.T) {
+	persistent := t.TempDir()
+	resourceID := "res_" + strings.Repeat("0", 32)
+	resourceParent := filepath.Join(persistent, "resources")
+	resourceRoot := filepath.Join(resourceParent, resourceID)
+	if err := os.MkdirAll(filepath.Join(resourceRoot, "backend"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installation := domain.Installation{Resources: []domain.AppResource{{ID: resourceID}}}
+	for _, path := range []string{resourceRoot, resourceParent, persistent} {
+		if !retainExternalResourcePath(path, persistent, installation) {
+			t.Fatalf("authorized retained path was rejected: %s", path)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(persistent, "foreign"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if retainExternalResourcePath(persistent, persistent, installation) {
+		t.Fatal("foreign persistent residue was accepted")
+	}
+}
+
 func TestCommittedUninstallFixtureForeignResidueFailsAndRetries(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-owned lifecycle fixture")
