@@ -176,6 +176,20 @@ test('LP-CONTRACTION-001 unpublish and close-all display exact contraction outco
   }
 });
 
+test('LP-UI-OVERVIEW-001 system status spans overview and follows the selected language',async({page,request})=>{
+  await resetFixture(request);
+  await page.route('**/api/actions/diagnostics',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({system_status:{observed_at:'2026-01-01T00:00:00Z',nginx_status:'healthy',nginx_entry_count:0,headscale:'not_configured',connector:'not_configured',resources:[]},issues:[]})}));
+  await login(page);
+  await expect(page.locator('#system-status-summary')).toContainText('Nginx:');
+  const widths=await page.evaluate(()=>({container:document.querySelector('#group-overview .control-group-content').getBoundingClientRect().width,status:document.querySelector('#system-status').getBoundingClientRect().width}));
+  expect(widths.status).toBeGreaterThan(widths.container-3);
+  await page.locator('#locale').selectOption('zh-CN');
+  await expect(page.locator('#workspace h2').first()).toHaveText('应用概览');
+  await expect(page.locator('#system-status-summary')).toContainText('连接器：');
+  await page.locator('#locale').selectOption('en-US');
+  await expect(page.locator('#system-status-summary')).toContainText('Connector:');
+});
+
 test('LP-UI-RESPONSIVE-001 mobile layout collapses detail groups and keeps dark primary actions readable',async({page,request})=>{await resetFixture(request);await page.setViewportSize({width:390,height:844});await page.emulateMedia({colorScheme:'dark'});await login(page);const overflow=await page.evaluate(()=>document.documentElement.scrollWidth-document.documentElement.clientWidth);expect(overflow).toBeLessThanOrEqual(1);await expect(page.locator('#group-overview')).toHaveAttribute('open','');await expect(page.locator('#group-applications')).not.toHaveAttribute('open','');const contrast=await page.locator('#refresh-status').evaluate(node=>{const rgb=getComputedStyle(node).backgroundColor.match(/\d+(?:\.\d+)?/g).map(Number).map(value=>value/255);const linear=rgb.map(value=>value<=.04045?value/12.92:((value+.055)/1.055)**2.4);const luminance=.2126*linear[0]+.7152*linear[1]+.0722*linear[2];return 1.05/(luminance+.05)});expect(contrast).toBeGreaterThanOrEqual(4.5)});
 
 test('LP-UI-EMERGENCY-001 emergency profile is visibly read-only and retains recovery reads',async({page,request})=>{await resetFixture(request);await fixtureScenario(request,'emergency');await page.goto(origin);await page.locator('input[name=token]').fill('admin');await page.locator('#login button').click();await expect(page.locator('#status')).toContainText('startup recovery incomplete');await expect(page.locator('#resource-create-open')).toBeHidden();for(const id of ['rotate','close-all','headscale-initialize','headscale-control','headscale-user-create','headscale-key-create','connector-binding','connector-login','job-detail'])await expect(page.locator('#'+id)).toBeHidden();for(const [section,id] of [['headscale','headscale-reads'],['operations','product-reads'],['connector','connector-verify']]){await openSection(page,section);await expect(page.locator('#'+id)).toBeVisible()}});

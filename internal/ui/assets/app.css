@@ -71,7 +71,9 @@ input:invalid:not(:placeholder-shown), select:invalid, textarea:invalid { border
 .control-group > summary small { display: block; margin: .25rem 0 0 1.4rem; color: var(--muted); font-size: .9rem; font-weight: 400; }
 .control-group-content { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 25rem), 1fr)); gap: .2rem 1rem; align-items: start; }
 .control-group-content > form, .control-group-content > article, .control-group-content > section, .control-group-content > p, .control-group-content > button, .control-group-content > div { min-width: 0; }
-.control-group-content > #resource-list, .control-group-content > #resource-detail, .control-group-content > #resource-create, .control-group-content > #resource-update-json { grid-column: 1 / -1; }
+.control-group-content > #resource-list, .control-group-content > #resource-detail, .control-group-content > #resource-create, .control-group-content > #resource-update-json, .control-group-content > #system-status, .control-group-content > #action-progress, .control-group-content > #action-result { grid-column: 1 / -1; }
+#system-status-summary { margin: 0; }
+#system-status-detail { width: 100%; }
 
 #resource-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 28rem), 1fr)); gap: 1rem; }
 #resource-list:empty::before { content: "No applications loaded. Refresh status to begin."; display: block; padding: 1rem; color: var(--muted); }
