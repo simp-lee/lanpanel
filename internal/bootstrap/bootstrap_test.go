@@ -414,6 +414,12 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 			t.Fatalf("Nginx unit contains %q: %s", forbidden, nginxUnit)
 		}
 	}
+	timerUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-timer.service")])
+	for _, required := range []string{"After=local-fs.target lanpanel-helper.service", "Requires=lanpanel-helper.service"} {
+		if !strings.Contains(timerUnit, required) {
+			t.Fatalf("timer unit omitted %q: %s", required, timerUnit)
+		}
+	}
 	ui := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-ui.service")])
 	for _, forbidden := range []string{"PartOf=", "BindsTo=", "lanpanel-timer.service", "nginx", "headscale"} {
 		if strings.Contains(ui, forbidden) {
