@@ -226,6 +226,36 @@ func TestContractionPreflightBlocksOnlyPrivilegeAndClosureAuthority(t *testing.T
 	}
 }
 
+func TestExpansionAuthorityDigestExcludesFreshnessCounters(t *testing.T) {
+	request := expansionRequest(ExpansionTemporaryHTTP)
+	request.Domains = nil
+	request.PublicAddresses = []string{"8.8.8.8"}
+	request.TemporaryPort = 23456
+	firstObserved := passingExpansionObservations(request, time.Unix(1_700_000_000, 0).UTC())
+	first, err := EvaluateExpansion(request, firstObserved)
+	if err != nil || !first.Allowed {
+		t.Fatalf("first result=%#v err=%v", first, err)
+	}
+	secondObserved := firstObserved
+	secondObserved.Clock.Now = secondObserved.Clock.Now.Add(time.Second)
+	secondObserved.Disks[0].AvailableBytes += 4096
+	second, err := EvaluateExpansion(request, secondObserved)
+	if err != nil || !second.Allowed {
+		t.Fatalf("second result=%#v err=%v", second, err)
+	}
+	firstDigest, err := first.AuthorityDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDigest, err := second.AuthorityDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstDigest != secondDigest {
+		t.Fatalf("freshness-only observations changed authority digest: %s != %s", firstDigest, secondDigest)
+	}
+}
+
 func TestExpansionResultBindsExactTypedRequest(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	request := expansionRequest(ExpansionDomainHTTPS)

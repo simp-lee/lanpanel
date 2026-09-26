@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 )
 
 func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations) (Result, error) {
@@ -39,7 +38,7 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
 	add("managed_confinement", confinementMatches, "unified cgroup mode required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode)
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
-	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source+"/"+observed.Clock.Now.UTC().Format(time.RFC3339Nano))
+	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source)
 	add("root_executor", observed.ExecutorUID == 0, "actual mutation executor is root", strconv.FormatUint(uint64(observed.ExecutorUID), 10))
 	add("systemd", observed.Systemd.Available && observed.Systemd.Identity != "", "systemd runtime and identity", observed.Systemd.Identity)
 	add("apt", observed.APT.Available && observed.APT.Identity != "", "apt capability and identity", observed.APT.Identity)
@@ -266,7 +265,7 @@ func validateDiskObservations(required []DiskRequirement, observed []DiskObserva
 		if value.Path != requirement.Path || value.Failure != "" || value.Device == 0 || value.ReadOnly || value.AvailableBytes < requirement.MinimumAvailableBytes {
 			return false, value.Path + "/" + value.Failure
 		}
-		identities = append(identities, fmt.Sprintf("%s/%d/%d", value.Path, value.Device, value.AvailableBytes))
+		identities = append(identities, fmt.Sprintf("%s/%d", value.Path, value.Device))
 	}
 	return true, strings.Join(identities, ";")
 }
