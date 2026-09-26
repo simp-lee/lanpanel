@@ -165,6 +165,16 @@ func TestAPTConfigurationAcceptsDistroSharedKeyringPath(t *testing.T) {
 	}
 }
 
+func TestAPTSourceIgnoresDebSrcLines(t *testing.T) {
+	values, err := parseSourceFile("/etc/apt/sources.list", []byte("deb-src https://deb.example.test/debian stable main\ndeb https://deb.example.test/debian stable main\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 1 || values[0].URI != "https://deb.example.test/debian" {
+		t.Fatalf("binary APT sources=%#v", values)
+	}
+}
+
 func TestAPTSourceAcceptsOptionlessLineOnlyWithAuthorizedSharedKeyring(t *testing.T) {
 	plan := testPlan(t, DistroRepository)
 	plan.Repositories[0].KeyringPath = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"

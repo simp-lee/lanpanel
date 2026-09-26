@@ -1110,11 +1110,14 @@ func parseSourceFile(path string, data []byte) ([]ObservedRepository, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 4 || fields[0] != "deb" {
+		if len(fields) < 4 || fields[0] != "deb" && fields[0] != "deb-src" {
 			return nil, fmt.Errorf("APT source line is unsupported or malformed")
 		}
+		binarySource := fields[0] == "deb"
 		if !strings.HasPrefix(fields[1], "[") {
-			result = append(result, ObservedRepository{URI: fields[1], Suite: fields[2], Components: append([]string(nil), fields[3:]...), Enabled: true})
+			if binarySource {
+				result = append(result, ObservedRepository{URI: fields[1], Suite: fields[2], Components: append([]string(nil), fields[3:]...), Enabled: true})
+			}
 			continue
 		}
 		closing := slices.IndexFunc(fields, func(value string) bool { return strings.HasSuffix(value, "]") })
@@ -1139,7 +1142,9 @@ func parseSourceFile(path string, data []byte) ([]ObservedRepository, error) {
 		if signedBy == "" {
 			return nil, fmt.Errorf("APT source omits exact signed-by authority")
 		}
-		result = append(result, ObservedRepository{URI: fields[closing+1], Suite: fields[closing+2], Components: append([]string(nil), fields[closing+3:]...), KeyringPath: signedBy, Enabled: true})
+		if binarySource {
+			result = append(result, ObservedRepository{URI: fields[closing+1], Suite: fields[closing+2], Components: append([]string(nil), fields[closing+3:]...), KeyringPath: signedBy, Enabled: true})
+		}
 	}
 	return result, nil
 }
