@@ -27,6 +27,7 @@ import (
 const (
 	temporaryInterruptedClosingReason = "interrupted_temporary_http_activation"
 	temporaryCommittedClosingReason   = "committed_temporary_http_recovery"
+	temporaryActivationRecoveryReason = "temporary_http_activation_recovery"
 )
 
 type temporaryPublicationRecoveryStage uint8
@@ -37,6 +38,7 @@ const (
 	temporaryRecoveryActivationDurable
 	temporaryRecoveryTerminalNoEffect
 	temporaryRecoveryCommitted
+	temporaryRecoveryActivationConvergence
 )
 
 type temporaryPublicationRecovery struct {
@@ -149,6 +151,18 @@ func classifyTemporaryPublicationRecovery(value temporaryPublicationRecovery) (t
 		}
 		if value.Resource.PublicationRecord.State == domain.PublicationPublished && value.Resource.PublicationRecord.LastAppliedBundle != nil && value.Resource.PublicationRecord.LastAppliedBundle.TemporaryHTTP != nil && value.Job.Result == jobs.ResultSucceeded {
 			return temporaryRecoveryCommitted, nil
+		}
+		if value.Resource.PublicationRecord.State == domain.PublicationUnpublished && value.Resource.PublicationRecord.LastAppliedBundle != nil && value.Resource.PublicationRecord.LastAppliedBundle.TemporaryHTTP != nil && value.Job.Result == jobs.ResultSucceeded {
+			if value.Journal == nil || value.Journal.ID != "activation-"+value.Intent.JobID || value.Journal.Kind != operations.JournalAppActivation || value.Journal.Operation != operations.Publish || value.Journal.Target != value.Intent.Target || value.Journal.Generation != value.Intent.IntentGeneration || value.Journal.ArtifactDigest != value.Marker.CandidateBundle || value.Journal.Phase != operations.JournalTerminal {
+				return 0, fmt.Errorf("contracted committed temporary publication journal authority changed")
+			}
+			return temporaryRecoveryActivationConvergence, nil
+		}
+		if value.Resource.PublicationRecord.State == domain.PublicationUnpublished && value.Job.Result == jobs.ResultInterrupted && value.Job.ErrorCode == "temporary_http_activation_recovery" && len(value.Job.Postconditions) == 1 && value.Job.Postconditions[0].Kind == "temporary_http_activation_contracted" && value.Job.Postconditions[0].Identity != "" {
+			if value.Journal == nil || value.Journal.ID != "activation-"+value.Intent.JobID || value.Journal.Kind != operations.JournalAppActivation || value.Journal.Operation != operations.Publish || value.Journal.Target != value.Intent.Target || value.Journal.Generation != value.Intent.IntentGeneration || value.Journal.ArtifactDigest != value.Marker.CandidateBundle || value.Journal.Phase != operations.JournalTerminal {
+				return 0, fmt.Errorf("contracted temporary publication journal authority changed")
+			}
+			return temporaryRecoveryActivationConvergence, nil
 		}
 		if value.Resource.PublicationRecord.State != domain.PublicationActivating && value.Job.Result == jobs.ResultFailed {
 			if value.Journal != nil {
@@ -287,6 +301,113 @@ func convergeCommittedTemporaryPublication(ctx context.Context, service *FixedSe
 		return fmt.Errorf("committed temporary publication safety resource missing")
 	}
 	_, err = service.safety.Commit(ctx, exposure, safety.RolePublish, state.Revision, next, safety.TransitionProof{Reactivation: proof})
+	return err
+}
+
+func temporaryIngressActivationFence(state safety.State, resourceID string, marker safety.Reactivating) (bool, error) {
+	if state.StopFence == nil {
+		return false, nil
+	}
+	fence := state.StopFence
+	if fence.Kind != safety.StopFenceIngressActivation || fence.Scope.Kind != "app" || fence.Scope.ResourceID != resourceID || fence.IngressActivation == nil || fence.IngressActivation.IntentRef != marker.PlanID || fence.IngressActivation.CandidateGeneration != marker.Generation || fence.IngressActivation.PriorGeneration+1 != marker.Generation {
+		return false, fmt.Errorf("temporary publication activation stop fence authority changed")
+	}
+	for _, resource := range state.Resources {
+		if resource.ResourceID != resourceID {
+			continue
+		}
+		if resource.Reactivating == nil || !reflect.DeepEqual(*resource.Reactivating, marker) {
+			return false, fmt.Errorf("temporary publication activation marker changed")
+		}
+		return true, nil
+	}
+	return false, fmt.Errorf("temporary publication activation safety resource missing")
+}
+
+func convergeInterruptedTemporaryActivation(ctx context.Context, service *FixedService, exposure *locks.Lease, resourceID string, generation uint64, runtimeDigest string, marker safety.Reactivating, reason string) error {
+	if service == nil || exposure == nil || resourceID == "" || generation == 0 || runtimeDigest == "" || marker.PlanID == "" {
+		return fmt.Errorf("temporary publication activation convergence authority is incomplete")
+	}
+	document, err := service.normal.Read()
+	if err != nil {
+		return err
+	}
+	installation, err := installationFromDocument(document)
+	if err != nil {
+		return err
+	}
+	var resource *domain.AppResource
+	for index := range installation.Resources {
+		if installation.Resources[index].ID == resourceID {
+			resource = &installation.Resources[index]
+			break
+		}
+	}
+	if resource == nil || resource.PublicationRecord.State != domain.PublicationUnpublished || resource.PublicationRecord.ActivationIntent != nil || resource.PublicationRecord.UnpublishedGeneration != generation || resource.PublicationRecord.LastJobID == "" {
+		return fmt.Errorf("temporary publication activation normal state changed")
+	}
+	record, err := jobs.LoadEntries(document.Entries, resource.PublicationRecord.LastJobID)
+	if err != nil {
+		return err
+	}
+	switch reason {
+	case temporaryInterruptedClosingReason:
+		if record.Status != jobs.StatusTerminal || record.Result != jobs.ResultInterrupted || record.ErrorCode != "temporary_http_activation_recovery" || len(record.Postconditions) != 1 || record.Postconditions[0].Kind != "temporary_http_activation_contracted" || record.Postconditions[0].Identity != runtimeDigest {
+			return fmt.Errorf("temporary publication activation job evidence changed")
+		}
+	case temporaryCommittedClosingReason:
+		if record.Status != jobs.StatusTerminal || record.Result != jobs.ResultSucceeded || resource.PublicationRecord.LastAppliedBundle == nil || resource.PublicationRecord.LastAppliedBundle.TemporaryHTTP == nil {
+			return fmt.Errorf("committed temporary publication activation job evidence changed")
+		}
+	default:
+		return fmt.Errorf("temporary publication activation convergence reason changed")
+	}
+	fresh, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if present, err := temporaryIngressActivationFence(fresh, resourceID, marker); err != nil || !present {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("temporary publication activation stop fence is missing")
+	}
+	fence := *fresh.StopFence
+	next := fresh
+	next.Revision++
+	next.StopFence = nil
+	authority, err := service.safety.EmergencyAuthority()
+	if err != nil {
+		return err
+	}
+	next.AuthoritySequence = authority.Sequence
+	next.GlobalClose = authority.GlobalClose
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.Resources = append([]safety.ResourceSafety(nil), fresh.Resources...)
+	unpublished := make(map[string]uint64, len(next.Resources))
+	found := false
+	for index := range next.Resources {
+		item := &next.Resources[index]
+		if item.ResourceID == resourceID {
+			if item.Reactivating == nil || !reflect.DeepEqual(*item.Reactivating, marker) || generation != item.GenerationSequence+1 {
+				return fmt.Errorf("temporary publication activation reactivation authority changed")
+			}
+			item.GenerationSequence = generation
+			item.Reactivating = nil
+			item.Closing = nil
+			item.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: temporaryActivationRecoveryReason}
+			found = true
+		}
+		if item.StickyUnpublished == nil || item.ChallengePending != nil || item.Reactivating != nil {
+			return fmt.Errorf("temporary publication activation stop fence does not cover every resource")
+		}
+		unpublished[item.ResourceID] = item.StickyUnpublished.Generation
+	}
+	if !found {
+		return fmt.Errorf("temporary publication activation safety resource missing")
+	}
+	proof := &safety.StopFenceConvergenceProof{Kind: fence.Kind, FenceGeneration: fence.FenceGeneration, FenceDigest: safety.StopFenceDigest(fence), JournalRef: fence.IngressActivation.IntentRef, InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: runtimeDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}
+	_, err = service.safety.Commit(ctx, exposure, safety.RoleJournalConvergence, fresh.Revision, next, safety.TransitionProof{StopFence: proof})
 	return err
 }
 
@@ -619,13 +740,41 @@ func temporaryTerminalContractionEvidence(document persist.Document, resource do
 }
 
 func contractTemporaryPublicationLocked(ctx context.Context, service *FixedService, admitter *operations.Admitter, mutation *operations.MutationLease, exposure *locks.Lease, recovery temporaryPublicationRecovery, host temporaryPublicationRecoveryHost, reason string) error {
-	manifest, manifestErr := host.AuditManifest(ctx)
-	inventory, inventoryErr := buildTemporaryClosureInventory(service, exposure, recovery.Resource.ID, recovery.Marker.PlanID, recovery.Marker.Generation, manifest)
-	generation, err := beginTemporaryPublicationContraction(ctx, service, exposure, recovery.Resource.ID, recovery.Marker, reason)
+	state, err := service.safety.ReadForRecovery(exposure)
 	if err != nil {
 		return err
 	}
+	activationFencePresent, err := temporaryIngressActivationFence(state, recovery.Resource.ID, recovery.Marker)
+	if err != nil {
+		return err
+	}
+	if activationFencePresent {
+		if _, err := convergeTemporaryPublicationOwnership(ctx, service, exposure, recovery.Resource.ID, recovery.Marker); err != nil {
+			return err
+		}
+	}
+	manifest, manifestErr := host.AuditManifest(ctx)
+	inventory, inventoryErr := buildTemporaryClosureInventory(service, exposure, recovery.Resource.ID, recovery.Marker.PlanID, recovery.Marker.Generation, manifest)
+	generation := uint64(0)
+	for _, resource := range state.Resources {
+		if resource.ResourceID == recovery.Resource.ID {
+			generation = resource.GenerationSequence + 1
+			break
+		}
+	}
+	if generation == 0 {
+		return fmt.Errorf("temporary publication contraction safety resource missing")
+	}
+	if !activationFencePresent {
+		generation, err = beginTemporaryPublicationContraction(ctx, service, exposure, recovery.Resource.ID, recovery.Marker, reason)
+		if err != nil {
+			return err
+		}
+	}
 	if inventoryErr != nil || manifestErr != nil {
+		if activationFencePresent {
+			return errors.Join(manifestErr, inventoryErr)
+		}
 		return failTemporaryPublicationContraction(ctx, service, exposure, host, recovery.Resource.ID, recovery.Marker.PlanID, generation, errors.Join(manifestErr, inventoryErr))
 	}
 	result, contractErr := host.ContractResource(ctx, recovery.Resource.ID)
@@ -633,6 +782,10 @@ func contractTemporaryPublicationLocked(ctx context.Context, service *FixedServi
 		result.RuntimeDigest, contractErr = host.ProbeTemporaryClosure(ctx, inventory)
 	}
 	if contractErr != nil {
+		if activationFencePresent {
+			_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			return errors.Join(contractErr, stopErr)
+		}
 		return failTemporaryPublicationContraction(ctx, service, exposure, host, recovery.Resource.ID, recovery.Marker.PlanID, generation, contractErr)
 	}
 	document, err := service.normal.Read()
@@ -669,13 +822,22 @@ func contractTemporaryPublicationLocked(ctx context.Context, service *FixedServi
 			return err
 		}
 	case domain.PublicationUnpublished:
-		if err := temporaryTerminalContractionEvidence(document, *current, safety.GenerationMarker{Kind: safety.MarkerClosing, Generation: generation, Reason: reason}); err != nil {
-			return err
+		if !activationFencePresent {
+			if err := temporaryTerminalContractionEvidence(document, *current, safety.GenerationMarker{Kind: safety.MarkerClosing, Generation: generation, Reason: reason}); err != nil {
+				return err
+			}
 		}
 	default:
 		return fmt.Errorf("temporary publication contraction normal state changed")
 	}
 	if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), recovery.Resource.ID); err != nil {
+		return err
+	}
+	if activationFencePresent {
+		if err := convergeInterruptedTemporaryActivation(ctx, service, exposure, recovery.Resource.ID, generation, result.RuntimeDigest, recovery.Marker, reason); err != nil {
+			return err
+		}
+		_, err = contractClosedPublicationOwnership(ctx, service, exposure, recovery.Resource.ID, recovery.Intent.JobID, generation)
 		return err
 	}
 	return convergeInterruptedDomainClosing(ctx, service, exposure, recovery.Resource.ID, generation, result.RuntimeDigest, reason)
@@ -748,6 +910,45 @@ func recoverTemporaryPublicationLocked(ctx context.Context, service *FixedServic
 		return false, restoreExactTemporaryMarker(ctx, service, exposure, recovery.Resource.ID, marker)
 	case temporaryRecoveryTerminalNoEffect:
 		return false, restoreExactTemporaryMarker(ctx, service, exposure, recovery.Resource.ID, marker)
+	case temporaryRecoveryActivationConvergence:
+		if host == nil {
+			return false, fmt.Errorf("temporary publication activation convergence host is missing")
+		}
+		manifest, manifestErr := host.AuditManifest(ctx)
+		inventory, inventoryErr := buildTemporaryClosureInventory(service, exposure, recovery.Resource.ID, recovery.Marker.PlanID, recovery.Marker.Generation, manifest)
+		if manifestErr != nil || inventoryErr != nil {
+			return false, errors.Join(manifestErr, inventoryErr)
+		}
+		runtimeDigest, err := host.ProbeTemporaryClosure(ctx, inventory)
+		if err != nil {
+			return false, err
+		}
+		if err := host.AcknowledgeContraction(context.WithoutCancel(ctx), recovery.Resource.ID); err != nil {
+			return false, err
+		}
+		reason := temporaryInterruptedClosingReason
+		if recovery.Job.Result == jobs.ResultSucceeded {
+			reason = temporaryCommittedClosingReason
+		}
+		state, err := service.safety.ReadForRecovery(exposure)
+		if err != nil {
+			return false, err
+		}
+		var generation uint64
+		for _, resource := range state.Resources {
+			if resource.ResourceID == recovery.Resource.ID {
+				generation = resource.GenerationSequence + 1
+				break
+			}
+		}
+		if generation == 0 {
+			return false, fmt.Errorf("temporary publication activation convergence safety resource missing")
+		}
+		if err := convergeInterruptedTemporaryActivation(ctx, service, exposure, recovery.Resource.ID, generation, runtimeDigest, recovery.Marker, reason); err != nil {
+			return false, err
+		}
+		_, err = contractClosedPublicationOwnership(ctx, service, exposure, recovery.Resource.ID, recovery.Intent.JobID, generation)
+		return false, err
 	case temporaryRecoveryActivationDurable, temporaryRecoveryCommitted:
 		completed, completeErr := completeTemporaryPublicationLocked(ctx, service, admitter, mutation, exposure, recovery, host)
 		if completeErr != nil || completed {
@@ -918,7 +1119,7 @@ func reconcileInterruptedTemporaryPublication(ctx context.Context, service *Fixe
 	if err != nil {
 		return err
 	}
-	if host == nil && (recoveryStage == temporaryRecoveryActivationDurable || recoveryStage == temporaryRecoveryCommitted) {
+	if host == nil && (recoveryStage == temporaryRecoveryActivationDurable || recoveryStage == temporaryRecoveryCommitted || recoveryStage == temporaryRecoveryActivationConvergence) {
 		fixedHost, err := activation.NewFixedHost()
 		if err != nil {
 			return err

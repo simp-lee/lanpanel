@@ -439,6 +439,56 @@ func TestTemporaryPublicationRecoveryStages(t *testing.T) {
 	}
 }
 
+func TestTemporaryPublicationRecoveryWithIngressActivationFence(t *testing.T) {
+	fixture := newTemporaryRecoveryFixture(t, "intent")
+	service := fixture.fixture.open(t)
+	mutationSet, mutation, exposure := fixture.fixture.acquire(t, service, "resource/"+fixture.resource.ID)
+	state, err := service.safety.ReadForRecovery(exposure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownershipInventory, err := service.ownership.Inventory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checksums := make(map[string]string, len(ownershipInventory.Records))
+	for _, record := range ownershipInventory.Records {
+		checksums[record.ResourceID] = record.Checksum
+	}
+	fence := &safety.StopFence{Kind: safety.StopFenceIngressActivation, OriginOperation: string(operations.Publish), Scope: safety.FenceScope{Kind: "app", ResourceID: fixture.resource.ID}, FenceGeneration: state.StopFenceSequence + 1, CreatedAt: time.Now().UTC(), SafetyGenerations: []safety.MarkerGeneration{{Kind: "reactivating", Generation: fixture.marker.Generation}, {Kind: "sticky_unpublished", Generation: 1}}, OwnedGraphDigest: recoveryDigest("temporary-ingress-graph"), InventoryDigest: safety.OwnershipInventoryDigest(checksums), Observation: safety.StopObservation{MasterStopped: true, WorkersStopped: true, ListenersStopped: true, ObservedAt: time.Now().UTC()}, AccessMayRemain: true, IngressActivation: &safety.IngressActivationFence{IntentRef: fixture.marker.PlanID, CandidateGeneration: fixture.marker.Generation, PriorGeneration: fixture.marker.PriorGeneration}}
+	authority, err := safety.ReserveEmergencyStopFenceGeneration(exposure, service.emergency, safety.RoleIngressActivation, safety.StopFenceIngressActivation, safety.StopFenceDigest(*fence), state.StopFenceSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = authority.Sequence
+	next.StopFenceSequence = authority.StopFenceSequence
+	next.StopFence = fence
+	if _, err := service.safety.Commit(context.Background(), exposure, safety.RoleIngressActivation, state.Revision, next, safety.TransitionProof{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(operations.ReleaseExposure(mutation, exposure), mutationSet.Close(), service.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := &temporaryRecoveryRuntimeProbe{}
+	runTemporaryRestartRecovery(t, fixture, false, runtime)
+	assertTemporaryRecoveryConverged(t, fixture, jobs.ResultInterrupted, domain.PublicationUnpublished)
+	if runtime.contractCalls != 1 || runtime.probeCalls != 1 {
+		t.Fatalf("temporary ingress-fenced recovery did not contract and prove closure: contract=%d probe=%d", runtime.contractCalls, runtime.probeCalls)
+	}
+	service = fixture.fixture.open(t)
+	defer func() { _ = service.Close() }()
+	state, err = service.safety.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.StopFence != nil || state.Resources[0].Reactivating != nil || state.Resources[0].Closing != nil || state.Resources[0].StickyUnpublished == nil || state.Resources[0].StickyUnpublished.Generation != 3 {
+		t.Fatalf("temporary ingress fence did not converge: %#v", state)
+	}
+}
+
 func TestTemporaryPriorRestoreIgnoresCallerCancellation(t *testing.T) {
 	fixture := newTemporaryRecoveryFixture(t, "intent")
 	service := fixture.fixture.open(t)
