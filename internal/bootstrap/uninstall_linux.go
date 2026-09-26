@@ -1136,7 +1136,7 @@ func mutableEnablementTarget(path, target string, artifacts map[string]string) b
 }
 
 func mutableServiceOwnedPath(path string) bool {
-	for _, root := range []string{"/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/certificates/", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/etc/lanpanel/startup-authority.json", "/run/lanpanel", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
+	for _, root := range []string{"/etc/lanpanel", "/usr/lib/lanpanel", "/var/lib/lanpanel/headscale-runtime", "/var/lib/lanpanel/headscale-control", "/var/lib/lanpanel/certificates/", "/var/lib/lanpanel/headscale/", "/var/lib/lanpanel/resources/", "/var/lib/lanpanel/goaccess/", "/var/log/lanpanel/goaccess/", "/etc/lanpanel/startup-authority.json", "/run/lanpanel", "/run/lanpanel/apps/", "/run/lanpanel-goaccess/"} {
 		if path == strings.TrimSuffix(root, "/") || strings.HasPrefix(path, root) {
 			return true
 		}
