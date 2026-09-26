@@ -177,6 +177,15 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 		return fmt.Errorf("uninstall ownership inventory changed after locking")
 	}
 	inventory = lockedInventory
+	// Verify lifecycle closure before stopping the helper and its recovery
+	// authority. A failed confirmation must leave the installation recoverable.
+	preStopInstallation, err := readLifecycleInstallation(paths, manager.Authority())
+	if err != nil {
+		return err
+	}
+	if err := verifyLifecycleIngressClosed(preStopInstallation); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
@@ -699,7 +708,7 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 		if err != nil {
 			return err
 		}
-		if err := addList(append(append([]string(nil), derived.ManagedPaths()...), process.AuthorityPath(app.ID), filepath.Join(derived.ResourceRoot, ".lanpanel-filetxn"), filepath.Dir(derived.SysusersFile), filepath.Dir(derived.ResourceRoot)), true); err != nil {
+		if err := addList(append(append([]string(nil), derived.ManagedPaths()...), process.AuthorityPath(app.ID), filepath.Join(derived.ResourceRoot, ".lanpanel-filetxn"), filepath.Join(filepath.Dir(derived.SysusersFile), ".lanpanel-filetxn"), filepath.Dir(derived.SysusersFile), filepath.Dir(derived.ResourceRoot)), true); err != nil {
 			return err
 		}
 		for _, link := range []string{

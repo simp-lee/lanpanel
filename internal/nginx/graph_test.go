@@ -63,6 +63,25 @@ func TestConfigIdentitySurvivesPartialTeardown(t *testing.T) {
 	}
 }
 
+func TestConfigIdentityAllowsEmptyManagedIncludeDirectories(t *testing.T) {
+	paths, manifest := installTestGraph(t)
+	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	data, err := EncodeManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMode(t, paths.ManifestPath(), data, 0o600)
+	for _, path := range []string{paths.CertificatePath, paths.PrivateKeyPath} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verified, err := VerifyConfigIdentity(paths, owner)
+	if err != nil || verified.InstallationID != manifest.InstallationID {
+		t.Fatalf("config identity with managed include directories=%#v err=%v", verified, err)
+	}
+}
+
 func TestClosedGraphRejectsForeignFilesAndContractsWithoutRestore(t *testing.T) {
 	paths, manifest := installTestGraph(t)
 	owner := filetxn.Owner{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}

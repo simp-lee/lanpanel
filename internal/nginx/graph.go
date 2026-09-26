@@ -379,7 +379,7 @@ func VerifyConfigIdentity(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	allowed := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true}
+	allowed := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, TemporaryDirectory: true}
 	for _, entry := range entries {
 		if !allowed[entry.Name()] {
 			return Manifest{}, fmt.Errorf("foreign Nginx root graph entry %q", entry.Name())
