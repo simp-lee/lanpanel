@@ -570,6 +570,9 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	if err := add(filepath.Join(paths.PersistentRoot, "installation", "acme-account.contact"), true); err != nil {
 		return err
 	}
+	if err := add(filepath.Join(paths.PersistentRoot, "resources"), true); err != nil {
+		return err
+	}
 	if paths == FixedPaths() {
 		nginxPaths := nginx.FixedPaths()
 		if err := addList([]string{nginxPaths.StateRoot, filepath.Join(nginxPaths.StateRoot, ".lanpanel-contraction-filetxn")}, true); err != nil {
