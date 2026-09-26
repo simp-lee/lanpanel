@@ -343,6 +343,20 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 		previousProfile = profile.Profile.ID
 		seenFamilies[familyKey] = true
 	}
+	if err := validateSupportedPreviewFamilies(manifest.SupportedProfiles); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSupportedPreviewFamilies(values []SupportedOSProfile) error {
+	seen := map[string]bool{}
+	for _, value := range values {
+		seen[value.Profile.Family+"/"+value.Profile.Architecture] = true
+	}
+	if !seen[PreviewDebianFamily+"/"+PreviewTargetArchitecture] || !seen[PreviewUbuntuFamily+"/"+PreviewTargetArchitecture] {
+		return fmt.Errorf("release manifest must include both Debian and Ubuntu amd64 profiles")
+	}
 	return nil
 }
 

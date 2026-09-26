@@ -2,6 +2,18 @@ package release
 
 import "testing"
 
+func TestValidateSupportedPreviewFamiliesRequiresBothFamilies(t *testing.T) {
+	profile := func(family string) SupportedOSProfile {
+		return SupportedOSProfile{Profile: OSProfile{Family: family, Architecture: PreviewTargetArchitecture}}
+	}
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily)}); err == nil {
+		t.Fatal("Ubuntu-only release profile set was accepted")
+	}
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewDebianFamily), profile(PreviewUbuntuFamily)}); err != nil {
+		t.Fatalf("complete Debian/Ubuntu profile set rejected: %v", err)
+	}
+}
+
 func TestIsSupportedPreviewTarget(t *testing.T) {
 	cases := []struct {
 		name      string
