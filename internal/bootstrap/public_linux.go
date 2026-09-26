@@ -92,7 +92,11 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err != nil {
 		return nil, identity.Material{}, err
 	}
-	return buildPublicInstallerInputWithMaterial(bundleDir, material, nil, nil)
+	data, built, err := buildPublicInstallerInputWithMaterial(bundleDir, material, nil, nil)
+	if err != nil {
+		material.Destroy()
+	}
+	return data, built, err
 }
 
 func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.Material, packagePlanOverride *packages.Plan, packagePreflightOverride *preflight.Result) ([]byte, identity.Material, error) {
