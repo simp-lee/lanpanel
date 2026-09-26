@@ -20,6 +20,10 @@ import (
 	"time"
 )
 
+func temporaryPublicationLastTrustedWall() time.Time {
+	return time.Unix(1, 0).UTC()
+}
+
 func evaluateTemporaryPreflight(ctx context.Context, installation domain.Installation, resource domain.AppResource, state safety.State, owned *ownership.Record) (preflight.ExpansionRequest, preflight.Result, error) {
 	publication := resource.Publication.TemporaryHTTP
 	if publication == nil {
@@ -53,7 +57,7 @@ func evaluateTemporaryPreflight(ctx context.Context, installation domain.Install
 		Profile:         preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: "amd64", SystemdVersion: profile.SystemdVersion, SystemdVersionMinimum: profile.SystemdVersionMinimum, SystemdVersionMaximum: profile.SystemdVersionMaximum, NginxVersion: profile.NginxVersion, NginxVersionMinimum: profile.NginxVersionMinimum, NginxVersionMaximum: profile.NginxVersionMaximum, PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), PolicyDigest: "sha256:" + confinement.PolicyDigest}, Authority: authority},
 		PublicAddresses: []string{publication.PublicIPv4}, TemporaryPort: publication.Port,
 		ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/lanpanel/nginx", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}},
-		Disks:        []preflight.DiskRequirement{{Path: "/etc/lanpanel/nginx", MinimumAvailableBytes: 1}}, LastTrustedWall: time.Now().UTC().Add(-time.Second),
+		Disks:        []preflight.DiskRequirement{{Path: "/etc/lanpanel/nginx", MinimumAvailableBytes: 1}}, LastTrustedWall: temporaryPublicationLastTrustedWall(),
 	}
 	packageRead := func(ctx context.Context) (preflight.PackageObservation, error) {
 		return preflight.ObserveBootstrapReadiness(ctx)

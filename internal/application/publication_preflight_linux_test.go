@@ -38,6 +38,15 @@ func TestPublicationProbeBindsOnlyConfirmedProcessRuntimeViolations(t *testing.T
 	}
 }
 
+func TestTemporaryPreflightTrustBoundaryIsStableAcrossRevalidation(t *testing.T) {
+	first := temporaryPublicationLastTrustedWall()
+	time.Sleep(time.Millisecond)
+	second := temporaryPublicationLastTrustedWall()
+	if !first.Equal(second) || !first.Equal(time.Unix(1, 0).UTC()) {
+		t.Fatalf("temporary preflight trust boundary changed: first=%s second=%s", first, second)
+	}
+}
+
 func TestTemporaryPreflightUsesOnlyExactOwnedNginxRuntimeListener(t *testing.T) {
 	const (
 		resourceID = "res_00000000000000000000000000000001"
