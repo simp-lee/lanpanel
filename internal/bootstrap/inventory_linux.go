@@ -26,7 +26,7 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 	for _, name := range []string{"lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		values = append(values, filepath.Join(paths.SystemdRoot, "multi-user.target.wants", name))
 	}
-	values = append(values, filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-management.socket"))
+	values = append(values, filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-management.socket"), filepath.Join(paths.SystemdRoot, "timers.target.wants", "lanpanel-timer.timer"))
 	if paths == FixedPaths() {
 		values = append(values, domain.HeadscaleManagedPaths()...)
 		controlPaths := control.FixedPaths()

@@ -294,9 +294,15 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 	if err := removeOwnedPath(paths.PersistentRoot, inventory.Artifacts, inventory.MutablePaths); err != nil && !retainExternalResourcePath(paths.PersistentRoot, paths.PersistentRoot, lifecycleInstallation) {
 		return retainFence(err)
 	}
+	if err := removeOwnedPath("/etc/lanpanel", inventory.Artifacts, inventory.MutablePaths); err != nil {
+		return retainFence(err)
+	}
 	if err := os.Remove(paths.BinaryPath); err != nil {
 		_ = stopOwnedServices(ctx, inventory.Paths)
 		return fmt.Errorf("uninstall binary removal failed; fence retained: %w", err)
+	}
+	if err := os.Remove(filepath.Dir(paths.BinaryPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("uninstall binary directory removal failed: %w", err)
 	}
 	_, _ = fmt.Fprintln(out, "LanPanel uninstall completed; no APT/dpkg package was removed; package and service ownership not proven by this lifecycle remain retained.")
 	return nil
