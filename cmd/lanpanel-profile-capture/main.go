@@ -231,7 +231,7 @@ func packageMinimum(name string) string {
 	case "nginx":
 		return "1.18.0"
 	case "goaccess":
-		return "1.8.0"
+		return "1.7.0"
 	default:
 		return "0"
 	}
