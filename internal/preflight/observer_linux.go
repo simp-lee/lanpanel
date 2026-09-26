@@ -168,6 +168,41 @@ func ObserveInstalledPackageTuples(ctx context.Context, names []string) ([]Insta
 	return observeInstalledPackageTuples(ctx, "/var/lib/dpkg/status", names, true)
 }
 
+// ObserveInstalledPackage performs a read-only optional package lookup for
+// ownership checks before the installer creates state.
+func ObserveInstalledPackage(ctx context.Context, name string) (InstalledPackageTuple, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return InstalledPackageTuple{}, false, err
+	}
+	if !validPackageTupleName(name) {
+		return InstalledPackageTuple{}, false, fmt.Errorf("installed package selector is invalid")
+	}
+	status, err := readSafeBoundedFile("/var/lib/dpkg/status", 32<<20, true)
+	if err != nil {
+		return InstalledPackageTuple{}, false, err
+	}
+	installed, partial, err := parseBootstrapDPKGStatus(status)
+	if err != nil {
+		return InstalledPackageTuple{}, false, err
+	}
+	if partial {
+		return InstalledPackageTuple{}, false, fmt.Errorf("dpkg package inventory found partial state")
+	}
+	var result InstalledPackageTuple
+	found := false
+	for _, item := range installed {
+		if item.Name != name {
+			continue
+		}
+		if found || item.Version == "" || item.Version != strings.TrimSpace(item.Version) || strings.ContainsAny(item.Version, "\x00\r\n") || item.Architecture != "amd64" && item.Architecture != "all" {
+			return InstalledPackageTuple{}, false, fmt.Errorf("installed package tuple is invalid or duplicated")
+		}
+		result = InstalledPackageTuple(item)
+		found = true
+	}
+	return result, found, nil
+}
+
 func observeInstalledPackageTuples(ctx context.Context, statusPath string, names []string, requireRoot bool) ([]InstalledPackageTuple, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

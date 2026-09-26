@@ -754,8 +754,11 @@ func validateBefore(plan Plan, before RuntimeSnapshot) error {
 	}
 	if hasPackage(plan.Packages, "nginx") {
 		installed := hasPackage(before.Installed, "nginx")
-		if plan.FirstNginxInstall == installed {
-			return fmt.Errorf("first-Nginx authority differs from the audited installed state")
+		if plan.FirstNginxInstall && installed {
+			return fmt.Errorf("nginx is already installed outside LanPanel; remove the foreign Nginx installation or use the existing LanPanel-owned transaction; no package mutation was performed")
+		}
+		if !plan.FirstNginxInstall && !installed {
+			return fmt.Errorf("LanPanel-owned Nginx is missing from the audited installed state")
 		}
 	}
 	units := affectedUnits(plan.Packages)

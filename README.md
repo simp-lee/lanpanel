@@ -30,7 +30,7 @@ The current release supports Debian or Ubuntu Linux on amd64 (x86_64) with:
 - an APT mirror with signature verification enabled and a healthy package state;
 - enough disk space and available ports.
 
-Before changing the host, the installer checks the operating system, packages, ports, filesystem, and Nginx configuration. Other distributions, ARM64, and hosts that fail these checks are unsupported. An unknown future Debian/Ubuntu release proceeds only when every check passes.
+Before changing the host, the installer checks the operating system, packages, ports, filesystem, and Nginx ownership/configuration. Other distributions, ARM64, and hosts that fail these checks are unsupported. An unknown future Debian/Ubuntu release proceeds only when every check passes.
 
 Installation does not require ACME or DNS operations in advance. You only need a domain, DNS, and the relevant 80/443 network access when you later publish a domain-based HTTPS application.
 
@@ -62,6 +62,13 @@ sudo /tmp/lanpanel-bootstrap.sh install
 ```
 
 Bootstrap verifies the release archive's SHA-256 in a protected temporary directory and then invokes the same `install` flow. It does not pipe downloaded content to a shell and has no third-party download fallback. System packages still come from the host's own APT mirror with signature verification enabled; do not disable repository signature checks or use `--allow-unauthenticated`.
+
+### Nginx and GoAccess package ownership
+
+- On a fresh installation, Nginx must not already be installed or controlled by another service. LanPanel installs and owns the Nginx package and its closed ingress configuration.
+- If an exact LanPanel installation already owns Nginx, an interrupted transaction resumes only from its durable journal. Replaying the same signed release is idempotent; an internal LanPanel-owned package transaction may reuse a qualifying Nginx version or upgrade it through the host APT policy.
+- A foreign Nginx package, listener, site, or systemd authority is rejected before package mutation. LanPanel does not stop it, overwrite its configuration, remove it, or adopt its package ownership. Remove the foreign installation or use the existing LanPanel installation instead.
+- GoAccess is optional at the host level. If it is already installed, healthy, and meets the selected profile's minimum version, LanPanel reuses it; otherwise the authorized APT transaction may install or upgrade it.
 
 ### 3. Open the Management UI
 
@@ -241,7 +248,7 @@ Use the secret-free configuration export when you need to take product configura
 
 ## Preview limitations
 
-- Clean installation only; no in-place upgrade, same-version reinstall, dependency maintenance, updater, rollback engine, or state/schema migration.
+- Clean installation only for a new host; no in-place release upgrade, dependency updater, rollback engine, or state/schema migration. Replaying the same signed release after a committed installation is idempotent; package ownership rules above still apply.
 - No supported product backup/restore, restore cutover, or cross-host migration. A manual host copy or VM snapshot is not automatically a supported recoverable backup.
 - No generic Repair, host repair, orphan adoption, or automatic normalization.
 - No EdgeOne integration in Preview.

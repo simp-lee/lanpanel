@@ -26,15 +26,21 @@ func TestArtifactDirectoryRejectsUnexpectedAssets(t *testing.T) {
 	}
 }
 
+func TestFreshInstallRejectsForeignNginx(t *testing.T) {
+	if err := validateFreshNginxPackageOwnership(preflight.InstalledPackageTuple{Name: "nginx", Version: "1.22.1-9", Architecture: "amd64"}); err == nil || !strings.Contains(err.Error(), "already installed outside LanPanel") {
+		t.Fatalf("foreign Nginx was not rejected clearly: %v", err)
+	}
+}
+
 func TestPublicInstallerHasNoUserSuppliedAuthorityArguments(t *testing.T) {
 	if err := runPublicInstaller([]string{"--bundle-dir", "/srv/release"}, io.Discard); err == nil {
 		t.Fatal("legacy public installer arguments were accepted")
 	}
 }
 
-func TestPublicInstallerResumeChecksTerminalPhaseBeforeInput(t *testing.T) {
-	if err := validatePublicInstallerResume(PhaseActivated, nil); err == nil || !strings.Contains(err.Error(), "already activated") {
-		t.Fatalf("activated resume was not recognized before input validation: %v", err)
+func TestPublicInstallerResumeAllowsCommittedSameReleaseReplay(t *testing.T) {
+	if err := validatePublicInstallerResume(PhaseActivated, nil); err != nil {
+		t.Fatalf("activated same-release replay was rejected: %v", err)
 	}
 	if err := validatePublicInstallerResume(PhasePrepared, nil); err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("nonterminal resume without input was not rejected: %v", err)

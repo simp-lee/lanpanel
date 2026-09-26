@@ -46,6 +46,18 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 		if err := validatePublicInstallerResume(journalPhase, data); err != nil {
 			return err
 		}
+		if journalPhase == PhaseActivated {
+			bundleDir, err := currentArtifactDirectory()
+			if err != nil {
+				return err
+			}
+			data, material, err := buildPublicInstallerInput(bundleDir)
+			if err != nil {
+				return err
+			}
+			defer material.Destroy()
+			return runInstallerAuthority(data, stdout)
+		}
 		return runInstallerAuthority(data, stdout)
 	}
 	bundleDir, err := currentArtifactDirectory()
@@ -237,7 +249,7 @@ func readCurrentExecutable(maximum uint64) ([]byte, error) {
 
 func validatePublicInstallerResume(phase Phase, data []byte) error {
 	if phase == PhaseActivated {
-		return fmt.Errorf("installation is already activated")
+		return nil
 	}
 	if len(data) == 0 {
 		return fmt.Errorf("public installer resume authority is missing from the bootstrap journal")

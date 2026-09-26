@@ -104,6 +104,14 @@ func install(ctx context.Context, request Request, strict bool) error {
 		if err := validateJournalPackageAuthority(journal); err != nil {
 			return err
 		}
+		if journal.Phase == PhaseActivated {
+			if !reflect.DeepEqual(journal.Release, releaseIdentity) || journal.Paths != paths {
+				return fmt.Errorf("activated LanPanel installation belongs to a different release authority")
+			}
+			request.PackagePlan = journal.PackagePlan
+			request.PackagePreflight = journal.PackagePreflight
+			return resume(ctx, store, journal, request, nil, strict)
+		}
 		if journal.PackageInputPlanDigest != packagePlanDigest {
 			return fmt.Errorf("existing bootstrap attempt package input authority changed")
 		}
@@ -172,6 +180,17 @@ func install(ctx context.Context, request Request, strict bool) error {
 		return fmt.Errorf("clean install persistent root already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if strict && paths == FixedPaths() {
+		if err := rejectForeignNginxPackage(ctx); err != nil {
+			return err
+		}
+		if err := rejectForeignNginxPreinstallFiles(); err != nil {
+			return err
+		}
+		if err := rejectForeignNginxAuthority(); err != nil {
+			return err
+		}
 	}
 	var material identity.Material
 	if request.Material != nil {
@@ -927,6 +946,32 @@ func installVendorNginxMask(systemdRoot string) error {
 		return fmt.Errorf("created Nginx mask identity changed")
 	}
 	return unix.Fsync(directory)
+}
+
+func rejectForeignNginxPreinstallFiles() error {
+	for _, path := range []string{"/usr/sbin/nginx", "/etc/nginx"} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("foreign Nginx authority exists at %q; remove it or use the existing LanPanel installation; no package mutation was performed", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectForeignNginxPackage(ctx context.Context) error {
+	installed, present, err := preflight.ObserveInstalledPackage(ctx, "nginx")
+	if err != nil {
+		return fmt.Errorf("inspect Nginx package ownership before mutation: %w", err)
+	}
+	if !present {
+		return nil
+	}
+	return validateFreshNginxPackageOwnership(installed)
+}
+
+func validateFreshNginxPackageOwnership(installed preflight.InstalledPackageTuple) error {
+	return fmt.Errorf("nginx is already installed outside LanPanel (%s); stop and remove the foreign Nginx installation or use the existing LanPanel installation; no package mutation was performed", installed.Version)
 }
 
 func rejectForeignNginxAuthority() error {

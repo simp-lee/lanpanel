@@ -18,6 +18,26 @@ import (
 	"time"
 )
 
+func TestNginxOwnershipPolicyDistinguishesForeignAndLanPanelPackages(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	before := RuntimeSnapshot{
+		Installed: []Package{{Name: "nginx"}},
+		Units:     []UnitState{{Name: "nginx.service", Active: false}},
+	}
+	if err := validateBefore(plan, before); err == nil || !strings.Contains(err.Error(), "already installed outside LanPanel") {
+		t.Fatalf("foreign Nginx package was not rejected clearly: %v", err)
+	}
+	plan.FirstNginxInstall = false
+	if err := validateBefore(plan, before); err != nil {
+		t.Fatalf("LanPanel-owned Nginx package was rejected: %v", err)
+	}
+	plan.FirstNginxInstall = true
+	before.Installed = []Package{{Name: "goaccess"}}
+	if err := validateBefore(plan, before); err != nil {
+		t.Fatalf("pre-existing GoAccess blocked an otherwise fresh Nginx install: %v", err)
+	}
+}
+
 func TestPackageNoAutostartRoleAlwaysDeniesMaintainerStarts(t *testing.T) {
 	for _, arguments := range [][]string{{"nginx", "start"}, {"apache2", "restart"}, {"--hostile"}, nil} {
 		if code := NoAutostartExitCode(arguments); code != 101 {

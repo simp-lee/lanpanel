@@ -80,19 +80,22 @@ type Plan struct {
 	Mode             Mode      `json:"mode"`
 	// Public release plans never persist a proxy; a non-nil in-memory value is
 	// rejected by ValidatePublicReleasePlan and strict decoders reject legacy JSON.
-	Proxy                   *sources.Proxy `json:"-"`
-	Packages                []Package      `json:"packages"`
-	Repositories            []Repository   `json:"repositories"`
-	FirstNginxInstall       bool           `json:"first_nginx_install"`
-	LockWait                time.Duration  `json:"lock_wait"`
-	ConnectTimeout          time.Duration  `json:"connect_timeout"`
-	ReadTimeout             time.Duration  `json:"read_timeout"`
-	TotalTimeout            time.Duration  `json:"total_timeout"`
-	NoNetwork               bool           `json:"no_network"`
-	NoAutostartPolicyDigest string         `json:"no_autostart_policy_digest"`
-	PreflightDigest         string         `json:"preflight_digest"`
-	PreflightRequestDigest  string         `json:"preflight_request_digest"`
-	Authority               Authority      `json:"authority"`
+	Proxy        *sources.Proxy `json:"-"`
+	Packages     []Package      `json:"packages"`
+	Repositories []Repository   `json:"repositories"`
+	// FirstNginxInstall is true only for a fresh LanPanel-owned Nginx
+	// transaction. Internal transactions for an already committed LanPanel
+	// installation set it false; a foreign pre-existing Nginx is rejected.
+	FirstNginxInstall       bool          `json:"first_nginx_install"`
+	LockWait                time.Duration `json:"lock_wait"`
+	ConnectTimeout          time.Duration `json:"connect_timeout"`
+	ReadTimeout             time.Duration `json:"read_timeout"`
+	TotalTimeout            time.Duration `json:"total_timeout"`
+	NoNetwork               bool          `json:"no_network"`
+	NoAutostartPolicyDigest string        `json:"no_autostart_policy_digest"`
+	PreflightDigest         string        `json:"preflight_digest"`
+	PreflightRequestDigest  string        `json:"preflight_request_digest"`
+	Authority               Authority     `json:"authority"`
 }
 
 type ConfigKind string
