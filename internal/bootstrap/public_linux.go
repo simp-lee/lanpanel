@@ -51,7 +51,11 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 			if err != nil {
 				return err
 			}
-			data, material, err := buildPublicInstallerInput(bundleDir)
+			material, packagePlan, packagePreflight, err := readPublicInstallerReplayAuthority()
+			if err != nil {
+				return err
+			}
+			data, material, err := buildPublicInstallerInputWithMaterial(bundleDir, material, &packagePlan, &packagePreflight)
 			if err != nil {
 				return err
 			}
@@ -84,6 +88,14 @@ func currentArtifactDirectory() (string, error) {
 }
 
 func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, error) {
+	material, err := identity.Generate(rand.Reader)
+	if err != nil {
+		return nil, identity.Material{}, err
+	}
+	return buildPublicInstallerInputWithMaterial(bundleDir, material, nil, nil)
+}
+
+func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.Material, packagePlanOverride *packages.Plan, packagePreflightOverride *preflight.Result) ([]byte, identity.Material, error) {
 	manifestAssets, err := readInstallerAssets(map[string]string{"release.json": filepath.Join(bundleDir, "release.json")})
 	if err != nil {
 		return nil, identity.Material{}, err
@@ -144,21 +156,29 @@ func buildPublicInstallerInput(bundleDir string) ([]byte, identity.Material, err
 	if err := release.DecodeCanonical(packageTemplateBytes, &packageTemplate); err != nil {
 		return nil, identity.Material{}, fmt.Errorf("public package template is invalid: %w", err)
 	}
-	material, err := identity.Generate(rand.Reader)
-	if err != nil {
-		return nil, identity.Material{}, err
-	}
 	identityValue := authority.Identity()
-	preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
-	packagePreflightRequest, packagePreflight, err := preflightEvaluator(context.Background(), material.Authority, material.SafetyGeneration)
-	if err != nil {
-		material.Destroy()
-		return nil, identity.Material{}, err
-	}
-	packagePlan, err := bindPublicPackagePlan(packageTemplate, identityValue, material, packagePreflightRequest, packagePreflight, time.Now().UTC(), release.DigestBytes(manifestBytes))
-	if err != nil {
-		material.Destroy()
-		return nil, identity.Material{}, err
+	var packagePlan packages.Plan
+	var packagePreflight preflight.Result
+	if packagePlanOverride != nil || packagePreflightOverride != nil {
+		if packagePlanOverride == nil || packagePreflightOverride == nil {
+			material.Destroy()
+			return nil, identity.Material{}, fmt.Errorf("public installer package replay authority is incomplete")
+		}
+		packagePlan = *packagePlanOverride
+		packagePreflight = *packagePreflightOverride
+	} else {
+		preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
+		packagePreflightRequest, evaluatedPreflight, err := preflightEvaluator(context.Background(), material.Authority, material.SafetyGeneration)
+		if err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, err
+		}
+		packagePlan, err = bindPublicPackagePlan(packageTemplate, identityValue, material, packagePreflightRequest, evaluatedPreflight, time.Now().UTC(), release.DigestBytes(manifestBytes))
+		if err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, err
+		}
+		packagePreflight = evaluatedPreflight
 	}
 	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
 	data, err := json.Marshal(input)
@@ -255,6 +275,20 @@ func validatePublicInstallerResume(phase Phase, data []byte) error {
 		return fmt.Errorf("public installer resume authority is missing from the bootstrap journal")
 	}
 	return nil
+}
+
+func readPublicInstallerReplayAuthority() (identity.Material, packages.Plan, preflight.Result, error) {
+	store, journal, err := openJournal(FixedPaths().Journal, 0, 0)
+	if err != nil {
+		return identity.Material{}, packages.Plan{}, preflight.Result{}, err
+	}
+	if closeErr := store.close(); closeErr != nil {
+		return identity.Material{}, packages.Plan{}, preflight.Result{}, closeErr
+	}
+	if journal.Phase != PhaseActivated {
+		return identity.Material{}, packages.Plan{}, preflight.Result{}, fmt.Errorf("public installer replay journal is not activated")
+	}
+	return identity.Material{AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, SafetyGeneration: journal.SafetyGeneration, Authority: journal.Authority}, journal.PackagePlan, journal.PackagePreflight, nil
 }
 
 func readPublicInstallerInputFromJournal() ([]byte, Phase, error) {
