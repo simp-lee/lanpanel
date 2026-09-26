@@ -286,9 +286,13 @@ func writeFixture(t *testing.T, root, relative string, data []byte, mode os.File
 
 type auditLauncher struct {
 	emptySimulation bool
+	lastStaged      bool
 }
 
 func (launcher *auditLauncher) RunInvocation(_ context.Context, profile child.ProfileID, invocation child.Invocation, _ []byte) (child.Result, error) {
+	if profile == child.ProfileAPTSimulate {
+		launcher.lastStaged = invocation.Package.Staged
+	}
 	result := child.Result{ExitCode: 0, StdoutDigest: "sha256:" + strings.Repeat("1", 64), StderrDigest: "sha256:" + strings.Repeat("2", 64), PackageChanges: []child.PackageChange{}}
 	if profile == child.ProfileAPTSimulate && !launcher.emptySimulation {
 		for _, pkg := range invocation.Package.Packages {
@@ -296,4 +300,20 @@ func (launcher *auditLauncher) RunInvocation(_ context.Context, profile child.Pr
 		}
 	}
 	return result, nil
+}
+
+func TestHostExecutorResolveUsesStagedSimulationForArtifactPlans(t *testing.T) {
+	for _, mode := range []Mode{StagedDebs, OfflineDebs} {
+		t.Run(string(mode), func(t *testing.T) {
+			plan := testPlan(t, mode)
+			launcher := &auditLauncher{}
+			resolved, err := (&HostExecutor{Launcher: launcher}).Resolve(context.Background(), plan)
+			if err != nil || !reflectPackages(resolved, plan.Packages) {
+				t.Fatalf("resolved=%#v error=%v", resolved, err)
+			}
+			if !launcher.lastStaged {
+				t.Fatal("artifact package simulation was not staged")
+			}
+		})
+	}
 }

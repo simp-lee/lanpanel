@@ -76,7 +76,8 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 	if executor == nil || executor.Launcher == nil {
 		return nil, fmt.Errorf("package simulation child is unavailable")
 	}
-	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, false), nil)
+	staged := plan.Mode == StagedDebs || plan.Mode == OfflineDebs
+	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, staged), nil)
 	if err != nil {
 		return nil, fmt.Errorf("exact package simulation failed: %w", err)
 	}
