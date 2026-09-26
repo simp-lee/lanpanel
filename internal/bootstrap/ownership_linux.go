@@ -22,7 +22,7 @@ func mutableOwnershipPaths(paths Paths) []string {
 	for _, name := range []string{"lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		values = append(values, filepath.Join(paths.SystemdRoot, "multi-user.target.wants", name))
 	}
-	values = append(values, filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-management.socket"))
+	values = append(values, filepath.Join(paths.SystemdRoot, "sockets.target.wants", "lanpanel-management.socket"), filepath.Join(paths.SystemdRoot, "timers.target.wants", "lanpanel-timer.timer"))
 	if paths == FixedPaths() {
 		controlPaths := control.FixedPaths()
 		values = append(values, controlPaths.Config, filepath.Join(controlPaths.ConfigRoot, ".lanpanel-filetxn"), controlPaths.Policy, controlPaths.Unit, controlPaths.Database, controlPaths.NoiseKey, controlPaths.DERPKey, controlPaths.Journal, controlPaths.JournalStaging, controlPaths.ControlSocket, controlPaths.AdminSocket, controlPaths.MetricsSocket, "/var/lib/lanpanel/headscale/identity", "/var/lib/lanpanel/headscale/identity/database-uuid", "/var/lib/lanpanel/headscale/identity/snapshot.json", "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging")
