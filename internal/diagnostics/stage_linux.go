@@ -38,15 +38,13 @@ func recordCertificateStage(path, jobID, stage, outcome string) error {
 	if err != nil {
 		return err
 	}
-	if path == CertificateStageLog {
-		directory := filepath.Dir(path)
-		if err := os.Mkdir(directory, 0o700); err != nil && !os.IsExist(err) {
-			return err
-		}
-		var directoryStat unix.Stat_t
-		if err := unix.Lstat(directory, &directoryStat); err != nil || directoryStat.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStat.Uid != uint32(os.Geteuid()) || directoryStat.Gid != uint32(os.Getegid()) || directoryStat.Mode&0o7777 != 0o700 {
-			return fmt.Errorf("certificate stage diagnostic directory is unsafe")
-		}
+	directory := filepath.Dir(path)
+	if err := os.Mkdir(directory, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	var directoryStat unix.Stat_t
+	if err := unix.Lstat(directory, &directoryStat); err != nil || directoryStat.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStat.Uid != uint32(os.Geteuid()) || directoryStat.Gid != uint32(os.Getegid()) || directoryStat.Mode&0o7777 != 0o700 {
+		return fmt.Errorf("certificate stage diagnostic directory is unsafe")
 	}
 	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
