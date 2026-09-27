@@ -677,6 +677,18 @@ func augmentCurrentLifecycleOwnership(paths Paths, authority locks.Authority, in
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
+	// Register resource-owned paths before scanning shared staging roots. Resource
+	// sysusers files and runtime sockets live below roots that are also used by
+	// other lifecycle transactions; they are not foreign residue.
+	for _, app := range installation.Resources {
+		derived, err := appresource.DerivePaths(app.ID)
+		if err != nil {
+			return err
+		}
+		if err := addList(append(append([]string(nil), derived.ManagedPaths()...), process.AuthorityPath(app.ID), filepath.Join(derived.ResourceRoot, ".lanpanel-filetxn"), filepath.Join(filepath.Dir(derived.SysusersFile), ".lanpanel-filetxn"), filepath.Dir(derived.SysusersFile), filepath.Dir(derived.ResourceRoot)), true); err != nil {
+			return err
+		}
+	}
 	for _, root := range []string{
 		filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.PersistentRoot, ".lanpanel-filetxn"), "/etc/.lanpanel-filetxn", "/usr/local/bin/.lanpanel-filetxn", "/etc/lanpanel/sysusers/.lanpanel-filetxn", "/etc/lanpanel/sysusers", filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"), "/etc/lanpanel/.lanpanel-filetxn", "/usr/lib/lanpanel/.lanpanel-filetxn", "/usr/sbin/.lanpanel-filetxn", "/etc/sysusers.d/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-filetxn", "/etc/lanpanel-public/basic/.txn", filepath.Join(paths.SafetyRoot, "process", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-create", ".filetxn"), filepath.Join(paths.SafetyRoot, "resource-update", ".filetxn"), filepath.Join(paths.SafetyRoot, "managed-basic", ".filetxn"), filepath.Join(paths.SafetyRoot, "process"), filepath.Join(paths.SafetyRoot, "resource-create"), filepath.Join(paths.SafetyRoot, "resource-update"), filepath.Join(paths.SafetyRoot, "managed-basic"), "/run/lanpanel/apps", "/etc/lanpanel-headscale/.lanpanel-filetxn", "/etc/systemd/system/.lanpanel-headscale-filetxn", "/etc/lanpanel/nginx/.lanpanel-filetxn", "/var/log/lanpanel/.lanpanel-filetxn", filepath.Join(paths.StateRoot, ".lanpanel-contraction-filetxn"), "/var/lib/lanpanel/headscale/identity/.identity.lanpanel-staging", "/var/lib/lanpanel/headscale/journal/.lanpanel-filetxn",
 	} {
