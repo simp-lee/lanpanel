@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"lanpanel/internal/domain"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,17 @@ func TestFreshResourceHasStableUnpublishedStoppedIdentity(t *testing.T) {
 	secondPaths, _ := DerivePaths(second.ID)
 	if first.ID != "res_"+strings.Repeat("01", 16) || first.ManagedProcess.ID != "proc_"+strings.Repeat("01", 16) || first.PublicationRecord.State != domain.PublicationUnpublished || first.PublicationRecord.UnpublishedGeneration != 1 || first.ManagedProcess.Requested != domain.ProcessRequestedStopped || first.ManagedProcess.Applied != nil || firstPaths != secondPaths {
 		t.Fatalf("resource=%#v paths=%#v", first, firstPaths)
+	}
+	backendDir := filepath.Dir(firstPaths.BackendSocket)
+	foundBackendDir := false
+	for _, path := range first.ManagedPaths {
+		if path == backendDir {
+			foundBackendDir = true
+			break
+		}
+	}
+	if !foundBackendDir {
+		t.Fatalf("resource managed paths omit backend directory: %v", first.ManagedPaths)
 	}
 }
 

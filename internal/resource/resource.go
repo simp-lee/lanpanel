@@ -364,7 +364,7 @@ func DerivePaths(resourceID string) (Paths, error) {
 }
 
 func (paths Paths) ManagedPaths() []string {
-	values := []string{paths.ResourceRoot, paths.FrontendSocket, filepath.Join("/etc/systemd/system", paths.ServiceUnit), filepath.Join("/etc/systemd/system", paths.SocketUnit), filepath.Join("/etc/systemd/system", paths.PolicyUnit), filepath.Join("/etc/systemd/system", paths.BackendSocketUnit), paths.SysusersFile}
+	values := []string{paths.ResourceRoot, filepath.Dir(paths.BackendSocket), paths.FrontendSocket, filepath.Join("/etc/systemd/system", paths.ServiceUnit), filepath.Join("/etc/systemd/system", paths.SocketUnit), filepath.Join("/etc/systemd/system", paths.PolicyUnit), filepath.Join("/etc/systemd/system", paths.BackendSocketUnit), paths.SysusersFile}
 	if paths.RelayUnit != "" {
 		values = append(values, filepath.Join("/etc/systemd/system", paths.RelayUnit))
 	}
