@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/child"
 	managedconnector "lanpanel/internal/connector"
 	"lanpanel/internal/contraction"
+	"lanpanel/internal/diagnostics"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	managedheadscale "lanpanel/internal/headscale"
@@ -1761,6 +1762,19 @@ func contractPublicationProcessViolation(ctx context.Context, cause error) error
 	return errors.Join(cause, contractErr)
 }
 
+func traceCertificateStage(jobID, stage string, err error) {
+	outcome := "succeeded"
+	if err != nil {
+		outcome = "failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			outcome = "deadline"
+		}
+	}
+	if traceErr := diagnostics.RecordCertificateStage(jobID, stage, outcome); traceErr != nil {
+		log.Printf("certificate stage diagnostic unavailable: %v", traceErr)
+	}
+}
+
 func executeDomainPublication(ctx context.Context, request helperproto.Request) (output ExecutionResult, resultErr error) {
 	execution, err := application.BeginCertificateIssue(ctx, application.Actor{Kind: application.ActorUI, Identity: request.Resource.ActorIdentity, Generation: request.Resource.ActorGeneration}, request.Target, application.ConfirmationPayload{PlanID: request.Resource.PlanID, Confirmation: request.Resource.Confirmation})
 	if err != nil {
@@ -1778,31 +1792,48 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 		}
 	}()
 	abort := func(cause error) (ExecutionResult, error) {
-		return ExecutionResult{}, execution.Abort(context.WithoutCancel(ctx), cause)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		abortErr := execution.Abort(cleanupCtx, cause)
+		traceCertificateStage(execution.JobID, "abort", abortErr)
+		return ExecutionResult{}, abortErr
 	}
+	traceCertificateStage(execution.JobID, "challenge", nil)
 	if err := execution.ActivateChallenge(ctx); err != nil {
+		traceCertificateStage(execution.JobID, "challenge", err)
 		return abort(err)
 	}
+	traceCertificateStage(execution.JobID, "acme", nil)
 	result, runErr := execution.RunRemote(ctx, execution.StageUID, execution.StageGID)
-	if err := execution.TerminalizeChild(ctx, result, runErr); err != nil {
+	traceCertificateStage(execution.JobID, "acme", runErr)
+	// Terminalization and contraction must retain time after the remote deadline.
+	terminalCtx, cancelTerminal := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancelTerminal()
+	if err := execution.TerminalizeChild(terminalCtx, result, runErr); err != nil {
+		traceCertificateStage(execution.JobID, "child_terminal", err)
 		return abort(err)
 	}
+	traceCertificateStage(execution.JobID, "child_terminal", nil)
 	if runErr != nil {
 		return abort(runErr)
 	}
 	material, err := execution.LoadIssued(time.Now().UTC())
+	traceCertificateStage(execution.JobID, "issued_material", err)
 	if err != nil {
 		return abort(err)
 	}
 	identity, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: execution.StageUID, GID: execution.StageGID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
+	traceCertificateStage(execution.JobID, "certificate_staging", err)
 	if err != nil {
 		return abort(err)
 	}
 	certificate, err := execution.PreparePublicationCertificate(ctx, identity)
 	if err != nil {
+		traceCertificateStage(execution.JobID, "publication_handoff", err)
 		return abort(err)
 	}
 	publicationExecution, err := execution.PrepareDomainPublication(ctx, certificate)
+	traceCertificateStage(execution.JobID, "publication_handoff", err)
 	if err != nil {
 		return abort(err)
 	}
@@ -1812,6 +1843,7 @@ func executeDomainPublication(ctx context.Context, request helperproto.Request) 
 		}
 	}()
 	job, err := publicationExecution.Run(ctx)
+	traceCertificateStage(execution.JobID, "job_terminal", err)
 	if err != nil {
 		if job.ID == "" || job.Status != jobs.StatusTerminal || job.Result != jobs.ResultPartial {
 			return ExecutionResult{}, err

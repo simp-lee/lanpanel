@@ -506,6 +506,7 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 	if err != nil {
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}
+	host.JobID = execution.JobID
 	if execution.Candidate.Bundle.DomainHTTPS != nil {
 		if _, bindingErr := bindingFromCertificateAuthority(execution.Candidate.Bundle.DomainHTTPS.Certificate.Authority); bindingErr != nil {
 			if stagedGoAccess != nil {
@@ -537,20 +538,25 @@ func (execution *PublicationExecution) Run(ctx context.Context) (jobs.Record, er
 				return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, restoreErr))
 			}
 		}
+		if priorRestored {
+			restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			restoreErr := execution.Service.RestorePublicationSafety(restoreCtx, execution.Exposure, execution.Resource.ID, execution.Reactivating)
+			if restoreErr == nil {
+				rejectErr := execution.Admitter.RejectPublication(restoreCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior")
+				if rejectErr == nil {
+					cancelRestore()
+					return jobs.Record{}, err
+				}
+				restoreErr = rejectErr
+			}
+			cancelRestore()
+			err = errors.Join(err, restoreErr)
+		}
 		if activationCtx.Err() != nil {
 			return jobs.Record{}, execution.failClosed(ctx, errors.Join(err, activationCtx.Err()))
 		}
 		if !priorRestored {
 			return jobs.Record{}, execution.failClosed(ctx, err)
-		}
-		if restoreErr := execution.Service.RestorePublicationSafety(activationCtx, execution.Exposure, execution.Resource.ID, execution.Reactivating); restoreErr == nil {
-			if rejectErr := execution.Admitter.RejectPublication(activationCtx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, "activation_restored_prior"); rejectErr == nil {
-				return jobs.Record{}, err
-			} else {
-				err = errors.Join(err, rejectErr)
-			}
-		} else {
-			err = errors.Join(err, restoreErr)
 		}
 		return jobs.Record{}, execution.failClosed(ctx, err)
 	}

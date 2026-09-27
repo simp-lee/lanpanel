@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/locks"
 	"os"
@@ -299,6 +300,78 @@ func TestStoreConvergesSupersededActivationReservation(t *testing.T) {
 	}
 	if persisted.StopFence != nil || persisted.StopFenceSequence != orphan.StopFenceSequence || persisted.AuthoritySequence != authority.Sequence || authority.ClearProof == nil {
 		t.Fatalf("superseded activation reservation did not converge: state=%#v authority=%#v", persisted, authority)
+	}
+}
+
+func TestStoreConvergesOrphanedIngressReservation(t *testing.T) {
+	for _, preCleared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pre_cleared_%t", preCleared), func(t *testing.T) {
+			store, emergency, manager, lease := newSafetyStore(t)
+			defer closeSafetyStore(t, store, emergency, manager, lease)
+			ownership := testOwnershipAuthority{"app-one": digest("owner")}
+			if _, err := store.Initialize(context.Background(), lease); err != nil {
+				t.Fatal(err)
+			}
+			store.config.Ownership = ownership
+			authority, err := emergency.Authority()
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := State{SchemaVersion: SchemaVersion, Revision: 1, AuthoritySequence: authority.Sequence, GlobalClose: GlobalClose{Phase: GlobalCloseNone}, StopFenceSequence: authority.StopFenceSequence, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 2, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 1, Reason: "initial"}, Reactivating: &Reactivating{Generation: 2, PriorGeneration: 1, PlanID: "plan-one", CandidateDigest: digest("candidate"), CandidateBundle: digest("bundle"), CertificateUntil: time.Now().Add(time.Hour), BaseMarkers: absentBaseSnapshot()}}}}
+			if _, err := store.persist(context.Background(), current, filetxn.ReplaceOnly); err != nil {
+				t.Fatal(err)
+			}
+			fence := validStopFence(StopFenceIngressActivation)
+			fence.SafetyGenerations = nil
+			fence.IngressActivation = &IngressActivationFence{IntentRef: "plan-one", CandidateGeneration: 2, PriorGeneration: 1}
+			reservationDigest := StopFenceDigest(fence)
+			reserved, err := ReserveEmergencyStopFenceGeneration(lease, emergency, RoleIngressActivation, StopFenceIngressActivation, reservationDigest, current.StopFenceSequence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := current
+			next.Revision++
+			next.AuthoritySequence = reserved.Sequence
+			next.StopFenceSequence = reserved.StopFenceSequence
+			next.Resources = append([]ResourceSafety(nil), current.Resources...)
+			next.Resources[0].GenerationSequence = 3
+			next.Resources[0].Reactivating = nil
+			next.Resources[0].Closing = &GenerationMarker{Kind: MarkerClosing, Generation: 3, Reason: "interrupted_domain_activation"}
+			digestValue := digest("runtime")
+			proof := &StopFenceConvergenceProof{Kind: StopFenceIngressActivation, ResourceID: "app-one", ActivationGeneration: 2, FenceGeneration: reserved.StopFenceSequence, FenceDigest: reservationDigest, JournalRef: "plan-one", InventoryDigest: OwnershipInventoryDigest(map[string]string{"app-one": digest("owner")}), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digestValue, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: map[string]uint64{"app-one": 3}}
+			wrongDigest := *proof
+			wrongDigest.FenceDigest = digest("wrong-fence")
+			if _, err := store.Commit(context.Background(), lease, RoleContraction, current.Revision, next, TransitionProof{StopFence: &wrongDigest}); err == nil {
+				t.Fatal("orphaned reservation accepted a mismatched fence proof")
+			}
+			wrongInventory := *proof
+			wrongInventory.InventoryDigest = digest("wrong-inventory")
+			if _, err := store.Commit(context.Background(), lease, RoleContraction, current.Revision, next, TransitionProof{StopFence: &wrongInventory}); err == nil {
+				t.Fatal("orphaned reservation accepted a mismatched inventory proof")
+			}
+			if preCleared {
+				cleared := reserved
+				cleared.Sequence++
+				cleared.ClearProof = &EmergencyClearProof{Generation: reserved.GlobalClose.Generation, StopFenceGeneration: reserved.StopFenceSequence, StopFenceDigest: reservationDigest, InventoryDigest: proof.InventoryDigest, OwnedGraphDigest: proof.OwnedGraphDigest, RuntimeClosureDigest: proof.RuntimeClosureDigest, NginxTestPassed: true, RuntimeClosed: true}
+				if err := emergency.commitReservedStopFenceClearProof(lease, reserved.Sequence, cleared); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.Commit(context.Background(), lease, RoleContraction, current.Revision, next, TransitionProof{StopFence: proof}); err != nil {
+				t.Fatalf("orphaned reservation did not converge: %v", err)
+			}
+			persisted, err := store.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			finalAuthority, err := emergency.Authority()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.StopFence != nil || persisted.StopFenceSequence != reserved.StopFenceSequence || persisted.AuthoritySequence != finalAuthority.Sequence || finalAuthority.ClearProof == nil {
+				t.Fatalf("orphaned reservation did not converge: state=%#v authority=%#v", persisted, finalAuthority)
+			}
+		})
 	}
 }
 

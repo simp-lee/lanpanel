@@ -93,6 +93,8 @@ type GlobalConvergenceProof struct {
 
 type StopFenceConvergenceProof struct {
 	Kind                   StopFenceKind
+	ResourceID             string
+	ActivationGeneration   uint64
 	FenceGeneration        uint64
 	FenceDigest            string
 	JournalRef             string
@@ -412,6 +414,7 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 		return filetxn.Result{}, err
 	}
 	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0) && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
+	orphanedIngressReservation := current.StopFence == nil && next.StopFence == nil && role == RoleContraction && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && authority.ReservedStopFenceKind == StopFenceIngressActivation && authority.StopFenceSequence == next.StopFenceSequence && validOrphanedReservationAuthority(current, next, authority, proof.StopFence)
 	if supersededReservation {
 		if proof.StopFence == nil || !validStopClearProof(*current.StopFence, next, proof.StopFence) {
 			return filetxn.Result{}, fmt.Errorf("superseded activation fence lacks exact convergence proof")
@@ -423,6 +426,25 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 			return filetxn.Result{}, err
 		}
 		authority = nextAuthority
+		next.AuthoritySequence = authority.Sequence
+	}
+	if orphanedIngressReservation {
+		inventoryDigest, err := readOwnershipInventoryDigest(store.config.Ownership)
+		if err != nil {
+			return filetxn.Result{}, err
+		}
+		if proof.StopFence.InventoryDigest != inventoryDigest {
+			return filetxn.Result{}, fmt.Errorf("orphaned ingress reservation inventory proof changed")
+		}
+		if authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0 {
+			nextAuthority := authority
+			nextAuthority.Sequence++
+			nextAuthority.ClearProof = &EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFenceSequence, StopFenceDigest: proof.StopFence.FenceDigest, InventoryDigest: proof.StopFence.InventoryDigest, OwnedGraphDigest: proof.StopFence.OwnedGraphDigest, RuntimeClosureDigest: proof.StopFence.RuntimeClosureDigest, NginxTestPassed: proof.StopFence.NginxTestPassed, RuntimeClosed: proof.StopFence.RuntimeClosed}
+			if err := store.config.Emergency.commitReservedStopFenceClearProof(lease, authority.Sequence, nextAuthority); err != nil {
+				return filetxn.Result{}, err
+			}
+			authority = nextAuthority
+		}
 		next.AuthoritySequence = authority.Sequence
 	}
 	if next.AuthoritySequence != authority.Sequence || next.GlobalClose != authority.GlobalClose || next.StopFenceSequence != authority.StopFenceSequence {
@@ -464,7 +486,7 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err := Validate(next); err != nil {
 		return filetxn.Result{}, err
 	}
-	if err := validateTransition(role, current, next, proof); err != nil {
+	if err := validateTransitionWithOrphanedReservation(role, current, next, proof, orphanedIngressReservation); err != nil {
 		return filetxn.Result{}, err
 	}
 	deleteOverhang := map[string]string(nil)
@@ -637,6 +659,10 @@ func normalFenceMatchesEmergency(normal *StopFence, emergency EmergencyStopFence
 }
 
 func validateTransition(role ClearRole, current, next State, proof TransitionProof) error {
+	return validateTransitionWithOrphanedReservation(role, current, next, proof, false)
+}
+
+func validateTransitionWithOrphanedReservation(role ClearRole, current, next State, proof TransitionProof, orphanedIngressReservation bool) error {
 	if current.GlobalClose != next.GlobalClose {
 		if next.GlobalClose.Phase == GlobalCloseNone {
 			if err := AuthorizeClear(role, ClearGlobalClose, ""); err != nil {
@@ -656,7 +682,7 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 			}
 		}
 	}
-	if err := validateStopFenceTransition(role, current, next, proof.StopFence); err != nil {
+	if err := validateStopFenceTransition(role, current, next, proof.StopFence, orphanedIngressReservation); err != nil {
 		return err
 	}
 	if err := validateHeadscaleTransition(role, current.Headscale, next.Headscale, proof.Headscale); err != nil {
@@ -691,8 +717,11 @@ func validateTransition(role ClearRole, current, next State, proof TransitionPro
 	return nil
 }
 
-func validateStopFenceTransition(role ClearRole, current, next State, proof *StopFenceConvergenceProof) error {
+func validateStopFenceTransition(role ClearRole, current, next State, proof *StopFenceConvergenceProof, orphanedIngressReservation bool) error {
 	before, after := current.StopFence, next.StopFence
+	if orphanedIngressReservation && before == nil && after == nil && role == RoleContraction && next.StopFenceSequence == current.StopFenceSequence+1 && proof != nil && proof.Kind == StopFenceIngressActivation && proof.FenceGeneration == next.StopFenceSequence && isDigest(proof.FenceDigest) {
+		return nil
+	}
 	if next.StopFenceSequence < current.StopFenceSequence {
 		return fmt.Errorf("stop fence generation sequence regressed")
 	}
@@ -1099,6 +1128,45 @@ func validGlobalClearProof(current State, proof *GlobalConvergenceProof) bool {
 		if resource.Ownership == OwnershipOrphan || resource.StickyUnpublished == nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
 			return false
 		}
+	}
+	return true
+}
+
+func validOrphanedReservationAuthority(current, next State, authority EmergencyState, proof *StopFenceConvergenceProof) bool {
+	if proof == nil || proof.Kind != StopFenceIngressActivation || proof.ResourceID == "" || proof.ActivationGeneration == 0 || proof.FenceGeneration != next.StopFenceSequence || proof.FenceDigest != authority.ReservedStopFenceDigest || !validRef(proof.JournalRef) || !isDigest(proof.InventoryDigest) || !isDigest(proof.OwnedGraphDigest) || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NoAppDisk || !proof.WorkersDrained || !proof.ListenersClosed || !proof.RuntimeClosed || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) {
+		return false
+	}
+	intentMatches := false
+	for _, resource := range current.Resources {
+		if resource.ResourceID == proof.ResourceID && resource.Reactivating != nil && resource.Reactivating.PlanID == proof.JournalRef && resource.Reactivating.Generation == proof.ActivationGeneration {
+			intentMatches = true
+			break
+		}
+	}
+	if !intentMatches {
+		return false
+	}
+	pending := authority.Sequence == current.AuthoritySequence+1 && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0)
+	cleared := authority.Sequence == current.AuthoritySequence+2 && authority.ClearProof != nil && authority.ClearProof.StopFenceGeneration == next.StopFenceSequence && authority.ClearProof.StopFenceDigest == authority.ReservedStopFenceDigest
+	if !pending && !cleared {
+		return false
+	}
+	for _, resource := range next.Resources {
+		if resource.Ownership == OwnershipOrphan || resource.ChallengePending != nil || resource.Reactivating != nil {
+			return false
+		}
+		generation := uint64(0)
+		if resource.Closing != nil {
+			generation = resource.Closing.Generation
+		} else if resource.StickyUnpublished != nil {
+			generation = resource.StickyUnpublished.Generation
+		}
+		if generation == 0 || proof.UnpublishedGenerations[resource.ResourceID] != generation {
+			return false
+		}
+	}
+	if cleared && (authority.ClearProof.InventoryDigest != proof.InventoryDigest || authority.ClearProof.OwnedGraphDigest != proof.OwnedGraphDigest || authority.ClearProof.RuntimeClosureDigest != proof.RuntimeClosureDigest || authority.ClearProof.NginxTestPassed != proof.NginxTestPassed || authority.ClearProof.RuntimeClosed != proof.RuntimeClosed) {
+		return false
 	}
 	return true
 }

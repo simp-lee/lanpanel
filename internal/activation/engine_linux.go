@@ -21,10 +21,12 @@ import (
 	"lanpanel/internal/certificates"
 	"lanpanel/internal/child"
 	"lanpanel/internal/closure"
+	"lanpanel/internal/diagnostics"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/publication"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -58,6 +60,7 @@ type Host struct {
 	Launcher *child.Launcher
 	Paths    nginx.Paths
 	Owner    filetxn.Owner
+	JobID    string
 }
 
 type (
@@ -92,6 +95,23 @@ func NewFixedHost() (Host, error) {
 	return Host{Launcher: launcher, Paths: nginx.FixedPaths(), Owner: filetxn.Owner{UID: 0, GID: 0}}, err
 }
 
+func (host Host) recordStage(stage string, err error) error {
+	if host.JobID == "" {
+		return err
+	}
+	outcome := "succeeded"
+	if err != nil {
+		outcome = "failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			outcome = "deadline"
+		}
+	}
+	if diagnosticErr := diagnostics.RecordCertificateStage(host.JobID, stage, outcome); diagnosticErr != nil {
+		log.Printf("certificate stage diagnostic unavailable: %v", diagnosticErr)
+	}
+	return err
+}
+
 func (host Host) Activate(ctx context.Context, candidate publication.Candidate, target domain.AppTarget, reloadAuthority ReloadAuthority) (result Result, resultErr error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
@@ -99,16 +119,20 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 		return Result{}, fmt.Errorf("activation host authority incomplete")
 	}
 	priorManifest, err := nginx.Audit(host.Paths, host.Owner)
-	if err != nil {
+	if err = host.recordStage("nginx_graph", err); err != nil {
 		return Result{}, err
 	}
 	observer := host.observer(priorManifest)
 	prior, err := observer.Observe(ctx)
 	if err != nil || prior.Master == nil {
-		return Result{}, fmt.Errorf("nginx must be running before App activation: %w", err)
+		err = fmt.Errorf("nginx must be running before App activation: %w", err)
+		return Result{}, host.recordStage("nginx_listeners", err)
+	}
+	if err := host.recordStage("nginx_listeners", nil); err != nil {
+		return Result{}, err
 	}
 	priorDisk, prospective, err := prepareApplicationExpansion(host.Paths, host.Owner, candidate.Entry, reloadAuthority)
-	if err != nil {
+	if err = host.recordStage("nginx_graph", err); err != nil {
 		return Result{}, err
 	}
 	if !reflect.DeepEqual(priorDisk.Manifest, priorManifest) {
@@ -186,30 +210,35 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	manifest, paths, err := installActivationEntry(&activeManifest, func() (nginx.Manifest, []string, error) {
 		return nginx.InstallEntry(ctx, host.Paths, host.Owner, candidate.Entry)
 	})
-	if err != nil {
+	if err = host.recordStage("nginx_graph", err); err != nil {
 		return Result{}, err
 	}
 	if !reflect.DeepEqual(manifest, prospective) {
-		return Result{}, fmt.Errorf("installed App graph differs from guarded prospective manifest")
+		err = fmt.Errorf("installed App graph differs from guarded prospective manifest")
+		return Result{}, host.recordStage("nginx_graph", err)
 	}
-	if err := nginx.VerifyTailnetRoutes(manifest); err != nil {
+	if err := host.recordStage("nginx_graph", nginx.VerifyTailnetRoutes(manifest)); err != nil {
 		return Result{}, err
 	}
-	if err := host.run(ctx, child.ProfileNginxDump); err != nil {
+	if err := host.recordStage("nginx_dump", host.run(ctx, child.ProfileNginxDump)); err != nil {
 		return Result{}, err
 	}
-	if err := host.run(ctx, child.ProfileNginxTest); err != nil {
+	if err := host.recordStage("nginx_test", host.run(ctx, child.ProfileNginxTest)); err != nil {
 		return Result{}, err
 	}
-	if err := signalAuthorizedReload(host.Paths, host.Owner, manifest, reloadAuthority, func() error {
+	if err := host.recordStage("nginx_reload", signalAuthorizedReload(host.Paths, host.Owner, manifest, reloadAuthority, func() error {
 		return host.run(ctx, child.ProfileNginxReloadSignal)
-	}); err != nil {
+	})); err != nil {
 		return Result{}, fmt.Errorf("app activation reload rejected at signal: %w", err)
 	}
 	currentObserver := host.observer(manifest)
 	snapshot, err := closure.WaitPriorWorkers(ctx, currentObserver, prior.Workers, nginx.DefaultWorkerTimeout)
 	if err != nil || snapshot.Master == nil {
-		return Result{}, fmt.Errorf("activated Nginx generation unavailable: %w", err)
+		err = fmt.Errorf("activated Nginx generation unavailable: %w", err)
+		return Result{}, host.recordStage("nginx_listeners", err)
+	}
+	if err := host.recordStage("nginx_listeners", nil); err != nil {
+		return Result{}, err
 	}
 	var runtimeDigest string
 	if candidate.Entry.Kind == nginx.EntryTemporary {
@@ -217,7 +246,7 @@ func (host Host) Activate(ctx context.Context, candidate publication.Candidate, 
 	} else {
 		runtimeDigest, err = probeDomain(ctx, candidate, target, snapshot)
 	}
-	if err != nil {
+	if err = host.recordStage("upstream_probe", err); err != nil {
 		return Result{}, err
 	}
 	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: runtimeDigest}, nil

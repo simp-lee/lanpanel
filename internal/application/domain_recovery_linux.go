@@ -422,6 +422,20 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			return err
 		}
 		activationFencePresent := fresh.StopFence != nil
+		emergencyAuthority, err := service.emergency.Authority()
+		if err != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return err
+		}
+		reservationPending := emergencyAuthority.Sequence == fresh.AuthoritySequence+1 && (emergencyAuthority.ClearProof == nil || emergencyAuthority.ClearProof.StopFenceGeneration == 0)
+		reservationCleared := emergencyAuthority.Sequence == fresh.AuthoritySequence+2 && emergencyAuthority.ClearProof != nil && emergencyAuthority.ClearProof.StopFenceGeneration == emergencyAuthority.StopFenceSequence && emergencyAuthority.ClearProof.StopFenceDigest == emergencyAuthority.ReservedStopFenceDigest
+		orphanedIngressReservation := !activationFencePresent && emergencyAuthority.StopFence == nil && emergencyAuthority.GlobalClose == fresh.GlobalClose && emergencyAuthority.ReservedStopFenceKind == safety.StopFenceIngressActivation && emergencyAuthority.StopFenceSequence == fresh.StopFenceSequence+1 && (reservationPending || reservationCleared)
+		if !orphanedIngressReservation && !recoverySafetyAuthorityMatches(fresh, emergencyAuthority) {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("interrupted safety authority changed before runtime mutation")
+		}
 		if activationFencePresent && (fresh.StopFence.Kind != safety.StopFenceIngressActivation || fresh.StopFence.Scope.Kind != "app" || fresh.StopFence.Scope.ResourceID != resource.ID || fresh.StopFence.IngressActivation == nil || fresh.StopFence.IngressActivation.IntentRef != activationIntent.PlanID || fresh.StopFence.IngressActivation.CandidateGeneration != activationIntent.Generation || fresh.StopFence.IngressActivation.PriorGeneration+1 != activationIntent.Generation) {
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
@@ -483,7 +497,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_ = mutationSet.Close()
 			return fmt.Errorf("reactivating publication safety resource missing")
 		}
-		if safetyChanged && !activationFencePresent {
+		if safetyChanged && !activationFencePresent && !orphanedIngressReservation {
 			if _, err := service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{}); err != nil {
 				_ = operations.ReleaseExposure(mutation, exposure)
 				_ = mutationSet.Close()
@@ -504,7 +518,7 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			snapshot, stopErr := stopRecoveredNginxBounded(host)
 			goaccessErr := stopRecoveredGoAccessBounded(service, exposure, resource)
 			var fenceErr error
-			if !activationFencePresent {
+			if !activationFencePresent && !orphanedIngressReservation {
 				observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
 				fenceCtx, cancelFence := context.WithTimeout(context.Background(), 15*time.Second)
 				fenceErr = service.WriteIngressActivationFence(fenceCtx, exposure, resource.ID, activationIntent.PlanID, generation, generation-1, observed, stopErr != nil || goaccessErr != nil)
@@ -513,6 +527,18 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
 			return errors.Join(contractErr, stopErr, goaccessErr, fenceErr)
+		}
+		if orphanedIngressReservation {
+			next.StopFenceSequence = fresh.StopFenceSequence + 1
+			proof, proofErr := orphanedIngressReservationProof(service, resource.ID, activationIntent.PlanID, generation, next, emergencyAuthority, result)
+			if proofErr == nil {
+				_, proofErr = service.safety.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, next, safety.TransitionProof{StopFence: proof})
+			}
+			if proofErr != nil {
+				_ = operations.ReleaseExposure(mutation, exposure)
+				_ = mutationSet.Close()
+				return proofErr
+			}
 		}
 		pointerErr := restoreInterruptedDomainPointer(ctx, *activationIntent)
 		freshDocument, err := service.normal.Read()
@@ -954,6 +980,47 @@ func reconcileRetiredGoAccess(ctx context.Context, service *FixedService) error 
 		}
 	}
 	return nil
+}
+
+func recoverySafetyAuthorityMatches(state safety.State, authority safety.EmergencyState) bool {
+	if state.AuthoritySequence != authority.Sequence || state.GlobalClose != authority.GlobalClose || state.StopFenceSequence != authority.StopFenceSequence {
+		return false
+	}
+	if state.StopFence == nil {
+		return authority.StopFence == nil
+	}
+	if authority.StopFence != nil {
+		return safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence)
+	}
+	return authority.ReservedStopFenceKind == state.StopFence.Kind && authority.ReservedStopFenceDigest == safety.StopFenceDigest(*state.StopFence) && authority.StopFenceSequence == state.StopFence.FenceGeneration
+}
+
+func orphanedIngressReservationProof(service *FixedService, resourceID, planID string, generation uint64, next safety.State, authority safety.EmergencyState, result activation.Result) (*safety.StopFenceConvergenceProof, error) {
+	if service == nil || resourceID == "" || planID == "" || generation == 0 || authority.ReservedStopFenceKind != safety.StopFenceIngressActivation || authority.ReservedStopFenceDigest == "" {
+		return nil, fmt.Errorf("orphaned ingress reservation proof authority is incomplete")
+	}
+	inventoryDigest, err := service.safety.OwnershipInventoryDigest()
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := nginx.EncodeManifest(result.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	unpublished := make(map[string]uint64, len(next.Resources))
+	for _, resource := range next.Resources {
+		generation := uint64(0)
+		if resource.Closing != nil {
+			generation = resource.Closing.Generation
+		} else if resource.StickyUnpublished != nil {
+			generation = resource.StickyUnpublished.Generation
+		}
+		if generation == 0 {
+			return nil, fmt.Errorf("orphaned ingress reservation resource closure generation is missing")
+		}
+		unpublished[resource.ResourceID] = generation
+	}
+	return &safety.StopFenceConvergenceProof{Kind: safety.StopFenceIngressActivation, ResourceID: resourceID, ActivationGeneration: generation, FenceGeneration: authority.StopFenceSequence, FenceDigest: authority.ReservedStopFenceDigest, JournalRef: planID, InventoryDigest: inventoryDigest, OwnedGraphDigest: shaDigest(manifest), RuntimeClosureDigest: result.RuntimeDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}, nil
 }
 
 func interruptDomainSafety(item safety.ResourceSafety, intent domain.ActivationIntent) (safety.ResourceSafety, uint64, bool, error) {

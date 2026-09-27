@@ -1473,55 +1473,76 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 			return errors.Join(cause, err)
 		}
 	}
+	contractedTerminal := false
+	if document, readErr := execution.Service.normal.Read(); readErr == nil {
+		if raw, present := document.Entries["journals/certificate-"+execution.JobID]; present {
+			var journal operations.JournalRecord
+			if json.Unmarshal(raw, &journal) == nil && journal.Certificate != nil {
+				cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.CandidateBundleIdentity, journal.Certificate.StageUID, journal.Certificate.StageGID)
+				if cleanupErr != nil {
+					return errors.Join(cause, cleanupErr)
+				}
+				pending := safety.ChallengePending{PlanID: execution.Challenge.Safety.PlanID, Generation: execution.Challenge.Safety.Generation, SANIdentity: execution.Challenge.Safety.SANIdentity, ACMEBinding: execution.Challenge.Safety.ACMEBinding}
+				closure := shaDigest([]byte("certificate-abort\x00" + execution.JobID))
+				if _, terminalErr := execution.Admitter.TerminalizeContractedCertificate(ctx, execution.Mutation, execution.Exposure, document.Revision, execution.JobID, pending, closure); terminalErr == nil {
+					contractedTerminal = true
+				}
+			}
+		}
+	}
 	document, err := execution.Service.normal.Read()
 	if err != nil {
 		return errors.Join(cause, err)
 	}
-	for _, record := range []operations.ChildRecord{execution.Child} {
-		document, err = execution.Service.normal.Read()
-		if err != nil {
-			return errors.Join(cause, err)
-		}
-		raw, present := document.Entries["children/"+record.ID]
-		if !present {
-			continue
-		}
-		var current operations.ChildRecord
-		if err := json.Unmarshal(raw, &current); err != nil {
-			return errors.Join(cause, err)
-		}
-		if current.State == operations.ChildTerminal {
-			continue
-		}
-		now := time.Now().UTC()
-		current.State = operations.ChildTerminal
-		current.Outcome = operations.ChildUnknown
-		current.TerminalAt = &now
-		sum := sha256.Sum256([]byte("certificate_child_failed"))
-		current.ResultDigest = "sha256:" + hex.EncodeToString(sum[:])
-		if err := execution.Admitter.TransitionChild(ctx, execution.Mutation, execution.Exposure, document.Revision, current); err != nil {
-			return errors.Join(cause, err)
+	if !contractedTerminal {
+		for _, record := range []operations.ChildRecord{execution.Child} {
+			document, err = execution.Service.normal.Read()
+			if err != nil {
+				return errors.Join(cause, err)
+			}
+			raw, present := document.Entries["children/"+record.ID]
+			if !present {
+				continue
+			}
+			var current operations.ChildRecord
+			if err := json.Unmarshal(raw, &current); err != nil {
+				return errors.Join(cause, err)
+			}
+			if current.State == operations.ChildTerminal {
+				continue
+			}
+			now := time.Now().UTC()
+			current.State = operations.ChildTerminal
+			current.Outcome = operations.ChildUnknown
+			current.TerminalAt = &now
+			sum := sha256.Sum256([]byte("certificate_child_failed"))
+			current.ResultDigest = "sha256:" + hex.EncodeToString(sum[:])
+			if err := execution.Admitter.TransitionChild(ctx, execution.Mutation, execution.Exposure, document.Revision, current); err != nil {
+				return errors.Join(cause, err)
+			}
 		}
 	}
 	document, err = execution.Service.normal.Read()
 	if err != nil {
 		return errors.Join(cause, err)
 	}
-	if raw, present := document.Entries["journals/certificate-"+execution.JobID]; present {
-		var journal operations.JournalRecord
-		if err := json.Unmarshal(raw, &journal); err != nil {
-			return errors.Join(cause, err)
-		}
-		if journal.Certificate != nil {
-			cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.CandidateBundleIdentity, journal.Certificate.StageUID, journal.Certificate.StageGID)
-			if cleanupErr != nil {
-				return errors.Join(cause, cleanupErr)
-			}
-		}
-		if journal.Phase != operations.JournalTerminal {
-			journal.Phase = operations.JournalTerminal
-			if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, document.Revision, journal, false); err != nil {
+	if !contractedTerminal {
+		if raw, present := document.Entries["journals/certificate-"+execution.JobID]; present {
+			var journal operations.JournalRecord
+			if err := json.Unmarshal(raw, &journal); err != nil {
 				return errors.Join(cause, err)
+			}
+			if journal.Certificate != nil {
+				cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.CandidateBundleIdentity, journal.Certificate.StageUID, journal.Certificate.StageGID)
+				if cleanupErr != nil {
+					return errors.Join(cause, cleanupErr)
+				}
+			}
+			if journal.Phase != operations.JournalTerminal {
+				journal.Phase = operations.JournalTerminal
+				if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, document.Revision, journal, false); err != nil {
+					return errors.Join(cause, err)
+				}
 			}
 		}
 	}
@@ -1566,6 +1587,9 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 				return errors.Join(cause, err)
 			}
 		}
+	}
+	if contractedTerminal {
+		return cause
 	}
 	branch := "source_unknown"
 	status := jobs.PostconditionUnobserved
