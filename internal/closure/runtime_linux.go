@@ -353,8 +353,11 @@ func readMasterPID(path string) (int, error) {
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
 	var stat unix.Stat_t
-	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > 32 {
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != 0 || stat.Nlink != 1 || stat.Size < 0 || stat.Size > 32 {
 		return 0, fmt.Errorf("nginx PID file identity is unsafe")
+	}
+	if stat.Size == 0 {
+		return 0, os.ErrNotExist
 	}
 	data, err := io.ReadAll(io.LimitReader(file, 33))
 	if err != nil {

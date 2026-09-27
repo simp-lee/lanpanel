@@ -138,6 +138,42 @@ func TestProcObserverRejectsOwnedListenerOutsideExactNginxProcesses(t *testing.T
 	}
 }
 
+func TestProcObserverAcceptsOwnedEmptyPIDWhenStopped(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned PID file fixture")
+	}
+	procRoot := t.TempDir()
+	netRoot := filepath.Join(procRoot, "net")
+	if err := os.Mkdir(netRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	header := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\\n"
+	for _, name := range []string{"tcp", "tcp6"} {
+		if err := os.WriteFile(filepath.Join(netRoot, name), []byte(header), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pidPath := filepath.Join(procRoot, "nginx.pid")
+	if err := os.WriteFile(pidPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observer := ProcObserver{
+		ProcRoot:     procRoot,
+		UnitCgroup:   "/system.slice/lanpanel-nginx.service",
+		Executable:   "/usr/sbin/nginx",
+		ExpectedArgv: "/usr/sbin/nginx\\x00-c\\x00/etc/lanpanel/nginx/nginx.conf",
+		PIDPath:      pidPath,
+		Generation:   "generation-stopped",
+	}
+	snapshot, err := observer.Observe(context.Background())
+	if err != nil {
+		t.Fatalf("stopped Nginx with an owned empty PID file was rejected: %v", err)
+	}
+	if snapshot.Master != nil || len(snapshot.Workers) != 0 || len(snapshot.Listeners) != 0 || !snapshot.Complete {
+		t.Fatalf("stopped Nginx snapshot=%#v", snapshot)
+	}
+}
+
 func TestProcessSocketInodesRejectsReusedPIDIdentity(t *testing.T) {
 	procRoot := t.TempDir()
 	pidRoot := filepath.Join(procRoot, "123")
