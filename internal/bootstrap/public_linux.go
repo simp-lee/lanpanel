@@ -198,7 +198,7 @@ func bindPublicPackagePlan(template packages.Plan, identityValue release.Install
 		return packages.Plan{}, fmt.Errorf("public package template is not a valid distro repository plan")
 	}
 	if !identity.ValidateAttemptID(material.AttemptID) || material.SafetyGeneration == 0 || request.Scope != preflight.ExpansionBootstrap || request.Target != "installation" || request.Generation != material.SafetyGeneration || len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Address != material.Authority.Address || request.BootstrapListeners[0].Port != material.Authority.Port || preflight.RequireExpansionResultForRequest(result, request, now.UTC()) != nil {
-		return packages.Plan{}, fmt.Errorf("public package Plan preflight does not match installation material")
+		return packages.Plan{}, fmt.Errorf("public package Plan preflight does not match installation material: attempt=%q safety=%d scope=%q target=%q generation=%d authority=%s:%d listeners=%#v result_generation=%d result_request=%q now=%s", material.AttemptID, material.SafetyGeneration, request.Scope, request.Target, request.Generation, material.Authority.Address, material.Authority.Port, request.BootstrapListeners, result.Generation, result.RequestDigest, now.UTC().Format(time.RFC3339))
 	}
 	resultDigest, err := result.Digest()
 	if err != nil {
