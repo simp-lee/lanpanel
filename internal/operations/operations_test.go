@@ -1481,6 +1481,54 @@ func TestGoAccessRetirementKeepsPublishJobRunningUntilFinalCommit(t *testing.T) 
 	}
 }
 
+func TestInterruptedPublicationContractionPreservesAppliedDigestByValue(t *testing.T) {
+	now := time.Unix(1700000000, 0).UTC()
+	installation := operationStateInstallation()
+	resource := &installation.Resources[0]
+	bundle := domainBundleForRetirement(resource.CurrentConfigDigest)
+	bundle.Generation = 3
+	record, err := jobs.NewReserved(jobs.Spec{Operation: string(Publish), Target: "resource/" + resource.ID, ActorIdentity: "ui/session"}, now, bytes.NewReader(bytes.Repeat([]byte{9}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _ := jobs.Start(record)
+	resource.PublicationRecord.State = domain.PublicationActivating
+	resource.PublicationRecord.LastAppliedDigest = &bundle.ConfigDigest
+	resource.PublicationRecord.LastAppliedBundle = &bundle
+	resource.PublicationRecord.LastOperation = domain.OperationUnpublish
+	resource.PublicationRecord.LastOperationResult = domain.OperationSucceeded
+	resource.PublicationRecord.LastJobID = record.ID
+	resource.PublicationRecord.ActivationIntent = &domain.ActivationIntent{ID: "activation-interrupted", JobID: record.ID, PlanID: "plan-interrupted", Generation: 3, Candidate: bundle, PriorState: domain.PublicationUnpublished}
+	intent := Reservation{SchemaVersion: "lanpanel.operation.reservation.v1", JobID: record.ID, PlanID: "plan-interrupted", AdmissionSource: AdmissionPlan, Operation: Publish, Target: "resource/" + resource.ID, Phase: PhaseLocalIntent, SafetyDigest: testDigest("safety"), SafetyBinding: SafetyBinding{ResourceID: resource.ID}, CreatedAt: now, IntentGeneration: 3, Consumption: &ConsumptionSnapshot{Source: AdmissionPlan, ConfirmationDigest: testDigest("confirmation"), ConfirmedAt: now, SafetyDigest: testDigest("safety")}}
+	encode := func(value any) json.RawMessage {
+		raw, encodeErr := persist.EncodeEntry(value)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		return raw
+	}
+	before := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: map[string]json.RawMessage{"installations/current": encode(installation), reservationKey(record.ID): encode(intent), "jobs/" + record.ID: encode(running)}}
+	interrupted, err := jobs.Finish(running, jobs.Completion{Result: jobs.ResultInterrupted, Postconditions: []jobs.Postcondition{{Kind: "interrupted_activation_contracted", Status: jobs.PostconditionKnown, Identity: testDigest("runtime")}}, ErrorCode: "activation_contracted"}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInstallation := installation
+	afterInstallation.Resources = append([]domain.AppResource(nil), installation.Resources...)
+	after := &afterInstallation.Resources[0]
+	after.PublicationRecord.State = domain.PublicationUnpublished
+	after.PublicationRecord.UnpublishedGeneration = 4
+	after.PublicationRecord.ActivationIntent = nil
+	after.PublicationRecord.LastOperation = domain.OperationPublish
+	after.PublicationRecord.LastOperationResult = domain.OperationInterrupted
+	after.PublicationRecord.RuntimeObservation = &domain.RuntimeObservation{Status: domain.RuntimeDegraded, ObservedAt: now.Add(time.Second).Format(time.RFC3339), Reason: "interrupted_activation_contracted"}
+	terminalIntent := intent
+	terminalIntent.Phase = PhaseTerminal
+	afterDocument := persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 2, Entries: map[string]json.RawMessage{"installations/current": encode(afterInstallation), reservationKey(record.ID): encode(terminalIntent), "jobs/" + record.ID: encode(interrupted)}}
+	if err := validateOperationStateTransitions(before, afterDocument); err != nil {
+		t.Fatalf("interrupted publication contraction rejected equal digest values with distinct pointers: %v", err)
+	}
+}
+
 func operationUnitIdentities(label string) []string {
 	return []string{testDigest(label + "-1"), testDigest(label + "-2"), testDigest(label + "-3"), testDigest(label + "-4"), testDigest(label + "-5")}
 }

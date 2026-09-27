@@ -7657,7 +7657,7 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 				return fmt.Errorf("resource %q committed publication recovery identity changed", resource.ID)
 			}
 		case interruptedActivation:
-			if resource.PublicationRecord.LastAppliedDigest != oldResource.PublicationRecord.LastAppliedDigest || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
+			if !reflect.DeepEqual(resource.PublicationRecord.LastAppliedDigest, oldResource.PublicationRecord.LastAppliedDigest) || !reflect.DeepEqual(resource.PublicationRecord.LastAppliedBundle, oldResource.PublicationRecord.LastAppliedBundle) || resource.PublicationRecord.LastOperation != domain.OperationPublish || string(resource.PublicationRecord.LastOperationResult) != string(record.Result) {
 				return fmt.Errorf("resource %q interrupted publication contraction identity changed", resource.ID)
 			}
 		case failedActivation:
