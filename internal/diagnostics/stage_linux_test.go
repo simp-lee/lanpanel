@@ -51,6 +51,12 @@ func TestRecordCertificateStageRejectsUnsafeDirectory(t *testing.T) {
 	if err := recordCertificateStage(path, job, "nginx_test", "failed"); err == nil {
 		t.Fatal("accepted unsafe diagnostic directory")
 	}
+	if err := os.Chmod(directory, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordCertificateStage(path, job, "nginx_test", "failed"); err != nil {
+		t.Fatalf("rejected installer diagnostic directory: %v", err)
+	}
 }
 
 func readFile(path string) ([]byte, error) {

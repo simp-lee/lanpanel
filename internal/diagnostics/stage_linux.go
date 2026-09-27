@@ -43,7 +43,11 @@ func recordCertificateStage(path, jobID, stage, outcome string) error {
 		return err
 	}
 	var directoryStat unix.Stat_t
-	if err := unix.Lstat(directory, &directoryStat); err != nil || directoryStat.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStat.Uid != uint32(os.Geteuid()) || directoryStat.Gid != uint32(os.Getegid()) || directoryStat.Mode&0o7777 != 0o700 {
+	if err := unix.Lstat(directory, &directoryStat); err != nil || directoryStat.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStat.Uid != uint32(os.Geteuid()) || directoryStat.Gid != uint32(os.Getegid()) {
+		return fmt.Errorf("certificate stage diagnostic directory is unsafe")
+	}
+	mode := directoryStat.Mode & 0o7777
+	if mode != 0o700 && mode != 0o711 {
 		return fmt.Errorf("certificate stage diagnostic directory is unsafe")
 	}
 	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_APPEND|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
