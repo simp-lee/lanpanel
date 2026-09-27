@@ -226,7 +226,7 @@ func TestRetainExternalResourcePathAcceptsOnlyAuthorizedResourceRoots(t *testing
 		t.Fatal(err)
 	}
 	installation := domain.Installation{Resources: []domain.AppResource{{ID: resourceID}}}
-	for _, path := range []string{resourceRoot, resourceParent, persistent} {
+	for _, path := range []string{resourceRoot, filepath.Join(resourceRoot, "backend"), resourceParent, persistent} {
 		if !retainExternalResourcePath(path, persistent, installation) {
 			t.Fatalf("authorized retained path was rejected: %s", path)
 		}

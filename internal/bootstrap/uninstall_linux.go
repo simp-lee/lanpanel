@@ -1235,7 +1235,11 @@ func retainExternalResourcePath(path, persistentRoot string, installation domain
 	resourceParent := filepath.Join(persistentRoot, "resources")
 	knownRoots := make(map[string]struct{}, len(installation.Resources))
 	for _, app := range installation.Resources {
-		knownRoots[filepath.Join(resourceParent, app.ID)] = struct{}{}
+		resourceRoot := filepath.Join(resourceParent, app.ID)
+		knownRoots[resourceRoot] = struct{}{}
+		if path == filepath.Join(resourceRoot, "backend") {
+			return true
+		}
 	}
 	if _, known := knownRoots[path]; known {
 		return true
