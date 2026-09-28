@@ -3,10 +3,15 @@
 package diagnostics
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	xacme "golang.org/x/crypto/acme"
 )
 
 func TestRecordCertificateStageIsRedactedAndBounded(t *testing.T) {
@@ -38,6 +43,40 @@ func TestRecordCertificateStageIsRedactedAndBounded(t *testing.T) {
 	}
 	if err := recordCertificateStage(path, job, "provider-output", "failed"); err == nil {
 		t.Fatal("accepted unbounded stage")
+	}
+}
+
+func TestCertificateErrorMetadataClassifiesRateLimitAndRetryAfter(t *testing.T) {
+	cause := &xacme.Error{ProblemType: "urn:ietf:params:acme:error:rateLimited", Header: http.Header{"Retry-After": []string{"120"}}}
+	class, retryAfter := certificateErrorMetadata(cause)
+	if class != "rate_limited" || retryAfter != 120 {
+		t.Fatalf("metadata=%q,%d", class, retryAfter)
+	}
+	if class, retryAfter := certificateErrorMetadata(context.DeadlineExceeded); class != "deadline" || retryAfter != 0 {
+		t.Fatalf("deadline metadata=%q,%d", class, retryAfter)
+	}
+	if class, retryAfter := certificateErrorMetadata(context.Canceled); class != "canceled" || retryAfter != 0 {
+		t.Fatalf("canceled metadata=%q,%d", class, retryAfter)
+	}
+}
+
+func TestRecordCertificateStageErrorPersistsOnlyBoundedMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lanpanel", "stages.jsonl")
+	job := "job_" + strings.Repeat("c", 64)
+	cause := &xacme.Error{ProblemType: "urn:ietf:params:acme:error:rateLimited", Header: http.Header{"Retry-After": []string{"1"}}}
+	if err := recordCertificateStageError(path, job, "acme", "failed", cause); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value CertificateStage
+	if err := json.Unmarshal(data[:len(data)-1], &value); err != nil {
+		t.Fatal(err)
+	}
+	if value.ErrorClass != "rate_limited" || value.RetryAfterSeconds != 1 || strings.Contains(string(data), "rateLimited") {
+		t.Fatalf("unexpected bounded diagnostic=%q", data)
 	}
 }
 

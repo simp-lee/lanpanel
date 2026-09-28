@@ -1768,9 +1768,11 @@ func traceCertificateStage(jobID, stage string, err error) {
 		outcome = "failed"
 		if errors.Is(err, context.DeadlineExceeded) {
 			outcome = "deadline"
+		} else if errors.Is(err, context.Canceled) {
+			outcome = "interrupted"
 		}
 	}
-	if traceErr := diagnostics.RecordCertificateStage(jobID, stage, outcome); traceErr != nil {
+	if traceErr := diagnostics.RecordCertificateStageError(jobID, stage, outcome, err); traceErr != nil {
 		log.Printf("certificate stage diagnostic unavailable: %v", traceErr)
 	}
 }
