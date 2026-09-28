@@ -52,6 +52,9 @@ func TestCertificateErrorMetadataClassifiesRateLimitAndRetryAfter(t *testing.T) 
 	if class != "rate_limited" || retryAfter != 120 {
 		t.Fatalf("metadata=%q,%d", class, retryAfter)
 	}
+	if class, retryAfter := certificateErrorMetadata(&xacme.OrderError{Problem: cause}); class != "rate_limited" || retryAfter != 120 {
+		t.Fatalf("order rate-limit metadata=%q,%d", class, retryAfter)
+	}
 	if class, retryAfter := certificateErrorMetadata(context.DeadlineExceeded); class != "deadline" || retryAfter != 0 {
 		t.Fatalf("deadline metadata=%q,%d", class, retryAfter)
 	}

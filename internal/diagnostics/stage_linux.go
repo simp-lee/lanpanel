@@ -100,6 +100,10 @@ func certificateErrorMetadata(cause error) (string, int64) {
 	if errors.Is(cause, context.Canceled) {
 		return "canceled", 0
 	}
+	var orderErr *xacme.OrderError
+	if errors.As(cause, &orderErr) && orderErr.Problem != nil {
+		cause = orderErr.Problem
+	}
 	var apiErr *xacme.Error
 	if errors.As(cause, &apiErr) {
 		if retryAfter, limited := xacme.RateLimit(apiErr); limited {
@@ -122,8 +126,7 @@ func certificateErrorMetadata(cause error) (string, int64) {
 	if errors.As(cause, &authorizationErr) {
 		return "authorization_failed", 0
 	}
-	var orderErr *xacme.OrderError
-	if errors.As(cause, &orderErr) {
+	if orderErr != nil {
 		return "order_failed", 0
 	}
 	return "internal_failed", 0
