@@ -215,6 +215,19 @@ func TestProcessSocketInodesRejectsReusedPIDIdentity(t *testing.T) {
 	}
 }
 
+func TestValidWorkerArgumentsAcceptsGracefulShutdownTitleOnly(t *testing.T) {
+	for _, title := range []string{"nginx: worker process", "nginx: worker process is shutting down"} {
+		if !validWorkerArguments(title) {
+			t.Fatalf("worker title %q was rejected", title)
+		}
+	}
+	for _, title := range []string{"nginx: worker process started", "nginx: master process", "worker process is shutting down"} {
+		if validWorkerArguments(title) {
+			t.Fatalf("unexpected worker title %q was accepted", title)
+		}
+	}
+}
+
 func TestValidMasterArgumentsAcceptsUbuntuNginxTitleTruncation(t *testing.T) {
 	expected := "/usr/sbin/nginx\x00-c\x00/etc/lanpanel/nginx/nginx.conf\x00-p\x00/var/lib/lanpanel/nginx/\x00-g\x00daemon off;"
 	title := "nginx: master process " + strings.ReplaceAll(expected, "\x00", " ")

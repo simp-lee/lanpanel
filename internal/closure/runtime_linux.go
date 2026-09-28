@@ -130,7 +130,7 @@ func (observer ProcObserver) Observe(ctx context.Context) (RuntimeSnapshot, erro
 			snapshot.Master = &copy
 			continue
 		}
-		if process.Executable != observer.Executable || process.ParentPID != masterPID || process.Arguments != "nginx: worker process" {
+		if process.Executable != observer.Executable || process.ParentPID != masterPID || !validWorkerArguments(process.Arguments) {
 			return RuntimeSnapshot{}, fmt.Errorf("unknown process exists in exact Nginx unit cgroup")
 		}
 		snapshot.Workers = append(snapshot.Workers, process)
@@ -319,6 +319,15 @@ func bytesToArgv(payload []byte) []string {
 		values[index] = string(part)
 	}
 	return values
+}
+
+func validWorkerArguments(actual string) bool {
+	switch actual {
+	case "nginx: worker process", "nginx: worker process is shutting down":
+		return true
+	default:
+		return false
+	}
 }
 
 func validMasterArguments(actual, expected string) bool {
