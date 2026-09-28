@@ -27,7 +27,7 @@ func RunRuntimeGuard(args []string) error {
 	if config.SocketGroup == 0 {
 		return fmt.Errorf("runtime socket group is missing")
 	}
-	if _, err = ensureDirectory(FixedPaths().RuntimeRoot, filetxn.Owner{UID: 0, GID: config.SocketGroup}, 0o710); err != nil {
+	if _, err = ensureRuntimeDirectory(FixedPaths().RuntimeRoot, filetxn.Owner{UID: 0, GID: config.SocketGroup}); err != nil {
 		return err
 	}
 	if err := helper.CleanupStaleSocket(config.SocketGroup); err != nil {

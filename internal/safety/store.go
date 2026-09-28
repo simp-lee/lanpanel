@@ -436,7 +436,7 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 		if proof.StopFence.InventoryDigest != inventoryDigest {
 			return filetxn.Result{}, fmt.Errorf("orphaned ingress reservation inventory proof changed")
 		}
-		if authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0 {
+		if authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence {
 			nextAuthority := authority
 			nextAuthority.Sequence++
 			nextAuthority.ClearProof = &EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFenceSequence, StopFenceDigest: proof.StopFence.FenceDigest, InventoryDigest: proof.StopFence.InventoryDigest, OwnedGraphDigest: proof.StopFence.OwnedGraphDigest, RuntimeClosureDigest: proof.StopFence.RuntimeClosureDigest, NginxTestPassed: proof.StopFence.NginxTestPassed, RuntimeClosed: proof.StopFence.RuntimeClosed}
@@ -1137,22 +1137,34 @@ func validOrphanedReservationAuthority(current, next State, authority EmergencyS
 		return false
 	}
 	intentMatches := false
+	markerlessAuthority := false
 	for _, resource := range current.Resources {
-		if resource.ResourceID == proof.ResourceID && resource.Reactivating != nil && resource.Reactivating.PlanID == proof.JournalRef && resource.Reactivating.Generation == proof.ActivationGeneration {
+		if resource.ResourceID != proof.ResourceID {
+			continue
+		}
+		if resource.Reactivating != nil && resource.Reactivating.PlanID == proof.JournalRef && resource.Reactivating.Generation == proof.ActivationGeneration {
 			intentMatches = true
+			break
+		}
+		if resource.Reactivating == nil && resource.Closing == nil && resource.StickyUnpublished != nil && resource.StickyUnpublished.Generation < proof.ActivationGeneration {
+			intentMatches = true
+			markerlessAuthority = true
 			break
 		}
 	}
 	if !intentMatches {
 		return false
 	}
-	pending := authority.Sequence == current.AuthoritySequence+1 && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0)
+	pending := authority.Sequence == current.AuthoritySequence+1 && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence)
 	cleared := authority.Sequence == current.AuthoritySequence+2 && authority.ClearProof != nil && authority.ClearProof.StopFenceGeneration == next.StopFenceSequence && authority.ClearProof.StopFenceDigest == authority.ReservedStopFenceDigest
 	if !pending && !cleared {
 		return false
 	}
 	for _, resource := range next.Resources {
 		if resource.Ownership == OwnershipOrphan || resource.ChallengePending != nil || resource.Reactivating != nil {
+			return false
+		}
+		if markerlessAuthority && resource.ResourceID == proof.ResourceID && (resource.Closing == nil || resource.Closing.Generation != proof.ActivationGeneration) {
 			return false
 		}
 		generation := uint64(0)

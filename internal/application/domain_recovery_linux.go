@@ -301,7 +301,8 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			}
 			continue
 		}
-		if authority.Reactivating == nil && (authority.Closing == nil || authority.Closing.Reason != "interrupted_domain_activation" && authority.Closing.Reason != "committed_domain_recovery") {
+		markerlessActivation := authority.Reactivating == nil && authority.Closing == nil
+		if authority.Reactivating == nil && authority.Closing != nil && authority.Closing.Reason != "interrupted_domain_activation" && authority.Closing.Reason != "committed_domain_recovery" {
 			continue
 		}
 		document, err := service.normal.Read()
@@ -313,6 +314,11 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			return err
 		}
 		activationIntent := resource.PublicationRecord.ActivationIntent
+		if markerlessActivation {
+			if resource.PublicationRecord.State != domain.PublicationActivating || activationIntent == nil || activationIntent.Candidate.DomainHTTPS == nil || activationIntent.JobID == "" {
+				continue
+			}
+		}
 		if authority.Reactivating == nil && authority.Closing != nil && authority.Closing.Reason == "committed_domain_recovery" {
 			if err := resumeCommittedDomainContraction(ctx, service, resource, *authority.Closing); err != nil {
 				return err
@@ -428,9 +434,14 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			_ = mutationSet.Close()
 			return err
 		}
-		reservationPending := emergencyAuthority.Sequence == fresh.AuthoritySequence+1 && (emergencyAuthority.ClearProof == nil || emergencyAuthority.ClearProof.StopFenceGeneration == 0)
+		reservationPending := emergencyAuthority.Sequence == fresh.AuthoritySequence+1 && (emergencyAuthority.ClearProof == nil || emergencyAuthority.ClearProof.StopFenceGeneration != emergencyAuthority.StopFenceSequence)
 		reservationCleared := emergencyAuthority.Sequence == fresh.AuthoritySequence+2 && emergencyAuthority.ClearProof != nil && emergencyAuthority.ClearProof.StopFenceGeneration == emergencyAuthority.StopFenceSequence && emergencyAuthority.ClearProof.StopFenceDigest == emergencyAuthority.ReservedStopFenceDigest
 		orphanedIngressReservation := !activationFencePresent && emergencyAuthority.StopFence == nil && emergencyAuthority.GlobalClose == fresh.GlobalClose && emergencyAuthority.ReservedStopFenceKind == safety.StopFenceIngressActivation && emergencyAuthority.StopFenceSequence == fresh.StopFenceSequence+1 && (reservationPending || reservationCleared)
+		if markerlessActivation && !orphanedIngressReservation {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("markerless interrupted domain activation lacks orphaned ingress reservation")
+		}
 		if !orphanedIngressReservation && !recoverySafetyAuthorityMatches(fresh, emergencyAuthority) {
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
@@ -481,6 +492,15 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 		for index := range next.Resources {
 			if next.Resources[index].ResourceID != resource.ID {
 				continue
+			}
+			if markerlessActivation {
+				seeded, seedErr := seedMarkerlessInterruptedDomainActivation(next.Resources[index], *activationIntent)
+				if seedErr != nil {
+					_ = operations.ReleaseExposure(mutation, exposure)
+					_ = mutationSet.Close()
+					return seedErr
+				}
+				next.Resources[index] = seeded
 			}
 			updated, currentGeneration, changed, transitionErr := interruptDomainSafety(next.Resources[index], *activationIntent)
 			if transitionErr != nil {
@@ -1021,6 +1041,17 @@ func orphanedIngressReservationProof(service *FixedService, resourceID, planID s
 		unpublished[resource.ResourceID] = generation
 	}
 	return &safety.StopFenceConvergenceProof{Kind: safety.StopFenceIngressActivation, ResourceID: resourceID, ActivationGeneration: generation, FenceGeneration: authority.StopFenceSequence, FenceDigest: authority.ReservedStopFenceDigest, JournalRef: planID, InventoryDigest: inventoryDigest, OwnedGraphDigest: shaDigest(manifest), RuntimeClosureDigest: result.RuntimeDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}, nil
+}
+
+func seedMarkerlessInterruptedDomainActivation(item safety.ResourceSafety, intent domain.ActivationIntent) (safety.ResourceSafety, error) {
+	if item.Reactivating != nil || item.Closing != nil {
+		return item, fmt.Errorf("markerless interrupted domain activation safety changed")
+	}
+	if intent.PlanID == "" || intent.Generation == 0 {
+		return item, fmt.Errorf("markerless interrupted domain activation intent incomplete")
+	}
+	item.Reactivating = &safety.Reactivating{Generation: intent.Generation, PlanID: intent.PlanID}
+	return item, nil
 }
 
 func interruptDomainSafety(item safety.ResourceSafety, intent domain.ActivationIntent) (safety.ResourceSafety, uint64, bool, error) {

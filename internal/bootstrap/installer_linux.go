@@ -825,7 +825,7 @@ func createBootstrapDirectories(journal Journal) error {
 		ui, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
 		runtimeOwner.GID = ui.GID
 	}
-	if _, err := ensureDirectory(journal.Paths.RuntimeRoot, runtimeOwner, 0o710); err != nil {
+	if _, err := ensureRuntimeDirectory(journal.Paths.RuntimeRoot, runtimeOwner); err != nil {
 		return err
 	}
 	return nil

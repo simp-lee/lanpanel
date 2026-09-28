@@ -415,7 +415,7 @@ func sameEmergencyDirectory(actual, expected unix.Stat_t) bool {
 }
 
 func validReservedStopFenceClearTransition(current, next EmergencyState) bool {
-	return current.StopFence == nil && next.StopFence == nil && current.StopFenceSequence != 0 && current.ReservedStopFenceKind != StopFenceContraction && next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest && (current.ClearProof == nil || current.ClearProof.StopFenceGeneration == 0) && next.ClearProof != nil && next.ClearProof.StopFenceGeneration == current.StopFenceSequence && validEmergencyClearProof(next.ClearProof, current)
+	return current.StopFence == nil && next.StopFence == nil && current.StopFenceSequence != 0 && current.ReservedStopFenceKind != StopFenceContraction && next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest && (current.ClearProof == nil || current.ClearProof.StopFenceGeneration != current.StopFenceSequence) && next.ClearProof != nil && next.ClearProof.StopFenceGeneration == current.StopFenceSequence && validEmergencyClearProof(next.ClearProof, current)
 }
 
 func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool {

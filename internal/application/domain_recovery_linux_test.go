@@ -21,6 +21,32 @@ func TestCertificateHandoffCarriesInstallationAndActivationDeadline(t *testing.T
 	}
 }
 
+func TestMarkerlessInterruptedDomainActivationSeedsOnlyTransientRecoveryAuthority(t *testing.T) {
+	item := safety.ResourceSafety{ResourceID: "res_one", GenerationSequence: 9, StickyUnpublished: &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: 7}}
+	intent := domain.ActivationIntent{PlanID: "plan_one", Generation: 9}
+	seeded, err := seedMarkerlessInterruptedDomainActivation(item, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seeded.Reactivating == nil || seeded.Reactivating.PlanID != intent.PlanID || seeded.Reactivating.Generation != intent.Generation || seeded.Closing != nil || seeded.StickyUnpublished == nil {
+		t.Fatalf("unexpected transient recovery authority: %#v", seeded)
+	}
+	contracted, generation, changed, err := interruptDomainSafety(seeded, intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || generation != 10 || contracted.Reactivating != nil || contracted.Closing == nil || contracted.Closing.Generation != 10 {
+		t.Fatalf("unexpected markerless contraction: %#v", contracted)
+	}
+}
+
+func TestMarkerlessInterruptedDomainActivationRejectsExistingAuthority(t *testing.T) {
+	item := safety.ResourceSafety{Reactivating: &safety.Reactivating{PlanID: "plan_one", Generation: 9}}
+	if _, err := seedMarkerlessInterruptedDomainActivation(item, domain.ActivationIntent{PlanID: "plan_one", Generation: 9}); err == nil {
+		t.Fatal("markerless seeding replaced existing reactivation authority")
+	}
+}
+
 func TestInterruptedDomainActivationContractionWinsWithFreshGeneration(t *testing.T) {
 	item := safety.ResourceSafety{ResourceID: "res_one", GenerationSequence: 7, Reactivating: &safety.Reactivating{PlanID: "plan_one", Generation: 7}}
 	intent := domain.ActivationIntent{PlanID: "plan_one", Generation: 7}

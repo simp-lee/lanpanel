@@ -303,6 +303,24 @@ func TestStoreConvergesSupersededActivationReservation(t *testing.T) {
 	}
 }
 
+func TestMarkerlessOrphanedIngressReservationAuthorityIsBoundToStickyClosure(t *testing.T) {
+	current := State{AuthoritySequence: 3, StopFenceSequence: 1, Resources: []ResourceSafety{{ResourceID: "app-one", GenerationSequence: 9, State: ResourceActive, Ownership: OwnershipOwned, OwnershipDigest: digest("owner"), StickyUnpublished: &GenerationMarker{Kind: MarkerStickyUnpublished, Generation: 7, Reason: "interrupted_domain_activation"}}}}
+	next := current
+	next.StopFenceSequence = 2
+	next.Resources = append([]ResourceSafety(nil), current.Resources...)
+	next.Resources[0].GenerationSequence = 10
+	next.Resources[0].Closing = &GenerationMarker{Kind: MarkerClosing, Generation: 10, Reason: "interrupted_domain_activation"}
+	proof := &StopFenceConvergenceProof{Kind: StopFenceIngressActivation, ResourceID: "app-one", ActivationGeneration: 10, FenceGeneration: 2, FenceDigest: digest("fence"), JournalRef: "plan-one", InventoryDigest: digest("inventory"), OwnedGraphDigest: digest("graph"), RuntimeClosureDigest: digest("runtime"), AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: map[string]uint64{"app-one": 10}}
+	authority := EmergencyState{Sequence: 4, StopFenceSequence: 2, ReservedStopFenceKind: StopFenceIngressActivation, ReservedStopFenceDigest: proof.FenceDigest}
+	if !validOrphanedReservationAuthority(current, next, authority, proof) {
+		t.Fatal("markerless interrupted activation was not bound to its sticky closure")
+	}
+	proof.ActivationGeneration = 9
+	if validOrphanedReservationAuthority(current, next, authority, proof) {
+		t.Fatal("markerless interrupted activation accepted a stale closure generation")
+	}
+}
+
 func TestStoreConvergesOrphanedIngressReservation(t *testing.T) {
 	for _, preCleared := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pre_cleared_%t", preCleared), func(t *testing.T) {

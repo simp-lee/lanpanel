@@ -132,6 +132,38 @@ func ensureDirectory(path string, owner filetxn.Owner, mode uint32) (bool, error
 	return created, nil
 }
 
+func ensureRuntimeDirectory(path string, owner filetxn.Owner) (bool, error) {
+	created, err := ensureDirectory(path, owner, 0o711)
+	if err == nil {
+		return created, nil
+	}
+	parent := filepath.Dir(path)
+	parentFD, parentErr := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if parentErr != nil {
+		return false, errors.Join(err, parentErr)
+	}
+	defer func() { _ = unix.Close(parentFD) }()
+	fd, openErr := unix.Openat(parentFD, filepath.Base(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		return false, errors.Join(err, openErr)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var stat unix.Stat_t
+	if statErr := unix.Fstat(fd, &stat); statErr != nil {
+		return false, errors.Join(err, statErr)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Mode&0o7777 != 0o710 {
+		return false, err
+	}
+	if chmodErr := unix.Fchmod(fd, 0o711); chmodErr != nil {
+		return false, errors.Join(err, chmodErr)
+	}
+	if syncErr := unix.Fsync(parentFD); syncErr != nil {
+		return false, errors.Join(err, syncErr)
+	}
+	return false, nil
+}
+
 func targetStaging(path string) (string, error) {
 	directory := filepath.Dir(path)
 	staging := filepath.Join(directory, ".lanpanel-filetxn")
