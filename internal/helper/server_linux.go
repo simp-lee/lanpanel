@@ -434,7 +434,7 @@ func CleanupStaleSocket(socketGroup uint32) error {
 		return fmt.Errorf("helper socket cleanup requires root, its fixed path, and a dedicated client group")
 	}
 	parent := filepath.Dir(path)
-	if err := validateRootParentChain(parent, socketGroup, 0o710); err != nil {
+	if err := validateRootParentChain(parent, socketGroup, 0o711); err != nil {
 		return fmt.Errorf("helper socket parent is unsafe: %w", err)
 	}
 	return cleanupStaleSocket(path, 0, socketGroup)
@@ -446,7 +446,7 @@ func ListenProtected(socketGroup uint32) (*ProtectedListener, error) {
 		return nil, fmt.Errorf("helper socket requires root, its fixed path, and a dedicated client group")
 	}
 	parent := filepath.Dir(path)
-	if err := validateRootParentChain(parent, socketGroup, 0o710); err != nil {
+	if err := validateRootParentChain(parent, socketGroup, 0o711); err != nil {
 		return nil, fmt.Errorf("helper socket parent is unsafe: %w", err)
 	}
 	if err := cleanupStaleSocket(path, 0, socketGroup); err != nil {
