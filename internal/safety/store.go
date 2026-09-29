@@ -413,8 +413,41 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 	if err != nil {
 		return filetxn.Result{}, err
 	}
-	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration == 0) && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
+	exactReservedFence := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence && authority.StopFence == nil && authority.StopFenceSequence == current.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest == StopFenceDigest(*current.StopFence)
+	exactReservedFenceClear := exactReservedFence && authority.Sequence == current.AuthoritySequence && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence)
+	exactReservedFencePrecleared := exactReservedFence && authority.Sequence == current.AuthoritySequence+1 && emergencyClearProofMatchesStopFence(authority.ClearProof, *current.StopFence)
+	supersededReservation := current.StopFence != nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence) && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == next.StopFenceSequence && authority.ReservedStopFenceKind == current.StopFence.Kind && authority.ReservedStopFenceDigest != StopFenceDigest(*current.StopFence)
 	orphanedIngressReservation := current.StopFence == nil && next.StopFence == nil && role == RoleContraction && next.StopFenceSequence == current.StopFenceSequence+1 && authority.StopFence == nil && authority.ReservedStopFenceKind == StopFenceIngressActivation && authority.StopFenceSequence == next.StopFenceSequence && validOrphanedReservationAuthority(current, next, authority, proof.StopFence)
+	reservedStopFenceRetirement := current.StopFence == nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence && authority.StopFence == nil && authority.Sequence == current.AuthoritySequence && authority.StopFenceSequence == current.StopFenceSequence && authority.ReservedStopFenceKind != "" && authority.ReservedStopFenceKind != StopFenceContraction && isDigest(authority.ReservedStopFenceDigest) && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence) && validReservedStopFenceRetirementProof(current, next, authority, proof.StopFence)
+	reservedStopFenceRetirementPrecleared := current.StopFence == nil && next.StopFence == nil && role == RoleJournalConvergence && next.StopFenceSequence == current.StopFenceSequence && authority.StopFence == nil && authority.Sequence == current.AuthoritySequence+1 && authority.StopFenceSequence == current.StopFenceSequence && authority.ReservedStopFenceKind != "" && authority.ReservedStopFenceKind != StopFenceContraction && emergencyClearProofMatchesReservedStopFence(authority.ClearProof, authority) && validReservedStopFenceRetirementProof(current, next, authority, proof.StopFence)
+	if current.StopFence == nil && next.StopFence == nil && authority.StopFence == nil && authority.ReservedStopFenceKind != "" && authority.ReservedStopFenceKind != StopFenceContraction && (authority.ClearProof == nil || authority.ClearProof.StopFenceGeneration != authority.StopFenceSequence) && !orphanedIngressReservation && !reservedStopFenceRetirement {
+		return filetxn.Result{}, fmt.Errorf("normal safety commit leaves an unresolved emergency stop-fence reservation")
+	}
+	if exactReservedFence && !exactReservedFenceClear && !exactReservedFencePrecleared {
+		return filetxn.Result{}, fmt.Errorf("reserved activation fence clear authority changed")
+	}
+	if exactReservedFenceClear || exactReservedFencePrecleared {
+		if proof.StopFence == nil || !validStopClearProof(*current.StopFence, next, proof.StopFence) || proof.StopFence.FenceDigest != StopFenceDigest(*current.StopFence) {
+			return filetxn.Result{}, fmt.Errorf("reserved activation fence lacks exact convergence proof")
+		}
+		inventoryDigest, err := readOwnershipInventoryDigest(store.config.Ownership)
+		if err != nil {
+			return filetxn.Result{}, err
+		}
+		if proof.StopFence.InventoryDigest != inventoryDigest {
+			return filetxn.Result{}, fmt.Errorf("reserved activation fence inventory proof changed")
+		}
+		if exactReservedFenceClear {
+			nextAuthority := authority
+			nextAuthority.Sequence++
+			nextAuthority.ClearProof = &EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFenceSequence, StopFenceDigest: proof.StopFence.FenceDigest, InventoryDigest: proof.StopFence.InventoryDigest, OwnedGraphDigest: proof.StopFence.OwnedGraphDigest, RuntimeClosureDigest: proof.StopFence.RuntimeClosureDigest, NginxTestPassed: proof.StopFence.NginxTestPassed, RuntimeClosed: proof.StopFence.RuntimeClosed}
+			if err := store.config.Emergency.commitExactReservedStopFenceClearProof(lease, authority.Sequence, proof.StopFence.FenceDigest, nextAuthority); err != nil {
+				return filetxn.Result{}, err
+			}
+			authority = nextAuthority
+		}
+		next.AuthoritySequence = authority.Sequence
+	}
 	if supersededReservation {
 		if proof.StopFence == nil || !validStopClearProof(*current.StopFence, next, proof.StopFence) {
 			return filetxn.Result{}, fmt.Errorf("superseded activation fence lacks exact convergence proof")
@@ -426,6 +459,21 @@ func (store *Store) Commit(ctx context.Context, lease *locks.Lease, role ClearRo
 			return filetxn.Result{}, err
 		}
 		authority = nextAuthority
+		next.AuthoritySequence = authority.Sequence
+	}
+	if reservedStopFenceRetirement || reservedStopFenceRetirementPrecleared {
+		if reservedStopFenceRetirementPrecleared && !emergencyClearProofMatchesRetirement(authority.ClearProof, proof.StopFence) {
+			return filetxn.Result{}, fmt.Errorf("retired reservation clear proof changed")
+		}
+		if reservedStopFenceRetirement {
+			nextAuthority := authority
+			nextAuthority.Sequence++
+			nextAuthority.ClearProof = &EmergencyClearProof{Generation: authority.GlobalClose.Generation, StopFenceGeneration: authority.StopFenceSequence, StopFenceDigest: authority.ReservedStopFenceDigest, InventoryDigest: proof.StopFence.InventoryDigest, OwnedGraphDigest: proof.StopFence.OwnedGraphDigest, RuntimeClosureDigest: proof.StopFence.RuntimeClosureDigest, NginxTestPassed: proof.StopFence.NginxTestPassed, RuntimeClosed: proof.StopFence.RuntimeClosed}
+			if err := store.config.Emergency.commitReservedStopFenceRetirement(lease, authority.Sequence, authority.ReservedStopFenceDigest, nextAuthority); err != nil {
+				return filetxn.Result{}, err
+			}
+			authority = nextAuthority
+		}
 		next.AuthoritySequence = authority.Sequence
 	}
 	if orphanedIngressReservation {
@@ -597,6 +645,10 @@ func OwnershipInventoryDigest(records map[string]string) string {
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 
+func emergencyClearProofMatchesStopFence(proof *EmergencyClearProof, fence StopFence) bool {
+	return proof != nil && proof.StopFenceGeneration == fence.FenceGeneration && proof.StopFenceDigest == StopFenceDigest(fence) && proof.InventoryDigest == fence.InventoryDigest && proof.OwnedGraphDigest == fence.OwnedGraphDigest && isDigest(proof.RuntimeClosureDigest) && proof.NginxTestPassed && proof.RuntimeClosed
+}
+
 func matchAuthority(state State, authority EmergencyState) error {
 	if state.AuthoritySequence != authority.Sequence || state.GlobalClose != authority.GlobalClose || state.StopFenceSequence != authority.StopFenceSequence {
 		return fmt.Errorf("normal and emergency safety authority are one-sided")
@@ -609,6 +661,10 @@ func matchAuthority(state State, authority EmergencyState) error {
 		}
 	} else if authority.StopFence != nil {
 		return fmt.Errorf("normal safety state omits emergency stop authority")
+	} else if authority.ReservedStopFenceKind != "" && authority.ReservedStopFenceKind != StopFenceContraction {
+		if !emergencyClearProofMatchesRetiredReservation(authority.ClearProof, authority) {
+			return fmt.Errorf("normal safety state leaves an unresolved emergency stop-fence reservation")
+		}
 	}
 	return nil
 }
@@ -1181,6 +1237,30 @@ func validOrphanedReservationAuthority(current, next State, authority EmergencyS
 		return false
 	}
 	return true
+}
+
+func validReservedStopFenceRetirementProof(current, next State, authority EmergencyState, proof *StopFenceConvergenceProof) bool {
+	if proof == nil || proof.Kind != authority.ReservedStopFenceKind || proof.FenceGeneration != authority.StopFenceSequence || proof.FenceDigest != authority.ReservedStopFenceDigest || proof.JournalRef != "emergency-reservation-retirement" || !isDigest(proof.InventoryDigest) || !isDigest(proof.OwnedGraphDigest) || !isDigest(proof.RuntimeClosureDigest) || !proof.AllChildrenExited || !proof.AllAppsUnpublished || !proof.NoAppDisk || !proof.WorkersDrained || !proof.ListenersClosed || !proof.RuntimeClosed || !proof.NginxTestPassed || len(proof.UnpublishedGenerations) != len(next.Resources) || !reflect.DeepEqual(current.Resources, next.Resources) {
+		return false
+	}
+	for _, resource := range next.Resources {
+		if resource.Ownership == OwnershipOrphan || resource.StickyUnpublished == nil || resource.Closing != nil || resource.ChallengePending != nil || resource.Reactivating != nil || proof.UnpublishedGenerations[resource.ResourceID] != resource.StickyUnpublished.Generation {
+			return false
+		}
+	}
+	return true
+}
+
+func emergencyClearProofMatchesReservedStopFence(proof *EmergencyClearProof, authority EmergencyState) bool {
+	return proof != nil && proof.StopFenceGeneration == authority.StopFenceSequence && proof.StopFenceDigest == authority.ReservedStopFenceDigest && validEmergencyClearProof(proof, authority)
+}
+
+func emergencyClearProofMatchesRetiredReservation(proof *EmergencyClearProof, authority EmergencyState) bool {
+	return proof != nil && proof.StopFenceGeneration == authority.StopFenceSequence && isDigest(proof.StopFenceDigest) && validEmergencyClearProof(proof, authority)
+}
+
+func emergencyClearProofMatchesRetirement(proof *EmergencyClearProof, convergence *StopFenceConvergenceProof) bool {
+	return proof != nil && convergence != nil && proof.StopFenceGeneration == convergence.FenceGeneration && proof.StopFenceDigest == convergence.FenceDigest && proof.InventoryDigest == convergence.InventoryDigest && proof.OwnedGraphDigest == convergence.OwnedGraphDigest && proof.RuntimeClosureDigest == convergence.RuntimeClosureDigest && proof.NginxTestPassed == convergence.NginxTestPassed && proof.RuntimeClosed == convergence.RuntimeClosed
 }
 
 func validStopClearProof(fence StopFence, next State, proof *StopFenceConvergenceProof) bool {

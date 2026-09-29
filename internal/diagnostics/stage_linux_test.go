@@ -5,6 +5,7 @@ package diagnostics
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,6 +61,15 @@ func TestCertificateErrorMetadataClassifiesRateLimitAndRetryAfter(t *testing.T) 
 	}
 	if class, retryAfter := certificateErrorMetadata(context.Canceled); class != "canceled" || retryAfter != 0 {
 		t.Fatalf("canceled metadata=%q,%d", class, retryAfter)
+	}
+}
+
+func TestCertificateErrorMetadataClassifiesPublicationCommitFailures(t *testing.T) {
+	if class, retryAfter := certificateErrorMetadata(errors.New("publication terminal intent mismatched")); class != "publication_commit_failed" || retryAfter != 0 {
+		t.Fatalf("publication metadata=%q,%d", class, retryAfter)
+	}
+	if class, retryAfter := certificateErrorMetadata(errors.New("normal safety commit leaves an unresolved emergency stop-fence reservation")); class != "safety_commit_failed" || retryAfter != 0 {
+		t.Fatalf("safety metadata=%q,%d", class, retryAfter)
 	}
 }
 

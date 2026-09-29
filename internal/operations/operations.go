@@ -2961,7 +2961,7 @@ func (admitter *Admitter) CommitPublicationPublished(ctx context.Context, mutati
 				continue
 			}
 			active := resource.PublicationRecord.ActivationIntent
-			if resource.PublicationRecord.State != domain.PublicationActivating || active == nil || active.JobID != jobID || !reflect.DeepEqual(active.Candidate, commit.Bundle) {
+			if resource.PublicationRecord.State != domain.PublicationActivating || active == nil || active.JobID != jobID || publication.RequireBundleDigest(active.Candidate, intent.SafetyBinding.CandidateBundle) != nil || publication.RequireBundleDigest(commit.Bundle, intent.SafetyBinding.CandidateBundle) != nil {
 				return fmt.Errorf("publication candidate authority changed")
 			}
 			digest := commit.Bundle.ConfigDigest

@@ -282,6 +282,13 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := reconcileStaleEmergencyStopFenceReservation(ctx, service, state); err != nil {
+		return err
+	}
+	state, err = readPublicationRecoverySafety(ctx, service)
+	if err != nil {
+		return err
+	}
 	if err := reconcileMarkerlessTemporaryReservations(ctx, service, state); err != nil {
 		return err
 	}
@@ -314,6 +321,15 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			return err
 		}
 		activationIntent := resource.PublicationRecord.ActivationIntent
+		if markerlessActivation {
+			emergencyAuthority, authorityErr := service.emergency.Authority()
+			if authorityErr != nil {
+				return authorityErr
+			}
+			if emergencyAuthority.StopFence == nil && emergencyAuthority.ReservedStopFenceKind != "" && emergencyAuthority.ReservedStopFenceKind != safety.StopFenceContraction && (emergencyAuthority.ClearProof == nil || emergencyAuthority.ClearProof.StopFenceGeneration != emergencyAuthority.StopFenceSequence) {
+				return fmt.Errorf("markerless interrupted publication has an unresolved emergency stop-fence reservation without normal fence provenance")
+			}
+		}
 		if markerlessActivation {
 			if resource.PublicationRecord.State != domain.PublicationActivating || activationIntent == nil || activationIntent.Candidate.DomainHTTPS == nil || activationIntent.JobID == "" {
 				continue
@@ -462,6 +478,9 @@ func ReconcileInterruptedDomainPublications(ctx context.Context) error {
 			if item.ResourceID == resource.ID && item.Reactivating != nil && item.OwnershipDigest != owned.Checksum {
 				ownershipNext := fresh
 				ownershipNext.Revision++
+				if recoverySafetyAuthorityPrecleared(fresh, emergencyAuthority) {
+					ownershipNext.AuthoritySequence = emergencyAuthority.Sequence
+				}
 				ownershipNext.Resources = append([]safety.ResourceSafety(nil), fresh.Resources...)
 				for index := range ownershipNext.Resources {
 					if ownershipNext.Resources[index].ResourceID == resource.ID {
@@ -1002,12 +1021,22 @@ func reconcileRetiredGoAccess(ctx context.Context, service *FixedService) error 
 	return nil
 }
 
+func recoverySafetyAuthorityPrecleared(state safety.State, authority safety.EmergencyState) bool {
+	return state.StopFence != nil && state.AuthoritySequence+1 == authority.Sequence && authority.StopFence == nil && authority.ReservedStopFenceKind == state.StopFence.Kind && authority.StopFenceSequence == state.StopFence.FenceGeneration && authority.ClearProof != nil && authority.ClearProof.StopFenceGeneration == state.StopFence.FenceGeneration && authority.ClearProof.StopFenceDigest == safety.StopFenceDigest(*state.StopFence) && authority.ClearProof.InventoryDigest == state.StopFence.InventoryDigest && authority.ClearProof.OwnedGraphDigest == state.StopFence.OwnedGraphDigest && authority.ClearProof.NginxTestPassed && authority.ClearProof.RuntimeClosed
+}
+
 func recoverySafetyAuthorityMatches(state safety.State, authority safety.EmergencyState) bool {
-	if state.AuthoritySequence != authority.Sequence || state.GlobalClose != authority.GlobalClose || state.StopFenceSequence != authority.StopFenceSequence {
+	if state.GlobalClose != authority.GlobalClose || state.StopFenceSequence != authority.StopFenceSequence {
 		return false
 	}
 	if state.StopFence == nil {
-		return authority.StopFence == nil
+		return state.AuthoritySequence == authority.Sequence && authority.StopFence == nil
+	}
+	if state.AuthoritySequence != authority.Sequence {
+		return recoverySafetyAuthorityPrecleared(state, authority)
+	}
+	if authority.StopFence == nil {
+		return authority.ReservedStopFenceKind == state.StopFence.Kind && authority.ReservedStopFenceDigest == safety.StopFenceDigest(*state.StopFence) && authority.StopFenceSequence == state.StopFence.FenceGeneration
 	}
 	if authority.StopFence != nil {
 		return safety.FenceMatchesEmergency(state.StopFence, *authority.StopFence)

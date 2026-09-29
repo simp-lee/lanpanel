@@ -8,9 +8,23 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/publication"
 	"lanpanel/internal/safety"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestRecoveryAcceptsEmergencyClearedNormalActivationFenceForRetry(t *testing.T) {
+	fence := safety.StopFence{Kind: safety.StopFenceIngressActivation, OriginOperation: "publish", Scope: safety.FenceScope{Kind: "app", ResourceID: "res_one"}, FenceGeneration: 1, CreatedAt: time.Unix(100, 0).UTC(), OwnedGraphDigest: "sha256:" + "a" + strings.Repeat("0", 63), InventoryDigest: "sha256:" + "b" + strings.Repeat("0", 63), IngressActivation: &safety.IngressActivationFence{IntentRef: "plan_one", CandidateGeneration: 2, PriorGeneration: 1}}
+	state := safety.State{AuthoritySequence: 1, GlobalClose: safety.GlobalClose{Phase: safety.GlobalCloseNone}, StopFenceSequence: 1, StopFence: &fence}
+	authority := safety.EmergencyState{Sequence: 2, GlobalClose: state.GlobalClose, StopFenceSequence: 1, ReservedStopFenceKind: fence.Kind, ReservedStopFenceDigest: safety.StopFenceDigest(fence), ClearProof: &safety.EmergencyClearProof{StopFenceGeneration: 1, StopFenceDigest: safety.StopFenceDigest(fence), InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: "sha256:" + strings.Repeat("d", 64), NginxTestPassed: true, RuntimeClosed: true}}
+	if !recoverySafetyAuthorityMatches(state, authority) {
+		t.Fatal("recovery rejected an emergency-cleared normal activation fence")
+	}
+	authority.ClearProof.StopFenceDigest = "sha256:" + strings.Repeat("c", 64)
+	if recoverySafetyAuthorityMatches(state, authority) {
+		t.Fatal("recovery accepted an emergency clear proof for a different fence")
+	}
+}
 
 func TestCertificateHandoffCarriesInstallationAndActivationDeadline(t *testing.T) {
 	deadline := time.Now().UTC().Add(time.Minute)

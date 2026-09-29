@@ -129,6 +129,13 @@ func certificateErrorMetadata(cause error) (string, int64) {
 	if orderErr != nil {
 		return "order_failed", 0
 	}
+	message := strings.ToLower(cause.Error())
+	if strings.Contains(message, "publication terminal") || strings.Contains(message, "publication candidate") || strings.Contains(message, "publication journal") {
+		return "publication_commit_failed", 0
+	}
+	if strings.Contains(message, "safety commit") || strings.Contains(message, "normal safety") || strings.Contains(message, "safety revision") {
+		return "safety_commit_failed", 0
+	}
 	return "internal_failed", 0
 }
 

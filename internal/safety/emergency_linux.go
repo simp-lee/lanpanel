@@ -274,14 +274,36 @@ func (store *EmergencyStore) commitReservedStopFenceClearProof(lease *locks.Leas
 	if err != nil {
 		return err
 	}
-	return committer.commit(RoleJournalConvergence, expectedSequence, next, true)
+	return committer.commit(RoleJournalConvergence, expectedSequence, next, true, "")
+}
+
+func (store *EmergencyStore) commitReservedStopFenceRetirement(lease *locks.Lease, expectedSequence uint64, reservationDigest string, next EmergencyState) error {
+	if !isDigest(reservationDigest) {
+		return ErrEmergencyState
+	}
+	committer, err := store.PrepareCommit(lease)
+	if err != nil {
+		return err
+	}
+	return committer.commit(RoleJournalConvergence, expectedSequence, next, true, reservationDigest)
+}
+
+func (store *EmergencyStore) commitExactReservedStopFenceClearProof(lease *locks.Lease, expectedSequence uint64, fenceDigest string, next EmergencyState) error {
+	if !isDigest(fenceDigest) {
+		return ErrEmergencyState
+	}
+	committer, err := store.PrepareCommit(lease)
+	if err != nil {
+		return err
+	}
+	return committer.commit(RoleJournalConvergence, expectedSequence, next, true, fenceDigest)
 }
 
 func (committer *EmergencyCommitter) Commit(role ClearRole, expectedSequence uint64, next EmergencyState) error {
-	return committer.commit(role, expectedSequence, next, false)
+	return committer.commit(role, expectedSequence, next, false, "")
 }
 
-func (committer *EmergencyCommitter) commit(role ClearRole, expectedSequence uint64, next EmergencyState, allowReservedStopFenceClear bool) error {
+func (committer *EmergencyCommitter) commit(role ClearRole, expectedSequence uint64, next EmergencyState, allowReservedStopFenceClear bool, expectedReservedStopFenceDigest string) error {
 	if committer == nil || committer.used || committer.store == nil || !committer.lease.Active(locks.Exposure) {
 		return ErrEmergencyState
 	}
@@ -305,7 +327,11 @@ func (committer *EmergencyCommitter) commit(role ClearRole, expectedSequence uin
 	if store.closed || store.current.Sequence != expectedSequence || next.Sequence != expectedSequence+1 {
 		return ErrEmergencySequence
 	}
-	if !validEmergencyTransition(role, store.current, next) && (!allowReservedStopFenceClear || !validReservedStopFenceClearTransition(store.current, next)) {
+	validReservedClear := validReservedStopFenceClearTransition(store.current, next)
+	if expectedReservedStopFenceDigest != "" && (!validReservedClear || next.ClearProof == nil || next.ClearProof.StopFenceDigest != expectedReservedStopFenceDigest) {
+		return ErrEmergencyState
+	}
+	if !validEmergencyTransition(role, store.current, next) && (!allowReservedStopFenceClear || !validReservedClear) {
 		return ErrEmergencyState
 	}
 	clear(store.slot[:])
@@ -415,7 +441,7 @@ func sameEmergencyDirectory(actual, expected unix.Stat_t) bool {
 }
 
 func validReservedStopFenceClearTransition(current, next EmergencyState) bool {
-	return current.StopFence == nil && next.StopFence == nil && current.StopFenceSequence != 0 && current.ReservedStopFenceKind != StopFenceContraction && next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest && (current.ClearProof == nil || current.ClearProof.StopFenceGeneration != current.StopFenceSequence) && next.ClearProof != nil && next.ClearProof.StopFenceGeneration == current.StopFenceSequence && validEmergencyClearProof(next.ClearProof, current)
+	return current.StopFence == nil && next.StopFence == nil && current.StopFenceSequence != 0 && current.ReservedStopFenceKind != StopFenceContraction && isDigest(current.ReservedStopFenceDigest) && next.StopFenceSequence == current.StopFenceSequence && next.ReservedStopFenceKind == current.ReservedStopFenceKind && next.ReservedStopFenceDigest == current.ReservedStopFenceDigest && (current.ClearProof == nil || current.ClearProof.StopFenceGeneration != current.StopFenceSequence) && next.ClearProof != nil && next.ClearProof.StopFenceGeneration == current.StopFenceSequence && isDigest(next.ClearProof.StopFenceDigest) && validEmergencyClearProof(next.ClearProof, current)
 }
 
 func validEmergencyTransition(role ClearRole, current, next EmergencyState) bool {
