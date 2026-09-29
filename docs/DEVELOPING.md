@@ -84,7 +84,7 @@ make materialize-preview-dependencies \
 
 `materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
-每个支持的发行版版本都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。目前目标矩阵是 Debian 12/13 和 Ubuntu 22.04/24.04；主机必须使用完整 unified cgroup v2、可用的 `cgroup.kill`，并支持 systemd `Delegate=`。先运行只读检查：
+每个支持的发行版版本都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。目前目标矩阵是 Debian 12/13 和 Ubuntu 22.04/24.04；每个发布清单必须包含这四个精确 OS Profile。主机必须使用完整 unified cgroup v2、可用的 `cgroup.kill`，并支持 systemd `Delegate=`。先运行只读检查：
 
 ```sh
 make check-preview-profile-host PREVIEW_PROFILE_TARGET=debian-12
