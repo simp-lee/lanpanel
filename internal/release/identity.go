@@ -334,14 +334,14 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 		}
 	}
 	previousProfile := ""
-	seenTargets := map[string]bool{}
+	seenFamilies := map[string]bool{}
 	for _, profile := range manifest.SupportedProfiles {
-		targetKey := profile.Profile.Family + "/" + profile.Profile.Release + "/" + profile.Profile.Architecture
-		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenTargets[targetKey] {
+		familyKey := profile.Profile.Family + "/" + profile.Profile.Architecture
+		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenFamilies[familyKey] {
 			return fmt.Errorf("release manifest OS profile or profile asset authority is invalid")
 		}
 		previousProfile = profile.Profile.ID
-		seenTargets[targetKey] = true
+		seenFamilies[familyKey] = true
 	}
 	if err := validateSupportedPreviewFamilies(manifest.SupportedProfiles); err != nil {
 		return err

@@ -1060,7 +1060,7 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, managem
 	if err := preflight.RequireExpansionResultForRequest(result, request, now); err != nil {
 		return err
 	}
-	if request.Profile.Authority.Digest != "sha256:"+releaseIdentity.ProfileDigest || request.Profile.ID != releaseIdentity.Profile.Family || request.Profile.VersionID != releaseIdentity.Profile.Release || request.Profile.Architecture != "amd64" {
+	if request.Profile.Authority.Digest != "sha256:"+releaseIdentity.ProfileDigest || request.Profile.ID != releaseIdentity.Profile.Family || request.Profile.Architecture != "amd64" {
 		return fmt.Errorf("bootstrap preflight does not bind the selected release profile")
 	}
 	if len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Protocol != "tcp" || request.BootstrapListeners[0].Purpose != "management" || request.BootstrapListeners[0].Address != management.Address || request.BootstrapListeners[0].Port != management.Port {

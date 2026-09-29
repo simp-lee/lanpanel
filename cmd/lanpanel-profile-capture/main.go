@@ -47,7 +47,7 @@ func main() {
 	var output, profileID, dependencyPath string
 	var packageNames stringList
 	flag.StringVar(&output, "output", "", "output directory")
-	flag.StringVar(&profileID, "profile-id", "", "profile ID, for example debian-12-amd64")
+	flag.StringVar(&profileID, "profile-id", "", "profile ID, for example debian-amd64")
 	flag.StringVar(&dependencyPath, "dependency-inputs", "", "resolved dependency-inputs.json")
 	flag.Var(&packageNames, "package", "package to include; may be repeated")
 	flag.Parse()
@@ -71,9 +71,9 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	if runtime.GOARCH != "amd64" || !release.IsSupportedPreviewTarget(release.OSProfile{Family: platform.ID, Release: platform.VersionID, Architecture: runtime.GOARCH}) {
 		return fmt.Errorf("host %s/%s/%s is not a supported Debian or Ubuntu amd64 platform", platform.ID, platform.VersionID, runtime.GOARCH)
 	}
-	expectedProfileID := platform.ID + "-" + platform.VersionID + "-" + runtime.GOARCH
+	expectedProfileID := platform.ID + "-" + runtime.GOARCH
 	if profileID != expectedProfileID {
-		return fmt.Errorf("profile-id %q must identify the exact host release and architecture", profileID)
+		return fmt.Errorf("profile-id %q must identify the host family and architecture", profileID)
 	}
 	// Package profiles are build-time package authority. Runtime cgroup and
 	// systemd capability checks belong to installer preflight, so capturing a

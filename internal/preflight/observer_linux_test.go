@@ -119,8 +119,8 @@ func TestVerifyInstalledProfileIgnoresPackageVersionsAndSnapshot(t *testing.T) {
 	}
 	candidate := observed
 	candidate.Platform.VersionID = "14"
-	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
-		t.Fatalf("OS version drift was not classified: %v", err)
+	if err := VerifyInstalledProfile(expected, candidate); err != nil {
+		t.Fatalf("OS release change should remain compatible with the family profile: %v", err)
 	}
 	candidate = observed
 	candidate.CgroupKillAvailable = false

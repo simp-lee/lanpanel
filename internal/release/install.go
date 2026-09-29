@@ -169,16 +169,16 @@ func selectSupportedProfile(manifest ReleaseManifest, observed PublicInstallObse
 	var selected SupportedOSProfile
 	for _, candidate := range manifest.SupportedProfiles {
 		profile := candidate.Profile
-		if profile.Family != observed.OSID || profile.Release != observed.OSVersionID || profile.Architecture != observed.Architecture {
+		if profile.Family != observed.OSID || profile.Architecture != observed.Architecture {
 			continue
 		}
 		if selected.Profile.ID != "" {
-			return SupportedOSProfile{}, fmt.Errorf("release contains duplicate exact OS profiles")
+			return SupportedOSProfile{}, fmt.Errorf("release contains duplicate family profiles")
 		}
 		selected = candidate
 	}
 	if selected.Profile.ID == "" {
-		return SupportedOSProfile{}, fmt.Errorf("release does not support exact host platform %s/%s/%s", observed.OSID, observed.OSVersionID, observed.Architecture)
+		return SupportedOSProfile{}, fmt.Errorf("release does not support host family %s/%s", observed.OSID, observed.Architecture)
 	}
 	return selected, nil
 }

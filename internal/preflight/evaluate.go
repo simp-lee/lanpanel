@@ -33,8 +33,8 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID
-	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
+	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID != ""
+	add("os_profile", profileMatches, "authorized OS family profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
 	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode && observed.CgroupMountpoint == "/sys/fs/cgroup" && observed.CgroupMountRoot == "/"
 	add("managed_confinement", confinementMatches, "complete unified cgroup v2 topology required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode+"/"+observed.CgroupMountpoint+"/"+observed.CgroupMountRoot)
 	add("cgroup_kill", observed.CgroupKillAvailable, "cgroup.kill is required for proven child closure", boolIdentity(observed.CgroupKillAvailable))

@@ -99,7 +99,7 @@ make capture-preview-profile \
   PREVIEW_DEPENDENCY_INPUTS=dist/dependencies/dependency-inputs.json
 ```
 
-Debian 13 使用 `PREVIEW_PROFILE_TARGET=debian-13`、`PREVIEW_PROFILE_ID=debian-13-amd64`；Ubuntu 22.04/24.04/26.04 分别使用对应的 `PREVIEW_PROFILE_TARGET` 和 `ubuntu-<VERSION>-amd64` Profile ID。检查会验证对应发行版版本、amd64、systemd、APT/dpkg 以及必要软件包；安装器自身还会在真实目标主机上检查 systemd delegation、完整 unified cgroup v2 和 `cgroup.kill`。采集命令只写入 Profile、软件包模板和依赖基线，不绑定某个 APT 镜像。生成结果必须人工审查后再提交。
+Profile 按发行版家族生成：Debian 使用 `PREVIEW_PROFILE_TARGET=debian`、`PREVIEW_PROFILE_ID=debian-amd64`；Ubuntu 使用 `PREVIEW_PROFILE_TARGET=ubuntu`、`PREVIEW_PROFILE_ID=ubuntu-amd64`。Profile 中的 Nginx 约束使用最低版本范围，不绑定某个发行版版本；安装器仍会在目标主机上检查实际 APT/dpkg 和运行能力。检查会验证对应发行版版本、amd64、systemd、APT/dpkg 以及必要软件包；安装器自身还会在真实目标主机上检查 systemd delegation、完整 unified cgroup v2 和 `cgroup.kill`。采集命令只写入 Profile、软件包模板和依赖基线，不绑定某个 APT 镜像。生成结果必须人工审查后再提交。
 
 ## 本地构建 Preview 发布包
 

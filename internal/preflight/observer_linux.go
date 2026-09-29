@@ -168,7 +168,6 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 	}{
 		{"architecture", expected.Architecture, observed.Architecture},
 		{"os_family", expected.ID, observed.Platform.ID},
-		{"os_version", expected.VersionID, observed.Platform.VersionID},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
 		{"cgroup_mountpoint", "/sys/fs/cgroup", observed.CgroupMountpoint},
 		{"cgroup_mount_root", "/", observed.CgroupMountRoot},
