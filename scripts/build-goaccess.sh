@@ -29,12 +29,15 @@ source_dir=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'goaccess-*' -pr
 (
   cd "$source_dir"
   # Static linking removes the target host's ncurses/glibc builder baseline
-  # from the runtime dependency contract. The glibc NSS warning is harmless
-  # here because LanPanel runs GoAccess as its fixed non-root service user.
-  LIBS="-ltinfo -ldl" LDFLAGS="-static" ./configure --enable-utf8 --disable-geoip
+  # from the runtime dependency contract. Normalize timestamps and linker
+  # build IDs, and strip debug data so materializing the reviewed lock reproduces the
+  # release-builder output. The glibc NSS warning is harmless here because
+  # LanPanel runs GoAccess as its fixed non-root service user.
+  export SOURCE_DATE_EPOCH=0
+  CFLAGS="-O2 -g" LIBS="-ltinfo -ldl" LDFLAGS="-static -Wl,--build-id=none" ./configure --enable-utf8 --disable-geoip
   make -j2
 )
 [ -x "$source_dir/goaccess" ] || { echo "GoAccess build did not produce an executable" >&2; exit 1; }
 mkdir -p -- "$(dirname "$output")"
 install -m 0755 "$source_dir/goaccess" "$output"
-strip --strip-unneeded "$output"
+strip --strip-all "$output"
