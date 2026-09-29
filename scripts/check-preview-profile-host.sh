@@ -4,11 +4,15 @@ set -eu
 
 target=${1:-debian-12}
 case "$target" in
-  debian-12) family=debian; version=12 ;;
-  debian-13) family=debian; version=13 ;;
-  ubuntu-22.04) family=ubuntu; version=22.04 ;;
-  ubuntu-24.04) family=ubuntu; version=24.04 ;;
-  *) echo "usage: $0 [debian-12|debian-13|ubuntu-22.04|ubuntu-24.04]" >&2; exit 2 ;;
+  debian) family=debian; version="" ;;
+  ubuntu) family=ubuntu; version="" ;;
+  debian-*) family=debian; version=${target#debian-} ;;
+  ubuntu-*) family=ubuntu; version=${target#ubuntu-} ;;
+  *) echo "usage: $0 [debian[-VERSION]|ubuntu[-VERSION]]" >&2; exit 2 ;;
+esac
+case "$version" in
+  ""|[0-9]*.[0-9]*|[0-9]*) ;;
+  *) echo "invalid target release: $version" >&2; exit 2 ;;
 esac
 
 fail=0
@@ -26,7 +30,7 @@ check() {
 check_os() {
   [ -r /etc/os-release ] || return 1
   . /etc/os-release
-  [ "$ID" = "$family" ] && [ "$VERSION_ID" = "$version" ]
+  [ "$ID" = "$family" ] && { [ -z "$version" ] || [ "$VERSION_ID" = "$version" ]; }
 }
 check_arch() { [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ] && [ "$(uname -m)" = x86_64 ]; }
 check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ]; }

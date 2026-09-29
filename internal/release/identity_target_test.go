@@ -2,19 +2,15 @@ package release
 
 import "testing"
 
-func TestValidateSupportedPreviewFamiliesRequiresExactFourTargets(t *testing.T) {
-	profile := func(family, release string) SupportedOSProfile {
-		return SupportedOSProfile{Profile: OSProfile{Family: family, Release: release, Architecture: PreviewTargetArchitecture}}
+func TestValidateSupportedPreviewFamiliesRequiresBothFamilies(t *testing.T) {
+	profile := func(family string) SupportedOSProfile {
+		return SupportedOSProfile{Profile: OSProfile{Family: family, Architecture: PreviewTargetArchitecture}}
 	}
-	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily, "24.04")}); err == nil {
-		t.Fatal("partial release profile set was accepted")
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily)}); err == nil {
+		t.Fatal("Ubuntu-only release profile set was accepted")
 	}
-	complete := []SupportedOSProfile{
-		profile(PreviewDebianFamily, "12"), profile(PreviewDebianFamily, "13"),
-		profile(PreviewUbuntuFamily, "22.04"), profile(PreviewUbuntuFamily, "24.04"),
-	}
-	if err := validateSupportedPreviewFamilies(complete); err != nil {
-		t.Fatalf("complete four-target profile set rejected: %v", err)
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewDebianFamily), profile(PreviewUbuntuFamily)}); err != nil {
+		t.Fatalf("complete Debian/Ubuntu profile set rejected: %v", err)
 	}
 }
 
@@ -30,8 +26,8 @@ func TestIsSupportedPreviewTarget(t *testing.T) {
 		{name: "debian 13 amd64", family: PreviewDebianFamily, release: "13", arch: PreviewTargetArchitecture, supported: true},
 		{name: "ubuntu 22.04 amd64", family: PreviewUbuntuFamily, release: "22.04", arch: PreviewTargetArchitecture, supported: true},
 		{name: "ubuntu 24.04 amd64", family: PreviewUbuntuFamily, release: "24.04", arch: PreviewTargetArchitecture, supported: true},
-		{name: "debian future amd64", family: PreviewDebianFamily, release: "99", arch: PreviewTargetArchitecture, supported: false},
-		{name: "ubuntu future amd64", family: PreviewUbuntuFamily, release: "30.04", arch: PreviewTargetArchitecture, supported: false},
+		{name: "debian future amd64", family: PreviewDebianFamily, release: "99", arch: PreviewTargetArchitecture, supported: true},
+		{name: "ubuntu future amd64", family: PreviewUbuntuFamily, release: "30.04", arch: PreviewTargetArchitecture, supported: true},
 		{name: "arm64", family: PreviewDebianFamily, release: "13", arch: "arm64"},
 	}
 	for _, test := range cases {

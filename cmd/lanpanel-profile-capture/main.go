@@ -75,13 +75,9 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	if profileID != expectedProfileID {
 		return fmt.Errorf("profile-id %q must identify the exact host release and architecture", profileID)
 	}
-	capabilities, err := preflight.ObserveHostCapabilities()
-	if err != nil {
-		return fmt.Errorf("observe managed host capabilities: %w", err)
-	}
-	if capabilities.CgroupMode != "unified_v2" || capabilities.CgroupMountpoint != "/sys/fs/cgroup" || capabilities.CgroupMountRoot != "/" || !capabilities.CgroupKillAvailable || !capabilities.SystemdDelegation.Available {
-		return fmt.Errorf("host lacks the required unified cgroup v2 and systemd delegation contract: mode=%s mountpoint=%s root=%s cgroup.kill=%t delegation=%s", capabilities.CgroupMode, capabilities.CgroupMountpoint, capabilities.CgroupMountRoot, capabilities.CgroupKillAvailable, capabilities.SystemdDelegation.Identity)
-	}
+	// Package profiles are build-time package authority. Runtime cgroup and
+	// systemd capability checks belong to installer preflight, so capturing a
+	// package profile does not require running on every customer's exact host.
 	observation, err := preflight.ObserveBootstrapReadiness(context.Background())
 	if err != nil {
 		return fmt.Errorf("observe package prerequisites: %w", err)

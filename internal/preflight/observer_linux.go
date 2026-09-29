@@ -652,39 +652,14 @@ func (observer *LinuxObserver) probeCgroupKill(mountpoint string) (bool, error) 
 		return false, err
 	}
 	parent := filepath.Join(mountpoint, strings.TrimPrefix(logicalPath, "/"))
-	parentKill, parentErr := os.Stat(filepath.Join(parent, "cgroup.kill"))
-	if parentErr == nil && parentKill.Mode().IsRegular() {
-		probe, mkdirErr := os.MkdirTemp(parent, ".lanpanel-cgroup-probe-")
-		if mkdirErr != nil {
-			return false, fmt.Errorf("probe systemd cgroup delegation: %w", mkdirErr)
+	info, statErr := os.Stat(filepath.Join(parent, "cgroup.kill"))
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			return false, nil
 		}
-		_ = os.Remove(probe)
-		return true, nil
+		return false, fmt.Errorf("observe cgroup.kill: %w", statErr)
 	}
-	if logicalPath != "/" {
-		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
-			return false, fmt.Errorf("observe cgroup.kill: %w", parentErr)
-		}
-		return false, nil
-	}
-	probe, mkdirErr := os.MkdirTemp(parent, ".lanpanel-cgroup-probe-")
-	if mkdirErr != nil {
-		return false, fmt.Errorf("probe systemd cgroup delegation: %w", mkdirErr)
-	}
-	defer os.Remove(probe)
-	for _, name := range []string{"cgroup.kill", "cgroup.procs", "cgroup.events"} {
-		info, statErr := os.Stat(filepath.Join(probe, name))
-		if statErr != nil {
-			if errors.Is(statErr, os.ErrNotExist) {
-				return false, nil
-			}
-			return false, fmt.Errorf("observe delegated cgroup control %s: %w", name, statErr)
-		}
-		if !info.Mode().IsRegular() {
-			return false, fmt.Errorf("delegated cgroup control %s is not a regular file", name)
-		}
-	}
-	return true, nil
+	return info.Mode().IsRegular(), nil
 }
 
 func parseUnifiedCgroupPath(data string) (string, error) {

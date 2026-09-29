@@ -25,21 +25,13 @@ const (
 	PreviewUbuntuFamily       = "ubuntu"
 )
 
-// IsSupportedPreviewTarget validates the exact release matrix for the
-// unified-cgroup-v2 release contract. Unsupported or future releases must not
-// inherit a profile captured for another OS version.
+// IsSupportedPreviewTarget validates the platform shape. Runtime support is
+// decided by the signed exact OS profile and live capability preflight, not by
+// a hard-coded release-version allow-list.
 func IsSupportedPreviewTarget(profile OSProfile) bool {
-	if profile.Architecture != PreviewTargetArchitecture {
-		return false
-	}
-	switch profile.Family {
-	case PreviewDebianFamily:
-		return profile.Release == "12" || profile.Release == "13"
-	case PreviewUbuntuFamily:
-		return profile.Release == "22.04" || profile.Release == "24.04"
-	default:
-		return false
-	}
+	return profile.Architecture == PreviewTargetArchitecture &&
+		(profile.Family == PreviewDebianFamily || profile.Family == PreviewUbuntuFamily) &&
+		osReleasePattern.MatchString(profile.Release)
 }
 
 type InstallKind string
@@ -358,22 +350,12 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 }
 
 func validateSupportedPreviewFamilies(values []SupportedOSProfile) error {
-	required := map[string]bool{
-		PreviewDebianFamily + "/12/" + PreviewTargetArchitecture:    false,
-		PreviewDebianFamily + "/13/" + PreviewTargetArchitecture:    false,
-		PreviewUbuntuFamily + "/22.04/" + PreviewTargetArchitecture: false,
-		PreviewUbuntuFamily + "/24.04/" + PreviewTargetArchitecture: false,
-	}
+	seen := map[string]bool{}
 	for _, value := range values {
-		key := value.Profile.Family + "/" + value.Profile.Release + "/" + value.Profile.Architecture
-		if _, expected := required[key]; expected {
-			required[key] = true
-		}
+		seen[value.Profile.Family+"/"+value.Profile.Architecture] = true
 	}
-	for target, present := range required {
-		if !present {
-			return fmt.Errorf("release manifest is missing supported OS profile %s", target)
-		}
+	if !seen[PreviewDebianFamily+"/"+PreviewTargetArchitecture] || !seen[PreviewUbuntuFamily+"/"+PreviewTargetArchitecture] {
+		return fmt.Errorf("release manifest must include both Debian and Ubuntu amd64 profiles")
 	}
 	return nil
 }
