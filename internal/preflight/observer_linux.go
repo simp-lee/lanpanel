@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -28,8 +29,14 @@ type LinuxPaths struct {
 	KernelRelease           string
 	CgroupControllers       string
 	CgroupHybridControllers string
+	CgroupMountpoint        string
+	CgroupMountInfo         string
+	CgroupCurrent           string
 	SystemdRoot             string
 	SystemdPID1             string
+	SystemdExecutable       string
+	SystemdControl          string
+	SystemdHelperUnit       string
 	APTExecutable           string
 	DPKGExecutable          string
 	TCP                     string
@@ -45,12 +52,25 @@ type LinuxObserver struct {
 	strictRoot  bool
 }
 
+type HostCapabilities struct {
+	KernelRelease       string
+	CgroupMode          string
+	CgroupMountpoint    string
+	CgroupMountRoot     string
+	CgroupKillAvailable bool
+	SystemdDelegation   ComponentObservation
+}
+
 type InstalledProfileObservation struct {
-	Architecture  string
-	Platform      PlatformInfo
-	KernelRelease string
-	CgroupMode    string
-	Packages      PackageObservation
+	Architecture        string
+	Platform            PlatformInfo
+	KernelRelease       string
+	CgroupMode          string
+	CgroupMountpoint    string
+	CgroupMountRoot     string
+	CgroupKillAvailable bool
+	SystemdDelegation   ComponentObservation
+	Packages            PackageObservation
 }
 
 type ProfileDriftError struct {
@@ -72,11 +92,33 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
 	}
-	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", CgroupHybridControllers: "/sys/fs/cgroup/unified/cgroup.controllers", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
+	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", CgroupHybridControllers: "/sys/fs/cgroup/unified/cgroup.controllers", CgroupMountInfo: "/proc/self/mountinfo", CgroupCurrent: "/proc/self/cgroup", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", SystemdExecutable: "/usr/bin/systemd", SystemdControl: "/usr/bin/systemctl", SystemdHelperUnit: "/etc/systemd/system/lanpanel-helper.service", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
 }
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
 	return &LinuxObserver{paths: paths, packageRead: packageRead, now: now}
+}
+
+func ObserveHostCapabilities() (HostCapabilities, error) {
+	observer, err := NewLinuxObserver(func(ctx context.Context) (PackageObservation, error) {
+		return ObserveBootstrapReadiness(ctx)
+	})
+	if err != nil {
+		return HostCapabilities{}, err
+	}
+	return observer.observeHostCapabilities()
+}
+
+func (observer *LinuxObserver) observeHostCapabilities() (HostCapabilities, error) {
+	kernelRelease, err := observer.readKernelRelease()
+	if err != nil {
+		return HostCapabilities{}, err
+	}
+	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities()
+	if err != nil {
+		return HostCapabilities{}, err
+	}
+	return HostCapabilities{KernelRelease: kernelRelease, CgroupMode: mode, CgroupMountpoint: mountpoint, CgroupMountRoot: mountRoot, CgroupKillAvailable: killAvailable, SystemdDelegation: delegation}, nil
 }
 
 func ObserveInstalledProfile(ctx context.Context) (InstalledProfileObservation, error) {
@@ -104,7 +146,7 @@ func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (Ins
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
-	cgroupMode, err := observer.readCgroupMode()
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities()
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
@@ -115,7 +157,7 @@ func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (Ins
 	if err := ctx.Err(); err != nil {
 		return InstalledProfileObservation{}, err
 	}
-	return InstalledProfileObservation{Architecture: runtime.GOARCH, Platform: platform, KernelRelease: kernelRelease, CgroupMode: cgroupMode, Packages: packages}, nil
+	return InstalledProfileObservation{Architecture: runtime.GOARCH, Platform: platform, KernelRelease: kernelRelease, CgroupMode: cgroupMode, CgroupMountpoint: cgroupMountpoint, CgroupMountRoot: cgroupMountRoot, CgroupKillAvailable: cgroupKillAvailable, SystemdDelegation: systemdDelegation, Packages: packages}, nil
 }
 
 func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileObservation) error {
@@ -126,7 +168,12 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 	}{
 		{"architecture", expected.Architecture, observed.Architecture},
 		{"os_family", expected.ID, observed.Platform.ID},
+		{"os_version", expected.VersionID, observed.Platform.VersionID},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
+		{"cgroup_mountpoint", "/sys/fs/cgroup", observed.CgroupMountpoint},
+		{"cgroup_mount_root", "/", observed.CgroupMountRoot},
+		{"cgroup_kill", "true", boolIdentity(observed.CgroupKillAvailable)},
+		{"systemd_delegation", "true", boolIdentity(observed.SystemdDelegation.Available)},
 	}
 	for _, check := range checks {
 		if check.expected != check.observed {
@@ -355,7 +402,7 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
-	cgroupMode, err := observer.readCgroupMode()
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities()
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
@@ -404,7 +451,7 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 		disks = append(disks, observation)
 	}
 	return ExpansionObservations{
-		OperatingSystem: "linux", Architecture: runtime.GOARCH, KernelRelease: kernelRelease, CgroupMode: cgroupMode, Platform: platform,
+		OperatingSystem: "linux", Architecture: runtime.GOARCH, KernelRelease: kernelRelease, CgroupMode: cgroupMode, CgroupMountpoint: cgroupMountpoint, CgroupMountRoot: cgroupMountRoot, CgroupKillAvailable: cgroupKillAvailable, SystemdDelegation: systemdDelegation, Platform: platform,
 		Clock:       observeClock(observer.now().UTC()),
 		ExecutorUID: uint32(os.Geteuid()), Systemd: systemd, APT: apt, DPKG: dpkg, Packages: packages,
 		DNS: dns, Listeners: listeners, ListenerInventoryComplete: true, Paths: paths, Disks: disks,
@@ -432,24 +479,238 @@ func observeSystemdPID1(path string) (ComponentObservation, error) {
 	return ComponentObservation{Available: identity == "systemd", Identity: identity}, nil
 }
 
+type cgroupMount struct {
+	Root       string
+	Mountpoint string
+}
+
+func (observer *LinuxObserver) observeManagedCapabilities() (string, string, string, bool, ComponentObservation, error) {
+	mountpoint, mountRoot, mode, err := observer.observeCgroupTopology()
+	if err != nil {
+		return "", "", "", false, ComponentObservation{}, err
+	}
+	killAvailable := false
+	if mode == "unified_v2" && mountpoint != "" {
+		var probeErr error
+		killAvailable, probeErr = observer.probeCgroupKill(mountpoint)
+		if probeErr != nil {
+			return "", "", "", false, ComponentObservation{}, probeErr
+		}
+	}
+	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable)
+	return mode, mountpoint, mountRoot, killAvailable, delegation, nil
+}
+
+func (observer *LinuxObserver) observeCgroupTopology() (string, string, string, error) {
+	if observer.paths.CgroupMountInfo == "" {
+		// Test observers created before mount topology was part of the authority
+		// retain the old fixture contract; the production observer always sets
+		// CgroupMountInfo.
+		controllers, err := readBoundedProcFile(observer.paths.CgroupControllers, 1<<20)
+		if err == nil && len(strings.TrimSpace(string(controllers))) != 0 {
+			mountpoint := observer.paths.CgroupMountpoint
+			if mountpoint == "" {
+				mountpoint = "/sys/fs/cgroup"
+			}
+			return mountpoint, "/", "unified_v2", nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", "", "", fmt.Errorf("observe unified cgroup v2 state: %w", err)
+		}
+		if observer.paths.CgroupHybridControllers != "" {
+			hybrid, hybridErr := readBoundedProcFile(observer.paths.CgroupHybridControllers, 1<<20)
+			if hybridErr == nil && len(strings.TrimSpace(string(hybrid))) != 0 {
+				return "", "", "hybrid_v2", nil
+			}
+		}
+		return "", "", "not_unified_v2", nil
+	}
+	data, err := readBoundedProcFile(observer.paths.CgroupMountInfo, 4<<20)
+	if err != nil {
+		return "", "", "", fmt.Errorf("observe cgroup mount topology: %w", err)
+	}
+	mounts, err := parseCgroup2Mounts(string(data))
+	if err != nil {
+		return "", "", "", fmt.Errorf("parse cgroup mount topology: %w", err)
+	}
+	if len(mounts) == 0 {
+		return "", "", "not_unified_v2", nil
+	}
+	expectedMountpoint := observer.paths.CgroupMountpoint
+	if expectedMountpoint == "" {
+		expectedMountpoint = "/sys/fs/cgroup"
+	}
+	var selected *cgroupMount
+	for index := range mounts {
+		if mounts[index].Mountpoint == expectedMountpoint && mounts[index].Root == "/" {
+			selected = &mounts[index]
+			break
+		}
+	}
+	if selected == nil || len(mounts) != 1 {
+		return "", "", "hybrid_v2", nil
+	}
+	controllers, err := readBoundedProcFile(filepath.Join(selected.Mountpoint, "cgroup.controllers"), 1<<20)
+	if err != nil {
+		return selected.Mountpoint, selected.Root, "hybrid_v2", nil
+	}
+	if len(strings.TrimSpace(string(controllers))) == 0 {
+		return selected.Mountpoint, selected.Root, "hybrid_v2", nil
+	}
+	return selected.Mountpoint, selected.Root, "unified_v2", nil
+}
+
+func parseCgroup2Mounts(data string) ([]cgroupMount, error) {
+	mounts := []cgroupMount{}
+	for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		separator := slices.Index(fields, "-")
+		if separator < 6 || separator+3 > len(fields) || fields[separator+1] != "cgroup2" {
+			continue
+		}
+		root, err := unescapeMountInfoPath(fields[3])
+		if err != nil {
+			return nil, err
+		}
+		mountpoint, err := unescapeMountInfoPath(fields[4])
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, cgroupMount{Root: root, Mountpoint: mountpoint})
+	}
+	return mounts, nil
+}
+
+func unescapeMountInfoPath(value string) (string, error) {
+	var output strings.Builder
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' {
+			output.WriteByte(value[index])
+			continue
+		}
+		if index+3 >= len(value) || value[index+1] < '0' || value[index+1] > '7' || value[index+2] < '0' || value[index+2] > '7' || value[index+3] < '0' || value[index+3] > '7' {
+			return "", fmt.Errorf("mountinfo path escape is invalid")
+		}
+		value := (value[index+1]-'0')*64 + (value[index+2]-'0')*8 + value[index+3] - '0'
+		output.WriteByte(value)
+		index += 3
+	}
+	return output.String(), nil
+}
+
+func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool) ComponentObservation {
+	expectedMountpoint := observer.paths.CgroupMountpoint
+	if expectedMountpoint == "" {
+		expectedMountpoint = "/sys/fs/cgroup"
+	}
+	if mode != "unified_v2" || mountpoint != expectedMountpoint || !cgroupDelegation {
+		return ComponentObservation{Identity: "cgroup delegation unavailable: " + mode}
+	}
+	data, err := exec.Command(observer.paths.SystemdExecutable, "--version").Output()
+	if err != nil {
+		return ComponentObservation{Identity: "systemd version unavailable"}
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 || fields[0] != "systemd" {
+		return ComponentObservation{Identity: "systemd version output invalid"}
+	}
+	major, err := strconv.Atoi(fields[1])
+	if err != nil || major < 218 {
+		return ComponentObservation{Identity: "systemd Delegate= unsupported"}
+	}
+	if observer.paths.SystemdHelperUnit != "" {
+		unit, unitErr := os.ReadFile(observer.paths.SystemdHelperUnit)
+		if unitErr == nil {
+			if !strings.Contains(string(unit), "\\nDelegate=yes\\n") {
+				return ComponentObservation{Identity: "lanpanel-helper.service lacks Delegate=yes"}
+			}
+			if observer.paths.SystemdControl != "" {
+				show, showErr := exec.Command(observer.paths.SystemdControl, "show", "--property=Delegate", "--value", "lanpanel-helper.service").Output()
+				if showErr != nil || strings.TrimSpace(string(show)) != "yes" {
+					return ComponentObservation{Identity: "effective lanpanel-helper.service delegation is not yes"}
+				}
+			}
+		}
+	}
+	return ComponentObservation{Available: true, Identity: fmt.Sprintf("systemd/%d Delegate=yes", major)}
+}
+
+func (observer *LinuxObserver) probeCgroupKill(mountpoint string) (bool, error) {
+	currentPath := observer.paths.CgroupCurrent
+	if currentPath == "" {
+		return false, nil
+	}
+	data, err := readBoundedProcFile(currentPath, 16<<10)
+	if err != nil {
+		return false, fmt.Errorf("observe current unified cgroup: %w", err)
+	}
+	logicalPath, err := parseUnifiedCgroupPath(string(data))
+	if err != nil {
+		return false, err
+	}
+	parent := filepath.Join(mountpoint, strings.TrimPrefix(logicalPath, "/"))
+	parentKill, parentErr := os.Stat(filepath.Join(parent, "cgroup.kill"))
+	if parentErr == nil && parentKill.Mode().IsRegular() {
+		probe, mkdirErr := os.MkdirTemp(parent, ".lanpanel-cgroup-probe-")
+		if mkdirErr != nil {
+			return false, fmt.Errorf("probe systemd cgroup delegation: %w", mkdirErr)
+		}
+		_ = os.Remove(probe)
+		return true, nil
+	}
+	if logicalPath != "/" {
+		if parentErr != nil && !errors.Is(parentErr, os.ErrNotExist) {
+			return false, fmt.Errorf("observe cgroup.kill: %w", parentErr)
+		}
+		return false, nil
+	}
+	probe, mkdirErr := os.MkdirTemp(parent, ".lanpanel-cgroup-probe-")
+	if mkdirErr != nil {
+		return false, fmt.Errorf("probe systemd cgroup delegation: %w", mkdirErr)
+	}
+	defer os.Remove(probe)
+	for _, name := range []string{"cgroup.kill", "cgroup.procs", "cgroup.events"} {
+		info, statErr := os.Stat(filepath.Join(probe, name))
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, fmt.Errorf("observe delegated cgroup control %s: %w", name, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			return false, fmt.Errorf("delegated cgroup control %s is not a regular file", name)
+		}
+	}
+	return true, nil
+}
+
+func parseUnifiedCgroupPath(data string) (string, error) {
+	path := ""
+	for _, line := range strings.Split(strings.TrimSpace(data), "\\n") {
+		if !strings.HasPrefix(line, "0::") {
+			continue
+		}
+		if path != "" {
+			return "", fmt.Errorf("unified cgroup identity duplicated")
+		}
+		path = strings.TrimPrefix(line, "0::")
+	}
+	if path == "" || filepath.Clean(path) != path || !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+		return "", fmt.Errorf("unified cgroup identity is invalid")
+	}
+	return path, nil
+}
+
 func (observer *LinuxObserver) readCgroupMode() (string, error) {
-	controllers, err := readBoundedProcFile(observer.paths.CgroupControllers, 1<<20)
-	if err == nil && len(strings.TrimSpace(string(controllers))) != 0 {
-		return "unified_v2", nil
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("observe unified cgroup v2 state: %w", err)
-	}
-	if observer.paths.CgroupHybridControllers != "" {
-		hybrid, hybridErr := readBoundedProcFile(observer.paths.CgroupHybridControllers, 1<<20)
-		if hybridErr == nil && len(strings.TrimSpace(string(hybrid))) != 0 {
-			return "hybrid_v2", nil
-		}
-		if hybridErr != nil && !errors.Is(hybridErr, os.ErrNotExist) {
-			return "", fmt.Errorf("observe hybrid cgroup v2 state: %w", hybridErr)
-		}
-	}
-	return "not_unified_v2", nil
+	_, _, mode, err := observer.observeCgroupTopology()
+	return mode, err
+}
+
+func boolIdentity(value bool) string {
+	return strconv.FormatBool(value)
 }
 
 func (observer *LinuxObserver) readPlatform() (PlatformInfo, error) {

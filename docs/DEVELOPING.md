@@ -84,22 +84,22 @@ make materialize-preview-dependencies \
 
 `materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
-每个支持的发行版家族都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。先运行只读检查：
+每个支持的发行版版本都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。目前目标矩阵是 Debian 12/13 和 Ubuntu 22.04/24.04；主机必须使用完整 unified cgroup v2、可用的 `cgroup.kill`，并支持 systemd `Delegate=`。先运行只读检查：
 
 ```sh
-make check-preview-profile-host PREVIEW_PROFILE_TARGET=debian
+make check-preview-profile-host PREVIEW_PROFILE_TARGET=debian-12
 ```
 
 然后在已完成依赖物化的环境中采集：
 
 ```sh
 make capture-preview-profile \
-  PREVIEW_PROFILE_ID=debian-amd64 \
-  PREVIEW_PROFILE_OUTPUT_DIR=release-inputs/profiles/debian-amd64 \
+  PREVIEW_PROFILE_ID=debian-12-amd64 \
+  PREVIEW_PROFILE_OUTPUT_DIR=release-inputs/profiles/debian-12-amd64 \
   PREVIEW_DEPENDENCY_INPUTS=dist/dependencies/dependency-inputs.json
 ```
 
-Ubuntu 主机使用 `PREVIEW_PROFILE_TARGET=ubuntu` 和 `PREVIEW_PROFILE_ID=ubuntu-amd64`。检查和采集会验证发行版、amd64、systemd、cgroup v2、APT/dpkg 以及必要软件包；采集命令只写入 Profile、软件包模板和依赖基线，不绑定某个 APT 镜像。生成结果必须人工审查后再提交。
+Debian 13 使用 `PREVIEW_PROFILE_TARGET=debian-13`、`PREVIEW_PROFILE_ID=debian-13-amd64`；Ubuntu 22.04/24.04 分别使用 `ubuntu-22.04`/`ubuntu-24.04` 和对应的 `*-amd64` Profile ID。检查和采集会验证精确发行版版本、amd64、systemd delegation、完整 unified cgroup v2、`cgroup.kill`、APT/dpkg 以及必要软件包；采集命令只写入 Profile、软件包模板和依赖基线，不绑定某个 APT 镜像。生成结果必须人工审查后再提交。
 
 ## 本地构建 Preview 发布包
 

@@ -47,7 +47,7 @@ func main() {
 	var output, profileID, dependencyPath string
 	var packageNames stringList
 	flag.StringVar(&output, "output", "", "output directory")
-	flag.StringVar(&profileID, "profile-id", "", "profile ID, for example debian-amd64")
+	flag.StringVar(&profileID, "profile-id", "", "profile ID, for example debian-12-amd64")
 	flag.StringVar(&dependencyPath, "dependency-inputs", "", "resolved dependency-inputs.json")
 	flag.Var(&packageNames, "package", "package to include; may be repeated")
 	flag.Parse()
@@ -71,8 +71,16 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	if runtime.GOARCH != "amd64" || !release.IsSupportedPreviewTarget(release.OSProfile{Family: platform.ID, Release: platform.VersionID, Architecture: runtime.GOARCH}) {
 		return fmt.Errorf("host %s/%s/%s is not a supported Debian or Ubuntu amd64 platform", platform.ID, platform.VersionID, runtime.GOARCH)
 	}
-	if profileID != platform.ID+"-"+runtime.GOARCH {
-		return fmt.Errorf("profile-id %q must identify the host family and architecture", profileID)
+	expectedProfileID := platform.ID + "-" + platform.VersionID + "-" + runtime.GOARCH
+	if profileID != expectedProfileID {
+		return fmt.Errorf("profile-id %q must identify the exact host release and architecture", profileID)
+	}
+	capabilities, err := preflight.ObserveHostCapabilities()
+	if err != nil {
+		return fmt.Errorf("observe managed host capabilities: %w", err)
+	}
+	if capabilities.CgroupMode != "unified_v2" || capabilities.CgroupMountpoint != "/sys/fs/cgroup" || capabilities.CgroupMountRoot != "/" || !capabilities.CgroupKillAvailable || !capabilities.SystemdDelegation.Available {
+		return fmt.Errorf("host lacks the required unified cgroup v2 and systemd delegation contract: mode=%s mountpoint=%s root=%s cgroup.kill=%t delegation=%s", capabilities.CgroupMode, capabilities.CgroupMountpoint, capabilities.CgroupMountRoot, capabilities.CgroupKillAvailable, capabilities.SystemdDelegation.Identity)
 	}
 	observation, err := preflight.ObserveBootstrapReadiness(context.Background())
 	if err != nil {

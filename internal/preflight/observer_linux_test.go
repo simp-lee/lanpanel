@@ -16,8 +16,13 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	root := t.TempDir()
 	osRelease := filepath.Join(root, "os-release")
 	kernelRelease := filepath.Join(root, "kernel-release")
-	cgroupControllers := filepath.Join(root, "cgroup.controllers")
+	cgroupMountpoint := filepath.Join(root, "cgroup")
+	cgroupSession := filepath.Join(cgroupMountpoint, "session.scope")
+	cgroupControllers := filepath.Join(cgroupMountpoint, "cgroup.controllers")
+	cgroupKill := filepath.Join(cgroupSession, "cgroup.kill")
+	cgroupMountInfo := filepath.Join(root, "mountinfo")
 	systemd := filepath.Join(root, "systemd")
+	systemdExecutable := filepath.Join(root, "systemd-bin")
 	apt := filepath.Join(root, "apt-get")
 	dpkg := filepath.Join(root, "dpkg")
 	tcp := filepath.Join(root, "tcp")
@@ -26,7 +31,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	udp6 := filepath.Join(root, "udp6")
 	managedParent := filepath.Join(root, "managed")
 	managed := filepath.Join(managedParent, "app")
-	for _, path := range []string{systemd, managedParent, managed} {
+	for _, path := range []string{systemd, cgroupMountpoint, cgroupSession, managedParent, managed} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -39,6 +44,12 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	write(osRelease, "ID=debian\nVERSION_ID=13\n", 0o644)
 	write(kernelRelease, "6.12.1-fixture\n", 0o644)
 	write(cgroupControllers, "cpu memory pids\n", 0o644)
+	write(cgroupKill, "", 0o200)
+	write(filepath.Join(cgroupSession, "cgroup.procs"), "", 0o600)
+	write(filepath.Join(cgroupSession, "cgroup.events"), "populated 0\n", 0o600)
+	write(cgroupMountInfo, "29 23 0:26 / "+cgroupMountpoint+" rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n", 0o644)
+	write(filepath.Join(root, "self-cgroup"), "0::/session.scope\n", 0o644)
+	write(systemdExecutable, "#!/bin/sh\necho systemd 257\n", 0o755)
 	write(apt, "fixture", 0o700)
 	write(dpkg, "fixture", 0o700)
 	write(tcp, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 101\n", 0o600)
@@ -50,7 +61,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 		t.Fatal(err)
 	}
 	now := time.Unix(1_700_000_000, 0).UTC()
-	observer := newTestLinuxObserver(LinuxPaths{OSRelease: osRelease, KernelRelease: kernelRelease, CgroupControllers: cgroupControllers, SystemdRoot: systemd, APTExecutable: apt, DPKGExecutable: dpkg, TCP: tcp, TCP6: tcp6, UDP: udp, UDP6: udp6}, func(context.Context) (PackageObservation, error) {
+	observer := newTestLinuxObserver(LinuxPaths{OSRelease: osRelease, KernelRelease: kernelRelease, CgroupControllers: cgroupControllers, CgroupMountpoint: cgroupMountpoint, CgroupMountInfo: cgroupMountInfo, CgroupCurrent: filepath.Join(root, "self-cgroup"), SystemdRoot: systemd, SystemdExecutable: systemdExecutable, APTExecutable: apt, DPKGExecutable: dpkg, TCP: tcp, TCP6: tcp6, UDP: udp, UDP6: udp6}, func(context.Context) (PackageObservation, error) {
 		return PackageObservation{Ready: true, Identity: "packages/ready", SystemdVersion: "257.1", NginxVersion: "1.26.0", PackageSnapshotDigest: "sha256:" + strings.Repeat("9", 64)}, nil
 	}, func() time.Time { return now })
 	request := expansionRequest(ExpansionBootstrap)
@@ -63,7 +74,7 @@ func TestLinuxObserverReadsWithoutMutationAndParsesExactSocketIdentity(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observed.Platform.ID != "debian" || observed.Platform.VersionID != "13" || observed.KernelRelease != "6.12.1-fixture" || observed.CgroupMode != "unified_v2" || len(observed.Listeners) != 2 || observed.Listeners[0].Port != 80 || observed.Listeners[0].SocketInode != 101 || observed.Listeners[1].Port != 3478 || observed.Listeners[1].SocketInode != 102 {
+	if observed.Platform.ID != "debian" || observed.Platform.VersionID != "13" || observed.KernelRelease != "6.12.1-fixture" || observed.CgroupMode != "unified_v2" || observed.CgroupMountpoint != cgroupMountpoint || observed.CgroupMountRoot != "/" || !observed.CgroupKillAvailable || !observed.SystemdDelegation.Available || len(observed.Listeners) != 2 || observed.Listeners[0].Port != 80 || observed.Listeners[0].SocketInode != 101 || observed.Listeners[1].Port != 3478 || observed.Listeners[1].SocketInode != 102 {
 		t.Fatalf("observed=%#v", observed)
 	}
 	after, err := treeSnapshot(root)
@@ -84,7 +95,7 @@ func TestVerifyInstalledProfileIgnoresPackageVersionsAndSnapshot(t *testing.T) {
 	}
 	observed := InstalledProfileObservation{
 		Architecture: runtime.GOARCH, Platform: PlatformInfo{ID: "debian", VersionID: "13"},
-		KernelRelease: "6.12.1", CgroupMode: "unified_v2",
+		KernelRelease: "6.12.1", CgroupMode: "unified_v2", CgroupMountpoint: "/sys/fs/cgroup", CgroupMountRoot: "/", CgroupKillAvailable: true, SystemdDelegation: ComponentObservation{Available: true, Identity: "systemd/257 Delegate=yes"},
 		Packages: PackageObservation{Ready: true, Identity: "package-observation", SystemdVersion: "1:257.8-1~deb13u1", NginxVersion: "1.26.3-3+deb13u1", PackageSnapshotDigest: digest},
 	}
 	if err := VerifyInstalledProfile(expected, observed); err != nil {
@@ -108,8 +119,18 @@ func TestVerifyInstalledProfileIgnoresPackageVersionsAndSnapshot(t *testing.T) {
 	}
 	candidate := observed
 	candidate.Platform.VersionID = "14"
-	if err := VerifyInstalledProfile(expected, candidate); err != nil {
-		t.Fatalf("OS release revision blocked family-level compatibility: %v", err)
+	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
+		t.Fatalf("OS version drift was not classified: %v", err)
+	}
+	candidate = observed
+	candidate.CgroupKillAvailable = false
+	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
+		t.Fatalf("missing cgroup.kill was not classified: %v", err)
+	}
+	candidate = observed
+	candidate.SystemdDelegation.Available = false
+	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
+		t.Fatalf("missing systemd delegation was not classified: %v", err)
 	}
 	candidate = observed
 	candidate.Platform.ID = "ubuntu"

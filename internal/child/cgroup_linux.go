@@ -64,6 +64,13 @@ func createInvocationCgroup(name string, pid int) (*invocationCgroup, error) {
 		removeErr := os.Remove(path)
 		return nil, errors.Join(cause, removeErr)
 	}
+	killInfo, err := os.Stat(filepath.Join(path, "cgroup.kill"))
+	if err != nil {
+		return cleanup(fmt.Errorf("child cgroup.kill is unavailable: %w", err))
+	}
+	if !killInfo.Mode().IsRegular() {
+		return cleanup(fmt.Errorf("child cgroup.kill is not a regular control file"))
+	}
 	processes, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
 	if err != nil || len(strings.Fields(string(processes))) != 0 {
 		return cleanup(fmt.Errorf("child cgroup is not empty: %w", err))

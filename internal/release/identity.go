@@ -25,13 +25,21 @@ const (
 	PreviewUbuntuFamily       = "ubuntu"
 )
 
-// IsSupportedPreviewTarget validates the supported platform family and
-// architecture. The release number is observed and reported, but is not a
-// release compatibility gate; package ranges and runtime probes decide that.
+// IsSupportedPreviewTarget validates the exact release matrix for the
+// unified-cgroup-v2 release contract. Unsupported or future releases must not
+// inherit a profile captured for another OS version.
 func IsSupportedPreviewTarget(profile OSProfile) bool {
-	return profile.Architecture == PreviewTargetArchitecture &&
-		(profile.Family == PreviewDebianFamily || profile.Family == PreviewUbuntuFamily) &&
-		osReleasePattern.MatchString(profile.Release)
+	if profile.Architecture != PreviewTargetArchitecture {
+		return false
+	}
+	switch profile.Family {
+	case PreviewDebianFamily:
+		return profile.Release == "12" || profile.Release == "13"
+	case PreviewUbuntuFamily:
+		return profile.Release == "22.04" || profile.Release == "24.04"
+	default:
+		return false
+	}
 }
 
 type InstallKind string
@@ -334,14 +342,14 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 		}
 	}
 	previousProfile := ""
-	seenFamilies := map[string]bool{}
+	seenTargets := map[string]bool{}
 	for _, profile := range manifest.SupportedProfiles {
-		familyKey := profile.Profile.Family + "/" + profile.Profile.Architecture
-		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenFamilies[familyKey] {
+		targetKey := profile.Profile.Family + "/" + profile.Profile.Release + "/" + profile.Profile.Architecture
+		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenTargets[targetKey] {
 			return fmt.Errorf("release manifest OS profile or profile asset authority is invalid")
 		}
 		previousProfile = profile.Profile.ID
-		seenFamilies[familyKey] = true
+		seenTargets[targetKey] = true
 	}
 	if err := validateSupportedPreviewFamilies(manifest.SupportedProfiles); err != nil {
 		return err

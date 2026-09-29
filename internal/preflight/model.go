@@ -202,6 +202,10 @@ type ExpansionObservations struct {
 	Architecture              string                `json:"architecture"`
 	KernelRelease             string                `json:"kernel_release"`
 	CgroupMode                string                `json:"cgroup_mode"`
+	CgroupMountpoint          string                `json:"cgroup_mountpoint"`
+	CgroupMountRoot           string                `json:"cgroup_mount_root"`
+	CgroupKillAvailable       bool                  `json:"cgroup_kill_available"`
+	SystemdDelegation         ComponentObservation  `json:"systemd_delegation"`
 	Platform                  PlatformInfo          `json:"platform"`
 	Clock                     ClockObservation      `json:"clock"`
 	ExecutorUID               uint32                `json:"executor_uid"`

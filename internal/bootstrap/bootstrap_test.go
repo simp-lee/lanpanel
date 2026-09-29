@@ -388,7 +388,7 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 		t.Fatal(err)
 	}
 	helperUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-helper.service")])
-	for _, required := range []string{"Type=notify", "NotifyAccess=main"} {
+	for _, required := range []string{"Type=notify", "NotifyAccess=main", "Delegate=yes"} {
 		if !strings.Contains(helperUnit, required) {
 			t.Fatalf("helper unit omitted %q: %s", required, helperUnit)
 		}

@@ -33,10 +33,12 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID != ""
+	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID == request.Profile.VersionID
 	add("os_profile", profileMatches, "exact authorized OS profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
-	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode
-	add("managed_confinement", confinementMatches, "unified cgroup mode required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode)
+	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode && observed.CgroupMountpoint == "/sys/fs/cgroup" && observed.CgroupMountRoot == "/"
+	add("managed_confinement", confinementMatches, "complete unified cgroup v2 topology required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode+"/"+observed.CgroupMountpoint+"/"+observed.CgroupMountRoot)
+	add("cgroup_kill", observed.CgroupKillAvailable, "cgroup.kill is required for proven child closure", boolIdentity(observed.CgroupKillAvailable))
+	add("systemd_delegation", observed.SystemdDelegation.Available, "systemd delegation is required for managed child cgroups", observed.SystemdDelegation.Identity)
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
 	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source)
 	add("root_executor", observed.ExecutorUID == 0, "actual mutation executor is root", strconv.FormatUint(uint64(observed.ExecutorUID), 10))

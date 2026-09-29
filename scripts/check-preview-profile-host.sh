@@ -2,10 +2,13 @@
 # Read-only qualification check for a Preview profile capture host.
 set -eu
 
-target=${1:-debian}
+target=${1:-debian-12}
 case "$target" in
-  debian|ubuntu) family=$target ;;
-  *) echo "usage: $0 [debian|ubuntu]" >&2; exit 2 ;;
+  debian-12) family=debian; version=12 ;;
+  debian-13) family=debian; version=13 ;;
+  ubuntu-22.04) family=ubuntu; version=22.04 ;;
+  ubuntu-24.04) family=ubuntu; version=24.04 ;;
+  *) echo "usage: $0 [debian-12|debian-13|ubuntu-22.04|ubuntu-24.04]" >&2; exit 2 ;;
 esac
 
 fail=0
@@ -23,11 +26,22 @@ check() {
 check_os() {
   [ -r /etc/os-release ] || return 1
   . /etc/os-release
-  [ "$ID" = "$family" ] && [ -n "$VERSION_ID" ]
+  [ "$ID" = "$family" ] && [ "$VERSION_ID" = "$version" ]
 }
 check_arch() { [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ] && [ "$(uname -m)" = x86_64 ]; }
 check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ]; }
-check_cgroup() { [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] && [ -r /sys/fs/cgroup/cgroup.controllers ]; }
+check_cgroup() {
+  [ "$(findmnt -rn -t cgroup2 -o TARGET,ROOT 2>/dev/null | awk '$1 == "/sys/fs/cgroup" && $2 == "/" { count++ } END { print count + 0 }')" = 1 ] || return 1
+  [ "$(findmnt -rn -t cgroup2 -o TARGET 2>/dev/null | wc -l)" = 1 ] || return 1
+  [ -s /sys/fs/cgroup/cgroup.controllers ] || return 1
+  self_cgroup=$(awk -F: '$1 == 0 { print $3 }' /proc/self/cgroup)
+  [ -n "$self_cgroup" ] && [ -f "/sys/fs/cgroup${self_cgroup}/cgroup.kill" ]
+}
+check_systemd_delegation() {
+  command -v systemd >/dev/null 2>&1 || return 1
+  major=$(systemd --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+  [ -n "$major" ] && [ "$major" -ge 218 ]
+}
 check_dpkg() { command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1 && [ -z "$(dpkg --audit 2>/dev/null)" ]; }
 check_packages() {
   for package in systemd nginx; do
@@ -48,10 +62,11 @@ check_distribution_sources() {
   grep -RhsE '^[[:space:]]*deb([[:space:]]|\[)|^[[:space:]]*Types:[[:space:]]*deb([[:space:]]|$)' $files 2>/dev/null | grep -q .
 }
 
-check "$target family" check_os
+check "$target exact OS release" check_os
 check 'amd64' check_arch
 check 'systemd available' check_systemd
-check 'unified cgroup v2' check_cgroup
+check 'complete unified cgroup v2 topology and cgroup.kill' check_cgroup
+check 'systemd Delegate= capability' check_systemd_delegation
 check 'dpkg healthy' check_dpkg
 check 'profile packages installed' check_packages
 check 'only selected distribution archive sources' check_distribution_sources
