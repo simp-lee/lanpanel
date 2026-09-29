@@ -77,7 +77,7 @@ func Render(profile Profile, resourceID, workingDirectory, environmentFile, fron
 	cgroup := "/lanpanel.slice/lanpanel-app.slice/lanpanel-app-" + short[:20] + ".slice/lanpanel-app-" + short[:20] + ".service"
 	directives := []string{
 		"NoNewPrivileges=yes", "AmbientCapabilities=cap_setuid cap_setgid cap_setpcap",
-		"PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid",
+		"PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "InaccessiblePaths=/proc",
 		"LockPersonality=yes", "RestrictRealtime=yes", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
 		"UMask=" + map[bool]string{true: "0117", false: "0077"}[backend != ""],
 		"TemporaryFileSystem=/run:ro", "InaccessiblePaths=/etc/lanpanel /var/lib/lanpanel/installation /var/lib/lanpanel/state /var/lib/lanpanel/safety /var/lib/lanpanel/ownership /var/lib/lanpanel/locks",

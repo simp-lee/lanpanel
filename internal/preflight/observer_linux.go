@@ -24,17 +24,18 @@ import (
 const maxOSReleaseBytes = 64 << 10
 
 type LinuxPaths struct {
-	OSRelease         string
-	KernelRelease     string
-	CgroupControllers string
-	SystemdRoot       string
-	SystemdPID1       string
-	APTExecutable     string
-	DPKGExecutable    string
-	TCP               string
-	TCP6              string
-	UDP               string
-	UDP6              string
+	OSRelease               string
+	KernelRelease           string
+	CgroupControllers       string
+	CgroupHybridControllers string
+	SystemdRoot             string
+	SystemdPID1             string
+	APTExecutable           string
+	DPKGExecutable          string
+	TCP                     string
+	TCP6                    string
+	UDP                     string
+	UDP6                    string
 }
 
 type LinuxObserver struct {
@@ -71,7 +72,7 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
 	}
-	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
+	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", CgroupHybridControllers: "/sys/fs/cgroup/unified/cgroup.controllers", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
 }
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
@@ -433,13 +434,22 @@ func observeSystemdPID1(path string) (ComponentObservation, error) {
 
 func (observer *LinuxObserver) readCgroupMode() (string, error) {
 	controllers, err := readBoundedProcFile(observer.paths.CgroupControllers, 1<<20)
-	if errors.Is(err, os.ErrNotExist) || err == nil && len(controllers) == 0 {
-		return "not_unified_v2", nil
+	if err == nil && len(strings.TrimSpace(string(controllers))) != 0 {
+		return "unified_v2", nil
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("observe unified cgroup v2 state: %w", err)
 	}
-	return "unified_v2", nil
+	if observer.paths.CgroupHybridControllers != "" {
+		hybrid, hybridErr := readBoundedProcFile(observer.paths.CgroupHybridControllers, 1<<20)
+		if hybridErr == nil && len(strings.TrimSpace(string(hybrid))) != 0 {
+			return "hybrid_v2", nil
+		}
+		if hybridErr != nil && !errors.Is(hybridErr, os.ErrNotExist) {
+			return "", fmt.Errorf("observe hybrid cgroup v2 state: %w", hybridErr)
+		}
+	}
+	return "not_unified_v2", nil
 }
 
 func (observer *LinuxObserver) readPlatform() (PlatformInfo, error) {

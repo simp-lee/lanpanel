@@ -201,6 +201,22 @@ func TestLinuxObserverRecordsNonUnifiedCgroupV2(t *testing.T) {
 	}
 }
 
+func TestLinuxObserverClassifiesHybridCgroupV2(t *testing.T) {
+	root := t.TempDir()
+	controllers := filepath.Join(root, "unified", "cgroup.controllers")
+	if err := os.MkdirAll(filepath.Dir(controllers), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(controllers, []byte("cpu memory pids\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observer := &LinuxObserver{paths: LinuxPaths{CgroupControllers: filepath.Join(root, "root", "cgroup.controllers"), CgroupHybridControllers: controllers}}
+	mode, err := observer.readCgroupMode()
+	if err != nil || mode != "hybrid_v2" {
+		t.Fatalf("mode=%q err=%v", mode, err)
+	}
+}
+
 func TestParseProcNetIncludesBoundUDPStates(t *testing.T) {
 	data := []byte("header\n0: 00000000:0D96 00000000:0000 01 0:0 0:0 0 0 0 55\n")
 	observed, err := parseProcNet(data, "udp", false)

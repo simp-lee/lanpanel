@@ -180,7 +180,7 @@ func (runtime *SystemdRuntime) show(ctx context.Context, invocation child.Invoca
 }
 
 func validateHeadscaleServiceProperties(properties map[string]string, rendered Rendered, account identity.AccountIdentity, state headscaleServiceExpectation, unitFileState string) error {
-	exact := map[string]string{"Id": "lanpanel-headscale.service", "LoadState": "loaded", "UnitFileState": unitFileState, "User": account.User, "Group": account.Group, "SupplementaryGroups": "", "NoNewPrivileges": "yes", "CapabilityBoundingSet": "", "AmbientCapabilities": "", "RestrictSUIDSGID": "yes", "PrivateNetwork": "yes", "PrivateTmp": "yes", "PrivateDevices": "yes", "RuntimeDirectory": "lanpanel/headscale", "RuntimeDirectoryMode": "0700", "ProtectSystem": "strict", "ProtectHome": "yes", "ProtectProc": "invisible", "ProcSubset": "pid", "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "LockPersonality": "yes", "MemoryDenyWriteExecute": "yes", "SystemCallArchitectures": "native", "UMask": "0077", "KillMode": "control-group", "FragmentPath": rendered.Candidate.Paths.Unit, "DropInPaths": ""}
+	exact := map[string]string{"Id": "lanpanel-headscale.service", "LoadState": "loaded", "UnitFileState": unitFileState, "User": account.User, "Group": account.Group, "SupplementaryGroups": "", "NoNewPrivileges": "yes", "CapabilityBoundingSet": "", "AmbientCapabilities": "", "RestrictSUIDSGID": "yes", "PrivateNetwork": "yes", "PrivateTmp": "yes", "PrivateDevices": "yes", "RuntimeDirectory": "lanpanel/headscale", "RuntimeDirectoryMode": "0700", "ProtectSystem": "strict", "ProtectHome": "yes", "InaccessiblePaths": "/proc", "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes", "ProtectControlGroups": "yes", "LockPersonality": "yes", "MemoryDenyWriteExecute": "yes", "SystemCallArchitectures": "native", "UMask": "0077", "KillMode": "control-group", "FragmentPath": rendered.Candidate.Paths.Unit, "DropInPaths": ""}
 	for key, expected := range exact {
 		if properties[key] != expected {
 			return fmt.Errorf("effective Headscale unit property %s changed", key)
@@ -228,12 +228,12 @@ func parseHeadscaleUnitProperties(raw []byte) (map[string]string, error) {
 		}
 		values[key] = value
 	}
-	for _, key := range []string{"Id", "LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID", "ControlGroup", "User", "Group", "SupplementaryGroups", "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictSUIDSGID", "PrivateNetwork", "PrivateTmp", "PrivateDevices", "RuntimeDirectory", "RuntimeDirectoryMode", "ProtectSystem", "ProtectHome", "ProtectProc", "ProcSubset", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups", "LockPersonality", "MemoryDenyWriteExecute", "SystemCallArchitectures", "RestrictAddressFamilies", "ReadWritePaths", "UMask", "KillMode", "ExecStart", "ExecStartPost", "FragmentPath", "DropInPaths"} {
+	for _, key := range []string{"Id", "LoadState", "ActiveState", "SubState", "UnitFileState", "MainPID", "ControlGroup", "User", "Group", "SupplementaryGroups", "NoNewPrivileges", "CapabilityBoundingSet", "AmbientCapabilities", "RestrictSUIDSGID", "PrivateNetwork", "PrivateTmp", "PrivateDevices", "RuntimeDirectory", "RuntimeDirectoryMode", "ProtectSystem", "ProtectHome", "InaccessiblePaths", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups", "LockPersonality", "MemoryDenyWriteExecute", "SystemCallArchitectures", "RestrictAddressFamilies", "ReadWritePaths", "UMask", "KillMode", "ExecStart", "ExecStartPost", "FragmentPath", "DropInPaths"} {
 		if _, present := values[key]; !present {
 			return nil, fmt.Errorf("effective Headscale unit property %s is missing", key)
 		}
 	}
-	if len(values) != 37 {
+	if len(values) != 36 {
 		return nil, fmt.Errorf("effective Headscale unit output contains unrequested properties")
 	}
 	return values, nil

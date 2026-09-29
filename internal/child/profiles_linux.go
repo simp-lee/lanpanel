@@ -335,13 +335,13 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		case ProfileHeadscaleStop:
 			profile.Arguments = []string{"stop", "lanpanel-headscale.service"}
 		case ProfileHeadscaleShow:
-			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,RuntimeDirectory,RuntimeDirectoryMode,ProtectSystem,ProtectHome", "--property=ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartPost,FragmentPath,DropInPaths", "lanpanel-headscale.service"}
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,RuntimeDirectory,RuntimeDirectoryMode,ProtectSystem,ProtectHome", "--property=InaccessiblePaths,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartPost,FragmentPath,DropInPaths", "lanpanel-headscale.service"}
 		case ProfileHeadscaleActivateStart:
 			profile.Arguments = []string{"start", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"}
 		case ProfileHeadscaleActivateStop:
 			profile.Arguments = []string{"stop", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service"}
 		case ProfileHeadscaleActivateShow:
-			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,PrivateNetwork,JoinsNamespaceOf,RestrictAddressFamilies,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictSUIDSGID,KillMode,Restart,ExecStart,Sockets,Listen,SocketMode,SocketUser,SocketGroup,RemoveOnStop,FreeBind,ReusePort,FragmentPath,DropInPaths", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service"}
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,PrivateNetwork,JoinsNamespaceOf,RestrictAddressFamilies,ProtectSystem,ProtectHome,InaccessiblePaths,ProtectKernelTunables,ProtectKernelModules,ProtectControlGroups,LockPersonality,MemoryDenyWriteExecute,SystemCallArchitectures,RestrictSUIDSGID,KillMode,Restart,ExecStart,Sockets,Listen,SocketMode,SocketUser,SocketGroup,RemoveOnStop,FreeBind,ReusePort,FragmentPath,DropInPaths", "lanpanel-headscale-control.socket", "lanpanel-headscale-control-relay.service", "lanpanel-headscale-stun.socket", "lanpanel-headscale-stun-relay.service"}
 		case ProfileHeadscaleBootEnable:
 			profile.Arguments = []string{"enable", "--now", "lanpanel-headscale.service", "lanpanel-headscale-control.socket", "lanpanel-headscale-stun.socket"}
 		case ProfileHeadscaleBootReconcile:
@@ -399,7 +399,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 				}
 			}
 		case ProfileGoAccessShow:
-			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,JoinsNamespaceOf,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartEx,Environment", "--property=Sockets,Service,Unit,FragmentPath,DropInPaths,Listen,SocketMode,SocketUser,SocketGroup,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,TimeoutStartUSec", "--property=Job", "lanpanel-goaccess-" + goaccessUnit + ".service", "lanpanel-goaccess-relay-" + goaccessUnit + ".service", "lanpanel-goaccess-" + goaccessUnit + ".socket", "lanpanel-goaccess-retention-" + goaccessUnit + ".timer", "lanpanel-goaccess-retention-" + goaccessUnit + ".service"}
+			profile.Arguments = []string{"show", "--property=Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ControlGroup,User,Group,SupplementaryGroups,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,PrivateNetwork,PrivateTmp,PrivateDevices,ProtectSystem,ProtectHome,InaccessiblePaths,JoinsNamespaceOf,RestrictAddressFamilies,ReadWritePaths,UMask,KillMode,ExecStart,ExecStartEx,Environment", "--property=Sockets,Service,Unit,FragmentPath,DropInPaths,Listen,SocketMode,SocketUser,SocketGroup,RuntimeDirectory,RuntimeDirectoryMode,RuntimeDirectoryPreserve,TimeoutStartUSec", "--property=Job", "lanpanel-goaccess-" + goaccessUnit + ".service", "lanpanel-goaccess-relay-" + goaccessUnit + ".service", "lanpanel-goaccess-" + goaccessUnit + ".socket", "lanpanel-goaccess-retention-" + goaccessUnit + ".timer", "lanpanel-goaccess-retention-" + goaccessUnit + ".service"}
 		case ProfileResourceDaemonReload:
 			profile.Arguments = []string{"daemon-reload"}
 		case ProfileResourceStart:
@@ -417,7 +417,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			if invocation.Resource.Relay {
 				unit = "lanpanel-relay-" + short + ".service"
 			}
-			profile.Arguments = []string{"show", "--property=ActiveState,SubState,MainPID,ControlGroup,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,IPAddressDeny,ProtectSystem,ProtectHome,ProtectProc,ProcSubset,PrivateTmp,PrivateDevices,LockPersonality,RestrictRealtime,RestrictAddressFamilies,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,InaccessiblePaths,UMask", unit}
+			profile.Arguments = []string{"show", "--property=ActiveState,SubState,MainPID,ControlGroup,User,Group,NoNewPrivileges,CapabilityBoundingSet,AmbientCapabilities,RestrictSUIDSGID,IPAddressDeny,ProtectSystem,ProtectHome,InaccessiblePaths,PrivateTmp,PrivateDevices,LockPersonality,RestrictRealtime,RestrictAddressFamilies,ReadWritePaths,ReadOnlyPaths,BindPaths,BindReadOnlyPaths,TemporaryFileSystem,UMask", unit}
 		}
 		profile.Complete = true
 		if err := validateProfile(profile); err != nil {

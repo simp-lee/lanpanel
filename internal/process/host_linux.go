@@ -543,7 +543,7 @@ func expectedRelayPolicy(resourceID string, relayUID, relayGID uint32) (confinem
 	}
 	short := strings.TrimPrefix(resourceID, "res_")[:20]
 	cgroup := "/system.slice/lanpanel-relay-" + short + ".service"
-	directives := []string{"ActiveState=active", "SubState=running", "User=" + fmt.Sprint(relayUID), "Group=" + fmt.Sprint(relayGID), "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "ProtectProc=invisible", "ProcSubset=pid", "RestrictAddressFamilies=AF_UNIX", "TemporaryFileSystem=/run:ro", "BindReadOnlyPaths=" + filepath.Dir(paths.BackendSocket) + ":/backend", "InaccessiblePaths=/proc", "UMask=0007"}
+	directives := []string{"ActiveState=active", "SubState=running", "User=" + fmt.Sprint(relayUID), "Group=" + fmt.Sprint(relayGID), "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectSystem=strict", "ProtectHome=yes", "InaccessiblePaths=/proc", "RestrictAddressFamilies=AF_UNIX", "TemporaryFileSystem=/run:ro", "BindReadOnlyPaths=" + filepath.Dir(paths.BackendSocket) + ":/backend", "UMask=0007"}
 	return confinement.RelayPolicy(resourceID, cgroup, directives)
 }
 

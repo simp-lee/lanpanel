@@ -2,6 +2,7 @@
 package main
 
 import (
+	"debug/elf"
 	"flag"
 	"fmt"
 	"io"
@@ -487,10 +488,34 @@ func ensureCleanTag(source, tag string) error {
 func buildBinary(source, output string) error {
 	command := exec.Command("go", "build", "-trimpath", "-o", output, "./cmd/lanpanel")
 	command.Dir = source
-	command.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
+	// Build the public Linux binary without CGO so one amd64 artifact does not
+	// inherit the builder's glibc baseline. The runtime already uses pure-Go
+	// implementations for its Linux dependencies, and a static binary is
+	// required for the supported Debian/Ubuntu release range.
+	command.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
 	command.Stdout, command.Stderr = io.Discard, os.Stderr
 	if err := command.Run(); err != nil {
 		return fmt.Errorf("build lanpanel: %w", err)
 	}
+	if err := verifyPortableLinuxBinary(output); err != nil {
+		return err
+	}
 	return os.Chmod(output, 0o755)
+}
+
+func verifyPortableLinuxBinary(path string) error {
+	file, err := elf.Open(path)
+	if err != nil {
+		return fmt.Errorf("inspect Linux binary: %w", err)
+	}
+	defer file.Close()
+	if file.Class != elf.ELFCLASS64 || file.Machine != elf.EM_X86_64 {
+		return fmt.Errorf("Linux binary is not amd64 ELF")
+	}
+	for _, program := range file.Progs {
+		if program.Type == elf.PT_INTERP {
+			return fmt.Errorf("Linux binary is dynamically linked; release builds must be static")
+		}
+	}
+	return nil
 }
