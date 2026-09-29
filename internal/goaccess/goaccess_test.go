@@ -35,7 +35,7 @@ func TestRenderUsesPrivateNetworkAndProtectedRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	service, relay, socket, retentionTimer := string(candidate.Service), string(candidate.Relay), string(candidate.Socket), string(candidate.RetentionTimer)
-	for _, required := range []string{"PrivateNetwork=yes", "--no-global-config", "--keep-db-files", "--addr=127.0.0.1", "--port=7890", "ExecStartPre=+/usr/lib/lanpanel/lanpanel goaccess-account-guard", "Environment=LANPANEL_INSTALLATION_ID=", "WantedBy=multi-user.target"} {
+	for _, required := range []string{"PrivateNetwork=yes", "--no-global-config", "--persist", "--restore", "--addr=127.0.0.1", "--port=7890", "ExecStartPre=+/usr/lib/lanpanel/lanpanel goaccess-account-guard", "Environment=LANPANEL_INSTALLATION_ID=", "WantedBy=multi-user.target"} {
 		if !strings.Contains(service, required) {
 			t.Fatalf("service missing %q", required)
 		}
