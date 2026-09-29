@@ -358,12 +358,22 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 }
 
 func validateSupportedPreviewFamilies(values []SupportedOSProfile) error {
-	seen := map[string]bool{}
-	for _, value := range values {
-		seen[value.Profile.Family+"/"+value.Profile.Architecture] = true
+	required := map[string]bool{
+		PreviewDebianFamily + "/12/" + PreviewTargetArchitecture:    false,
+		PreviewDebianFamily + "/13/" + PreviewTargetArchitecture:    false,
+		PreviewUbuntuFamily + "/22.04/" + PreviewTargetArchitecture: false,
+		PreviewUbuntuFamily + "/24.04/" + PreviewTargetArchitecture: false,
 	}
-	if !seen[PreviewDebianFamily+"/"+PreviewTargetArchitecture] || !seen[PreviewUbuntuFamily+"/"+PreviewTargetArchitecture] {
-		return fmt.Errorf("release manifest must include both Debian and Ubuntu amd64 profiles")
+	for _, value := range values {
+		key := value.Profile.Family + "/" + value.Profile.Release + "/" + value.Profile.Architecture
+		if _, expected := required[key]; expected {
+			required[key] = true
+		}
+	}
+	for target, present := range required {
+		if !present {
+			return fmt.Errorf("release manifest is missing supported OS profile %s", target)
+		}
 	}
 	return nil
 }

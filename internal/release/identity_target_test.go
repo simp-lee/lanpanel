@@ -2,15 +2,19 @@ package release
 
 import "testing"
 
-func TestValidateSupportedPreviewFamiliesRequiresBothFamilies(t *testing.T) {
-	profile := func(family string) SupportedOSProfile {
-		return SupportedOSProfile{Profile: OSProfile{Family: family, Architecture: PreviewTargetArchitecture}}
+func TestValidateSupportedPreviewFamiliesRequiresExactFourTargets(t *testing.T) {
+	profile := func(family, release string) SupportedOSProfile {
+		return SupportedOSProfile{Profile: OSProfile{Family: family, Release: release, Architecture: PreviewTargetArchitecture}}
 	}
-	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily)}); err == nil {
-		t.Fatal("Ubuntu-only release profile set was accepted")
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily, "24.04")}); err == nil {
+		t.Fatal("partial release profile set was accepted")
 	}
-	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewDebianFamily), profile(PreviewUbuntuFamily)}); err != nil {
-		t.Fatalf("complete Debian/Ubuntu profile set rejected: %v", err)
+	complete := []SupportedOSProfile{
+		profile(PreviewDebianFamily, "12"), profile(PreviewDebianFamily, "13"),
+		profile(PreviewUbuntuFamily, "22.04"), profile(PreviewUbuntuFamily, "24.04"),
+	}
+	if err := validateSupportedPreviewFamilies(complete); err != nil {
+		t.Fatalf("complete four-target profile set rejected: %v", err)
 	}
 }
 
