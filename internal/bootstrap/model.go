@@ -173,6 +173,7 @@ type Request struct {
 	SourceBinary       []byte
 	LegoBytes          []byte
 	TailscaleBytes     []byte
+	GoAccessBytes      []byte
 	HeadscaleBytes     []byte
 	Random             io.Reader
 	Now                func() time.Time

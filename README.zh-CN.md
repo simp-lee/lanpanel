@@ -63,12 +63,12 @@ sudo /tmp/lanpanel-bootstrap.sh install
 
 Bootstrap 会在受保护的临时目录中验证发布包 SHA-256，然后调用同一个 `install` 流程；不会把下载内容直接交给 Shell，也没有第三方下载源回退。系统软件包使用主机自己的、启用签名校验的 APT 镜像，请不要关闭仓库签名检查或使用 `--allow-unauthenticated`。
 
-### Nginx 和 GoAccess 软件包所有权
+### Nginx 软件包所有权与内置 GoAccess
 
 - 全新安装时，主机上不能已经安装或由其他服务控制 Nginx。LanPanel 会安装并接管 Nginx 软件包及其封闭式入口配置。
 - 如果已有完整的 LanPanel 安装并由它拥有 Nginx，中断的事务只会依据持久化 journal resume；再次执行同一个签名发布包是幂等的。LanPanel 自己拥有的软件包事务可以复用符合版本要求的 Nginx，也可以按主机 APT 策略升级它。
 - 如果发现外部 Nginx 软件包、监听器、站点或 systemd 权威，安装器会在修改软件包前拒绝继续。LanPanel 不会停止、覆盖、删除或接管它；请先处理外部安装，或使用已有的 LanPanel 安装。
-- GoAccess 在主机层面是可选的。若它已经安装、软件包状态正常且满足 profile 最低版本，LanPanel 会复用它；否则授权的 APT 事务可以安装或升级它。
+- GoAccess 作为固定版本的静态 amd64 二进制随签名发布包提供，安装到 `/usr/lib/lanpanel/dependencies/goaccess`。安装器不会安装、升级或卸载系统 GoAccess，也不会使用 `/usr/bin/goaccess`。
 
 ### 3. 打开管理界面
 

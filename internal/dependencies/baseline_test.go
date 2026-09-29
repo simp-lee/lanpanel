@@ -124,7 +124,7 @@ func testBaseline(cutoff time.Time) Baseline {
 	published := cutoff.Add(-time.Hour)
 	return Baseline{SchemaVersion: SchemaVersion, Cutoff: cutoff, Selections: []Selection{
 		selection("ca-certificates", SourceDistroRepository, "20230311", "ca-certificates=20230311@debian/bookworm-security", published),
-		selection("goaccess", SourceDistroRepository, "1.7-1", "goaccess=1.7-1@debian/bookworm", published),
+		selection("goaccess", SourceCanonicalArtifact, "1.12", "https://tar.goaccess.io/goaccess-1.12.tar.gz", published),
 		selection("headscale", SourceCanonicalArtifact, "0.25.1", "https://downloads.example.test/headscale-0.25.1", published),
 		selection("lego", SourceCanonicalArtifact, "4.25.2", "https://downloads.example.test/lego-4.25.2", published),
 		selection("nginx", SourceDistroRepository, "1.22.1-9", "nginx=1.22.1-9@debian/bookworm-security", published),

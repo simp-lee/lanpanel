@@ -52,7 +52,7 @@ func main() {
 	flag.Var(&packageNames, "package", "package to include; may be repeated")
 	flag.Parse()
 	if len(packageNames) == 0 {
-		packageNames = stringList{"goaccess", "nginx"}
+		packageNames = stringList{"nginx"}
 	}
 	if err := capture(output, profileID, dependencyPath, packageNames); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -89,6 +89,9 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 		return fmt.Errorf("package set omits required nginx")
 	}
 	for _, name := range packageNames {
+		if name == "goaccess" {
+			return fmt.Errorf("GoAccess is release-bundled and must not be captured as an APT package")
+		}
 		if seen[name] {
 			return fmt.Errorf("duplicate package %q", name)
 		}
@@ -155,8 +158,8 @@ func buildBaseline(dependencyPath string) (dependencies.Baseline, error) {
 		return dependencies.Baseline{}, fmt.Errorf("dependency inputs have unsupported schema %q", inputs.SchemaVersion)
 	}
 	cutoff := time.Now().UTC().Truncate(time.Second)
-	selections := make([]dependencies.Selection, 0, 3)
-	for _, name := range []string{"headscale", "lego", "tailscale"} {
+	selections := make([]dependencies.Selection, 0, 4)
+	for _, name := range []string{"goaccess", "headscale", "lego", "tailscale"} {
 		var dep release.DependencyInput
 		for _, candidate := range inputs.Dependencies {
 			if candidate.Name == name {
@@ -230,8 +233,6 @@ func packageMinimum(name string) string {
 	switch name {
 	case "nginx":
 		return "1.18.0"
-	case "goaccess":
-		return "1.7.0"
 	default:
 		return "0"
 	}

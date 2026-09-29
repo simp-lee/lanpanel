@@ -12,6 +12,7 @@ for tool in curl jq sha256sum tar gzip awk wc; do
 done
 mkdir -p -- "$output"
 output=$(CDPATH= cd -- "$output" && pwd -P)
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 if [ -n "$(find "$output" -mindepth 1 -print -quit)" ]; then
   echo "output directory must be empty: $output" >&2
   exit 1
@@ -84,22 +85,37 @@ tar --create --format=ustar --blocking-factor=20 --owner=0 --group=0 --numeric-o
   --mtime='UTC 1970-01-01' --directory="$work" --file="$work/headscale.tar" headscale
 gzip -n -c "$work/headscale.tar" > "$work/headscale.tar.gz"
 
+# GoAccess does not publish a portable binary asset. Pin the current stable
+# source release at build time, verify its official archive digest, and build
+# the release-owned binary in the controlled release environment.
+goaccess_version="${GOACCESS_VERSION:-1.12}"
+goaccess_source_url="https://tar.goaccess.io/goaccess-${goaccess_version}.tar.gz"
+goaccess_source_sha256="${GOACCESS_SOURCE_SHA256:-3aef5f6d5061decc6fc4946339b3a61b170bd256f80b4e861194b095df83ec86}"
+fetch "https://goaccess.io/download" "$work/goaccess-metadata"
+fetch "$goaccess_source_url" "$work/goaccess-source.tar.gz"
+printf '%s  %s\n' "$goaccess_source_sha256" "$work/goaccess-source.tar.gz" | sha256sum --check --status
+"$script_dir/build-goaccess.sh" "$work/goaccess-source.tar.gz" "$work/goaccess"
+
 jq -cjn \
   --arg lv "$lego_version" --arg lu "$lego_url" --arg lm "https://api.github.com/repos/go-acme/lego/releases/latest" --arg ld "$(sha256sum "$work/lego-release.json" | awk '{print $1}')" --arg lp "$(jq -er '.published_at' "$work/lego-release.json")" \
   --arg tv "$tailscale_version" --arg tu "$tailscale_url" --arg tm "$tailscale_member" --arg tmmeta "https://api.github.com/repos/tailscale/tailscale/releases/latest" --arg td "$(sha256sum "$work/tailscale-release.json" | awk '{print $1}')" --arg tp "$(jq -er '.published_at' "$work/tailscale-release.json")" \
   --arg hv "$headscale_version" --arg hu "$headscale_url" --arg hm "https://api.github.com/repos/juanfont/headscale/releases/latest" --arg hd "$(sha256sum "$work/headscale-release.json" | awk '{print $1}')" --arg hp "$(jq -er '.published_at' "$work/headscale-release.json")" \
+  --arg gv "$goaccess_version" --arg gu "$goaccess_source_url" --arg gm "https://goaccess.io/download" --arg gd "$(sha256sum "$work/goaccess-metadata" | awk '{print $1}')" --arg gp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --argjson ga "$(identity "$work/goaccess-source.tar.gz" goaccess-source.tar.gz)" \
+  --argjson ge "$(identity "$work/goaccess" goaccess)" \
   --argjson la "$(identity "$work/lego.tar.gz" lego.tar.gz)" \
   --argjson le "$(identity "$work/lego" lego)" \
   --argjson ta "$(identity "$work/tailscale.tar.gz" tailscale.tar.gz)" \
   --argjson te "$(identity "$work/tailscale" tailscale)" \
   --argjson ha "$(identity "$work/headscale.tar.gz" headscale.tar.gz)" \
   --argjson he "$(identity "$work/headscale" headscale)" \
-  '{schema_version:"lanpanel.dependency-inputs.v1",dependencies:[
+  '{schema_version:"lanpanel.dependency-inputs.v2",dependencies:[
     {name:"lego",version:$lv,metadata_source:$lm,metadata_digest:$ld,published_at:$lp,source:{url:$lu,format:"tar_gzip",asset:$la},archive:$la,executable:$le,member:"lego"},
     {name:"tailscale",version:$tv,metadata_source:$tmmeta,metadata_digest:$td,published_at:$tp,source:{url:$tu,format:"tar_gzip",asset:$ta},archive:$ta,executable:$te,member:$tm},
-    {name:"headscale",version:$hv,metadata_source:$hm,metadata_digest:$hd,published_at:$hp,source:{url:$hu,format:"executable",asset:$he},archive:$ha,executable:$he,member:"headscale"}
+    {name:"headscale",version:$hv,metadata_source:$hm,metadata_digest:$hd,published_at:$hp,source:{url:$hu,format:"executable",asset:$he},archive:$ha,executable:$he,member:"headscale"},
+    {name:"goaccess",version:$gv,metadata_source:$gm,metadata_digest:$gd,published_at:$gp,source:{url:$gu,format:"source_tar_gzip",asset:$ga},archive:{path:"",sha256:"",bytes:0},executable:$ge,member:"goaccess"}
   ]}' > "$work/dependency-inputs.json"
-for file in lego.tar.gz lego tailscale.tar.gz tailscale headscale.tar.gz headscale dependency-inputs.json; do
+for file in lego.tar.gz lego tailscale.tar.gz tailscale headscale.tar.gz headscale goaccess dependency-inputs.json; do
   mv -- "$work/$file" "$output/$file"
 done
 printf 'Verified dependency assets and lock: %s/dependency-inputs.json\n' "$output"

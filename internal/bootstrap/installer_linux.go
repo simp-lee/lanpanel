@@ -77,6 +77,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if len(request.TailscaleBytes) == 0 || uint64(len(request.TailscaleBytes)) != releaseIdentity.Tailscale.Bytes || digestBytes(request.TailscaleBytes) != releaseIdentity.Tailscale.Digest {
 		return fmt.Errorf("selected Tailscale bytes differ from release authority")
 	}
+	if len(request.GoAccessBytes) == 0 || uint64(len(request.GoAccessBytes)) != releaseIdentity.GoAccess.Bytes || digestBytes(request.GoAccessBytes) != releaseIdentity.GoAccess.Digest {
+		return fmt.Errorf("selected GoAccess bytes differ from release authority")
+	}
 	if len(request.HeadscaleBytes) == 0 || uint64(len(request.HeadscaleBytes)) != releaseIdentity.Headscale.Archive.Bytes || digestBytes(request.HeadscaleBytes) != releaseIdentity.Headscale.Archive.Digest {
 		return fmt.Errorf("selected Headscale archive bytes differ from release authority")
 	}
@@ -314,7 +317,7 @@ func tarMemberPhysicalBytes(size uint64) int64 {
 }
 
 func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Request) error {
-	if journal == nil || release.ValidateInstallIdentity(journal.Release) != nil || len(request.HeadscaleBytes) == 0 {
+	if journal == nil || release.ValidateInstallIdentity(journal.Release) != nil || len(request.HeadscaleBytes) == 0 || len(request.GoAccessBytes) == 0 {
 		return fmt.Errorf("fixed runtime asset authority is incomplete")
 	}
 	authority := journal.Release.Headscale
@@ -355,6 +358,10 @@ func installFixedRuntimeAssets(ctx context.Context, journal *Journal, request Re
 		return err
 	}
 	journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/tailscale"] = journal.Release.Tailscale.Digest
+	if err := putOrVerifyTargetFile(ctx, "/usr/lib/lanpanel/dependencies/goaccess", request.GoAccessBytes, 0o755); err != nil {
+		return err
+	}
+	journal.ArtifactDigests["/usr/lib/lanpanel/dependencies/goaccess"] = journal.Release.GoAccess.Digest
 	return nil
 }
 

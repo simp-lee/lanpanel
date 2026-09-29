@@ -94,11 +94,14 @@ func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
 	fixture.Release.Binary.Digest = release.DigestBytes(sourceBinary)
 	lego := []byte("real-lifecycle-lego")
 	tailscale := []byte("real-lifecycle-tailscale")
+	goaccess := []byte("real-lifecycle-goaccess")
 	headscale, member := lifecycleHeadscaleArchive(t)
 	fixture.Release.Lego.Bytes = uint64(len(lego))
 	fixture.Release.Lego.Digest = release.DigestBytes(lego)
 	fixture.Release.Tailscale.Bytes = uint64(len(tailscale))
 	fixture.Release.Tailscale.Digest = release.DigestBytes(tailscale)
+	fixture.Release.GoAccess.Bytes = uint64(len(goaccess))
+	fixture.Release.GoAccess.Digest = release.DigestBytes(goaccess)
 	fixture.Release.Headscale.Archive.Bytes = uint64(len(headscale))
 	fixture.Release.Headscale.Archive.Digest = release.DigestBytes(headscale)
 	fixture.Release.Headscale.Members[0].Mode = 0o755
@@ -111,7 +114,7 @@ func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request := installerFixtureRequest(t, fixture, material, sourceBinary, lego, tailscale, headscale, paths)
+	request := installerFixtureRequest(t, fixture, material, sourceBinary, lego, tailscale, goaccess, headscale, paths)
 	if err := install(context.Background(), request, false); err != nil {
 		phase := "unknown"
 		if store, journal, readErr := openJournal(paths.Journal, 0, 0); readErr == nil {
@@ -225,7 +228,7 @@ func prepareLifecycleNamespace(t *testing.T) {
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-func installerFixtureRequest(t *testing.T, fixture Journal, material identity.Material, sourceBinary, lego, tailscale, headscale []byte, paths Paths) Request {
+func installerFixtureRequest(t *testing.T, fixture Journal, material identity.Material, sourceBinary, lego, tailscale, goaccess, headscale []byte, paths Paths) Request {
 	t.Helper()
 	request := installerPreflightRequest(fixture.Release, material.Authority, material.SafetyGeneration)
 	requestDigest, err := preflight.ExpansionRequestDigest(request)
@@ -249,7 +252,7 @@ func installerFixtureRequest(t *testing.T, fixture Journal, material identity.Ma
 		return request, result, nil
 	}, PackagePlan: plan, PackagePreflight: result, PackageTransaction: func(context.Context, packages.Plan, preflight.Result) (packages.Journal, error) {
 		return packages.Journal{SchemaVersion: packages.PackageJournalSchemaVersion, TransactionID: plan.TransactionID, NormalJournalID: "package-" + plan.TransactionID, ChildID: "package-child-" + plan.TransactionID, JobID: plan.JobID, PlanDigest: mustPlanDigest(plan), AuthorityDigest: strings.Repeat("a", 64), PackageProfile: child.ProfileAPTTransaction, Phase: packages.JournalCleaned, Masks: []packages.MaskIdentity{}, MasksComplete: true, ChildResultDigest: strings.Repeat("b", 64), ChildSucceeded: true, PostconditionDigest: strings.Repeat("c", 64)}, nil
-	}, SourceBinary: sourceBinary, LegoBytes: lego, TailscaleBytes: tailscale, HeadscaleBytes: headscale, Random: bytes.NewReader(bytes.Repeat([]byte{0x52}, 8192)), Now: func() time.Time { return now }, Paths: paths, Output: io.Discard}
+	}, SourceBinary: sourceBinary, LegoBytes: lego, TailscaleBytes: tailscale, GoAccessBytes: goaccess, HeadscaleBytes: headscale, Random: bytes.NewReader(bytes.Repeat([]byte{0x52}, 8192)), Now: func() time.Time { return now }, Paths: paths, Output: io.Discard}
 }
 
 func authorityForFixture(value release.InstallIdentity) *release.InstallAuthority {

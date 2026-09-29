@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const ReleaseManifestSchemaVersion = "lanpanel.release.v6"
+const ReleaseManifestSchemaVersion = "lanpanel.release.v7"
 
 const (
 	ReleaseSignaturePath  = "release.json.sig"
@@ -317,7 +317,7 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || manifest.KnownLimitations.Path != "README.md" || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
 		return fmt.Errorf("release manifest asset authority is invalid")
 	}
-	requiredAdditional := map[string]bool{"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false}
+	requiredAdditional := map[string]bool{"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false, "goaccess": false}
 	seenAdditional := map[string]bool{}
 	for _, asset := range manifest.AdditionalAssets {
 		if validateAsset(asset) != nil || asset.Path == "release.json" || asset.Path == ReleaseSignaturePath || asset.Path == manifest.Checksums.Path || seenAdditional[asset.Path] {

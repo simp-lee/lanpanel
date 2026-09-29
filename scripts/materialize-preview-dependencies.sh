@@ -15,8 +15,9 @@ done
 [ -f "$lock" ] || { echo "dependency lock is missing: $lock" >&2; exit 1; }
 mkdir -p -- "$output"
 output=$(CDPATH= cd -- "$output" && pwd -P)
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 [ -z "$(find "$output" -mindepth 1 -print -quit)" ] || { echo "output directory must be empty: $output" >&2; exit 1; }
-jq -e '.schema_version == "lanpanel.dependency-inputs.v1" and (.dependencies | length == 3)' "$lock" >/dev/null
+jq -e '.schema_version == "lanpanel.dependency-inputs.v2" and (.dependencies | length == 4)' "$lock" >/dev/null
 
 fetch() {
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
@@ -27,14 +28,23 @@ verify() {
   printf '%s  %s\n' "$2" "$1" | sha256sum --check --status
 }
 
-for name in lego tailscale headscale; do
+for name in lego tailscale headscale goaccess; do
   source_url=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .source.url' "$lock")
-  archive_path=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .archive.path' "$lock")
-  archive_digest=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .archive.sha256' "$lock")
+  archive_path=$(jq -r --arg name "$name" '.dependencies[] | select(.name == $name) | .archive.path' "$lock")
+  archive_digest=$(jq -r --arg name "$name" '.dependencies[] | select(.name == $name) | .archive.sha256' "$lock")
+  source_path=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .source.asset.path' "$lock")
+  source_digest=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .source.asset.sha256' "$lock")
   executable_path=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.path' "$lock")
   executable_digest=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.sha256' "$lock")
   member=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .member' "$lock")
   case "$name" in
+    goaccess)
+      fetch "$source_url" "$output/$source_path"
+      verify "$output/$source_path" "$source_digest"
+      "$script_dir/build-goaccess.sh" "$output/$source_path" "$output/$executable_path"
+      verify "$output/$executable_path" "$executable_digest"
+      rm -f "$output/$source_path"
+      ;;
     headscale)
       fetch "$source_url" "$output/$executable_path"
       verify "$output/$executable_path" "$executable_digest"

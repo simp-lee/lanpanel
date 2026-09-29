@@ -13,16 +13,19 @@ import (
 // verifies bytes and versions needed to install and run the product; it is not
 // a Preview dependency identity, not a release audit report.
 type DependencyAuthority struct {
-	SchemaVersion        string                     `json:"schema_version"`
-	ProfileID            string                     `json:"profile_id"`
-	DependencyBaseline   AssetIdentity              `json:"dependency_baseline"`
-	Headscale            HeadscaleArtifactAuthority `json:"headscale"`
-	LegoVersion          string                     `json:"lego_version"`
-	LegoArtifactIdentity string                     `json:"lego_artifact_identity"`
-	LegoArchive          AssetIdentity              `json:"lego_archive"`
-	LegoMembers          []ArchiveMemberAuthority   `json:"lego_members"`
-	Lego                 AssetIdentity              `json:"lego"`
-	Tailscale            ClientArtifactAuthority    `json:"tailscale"`
+	SchemaVersion            string                     `json:"schema_version"`
+	ProfileID                string                     `json:"profile_id"`
+	DependencyBaseline       AssetIdentity              `json:"dependency_baseline"`
+	Headscale                HeadscaleArtifactAuthority `json:"headscale"`
+	LegoVersion              string                     `json:"lego_version"`
+	LegoArtifactIdentity     string                     `json:"lego_artifact_identity"`
+	LegoArchive              AssetIdentity              `json:"lego_archive"`
+	LegoMembers              []ArchiveMemberAuthority   `json:"lego_members"`
+	Lego                     AssetIdentity              `json:"lego"`
+	Tailscale                ClientArtifactAuthority    `json:"tailscale"`
+	GoAccessVersion          string                     `json:"goaccess_version"`
+	GoAccessArtifactIdentity string                     `json:"goaccess_artifact_identity"`
+	GoAccess                 AssetIdentity              `json:"goaccess"`
 }
 
 type InstallAuthority struct{ identity InstallIdentity }
@@ -42,6 +45,8 @@ type InstallIdentity struct {
 	Lego                     AssetIdentity              `json:"lego"`
 	Tailscale                AssetIdentity              `json:"tailscale"`
 	TailscaleVersion         string                     `json:"tailscale_version"`
+	GoAccess                 AssetIdentity              `json:"goaccess"`
+	GoAccessVersion          string                     `json:"goaccess_version"`
 }
 
 func (authority *InstallAuthority) Identity() InstallIdentity {
@@ -115,7 +120,7 @@ func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseM
 	if dependencyAuthority.DependencyBaseline != selected.DependencyBaseline {
 		return nil, fmt.Errorf("selected profile dependency baseline differs from its dependency manifest")
 	}
-	for _, asset := range []AssetIdentity{dependencyAuthority.DependencyBaseline, dependencyAuthority.LegoArchive, dependencyAuthority.Lego, dependencyAuthority.Tailscale.Archive} {
+	for _, asset := range []AssetIdentity{dependencyAuthority.DependencyBaseline, dependencyAuthority.LegoArchive, dependencyAuthority.Lego, dependencyAuthority.Tailscale.Archive, dependencyAuthority.GoAccess} {
 		data, present := assets[asset.Path]
 		if !present || uint64(len(data)) != asset.Bytes || DigestBytes(data) != asset.Digest {
 			return nil, fmt.Errorf("dependency asset %q is missing or mismatched", asset.Path)
@@ -141,6 +146,7 @@ func VerifyPublicInstallAuthority(expectedReleaseManifestDigest string, releaseM
 		DependencyBaseline: dependencyAuthority.DependencyBaseline, DependencyManifestDigest: selected.DependencyManifest.Digest,
 		Headscale: cloneHeadscaleAuthority(dependencyAuthority.Headscale), Lego: dependencyAuthority.Lego,
 		Tailscale: findClientExecutable(dependencyAuthority.Tailscale), TailscaleVersion: dependencyAuthority.Tailscale.Version,
+		GoAccess: dependencyAuthority.GoAccess, GoAccessVersion: dependencyAuthority.GoAccessVersion,
 	}
 	if err := ValidateInstallIdentity(identity); err != nil {
 		return nil, err
@@ -185,14 +191,14 @@ func decodeDependencyAuthority(data []byte, expectedDigest, profileID string) (D
 	if err := DecodeCanonical(data, &authority); err != nil {
 		return DependencyAuthority{}, err
 	}
-	if authority.SchemaVersion != "lanpanel.dependency-authority.v1" || authority.ProfileID != profileID || !concreteVersionPattern.MatchString(authority.LegoVersion) || !canonicalArtifactURL(authority.LegoArtifactIdentity) || validateAsset(authority.DependencyBaseline) != nil || !strings.HasPrefix(authority.DependencyBaseline.Path, "dependency-baseline-") || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.LegoArchive) != nil || authority.LegoArchive.Path != "lego.tar.gz" || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || len(authority.LegoMembers) != 1 || authority.LegoMembers[0].Path != "lego" || authority.LegoMembers[0].Destination != "/usr/lib/lanpanel/dependencies/lego" || authority.LegoMembers[0].Mode != 0o755 || authority.LegoMembers[0].Asset != authority.Lego || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil || authority.Tailscale.Archive.Path != "tailscale.tar.gz" {
+	if authority.SchemaVersion != "lanpanel.dependency-authority.v2" || authority.ProfileID != profileID || !concreteVersionPattern.MatchString(authority.LegoVersion) || !canonicalArtifactURL(authority.LegoArtifactIdentity) || validateAsset(authority.DependencyBaseline) != nil || !strings.HasPrefix(authority.DependencyBaseline.Path, "dependency-baseline-") || validateHeadscaleAuthority(authority.Headscale) != nil || validateAsset(authority.LegoArchive) != nil || authority.LegoArchive.Path != "lego.tar.gz" || validateAsset(authority.Lego) != nil || authority.Lego.Path != "lego" || len(authority.LegoMembers) != 1 || authority.LegoMembers[0].Path != "lego" || authority.LegoMembers[0].Destination != "/usr/lib/lanpanel/dependencies/lego" || authority.LegoMembers[0].Mode != 0o755 || authority.LegoMembers[0].Asset != authority.Lego || validateClientArtifactAuthority(authority.Tailscale, "tailscale", "/usr/lib/lanpanel/dependencies/tailscale") != nil || authority.Tailscale.Archive.Path != "tailscale.tar.gz" || !concreteVersionPattern.MatchString(authority.GoAccessVersion) || !canonicalArtifactURL(authority.GoAccessArtifactIdentity) || validateAsset(authority.GoAccess) != nil || authority.GoAccess.Path != "goaccess" {
 		return DependencyAuthority{}, fmt.Errorf("dependency manifest is invalid")
 	}
 	return authority, nil
 }
 
 func ValidateInstallIdentity(value InstallIdentity) error {
-	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !IsSupportedPreviewTarget(value.Profile) || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" {
+	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !IsSupportedPreviewTarget(value.Profile) || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" || validateAsset(value.GoAccess) != nil || value.GoAccess.Path != "goaccess" || !concreteVersionPattern.MatchString(value.GoAccessVersion) {
 		return fmt.Errorf("installation release identity is invalid")
 	}
 	profileDigest, err := ProfileDigest(value.Profile)

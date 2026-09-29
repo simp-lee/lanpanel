@@ -65,7 +65,7 @@ make playwright-fixture-gate
 
 ## 依赖和主机 Profile
 
-第三方依赖为 Lego、Tailscale 和 Headscale。`release-inputs/dependency-inputs.v1.json` 是经过审查的版本锁定文件；`dist/dependencies/` 是下载和解包目录，必须保持为空后再执行相关命令。
+第三方依赖为 GoAccess、Lego、Tailscale 和 Headscale。GoAccess 在 release 构建阶段从固定的官方源码版本编译为静态 amd64 二进制，不使用主机 APT 中的 GoAccess。`release-inputs/dependency-inputs.v2.json` 是经过审查的版本锁定文件；`dist/dependencies/` 是下载和解包目录，必须保持为空后再执行相关命令。
 
 只有明确要升级依赖时，才查询上游最新稳定版本：
 
@@ -74,15 +74,15 @@ make resolve-preview-dependencies \
   PREVIEW_DEPENDENCY_DIR="$PWD/dist/dependencies"
 ```
 
-审查生成的 `dependency-inputs.json` 后，将确认的结果更新到 `release-inputs/dependency-inputs.v1.json`。普通代码发布不要执行这一步。使用已审查的锁定结果时：
+审查生成的 `dependency-inputs.json` 后，将确认的结果更新到 `release-inputs/dependency-inputs.v2.json`。普通代码发布不要执行这一步。使用已审查的锁定结果时：
 
 ```sh
 make materialize-preview-dependencies \
-  PREVIEW_DEPENDENCY_LOCK="$PWD/release-inputs/dependency-inputs.v1.json" \
+  PREVIEW_DEPENDENCY_LOCK="$PWD/release-inputs/dependency-inputs.v2.json" \
   PREVIEW_DEPENDENCY_DIR="$PWD/dist/dependencies"
 ```
 
-`materialize` 只下载锁定的 URL 并验证大小和 SHA-256，不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
+`materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
 每个支持的发行版家族都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。先运行只读检查：
 

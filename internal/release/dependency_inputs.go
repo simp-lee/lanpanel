@@ -2,7 +2,7 @@ package release
 
 import "time"
 
-const DependencyInputsSchemaVersion = "lanpanel.dependency-inputs.v1"
+const DependencyInputsSchemaVersion = "lanpanel.dependency-inputs.v2"
 
 // DependencyInputAsset is an asset identity in the resolved dependency lock.
 type DependencyInputAsset struct {
@@ -18,8 +18,10 @@ type DependencyInputSource struct {
 	Asset  DependencyInputAsset `json:"asset"`
 }
 
-// DependencyInput is the complete v1 dependency lock entry shared by release
-// building and profile capture.
+// DependencyInput is the complete v2 dependency lock entry shared by release
+// building and profile capture. GoAccess is represented by an executable-only
+// entry; its Archive identity is intentionally empty because the release
+// carries the release-builder-produced binary.
 type DependencyInput struct {
 	Name           string                `json:"name"`
 	Version        string                `json:"version"`

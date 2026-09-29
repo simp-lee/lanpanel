@@ -139,12 +139,16 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if !present || release.DigestBytes(tailscaleBytes) != identityValue.Tailscale.Digest || uint64(len(tailscaleBytes)) != identityValue.Tailscale.Bytes {
 		return fmt.Errorf("selected Tailscale asset missing or mismatched")
 	}
+	goaccessBytes, present := assets[identityValue.GoAccess.Path]
+	if !present || release.DigestBytes(goaccessBytes) != identityValue.GoAccess.Digest || uint64(len(goaccessBytes)) != identityValue.GoAccess.Bytes {
+		return fmt.Errorf("selected GoAccess asset missing or mismatched")
+	}
 	installerInput := append([]byte(nil), data...)
 	headscaleBytes, present := assets[identityValue.Headscale.Archive.Path]
 	if !present || release.DigestBytes(headscaleBytes) != identityValue.Headscale.Archive.Digest || uint64(len(headscaleBytes)) != identityValue.Headscale.Archive.Bytes {
 		return fmt.Errorf("selected Headscale archive is missing or mismatched")
 	}
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 
 func rebindPublicInstallerInput(data []byte, plan packages.Plan, result preflight.Result) ([]byte, error) {

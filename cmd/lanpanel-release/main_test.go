@@ -6,7 +6,7 @@ import (
 )
 
 func TestRepositoryDependencyLockIsCanonical(t *testing.T) {
-	value, err := readCanonical(filepath.Join("..", "..", "release-inputs", "dependency-inputs.v1.json"), &dependencyInputs{})
+	value, err := readCanonical(filepath.Join("..", "..", "release-inputs", "dependency-inputs.v2.json"), &dependencyInputs{})
 	if err != nil {
 		t.Fatalf("repository dependency lock is not canonical: %v", err)
 	}

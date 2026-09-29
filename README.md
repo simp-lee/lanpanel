@@ -63,12 +63,12 @@ sudo /tmp/lanpanel-bootstrap.sh install
 
 Bootstrap verifies the release archive's SHA-256 in a protected temporary directory and then invokes the same `install` flow. It does not pipe downloaded content to a shell and has no third-party download fallback. System packages still come from the host's own APT mirror with signature verification enabled; do not disable repository signature checks or use `--allow-unauthenticated`.
 
-### Nginx and GoAccess package ownership
+### Nginx package ownership and bundled GoAccess
 
 - On a fresh installation, Nginx must not already be installed or controlled by another service. LanPanel installs and owns the Nginx package and its closed ingress configuration.
 - If an exact LanPanel installation already owns Nginx, an interrupted transaction resumes only from its durable journal. Replaying the same signed release is idempotent; an internal LanPanel-owned package transaction may reuse a qualifying Nginx version or upgrade it through the host APT policy.
 - A foreign Nginx package, listener, site, or systemd authority is rejected before package mutation. LanPanel does not stop it, overwrite its configuration, remove it, or adopt its package ownership. Remove the foreign installation or use the existing LanPanel installation instead.
-- GoAccess is optional at the host level. If it is already installed, healthy, and meets the selected profile's minimum version, LanPanel reuses it; otherwise the authorized APT transaction may install or upgrade it.
+- GoAccess is carried in the signed release as a fixed amd64 binary at `/usr/lib/lanpanel/dependencies/goaccess`. The installer never installs, upgrades, or removes a system GoAccess package and never uses `/usr/bin/goaccess`.
 
 ### 3. Open the Management UI
 

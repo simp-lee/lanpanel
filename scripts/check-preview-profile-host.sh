@@ -30,7 +30,7 @@ check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = s
 check_cgroup() { [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] && [ -r /sys/fs/cgroup/cgroup.controllers ]; }
 check_dpkg() { command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1 && [ -z "$(dpkg --audit 2>/dev/null)" ]; }
 check_packages() {
-  for package in systemd nginx goaccess; do
+  for package in systemd nginx; do
     if ! dpkg-query -W -f='${db:Status-Status} ${Version}\n' "$package" 2>/dev/null | grep -q '^installed '; then
       return 1
     fi

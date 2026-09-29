@@ -65,7 +65,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 		return fmt.Errorf("dependency inputs: %w", err)
 	}
 	resolved := inputs.(dependencyInputs)
-	if resolved.SchemaVersion != release.DependencyInputsSchemaVersion || len(resolved.Dependencies) != 3 {
+	if resolved.SchemaVersion != release.DependencyInputsSchemaVersion || len(resolved.Dependencies) != 4 {
 		return fmt.Errorf("dependency inputs are incomplete")
 	}
 	manifestValue, err := readCanonical(manifestPath, &release.ReleaseManifest{})
@@ -76,7 +76,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	manifest.ReleaseTag = tag
 	// The user-facing README is also the release limitation document.
 	manifest.KnownLimitations.Path = "README.md"
-	dependency := release.DependencyAuthority{SchemaVersion: "lanpanel.dependency-authority.v1"}
+	dependency := release.DependencyAuthority{SchemaVersion: "lanpanel.dependency-authority.v2"}
 	if dependencyPath != "" {
 		dependencyValue, err := readCanonical(dependencyPath, &release.DependencyAuthority{})
 		if err != nil {
@@ -84,6 +84,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 		}
 		dependency = dependencyValue.(release.DependencyAuthority)
 	}
+	dependency.SchemaVersion = "lanpanel.dependency-authority.v2"
 	if err := validateDependencies(resolved); err != nil {
 		return err
 	}
@@ -155,15 +156,25 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	}
 	for _, dep := range resolved.Dependencies {
 		for _, asset := range []inputAsset{dep.Archive, dep.Executable} {
+			if asset.Path == "" {
+				continue
+			}
 			if err := copyVerified(filepath.Join(filepath.Dir(inputsPath), filepath.FromSlash(asset.Path)), filepath.Join(tmp, filepath.FromSlash(asset.Path)), asset, 0o644); err != nil {
 				return err
 			}
 		}
 	}
 
-	lego, tailscale, headscale := resolved.Dependencies[0], resolved.Dependencies[1], resolved.Dependencies[2]
-	if lego.Name != "lego" || tailscale.Name != "tailscale" || headscale.Name != "headscale" {
-		return fmt.Errorf("dependency inputs must be ordered lego, tailscale, headscale")
+	byName := make(map[string]dependencyInput, len(resolved.Dependencies))
+	for _, dep := range resolved.Dependencies {
+		byName[dep.Name] = dep
+	}
+	lego, legoOK := byName["lego"]
+	tailscale, tailscaleOK := byName["tailscale"]
+	headscale, headscaleOK := byName["headscale"]
+	goaccess, goaccessOK := byName["goaccess"]
+	if !legoOK || !tailscaleOK || !headscaleOK || !goaccessOK {
+		return fmt.Errorf("dependency inputs must contain lego, tailscale, headscale, and goaccess")
 	}
 	manifest.Headscale = hydrateHeadscale(manifest.Headscale, headscale)
 	dependency.Headscale = manifest.Headscale
@@ -183,6 +194,9 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	dependency.Tailscale.Members[0].Asset = identity(tailscale.Executable)
 	dependency.Tailscale.Members[0].Destination = "/usr/lib/lanpanel/dependencies/tailscale"
 	dependency.Tailscale.Members[0].Mode = 0o755
+	dependency.GoAccessVersion = goaccess.Version
+	dependency.GoAccessArtifactIdentity = goaccess.Source.URL
+	dependency.GoAccess = identity(goaccess.Executable)
 	for i := range manifest.SupportedProfiles {
 		profile := &manifest.SupportedProfiles[i]
 		dependencyForProfile := dependency
@@ -377,8 +391,14 @@ func releasePackageTemplateMatches(template packages.Plan, profile release.OSPro
 func validateDependencies(inputs dependencyInputs) error {
 	seen := map[string]bool{}
 	for _, dep := range inputs.Dependencies {
-		if seen[dep.Name] || dep.Name == "" || dep.Version == "" || dep.MetadataSource == "" || !release.ValidDigest(dep.MetadataDigest) || dep.PublishedAt.IsZero() || dep.Source.URL == "" || dep.Member == "" || !release.ValidDigest(dep.Archive.SHA256) || !release.ValidDigest(dep.Executable.SHA256) || dep.Archive.Bytes == 0 || dep.Executable.Bytes == 0 {
+		if seen[dep.Name] || dep.Name == "" || dep.Version == "" || dep.MetadataSource == "" || !release.ValidDigest(dep.MetadataDigest) || dep.PublishedAt.IsZero() || dep.Source.URL == "" || dep.Member == "" || !release.ValidDigest(dep.Executable.SHA256) || dep.Executable.Bytes == 0 {
 			return fmt.Errorf("dependency input %q is invalid", dep.Name)
+		}
+		if dep.Name != "goaccess" && (!release.ValidDigest(dep.Archive.SHA256) || dep.Archive.Bytes == 0) {
+			return fmt.Errorf("dependency input %q archive is invalid", dep.Name)
+		}
+		if dep.Name == "goaccess" && dep.Member != "goaccess" {
+			return fmt.Errorf("GoAccess dependency member is invalid")
 		}
 		seen[dep.Name] = true
 	}

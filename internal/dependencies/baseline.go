@@ -75,6 +75,7 @@ var (
 )
 
 var requiredSelections = map[string]SourceKind{
+	"goaccess":         SourceCanonicalArtifact,
 	"headscale":        SourceCanonicalArtifact,
 	"lego":             SourceCanonicalArtifact,
 	"tailscale-client": SourceCanonicalArtifact,
