@@ -68,5 +68,11 @@ for name in lego tailscale headscale goaccess; do
       ;;
   esac
 done
-cp -- "$lock" "$output/dependency-inputs.json"
+# GoAccess is source-built in the controlled materialization environment. Bind
+# the resulting binary digest into the copied lock before release assembly;
+# the reviewed source lock intentionally leaves this generated digest empty so
+# it can be materialized on a different supported release builder.
+goaccess_digest=$(sha256sum "$output/goaccess" | awk '{print $1}')
+goaccess_bytes=$(wc -c < "$output/goaccess")
+printf '%s' "$(jq -c --arg digest "$goaccess_digest" --argjson bytes "$goaccess_bytes" '(.dependencies[] | select(.name == "goaccess") | .executable.sha256) = $digest | (.dependencies[] | select(.name == "goaccess") | .executable.bytes) = $bytes' "$lock")" > "$output/dependency-inputs.json"
 printf 'Materialized locked dependency assets: %s\n' "$output/dependency-inputs.json"

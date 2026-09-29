@@ -161,7 +161,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 			}
 			source := filepath.Join(filepath.Dir(inputsPath), filepath.FromSlash(asset.Path))
 			destination := filepath.Join(tmp, filepath.FromSlash(asset.Path))
-			if dep.Name == "goaccess" {
+			if dep.Name == "goaccess" && (!release.ValidDigest(asset.SHA256) || asset.Bytes == 0) {
 				if err := copyRegular(source, destination, 0o644); err != nil {
 					return err
 				}
