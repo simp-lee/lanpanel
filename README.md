@@ -30,7 +30,7 @@ The current release supports qualified Debian or Ubuntu amd64 (x86_64) profiles,
 - an APT mirror with signature verification enabled and a healthy package state;
 - enough disk space and available ports.
 
-Before changing the host, the installer checks the operating system, packages, ports, filesystem, and Nginx ownership/configuration. Other distributions, ARM64, hosts without a matching signed OS profile, and hosts that fail these capability checks are unsupported.
+Before changing the host, the installer checks the OS family, packages, ports, filesystem, and Nginx ownership/configuration. The signed release carries one package profile per supported Debian/Ubuntu family; the distribution release number is not itself an allowlist. Other distributions, ARM64, hosts without a matching signed family profile, and hosts that fail these capability checks are unsupported.
 
 Installation does not require ACME or DNS operations in advance. You only need a domain, DNS, and the relevant 80/443 network access when you later publish a domain-based HTTPS application.
 
