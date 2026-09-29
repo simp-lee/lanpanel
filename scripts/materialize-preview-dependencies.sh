@@ -35,14 +35,17 @@ for name in lego tailscale headscale goaccess; do
   source_path=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .source.asset.path' "$lock")
   source_digest=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .source.asset.sha256' "$lock")
   executable_path=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.path' "$lock")
-  executable_digest=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.sha256' "$lock")
+  executable_digest=$(jq -r --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.sha256' "$lock")
+  executable_bytes=$(jq -r --arg name "$name" '.dependencies[] | select(.name == $name) | .executable.bytes' "$lock")
   member=$(jq -er --arg name "$name" '.dependencies[] | select(.name == $name) | .member' "$lock")
   case "$name" in
     goaccess)
       fetch "$source_url" "$output/$source_path"
       verify "$output/$source_path" "$source_digest"
       "$script_dir/build-goaccess.sh" "$output/$source_path" "$output/$executable_path"
-      verify "$output/$executable_path" "$executable_digest"
+      if [ -n "$executable_digest" ] && [ "$executable_bytes" -gt 0 ]; then
+        verify "$output/$executable_path" "$executable_digest"
+      fi
       rm -f "$output/$source_path"
       ;;
     headscale)

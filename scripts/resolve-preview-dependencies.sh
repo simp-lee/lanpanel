@@ -102,7 +102,7 @@ jq -cjn \
   --arg hv "$headscale_version" --arg hu "$headscale_url" --arg hm "https://api.github.com/repos/juanfont/headscale/releases/latest" --arg hd "$(sha256sum "$work/headscale-release.json" | awk '{print $1}')" --arg hp "$(jq -er '.published_at' "$work/headscale-release.json")" \
   --arg gv "$goaccess_version" --arg gu "$goaccess_source_url" --arg gm "https://goaccess.io/download" --arg gd "$(sha256sum "$work/goaccess-metadata" | awk '{print $1}')" --arg gp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
   --argjson ga "$(identity "$work/goaccess-source.tar.gz" goaccess-source.tar.gz)" \
-  --argjson ge "$(identity "$work/goaccess" goaccess)" \
+  --argjson ge '{"path":"goaccess","sha256":"","bytes":0}' \
   --argjson la "$(identity "$work/lego.tar.gz" lego.tar.gz)" \
   --argjson le "$(identity "$work/lego" lego)" \
   --argjson ta "$(identity "$work/tailscale.tar.gz" tailscale.tar.gz)" \

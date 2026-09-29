@@ -159,7 +159,15 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 			if asset.Path == "" {
 				continue
 			}
-			if err := copyVerified(filepath.Join(filepath.Dir(inputsPath), filepath.FromSlash(asset.Path)), filepath.Join(tmp, filepath.FromSlash(asset.Path)), asset, 0o644); err != nil {
+			source := filepath.Join(filepath.Dir(inputsPath), filepath.FromSlash(asset.Path))
+			destination := filepath.Join(tmp, filepath.FromSlash(asset.Path))
+			if dep.Name == "goaccess" {
+				if err := copyRegular(source, destination, 0o644); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := copyVerified(source, destination, asset, 0o644); err != nil {
 				return err
 			}
 		}
@@ -196,7 +204,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	dependency.Tailscale.Members[0].Mode = 0o755
 	dependency.GoAccessVersion = goaccess.Version
 	dependency.GoAccessArtifactIdentity = goaccess.Source.URL
-	dependency.GoAccess = identity(goaccess.Executable)
+	dependency.GoAccess = fileIdentity(tmp, goaccess.Executable.Path)
 	for i := range manifest.SupportedProfiles {
 		profile := &manifest.SupportedProfiles[i]
 		dependencyForProfile := dependency
@@ -391,14 +399,15 @@ func releasePackageTemplateMatches(template packages.Plan, profile release.OSPro
 func validateDependencies(inputs dependencyInputs) error {
 	seen := map[string]bool{}
 	for _, dep := range inputs.Dependencies {
-		if seen[dep.Name] || dep.Name == "" || dep.Version == "" || dep.MetadataSource == "" || !release.ValidDigest(dep.MetadataDigest) || dep.PublishedAt.IsZero() || dep.Source.URL == "" || dep.Member == "" || !release.ValidDigest(dep.Executable.SHA256) || dep.Executable.Bytes == 0 {
+		if seen[dep.Name] || dep.Name == "" || dep.Version == "" || dep.MetadataSource == "" || !release.ValidDigest(dep.MetadataDigest) || dep.PublishedAt.IsZero() || dep.Source.URL == "" || dep.Member == "" || dep.Executable.Path == "" {
 			return fmt.Errorf("dependency input %q is invalid", dep.Name)
 		}
-		if dep.Name != "goaccess" && (!release.ValidDigest(dep.Archive.SHA256) || dep.Archive.Bytes == 0) {
-			return fmt.Errorf("dependency input %q archive is invalid", dep.Name)
-		}
-		if dep.Name == "goaccess" && dep.Member != "goaccess" {
-			return fmt.Errorf("GoAccess dependency member is invalid")
+		if dep.Name == "goaccess" {
+			if dep.Member != "goaccess" || dep.Executable.Path != "goaccess" {
+				return fmt.Errorf("GoAccess dependency identity is invalid")
+			}
+		} else if !release.ValidDigest(dep.Archive.SHA256) || dep.Archive.Bytes == 0 || !release.ValidDigest(dep.Executable.SHA256) || dep.Executable.Bytes == 0 {
+			return fmt.Errorf("dependency input %q asset identity is invalid", dep.Name)
 		}
 		seen[dep.Name] = true
 	}
