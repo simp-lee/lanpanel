@@ -461,7 +461,7 @@ var resourceStatusJobErrorCodes = map[JobErrorCode]struct{}{
 	"preauth_key_create_failed": {}, "preauth_key_revoke_failed": {}, "device_expire_failed": {}, "connector_login_failed": {}, "connector_login_unknown": {},
 	"headscale_lifecycle_interrupted": {}, "headscale_journal_failed": {}, "connector_mutation_interrupted": {}, "normal_revision_changed": {},
 	"plan_consumption_rejected": {}, "planless_start_rejected": {}, "process_lifecycle_not_started": {}, "preflight_rejected": {},
-	"publication_revalidation_failed": {}, "contraction_authority_failed": {}, "resource_create_not_started": {}, "resource_delete_not_started": {},
+	"publication_revalidation_failed": {}, "contraction_authority_failed": {}, "closure_commit_failed": {}, "closure_inventory_incomplete": {}, "disk_contraction_failed": {}, "nginx_test_failed": {}, "runtime_probe_failed": {}, "unpublished_commit_failed": {}, "worker_drain_failed": {}, "resource_create_not_started": {}, "resource_delete_not_started": {},
 	"resource_update_not_started": {}, "safety_authority_changed": {}, "safety_recheck_unavailable": {}, "safety_refresh_failed": {},
 }
 

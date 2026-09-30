@@ -454,6 +454,15 @@ func (authority *NormalAuthority) convergeStoppedFence(ctx context.Context, inve
 	return nil
 }
 
+func contractionErrorCode(candidate, fallback string) string {
+	switch candidate {
+	case "activation_contracted", "closure_commit_failed", "closure_inventory_incomplete", "contraction_authority_failed", "disk_contraction_failed", "goaccess_stop_failed", "nginx_test_failed", "runtime_probe_failed", "unpublished_commit_failed", "worker_drain_failed":
+		return candidate
+	default:
+		return fallback
+	}
+}
+
 func CompleteNormal(ctx context.Context, authority *NormalAuthority, result Result) (jobs.Record, error) {
 	branch, status, kind, code := "complete", jobs.PostconditionVerified, "access_closed", ""
 	identity := result.ClosureDigest
@@ -463,17 +472,16 @@ func CompleteNormal(ctx context.Context, authority *NormalAuthority, result Resu
 	switch result.Outcome {
 	case OutcomeSucceeded:
 	case OutcomePartial:
-		branch, status, kind, code = "known_residual", jobs.PostconditionKnown, "shared_ingress_down", "activation_contracted"
+		branch, status, kind, code = "known_residual", jobs.PostconditionKnown, "shared_ingress_down", contractionErrorCode(result.ErrorCode, "activation_contracted")
 		if result.ErrorCode == "goaccess_stop_failed" {
-			code = result.ErrorCode
 			kind = "goaccess_retirement_pending"
 		}
 	case OutcomeInterrupted:
-		branch, status, kind, code = "executor_died", jobs.PostconditionKnown, "contraction_interrupted", "activation_contracted"
+		branch, status, kind, code = "executor_died", jobs.PostconditionKnown, "contraction_interrupted", contractionErrorCode(result.ErrorCode, "activation_contracted")
 	case OutcomeUnknown:
-		branch, status, kind, code = "source_unknown", jobs.PostconditionUnobserved, "access_may_remain", "activation_contracted"
+		branch, status, kind, code = "source_unknown", jobs.PostconditionUnobserved, "access_may_remain", contractionErrorCode(result.ErrorCode, "activation_contracted")
 	case OutcomeFailed:
-		branch, status, kind, code = "no_effect", jobs.PostconditionVerified, "mutation_not_started", "contraction_authority_failed"
+		branch, status, kind, code = "no_effect", jobs.PostconditionVerified, "mutation_not_started", contractionErrorCode(result.ErrorCode, "contraction_authority_failed")
 	default:
 		return jobs.Record{}, fmt.Errorf("normal contraction result is invalid")
 	}
