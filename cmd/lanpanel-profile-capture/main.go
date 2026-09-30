@@ -43,6 +43,13 @@ type aptRecord struct {
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "delegation-probe-child" {
+		if err := preflight.RunDelegationProbeChild(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	var output, profileID, dependencyPath string
 	var packageNames stringList
 	flag.StringVar(&output, "output", "", "output directory")

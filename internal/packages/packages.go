@@ -543,7 +543,7 @@ func forbiddenAPTConfiguration(data []byte) bool {
 	if strings.ContainsAny(lower, "\x00\r") {
 		return true
 	}
-	if strings.Contains(lower, "admindir") || strings.Contains(lower, "instdir") {
+	if strings.Contains(lower, "admindir") || strings.Contains(lower, "instdir") || strings.Contains(lower, "check-valid-until") && strings.Contains(lower, "false") {
 		return true
 	}
 	words := []string{}

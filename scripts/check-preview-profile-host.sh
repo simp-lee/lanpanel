@@ -22,7 +22,7 @@ check() {
 
 check_os() { [ "$(uname -s)" = Linux ]; }
 check_arch() { [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ] && [ "$(uname -m)" = x86_64 ]; }
-check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ] && command -v systemd-run >/dev/null 2>&1; }
+check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ] && [ -x /proc/1/exe ] && command -v systemd-run >/dev/null 2>&1; }
 check_cgroup() {
   [ -z "$(awk 'function separator(){ for (i=1; i<=NF; i++) if ($i == "-") return i } { s=separator(); if (s && $(s+1) == "cgroup") print }' /proc/self/mountinfo)" ] || return 1
   mountpoint=$(awk 'function separator(){ for (i=1; i<=NF; i++) if ($i == "-") return i } { s=separator(); if (s && $(s+1) == "cgroup2" && $4 == "/") { print $5; count++ } } END { if (count == 1) exit 0; exit 1 }' /proc/self/mountinfo) || return 1
@@ -31,8 +31,8 @@ check_cgroup() {
   [ -n "$self_cgroup" ] && [ -f "$mountpoint${self_cgroup}/cgroup.procs" ] && [ -f "$mountpoint${self_cgroup}/cgroup.events" ]
 }
 check_systemd_delegation() {
-  command -v systemd >/dev/null 2>&1 || return 1
-  major=$(systemd --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+  [ -x /proc/1/exe ] || return 1
+  major=$(/proc/1/exe --version 2>/dev/null | awk 'NR == 1 { print $2 }')
   [ -n "$major" ] && [ "$major" -ge 218 ]
 }
 check_dpkg() { command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1 && [ -z "$(dpkg --audit 2>/dev/null)" ]; }

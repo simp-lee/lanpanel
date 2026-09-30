@@ -341,6 +341,9 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 		if err != nil {
 			return fmt.Errorf("APT repository %q InRelease signature is invalid: %w", repositories[index].ID, err)
 		}
+		if err := validateReleaseFreshness(plaintext); err != nil {
+			return fmt.Errorf("APT repository %q signed freshness is invalid: %w", repositories[index].ID, err)
+		}
 		releaseFiles, err := releaseSHA256Files(plaintext)
 		if err != nil {
 			return fmt.Errorf("read exact APT repository metadata checksums for %q: %w", repositories[index].ID, err)
@@ -818,31 +821,55 @@ func aptListPart(value string) string {
 	return result.String()
 }
 
-func repositoryCutoffDigest(release []byte) (string, error) {
+func validateReleaseFreshness(release []byte) error {
+	date, found, err := signedReleaseTime(release, "Date")
+	if err != nil || !found {
+		return fmt.Errorf("signed Release Date is invalid or missing")
+	}
+	now := time.Now().UTC()
+	if date.After(now.Add(24 * time.Hour)) {
+		return fmt.Errorf("signed Release Date is too far in the future")
+	}
+	validUntil, found, err := signedReleaseTime(release, "Valid-Until")
+	if err != nil {
+		return err
+	}
+	if found && (validUntil.Before(date) || now.After(validUntil)) {
+		return fmt.Errorf("signed Release Valid-Until has expired or predates Date")
+	}
+	return nil
+}
+
+func signedReleaseTime(release []byte, field string) (time.Time, bool, error) {
 	dateText, found := "", false
 	for line := range strings.SplitSeq(string(release), "\n") {
 		key, value, hasValue := strings.Cut(line, ":")
-		if !hasValue || key != "Date" {
+		if !hasValue || key != field {
 			continue
 		}
 		if found || strings.TrimSpace(value) == "" {
-			return "", fmt.Errorf("signed Release metadata has an invalid Date field")
+			return time.Time{}, false, fmt.Errorf("signed Release %s field is invalid", field)
 		}
 		dateText, found = strings.TrimSpace(value), true
 	}
 	if !found {
-		return "", fmt.Errorf("signed Release metadata omits its Date cutoff")
+		return time.Time{}, false, nil
 	}
-	var date time.Time
+	var parsed time.Time
 	var err error
 	for _, layout := range []string{time.RFC1123Z, time.RFC1123, time.RFC822Z, time.RFC822} {
-		date, err = time.Parse(layout, dateText)
+		parsed, err = time.Parse(layout, dateText)
 		if err == nil {
-			break
+			return parsed, true, nil
 		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("signed Release Date is not an RFC timestamp")
+	return time.Time{}, false, fmt.Errorf("signed Release %s is not an RFC timestamp", field)
+}
+
+func repositoryCutoffDigest(release []byte) (string, error) {
+	date, found, err := signedReleaseTime(release, "Date")
+	if err != nil || !found {
+		return "", fmt.Errorf("signed Release metadata omits or invalid Date cutoff")
 	}
 	canonical, err := json.Marshal(struct {
 		Date string `json:"date"`

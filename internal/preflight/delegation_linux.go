@@ -32,8 +32,9 @@ func activeDelegationProbe(ctx context.Context) (result ComponentObservation) {
 		return ComponentObservation{Identity: "delegation probe executable is unavailable"}
 	}
 	unit := delegationProbeUnitName()
+	collect := systemdRunSupportsCollect()
 	defer func() {
-		if cleanupErr := stopTransientUnit(unit); cleanupErr != nil {
+		if cleanupErr := stopTransientUnit(unit, collect); cleanupErr != nil {
 			result.Available = false
 			if result.Identity == "" {
 				result.Identity = "systemd delegation probe cleanup failed: " + cleanupErr.Error()
@@ -42,7 +43,12 @@ func activeDelegationProbe(ctx context.Context) (result ComponentObservation) {
 			}
 		}
 	}()
-	systemdRun := exec.CommandContext(probeCtx, "/usr/bin/systemd-run", "--unit="+unit, "--property=Delegate=yes", "--property=RemainAfterExit=yes", executable, "delegation-probe-child")
+	args := []string{"--unit=" + unit, "--property=Delegate=yes", "--property=RemainAfterExit=yes"}
+	if collect {
+		args = append(args, "--collect")
+	}
+	args = append(args, executable, "delegation-probe-child")
+	systemdRun := exec.CommandContext(probeCtx, "/usr/bin/systemd-run", args...)
 	output, err := systemdRun.CombinedOutput()
 	if err != nil {
 		identity := strings.TrimSpace(string(output))
@@ -103,7 +109,20 @@ func transientUnitState(ctx context.Context, unit string) (string, string, strin
 	return state, subState, status, nil
 }
 
-func stopTransientUnit(unit string) error {
+func systemdRunSupportsCollect() bool {
+	data, err := exec.Command("/proc/1/exe", "--version").Output()
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return false
+	}
+	major, err := strconv.Atoi(fields[1])
+	return err == nil && major >= 236
+}
+
+func stopTransientUnit(unit string, collect bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	stopErr := exec.CommandContext(ctx, "/usr/bin/systemctl", "stop", unit).Run()
@@ -120,7 +139,22 @@ func stopTransientUnit(unit string) error {
 	if resetErr != nil {
 		return resetErr
 	}
-	return nil
+	if !collect {
+		return nil
+	}
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		state, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value").Output()
+		if isMissingSystemdUnit(err) || strings.TrimSpace(string(state)) == "not-found" {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 func isMissingSystemdUnit(err error) bool {
