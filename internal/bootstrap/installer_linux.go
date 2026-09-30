@@ -849,8 +849,6 @@ func installNginxBaseline(ctx context.Context, journal *Journal, strict bool) er
 	}
 	if journal.Paths != FixedPaths() {
 		paths = testNginxPaths(journal.Paths)
-	} else if err := rejectForeignNginxAuthority(); err != nil {
-		return err
 	}
 	certificatePEM, err := readCommittedArtifact(paths.CertificatePath, nginx.MaximumGraphFileSize, 0o644)
 	if err != nil {
