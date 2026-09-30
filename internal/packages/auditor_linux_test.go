@@ -19,6 +19,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestReleaseSHA256FilesStopsAtAcquireByHash(t *testing.T) {
+	files, err := releaseSHA256Files([]byte("SHA256:\n abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd 1 Packages\nAcquire-By-Hash: yes\n"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("files=%#v err=%v", files, err)
+	}
+}
+
 func TestSignedAPTReleaseMatchesCodenameAndComponentSubset(t *testing.T) {
 	release := []byte("Suite: stable\nCodename: trixie\nComponents: main contrib non-free\n")
 	if !releaseSuiteMatches(release, "trixie") || !releaseComponentsAuthorize(release, []string{"main", "contrib"}) {

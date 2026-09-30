@@ -803,7 +803,7 @@ func releaseSHA256Files(release []byte) (map[string]repositoryReleaseFile, error
 		if !inSHA256 || trimmed == "" {
 			continue
 		}
-		if trimmed == "SHA512:" || trimmed == "MD5Sum:" || strings.HasPrefix(trimmed, "-----BEGIN PGP ") {
+		if trimmed == "SHA512:" || trimmed == "MD5Sum:" || strings.HasPrefix(trimmed, "Acquire-By-Hash:") || strings.HasPrefix(trimmed, "-----BEGIN PGP ") {
 			break
 		}
 		fields := strings.Fields(trimmed)
