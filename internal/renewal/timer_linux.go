@@ -36,8 +36,14 @@ func RunTimer(args []string) error {
 		secret.Destroy()
 		return fmt.Errorf("certificate timer returned secret")
 	}
-	if err != nil || response.RequestID != request.RequestID || response.Code != helperproto.ResponseSucceeded {
-		return fmt.Errorf("certificate timer failed: %w", err)
+	if err != nil {
+		return fmt.Errorf("certificate timer request failed: %w", err)
+	}
+	if response.RequestID != request.RequestID {
+		return fmt.Errorf("certificate timer response request identity changed")
+	}
+	if response.Code != helperproto.ResponseSucceeded {
+		return fmt.Errorf("certificate timer failed: code=%s error_code=%s error_job_id=%s", response.Code, response.ErrorCode, response.ErrorJobID)
 	}
 	return nil
 }
