@@ -7,6 +7,7 @@ import (
 	"lanpanel/internal/jobs"
 	"lanpanel/internal/locks"
 	"lanpanel/internal/operations"
+	"lanpanel/internal/persist"
 	"lanpanel/internal/safety"
 	"time"
 )
@@ -17,6 +18,7 @@ type NormalAuthority struct {
 	Safety          *safety.Store
 	Emergency       *safety.EmergencyStore
 	Admitter        *operations.Admitter
+	Normal          *persist.Store
 	Mutation        *operations.MutationLease
 	Exposure        *locks.Lease
 	JobID           string
@@ -302,7 +304,9 @@ func (authority *NormalAuthority) ConvergeClosure(ctx context.Context, inventory
 		return fmt.Errorf("normal closure inventory changed")
 	}
 	if authority.SafetyState.StopFence != nil {
-		return nil
+		if err := authority.convergeStoppedFence(ctx, inventory, closureDigest); err != nil {
+			return err
+		}
 	}
 	persisted := 0
 	for _, resource := range authority.SafetyState.Resources {
@@ -382,6 +386,71 @@ func (authority *NormalAuthority) ConvergeClosure(ctx context.Context, inventory
 		return authorityCommittedError{err: fmt.Errorf("emergency global clear committed but normal projection failed: %w", err)}
 	}
 	authority.SafetyState = globalNext
+	return nil
+}
+
+func (authority *NormalAuthority) convergeStoppedFence(ctx context.Context, inventory closure.Inventory, closureDigest string) error {
+	state := authority.SafetyState
+	fence := state.StopFence
+	if fence == nil || authority.Normal == nil || authority.Emergency == nil || authority.Exposure == nil {
+		return fmt.Errorf("normal stopped-fence recovery authority is incomplete")
+	}
+	emergency, err := authority.Emergency.Authority()
+	if err != nil {
+		return fmt.Errorf("read stopped-fence recovery authority: %w", err)
+	}
+	if emergency.StopFence == nil || !safety.FenceMatchesEmergency(fence, *emergency.StopFence) {
+		return fmt.Errorf("normal stopped-fence recovery authority changed")
+	}
+	if emergency.StopFence.AccessMayRemain || !emergency.StopFence.MasterStopped || !emergency.StopFence.WorkersStopped || !emergency.StopFence.ListenersStopped {
+		return fmt.Errorf("normal stopped-fence recovery is not exactly closed")
+	}
+	generations := make(map[string]uint64, len(state.Resources))
+	for _, resource := range state.Resources {
+		generation := resource.GenerationSequence + 1
+		if resource.StickyUnpublished != nil {
+			generation = resource.StickyUnpublished.Generation
+		}
+		if resource.Closing != nil {
+			generation = resource.Closing.Generation
+		}
+		generations[resource.ResourceID] = generation
+	}
+	if err := operations.RecoverClosedInstallation(ctx, authority.Normal, authority.Exposure, generations, nil, closureDigest, state.Checksum, time.Now().UTC(), nil); err != nil {
+		return err
+	}
+	withoutFence := emergency
+	withoutFence.Sequence++
+	withoutFence.StopFence = nil
+	withoutFence.ClearProof = &safety.EmergencyClearProof{Generation: emergency.GlobalClose.Generation, StopFenceGeneration: emergency.StopFenceSequence, StopFenceDigest: safety.EmergencyFenceDigest(*emergency.StopFence), InventoryDigest: emergency.StopFence.InventoryDigest, OwnedGraphDigest: emergency.StopFence.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, NginxTestPassed: true, RuntimeClosed: true}
+	if err := authority.Emergency.Commit(authority.Exposure, safety.RoleJournalConvergence, emergency.Sequence, withoutFence); err != nil {
+		return err
+	}
+	next := state
+	next.Revision++
+	next.AuthoritySequence = withoutFence.Sequence
+	next.StopFence = nil
+	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	closingProofs := map[string]safety.ClosingConvergenceProof{}
+	unpublished := make(map[string]uint64, len(next.Resources))
+	for index := range next.Resources {
+		resource := &next.Resources[index]
+		generation := generations[resource.ResourceID]
+		if resource.Closing != nil {
+			closingProofs[resource.ResourceID] = safety.ClosingConvergenceProof{ResourceID: resource.ResourceID, ClosingGeneration: resource.Closing.Generation, UnpublishedGeneration: generation, OwnershipDigest: resource.OwnershipDigest, RuntimeClosureDigest: closureDigest}
+		}
+		resource.GenerationSequence = generation
+		resource.StickyUnpublished = &safety.GenerationMarker{Kind: safety.MarkerStickyUnpublished, Generation: generation, Reason: "recovered_closed"}
+		resource.Closing = nil
+		resource.ChallengePending = nil
+		resource.Reactivating = nil
+		unpublished[resource.ResourceID] = generation
+	}
+	stopProof := &safety.StopFenceConvergenceProof{Kind: fence.Kind, ResourceID: fence.Scope.ResourceID, FenceGeneration: fence.FenceGeneration, FenceDigest: safety.StopFenceDigest(*fence), JournalRef: fence.Contraction.OperationRef, SafetyIntentID: fence.Contraction.SafetyIntentID, SafetyIntentGeneration: fence.Contraction.SafetyIntentGeneration, InventoryDigest: fence.InventoryDigest, OwnedGraphDigest: fence.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, AllChildrenExited: true, AllAppsUnpublished: true, NoAppDisk: true, WorkersDrained: true, ListenersClosed: true, RuntimeClosed: true, NginxTestPassed: true, UnpublishedGenerations: unpublished}
+	if _, err := authority.Safety.Commit(ctx, authority.Exposure, safety.RoleJournalConvergence, state.Revision, next, safety.TransitionProof{StopFence: stopProof, Closings: closingProofs}); err != nil {
+		return err
+	}
+	authority.SafetyState = next
 	return nil
 }
 

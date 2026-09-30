@@ -1100,7 +1100,7 @@ func ContractExpiredCertificate(ctx context.Context, resourceID string, now time
 	if generationErr != nil {
 		inventory = closure.BuildFallbackInventory(closure.Inputs{Installation: inventoryInstallation, Safety: &committedState, Ownership: owned, Graph: graph, ResourceIDs: []string{resourceID}}, generationErr)
 	}
-	authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.CertificateExpiry, Revision: latestDocument.Revision, SafetyState: committedState, Generations: generations}
+	authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Normal: service.normal, Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, Operation: operations.CertificateExpiry, Revision: latestDocument.Revision, SafetyState: committedState, Generations: generations}
 	if generation, present := generations[resourceID]; generationErr == nil && foundExisting && present && certificateExpirySafetyClosed(committedState, resourceID, generation) {
 		closureDigest := existing.ContractionDigest
 		if closureDigest == "" {

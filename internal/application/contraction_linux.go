@@ -177,7 +177,7 @@ func beginContraction(ctx context.Context, actor Actor, operation domain.Operati
 			ownershipAuthority[record.ResourceID] = record.Checksum
 		}
 	}
-	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, Installation: freshInstallation, SafetyState: freshState, OwnershipAuthority: ownershipAuthority, GoAccessGenerations: goaccessIDs, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Mutation: mutation, Exposure: exposure, JobID: job.ID, PlanID: plan.ID, Operation: operations.Type(operation), Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
+	return &CloseAllExecution{Service: service, Admitter: admitter, MutationSet: mutationSet, Mutation: mutation, Exposure: exposure, Inventory: inventory, Installation: freshInstallation, SafetyState: freshState, OwnershipAuthority: ownershipAuthority, GoAccessGenerations: goaccessIDs, Authority: &contraction.NormalAuthority{Safety: service.SafetyStore(), Emergency: service.EmergencyStore(), Admitter: admitter, Normal: service.Normal(), Mutation: mutation, Exposure: exposure, JobID: job.ID, PlanID: plan.ID, Operation: operations.Type(operation), Revision: intent.IntentGeneration, SafetyState: freshState, Generations: generations, Global: global}}, nil
 }
 
 func contractionGenerations(installation domain.Installation, state safety.State, selectedIDs []string) (map[string]uint64, error) {

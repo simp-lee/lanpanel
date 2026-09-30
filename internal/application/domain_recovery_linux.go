@@ -247,7 +247,7 @@ func reconcileTerminalContractionClosings(ctx context.Context, service *FixedSer
 			return err
 		}
 		if group.hasClosing || state.GlobalClose.Phase != safety.GlobalCloseNone {
-			authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Exposure: exposure, SafetyState: state, Generations: group.generations, Global: group.operation == operations.CloseAll || group.operation == operations.StartupContraction, InventoryDigest: group.inventoryDigest}
+			authority := &contraction.NormalAuthority{Safety: service.safety, Emergency: service.emergency, Normal: service.normal, Exposure: exposure, SafetyState: state, Generations: group.generations, Global: group.operation == operations.CloseAll || group.operation == operations.StartupContraction, InventoryDigest: group.inventoryDigest}
 			if err := authority.ConvergeClosure(context.WithoutCancel(ctx), closure.Inventory{Digest: group.inventoryDigest}, group.runtimeDigest); err != nil {
 				return err
 			}
