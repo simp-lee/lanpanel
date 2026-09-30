@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
@@ -99,7 +100,8 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 		}
 		return signed.Bytes()
 	}
-	releasePlaintext := fmt.Sprintf("Origin: fixture\nSuite: stable\nComponents: main\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))
+	releaseDate := time.Now().UTC().Add(-time.Hour).Format(time.RFC1123)
+	releasePlaintext := fmt.Sprintf("Origin: fixture\nSuite: stable\nComponents: main\nDate: %s\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n", releaseDate, packageDigest, len(packageIndex))
 	release := signRelease(releasePlaintext)
 	var compressedPackageIndex bytes.Buffer
 	compressor := lz4.NewWriter(&compressedPackageIndex)
@@ -156,8 +158,9 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 	if audit.Repositories[0].MetadataDigest != observedRepositories[0].MetadataDigest || audit.Repositories[0].CutoffDigest != observedRepositories[0].CutoffDigest {
 		t.Fatalf("audit did not return host-derived repository authority: %#v", audit.Repositories[0])
 	}
-	if observedRepositories[0].CutoffDigest != "a919e3552f73479b629bd4a340d863e33f49ea0ce2e2d143473fd20d33e7056c" {
-		t.Fatalf("unexpected canonical cutoff digest: %s", observedRepositories[0].CutoffDigest)
+	wantCutoff, err := repositoryCutoffDigest([]byte(releasePlaintext))
+	if err != nil || observedRepositories[0].CutoffDigest != wantCutoff {
+		t.Fatalf("unexpected canonical cutoff digest: got=%s want=%s error=%v", observedRepositories[0].CutoffDigest, wantCutoff, err)
 	}
 	if err := ValidateDPKGReady(audit.DPKG); err != nil {
 		t.Fatal(err)
@@ -191,9 +194,20 @@ func TestLinuxAuditorReadsExactRepositoryDPKGPolicyAndRuntimeAuthority(t *testin
 		t.Fatalf("standard distro APT hook was rejected: %v", err)
 	}
 	writeFixture(t, root, "etc/apt/apt.conf", []byte("// no hooks\n"), 0o644)
-	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", signRelease(fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: Sat, 11 Jul 2026 09:02:23 UTC\nArchitectures: amd64\nDescription: changed\nSHA256:\n %s %d main/binary-amd64/Packages\n", packageDigest, len(packageIndex))), 0o644)
+	writeFixture(t, root, "var/lib/apt/lists/deb.example.test_debian_dists_stable_InRelease", signRelease(fmt.Sprintf("Origin: fixture\nSuite: stable\nDate: %s\nArchitectures: amd64\nDescription: changed\nSHA256:\n %s %d main/binary-amd64/Packages\n", releaseDate, packageDigest, len(packageIndex))), 0o644)
 	if _, err := auditor.ObservePackages(context.Background(), plan); err == nil {
 		t.Fatal("post-transaction repository metadata drift was accepted")
+	}
+}
+
+func TestValidateReleaseFreshnessRequiresBoundedMetadataAge(t *testing.T) {
+	fresh := time.Now().UTC().Add(-time.Hour).Format(time.RFC1123)
+	if err := validateReleaseFreshness([]byte("Date: " + fresh + "\n")); err != nil {
+		t.Fatalf("fresh metadata without Valid-Until was rejected: %v", err)
+	}
+	stale := time.Now().UTC().Add(-maxAPTReleaseAge - time.Hour).Format(time.RFC1123)
+	if err := validateReleaseFreshness([]byte("Date: " + stale + "\n")); err == nil {
+		t.Fatal("stale metadata without Valid-Until was accepted")
 	}
 }
 

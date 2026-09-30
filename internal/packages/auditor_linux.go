@@ -845,6 +845,8 @@ func aptListPart(value string) string {
 	return result.String()
 }
 
+const maxAPTReleaseAge = 7 * 24 * time.Hour
+
 func validateReleaseFreshness(release []byte) error {
 	date, found, err := signedReleaseTime(release, "Date")
 	if err != nil || !found {
@@ -853,6 +855,9 @@ func validateReleaseFreshness(release []byte) error {
 	now := time.Now().UTC()
 	if date.After(now.Add(24 * time.Hour)) {
 		return fmt.Errorf("signed Release Date is too far in the future")
+	}
+	if now.Sub(date) > maxAPTReleaseAge {
+		return fmt.Errorf("signed Release Date is older than the maximum metadata age")
 	}
 	validUntil, found, err := signedReleaseTime(release, "Valid-Until")
 	if err != nil {
