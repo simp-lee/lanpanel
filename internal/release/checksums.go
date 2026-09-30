@@ -119,8 +119,12 @@ func VerifyAssetBytes(set ChecksumSet, assets map[string][]byte) error {
 	}
 	for _, entry := range set.entries {
 		data, present := assets[entry.Path]
-		if !present || DigestBytes(data) != entry.Digest {
-			return fmt.Errorf("asset %q does not match its checksum", entry.Path)
+		if !present {
+			return fmt.Errorf("asset %q is missing from the installer asset set", entry.Path)
+		}
+		observed := DigestBytes(data)
+		if observed != entry.Digest {
+			return fmt.Errorf("asset %q does not match its checksum: expected=%s observed=%s", entry.Path, entry.Digest, observed)
 		}
 	}
 	return nil
