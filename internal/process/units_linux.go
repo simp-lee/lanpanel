@@ -143,7 +143,7 @@ func renderSocket(app domain.AppResource, paths resource.Paths, account identity
 	if local.EndpointKind == domain.LocalEndpointRelayUnix {
 		service = paths.RelayUnit
 	}
-	return []byte("[Unit]\nDescription=LanPanel PID1-owned endpoint " + app.ID + "\nBefore=" + service + "\n\n[Socket]\n" + listen + "\n" + mode + "\nService=" + service + "\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n"), nil
+	return []byte("[Unit]\nDescription=LanPanel PID1-owned endpoint " + app.ID + "\nBefore=" + service + "\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\n" + listen + "\n" + mode + "\nService=" + service + "\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n"), nil
 }
 
 func validateAccounts(accounts identity.ResourceAccountSet, resourceID string, relay bool) error {
