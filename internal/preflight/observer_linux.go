@@ -635,7 +635,11 @@ func (observer *LinuxObserver) observeSystemdDelegation(ctx context.Context, mod
 			return ComponentObservation{Identity: "systemd is not PID 1"}
 		}
 	}
-	data, err := exec.Command(observer.paths.SystemdExecutable, "--version").Output()
+	versionExecutable := observer.paths.SystemdExecutable
+	if observer.paths.SystemdControl != "" {
+		versionExecutable = observer.paths.SystemdControl
+	}
+	data, err := exec.Command(versionExecutable, "--version").Output()
 	if err != nil {
 		return ComponentObservation{Identity: "systemd version unavailable"}
 	}
