@@ -209,6 +209,9 @@ func TestValidateReleaseFreshnessRequiresBoundedMetadataAge(t *testing.T) {
 	if err := validateReleaseFreshness([]byte("Date: " + stale + "\n")); err == nil {
 		t.Fatal("stale metadata without Valid-Until was accepted")
 	}
+	if err := validateReleaseFreshness([]byte("Suite: noble\nCodename: noble\nDate: " + stale + "\n")); err != nil {
+		t.Fatalf("long-lived Ubuntu release metadata was rejected: %v", err)
+	}
 }
 
 func TestLinuxAuditorReadDPKGClassifiesHeldAndInstalledStates(t *testing.T) {

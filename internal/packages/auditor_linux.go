@@ -856,7 +856,7 @@ func validateReleaseFreshness(release []byte) error {
 	if date.After(now.Add(24 * time.Hour)) {
 		return fmt.Errorf("signed Release Date is too far in the future")
 	}
-	if now.Sub(date) > maxAPTReleaseAge {
+	if now.Sub(date) > maxAPTReleaseAge && !longLivedReleaseSuite(release) {
 		return fmt.Errorf("signed Release Date is older than the maximum metadata age")
 	}
 	validUntil, found, err := signedReleaseTime(release, "Valid-Until")
@@ -867,6 +867,12 @@ func validateReleaseFreshness(release []byte) error {
 		return fmt.Errorf("signed Release Valid-Until has expired or predates Date")
 	}
 	return nil
+}
+
+func longLivedReleaseSuite(release []byte) bool {
+	suite, suiteFound := releaseFieldTokens(release, "Suite")
+	codename, codenameFound := releaseFieldTokens(release, "Codename")
+	return suiteFound && codenameFound && len(suite) == 1 && len(codename) == 1 && suite[0] == codename[0]
 }
 
 func signedReleaseTime(release []byte, field string) (time.Time, bool, error) {
