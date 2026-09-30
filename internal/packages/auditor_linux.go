@@ -367,6 +367,10 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 		entries := []repositoryPackageEntry{}
 		entryByIdentity := map[string]repositoryPackageEntry{}
 		for _, component := range repositories[index].Components {
+			signedComponent, componentOK := releaseComponentFor(plaintext, component)
+			if !componentOK {
+				return fmt.Errorf("APT repository %q signed component %q is not authorized", repositories[index].ID, component)
+			}
 			for _, architecture := range []string{"amd64", "all"} {
 				packagePrefix := prefix + aptListPart(component) + "_binary-" + architecture + "_Packages"
 				found := false
@@ -379,7 +383,7 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 					}
 					found = true
 					suffix := strings.TrimPrefix(packageFile.Name, packagePrefix)
-					releasePath := component + "/binary-" + architecture + "/Packages"
+					releasePath := signedComponent + "/binary-" + architecture + "/Packages"
 					packagesBytes, err := auditor.validateRepositoryPackageIndex(packageFile, suffix, releasePath, releaseFiles)
 					if err != nil {
 						return fmt.Errorf("APT repository %q package index is not bound by its InRelease metadata: %w", repositories[index].ID, err)
@@ -753,16 +757,33 @@ func releaseSuiteMatches(release []byte, configured string) bool {
 }
 
 func releaseComponentsAuthorize(release []byte, configured []string) bool {
-	values, found := releaseFieldTokens(release, "Components")
-	if !found || len(configured) == 0 {
-		return false
-	}
 	for _, component := range configured {
-		if !slices.Contains(values, component) {
+		if _, ok := releaseComponentFor(release, component); !ok {
 			return false
 		}
 	}
-	return true
+	return len(configured) != 0
+}
+
+func releaseComponentFor(release []byte, configured string) (string, bool) {
+	values, found := releaseFieldTokens(release, "Components")
+	if !found {
+		return "", false
+	}
+	configuredLeaf := configured
+	if slash := strings.LastIndexByte(configuredLeaf, '/'); slash >= 0 {
+		configuredLeaf = configuredLeaf[slash+1:]
+	}
+	for _, value := range values {
+		leaf := value
+		if slash := strings.LastIndexByte(leaf, '/'); slash >= 0 {
+			leaf = leaf[slash+1:]
+		}
+		if value == configured || leaf == configuredLeaf {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func releaseFieldContainsToken(release []byte, field, expected string) bool {
@@ -1089,7 +1110,7 @@ func (auditor *LinuxAuditor) bindObservedRepositoryKeyrings(repositories []Obser
 			}
 			paths := make([]string, 0, len(keyrings))
 			for path := range keyrings {
-				if strings.HasPrefix(path, "/usr/share/keyrings/") || strings.HasPrefix(path, "/etc/apt/trusted.gpg") {
+				if path == "/etc/apt/trusted.gpg" || strings.HasPrefix(path, "/etc/apt/trusted.gpg.d/") {
 					paths = append(paths, path)
 				}
 			}

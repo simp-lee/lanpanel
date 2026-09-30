@@ -129,32 +129,29 @@ func stopTransientUnit(unit string, collect bool) error {
 	if isMissingSystemdUnit(stopErr) {
 		stopErr = nil
 	}
+	if stopErr != nil {
+		return stopErr
+	}
+	if collect {
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			state, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value").Output()
+			if isMissingSystemdUnit(err) || strings.TrimSpace(string(state)) == "not-found" {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
 	resetErr := exec.CommandContext(ctx, "/usr/bin/systemctl", "reset-failed", unit).Run()
 	if isMissingSystemdUnit(resetErr) {
 		resetErr = nil
 	}
-	if stopErr != nil {
-		return stopErr
-	}
-	if resetErr != nil {
-		return resetErr
-	}
-	if !collect {
-		return nil
-	}
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		state, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value").Output()
-		if isMissingSystemdUnit(err) || strings.TrimSpace(string(state)) == "not-found" {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
+	return resetErr
 }
 
 func isMissingSystemdUnit(err error) bool {
