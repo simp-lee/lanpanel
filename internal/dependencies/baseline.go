@@ -30,18 +30,20 @@ const (
 )
 
 type Selection struct {
-	Component               string     `json:"component"`
-	SourceKind              SourceKind `json:"source_kind"`
-	SelectedVersion         string     `json:"selected_version"`
-	LatestStableVersion     string     `json:"latest_stable_version"`
-	LatestStablePublishedAt time.Time  `json:"latest_stable_published_at"`
-	MetadataSource          string     `json:"metadata_source"`
-	MetadataSnapshotDigest  string     `json:"metadata_snapshot_digest"`
-	OSProfileDigest         string     `json:"os_profile_digest,omitempty"`
-	OperatingSystem         string     `json:"operating_system,omitempty"`
-	Architecture            string     `json:"architecture,omitempty"`
-	ArtifactIdentity        string     `json:"artifact_identity"`
-	ArtifactDigest          string     `json:"artifact_digest"`
+	Component                string     `json:"component"`
+	SourceKind               SourceKind `json:"source_kind"`
+	SelectedVersion          string     `json:"selected_version"`
+	LatestStableVersion      string     `json:"latest_stable_version"`
+	LatestStablePublishedAt  time.Time  `json:"latest_stable_published_at"`
+	MetadataSource           string     `json:"metadata_source"`
+	MetadataSnapshotDigest   string     `json:"metadata_snapshot_digest"`
+	CapabilityContractDigest string     `json:"capability_contract_digest,omitempty"`
+	// OSProfileDigest is retained for older baseline files.
+	OSProfileDigest  string `json:"os_profile_digest,omitempty"`
+	OperatingSystem  string `json:"operating_system,omitempty"`
+	Architecture     string `json:"architecture,omitempty"`
+	ArtifactIdentity string `json:"artifact_identity"`
+	ArtifactDigest   string `json:"artifact_digest"`
 }
 
 type Baseline struct {
@@ -172,11 +174,11 @@ func SelectLatestStable(component, metadataSource, metadataSnapshotDigest string
 	}, nil
 }
 
-// SelectDistroPackage accepts only the single candidate resolved by apt for the
-// exact qualified OS/repository snapshot; publication timestamps are not used
-// as Debian package-version authority.
-func SelectDistroPackage(component, metadataSource, metadataSnapshotDigest, osProfileDigest string, cutoff time.Time, candidates []DistroPackageCandidate) (Selection, error) {
-	if !componentPattern.MatchString(component) || !canonicalHTTPSURL(metadataSource) || !validDigest(metadataSnapshotDigest) || !validDigest(osProfileDigest) || !exactUTCSecond(cutoff) {
+// SelectDistroPackage accepts only the single candidate resolved by APT for
+// the signed capability/repository snapshot; publication timestamps are not
+// used as Debian package-version authority.
+func SelectDistroPackage(component, metadataSource, metadataSnapshotDigest, capabilityContractDigest string, cutoff time.Time, candidates []DistroPackageCandidate) (Selection, error) {
+	if !componentPattern.MatchString(component) || !canonicalHTTPSURL(metadataSource) || !validDigest(metadataSnapshotDigest) || !validDigest(capabilityContractDigest) || !exactUTCSecond(cutoff) {
 		return Selection{}, fmt.Errorf("distribution package selection authority is invalid")
 	}
 	var selected *DistroPackageCandidate
@@ -196,7 +198,7 @@ func SelectDistroPackage(component, metadataSource, metadataSnapshotDigest, osPr
 	if selected == nil {
 		return Selection{}, fmt.Errorf("qualified repository did not resolve an exact package candidate")
 	}
-	return Selection{Component: component, SourceKind: SourceDistroRepository, SelectedVersion: selected.Version, LatestStableVersion: selected.Version, LatestStablePublishedAt: cutoff, MetadataSource: metadataSource, MetadataSnapshotDigest: metadataSnapshotDigest, OSProfileDigest: osProfileDigest, ArtifactIdentity: selected.ArtifactIdentity, ArtifactDigest: selected.ArtifactDigest}, nil
+	return Selection{Component: component, SourceKind: SourceDistroRepository, SelectedVersion: selected.Version, LatestStableVersion: selected.Version, LatestStablePublishedAt: cutoff, MetadataSource: metadataSource, MetadataSnapshotDigest: metadataSnapshotDigest, CapabilityContractDigest: capabilityContractDigest, OSProfileDigest: capabilityContractDigest, ArtifactIdentity: selected.ArtifactIdentity, ArtifactDigest: selected.ArtifactDigest}, nil
 }
 
 func validateSelection(selection Selection, cutoff time.Time) error {
@@ -210,7 +212,11 @@ func validateSelection(selection Selection, cutoff time.Time) error {
 		}
 	case SourceDistroRepository:
 		packageName, packageVersion, ok := parsePackageIdentity(selection.ArtifactIdentity)
-		if selection.OperatingSystem != "" || selection.Architecture != "" || !validDigest(selection.OSProfileDigest) || !ok || packageName != selection.Component || packageVersion != selection.SelectedVersion || floating(selection.ArtifactIdentity) {
+		contractDigest := selection.CapabilityContractDigest
+		if contractDigest == "" {
+			contractDigest = selection.OSProfileDigest
+		}
+		if selection.OperatingSystem != "" || selection.Architecture != "" || !validDigest(contractDigest) || !ok || packageName != selection.Component || packageVersion != selection.SelectedVersion || floating(selection.ArtifactIdentity) {
 			return fmt.Errorf("distribution package identity, version, or qualified OS profile is invalid")
 		}
 	}
@@ -262,6 +268,12 @@ func canonicalHTTPSURL(value string) bool {
 	return parsed.String() == value
 }
 
+func ValidateForCapabilityContract(baseline Baseline, capabilityContractDigest, nginxVersion string) error {
+	return ValidateForOSProfile(baseline, capabilityContractDigest, nginxVersion)
+}
+
+// ValidateForOSProfile is retained for old callers; the digest is now the
+// signed host capability contract digest.
 func ValidateForOSProfile(baseline Baseline, osProfileDigest, nginxVersion string) error {
 	if err := ValidateBaseline(baseline); err != nil {
 		return fmt.Errorf("dependency baseline is invalid")

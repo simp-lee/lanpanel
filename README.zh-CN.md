@@ -23,14 +23,15 @@ LanPanel 是一个面向个人和相互信任小团队的自托管 Linux 主机�
 
 ### 1. 准备主机
 
-目前支持已签名 Profile 覆盖的 Debian 或 Ubuntu amd64（x86_64）主机，当前优先验证 Debian 12/13 和 Ubuntu 22.04/24.04/26.04，并要求：
+目前支持满足签名 Host Capability Contract 的 Linux amd64（x86_64）主机，并要求：
 
-- 使用 `systemd`、完整 unified cgroup v2、可用的 `cgroup.kill`、systemd delegation 以及 `apt/dpkg`；
+- PID 1 使用 `systemd`，具备完整 unified cgroup v2、`cgroup.kill` 以及有效的 systemd delegation；
+- `apt/dpkg` 软件包状态健康，并能从签名验证的 APT 源获得 Nginx（最低版本 `1.18.0`）；
 - 具备 root 或可用的 `sudo` 权限；
 - APT 镜像启用签名校验，软件包状态正常；
 - 有足够的磁盘空间和可用端口。
 
-安装器会在修改主机前检查发行版家族、软件包、端口、文件系统以及 Nginx 的所有权和配置。签名发布包为支持的 Debian/Ubuntu 家族各携带一份包 Profile；发行版版本号本身不是兼容性白名单。其他发行版、ARM64、没有匹配签名家族 Profile 的主机，以及未通过能力检查的主机不受支持。
+安装器会在修改主机前检查能力契约、软件包、端口、文件系统以及 Nginx 的所有权和配置。发行版名称和版本号不是兼容性白名单。其他架构、不具备必要能力的主机，以及未通过这些检查的主机不受支持。
 
 安装不要求提前执行 ACME 或 DNS 操作。只有在之后发布域名 HTTPS 应用时，才需要准备域名、DNS 和对应的 80/443 网络访问条件。
 

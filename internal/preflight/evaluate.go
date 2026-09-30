@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"fmt"
+	"lanpanel/internal/debianversion"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -33,12 +34,39 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 		findings = append(findings, Finding{Code: code, Disposition: disposition, Summary: summary, Identity: identity})
 	}
 	add("architecture", observed.OperatingSystem == "linux" && observed.Architecture == request.Profile.Architecture && observed.Architecture == "amd64", "exact Linux amd64 architecture", observed.OperatingSystem+"/"+observed.Architecture)
-	profileMatches := observed.Platform.ID == request.Profile.ID && observed.Platform.VersionID != ""
-	add("os_profile", profileMatches, "authorized OS family profile", observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
-	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode && observed.CgroupMountpoint == "/sys/fs/cgroup" && observed.CgroupMountRoot == "/"
-	add("managed_confinement", confinementMatches, "complete unified cgroup v2 topology required for baseline isolation", observed.KernelRelease+"/"+observed.CgroupMode+"/"+observed.CgroupMountpoint+"/"+observed.CgroupMountRoot)
-	add("cgroup_kill", observed.CgroupKillAvailable, "cgroup.kill is required for proven child closure", boolIdentity(observed.CgroupKillAvailable))
-	add("systemd_delegation", observed.SystemdDelegation.Available, "systemd delegation is required for managed child cgroups", observed.SystemdDelegation.Identity)
+	contractMatches := request.Profile.ID != "" && observed.Platform.ID != ""
+	add("host_capability_contract", contractMatches, "host capability contract identity", request.Profile.ID+"/"+observed.Platform.ID+"/"+observed.Platform.VersionID+"/"+request.Profile.Authority.Digest)
+	confinementMatches := observed.CgroupMode == request.Profile.ManagedConfinement.CgroupMode && observed.CgroupMountpoint != "" && observed.CgroupMountRoot == "/"
+	confinementSummary := "unified cgroup v2 is available"
+	if !confinementMatches {
+		confinementSummary = "unified cgroup v2 is not available"
+	}
+	add("managed_confinement", confinementMatches, confinementSummary, observed.KernelRelease+"/"+observed.CgroupMode+"/"+observed.CgroupMountpoint+"/"+observed.CgroupMountRoot)
+	cgroupKillSummary := "cgroup.kill is available"
+	if !observed.CgroupKillAvailable {
+		cgroupKillSummary = "cgroup.kill is missing"
+	}
+	add("cgroup_kill", observed.CgroupKillAvailable, cgroupKillSummary, boolIdentity(observed.CgroupKillAvailable))
+	delegationSummary := "LanPanel helper delegation is effective"
+	if !observed.SystemdDelegation.Available {
+		delegationSummary = "LanPanel helper delegation is not effective"
+	}
+	add("systemd_delegation", observed.SystemdDelegation.Available, delegationSummary, observed.SystemdDelegation.Identity)
+	if request.Profile.ServiceManager != "" {
+		add("service_manager", request.Profile.ServiceManager == "systemd" && observed.Systemd.Available && observed.Systemd.Identity != "", "systemd service manager", observed.Systemd.Identity)
+	}
+	if request.Profile.PackageManager != "" {
+		add("package_manager", request.Profile.PackageManager == "apt-dpkg" && observed.APT.Available && observed.DPKG.Available, "APT/dpkg package manager", observed.APT.Identity+"/"+observed.DPKG.Identity)
+	}
+	if request.Profile.NginxPackage != "" {
+		minimum := request.Profile.NginxVersionMinimum
+		nginxOK := request.Profile.NginxPackage == "nginx" && observed.Packages.NginxVersion != "" && debianversion.Satisfies(observed.Packages.NginxVersion, minimum, request.Profile.NginxVersionMaximum)
+		nginxSummary := "Nginx candidate satisfies the signed minimum version"
+		if !nginxOK {
+			nginxSummary = "no nginx candidate satisfies the signed minimum version"
+		}
+		add("nginx_candidate", nginxOK, nginxSummary, request.Profile.NginxPackage+"="+observed.Packages.NginxVersion)
+	}
 	clockOK := !request.LastTrustedWall.IsZero() && observed.Clock.Synchronized && !observed.Clock.Now.Before(request.LastTrustedWall)
 	add("trusted_clock", clockOK, "trusted synchronized wall clock without regression", observed.Clock.Source)
 	add("root_executor", observed.ExecutorUID == 0, "actual mutation executor is root", strconv.FormatUint(uint64(observed.ExecutorUID), 10))
@@ -46,7 +74,11 @@ func EvaluateExpansion(request ExpansionRequest, observed ExpansionObservations)
 	add("apt", observed.APT.Available && observed.APT.Identity != "", "apt capability and identity", observed.APT.Identity)
 	add("dpkg", observed.DPKG.Available && observed.DPKG.Identity != "", "dpkg capability and identity", observed.DPKG.Identity)
 	packageReady := observed.Packages.Ready && observed.Packages.Identity != ""
-	add("package_state", packageReady, "apt/dpkg state is ready", observed.Packages.Identity+"/"+observed.Packages.Reason)
+	packageSummary := "apt/dpkg package state is healthy"
+	if !packageReady {
+		packageSummary = "apt/dpkg package state is not healthy"
+	}
+	add("package_state", packageReady, packageSummary, observed.Packages.Identity+"/"+observed.Packages.Reason)
 
 	if len(observed.DNS) != len(request.Domains) {
 		add("dns", false, "complete exact DNS observations", fmt.Sprintf("observed=%d/required=%d", len(observed.DNS), len(request.Domains)))
@@ -174,7 +206,7 @@ func validManagedConfinement(profile ManagedConfinementProfile) bool {
 }
 
 func validProfileAuthority(profile ExpectedProfile) bool {
-	return profile.ID != "" && profile.ID == strings.ToLower(profile.ID) && profile.VersionID != "" && !strings.ContainsAny(profile.ID+profile.VersionID, "\x00\r\n") && validDigest(profile.Authority.Digest) && profile.Authority.Kind == PreviewProfile
+	return profile.ID != "" && profile.ID == strings.ToLower(profile.ID) && !strings.ContainsAny(profile.ID+profile.VersionID+profile.ServiceManager+profile.PackageManager+profile.NginxPackage+profile.NginxService, "\x00\r\n") && validDigest(profile.Authority.Digest) && profile.Authority.Kind == PreviewProfile
 }
 
 func requiredListeners(request ExpansionRequest) []ListenerRequirement {

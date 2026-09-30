@@ -67,8 +67,12 @@ type ProfileAuthority struct {
 
 type ExpectedProfile struct {
 	ID                    string                    `json:"id"`
-	VersionID             string                    `json:"version_id"`
+	VersionID             string                    `json:"version_id,omitempty"`
 	Architecture          string                    `json:"architecture"`
+	ServiceManager        string                    `json:"service_manager,omitempty"`
+	PackageManager        string                    `json:"package_manager,omitempty"`
+	NginxPackage          string                    `json:"nginx_package,omitempty"`
+	NginxService          string                    `json:"nginx_service,omitempty"`
 	SystemdVersion        string                    `json:"systemd_version"`
 	SystemdVersionMinimum string                    `json:"systemd_version_minimum,omitempty"`
 	SystemdVersionMaximum string                    `json:"systemd_version_maximum,omitempty"`
@@ -357,7 +361,16 @@ func ValidateFreshResult(result Result, now time.Time) error {
 		return err
 	}
 	if !result.Allowed {
-		return fmt.Errorf("preflight is blocked")
+		blocked := make([]string, 0)
+		for _, finding := range result.Findings {
+			if finding.Disposition == FindingBlocked {
+				blocked = append(blocked, "blocked: "+finding.Code+": "+finding.Summary+" ("+finding.Identity+")")
+			}
+		}
+		if len(blocked) == 0 {
+			return fmt.Errorf("preflight is blocked")
+		}
+		return fmt.Errorf("preflight blocked: %s", strings.Join(blocked, "; "))
 	}
 	if now.Before(result.ObservedAt) || now.After(result.ValidUntil) {
 		return fmt.Errorf("preflight result is stale")

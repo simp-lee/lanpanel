@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	cgroupfs "lanpanel/internal/cgroup"
 	"lanpanel/internal/child"
 	"lanpanel/internal/confinement"
 	"lanpanel/internal/domain"
@@ -98,9 +99,19 @@ func LoadConfinementProfile() (confinement.Profile, error) {
 	if err := confinement.ValidateProfile(profile); err != nil {
 		return confinement.Profile{}, err
 	}
-	data, err = os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
-	if err != nil || len(data) == 0 {
-		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 authority unavailable")
+	topology, err := cgroupfs.Discover()
+	if err != nil {
+		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 authority unavailable: %w", err)
+	}
+	if topology.Root != "/" {
+		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 authority is not rooted at /")
+	}
+	data, err = os.ReadFile(filepath.Join(topology.Mountpoint, "cgroup.controllers"))
+	if err != nil {
+		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 controllers unavailable: %w", err)
+	}
+	if len(data) == 0 {
+		return confinement.Profile{}, fmt.Errorf("unified cgroup v2 controllers are empty")
 	}
 	return profile, nil
 }

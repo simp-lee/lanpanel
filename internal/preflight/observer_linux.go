@@ -36,8 +36,10 @@ type LinuxPaths struct {
 	SystemdPID1             string
 	SystemdExecutable       string
 	SystemdControl          string
+	SystemdRun              string
 	SystemdHelperUnit       string
 	APTExecutable           string
+	APTCacheExecutable      string
 	DPKGExecutable          string
 	TCP                     string
 	TCP6                    string
@@ -46,10 +48,11 @@ type LinuxPaths struct {
 }
 
 type LinuxObserver struct {
-	paths       LinuxPaths
-	packageRead func(context.Context) (PackageObservation, error)
-	now         func() time.Time
-	strictRoot  bool
+	paths           LinuxPaths
+	packageRead     func(context.Context) (PackageObservation, error)
+	now             func() time.Time
+	strictRoot      bool
+	delegationProbe func(context.Context) ComponentObservation
 }
 
 type HostCapabilities struct {
@@ -92,7 +95,7 @@ func NewLinuxObserver(packageRead func(context.Context) (PackageObservation, err
 	if packageRead == nil {
 		return nil, fmt.Errorf("preflight requires the shared apt/dpkg readiness observer")
 	}
-	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", CgroupHybridControllers: "/sys/fs/cgroup/unified/cgroup.controllers", CgroupMountInfo: "/proc/self/mountinfo", CgroupCurrent: "/proc/self/cgroup", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", SystemdExecutable: "/usr/bin/systemd", SystemdControl: "/usr/bin/systemctl", SystemdHelperUnit: "/etc/systemd/system/lanpanel-helper.service", APTExecutable: "/usr/bin/apt-get", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true}, nil
+	return &LinuxObserver{paths: LinuxPaths{OSRelease: "/etc/os-release", KernelRelease: "/proc/sys/kernel/osrelease", CgroupControllers: "/sys/fs/cgroup/cgroup.controllers", CgroupHybridControllers: "/sys/fs/cgroup/unified/cgroup.controllers", CgroupMountInfo: "/proc/self/mountinfo", CgroupCurrent: "/proc/self/cgroup", SystemdRoot: "/run/systemd/system", SystemdPID1: "/proc/1/comm", SystemdExecutable: "/usr/bin/systemd", SystemdControl: "/usr/bin/systemctl", SystemdRun: "/usr/bin/systemd-run", SystemdHelperUnit: "/etc/systemd/system/lanpanel-helper.service", APTExecutable: "/usr/bin/apt-get", APTCacheExecutable: "/usr/bin/apt-cache", DPKGExecutable: "/usr/bin/dpkg", TCP: "/proc/net/tcp", TCP6: "/proc/net/tcp6", UDP: "/proc/net/udp", UDP6: "/proc/net/udp6"}, packageRead: packageRead, now: func() time.Time { return time.Now().UTC() }, strictRoot: true, delegationProbe: activeDelegationProbe}, nil
 }
 
 func newTestLinuxObserver(paths LinuxPaths, packageRead func(context.Context) (PackageObservation, error), now func() time.Time) *LinuxObserver {
@@ -114,7 +117,7 @@ func (observer *LinuxObserver) observeHostCapabilities() (HostCapabilities, erro
 	if err != nil {
 		return HostCapabilities{}, err
 	}
-	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities()
+	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities(false)
 	if err != nil {
 		return HostCapabilities{}, err
 	}
@@ -146,7 +149,7 @@ func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (Ins
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities()
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(true)
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
@@ -167,7 +170,7 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 		observed  string
 	}{
 		{"architecture", expected.Architecture, observed.Architecture},
-		{"os_family", expected.ID, observed.Platform.ID},
+		{"host_platform_identity", "true", boolIdentity(observed.Platform.ID != "")},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
 		{"cgroup_mountpoint", "/sys/fs/cgroup", observed.CgroupMountpoint},
 		{"cgroup_mount_root", "/", observed.CgroupMountRoot},
@@ -401,7 +404,7 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities()
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(false)
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
@@ -424,6 +427,14 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	packages, err := observer.packageRead(ctx)
 	if err != nil {
 		return ExpansionObservations{}, err
+	}
+	if packages.NginxVersion == "" && observer.strictRoot {
+		candidate, candidateErr := observeAptCandidate(observer.paths.APTCacheExecutable, "nginx")
+		if candidateErr == nil {
+			packages.NginxVersion = candidate
+		} else {
+			packages.Reason = "nginx_candidate_unavailable: " + candidateErr.Error()
+		}
 	}
 	dns, err := observer.ObserveDNS(ctx, request.Domains)
 	if err != nil {
@@ -483,7 +494,7 @@ type cgroupMount struct {
 	Mountpoint string
 }
 
-func (observer *LinuxObserver) observeManagedCapabilities() (string, string, string, bool, ComponentObservation, error) {
+func (observer *LinuxObserver) observeManagedCapabilities(requireHelper bool) (string, string, string, bool, ComponentObservation, error) {
 	mountpoint, mountRoot, mode, err := observer.observeCgroupTopology()
 	if err != nil {
 		return "", "", "", false, ComponentObservation{}, err
@@ -496,7 +507,7 @@ func (observer *LinuxObserver) observeManagedCapabilities() (string, string, str
 			return "", "", "", false, ComponentObservation{}, probeErr
 		}
 	}
-	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable)
+	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable, requireHelper)
 	return mode, mountpoint, mountRoot, killAvailable, delegation, nil
 }
 
@@ -528,6 +539,9 @@ func (observer *LinuxObserver) observeCgroupTopology() (string, string, string, 
 	if err != nil {
 		return "", "", "", fmt.Errorf("observe cgroup mount topology: %w", err)
 	}
+	if hasLegacyCgroupMount(string(data)) {
+		return "", "", "hybrid_v2", nil
+	}
 	mounts, err := parseCgroup2Mounts(string(data))
 	if err != nil {
 		return "", "", "", fmt.Errorf("parse cgroup mount topology: %w", err)
@@ -535,16 +549,13 @@ func (observer *LinuxObserver) observeCgroupTopology() (string, string, string, 
 	if len(mounts) == 0 {
 		return "", "", "not_unified_v2", nil
 	}
-	expectedMountpoint := observer.paths.CgroupMountpoint
-	if expectedMountpoint == "" {
-		expectedMountpoint = "/sys/fs/cgroup"
-	}
 	var selected *cgroupMount
 	for index := range mounts {
-		if mounts[index].Mountpoint == expectedMountpoint && mounts[index].Root == "/" {
-			selected = &mounts[index]
-			break
+		if mounts[index].Root != "/" || observer.paths.CgroupMountpoint != "" && mounts[index].Mountpoint != observer.paths.CgroupMountpoint {
+			continue
 		}
+		selected = &mounts[index]
+		break
 	}
 	if selected == nil || len(mounts) != 1 {
 		return "", "", "hybrid_v2", nil
@@ -557,6 +568,17 @@ func (observer *LinuxObserver) observeCgroupTopology() (string, string, string, 
 		return selected.Mountpoint, selected.Root, "hybrid_v2", nil
 	}
 	return selected.Mountpoint, selected.Root, "unified_v2", nil
+}
+
+func hasLegacyCgroupMount(data string) bool {
+	for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+		fields := strings.Fields(line)
+		separator := slices.Index(fields, "-")
+		if separator >= 0 && separator+1 < len(fields) && fields[separator+1] == "cgroup" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseCgroup2Mounts(data string) ([]cgroupMount, error) {
@@ -600,13 +622,15 @@ func unescapeMountInfoPath(value string) (string, error) {
 	return output.String(), nil
 }
 
-func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool) ComponentObservation {
-	expectedMountpoint := observer.paths.CgroupMountpoint
-	if expectedMountpoint == "" {
-		expectedMountpoint = "/sys/fs/cgroup"
-	}
-	if mode != "unified_v2" || mountpoint != expectedMountpoint || !cgroupDelegation {
+func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool, requireHelper bool) ComponentObservation {
+	if mode != "unified_v2" || mountpoint == "" || !cgroupDelegation {
 		return ComponentObservation{Identity: "cgroup delegation unavailable: " + mode}
+	}
+	if observer.paths.SystemdPID1 != "" {
+		pid1, pid1Err := readBoundedProcFile(observer.paths.SystemdPID1, 128)
+		if pid1Err != nil || strings.TrimSpace(string(pid1)) != "systemd" {
+			return ComponentObservation{Identity: "systemd is not PID 1"}
+		}
 	}
 	data, err := exec.Command(observer.paths.SystemdExecutable, "--version").Output()
 	if err != nil {
@@ -620,18 +644,31 @@ func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string,
 	if err != nil || major < 218 {
 		return ComponentObservation{Identity: "systemd Delegate= unsupported"}
 	}
-	if observer.paths.SystemdHelperUnit != "" {
+	if observer.delegationProbe != nil {
+		probeContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		probe := observer.delegationProbe(probeContext)
+		cancel()
+		if !probe.Available {
+			return probe
+		}
+	}
+	if requireHelper {
 		unit, unitErr := os.ReadFile(observer.paths.SystemdHelperUnit)
-		if unitErr == nil {
-			if !strings.Contains(string(unit), "\\nDelegate=yes\\n") {
-				return ComponentObservation{Identity: "lanpanel-helper.service lacks Delegate=yes"}
+		if unitErr != nil {
+			return ComponentObservation{Identity: "lanpanel-helper.service is missing"}
+		}
+		delegate := false
+		for _, line := range strings.Split(string(unit), "\n") {
+			if strings.TrimSpace(line) == "Delegate=yes" {
+				delegate = true
 			}
-			if observer.paths.SystemdControl != "" {
-				show, showErr := exec.Command(observer.paths.SystemdControl, "show", "--property=Delegate", "--value", "lanpanel-helper.service").Output()
-				if showErr != nil || strings.TrimSpace(string(show)) != "yes" {
-					return ComponentObservation{Identity: "effective lanpanel-helper.service delegation is not yes"}
-				}
-			}
+		}
+		if !delegate {
+			return ComponentObservation{Identity: "lanpanel-helper.service lacks Delegate=yes"}
+		}
+		show, showErr := exec.Command(observer.paths.SystemdControl, "show", "--property=Delegate", "--value", "lanpanel-helper.service").Output()
+		if showErr != nil || strings.TrimSpace(string(show)) != "yes" {
+			return ComponentObservation{Identity: "effective lanpanel-helper.service delegation is not yes"}
 		}
 	}
 	return ComponentObservation{Available: true, Identity: fmt.Sprintf("systemd/%d Delegate=yes", major)}
@@ -890,6 +927,31 @@ func observeDisk(path string) (DiskObservation, error) {
 		}
 		probe = parent
 	}
+}
+
+func observeAptCandidate(path, packageName string) (string, error) {
+	if path == "" {
+		path = "/usr/bin/apt-cache"
+	}
+	output, err := exec.Command(path, "policy", packageName).Output()
+	if err != nil {
+		return "", fmt.Errorf("apt-cache policy %s: %w", packageName, err)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Candidate:") {
+			candidate := strings.TrimSpace(strings.TrimPrefix(line, "Candidate:"))
+			if candidate == "" || candidate == "(none)" || !concretePackageVersion(candidate) {
+				break
+			}
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("APT has no candidate for %s", packageName)
+}
+
+func concretePackageVersion(value string) bool {
+	return value != "" && !strings.ContainsAny(value, " \t\r\n") && !strings.EqualFold(value, "latest") && !strings.EqualFold(value, "stable")
 }
 
 func observeExecutableComponent(path string) (ComponentObservation, error) {

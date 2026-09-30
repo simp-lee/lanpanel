@@ -10,6 +10,7 @@ import (
 	"lanpanel/internal/helper"
 	"lanpanel/internal/nginxguard"
 	"lanpanel/internal/packages"
+	"lanpanel/internal/preflight"
 	managedprocess "lanpanel/internal/process"
 	"lanpanel/internal/relay"
 	"lanpanel/internal/renewal"
@@ -63,6 +64,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 		{Name: roles.ReloadGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunReloadGuard(args) }},
 		{Name: roles.RuntimeGuard, Handler: func(args []string, _, _ io.Writer) error { return bootstrap.RunRuntimeGuard(args) }},
 		{Name: roles.ManagedExecutor, Handler: func(args []string, _, _ io.Writer) error { return managedprocess.Execute(args) }},
+		{Name: roles.DelegationProbe, Handler: func(args []string, _, _ io.Writer) error {
+			if len(args) != 0 {
+				return fmt.Errorf("delegation probe does not accept arguments")
+			}
+			return preflight.RunDelegationProbeChild()
+		}},
 		{Name: roles.HeadscalePrivateProbe, Handler: func(args []string, _, _ io.Writer) error { return control.RunPrivateProbe(args) }},
 		{Name: roles.HeadscaleControlRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunControlRelay(args) }},
 		{Name: roles.HeadscaleSTUNRelay, Handler: func(args []string, _, _ io.Writer) error { return control.RunSTUNRelay(args) }},

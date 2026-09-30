@@ -23,14 +23,15 @@ LanPanel is a self-hosted Linux host manager for individuals and mutually truste
 
 ### 1. Prepare the host
 
-The current release supports qualified Debian or Ubuntu amd64 (x86_64) profiles, with Debian 12/13 and Ubuntu 22.04/24.04/26.04 as the current qualification targets, with:
+The current release supports Linux amd64 (x86_64) hosts that satisfy the signed Host Capability Contract:
 
-- `systemd`, complete unified cgroup v2 with `cgroup.kill` and systemd delegation, and `apt/dpkg`;
+- `systemd` as PID 1, complete unified cgroup v2 with `cgroup.kill`, and effective systemd delegation;
+- `apt/dpkg` with a healthy package database and a signed APT candidate for Nginx (minimum `1.18.0`);
 - root or usable `sudo` access;
 - an APT mirror with signature verification enabled and a healthy package state;
 - enough disk space and available ports.
 
-Before changing the host, the installer checks the OS family, packages, ports, filesystem, and Nginx ownership/configuration. The signed release carries one package profile per supported Debian/Ubuntu family; the distribution release number is not itself an allowlist. Other distributions, ARM64, hosts without a matching signed family profile, and hosts that fail these capability checks are unsupported.
+Before changing the host, the installer checks the capability contract, packages, ports, filesystem, and Nginx ownership/configuration. The distribution name and release number are not compatibility allowlists. Other architectures, hosts without the required capabilities, and hosts that fail these checks are unsupported.
 
 Installation does not require ACME or DNS operations in advance. You only need a domain, DNS, and the relevant 80/443 network access when you later publish a domain-based HTTPS application.
 

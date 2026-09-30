@@ -163,24 +163,34 @@ func SelectSupportedProfile(manifestBytes []byte, osID, versionID, architecture 
 }
 
 func selectSupportedProfile(manifest ReleaseManifest, observed PublicInstallObservation) (SupportedOSProfile, error) {
-	if observed.OSID == "" || observed.OSVersionID == "" || observed.Architecture == "" {
-		return SupportedOSProfile{}, fmt.Errorf("install host platform observation is missing")
+	if observed.Architecture == "" {
+		return SupportedOSProfile{}, fmt.Errorf("install host architecture observation is missing")
 	}
-	var selected SupportedOSProfile
-	for _, candidate := range manifest.SupportedProfiles {
-		profile := candidate.Profile
-		if profile.Family != observed.OSID || profile.Architecture != observed.Architecture {
+	var familyMatch, genericMatch *SupportedOSProfile
+	for index := range manifest.SupportedProfiles {
+		candidate := &manifest.SupportedProfiles[index]
+		if candidate.Profile.Architecture != observed.Architecture {
 			continue
 		}
-		if selected.Profile.ID != "" {
-			return SupportedOSProfile{}, fmt.Errorf("release contains duplicate family profiles")
+		if observed.OSID != "" && candidate.Profile.Family == observed.OSID {
+			if familyMatch != nil {
+				return SupportedOSProfile{}, fmt.Errorf("release contains duplicate legacy family contracts")
+			}
+			familyMatch = candidate
+		} else if candidate.Profile.Family == "" {
+			if genericMatch != nil {
+				return SupportedOSProfile{}, fmt.Errorf("release contains duplicate generic capability contracts")
+			}
+			genericMatch = candidate
 		}
-		selected = candidate
 	}
-	if selected.Profile.ID == "" {
-		return SupportedOSProfile{}, fmt.Errorf("release does not support host family %s/%s", observed.OSID, observed.Architecture)
+	if familyMatch != nil {
+		return *familyMatch, nil
 	}
-	return selected, nil
+	if genericMatch != nil {
+		return *genericMatch, nil
+	}
+	return SupportedOSProfile{}, fmt.Errorf("release contains no host capability contract for architecture %s", observed.Architecture)
 }
 
 func decodeDependencyAuthority(data []byte, expectedDigest, profileID string) (DependencyAuthority, error) {

@@ -24,8 +24,8 @@ func observePublicPlatform() (preflight.PlatformInfo, error) {
 		return preflight.PlatformInfo{}, fmt.Errorf("read host OS profile: %w", err)
 	}
 	platform := preflight.ParseOSRelease(string(data))
-	if platform.ID == "" || platform.VersionID == "" {
-		return preflight.PlatformInfo{}, fmt.Errorf("host OS profile is incomplete")
+	if platform.ID == "" {
+		return preflight.PlatformInfo{}, fmt.Errorf("host platform identity is incomplete")
 	}
 	return platform, nil
 }
@@ -210,11 +210,12 @@ func bindPublicPackagePlan(template packages.Plan, identityValue release.Install
 	plan.JobID = "job_" + release.DigestBytes([]byte(material.AttemptID+"\x00job"))
 	plan.IntentGeneration = result.Generation
 	plan.Deadline = now.UTC().Add(plan.TotalTimeout)
+	plan.CapabilityContractDigest = identityValue.ProfileDigest
 	plan.OSProfileDigest = identityValue.ProfileDigest
 	plan.NoAutostartPolicyDigest = identityValue.Binary.Digest
 	plan.PreflightDigest = resultDigest
 	plan.PreflightRequestDigest = result.RequestDigest
-	plan.Authority = packages.Authority{Kind: packages.PreviewProfile, ReleaseAuthorityDigest: releaseDigest, BinaryDigest: identityValue.Binary.Digest, HostFingerprint: identityValue.HostFingerprint, TargetOSProfileDigest: identityValue.ProfileDigest}
+	plan.Authority = packages.Authority{Kind: packages.PreviewProfile, ReleaseAuthorityDigest: releaseDigest, BinaryDigest: identityValue.Binary.Digest, HostFingerprint: identityValue.HostFingerprint, TargetCapabilityContractDigest: identityValue.ProfileDigest, TargetOSProfileDigest: identityValue.ProfileDigest}
 	if err := packages.ValidatePlan(plan); err != nil {
 		return packages.Plan{}, err
 	}

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	cgroupfs "lanpanel/internal/cgroup"
 	"lanpanel/internal/child"
 	"lanpanel/internal/filetxn"
 	"net/url"
@@ -52,13 +53,21 @@ func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 		return nil, fmt.Errorf("package auditor requires the typed child launcher")
 	}
 	procRoot := filepath.Join("/proc", strconv.Itoa(os.Getpid()), "net")
-	paths := []string{"/etc/apt", "/etc/dpkg", "/usr/share/keyrings", "/var/lib/apt/lists", "/var/lib/dpkg", "/sys/fs/cgroup/system.slice", procRoot, "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
+	topology, err := cgroupfs.Discover()
+	if err != nil {
+		return nil, fmt.Errorf("package auditor requires a unified cgroup v2 hierarchy: %w", err)
+	}
+	if topology.Root != "/" {
+		return nil, fmt.Errorf("package auditor requires a cgroup v2 hierarchy rooted at /")
+	}
+	cgroupRoot := filepath.Join(topology.Mountpoint, "system.slice")
+	paths := []string{"/etc/apt", "/etc/dpkg", "/usr/share/keyrings", "/var/lib/apt/lists", "/var/lib/dpkg", cgroupRoot, procRoot, "/usr/sbin", filepath.Dir(child.FixedLanPanelExecutable), FixedSystemdMaskDirectory}
 	for _, path := range paths {
 		if err := validateAuditorParent(path); err != nil {
 			return nil, err
 		}
 	}
-	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: procRoot, policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
+	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: cgroupRoot, procRoot: procRoot, policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
 }
 
 func newTestLinuxAuditor(launcher ChildLauncher, root string) *LinuxAuditor {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"lanpanel/internal/cgroup"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,7 +46,14 @@ func currentUnifiedCgroupPath() (string, error) {
 	if path == "" || filepath.Clean(path) != path || !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
 		return "", fmt.Errorf("helper requires unified cgroup identity")
 	}
-	return filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(path, "/")), nil
+	topology, err := cgroup.Discover()
+	if err != nil {
+		return "", err
+	}
+	if topology.Root != "/" {
+		return "", fmt.Errorf("helper requires a unified cgroup v2 hierarchy rooted at /")
+	}
+	return filepath.Join(topology.Mountpoint, strings.TrimPrefix(path, "/")), nil
 }
 
 func createInvocationCgroup(name string, pid int) (*invocationCgroup, error) {
@@ -187,7 +195,11 @@ func ObserveExclusiveCurrentCgroup() (string, error) {
 	if !seen {
 		return "", fmt.Errorf("helper cgroup omits current process")
 	}
-	path := strings.TrimPrefix(parent, "/sys/fs/cgroup")
+	topology, err := cgroup.Discover()
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimPrefix(parent, topology.Mountpoint)
 	if path == "" {
 		path = "/"
 	}

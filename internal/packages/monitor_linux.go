@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	cgroupfs "lanpanel/internal/cgroup"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,7 +23,11 @@ type LinuxMonitor struct {
 }
 
 func NewLinuxMonitor() *LinuxMonitor {
-	return &LinuxMonitor{cgroupRoot: "/sys/fs/cgroup/system.slice", procRoot: "/proc/net", interval: 25 * time.Millisecond}
+	root := ""
+	if topology, err := cgroupfs.Discover(); err == nil && topology.Root == "/" {
+		root = filepath.Join(topology.Mountpoint, "system.slice")
+	}
+	return &LinuxMonitor{cgroupRoot: root, procRoot: "/proc/net", interval: 25 * time.Millisecond}
 }
 
 func newTestLinuxMonitor(cgroupRoot, procRoot string, interval time.Duration) *LinuxMonitor {

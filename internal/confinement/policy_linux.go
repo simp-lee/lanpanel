@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	cgroupfs "lanpanel/internal/cgroup"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -180,10 +181,14 @@ type CgroupObservation struct {
 }
 
 func ObserveCgroup(root, cgroup string) (CgroupObservation, error) {
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || !validManagedCgroup(cgroup) {
+	resolvedRoot, err := cgroupfs.ResolveRoot(root)
+	if err != nil {
+		return CgroupObservation{}, fmt.Errorf("managed-process cgroup identity is invalid: %w", err)
+	}
+	if !filepath.IsAbs(resolvedRoot) || filepath.Clean(resolvedRoot) != resolvedRoot || !validManagedCgroup(cgroup) {
 		return CgroupObservation{}, fmt.Errorf("managed-process cgroup identity is invalid")
 	}
-	path := filepath.Join(root, strings.TrimPrefix(cgroup, "/"))
+	path := filepath.Join(resolvedRoot, strings.TrimPrefix(cgroup, "/"))
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return CgroupObservation{}, err

@@ -32,11 +32,13 @@ const (
 )
 
 type Authority struct {
-	Kind                   AuthorityKind `json:"kind"`
-	ReleaseAuthorityDigest string        `json:"release_authority_digest"`
-	BinaryDigest           string        `json:"binary_digest"`
-	HostFingerprint        string        `json:"host_fingerprint"`
-	TargetOSProfileDigest  string        `json:"target_os_profile_digest"`
+	Kind                           AuthorityKind `json:"kind"`
+	ReleaseAuthorityDigest         string        `json:"release_authority_digest"`
+	BinaryDigest                   string        `json:"binary_digest"`
+	HostFingerprint                string        `json:"host_fingerprint"`
+	TargetCapabilityContractDigest string        `json:"target_capability_contract_digest,omitempty"`
+	// TargetOSProfileDigest is retained for journal replay compatibility.
+	TargetOSProfileDigest string `json:"target_os_profile_digest,omitempty"`
 }
 
 type Package struct {
@@ -72,12 +74,14 @@ type Repository struct {
 }
 
 type Plan struct {
-	TransactionID    string    `json:"transaction_id"`
-	JobID            string    `json:"job_id"`
-	IntentGeneration uint64    `json:"intent_generation"`
-	Deadline         time.Time `json:"deadline"`
-	OSProfileDigest  string    `json:"os_profile_digest"`
-	Mode             Mode      `json:"mode"`
+	TransactionID            string    `json:"transaction_id"`
+	JobID                    string    `json:"job_id"`
+	IntentGeneration         uint64    `json:"intent_generation"`
+	Deadline                 time.Time `json:"deadline"`
+	CapabilityContractDigest string    `json:"capability_contract_digest,omitempty"`
+	// OSProfileDigest is retained for journal replay compatibility.
+	OSProfileDigest string `json:"os_profile_digest,omitempty"`
+	Mode            Mode   `json:"mode"`
 	// Public release plans never persist a proxy; a non-nil in-memory value is
 	// rejected by ValidatePublicReleasePlan and strict decoders reject legacy JSON.
 	Proxy        *sources.Proxy `json:"-"`
@@ -234,7 +238,11 @@ func ValidatePublicReleasePlan(plan Plan) error {
 }
 
 func ValidatePlan(plan Plan) error {
-	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(plan.OSProfileDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
+	contractDigest := plan.CapabilityContractDigest
+	if contractDigest == "" {
+		contractDigest = plan.OSProfileDigest
+	}
+	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(contractDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
 		return fmt.Errorf("package transaction identity, bounds, or OS profile are invalid")
 	}
 	if !digestPattern.MatchString(plan.NoAutostartPolicyDigest) || !strings.HasPrefix(plan.PreflightDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightDigest, "sha256:")) || !strings.HasPrefix(plan.PreflightRequestDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightRequestDigest, "sha256:")) {
@@ -298,7 +306,11 @@ func ValidatePlan(plan Plan) error {
 	if plan.FirstNginxInstall && !hasNginx {
 		return fmt.Errorf("first Nginx package closure omits nginx")
 	}
-	if plan.Authority.Kind != PreviewProfile || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) || plan.Authority.TargetOSProfileDigest != plan.OSProfileDigest {
+	authorityContractDigest := plan.Authority.TargetCapabilityContractDigest
+	if authorityContractDigest == "" {
+		authorityContractDigest = plan.Authority.TargetOSProfileDigest
+	}
+	if plan.Authority.Kind != PreviewProfile || !digestPattern.MatchString(plan.Authority.ReleaseAuthorityDigest) || !digestPattern.MatchString(plan.Authority.BinaryDigest) || !refPattern.MatchString(plan.Authority.HostFingerprint) || authorityContractDigest != contractDigest {
 		return fmt.Errorf("package authority does not match the install identity")
 	}
 	return nil

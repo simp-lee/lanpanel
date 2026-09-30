@@ -1060,8 +1060,8 @@ func validateBootstrapPreflight(releaseIdentity release.InstallIdentity, managem
 	if err := preflight.RequireExpansionResultForRequest(result, request, now); err != nil {
 		return err
 	}
-	if request.Profile.Authority.Digest != "sha256:"+releaseIdentity.ProfileDigest || request.Profile.ID != releaseIdentity.Profile.Family || request.Profile.Architecture != "amd64" {
-		return fmt.Errorf("bootstrap preflight does not bind the selected release profile")
+	if request.Profile.Authority.Digest != "sha256:"+releaseIdentity.ProfileDigest || request.Profile.ID != releaseIdentity.Profile.ID || request.Profile.Architecture != releaseIdentity.Profile.Architecture {
+		return fmt.Errorf("bootstrap preflight does not bind the selected host capability contract")
 	}
 	if len(request.BootstrapListeners) != 1 || request.BootstrapListeners[0].Protocol != "tcp" || request.BootstrapListeners[0].Purpose != "management" || request.BootstrapListeners[0].Address != management.Address || request.BootstrapListeners[0].Port != management.Port {
 		return fmt.Errorf("bootstrap preflight Management listener differs from installation authority")

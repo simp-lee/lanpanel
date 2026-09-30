@@ -134,8 +134,8 @@ func TestVerifyInstalledProfileIgnoresPackageVersionsAndSnapshot(t *testing.T) {
 	}
 	candidate = observed
 	candidate.Platform.ID = "ubuntu"
-	if err := VerifyInstalledProfile(expected, candidate); err == nil || !IsProfileDrift(err) {
-		t.Fatalf("OS family drift was not classified: %v", err)
+	if err := VerifyInstalledProfile(expected, candidate); err != nil {
+		t.Fatalf("OS family change should remain compatible with the capability contract: %v", err)
 	}
 	candidate = observed
 	candidate.Packages.Ready = false

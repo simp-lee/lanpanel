@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	cgroupfs "lanpanel/internal/cgroup"
 	"lanpanel/internal/confinement"
 	"lanpanel/internal/domain"
 	"net/netip"
@@ -316,7 +317,11 @@ func ObserveStopped(ctx context.Context, cgroupRoot string, bundle domain.Proces
 }
 
 func requireStoppedCgroup(cgroupRoot, cgroup string) error {
-	path := filepath.Join(cgroupRoot, strings.TrimPrefix(cgroup, "/"))
+	resolvedRoot, err := cgroupfs.ResolveRoot(cgroupRoot)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(resolvedRoot, strings.TrimPrefix(cgroup, "/"))
 	var stat unix.Stat_t
 	if err := unix.Lstat(path, &stat); errors.Is(err, unix.ENOENT) {
 		return nil

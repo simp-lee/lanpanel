@@ -47,7 +47,7 @@ func main() {
 	var output, profileID, dependencyPath string
 	var packageNames stringList
 	flag.StringVar(&output, "output", "", "output directory")
-	flag.StringVar(&profileID, "profile-id", "", "profile ID, for example debian-amd64")
+	flag.StringVar(&profileID, "profile-id", release.PreviewCapabilityContractID, "host capability contract ID")
 	flag.StringVar(&dependencyPath, "dependency-inputs", "", "resolved dependency-inputs.json")
 	flag.Var(&packageNames, "package", "package to include; may be repeated")
 	flag.Parse()
@@ -68,12 +68,11 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	if err != nil {
 		return err
 	}
-	if runtime.GOARCH != "amd64" || !release.IsSupportedPreviewTarget(release.OSProfile{Family: platform.ID, Release: platform.VersionID, Architecture: runtime.GOARCH}) {
-		return fmt.Errorf("host %s/%s/%s is not a supported Debian or Ubuntu amd64 platform", platform.ID, platform.VersionID, runtime.GOARCH)
+	if runtime.GOARCH != release.PreviewTargetArchitecture || platform.ID == "" || platform.VersionID == "" {
+		return fmt.Errorf("host %s/%s/%s does not provide a usable Linux amd64 platform identity", platform.ID, platform.VersionID, runtime.GOARCH)
 	}
-	expectedProfileID := platform.ID + "-" + runtime.GOARCH
-	if profileID != expectedProfileID {
-		return fmt.Errorf("profile-id %q must identify the host family and architecture", profileID)
+	if profileID != release.PreviewCapabilityContractID {
+		return fmt.Errorf("profile-id %q is not the supported APT/systemd capability contract", profileID)
 	}
 	// Package profiles are build-time package authority. Runtime cgroup and
 	// systemd capability checks belong to installer preflight, so capturing a
@@ -108,12 +107,13 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 		minimum := packageMinimum(name)
 		profilePackages = append(profilePackages, release.PackageTuple{Name: name, Version: record.Version, VersionMinimum: minimum, Architecture: record.Architecture})
 	}
-	profile := release.OSProfile{ID: profileID, Family: platform.ID, Release: platform.VersionID, Architecture: runtime.GOARCH, Packages: profilePackages, ManagedConfinement: confinementProfile()}
+	confinement := confinementProfile()
+	profile := release.HostCapabilityContract{ID: profileID, Architecture: runtime.GOARCH, ServiceManager: "systemd", PackageManager: "apt-dpkg", Nginx: release.NginxCapabilityContract{Package: "nginx", MinimumVersion: "1.18.0", Service: "nginx.service"}, Confinement: release.ConfinementCapabilityContract{UnifiedCgroupV2: true, CgroupKill: true, SystemdDelegate: true}, NginxVersion: packageValues[0].Version, NginxVersionMinimum: "1.18.0", Packages: profilePackages, ManagedConfinement: confinement}
 	profileDigest, err := release.ProfileDigest(profile)
 	if err != nil {
-		return fmt.Errorf("OS profile: %w", err)
+		return fmt.Errorf("host capability contract: %w", err)
 	}
-	plan := packages.Plan{TransactionID: "pkg_" + strings.Repeat("0", 64), JobID: "job_" + strings.Repeat("0", 64), IntentGeneration: 1, Deadline: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), OSProfileDigest: profileDigest, Mode: packages.DistroRepository, Packages: packageValues, FirstNginxInstall: true, LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoAutostartPolicyDigest: strings.Repeat("0", 64), PreflightDigest: "sha256:" + strings.Repeat("0", 64), PreflightRequestDigest: "sha256:" + strings.Repeat("0", 64), Authority: packages.Authority{Kind: packages.PreviewProfile, ReleaseAuthorityDigest: strings.Repeat("0", 64), BinaryDigest: strings.Repeat("0", 64), HostFingerprint: "profile-capture", TargetOSProfileDigest: profileDigest}}
+	plan := packages.Plan{TransactionID: "pkg_" + strings.Repeat("0", 64), JobID: "job_" + strings.Repeat("0", 64), IntentGeneration: 1, Deadline: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), CapabilityContractDigest: profileDigest, OSProfileDigest: profileDigest, Mode: packages.DistroRepository, Packages: packageValues, FirstNginxInstall: true, LockWait: 30 * time.Second, ConnectTimeout: 15 * time.Second, ReadTimeout: 30 * time.Second, TotalTimeout: 2 * time.Minute, NoAutostartPolicyDigest: strings.Repeat("0", 64), PreflightDigest: "sha256:" + strings.Repeat("0", 64), PreflightRequestDigest: "sha256:" + strings.Repeat("0", 64), Authority: packages.Authority{Kind: packages.PreviewProfile, ReleaseAuthorityDigest: strings.Repeat("0", 64), BinaryDigest: strings.Repeat("0", 64), HostFingerprint: "profile-capture", TargetCapabilityContractDigest: profileDigest, TargetOSProfileDigest: profileDigest}}
 	if err := packages.ValidatePublicReleasePlan(plan); err != nil {
 		return fmt.Errorf("package template: %w", err)
 	}
@@ -126,6 +126,9 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 		return err
 	}
 	if err := os.MkdirAll(output, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(output, "host-capability-contract.json"), profileBytes, 0o644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(output, "os-profile.json"), profileBytes, 0o644); err != nil {

@@ -63,7 +63,7 @@ make playwright-fixture-gate
 
 日常应用管理的产品边界是 Management UI，不要为应用管理重新增加 CLI、Shell、任意 `ExecStart` 或未类型化的配置入口。特权操作应继续经过现有的 typed helper；不要复制第二套安装、恢复或卸载流程。
 
-## 依赖和主机 Profile
+## 依赖和 Host Capability Contract
 
 第三方依赖为 GoAccess、Lego、Tailscale 和 Headscale。GoAccess 在 release 构建阶段从固定的官方源码版本编译为静态 amd64 二进制，不使用主机 APT 中的 GoAccess。`release-inputs/dependency-inputs.v2.json` 是经过审查的版本锁定文件；`dist/dependencies/` 是下载和解包目录，必须保持为空后再执行相关命令。
 
@@ -84,22 +84,24 @@ make materialize-preview-dependencies \
 
 `materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
-每个支持的发行版版本都要在干净的 Debian 或 Ubuntu amd64 主机上采集 Profile。目前优先验证 Debian 12/13 和 Ubuntu 22.04/24.04/26.04。OS Profile 是构建期的软件包仓库与版本 authority，可以在对应的临时 VM/CI 镜像中采集，不要求使用客户真实主机；完整 unified cgroup v2、`cgroup.kill` 和 systemd `Delegate=` 只在安装及运行时 preflight 检查。先运行只读检查：
+发布包不为每个 Debian/Ubuntu 版本单独采集 OS Profile。Host Capability Contract 只记录 LanPanel 真正依赖的接口：Linux amd64、systemd、APT/dpkg、Nginx 最低版本，以及 unified cgroup v2、`cgroup.kill` 和 systemd delegation。它可以在任意可用的 APT/dpkg + systemd amd64 临时 VM/CI 镜像中生成一次，不需要使用客户真实主机，也不绑定某个发行版版本或 APT 镜像。
+
+先运行只读检查：
 
 ```sh
-make check-preview-profile-host PREVIEW_PROFILE_TARGET=debian-12
+make check-preview-profile-host PREVIEW_PROFILE_TARGET=capability-host
 ```
 
-然后在已完成依赖物化的环境中采集：
+然后在已完成依赖物化的参考环境中采集：
 
 ```sh
 make capture-preview-profile \
-  PREVIEW_PROFILE_ID=debian-12-amd64 \
-  PREVIEW_PROFILE_OUTPUT_DIR=release-inputs/profiles/debian-12-amd64 \
+  PREVIEW_PROFILE_ID=linux-amd64-apt-dpkg-systemd \
+  PREVIEW_PROFILE_OUTPUT_DIR=release-inputs/profiles/linux-amd64-apt-dpkg-systemd \
   PREVIEW_DEPENDENCY_INPUTS=dist/dependencies/dependency-inputs.json
 ```
 
-Profile 按发行版家族生成：Debian 使用 `PREVIEW_PROFILE_TARGET=debian`、`PREVIEW_PROFILE_ID=debian-amd64`；Ubuntu 使用 `PREVIEW_PROFILE_TARGET=ubuntu`、`PREVIEW_PROFILE_ID=ubuntu-amd64`。Profile 中的 Nginx 约束使用最低版本范围，不绑定某个发行版版本；安装器仍会在目标主机上检查实际 APT/dpkg 和运行能力。检查会验证对应发行版版本、amd64、systemd、APT/dpkg 以及必要软件包；安装器自身还会在真实目标主机上检查 systemd delegation、完整 unified cgroup v2 和 `cgroup.kill`。采集命令只写入 Profile、软件包模板和依赖基线，不绑定某个 APT 镜像。生成结果必须人工审查后再提交。
+采集只读取 APT 候选 Nginx 版本，生成 Host Capability Contract、APT 包模板和依赖基线。发布时 APT/dpkg 仍使用目标主机自身的签名仓库；安装器会在真实目标主机上主动探测 systemd delegation、动态 cgroup v2 mountpoint、`cgroup.kill`、APT/dpkg 状态和 Nginx 最低版本。生成结果必须人工审查后再提交。
 
 ## 本地构建 Preview 发布包
 
@@ -107,7 +109,7 @@ Profile 按发行版家族生成：Debian 使用 `PREVIEW_PROFILE_TARGET=debian`
 
 1. **resolve**：有意查询上游最新依赖并更新锁定文件；
 2. **materialize**：只按锁定文件下载和校验依赖；
-3. **build**：构建 Linux amd64 二进制、源代码归档、Profile 相关文件和依赖清单；
+3. **build**：构建 Linux amd64 二进制、源代码归档、Host Capability Contract 相关文件和依赖清单；
 4. **verify/package**：校验完整发布目录并制作外层归档及 Bootstrap；
 5. **publish**（可选）：上传后重新下载并校验公开文件。
 
@@ -132,7 +134,7 @@ make release-preview \
 
 - `lanpanel` 和对应版本的源代码归档；
 - `release.json`、其 detached Ed25519 签名和 `SHA256SUMS`；
-- `LICENSE`、各 Profile 的软件包模板/依赖清单/依赖基线；
+- `LICENSE`、Host Capability Contract 的软件包模板/依赖清单/依赖基线；
 - 经过版本、来源、大小和 SHA-256 绑定的 Lego、Tailscale、Headscale 资产。
 
 发布构建会校验清单中的路径、文件大小、摘要、源代码树和第三方归档成员。`SHA256SUMS` 不包含 `release.json`、自身和 detached 签名；外层 `lanpanel-<tag>-linux-amd64.tar.gz` 的 SHA-256 单独写入 Bootstrap。任何缺失、篡改、额外文件、非 canonical 清单或脏 worktree 都必须失败。

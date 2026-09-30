@@ -14,15 +14,29 @@ import (
 
 func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfile {
 	confinement := profile.ManagedConfinement
+	nginxPackage, nginxService, nginxMinimum := profile.Nginx.Package, profile.Nginx.Service, profile.Nginx.MinimumVersion
+	if nginxPackage == "" {
+		nginxPackage = "nginx"
+	}
+	if nginxService == "" {
+		nginxService = "nginx.service"
+	}
+	if nginxMinimum == "" {
+		nginxMinimum = profile.NginxVersionMinimum
+	}
 	return preflight.ExpectedProfile{
-		ID:                    profile.Family,
+		ID:                    profile.ID,
 		VersionID:             profile.Release,
 		Architecture:          profile.Architecture,
+		ServiceManager:        profile.ServiceManager,
+		PackageManager:        profile.PackageManager,
+		NginxPackage:          nginxPackage,
+		NginxService:          nginxService,
 		SystemdVersion:        profile.SystemdVersion,
 		SystemdVersionMinimum: profile.SystemdVersionMinimum,
 		SystemdVersionMaximum: profile.SystemdVersionMaximum,
 		NginxVersion:          profile.NginxVersion,
-		NginxVersionMinimum:   profile.NginxVersionMinimum,
+		NginxVersionMinimum:   nginxMinimum,
 		NginxVersionMaximum:   profile.NginxVersionMaximum,
 		PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest),
 		ManagedConfinement: preflight.ManagedConfinementProfile{

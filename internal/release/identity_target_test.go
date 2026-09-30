@@ -2,15 +2,10 @@ package release
 
 import "testing"
 
-func TestValidateSupportedPreviewFamiliesRequiresBothFamilies(t *testing.T) {
-	profile := func(family string) SupportedOSProfile {
-		return SupportedOSProfile{Profile: OSProfile{Family: family, Architecture: PreviewTargetArchitecture}}
-	}
-	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewUbuntuFamily)}); err == nil {
-		t.Fatal("Ubuntu-only release profile set was accepted")
-	}
-	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile(PreviewDebianFamily), profile(PreviewUbuntuFamily)}); err != nil {
-		t.Fatalf("complete Debian/Ubuntu profile set rejected: %v", err)
+func TestValidateSupportedPreviewFamiliesAcceptsGenericCapabilityContract(t *testing.T) {
+	profile := SupportedOSProfile{Profile: OSProfile{ID: PreviewCapabilityContractID, Architecture: PreviewTargetArchitecture, ServiceManager: "systemd", PackageManager: "apt-dpkg", Nginx: NginxCapabilityContract{Package: "nginx", MinimumVersion: "1.18.0", Service: "nginx.service"}, Packages: []PackageTuple{{Name: "nginx", Version: "1.26.0", VersionMinimum: "1.18.0", Architecture: "amd64"}}}}
+	if err := validateSupportedPreviewFamilies([]SupportedOSProfile{profile}); err != nil {
+		t.Fatalf("generic capability contract rejected: %v", err)
 	}
 }
 
