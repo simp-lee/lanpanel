@@ -4,6 +4,8 @@ package preflight
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	cgroupfs "lanpanel/internal/cgroup"
 	"os"
@@ -17,27 +19,71 @@ import (
 
 // activeDelegationProbe asks PID 1 to create a disposable delegated scope and
 // runs the same cgroup lifecycle that LanPanel uses for package and helper
-// children. A read-only Delegate=yes unit-file check is not sufficient: the
-// kernel must accept cgroup.procs writes and cgroup.kill in the effective scope.
+// children. It deliberately avoids systemd-run --wait/--collect so the probe
+// remains usable with older systemd versions that support Delegate=yes.
 func activeDelegationProbe(ctx context.Context) ComponentObservation {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	executable, err := os.Executable()
 	if err != nil || !filepath.IsAbs(executable) {
 		return ComponentObservation{Identity: "delegation probe executable is unavailable"}
 	}
-	unit := "lanpanel-delegation-probe-" + strconv.Itoa(os.Getpid())
-	command := exec.CommandContext(ctx, "/usr/bin/systemd-run", "--quiet", "--wait", "--collect", "--unit="+unit, "--property=Delegate=yes", executable, "delegation-probe-child")
-	output, err := command.CombinedOutput()
+	unit := delegationProbeUnitName()
+	systemdRun := exec.CommandContext(probeCtx, "/usr/bin/systemd-run", "--quiet", "--unit="+unit, "--property=Delegate=yes", executable, "delegation-probe-child")
+	output, err := systemdRun.CombinedOutput()
 	if err != nil {
+		stopTransientUnit(unit)
 		identity := strings.TrimSpace(string(output))
 		if identity == "" {
 			identity = err.Error()
 		}
 		return ComponentObservation{Identity: "systemd delegation probe failed: " + identity}
 	}
-	return ComponentObservation{Available: true, Identity: "systemd delegated scope probe passed"}
+	defer stopTransientUnit(unit)
+	for {
+		if err := probeCtx.Err(); err != nil {
+			return ComponentObservation{Identity: "systemd delegation probe cancelled"}
+		}
+		state, status, showErr := transientUnitState(unit)
+		if showErr != nil {
+			return ComponentObservation{Identity: "systemd delegation probe observation failed: " + showErr.Error()}
+		}
+		if state == "inactive" || state == "failed" {
+			if status != "0" {
+				return ComponentObservation{Identity: "systemd delegation probe child failed with status " + status}
+			}
+			return ComponentObservation{Available: true, Identity: "systemd delegated scope probe passed"}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func delegationProbeUnitName() string {
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return fmt.Sprintf("lanpanel-delegation-probe-%d-%x", os.Getpid(), random[:])
+	}
+	return fmt.Sprintf("lanpanel-delegation-probe-%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func transientUnitState(unit string) (string, string, error) {
+	data, err := exec.Command("/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=ExecMainStatus", "--value").Output()
+	if err != nil {
+		return "", "", err
+	}
+	values := strings.Fields(string(data))
+	if len(values) != 2 {
+		return "", "", fmt.Errorf("transient unit state is malformed")
+	}
+	return values[0], values[1], nil
+}
+
+func stopTransientUnit(unit string) {
+	_ = exec.Command("/usr/bin/systemctl", "stop", unit).Run()
+	_ = exec.Command("/usr/bin/systemctl", "reset-failed", unit).Run()
 }
 
 // RunDelegationProbeChild is the executable role launched inside a temporary
@@ -55,7 +101,14 @@ func RunDelegationProbeChild() error {
 	if err := os.Mkdir(path, 0o700); err != nil {
 		return fmt.Errorf("create delegated probe cgroup: %w", err)
 	}
+	var child *exec.Cmd
+	childDone := true
 	cleanup := func(cause error) error {
+		if child != nil && !childDone {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+			childDone = true
+		}
 		return fmt.Errorf("%w (cleanup: %v)", cause, os.Remove(path))
 	}
 	for _, file := range []string{"cgroup.kill", "cgroup.procs", "cgroup.events"} {
@@ -64,22 +117,26 @@ func RunDelegationProbeChild() error {
 			return cleanup(fmt.Errorf("delegated probe control %s is unavailable", file))
 		}
 	}
-	child := exec.Command("/bin/sleep", "60")
+	child = exec.Command("/bin/sleep", "60")
 	if err := child.Start(); err != nil {
 		return cleanup(fmt.Errorf("start delegated probe child: %w", err))
 	}
+	childDone = false
+	defer func() {
+		if !childDone {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		}
+	}()
 	childPID := child.Process.Pid
 	if err := os.WriteFile(filepath.Join(path, "cgroup.procs"), []byte(strconv.Itoa(childPID)), 0o600); err != nil {
-		_ = child.Process.Kill()
-		_ = child.Wait()
 		return cleanup(fmt.Errorf("write delegated probe cgroup.procs: %w", err))
 	}
-	if err := os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o600); err != nil && err != syscall.ESRCH {
-		_ = child.Process.Kill()
-		_ = child.Wait()
+	if err := os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o600); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return cleanup(fmt.Errorf("write delegated probe cgroup.kill: %w", err))
 	}
 	_ = child.Wait()
+	childDone = true
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		data, readErr := os.ReadFile(filepath.Join(path, "cgroup.events"))

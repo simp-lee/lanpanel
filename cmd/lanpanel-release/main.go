@@ -107,6 +107,21 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	if err := buildBinary(source, filepath.Join(tmp, "lanpanel")); err != nil {
 		return err
 	}
+	signingKey, err := os.ReadFile(signingKeyPath)
+	if err != nil {
+		return fmt.Errorf("release signing key: %w", err)
+	}
+	binaryBytes, err := os.ReadFile(filepath.Join(tmp, "lanpanel"))
+	if err != nil {
+		return fmt.Errorf("read release binary: %w", err)
+	}
+	binarySignature, err := release.SignBinary(binaryBytes, signingKey)
+	if err != nil {
+		return err
+	}
+	if err := writeFile(filepath.Join(tmp, "lanpanel.sig"), binarySignature, 0o644); err != nil {
+		return err
+	}
 	sourceArchive, _, err := release.GenerateSourceArchive(source, tag)
 	if err != nil {
 		return fmt.Errorf("source archive: %w", err)
@@ -219,6 +234,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 		}
 	}
 	manifest.Binary = fileIdentity(tmp, "lanpanel")
+	manifest.BinarySignature = fileIdentity(tmp, "lanpanel.sig")
 	manifest.SourceArchive = fileIdentity(tmp, "lanpanel-"+tag+".tar.gz")
 	manifest.License = fileIdentity(tmp, manifest.License.Path)
 	manifest.KnownLimitations = fileIdentity(tmp, manifest.KnownLimitations.Path)
@@ -253,10 +269,6 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	manifestBytes, err := release.MarshalCanonical(manifest)
 	if err != nil {
 		return fmt.Errorf("release manifest: %w", err)
-	}
-	signingKey, err := os.ReadFile(signingKeyPath)
-	if err != nil {
-		return fmt.Errorf("release signing key: %w", err)
 	}
 	signatureBytes, err := release.SignCanonicalManifest(manifestBytes, signingKey)
 	if err != nil {

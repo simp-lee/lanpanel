@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-const ReleaseManifestSchemaVersion = "lanpanel.release.v7"
+const ReleaseManifestSchemaVersion = "lanpanel.release.v8"
 
 const (
 	ReleaseSignaturePath  = "release.json.sig"
@@ -163,6 +163,7 @@ type ReleaseManifest struct {
 	SchemaVersion     string                     `json:"schema_version"`
 	ReleaseTag        string                     `json:"release_tag"`
 	Binary            AssetIdentity              `json:"binary"`
+	BinarySignature   AssetIdentity              `json:"binary_signature"`
 	SourceArchive     AssetIdentity              `json:"source_archive"`
 	License           AssetIdentity              `json:"license"`
 	Headscale         HeadscaleArtifactAuthority `json:"headscale"`
@@ -211,6 +212,13 @@ var trustedReleasePublicKey = ed25519.PublicKey{
 
 func TrustedReleasePublicKeyBytes() []byte { return append([]byte(nil), trustedReleasePublicKey...) }
 
+func SignBinary(binaryBytes []byte, privateKey ed25519.PrivateKey) ([]byte, error) {
+	if len(binaryBytes) == 0 || len(privateKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("binary signing input is invalid")
+	}
+	return ed25519.Sign(privateKey, binaryBytes), nil
+}
+
 func SignCanonicalManifest(manifestBytes []byte, privateKey ed25519.PrivateKey) ([]byte, error) {
 	if _, err := DecodeReleaseManifest(manifestBytes); err != nil {
 		return nil, fmt.Errorf("manifest to sign is invalid: %w", err)
@@ -257,6 +265,9 @@ func verifyRelease(expectedManifestDigest string, manifestBytes, signatureBytes,
 	if err := verifyReleaseAssets(manifest, checksumBytes, assets); err != nil {
 		return nil, err
 	}
+	if !ed25519.Verify(trustedReleasePublicKey, assets[manifest.Binary.Path], assets[manifest.BinarySignature.Path]) {
+		return nil, fmt.Errorf("LanPanel binary signature is invalid")
+	}
 	return &VerifiedRelease{value: manifest, digest: expectedManifestDigest}, nil
 }
 
@@ -295,7 +306,7 @@ func releaseAssetPaths(manifest ReleaseManifest) []string {
 }
 
 func mustReleaseAssets(manifest ReleaseManifest) []AssetIdentity {
-	assets := []AssetIdentity{manifest.Binary, manifest.SourceArchive, manifest.License, manifest.Headscale.Archive, manifest.KnownLimitations}
+	assets := []AssetIdentity{manifest.Binary, manifest.BinarySignature, manifest.SourceArchive, manifest.License, manifest.Headscale.Archive, manifest.KnownLimitations}
 	for _, profile := range manifest.SupportedProfiles {
 		assets = append(assets, profile.PackageTemplate, profile.DependencyManifest, profile.DependencyBaseline)
 	}
@@ -341,7 +352,7 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	if manifest.SchemaVersion != ReleaseManifestSchemaVersion || !releaseTagPattern.MatchString(manifest.ReleaseTag) || manifest.Binary.Path != "lanpanel" || manifest.SourceArchive.Path != "lanpanel-"+manifest.ReleaseTag+".tar.gz" || manifest.Checksums.Path != "SHA256SUMS" || validateAsset(manifest.Checksums) != nil || len(manifest.SupportedProfiles) == 0 || len(manifest.SupportedProfiles) > 16 {
 		return fmt.Errorf("release manifest is incomplete")
 	}
-	if validateAsset(manifest.Binary) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || manifest.KnownLimitations.Path != "README.md" || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
+	if validateAsset(manifest.Binary) != nil || manifest.BinarySignature.Path != "lanpanel.sig" || validateAsset(manifest.BinarySignature) != nil || validateAsset(manifest.SourceArchive) != nil || validateAsset(manifest.License) != nil || manifest.KnownLimitations.Path != "README.md" || validateAsset(manifest.KnownLimitations) != nil || validateHeadscaleAuthority(manifest.Headscale) != nil {
 		return fmt.Errorf("release manifest asset authority is invalid")
 	}
 	requiredAdditional := map[string]bool{"lego.tar.gz": false, "lego": false, "tailscale.tar.gz": false, "tailscale": false, "goaccess": false}
@@ -492,11 +503,15 @@ func validateHostCapabilityContract(profile HostCapabilityContract) error {
 		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || !versionBoundsValid(tuple.Version, tuple.VersionMinimum, tuple.VersionMaximum) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || len(profile.Repositories) != 0 && (tuple.RepositoryID == "" || !refPattern.MatchString(tuple.RepositoryID) || !repositoryIDs[tuple.RepositoryID]) || previous != "" && previous >= key {
 			return fmt.Errorf("host capability contract package tuple is invalid, duplicated, or unsorted")
 		}
-		if tuple.Name == nginxPackage { hasNginx = true }
+		if tuple.Name == nginxPackage {
+			hasNginx = true
+		}
 		previous = key
 	}
 	if profile.ServiceManager != "" || profile.PackageManager != "" || profile.Nginx.Package != "" {
-		if !hasNginx { return fmt.Errorf("host capability contract omits the required nginx package") }
+		if !hasNginx {
+			return fmt.Errorf("host capability contract omits the required nginx package")
+		}
 	}
 	if profile.ManagedConfinement.SchemaVersion != "" {
 		return validateConfinementProfile(profile.ManagedConfinement)

@@ -133,7 +133,7 @@ make release-preview \
 发布工件至少包含：
 
 - `lanpanel` 和对应版本的源代码归档；
-- `release.json`、其 detached Ed25519 签名和 `SHA256SUMS`；
+- `release.json`、其 detached Ed25519 签名、`lanpanel.sig` 二进制签名和 `SHA256SUMS`；
 - `LICENSE`、Host Capability Contract 的软件包模板/依赖清单/依赖基线；
 - 经过版本、来源、大小和 SHA-256 绑定的 Lego、Tailscale、Headscale 资产。
 

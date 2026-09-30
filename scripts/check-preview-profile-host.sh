@@ -28,7 +28,7 @@ check_cgroup() {
   mountpoint=$(awk 'function separator(){ for (i=1; i<=NF; i++) if ($i == "-") return i } { s=separator(); if (s && $(s+1) == "cgroup2" && $4 == "/") { print $5; count++ } } END { if (count == 1) exit 0; exit 1 }' /proc/self/mountinfo) || return 1
   [ -s "$mountpoint/cgroup.controllers" ] || return 1
   self_cgroup=$(awk -F: '$1 == 0 { print $3 }' /proc/self/cgroup)
-  [ -n "$self_cgroup" ] && [ -f "$mountpoint${self_cgroup}/cgroup.kill" ] && [ -f "$mountpoint${self_cgroup}/cgroup.procs" ] && [ -f "$mountpoint${self_cgroup}/cgroup.events" ]
+  [ -n "$self_cgroup" ] && [ -f "$mountpoint${self_cgroup}/cgroup.procs" ] && [ -f "$mountpoint${self_cgroup}/cgroup.events" ]
 }
 check_systemd_delegation() {
   command -v systemd >/dev/null 2>&1 || return 1

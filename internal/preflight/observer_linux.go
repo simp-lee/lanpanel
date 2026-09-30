@@ -117,7 +117,7 @@ func (observer *LinuxObserver) observeHostCapabilities() (HostCapabilities, erro
 	if err != nil {
 		return HostCapabilities{}, err
 	}
-	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities(false)
+	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities(true, true)
 	if err != nil {
 		return HostCapabilities{}, err
 	}
@@ -149,7 +149,7 @@ func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (Ins
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(true)
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(true, false)
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
@@ -404,7 +404,7 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(false)
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(request.Scope != ExpansionBootstrap, request.Scope == ExpansionBootstrap)
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
@@ -494,7 +494,7 @@ type cgroupMount struct {
 	Mountpoint string
 }
 
-func (observer *LinuxObserver) observeManagedCapabilities(requireHelper bool) (string, string, string, bool, ComponentObservation, error) {
+func (observer *LinuxObserver) observeManagedCapabilities(requireHelper, activeProbe bool) (string, string, string, bool, ComponentObservation, error) {
 	mountpoint, mountRoot, mode, err := observer.observeCgroupTopology()
 	if err != nil {
 		return "", "", "", false, ComponentObservation{}, err
@@ -507,7 +507,10 @@ func (observer *LinuxObserver) observeManagedCapabilities(requireHelper bool) (s
 			return "", "", "", false, ComponentObservation{}, probeErr
 		}
 	}
-	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable, requireHelper)
+	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable, requireHelper, activeProbe)
+	if activeProbe && delegation.Available {
+		killAvailable = true
+	}
 	return mode, mountpoint, mountRoot, killAvailable, delegation, nil
 }
 
@@ -622,8 +625,8 @@ func unescapeMountInfoPath(value string) (string, error) {
 	return output.String(), nil
 }
 
-func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool, requireHelper bool) ComponentObservation {
-	if mode != "unified_v2" || mountpoint == "" || !cgroupDelegation {
+func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool, requireHelper, activeProbe bool) ComponentObservation {
+	if mode != "unified_v2" || mountpoint == "" || !cgroupDelegation && !activeProbe {
 		return ComponentObservation{Identity: "cgroup delegation unavailable: " + mode}
 	}
 	if observer.paths.SystemdPID1 != "" {
@@ -644,7 +647,7 @@ func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string,
 	if err != nil || major < 218 {
 		return ComponentObservation{Identity: "systemd Delegate= unsupported"}
 	}
-	if observer.delegationProbe != nil {
+	if activeProbe && observer.delegationProbe != nil {
 		probeContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		probe := observer.delegationProbe(probeContext)
 		cancel()
@@ -689,13 +692,29 @@ func (observer *LinuxObserver) probeCgroupKill(mountpoint string) (bool, error) 
 	}
 	parent := filepath.Join(mountpoint, strings.TrimPrefix(logicalPath, "/"))
 	info, statErr := os.Stat(filepath.Join(parent, "cgroup.kill"))
-	if statErr != nil {
-		if errors.Is(statErr, os.ErrNotExist) {
-			return false, nil
-		}
+	if statErr == nil && info.Mode().IsRegular() {
+		return true, nil
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return false, fmt.Errorf("observe cgroup.kill: %w", statErr)
 	}
-	return info.Mode().IsRegular(), nil
+	// The hierarchy root may intentionally omit cgroup.kill. After install,
+	// inspect the actual delegated helper cgroup instead of rejecting a valid
+	// hierarchy merely because the observer itself runs at the root.
+	if observer.paths.SystemdControl != "" {
+		data, showErr := exec.Command(observer.paths.SystemdControl, "show", "--property=ControlGroup", "--value", "lanpanel-helper.service").Output()
+		logical := strings.TrimSpace(string(data))
+		if showErr == nil && strings.HasPrefix(logical, "/") && filepath.Clean(logical) == logical && !strings.Contains(logical, "..") {
+			helperInfo, helperErr := os.Stat(filepath.Join(mountpoint, strings.TrimPrefix(logical, "/"), "cgroup.kill"))
+			if helperErr == nil {
+				return helperInfo.Mode().IsRegular(), nil
+			}
+			if !errors.Is(helperErr, os.ErrNotExist) {
+				return false, fmt.Errorf("observe helper cgroup.kill: %w", helperErr)
+			}
+		}
+	}
+	return false, nil
 }
 
 func parseUnifiedCgroupPath(data string) (string, error) {
