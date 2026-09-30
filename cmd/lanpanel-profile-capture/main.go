@@ -1,6 +1,6 @@
-// Command lanpanel-profile-capture records OS and package version
-// requirements from a qualified Debian or Ubuntu amd64 host. It never
-// mutates the host or binds a particular APT mirror.
+// Command lanpanel-profile-capture records a Host Capability Contract from a
+// qualified Linux amd64 APT/dpkg + systemd host. It never mutates the host or
+// binds a particular APT mirror.
 package main
 
 import (
@@ -64,12 +64,15 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	if output == "" || profileID == "" || dependencyPath == "" {
 		return fmt.Errorf("output, profile-id, and dependency-inputs are required")
 	}
-	platform, err := readPlatform()
-	if err != nil {
-		return err
+	if runtime.GOARCH != release.PreviewTargetArchitecture {
+		return fmt.Errorf("host architecture %s is not supported; capture requires Linux amd64", runtime.GOARCH)
 	}
-	if runtime.GOARCH != release.PreviewTargetArchitecture || platform.ID == "" || platform.VersionID == "" {
-		return fmt.Errorf("host %s/%s/%s does not provide a usable Linux amd64 platform identity", platform.ID, platform.VersionID, runtime.GOARCH)
+	capabilities, err := preflight.ObserveHostCapabilities()
+	if err != nil {
+		return fmt.Errorf("observe host capability contract: %w", err)
+	}
+	if capabilities.CgroupMode != "unified_v2" || capabilities.CgroupMountRoot != "/" || !capabilities.CgroupKillAvailable || !capabilities.SystemdDelegation.Available {
+		return fmt.Errorf("capture host does not prove unified cgroup v2, cgroup.kill, and systemd delegation")
 	}
 	if profileID != release.PreviewCapabilityContractID {
 		return fmt.Errorf("profile-id %q is not the supported APT/systemd capability contract", profileID)
@@ -108,7 +111,7 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 		profilePackages = append(profilePackages, release.PackageTuple{Name: name, Version: record.Version, VersionMinimum: minimum, Architecture: record.Architecture})
 	}
 	confinement := confinementProfile()
-	profile := release.HostCapabilityContract{ID: profileID, Architecture: runtime.GOARCH, ServiceManager: "systemd", PackageManager: "apt-dpkg", Nginx: release.NginxCapabilityContract{Package: "nginx", MinimumVersion: "1.18.0", Service: "nginx.service"}, Confinement: release.ConfinementCapabilityContract{UnifiedCgroupV2: true, CgroupKill: true, SystemdDelegate: true}, NginxVersion: packageValues[0].Version, NginxVersionMinimum: "1.18.0", Packages: profilePackages, ManagedConfinement: confinement}
+	profile := release.HostCapabilityContract{ID: profileID, Architecture: runtime.GOARCH, ServiceManager: "systemd", PackageManager: "apt-dpkg", Nginx: release.NginxCapabilityContract{Package: "nginx", MinimumVersion: "1.18.0", Service: "nginx.service"}, Confinement: release.ConfinementCapabilityContract{UnifiedCgroupV2: true, CgroupKill: true, SystemdDelegate: true}, Packages: profilePackages, ManagedConfinement: confinement}
 	profileDigest, err := release.ProfileDigest(profile)
 	if err != nil {
 		return fmt.Errorf("host capability contract: %w", err)
@@ -186,15 +189,6 @@ func buildBaseline(dependencyPath string) (dependencies.Baseline, error) {
 	}
 	sort.Slice(selections, func(left, right int) bool { return selections[left].Component < selections[right].Component })
 	return dependencies.Baseline{SchemaVersion: dependencies.SchemaVersion, Cutoff: cutoff, Selections: selections}, nil
-}
-
-func readPlatform() (struct{ ID, VersionID, Architecture string }, error) {
-	data, err := os.ReadFile("/etc/os-release")
-	if err != nil {
-		return struct{ ID, VersionID, Architecture string }{}, err
-	}
-	platform := preflight.ParseOSRelease(string(data))
-	return struct{ ID, VersionID, Architecture string }{platform.ID, platform.VersionID, runtime.GOARCH}, nil
 }
 
 func aptPackage(name string) (aptRecord, error) {

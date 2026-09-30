@@ -166,31 +166,21 @@ func selectSupportedProfile(manifest ReleaseManifest, observed PublicInstallObse
 	if observed.Architecture == "" {
 		return SupportedOSProfile{}, fmt.Errorf("install host architecture observation is missing")
 	}
-	var familyMatch, genericMatch *SupportedOSProfile
+	var match *SupportedOSProfile
 	for index := range manifest.SupportedProfiles {
 		candidate := &manifest.SupportedProfiles[index]
-		if candidate.Profile.Architecture != observed.Architecture {
+		if candidate.Profile.Architecture != observed.Architecture || candidate.Profile.ID != PreviewCapabilityContractID {
 			continue
 		}
-		if observed.OSID != "" && candidate.Profile.Family == observed.OSID {
-			if familyMatch != nil {
-				return SupportedOSProfile{}, fmt.Errorf("release contains duplicate legacy family contracts")
-			}
-			familyMatch = candidate
-		} else if candidate.Profile.Family == "" {
-			if genericMatch != nil {
-				return SupportedOSProfile{}, fmt.Errorf("release contains duplicate generic capability contracts")
-			}
-			genericMatch = candidate
+		if match != nil {
+			return SupportedOSProfile{}, fmt.Errorf("release contains duplicate host capability contracts")
 		}
+		match = candidate
 	}
-	if familyMatch != nil {
-		return *familyMatch, nil
+	if match == nil {
+		return SupportedOSProfile{}, fmt.Errorf("release contains no host capability contract for architecture %s", observed.Architecture)
 	}
-	if genericMatch != nil {
-		return *genericMatch, nil
-	}
-	return SupportedOSProfile{}, fmt.Errorf("release contains no host capability contract for architecture %s", observed.Architecture)
+	return *match, nil
 }
 
 func decodeDependencyAuthority(data []byte, expectedDigest, profileID string) (DependencyAuthority, error) {
@@ -208,7 +198,7 @@ func decodeDependencyAuthority(data []byte, expectedDigest, profileID string) (D
 }
 
 func ValidateInstallIdentity(value InstallIdentity) error {
-	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !IsSupportedPreviewTarget(value.Profile) || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" || validateAsset(value.GoAccess) != nil || value.GoAccess.Path != "goaccess" || !concreteVersionPattern.MatchString(value.GoAccessVersion) {
+	if value.Kind != InstallPublicRelease || !releaseTagPattern.MatchString(value.ReleaseTag) || validateAsset(value.Binary) != nil || value.Binary.Path != "lanpanel" || !ValidDigest(value.ReleaseManifestDigest) || validateOSProfile(value.Profile) != nil || !ValidDigest(value.ProfileDigest) || value.HostFingerprint == "" || value.AuthorityCreatedAt.IsZero() || validateAsset(value.DependencyBaseline) != nil || !ValidDigest(value.DependencyManifestDigest) || validateHeadscaleAuthority(value.Headscale) != nil || validateAsset(value.Lego) != nil || value.Lego.Path != "lego" || validateAsset(value.Tailscale) != nil || value.Tailscale.Path != "tailscale" || value.TailscaleVersion == "" || validateAsset(value.GoAccess) != nil || value.GoAccess.Path != "goaccess" || !concreteVersionPattern.MatchString(value.GoAccessVersion) {
 		return fmt.Errorf("installation release identity is invalid")
 	}
 	profileDigest, err := ProfileDigest(value.Profile)

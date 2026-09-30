@@ -26,15 +26,7 @@ const (
 	PreviewCapabilityContractID = "linux-amd64-apt-dpkg-systemd"
 )
 
-const (
-	PreviewDebianFamily = "debian" // retained for old fixture/profile inputs
-	PreviewUbuntuFamily = "ubuntu" // retained for old fixture/profile inputs
-)
-
 func IsSupportedPreviewTarget(profile OSProfile) bool {
-	if profile.ID == "" && (profile.Family == PreviewDebianFamily || profile.Family == PreviewUbuntuFamily) && osReleasePattern.MatchString(profile.Release) {
-		return profile.Architecture == PreviewTargetArchitecture
-	}
 	return profile.Architecture == PreviewTargetArchitecture && validateHostCapabilityContract(profile) == nil
 }
 
@@ -374,7 +366,7 @@ func validateReleaseManifest(manifest ReleaseManifest) error {
 	previousProfile := ""
 	seenContracts := map[string]bool{}
 	for _, profile := range manifest.SupportedProfiles {
-		if validateOSProfile(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenContracts[profile.Profile.ID] {
+		if validateHostCapabilityContract(profile.Profile) != nil || !IsSupportedPreviewTarget(profile.Profile) || validateAsset(profile.PackageTemplate) != nil || validateAsset(profile.DependencyManifest) != nil || validateAsset(profile.DependencyBaseline) != nil || previousProfile != "" && previousProfile >= profile.Profile.ID || seenContracts[profile.Profile.ID] {
 			return fmt.Errorf("release manifest host capability contract or asset authority is invalid")
 		}
 		previousProfile = profile.Profile.ID
@@ -391,7 +383,7 @@ func validateSupportedPreviewFamilies(values []SupportedOSProfile) error {
 		return fmt.Errorf("release manifest must include a host capability contract")
 	}
 	for _, value := range values {
-		if value.Profile.Architecture != PreviewTargetArchitecture || value.Profile.ServiceManager != "" && value.Profile.ServiceManager != "systemd" || value.Profile.PackageManager != "" && value.Profile.PackageManager != "apt-dpkg" {
+		if value.Profile.ID != PreviewCapabilityContractID || value.Profile.Family != "" || value.Profile.Release != "" || value.Profile.Architecture != PreviewTargetArchitecture || value.Profile.ServiceManager != "systemd" || value.Profile.PackageManager != "apt-dpkg" {
 			return fmt.Errorf("release manifest contains a non-APT systemd host capability contract")
 		}
 	}
@@ -449,14 +441,43 @@ func canonicalArtifactURL(value string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Opaque == "" && parsed.String() == value
 }
 
-func validateOSProfile(profile OSProfile) error { return validateHostCapabilityContract(profile) }
+// validateOSProfile is retained only for already-installed journal identities.
+// Public release manifests must use validateHostCapabilityContract directly.
+func validateOSProfile(profile OSProfile) error {
+	if err := validateHostCapabilityContract(profile); err == nil {
+		return nil
+	}
+	return validateLegacyStoredProfile(profile)
+}
+
+func validateLegacyStoredProfile(profile OSProfile) error {
+	if profile.Family == "" || !profileIDPattern.MatchString(profile.Family) || profile.Release == "" || !profileIDPattern.MatchString(profile.ID) || profile.Architecture != PreviewTargetArchitecture || len(profile.Packages) == 0 || len(profile.Packages) > 4096 {
+		return fmt.Errorf("stored host profile is invalid")
+	}
+	if len(profile.Repositories) != 0 {
+		if err := packages.ValidateRepositories(profile.Repositories); err != nil {
+			return err
+		}
+	}
+	previous := ""
+	for _, tuple := range profile.Packages {
+		key := tuple.Name + "\x00" + tuple.Architecture
+		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || !versionBoundsValid(tuple.Version, tuple.VersionMinimum, tuple.VersionMaximum) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || previous != "" && previous >= key {
+			return fmt.Errorf("stored host profile package set is invalid")
+		}
+		previous = key
+	}
+	if profile.ManagedConfinement.SchemaVersion != "" {
+		if err := validateConfinementProfile(profile.ManagedConfinement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func validateHostCapabilityContract(profile HostCapabilityContract) error {
-	if !profileIDPattern.MatchString(profile.ID) || profile.Architecture != PreviewTargetArchitecture || profile.ServiceManager != "" && profile.ServiceManager != "systemd" || profile.PackageManager != "" && profile.PackageManager != "apt-dpkg" {
+	if profile.ID != PreviewCapabilityContractID || profile.Architecture != PreviewTargetArchitecture || profile.ServiceManager != "systemd" || profile.PackageManager != "apt-dpkg" || profile.Family != "" || profile.Release != "" {
 		return fmt.Errorf("host capability contract identity or manager contract is invalid")
-	}
-	if profile.Family != "" && !profileIDPattern.MatchString(profile.Family) || profile.Release != "" && !osReleasePattern.MatchString(profile.Release) {
-		return fmt.Errorf("host capability contract legacy platform metadata is invalid")
 	}
 	nginxPackage, nginxMinimum, nginxMaximum, nginxService := profile.Nginx.Package, profile.Nginx.MinimumVersion, profile.Nginx.MaximumVersion, profile.Nginx.Service
 	if nginxPackage == "" {
@@ -477,7 +498,7 @@ func validateHostCapabilityContract(profile HostCapabilityContract) error {
 	if nginxPackage != "nginx" || nginxService != "nginx.service" || !concreteVersionPattern.MatchString(nginxMinimum) || movingVersion(nginxMinimum) || nginxMaximum != "" && (!concreteVersionPattern.MatchString(nginxMaximum) || movingVersion(nginxMaximum) || debianversion.Compare(nginxMinimum, nginxMaximum) >= 0) {
 		return fmt.Errorf("host capability contract Nginx requirement is invalid")
 	}
-	if profile.Confinement != (ConfinementCapabilityContract{}) && (!profile.Confinement.UnifiedCgroupV2 || !profile.Confinement.CgroupKill || !profile.Confinement.SystemdDelegate) {
+	if !profile.Confinement.UnifiedCgroupV2 || !profile.Confinement.CgroupKill || !profile.Confinement.SystemdDelegate {
 		return fmt.Errorf("host capability contract confinement requirements are incomplete")
 	}
 	if len(profile.Repositories) != 0 && packages.ValidateRepositories(profile.Repositories) != nil {
@@ -498,23 +519,30 @@ func validateHostCapabilityContract(profile HostCapabilityContract) error {
 	}
 	previous := ""
 	hasNginx := false
-	for _, tuple := range profile.Packages {
+	nginxTuple := -1
+	for index, tuple := range profile.Packages {
 		key := tuple.Name + "\x00" + tuple.Architecture
 		if !profileIDPattern.MatchString(tuple.Name) || !concreteVersionPattern.MatchString(tuple.Version) || !versionBoundsValid(tuple.Version, tuple.VersionMinimum, tuple.VersionMaximum) || tuple.Architecture != "amd64" && tuple.Architecture != "all" || len(profile.Repositories) != 0 && (tuple.RepositoryID == "" || !refPattern.MatchString(tuple.RepositoryID) || !repositoryIDs[tuple.RepositoryID]) || previous != "" && previous >= key {
 			return fmt.Errorf("host capability contract package tuple is invalid, duplicated, or unsorted")
 		}
 		if tuple.Name == nginxPackage {
 			hasNginx = true
+			nginxTuple = index
 		}
 		previous = key
 	}
-	if profile.ServiceManager != "" || profile.PackageManager != "" || profile.Nginx.Package != "" {
-		if !hasNginx {
-			return fmt.Errorf("host capability contract omits the required nginx package")
-		}
+	if !hasNginx || nginxTuple < 0 {
+		return fmt.Errorf("host capability contract omits the required nginx package")
 	}
-	if profile.ManagedConfinement.SchemaVersion != "" {
-		return validateConfinementProfile(profile.ManagedConfinement)
+	recordedNginx := profile.Packages[nginxTuple]
+	if recordedNginx.VersionMinimum != nginxMinimum || recordedNginx.VersionMaximum != nginxMaximum || !debianversion.Satisfies(recordedNginx.Version, nginxMinimum, nginxMaximum) {
+		return fmt.Errorf("host capability contract Nginx package range differs from the capability requirement")
+	}
+	if err := validateConfinementProfile(profile.ManagedConfinement); err != nil {
+		return fmt.Errorf("host capability contract managed confinement is invalid: %w", err)
+	}
+	if profile.NginxVersion != "" || profile.NginxVersionMinimum != "" || profile.NginxVersionMaximum != "" || profile.SystemdVersion != "" || profile.SystemdVersionMinimum != "" || profile.SystemdVersionMaximum != "" {
+		return fmt.Errorf("host capability contract contains legacy exact runtime version authority")
 	}
 	return nil
 }
@@ -576,7 +604,6 @@ func cloneReleaseManifest(source ReleaseManifest) ReleaseManifest {
 var (
 	releaseTagPattern      = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?$`)
 	profileIDPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9.+_-]{0,127}$`)
-	osReleasePattern       = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+){0,2}$`)
 	concreteVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
 	refPattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 )

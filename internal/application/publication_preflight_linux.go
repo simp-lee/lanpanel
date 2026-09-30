@@ -35,7 +35,8 @@ func evaluateTemporaryPreflight(ctx context.Context, installation domain.Install
 	}
 	profile := identity.Profile
 	authority := installedProfileAuthority(identity)
-	confinement := profile.ManagedConfinement
+	expected := expectedInstalledProfile(profile)
+	expected.Authority = authority
 	ownedListeners := []preflight.OwnedListenerAuthority{}
 	if ownsTemporaryListener(owned, resource.ID, publication.Port) {
 		host, err := activation.NewFixedHost()
@@ -54,7 +55,7 @@ func evaluateTemporaryPreflight(ctx context.Context, installation domain.Install
 	}
 	request := preflight.ExpansionRequest{
 		Scope: preflight.ExpansionTemporaryHTTP, Target: "resource/" + resource.ID, Generation: resource.PublicationRecord.UnpublishedGeneration, OwnedListeners: ownedListeners,
-		Profile:         preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: "amd64", SystemdVersion: profile.SystemdVersion, SystemdVersionMinimum: profile.SystemdVersionMinimum, SystemdVersionMaximum: profile.SystemdVersionMaximum, NginxVersion: profile.NginxVersion, NginxVersionMinimum: profile.NginxVersionMinimum, NginxVersionMaximum: profile.NginxVersionMaximum, PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), PolicyDigest: "sha256:" + confinement.PolicyDigest}, Authority: authority},
+		Profile:         expected,
 		PublicAddresses: []string{publication.PublicIPv4}, TemporaryPort: publication.Port,
 		ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/lanpanel/nginx", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}},
 		Disks:        []preflight.DiskRequirement{{Path: "/etc/lanpanel/nginx", MinimumAvailableBytes: 1}}, LastTrustedWall: temporaryPublicationLastTrustedWall(),
@@ -112,8 +113,9 @@ func evaluateDomainPreflight(ctx context.Context, installation domain.Installati
 			lastTrustedWall = authority.ActiveCertificate.LastTrustedWall
 		}
 	}
-	confinement := profile.ManagedConfinement
-	request := preflight.ExpansionRequest{Scope: preflight.ExpansionDomainHTTPS, Target: "resource/" + resource.ID, Generation: resource.PublicationRecord.UnpublishedGeneration, Domains: domains, OwnedListeners: owned, Profile: preflight.ExpectedProfile{ID: profile.Family, VersionID: profile.Release, Architecture: "amd64", SystemdVersion: profile.SystemdVersion, SystemdVersionMinimum: profile.SystemdVersionMinimum, SystemdVersionMaximum: profile.SystemdVersionMaximum, NginxVersion: profile.NginxVersion, NginxVersionMinimum: profile.NginxVersionMinimum, NginxVersionMaximum: profile.NginxVersionMaximum, PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest), ManagedConfinement: preflight.ManagedConfinementProfile{SchemaVersion: confinement.SchemaVersion, KernelRelease: confinement.KernelRelease, CgroupMode: confinement.CgroupMode, BindListenPolicy: confinement.BindListenPolicy, ConnectPolicy: confinement.ConnectPolicy, FilesystemPolicy: confinement.FilesystemPolicy, ProtectedDestinations: append([]string(nil), confinement.ProtectedDestinations...), PolicyDigest: "sha256:" + confinement.PolicyDigest}, Authority: authority}, ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/lanpanel/nginx", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}, {Path: "/var/lib/lanpanel/certificates", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o711, MaximumMode: 0o711}}, Disks: []preflight.DiskRequirement{{Path: "/etc/lanpanel/nginx", MinimumAvailableBytes: 1}}, LastTrustedWall: lastTrustedWall}
+	expected := expectedInstalledProfile(profile)
+	expected.Authority = authority
+	request := preflight.ExpansionRequest{Scope: preflight.ExpansionDomainHTTPS, Target: "resource/" + resource.ID, Generation: resource.PublicationRecord.UnpublishedGeneration, Domains: domains, OwnedListeners: owned, Profile: expected, ManagedPaths: []preflight.ManagedPathRequirement{{Path: "/etc/lanpanel/nginx", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o700, MaximumMode: 0o700}, {Path: "/var/lib/lanpanel/certificates", Kind: preflight.ManagedPathDirectory, OwnerUID: 0, OwnerGID: 0, RequiredMode: 0o711, MaximumMode: 0o711}}, Disks: []preflight.DiskRequirement{{Path: "/etc/lanpanel/nginx", MinimumAvailableBytes: 1}}, LastTrustedWall: lastTrustedWall}
 	observer, err := preflight.NewLinuxObserver(func(ctx context.Context) (preflight.PackageObservation, error) {
 		return preflight.ObserveBootstrapReadiness(ctx)
 	})

@@ -20,7 +20,7 @@ check() {
   fi
 }
 
-check_os() { [ -r /etc/os-release ] && [ "$(uname -s)" = Linux ]; }
+check_os() { [ "$(uname -s)" = Linux ]; }
 check_arch() { [ "$(dpkg --print-architecture 2>/dev/null)" = amd64 ] && [ "$(uname -m)" = x86_64 ]; }
 check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = systemd ] && command -v systemd-run >/dev/null 2>&1; }
 check_cgroup() {

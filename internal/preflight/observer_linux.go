@@ -117,7 +117,7 @@ func (observer *LinuxObserver) observeHostCapabilities() (HostCapabilities, erro
 	if err != nil {
 		return HostCapabilities{}, err
 	}
-	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities(true, true)
+	mode, mountpoint, mountRoot, killAvailable, delegation, err := observer.observeManagedCapabilities(context.Background(), false, true)
 	if err != nil {
 		return HostCapabilities{}, err
 	}
@@ -149,7 +149,7 @@ func (observer *LinuxObserver) ObserveInstalledProfile(ctx context.Context) (Ins
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(true, false)
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(ctx, true, false)
 	if err != nil {
 		return InstalledProfileObservation{}, err
 	}
@@ -172,7 +172,7 @@ func VerifyInstalledProfile(expected ExpectedProfile, observed InstalledProfileO
 		{"architecture", expected.Architecture, observed.Architecture},
 		{"host_platform_identity", "true", boolIdentity(observed.Platform.ID != "")},
 		{"cgroup_mode", expected.ManagedConfinement.CgroupMode, observed.CgroupMode},
-		{"cgroup_mountpoint", "/sys/fs/cgroup", observed.CgroupMountpoint},
+		{"cgroup_mountpoint", "true", boolIdentity(observed.CgroupMountpoint != "")},
 		{"cgroup_mount_root", "/", observed.CgroupMountRoot},
 		{"cgroup_kill", "true", boolIdentity(observed.CgroupKillAvailable)},
 		{"systemd_delegation", "true", boolIdentity(observed.SystemdDelegation.Available)},
@@ -404,7 +404,7 @@ func (observer *LinuxObserver) ObserveExpansion(ctx context.Context, request Exp
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
-	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(request.Scope != ExpansionBootstrap, request.Scope == ExpansionBootstrap)
+	cgroupMode, cgroupMountpoint, cgroupMountRoot, cgroupKillAvailable, systemdDelegation, err := observer.observeManagedCapabilities(ctx, request.Scope != ExpansionBootstrap, request.Scope == ExpansionBootstrap)
 	if err != nil {
 		return ExpansionObservations{}, err
 	}
@@ -494,7 +494,7 @@ type cgroupMount struct {
 	Mountpoint string
 }
 
-func (observer *LinuxObserver) observeManagedCapabilities(requireHelper, activeProbe bool) (string, string, string, bool, ComponentObservation, error) {
+func (observer *LinuxObserver) observeManagedCapabilities(ctx context.Context, requireHelper, activeProbe bool) (string, string, string, bool, ComponentObservation, error) {
 	mountpoint, mountRoot, mode, err := observer.observeCgroupTopology()
 	if err != nil {
 		return "", "", "", false, ComponentObservation{}, err
@@ -507,7 +507,7 @@ func (observer *LinuxObserver) observeManagedCapabilities(requireHelper, activeP
 			return "", "", "", false, ComponentObservation{}, probeErr
 		}
 	}
-	delegation := observer.observeSystemdDelegation(mode, mountpoint, killAvailable, requireHelper, activeProbe)
+	delegation := observer.observeSystemdDelegation(ctx, mode, mountpoint, killAvailable, requireHelper, activeProbe)
 	if activeProbe && delegation.Available {
 		killAvailable = true
 	}
@@ -625,7 +625,7 @@ func unescapeMountInfoPath(value string) (string, error) {
 	return output.String(), nil
 }
 
-func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string, cgroupDelegation bool, requireHelper, activeProbe bool) ComponentObservation {
+func (observer *LinuxObserver) observeSystemdDelegation(ctx context.Context, mode, mountpoint string, cgroupDelegation bool, requireHelper, activeProbe bool) ComponentObservation {
 	if mode != "unified_v2" || mountpoint == "" || !cgroupDelegation && !activeProbe {
 		return ComponentObservation{Identity: "cgroup delegation unavailable: " + mode}
 	}
@@ -648,7 +648,7 @@ func (observer *LinuxObserver) observeSystemdDelegation(mode, mountpoint string,
 		return ComponentObservation{Identity: "systemd Delegate= unsupported"}
 	}
 	if activeProbe && observer.delegationProbe != nil {
-		probeContext, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		probeContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 		probe := observer.delegationProbe(probeContext)
 		cancel()
 		if !probe.Available {

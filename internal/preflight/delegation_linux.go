@@ -47,7 +47,7 @@ func activeDelegationProbe(ctx context.Context) ComponentObservation {
 		if err := probeCtx.Err(); err != nil {
 			return ComponentObservation{Identity: "systemd delegation probe cancelled"}
 		}
-		state, status, showErr := transientUnitState(unit)
+		state, status, showErr := transientUnitState(probeCtx, unit)
 		if showErr != nil {
 			return ComponentObservation{Identity: "systemd delegation probe observation failed: " + showErr.Error()}
 		}
@@ -69,21 +69,31 @@ func delegationProbeUnitName() string {
 	return fmt.Sprintf("lanpanel-delegation-probe-%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
-func transientUnitState(unit string) (string, string, error) {
-	data, err := exec.Command("/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=ExecMainStatus", "--value").Output()
+func transientUnitState(ctx context.Context, unit string) (string, string, error) {
+	data, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=ExecMainStatus").Output()
 	if err != nil {
 		return "", "", err
 	}
-	values := strings.Fields(string(data))
-	if len(values) != 2 {
+	values := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	state, stateOK := values["ActiveState"]
+	status, statusOK := values["ExecMainStatus"]
+	if !stateOK || !statusOK || state == "" || status == "" {
 		return "", "", fmt.Errorf("transient unit state is malformed")
 	}
-	return values[0], values[1], nil
+	return state, status, nil
 }
 
 func stopTransientUnit(unit string) {
-	_ = exec.Command("/usr/bin/systemctl", "stop", unit).Run()
-	_ = exec.Command("/usr/bin/systemctl", "reset-failed", unit).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "/usr/bin/systemctl", "stop", unit).Run()
+	_ = exec.CommandContext(ctx, "/usr/bin/systemctl", "reset-failed", unit).Run()
 }
 
 // RunDelegationProbeChild is the executable role launched inside a temporary
