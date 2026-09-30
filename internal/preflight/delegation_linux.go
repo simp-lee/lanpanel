@@ -19,9 +19,9 @@ import (
 
 // activeDelegationProbe asks PID 1 to create a disposable delegated scope and
 // runs the same cgroup lifecycle that LanPanel uses for package and helper
-// children. It deliberately avoids systemd-run --wait/--collect so the probe
-// remains usable with older systemd versions that support Delegate=yes.
-func activeDelegationProbe(ctx context.Context) ComponentObservation {
+// children. It avoids systemd-run --wait/--collect so older systemd versions
+// with Delegate=yes remain eligible.
+func activeDelegationProbe(ctx context.Context) (result ComponentObservation) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -32,27 +32,36 @@ func activeDelegationProbe(ctx context.Context) ComponentObservation {
 		return ComponentObservation{Identity: "delegation probe executable is unavailable"}
 	}
 	unit := delegationProbeUnitName()
-	systemdRun := exec.CommandContext(probeCtx, "/usr/bin/systemd-run", "--quiet", "--unit="+unit, "--property=Delegate=yes", executable, "delegation-probe-child")
+	defer func() {
+		if cleanupErr := stopTransientUnit(unit); cleanupErr != nil {
+			result.Available = false
+			if result.Identity == "" {
+				result.Identity = "systemd delegation probe cleanup failed: " + cleanupErr.Error()
+			} else {
+				result.Identity += "; cleanup failed: " + cleanupErr.Error()
+			}
+		}
+	}()
+	systemdRun := exec.CommandContext(probeCtx, "/usr/bin/systemd-run", "--unit="+unit, "--property=Delegate=yes", "--property=RemainAfterExit=yes", executable, "delegation-probe-child")
 	output, err := systemdRun.CombinedOutput()
 	if err != nil {
-		stopTransientUnit(unit)
 		identity := strings.TrimSpace(string(output))
 		if identity == "" {
 			identity = err.Error()
 		}
 		return ComponentObservation{Identity: "systemd delegation probe failed: " + identity}
 	}
-	defer stopTransientUnit(unit)
 	for {
 		if err := probeCtx.Err(); err != nil {
 			return ComponentObservation{Identity: "systemd delegation probe cancelled"}
 		}
-		state, status, showErr := transientUnitState(probeCtx, unit)
+		state, subState, status, showErr := transientUnitState(probeCtx, unit)
 		if showErr != nil {
 			return ComponentObservation{Identity: "systemd delegation probe observation failed: " + showErr.Error()}
 		}
-		if state == "inactive" || state == "failed" {
-			if status != "0" {
+		terminal := state == "inactive" || state == "failed" || state == "active" && subState == "exited"
+		if terminal {
+			if status != "0" || state == "failed" {
 				return ComponentObservation{Identity: "systemd delegation probe child failed with status " + status}
 			}
 			return ComponentObservation{Available: true, Identity: "systemd delegated scope probe passed"}
@@ -69,10 +78,10 @@ func delegationProbeUnitName() string {
 	return fmt.Sprintf("lanpanel-delegation-probe-%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
-func transientUnitState(ctx context.Context, unit string) (string, string, error) {
-	data, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=ExecMainStatus").Output()
+func transientUnitState(ctx context.Context, unit string) (string, string, string, error) {
+	data, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=ExecMainStatus").Output()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	values := map[string]string{}
 	for _, line := range strings.Split(string(data), "\n") {
@@ -81,19 +90,42 @@ func transientUnitState(ctx context.Context, unit string) (string, string, error
 			values[key] = value
 		}
 	}
-	state, stateOK := values["ActiveState"]
-	status, statusOK := values["ExecMainStatus"]
-	if !stateOK || !statusOK || state == "" || status == "" {
-		return "", "", fmt.Errorf("transient unit state is malformed")
+	if values["LoadState"] == "not-found" {
+		return "", "", "", fmt.Errorf("transient unit disappeared")
 	}
-	return state, status, nil
+	loadState, loadOK := values["LoadState"]
+	state, stateOK := values["ActiveState"]
+	subState, subOK := values["SubState"]
+	status, statusOK := values["ExecMainStatus"]
+	if !loadOK || !stateOK || !subOK || !statusOK || loadState == "" || state == "" || subState == "" || status == "" {
+		return "", "", "", fmt.Errorf("transient unit state is malformed")
+	}
+	return state, subState, status, nil
 }
 
-func stopTransientUnit(unit string) {
+func stopTransientUnit(unit string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = exec.CommandContext(ctx, "/usr/bin/systemctl", "stop", unit).Run()
-	_ = exec.CommandContext(ctx, "/usr/bin/systemctl", "reset-failed", unit).Run()
+	stopErr := exec.CommandContext(ctx, "/usr/bin/systemctl", "stop", unit).Run()
+	if isMissingSystemdUnit(stopErr) {
+		stopErr = nil
+	}
+	resetErr := exec.CommandContext(ctx, "/usr/bin/systemctl", "reset-failed", unit).Run()
+	if isMissingSystemdUnit(resetErr) {
+		resetErr = nil
+	}
+	if stopErr != nil {
+		return stopErr
+	}
+	if resetErr != nil {
+		return resetErr
+	}
+	return nil
+}
+
+func isMissingSystemdUnit(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 5
 }
 
 // RunDelegationProbeChild is the executable role launched inside a temporary

@@ -19,6 +19,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestSignedAPTReleaseMatchesCodenameAndComponentSubset(t *testing.T) {
+	release := []byte("Suite: stable\nCodename: trixie\nComponents: main contrib non-free\n")
+	if !releaseSuiteMatches(release, "trixie") || !releaseComponentsAuthorize(release, []string{"main", "contrib"}) {
+		t.Fatal("valid APT codename/component subset was rejected")
+	}
+	if releaseSuiteMatches(release, "bookworm") || releaseComponentsAuthorize(release, []string{"main", "security"}) {
+		t.Fatal("unauthorized APT suite/component was accepted")
+	}
+}
+
 func TestAPTListRepositoryPrefixUsesAPTCanonicalPath(t *testing.T) {
 	for _, test := range []struct {
 		uri, suite, want string

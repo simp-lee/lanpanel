@@ -24,6 +24,9 @@ func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfi
 	if nginxMinimum == "" {
 		nginxMinimum = profile.NginxVersionMinimum
 	}
+	if nginxMinimum == "" {
+		nginxMinimum = "1.18.0"
+	}
 	return preflight.ExpectedProfile{
 		ID:                    profile.ID,
 		VersionID:             profile.Release,
@@ -37,7 +40,7 @@ func expectedInstalledProfile(profile release.OSProfile) preflight.ExpectedProfi
 		SystemdVersionMaximum: profile.SystemdVersionMaximum,
 		NginxVersion:          profile.NginxVersion,
 		NginxVersionMinimum:   nginxMinimum,
-		NginxVersionMaximum:   profile.NginxVersionMaximum,
+		NginxVersionMaximum:   profile.Nginx.MaximumVersion,
 		PackageSnapshotDigest: prefixedProfileDigest(profile.PackageSnapshotDigest),
 		ManagedConfinement: preflight.ManagedConfinementProfile{
 			SchemaVersion:         confinement.SchemaVersion,

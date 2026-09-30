@@ -26,7 +26,7 @@ check_systemd() { [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm 2>/dev/null)" = s
 check_cgroup() {
   [ -z "$(awk 'function separator(){ for (i=1; i<=NF; i++) if ($i == "-") return i } { s=separator(); if (s && $(s+1) == "cgroup") print }' /proc/self/mountinfo)" ] || return 1
   mountpoint=$(awk 'function separator(){ for (i=1; i<=NF; i++) if ($i == "-") return i } { s=separator(); if (s && $(s+1) == "cgroup2" && $4 == "/") { print $5; count++ } } END { if (count == 1) exit 0; exit 1 }' /proc/self/mountinfo) || return 1
-  [ -s "$mountpoint/cgroup.controllers" ] || return 1
+  [ -r "$mountpoint/cgroup.controllers" ] && [ -n "$(cat "$mountpoint/cgroup.controllers" 2>/dev/null)" ] || return 1
   self_cgroup=$(awk -F: '$1 == 0 { print $3 }' /proc/self/cgroup)
   [ -n "$self_cgroup" ] && [ -f "$mountpoint${self_cgroup}/cgroup.procs" ] && [ -f "$mountpoint${self_cgroup}/cgroup.events" ]
 }

@@ -348,8 +348,8 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 		if !releaseFieldContainsToken(plaintext, "Architectures", "amd64") {
 			return fmt.Errorf("APT repository %q InRelease does not authorize amd64", repositories[index].ID)
 		}
-		if !releaseFieldEqualsTokens(plaintext, "Suite", []string{repositories[index].Suite}) || !releaseFieldEqualsTokens(plaintext, "Components", repositories[index].Components) {
-			return fmt.Errorf("APT repository %q signed suite or components differ from authority", repositories[index].ID)
+		if !releaseSuiteMatches(plaintext, repositories[index].Suite) || !releaseComponentsAuthorize(plaintext, repositories[index].Components) {
+			return fmt.Errorf("APT repository %q signed suite or components do not authorize the configured source", repositories[index].ID)
 		}
 		allArchitectureRequired := releaseFieldContainsToken(plaintext, "Architectures", "all") && !releaseFieldContainsToken(plaintext, "No-Support-for-Architecture-all", "Packages")
 		requireIndexes := expectedPackages == nil
@@ -739,6 +739,29 @@ func releaseFieldEqualsTokens(release []byte, field string, expected []string) b
 	return found && slices.Equal(actual, expected)
 }
 
+func releaseSuiteMatches(release []byte, configured string) bool {
+	for _, field := range []string{"Suite", "Codename"} {
+		values, found := releaseFieldTokens(release, field)
+		if found && slices.Contains(values, configured) {
+			return true
+		}
+	}
+	return false
+}
+
+func releaseComponentsAuthorize(release []byte, configured []string) bool {
+	values, found := releaseFieldTokens(release, "Components")
+	if !found || len(configured) == 0 {
+		return false
+	}
+	for _, component := range configured {
+		if !slices.Contains(values, component) {
+			return false
+		}
+	}
+	return true
+}
+
 func releaseFieldContainsToken(release []byte, field, expected string) bool {
 	values, found := releaseFieldTokens(release, field)
 	return found && slices.Contains(values, expected)
@@ -888,7 +911,7 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 			keyrings[file.Path] = file.Bytes
 		}
 	}
-	if basic && plan.Mode != DistroRepository {
+	if basic {
 		if err := auditor.bindObservedRepositoryKeyrings(repositories, keyrings); err != nil {
 			return nil, nil, err
 		}
