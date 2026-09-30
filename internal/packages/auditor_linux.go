@@ -408,7 +408,7 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 				}
 				if !found && requireIndexes && (architecture == "amd64" || allArchitectureRequired) {
 					releasePath := signedComponent + "/binary-" + architecture + "/Packages"
-					if _, declared := releaseFiles[releasePath]; declared {
+					if declared, present := releaseFiles[releasePath]; present && declared.Bytes > 0 {
 						return fmt.Errorf("APT repository %q lacks the exact %s package index for component %q", repositories[index].ID, architecture, component)
 					}
 				}
