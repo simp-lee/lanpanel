@@ -888,17 +888,14 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 			keyrings[file.Path] = file.Bytes
 		}
 	}
-	if basic {
-		// Public distro plans intentionally use the host's configured APT
-		// sources. APT remains responsible for its normal signature checks;
-		// LanPanel does not bind a mirror URI or repository snapshot.
-		if plan.Mode == DistroRepository {
-			return files, repositories, nil
-		}
+	if basic && plan.Mode != DistroRepository {
 		if err := auditor.bindObservedRepositoryKeyrings(repositories, keyrings); err != nil {
 			return nil, nil, err
 		}
 	}
+	// Public distro plans intentionally use the host's configured APT sources,
+	// but still require the currently installed Release/InRelease metadata to
+	// verify against its configured keyring before apt is allowed to mutate.
 	for index := range repositories {
 		repositories[index].KeyringDigest = digestBytes(keyrings[repositories[index].KeyringPath])
 	}

@@ -18,7 +18,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -91,13 +90,10 @@ func capture(output, profileID, dependencyPath string, packageNames []string) er
 	profilePackages := make([]release.PackageTuple, 0, len(packageNames))
 	seen := map[string]bool{}
 	sort.Strings(packageNames)
-	if !slices.Contains(packageNames, "nginx") {
-		return fmt.Errorf("package set omits required nginx")
+	if len(packageNames) != 1 || packageNames[0] != "nginx" {
+		return fmt.Errorf("the Host Capability Contract permits only the host Nginx APT package")
 	}
 	for _, name := range packageNames {
-		if name == "goaccess" {
-			return fmt.Errorf("GoAccess is release-bundled and must not be captured as an APT package")
-		}
 		if seen[name] {
 			return fmt.Errorf("duplicate package %q", name)
 		}

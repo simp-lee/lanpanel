@@ -508,8 +508,8 @@ func validateHostCapabilityContract(profile HostCapabilityContract) error {
 	for _, repository := range profile.Repositories {
 		repositoryIDs[repository.ID] = true
 	}
-	if len(profile.Packages) == 0 || len(profile.Packages) > 4096 {
-		return fmt.Errorf("host capability contract package set is empty or unbounded")
+	if len(profile.Packages) != 1 {
+		return fmt.Errorf("host capability contract must contain exactly the Nginx host package")
 	}
 	for _, repository := range profile.Repositories {
 		parsed, err := url.Parse(repository.URI)
