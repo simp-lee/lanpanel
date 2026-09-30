@@ -187,6 +187,10 @@ type TTY interface {
 	WriteToken([]byte) error
 }
 
+type installerPrompt interface {
+	Confirm(string) (bool, error)
+}
+
 func validateJournal(value Journal) error {
 	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
 		return fmt.Errorf("bootstrap journal is incomplete or invalid")

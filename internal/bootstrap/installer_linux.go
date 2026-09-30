@@ -11,6 +11,7 @@ import (
 	"lanpanel/internal/acmeaccount"
 	managedarchive "lanpanel/internal/archive"
 	"lanpanel/internal/child"
+	"lanpanel/internal/debianversion"
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/identity"
@@ -184,17 +185,6 @@ func install(ctx context.Context, request Request, strict bool) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if strict && paths == FixedPaths() {
-		if err := rejectForeignNginxPackage(ctx); err != nil {
-			return err
-		}
-		if err := rejectForeignNginxPreinstallFiles(); err != nil {
-			return err
-		}
-		if err := rejectForeignNginxAuthority(); err != nil {
-			return err
-		}
-	}
 	var material identity.Material
 	if request.Material != nil {
 		material = *request.Material
@@ -226,6 +216,16 @@ func install(ctx context.Context, request Request, strict bool) error {
 		return err
 	}
 	request.PackagePreflight = preflightResult
+	if strict && paths == FixedPaths() {
+		request.PackagePlan, err = prepareFreshNginxPackagePlan(ctx, releaseIdentity, request)
+		if err != nil {
+			return err
+		}
+		packagePlanDigest, err = validateInstallerPackageAuthority(releaseIdentity, request.PackagePlan, request.PackagePreflight)
+		if err != nil {
+			return err
+		}
+	}
 	if len(request.InstallerInput) != 0 {
 		request.InstallerInput, err = rebindPublicInstallerInput(request.InstallerInput, request.PackagePlan, request.PackagePreflight)
 		if err != nil {
@@ -234,7 +234,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 		inputPackagePlanDigest = packagePlanDigest
 	}
 	preflightDigest, _ := preflight.ExpansionRequestDigest(preflightRequest)
-	plannedPaths, err := plannedBootstrapPaths(paths)
+	plannedPaths, err := plannedBootstrapPathsForPlan(paths, request.PackagePlan)
 	if err != nil {
 		return fmt.Errorf("bootstrap planned path inventory failed: %w", err)
 	}
@@ -296,11 +296,21 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile {
 		return "", fmt.Errorf("package plan does not match installer identity")
 	}
-	if len(plan.Packages) != len(installed.Profile.Packages) {
+	wantPackages := installed.Profile.Packages
+	if plan.ExternalNginx {
+		filtered := make([]release.PackageTuple, 0, len(wantPackages))
+		for _, want := range wantPackages {
+			if want.Name != "nginx" {
+				filtered = append(filtered, want)
+			}
+		}
+		wantPackages = filtered
+	}
+	if len(plan.Packages) != len(wantPackages) {
 		return "", fmt.Errorf("package plan package set differs from installer profile")
 	}
 	for index, pkg := range plan.Packages {
-		want := installed.Profile.Packages[index]
+		want := wantPackages[index]
 		if pkg.Name != want.Name || pkg.Version != want.Version || pkg.VersionMinimum != want.VersionMinimum || pkg.VersionMaximum != want.VersionMaximum || pkg.Architecture != want.Architecture {
 			return "", fmt.Errorf("package plan version set differs from installer profile")
 		}
@@ -386,6 +396,12 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 	if len(token) != 0 {
 		defer clear(token)
 	}
+	if journal.PackagePlan.ExternalNginx && journal.PackageJournalDigest != "" {
+		receipt, err := existingNginxReceipt(ctx, journal.Release, journal.PackagePlanDigest)
+		if err != nil || receipt != journal.ArtifactDigests["reused_nginx"] {
+			return fmt.Errorf("reused Nginx package authority changed")
+		}
+	}
 	advance := func(phase Phase) error {
 		journal.Sequence++
 		journal.Phase = phase
@@ -404,19 +420,29 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		if err := copyOrVerifyBinaryBytes(request.SourceBinary, journal.Paths, releaseBinary{Digest: journal.Release.Binary.Digest, Bytes: journal.Release.Binary.Bytes}); err != nil {
 			return fmt.Errorf("bootstrap binary install failed: %w", err)
 		}
-		if err := copyOrVerifyPolicyBytes(request.SourceBinary, journal.Release.Binary, journal.Paths); err != nil {
-			return fmt.Errorf("bootstrap policy install failed: %w", err)
+		if len(journal.PackagePlan.Packages) != 0 {
+			if err := copyOrVerifyPolicyBytes(request.SourceBinary, journal.Release.Binary, journal.Paths); err != nil {
+				return fmt.Errorf("bootstrap policy install failed: %w", err)
+			}
+			journal.ArtifactDigests["/usr/sbin/policy-rc.d"] = journal.Release.Binary.Digest
 		}
 		journal.ArtifactDigests[journal.Paths.BinaryPath] = journal.Release.Binary.Digest
 		if err := putOrVerifyTargetFile(ctx, publicCommandPath(journal.Paths), request.SourceBinary, 0o755); err != nil {
 			return fmt.Errorf("bootstrap public command install failed: %w", err)
 		}
 		journal.ArtifactDigests[publicCommandPath(journal.Paths)] = journal.Release.Binary.Digest
-		journal.ArtifactDigests["/usr/sbin/policy-rc.d"] = journal.Release.Binary.Digest
 		if _, err := ensureDirectory(journal.Paths.PersistentRoot, filetxn.Owner{UID: 0, GID: 0}, 0o711); err != nil {
 			return err
 		}
 		if journal.Paths == FixedPaths() {
+			if journal.PackagePlan.ExternalNginx {
+				if err := validateExistingNginxConfig(ctx); err != nil {
+					return fmt.Errorf("existing Nginx configuration test failed: %w", err)
+				}
+				if err := stopExistingNginxService(ctx); err != nil {
+					return fmt.Errorf("stop existing Nginx service before LanPanel takeover failed: %w", err)
+				}
+			}
 			if err := installVendorNginxMask(journal.Paths.SystemdRoot); err != nil {
 				return fmt.Errorf("bootstrap nginx mask failed: %w", err)
 			}
@@ -427,12 +453,28 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 		}
 	}
 	if journal.Phase == PhaseNginxMasked {
-		packageJournal, err := request.PackageTransaction(ctx, request.PackagePlan, request.PackagePreflight)
-		if err != nil {
-			return err
+		if journal.PackagePlan.ExternalNginx && len(journal.PackagePlan.Packages) == 0 {
+			digest, err := existingNginxReceipt(ctx, journal.Release, journal.PackagePlanDigest)
+			if err != nil {
+				return fmt.Errorf("verify reused Nginx before commit: %w", err)
+			}
+			journal.PackageJournalDigest = digest
+			journal.ArtifactDigests["reused_nginx"] = digest
+		} else {
+			packageJournal, err := request.PackageTransaction(ctx, request.PackagePlan, request.PackagePreflight)
+			if err != nil {
+				return err
+			}
+			if err := reconcilePackageCommit(&journal, packageJournal); err != nil {
+				return fmt.Errorf("bootstrap package commit failed: %w", err)
+			}
 		}
-		if err := reconcilePackageCommit(&journal, packageJournal); err != nil {
-			return fmt.Errorf("bootstrap package commit failed: %w", err)
+		if journal.PackagePlan.ExternalNginx && len(journal.PackagePlan.Packages) != 0 {
+			digest, err := existingNginxReceipt(ctx, journal.Release, journal.PackagePlanDigest)
+			if err != nil {
+				return fmt.Errorf("verify reused Nginx after package commit: %w", err)
+			}
+			journal.ArtifactDigests["reused_nginx"] = digest
 		}
 		if err := advance(PhasePackagesCommitted); err != nil {
 			return err
@@ -964,19 +1006,217 @@ func rejectForeignNginxPreinstallFiles() error {
 	return nil
 }
 
-func rejectForeignNginxPackage(ctx context.Context) error {
+func prepareFreshNginxPackagePlan(ctx context.Context, authority release.InstallIdentity, request Request) (packages.Plan, error) {
+	plan := request.PackagePlan
 	installed, present, err := preflight.ObserveInstalledPackage(ctx, "nginx")
 	if err != nil {
-		return fmt.Errorf("inspect Nginx package ownership before mutation: %w", err)
+		return packages.Plan{}, fmt.Errorf("inspect Nginx package before installation: %w", err)
 	}
 	if !present {
-		return nil
+		if err := rejectForeignNginxPreinstallFiles(); err != nil {
+			return packages.Plan{}, err
+		}
+		if err := rejectForeignNginxAuthority(); err != nil {
+			return packages.Plan{}, err
+		}
+		return plan, nil
 	}
-	return validateFreshNginxPackageOwnership(installed)
+	if err := validateExistingNginxVersion(authority, installed); err != nil {
+		return packages.Plan{}, err
+	}
+	if err := validateExistingNginxAuthority(); err != nil {
+		return packages.Plan{}, err
+	}
+	prompt, ok := request.TTY.(installerPrompt)
+	if !ok || request.TTY == nil || !request.TTY.Attached() {
+		return packages.Plan{}, fmt.Errorf("compatible Nginx %s is already installed; rerun install from an interactive terminal to choose whether LanPanel reuses it", installed.Version)
+	}
+	useExisting, err := prompt.Confirm(fmt.Sprintf("Detected compatible Nginx %s. LanPanel will preserve the package, stop nginx.service, and use its own managed configuration. Use the existing Nginx package? [Y/n]: ", installed.Version))
+	if err != nil {
+		return packages.Plan{}, fmt.Errorf("read Nginx installation choice: %w", err)
+	}
+	if !useExisting {
+		return packages.Plan{}, fmt.Errorf("existing compatible Nginx was kept unchanged; remove it and rerun install to let LanPanel install Nginx")
+	}
+	plan, err = planForExistingNginx(plan)
+	if err != nil {
+		return packages.Plan{}, err
+	}
+	return plan, nil
 }
 
-func validateFreshNginxPackageOwnership(installed preflight.InstalledPackageTuple) error {
-	return fmt.Errorf("nginx is already installed outside LanPanel (%s); stop and remove the foreign Nginx installation or use the existing LanPanel installation; no package mutation was performed", installed.Version)
+func planForExistingNginx(plan packages.Plan) (packages.Plan, error) {
+	plan.ExternalNginx = true
+	plan.FirstNginxInstall = false
+	filtered := make([]packages.Package, 0, len(plan.Packages))
+	for _, pkg := range plan.Packages {
+		if pkg.Name != "nginx" {
+			filtered = append(filtered, pkg)
+		}
+	}
+	if len(filtered) == len(plan.Packages) {
+		return packages.Plan{}, fmt.Errorf("compatible existing Nginx was selected but the package plan does not contain nginx")
+	}
+	plan.Packages = filtered
+	if err := packages.ValidatePlan(plan); err != nil {
+		return packages.Plan{}, fmt.Errorf("existing Nginx package plan is invalid: %w", err)
+	}
+	return plan, nil
+}
+
+func validateExistingNginxVersion(authority release.InstallIdentity, installed preflight.InstalledPackageTuple) error {
+	if installed.Name != "nginx" || installed.Architecture != "amd64" {
+		return fmt.Errorf("installed Nginx package has unsupported identity %s/%s", installed.Version, installed.Architecture)
+	}
+	minimum, maximum := authority.Profile.Nginx.MinimumVersion, authority.Profile.Nginx.MaximumVersion
+	if minimum == "" {
+		minimum = authority.Profile.NginxVersionMinimum
+	}
+	if maximum == "" {
+		maximum = authority.Profile.NginxVersionMaximum
+	}
+	if !debianversion.Satisfies(installed.Version, minimum, maximum) {
+		bound := minimum
+		if maximum != "" {
+			bound += " <= version < " + maximum
+		} else {
+			bound += " or newer"
+		}
+		return fmt.Errorf("installed Nginx version %s does not satisfy LanPanel requirement %s", installed.Version, bound)
+	}
+	return nil
+}
+
+func validateExistingNginxAuthority() error {
+	if err := validateExistingNginxBinary(); err != nil {
+		return err
+	}
+	if _, err := os.Lstat("/etc/systemd/system/nginx.service"); err == nil {
+		return fmt.Errorf("existing Nginx has a foreign systemd unit override at /etc/systemd/system/nginx.service")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, path := range []string{"/etc/systemd/system/nginx.service.d", "/usr/lib/systemd/system/nginx.service.d", "/lib/systemd/system/nginx.service.d", "/run/systemd/system.control/nginx.service", "/run/systemd/system.control/nginx.service.d", "/run/systemd/transient/nginx.service", "/run/systemd/transient/nginx.service.d", "/run/systemd/system.attached/nginx.service", "/run/systemd/system.attached/nginx.service.d", "/run/systemd/generator.early/nginx.service", "/run/systemd/generator.early/nginx.service.d", "/run/systemd/system/nginx.service", "/run/systemd/system/nginx.service.d", "/run/systemd/generator/nginx.service", "/run/systemd/generator/nginx.service.d", "/usr/local/lib/systemd/system/nginx.service", "/usr/local/lib/systemd/system/nginx.service.d", "/run/systemd/generator.late/nginx.service", "/run/systemd/generator.late/nginx.service.d"} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("existing Nginx has a foreign systemd override at %q", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if _, err := existingNginxUnitPath(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func existingNginxUnitPath() (string, error) {
+	for _, path := range []string{"/usr/lib/systemd/system/nginx.service", "/lib/systemd/system/nginx.service"} {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.Mode().IsRegular() {
+				return "", fmt.Errorf("existing Nginx canonical unit is not a regular file")
+			}
+			return path, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("existing Nginx package has no canonical nginx.service unit")
+}
+
+func validateExistingNginxConfig(ctx context.Context) error {
+	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
+	if err != nil {
+		return err
+	}
+	result, err := launcher.Run(ctx, child.ProfileExistingNginxTest, nil)
+	if err != nil {
+		return err
+	}
+	if result.ExitCode != 0 || result.OutputCutOff {
+		return fmt.Errorf("nginx -t exited with status %d", result.ExitCode)
+	}
+	return nil
+}
+
+func stopExistingNginxService(ctx context.Context) error {
+	if target, err := os.Readlink("/etc/systemd/system/nginx.service"); err == nil {
+		if target != "/dev/null" {
+			return fmt.Errorf("existing Nginx unit mask target is foreign")
+		}
+		return rejectNginxPortListeners()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
+	if err != nil {
+		return err
+	}
+	result, err := launcher.Run(ctx, child.ProfileExistingNginxStop, nil)
+	if err != nil {
+		return err
+	}
+	if result.ExitCode != 0 || result.OutputCutOff {
+		return fmt.Errorf("systemctl stop nginx.service exited with status %d", result.ExitCode)
+	}
+	return rejectNginxPortListeners()
+}
+
+func existingNginxReceipt(ctx context.Context, authority release.InstallIdentity, planDigest string) (string, error) {
+	installed, present, err := preflight.ObserveInstalledPackage(ctx, "nginx")
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		return "", fmt.Errorf("reused Nginx package disappeared")
+	}
+	if err := validateExistingNginxVersion(authority, installed); err != nil {
+		return "", err
+	}
+	if err := validateExistingNginxBinary(); err != nil {
+		return "", err
+	}
+	unitPath, err := existingNginxUnitPath()
+	if err != nil {
+		return "", err
+	}
+	binaryDigest, err := digestExistingNginxFile("/usr/sbin/nginx", 128<<20)
+	if err != nil {
+		return "", err
+	}
+	unitDigest, err := digestExistingNginxFile(unitPath, 1<<20)
+	if err != nil {
+		return "", err
+	}
+	return release.DigestBytes([]byte("lanpanel.external-nginx.v1\x00" + installed.Version + "\x00" + binaryDigest + "\x00" + unitDigest + "\x00" + planDigest)), nil
+}
+
+func digestExistingNginxFile(path string, maximum int64) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > maximum {
+		return "", fmt.Errorf("existing Nginx authority file is too large")
+	}
+	return release.DigestBytes(data), nil
+}
+
+func validateExistingNginxBinary() error {
+	info, err := os.Stat("/usr/sbin/nginx")
+	if err != nil {
+		return fmt.Errorf("compatible Nginx package is missing /usr/sbin/nginx: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+		return fmt.Errorf("existing Nginx binary /usr/sbin/nginx is not a regular executable")
+	}
+	return nil
 }
 
 func rejectForeignNginxAuthority() error {
@@ -988,6 +1228,10 @@ func rejectForeignNginxAuthority() error {
 			return fmt.Errorf("foreign Nginx site or unit authority exists at %q", path)
 		}
 	}
+	return rejectNginxPortListeners()
+}
+
+func rejectNginxPortListeners() error {
 	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		data, err := os.ReadFile(table)
 		if err != nil {
@@ -1160,7 +1404,7 @@ func verifyPrecommitArtifacts(journal Journal) error {
 		return err
 	}
 	for path, digest := range journal.ArtifactDigests {
-		if path == "release_binary" || path == "installation_bundle" || path == "package_transaction" {
+		if path == "release_binary" || path == "installation_bundle" || path == "package_transaction" || path == "reused_nginx" {
 			continue
 		}
 		if path == "default_rejection_certificate" {
@@ -1242,7 +1486,7 @@ func verifyCommittedBundle(paths Paths, journal Journal, commit Commit) error {
 		}
 	}
 	for path, digest := range journal.ArtifactDigests {
-		if path == "release_binary" || path == "installation_bundle" || path == "package_transaction" {
+		if path == "release_binary" || path == "installation_bundle" || path == "package_transaction" || path == "reused_nginx" {
 			continue
 		}
 		if path == "default_rejection_certificate" {

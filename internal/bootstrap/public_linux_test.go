@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"lanpanel/internal/preflight"
+	"lanpanel/internal/release"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -26,9 +27,20 @@ func TestArtifactDirectoryRejectsUnexpectedAssets(t *testing.T) {
 	}
 }
 
-func TestFreshInstallRejectsForeignNginx(t *testing.T) {
-	if err := validateFreshNginxPackageOwnership(preflight.InstalledPackageTuple{Name: "nginx", Version: "1.22.1-9", Architecture: "amd64"}); err == nil || !strings.Contains(err.Error(), "already installed outside LanPanel") {
-		t.Fatalf("foreign Nginx was not rejected clearly: %v", err)
+func TestExistingNginxVersionUsesCapabilityRange(t *testing.T) {
+	authority := release.InstallIdentity{Profile: release.OSProfile{Nginx: release.NginxCapabilityContract{MinimumVersion: "1.18.0", MaximumVersion: "2.0.0"}}}
+	for _, test := range []struct {
+		version string
+		wantErr bool
+	}{
+		{version: "1.24.0-2ubuntu7.18"},
+		{version: "2.0.0", wantErr: true},
+		{version: "1.17.9", wantErr: true},
+	} {
+		err := validateExistingNginxVersion(authority, preflight.InstalledPackageTuple{Name: "nginx", Version: test.version, Architecture: "amd64"})
+		if (err != nil) != test.wantErr {
+			t.Fatalf("version %s error=%v wantErr=%t", test.version, err, test.wantErr)
+		}
 	}
 }
 

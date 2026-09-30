@@ -87,7 +87,7 @@ func validateOwnershipInventory(value OwnershipInventory, journal Journal) error
 	if value.SchemaVersion != ownershipInventorySchema || value.AttemptID != journal.AttemptID || value.InstallationID != journal.InstallationID || value.GenerationID != journal.GenerationID || len(value.Paths) == 0 || value.Paths[0] == "" || !slices.Equal(value.MutablePaths, mutableOwnershipPaths(journal.Paths)) {
 		return fmt.Errorf("installation ownership inventory is incomplete")
 	}
-	expected, err := plannedBootstrapPaths(journal.Paths)
+	expected, err := plannedBootstrapPathsForPlan(journal.Paths, journal.PackagePlan)
 	if err != nil {
 		return err
 	}

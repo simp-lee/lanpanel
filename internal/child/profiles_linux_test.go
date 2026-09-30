@@ -30,7 +30,7 @@ func TestInvocationCgroupNamesAreTyped(t *testing.T) {
 }
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileLego, ProfileNginxDump, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileLego, ProfileNginxDump, ProfileExistingNginxTest, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileExistingNginxStop, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -49,6 +49,14 @@ func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing
 	stop, err := ResolveProfile(ProfileSystemctlNginxStop, Identities{})
 	if err != nil || !stop.Complete || !reflect.DeepEqual(stop.Arguments, []string{"stop", "lanpanel-nginx.service"}) || !reflect.DeepEqual(stop.AllowedAddressFamilies, []int{1}) {
 		t.Fatalf("Nginx stop profile=%#v error=%v", stop, err)
+	}
+	existingStop, err := ResolveProfile(ProfileExistingNginxStop, Identities{})
+	if err != nil || !existingStop.Complete || !reflect.DeepEqual(existingStop.Arguments, []string{"stop", "nginx.service"}) || !reflect.DeepEqual(existingStop.AllowedAddressFamilies, []int{1}) {
+		t.Fatalf("existing Nginx stop profile=%#v error=%v", existingStop, err)
+	}
+	existingTest, err := ResolveProfile(ProfileExistingNginxTest, Identities{})
+	if err != nil || !existingTest.Complete || !reflect.DeepEqual(existingTest.Arguments, []string{"-t"}) || existingTest.Network != NetworkUnixOnly {
+		t.Fatalf("existing Nginx test profile=%#v error=%v", existingTest, err)
 	}
 	headscaleInvocation := Invocation{Headscale: &HeadscaleInvocation{HeadscaleID: "hds_00000000000000000000000000000001"}}
 	for profileID, wantArguments := range map[ProfileID][]string{

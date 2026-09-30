@@ -134,6 +134,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	if err := ValidatePlan(plan); err != nil {
 		return Journal{}, err
 	}
+	if len(plan.Packages) == 0 {
+		return Journal{}, fmt.Errorf("read-only Nginx reuse must not submit a package transaction")
+	}
 	now := time.Now().UTC
 	if engine.Now != nil {
 		now = engine.Now
@@ -387,6 +390,9 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 	}
 	if err := ValidatePlan(plan); err != nil {
 		return Journal{}, err
+	}
+	if len(plan.Packages) == 0 {
+		return Journal{}, fmt.Errorf("read-only Nginx reuse has no package transaction to resume")
 	}
 	if err := ValidateJournal(journal); err != nil {
 		return Journal{}, err

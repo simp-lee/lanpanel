@@ -8,6 +8,7 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helper"
 	"lanpanel/internal/nginx"
+	"lanpanel/internal/packages"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,6 +41,20 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 			return nil, fmt.Errorf("bootstrap planned path is invalid")
 		}
+	}
+	return values, nil
+}
+
+func plannedBootstrapPathsForPlan(paths Paths, plan packages.Plan) ([]string, error) {
+	values, err := plannedBootstrapPaths(paths)
+	if err != nil {
+		return nil, err
+	}
+	if plan.ExternalNginx && len(plan.Packages) == 0 {
+		// A read-only reuse must not claim a host's policy-rc.d or its directory.
+		values = slices.DeleteFunc(values, func(path string) bool {
+			return path == "/usr/sbin/policy-rc.d" || path == "/usr/sbin/.lanpanel-filetxn"
+		})
 	}
 	return values, nil
 }

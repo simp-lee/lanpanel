@@ -89,8 +89,10 @@ type Plan struct {
 	Repositories []Repository   `json:"repositories"`
 	// FirstNginxInstall is true only for a fresh LanPanel-owned Nginx
 	// transaction. Internal transactions for an already committed LanPanel
-	// installation set it false; a foreign pre-existing Nginx is rejected.
+	// installation set it false. ExternalNginx records an explicit choice to
+	// reuse a compatible pre-existing host Nginx package instead of mutating it.
 	FirstNginxInstall       bool          `json:"first_nginx_install"`
+	ExternalNginx           bool          `json:"external_nginx,omitempty"`
 	LockWait                time.Duration `json:"lock_wait"`
 	ConnectTimeout          time.Duration `json:"connect_timeout"`
 	ReadTimeout             time.Duration `json:"read_timeout"`
@@ -226,6 +228,9 @@ func ValidatePublicReleasePlan(plan Plan) error {
 	if err := ValidatePlan(plan); err != nil {
 		return err
 	}
+	if plan.ExternalNginx {
+		return fmt.Errorf("public release package template cannot select external Nginx")
+	}
 	if plan.Mode != DistroRepository || plan.Proxy != nil || len(plan.Repositories) != 0 {
 		return fmt.Errorf("public release package plan must use the host's authenticated APT sources")
 	}
@@ -242,7 +247,7 @@ func ValidatePlan(plan Plan) error {
 	if contractDigest == "" {
 		contractDigest = plan.OSProfileDigest
 	}
-	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(contractDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 || len(plan.Packages) > 256 {
+	if !transactionPattern.MatchString(plan.TransactionID) || !jobPattern.MatchString(plan.JobID) || plan.IntentGeneration == 0 || plan.Deadline.IsZero() || !digestPattern.MatchString(contractDigest) || plan.LockWait <= 0 || plan.LockWait > 5*time.Minute || plan.LockWait%time.Second != 0 || plan.ConnectTimeout <= 0 || plan.ConnectTimeout > 5*time.Minute || plan.ConnectTimeout%time.Second != 0 || plan.ReadTimeout <= 0 || plan.ReadTimeout > 5*time.Minute || plan.ReadTimeout%time.Second != 0 || plan.TotalTimeout <= plan.LockWait || plan.TotalTimeout < plan.ConnectTimeout || plan.TotalTimeout < plan.ReadTimeout || plan.TotalTimeout > 30*time.Minute || len(plan.Packages) == 0 && !(plan.ExternalNginx && plan.Mode == DistroRepository) || len(plan.Packages) > 256 {
 		return fmt.Errorf("package transaction identity, bounds, or OS profile are invalid")
 	}
 	if !digestPattern.MatchString(plan.NoAutostartPolicyDigest) || !strings.HasPrefix(plan.PreflightDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightDigest, "sha256:")) || !strings.HasPrefix(plan.PreflightRequestDigest, "sha256:") || !digestPattern.MatchString(strings.TrimPrefix(plan.PreflightRequestDigest, "sha256:")) {
@@ -302,6 +307,15 @@ func ValidatePlan(plan Plan) error {
 			hasNginx = true
 		}
 		previous = pkg.Name
+	}
+	if plan.ExternalNginx && plan.Mode != DistroRepository {
+		return fmt.Errorf("external Nginx reuse requires a host APT plan")
+	}
+	if plan.ExternalNginx && plan.FirstNginxInstall {
+		return fmt.Errorf("external Nginx mode cannot be a first-install transaction")
+	}
+	if plan.ExternalNginx && hasNginx {
+		return fmt.Errorf("external Nginx package closure must omit nginx")
 	}
 	if plan.FirstNginxInstall && !hasNginx {
 		return fmt.Errorf("first Nginx package closure omits nginx")

@@ -66,9 +66,9 @@ Bootstrap 会在受保护的临时目录中验证发布包 SHA-256，然后调�
 
 ### Nginx 软件包所有权与内置 GoAccess
 
-- 全新安装时，主机上不能已经安装或由其他服务控制 Nginx。LanPanel 会安装并接管 Nginx 软件包及其封闭式入口配置。
-- 如果已有完整的 LanPanel 安装并由它拥有 Nginx，中断的事务只会依据持久化 journal resume；再次执行同一个签名发布包是幂等的。LanPanel 自己拥有的软件包事务可以复用符合版本要求的 Nginx，也可以按主机 APT 策略升级它。
-- 如果发现外部 Nginx 软件包、监听器、站点或 systemd 权威，安装器会在修改软件包前拒绝继续。LanPanel 不会停止、覆盖、删除或接管它；请先处理外部安装，或使用已有的 LanPanel 安装。
+- 全新安装时，如果主机已经安装且版本符合签名能力范围的 Nginx，交互式安装器会提示是否复用。软件包继续由主机所有；LanPanel 会保留它，停止并屏蔽 `nginx.service`，再使用该软件包中的 Nginx 二进制运行自己的封闭式入口配置。
+- 如果已有 Nginx 版本不在签名能力范围内，或存在不安全的 systemd 覆盖，安装器会在修改软件包前停止。请先处理后再重新安装。
+- 如果已有完整的 LanPanel 安装并由它拥有 Nginx，中断的事务只会依据持久化 journal resume；再次执行同一个签名发布包是幂等的；卸载时不会删除主机所有的 Nginx 软件包。
 - GoAccess 作为固定版本的静态 amd64 二进制随签名发布包提供，安装到 `/usr/lib/lanpanel/dependencies/goaccess`。安装器不会安装、升级或卸载系统 GoAccess，也不会使用 `/usr/bin/goaccess`。
 
 ### 3. 打开管理界面

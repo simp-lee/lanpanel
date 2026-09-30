@@ -66,9 +66,9 @@ Bootstrap verifies the release archive's SHA-256 in a protected temporary direct
 
 ### Nginx package ownership and bundled GoAccess
 
-- On a fresh installation, Nginx must not already be installed or controlled by another service. LanPanel installs and owns the Nginx package and its closed ingress configuration.
-- If an exact LanPanel installation already owns Nginx, an interrupted transaction resumes only from its durable journal. Replaying the same signed release is idempotent; an internal LanPanel-owned package transaction may reuse a qualifying Nginx version or upgrade it through the host APT policy.
-- A foreign Nginx package, listener, site, or systemd authority is rejected before package mutation. LanPanel does not stop it, overwrite its configuration, remove it, or adopt its package ownership. Remove the foreign installation or use the existing LanPanel installation instead.
+- On a fresh installation, if a compatible host Nginx is already installed, the interactive installer asks whether to reuse it. The package remains host-owned; LanPanel preserves it, stops and masks `nginx.service`, and runs its own closed ingress configuration through the packaged Nginx binary.
+- If the existing Nginx version is outside the signed capability range, or has an unsafe systemd override, installation stops without package mutation. Remove or repair it and rerun the installer.
+- If an exact LanPanel installation already owns Nginx, an interrupted transaction resumes only from its durable journal. Replaying the same signed release is idempotent; uninstall never removes the host-owned Nginx package.
 - GoAccess is carried in the signed release as a fixed amd64 binary at `/usr/lib/lanpanel/dependencies/goaccess`. The installer never installs, upgrades, or removes a system GoAccess package and never uses `/usr/bin/goaccess`.
 
 ### 3. Open the Management UI

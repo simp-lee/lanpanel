@@ -38,6 +38,29 @@ func TestNginxOwnershipPolicyDistinguishesForeignAndLanPanelPackages(t *testing.
 	}
 }
 
+func TestExternalNginxPlanOmitsOnlyNginx(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	plan.FirstNginxInstall = false
+	plan.ExternalNginx = true
+	original := clonePackages(plan.Packages)
+	plan.Packages = slices.DeleteFunc(clonePackages(plan.Packages), func(pkg Package) bool { return pkg.Name == "nginx" })
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("external Nginx plan was rejected: %v", err)
+	}
+	for _, pkg := range original {
+		if pkg.Name == "nginx" {
+			plan.Packages = append(plan.Packages, pkg)
+		}
+	}
+	if err := ValidatePlan(plan); err == nil || !strings.Contains(err.Error(), "must omit nginx") {
+		t.Fatalf("external Nginx plan accepted a package mutation: %v", err)
+	}
+	plan.Packages = nil
+	if err := ValidatePlan(plan); err != nil {
+		t.Fatalf("Nginx-only read-only reuse plan was rejected: %v", err)
+	}
+}
+
 func TestPackageNoAutostartRoleAlwaysDeniesMaintainerStarts(t *testing.T) {
 	for _, arguments := range [][]string{{"nginx", "start"}, {"apache2", "restart"}, {"--hostile"}, nil} {
 		if code := NoAutostartExitCode(arguments); code != 101 {

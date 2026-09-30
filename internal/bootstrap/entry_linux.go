@@ -3,6 +3,7 @@
 package bootstrap
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -229,13 +231,52 @@ func readInstallerAssets(paths map[string]string) (map[string][]byte, error) {
 type ControllingTTY struct{}
 
 func (ControllingTTY) Attached() bool {
-	fd, err := unix.Open("/dev/tty", unix.O_WRONLY|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = unix.Close(fd) }()
-	var out, tty unix.Stat_t
-	return unix.Fstat(int(os.Stdout.Fd()), &out) == nil && unix.Fstat(fd, &tty) == nil && out.Rdev == tty.Rdev && out.Mode&unix.S_IFMT == unix.S_IFCHR
+	stdout := int(os.Stdout.Fd())
+	if _, err := unix.IoctlGetTermios(stdout, unix.TCGETS); err != nil {
+		return false
+	}
+	if _, err := unix.IoctlGetTermios(fd, unix.TCGETS); err != nil {
+		return false
+	}
+	stdoutPgrp, err := unix.IoctlGetInt(stdout, unix.TIOCGPGRP)
+	if err != nil {
+		return false
+	}
+	ttyPgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+	return err == nil && stdoutPgrp == ttyPgrp
+}
+
+func (ControllingTTY) Confirm(message string) (bool, error) {
+	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false, err
+	}
+	file := os.NewFile(uintptr(fd), "installer-confirmation")
+	if file == nil {
+		_ = unix.Close(fd)
+		return false, fmt.Errorf("controlling TTY is unavailable")
+	}
+	defer func() { _ = file.Close() }()
+	if _, err := io.WriteString(file, message); err != nil {
+		return false, err
+	}
+	line, err := bufio.NewReader(file).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return false, err
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "", "y", "yes":
+		return true, nil
+	case "n", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("installer confirmation must be yes or no")
+	}
 }
 
 func (ControllingTTY) WriteToken(token []byte) error {
