@@ -56,6 +56,20 @@ func (monitor *LinuxMonitor) Start(ctx context.Context, units, listeners []strin
 	done := make(chan struct{})
 	var mu sync.Mutex
 	var observedErr error
+	check := func(observation monitorObservation) error {
+		for _, unit := range units {
+			if observation.units[unit] {
+				return fmt.Errorf("package maintainer script activated affected unit %q", unit)
+			}
+		}
+		if !equalUnmanagedBoolMap(observation.units, baseline.units, units) {
+			return fmt.Errorf("package maintainer script changed the complete unit/cgroup inventory")
+		}
+		if !equalBoolMap(observation.listeners, baseline.listeners) {
+			return fmt.Errorf("package maintainer script changed the complete bound-listener inventory")
+		}
+		return nil
+	}
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(monitor.interval)
@@ -66,11 +80,8 @@ func (monitor *LinuxMonitor) Start(ctx context.Context, units, listeners []strin
 				return
 			case <-ticker.C:
 				observation, err := monitor.observe()
-				if err == nil && !equalBoolMap(observation.units, baseline.units) {
-					err = fmt.Errorf("package maintainer script changed the complete unit/cgroup inventory")
-				}
-				if err == nil && !equalBoolMap(observation.listeners, baseline.listeners) {
-					err = fmt.Errorf("package maintainer script changed the complete bound-listener inventory")
+				if err == nil {
+					err = check(observation)
 				}
 				if err != nil {
 					mu.Lock()
@@ -86,11 +97,8 @@ func (monitor *LinuxMonitor) Start(ctx context.Context, units, listeners []strin
 	stop := func() error {
 		once.Do(func() {
 			observation, err := monitor.observe()
-			if err == nil && !equalBoolMap(observation.units, baseline.units) {
-				err = fmt.Errorf("package maintainer script changed the complete unit/cgroup inventory")
-			}
-			if err == nil && !equalBoolMap(observation.listeners, baseline.listeners) {
-				err = fmt.Errorf("package maintainer script changed the complete bound-listener inventory")
+			if err == nil {
+				err = check(observation)
 			}
 			if err != nil {
 				mu.Lock()
@@ -105,6 +113,26 @@ func (monitor *LinuxMonitor) Start(ctx context.Context, units, listeners []strin
 		return observedErr
 	}
 	return monitorCtx, stop, nil
+}
+
+func equalUnmanagedBoolMap(left, right map[string]bool, ignored []string) bool {
+	ignoredSet := make(map[string]struct{}, len(ignored))
+	for _, name := range ignored {
+		ignoredSet[name] = struct{}{}
+	}
+	filteredLeft := make(map[string]bool, len(left))
+	for key, value := range left {
+		if _, ok := ignoredSet[key]; !ok {
+			filteredLeft[key] = value
+		}
+	}
+	filteredRight := make(map[string]bool, len(right))
+	for key, value := range right {
+		if _, ok := ignoredSet[key]; !ok {
+			filteredRight[key] = value
+		}
+	}
+	return equalBoolMap(filteredLeft, filteredRight)
 }
 
 type monitorObservation struct {
