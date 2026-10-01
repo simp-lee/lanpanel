@@ -27,6 +27,13 @@ func TestArtifactDirectoryRejectsUnexpectedAssets(t *testing.T) {
 	}
 }
 
+func TestExistingNginxOwnedListenersOnlyCoversIngressPorts(t *testing.T) {
+	got := existingNginxOwnedListeners([]preflight.ListenerObservation{{Protocol: "tcp", Address: "0.0.0.0", Port: 80, SocketInode: 11}, {Protocol: "tcp", Address: "::", Port: 443, SocketInode: 12}, {Protocol: "udp", Address: "0.0.0.0", Port: 3478, SocketInode: 13}})
+	if len(got) != 2 || got[0].Port != 80 || got[1].Port != 443 || got[0].IdentityDigest != preflight.OwnedListenerDigest("tcp", "0.0.0.0", 80, 11) || got[1].IdentityDigest != preflight.OwnedListenerDigest("tcp", "::", 443, 12) {
+		t.Fatalf("owned listeners=%#v", got)
+	}
+}
+
 func TestExistingNginxVersionUsesCapabilityRange(t *testing.T) {
 	authority := release.InstallIdentity{Profile: release.OSProfile{Nginx: release.NginxCapabilityContract{MinimumVersion: "1.18.0", MaximumVersion: "2.0.0"}}}
 	for _, test := range []struct {

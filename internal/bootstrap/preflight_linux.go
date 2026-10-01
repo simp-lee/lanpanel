@@ -20,9 +20,27 @@ func newInstallerPreflightEvaluator(installed release.InstallIdentity) Preflight
 		if err != nil {
 			return preflight.ExpansionRequest{}, preflight.Result{}, err
 		}
+		installed, present, err := preflight.ObserveInstalledPackage(ctx, "nginx")
+		if err != nil {
+			return preflight.ExpansionRequest{}, preflight.Result{}, err
+		}
+		if present && installed.Name == "nginx" {
+			request.OwnedListeners = existingNginxOwnedListeners(observed.Listeners)
+		}
 		result, err := preflight.EvaluateExpansion(request, observed)
 		return request, result, err
 	}
+}
+
+func existingNginxOwnedListeners(observed []preflight.ListenerObservation) []preflight.OwnedListenerAuthority {
+	owned := make([]preflight.OwnedListenerAuthority, 0, len(observed))
+	for _, listener := range observed {
+		if listener.Protocol != "tcp" || listener.Port != 80 && listener.Port != 443 {
+			continue
+		}
+		owned = append(owned, preflight.OwnedListenerAuthority{Protocol: listener.Protocol, Address: listener.Address, Port: listener.Port, SocketInode: listener.SocketInode, IdentityDigest: preflight.OwnedListenerDigest(listener.Protocol, listener.Address, listener.Port, listener.SocketInode)})
+	}
+	return owned
 }
 
 func installerPreflightRequest(installed release.InstallIdentity, management identity.ManagementAuthority, generation uint64) preflight.ExpansionRequest {
