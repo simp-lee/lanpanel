@@ -729,11 +729,14 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 	if err != nil {
 		return err
 	}
-	if current.StopFence != nil {
-		return fmt.Errorf("durable emergency stop fence still requires exact recovery")
-	}
 	if current.GlobalClose.Phase == safety.GlobalCloseNone || service.normal == nil || service.safetyStore == nil || service.safetyState == nil || !inventory.Complete {
 		return fmt.Errorf("emergency closure cannot finalize incomplete normal projection")
+	}
+	if current.StopFence != nil {
+		if !matchesVerifiedEmergencyStopFence(*current.StopFence, inventory, current.GlobalClose.Generation) {
+			return fmt.Errorf("durable emergency stop fence still requires exact recovery")
+		}
+		return service.RecoverClosed(ctx, current.GlobalClose.Generation, inventory.Digest)
 	}
 	state := *service.safetyState
 	generations := make(map[string]uint64, len(state.Resources))
@@ -774,6 +777,7 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 	next.Sequence++
 	next.GlobalClose.Phase = safety.GlobalCloseNone
 	next.ClearProof = &safety.EmergencyClearProof{Generation: globalProof.Generation, InventoryDigest: globalProof.InventoryDigest, OwnedGraphDigest: globalProof.OwnedGraphDigest, RuntimeClosureDigest: closureDigest, NginxTestPassed: true, RuntimeClosed: true}
+
 	if err := service.emergency.Commit(service.exposure, safety.RoleGlobalCloseConvergence, current.Sequence, next); err != nil {
 		return err
 	}
@@ -786,6 +790,10 @@ func (service *EmergencyService) FinalizeClosure(ctx context.Context, inventory 
 	}
 	service.safetyState = &normalNext
 	return nil
+}
+
+func matchesVerifiedEmergencyStopFence(fence safety.EmergencyStopFence, inventory closure.Inventory, globalGeneration uint64) bool {
+	return fence.Generation != 0 && globalGeneration != 0 && inventory.Digest != "" && inventory.FullOwnershipDigest != "" && fence.Kind == safety.StopFenceContraction && fence.GlobalGeneration == globalGeneration && !fence.AccessMayRemain && fence.MasterStopped && fence.WorkersStopped && fence.ListenersStopped && fence.OwnedGraphDigest == inventory.Digest && fence.InventoryDigest == inventory.FullOwnershipDigest && fence.OriginOperation == "emergency_close_all" && fence.ScopeKind == "installation" && fence.SafetyIntentID == "emergency_close_all" && fence.SafetyIntentGeneration == globalGeneration
 }
 
 func (service *EmergencyService) UpdateStopObservation(_ context.Context, snapshot closure.RuntimeSnapshot, verified bool) error {

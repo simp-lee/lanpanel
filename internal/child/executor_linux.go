@@ -432,8 +432,10 @@ func applyProfile(profile Profile, hasInput bool) error {
 		}
 		_ = unix.Close(null)
 	}
-	if err := unix.CloseRange(3, ^uint(0), 0); err != nil {
-		return fmt.Errorf("close inherited child descriptors: %w", err)
+	// Keep the Go runtime's descriptors alive until exec. Closing them here can
+	// race its netpoller; CLOEXEC still prevents them from crossing the exec.
+	if err := unix.CloseRange(3, ^uint(0), unix.CLOSE_RANGE_CLOEXEC); err != nil {
+		return fmt.Errorf("mark inherited child descriptors close-on-exec: %w", err)
 	}
 	return nil
 }

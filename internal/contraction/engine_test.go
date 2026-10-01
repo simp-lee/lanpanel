@@ -27,6 +27,28 @@ func TestProjectEmergencyContractionFencePreservesCreatedAt(t *testing.T) {
 	}
 }
 
+func TestVerifiedEmergencyStopFenceMatchesFallbackInventory(t *testing.T) {
+	inventory := closure.Inventory{Complete: true, Digest: testDigest("graph"), FullOwnershipDigest: testDigest("inventory")}
+	fence := safety.EmergencyStopFence{Kind: safety.StopFenceContraction, OriginOperation: "emergency_close_all", ScopeKind: "installation", Generation: 1, GlobalGeneration: 7, SafetyIntentID: "emergency_close_all", SafetyIntentGeneration: 7, OwnedGraphDigest: inventory.Digest, InventoryDigest: inventory.FullOwnershipDigest, MasterStopped: true, WorkersStopped: true, ListenersStopped: true}
+	if !matchesVerifiedEmergencyStopFence(fence, inventory, 7) {
+		t.Fatal("verified emergency stop fence was rejected")
+	}
+	for name, mutate := range map[string]func(*safety.EmergencyStopFence){
+		"access may remain":  func(value *safety.EmergencyStopFence) { value.AccessMayRemain = true },
+		"graph mismatch":     func(value *safety.EmergencyStopFence) { value.OwnedGraphDigest = testDigest("other-graph") },
+		"inventory mismatch": func(value *safety.EmergencyStopFence) { value.InventoryDigest = testDigest("other-inventory") },
+		"stale origin":       func(value *safety.EmergencyStopFence) { value.SafetyIntentGeneration++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := fence
+			mutate(&invalid)
+			if matchesVerifiedEmergencyStopFence(invalid, inventory, 7) {
+				t.Fatalf("invalid %s accepted", name)
+			}
+		})
+	}
+}
+
 func TestRemoveEmptyNginxTestPID(t *testing.T) {
 	path := t.TempDir() + "/nginx.pid"
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
