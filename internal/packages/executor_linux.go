@@ -47,7 +47,7 @@ func (executor *HostExecutor) Audit(ctx context.Context, plan Plan) (Audit, erro
 
 func (executor *HostExecutor) Stage(ctx context.Context, plan Plan) error {
 	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
-		return nil
+		return executor.verifyTransactionFiles(ctx, plan)
 	}
 	if executor == nil || executor.Stager == nil {
 		return fmt.Errorf("package artifact stager is unavailable")
@@ -72,9 +72,25 @@ func (executor *HostExecutor) Prepare(ctx context.Context, plan Plan, config, so
 	return executor.Files.Prepare(ctx, plan, config, sources)
 }
 
+func (executor *HostExecutor) verifyTransactionFiles(ctx context.Context, plan Plan) error {
+	if executor == nil || executor.Files == nil {
+		return fmt.Errorf("package transaction file authority is unavailable")
+	}
+	config, sources, err := RenderAPTConfiguration(plan)
+	if err != nil {
+		return err
+	}
+	return executor.Files.Prepare(ctx, plan, config, sources)
+}
+
 func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package, error) {
 	if executor == nil || executor.Launcher == nil {
 		return nil, fmt.Errorf("package simulation child is unavailable")
+	}
+	if plan.Mode == DistroRepository && len(plan.Repositories) == 0 {
+		if err := executor.verifyTransactionFiles(ctx, plan); err != nil {
+			return nil, fmt.Errorf("verify exact package transaction files: %w", err)
+		}
 	}
 	staged := plan.Mode == StagedDebs || plan.Mode == OfflineDebs
 	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, staged), nil)

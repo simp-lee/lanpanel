@@ -336,6 +336,15 @@ func TestTransactionFilesBindExactAPTConfigAndStagedClosure(t *testing.T) {
 	if err := files.Prepare(context.Background(), plan, config, sourceList); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(transactions, plan.TransactionID, "apt.conf"), []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.Prepare(context.Background(), plan, config, sourceList); err == nil {
+		t.Fatal("tampered package transaction configuration was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(transactions, plan.TransactionID, "apt.conf"), config, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(transactions, plan.TransactionID, "unexpected"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}

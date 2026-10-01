@@ -120,19 +120,18 @@ func equalUnmanagedBoolMap(left, right map[string]bool, ignored []string) bool {
 	for _, name := range ignored {
 		ignoredSet[name] = struct{}{}
 	}
-	filteredLeft := make(map[string]bool, len(left))
-	for key, value := range left {
-		if _, ok := ignoredSet[key]; !ok {
-			filteredLeft[key] = value
+	active := func(values map[string]bool) map[string]bool {
+		result := make(map[string]bool)
+		for key, value := range values {
+			if value {
+				if _, ok := ignoredSet[key]; !ok {
+					result[key] = true
+				}
+			}
 		}
+		return result
 	}
-	filteredRight := make(map[string]bool, len(right))
-	for key, value := range right {
-		if _, ok := ignoredSet[key]; !ok {
-			filteredRight[key] = value
-		}
-	}
-	return equalBoolMap(filteredLeft, filteredRight)
+	return equalBoolMap(active(left), active(right))
 }
 
 type monitorObservation struct {
