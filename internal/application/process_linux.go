@@ -14,6 +14,7 @@ import (
 	"lanpanel/internal/process"
 	"lanpanel/internal/resource"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 )
@@ -460,8 +461,12 @@ func reconcileRequestedProcess(ctx context.Context, service *FixedService, host 
 	return nil
 }
 
+func equalManagedService(left, right domain.ManagedService) bool {
+	return left.Executable == right.Executable && slices.Equal(left.Arguments, right.Arguments) && left.WorkingDirectory == right.WorkingDirectory && left.EnvironmentFile == right.EnvironmentFile && slices.Equal(left.WritePaths, right.WritePaths)
+}
+
 func validateBootProcessAuthority(item domain.AppResource, authority process.ExecAuthority, applied domain.ProcessBundle) error {
-	if item.ManagedProcess == nil || item.Target.LocalHTTP == nil || authority.ResourceID != item.ID || !reflect.DeepEqual(authority.Service, item.ManagedProcess.Service) || authority.Policy.ResourceID != item.ID || authority.UID != applied.ApplicationUID || authority.GID != applied.ApplicationGID || authority.Policy.Digest != applied.PolicyDigest || authority.Policy.Cgroup != applied.Cgroup || authority.Evidence.ExecutableDigest != applied.ExecutableDigest || authority.Evidence.WorkingDirectoryIdentity != applied.WorkingDirectoryIdentity || authority.Evidence.EnvironmentFingerprint != applied.EnvironmentFingerprint || !reflect.DeepEqual(authority.Evidence.WritePathIdentities, applied.WritePathIdentities) || applied.ConfigDigest != item.CurrentConfigDigest {
+	if item.ManagedProcess == nil || item.Target.LocalHTTP == nil || authority.ResourceID != item.ID || !equalManagedService(authority.Service, item.ManagedProcess.Service) || authority.Policy.ResourceID != item.ID || authority.UID != applied.ApplicationUID || authority.GID != applied.ApplicationGID || authority.Policy.Digest != applied.PolicyDigest || authority.Policy.Cgroup != applied.Cgroup || authority.Evidence.ExecutableDigest != applied.ExecutableDigest || authority.Evidence.WorkingDirectoryIdentity != applied.WorkingDirectoryIdentity || authority.Evidence.EnvironmentFingerprint != applied.EnvironmentFingerprint || !slices.Equal(authority.Evidence.WritePathIdentities, applied.WritePathIdentities) || applied.ConfigDigest != item.CurrentConfigDigest {
 		return fmt.Errorf("durable applied process authority does not match local execution authority")
 	}
 	paths, err := resource.DerivePaths(item.ID)

@@ -22,7 +22,7 @@ func TestValidateBootProcessAuthorityRejectsMismatchedAppliedAuthority(t *testin
 		t.Fatal(err)
 	}
 	applied := domain.ProcessBundle{ConfigDigest: configDigest, PolicyDigest: policyDigest, Cgroup: "/system.slice/lanpanel-app.service", FrontendEndpoint: paths.FrontendSocket, ApplicationUID: 1200, ApplicationGID: 1201}
-	authority := managedprocess.ExecAuthority{ResourceID: resourceID, UID: applied.ApplicationUID, GID: applied.ApplicationGID, Service: service, Endpoint: paths.FrontendSocket, Policy: confinement.UnitPolicy{ResourceID: resourceID, Digest: policyDigest, Cgroup: applied.Cgroup}}
+	authority := managedprocess.ExecAuthority{ResourceID: resourceID, UID: applied.ApplicationUID, GID: applied.ApplicationGID, Service: domain.ManagedService{Executable: service.Executable, Arguments: []string{}, WorkingDirectory: service.WorkingDirectory, WritePaths: []string{}}, Endpoint: paths.FrontendSocket, Policy: confinement.UnitPolicy{ResourceID: resourceID, Digest: policyDigest, Cgroup: applied.Cgroup}, Evidence: managedresource.ReferenceEvidence{WritePathIdentities: []string{}}}
 	if err := validateBootProcessAuthority(item, authority, applied); err != nil {
 		t.Fatalf("valid boot authority rejected: %v", err)
 	}
