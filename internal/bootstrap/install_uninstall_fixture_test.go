@@ -225,6 +225,7 @@ func prepareLifecycleNamespace(t *testing.T) {
 	write("systemctl", "#!/bin/sh\ncase \"$1\" in is-active) exit 1;; show) exit 0;; *) exit 0;; esac\n")
 	write("userdel", "#!/bin/sh\nexit 0\n")
 	write("groupdel", "#!/bin/sh\nexit 0\n")
+	setUninstallSystemctlPath(t, filepath.Join(bin, "systemctl"))
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 

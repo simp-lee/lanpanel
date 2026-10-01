@@ -37,6 +37,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var uninstallSystemctlPath = "/usr/bin/systemctl"
+
 // RunPublicUninstall is the sole lifecycle removal entry point. It uses the
 // committed ownership inventory, never invokes apt/dpkg, and never recursively
 // deletes a directory containing unowned residue.
@@ -236,7 +238,7 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 			return err
 		}
 	}
-	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
+	if err := exec.CommandContext(ctx, uninstallSystemctlPath, "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("uninstall service fence reload failed: %w", err)
 	}
 	for _, stateFile := range []string{filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, "state.json")} {
@@ -890,10 +892,10 @@ func stopOwnedServices(ctx context.Context, paths []string) error {
 	}
 	slices.Sort(units)
 	for _, unit := range slices.Compact(units) {
-		if err := exec.CommandContext(ctx, "systemctl", "mask", "--runtime", "--now", unit).Run(); err != nil {
+		if err := exec.CommandContext(ctx, uninstallSystemctlPath, "mask", "--runtime", "--now", unit).Run(); err != nil {
 			return fmt.Errorf("uninstall could not fence %s; fence retained: %w", unit, err)
 		}
-		if err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run(); err == nil {
+		if err := exec.CommandContext(ctx, uninstallSystemctlPath, "is-active", "--quiet", unit).Run(); err == nil {
 			return fmt.Errorf("uninstall service fence is incomplete for %s", unit)
 		}
 	}
@@ -913,7 +915,7 @@ func verifyUnmaskTargets(ctx context.Context, paths []string, artifacts map[stri
 		if !strings.HasSuffix(base, ".service") && !strings.HasSuffix(base, ".socket") && !strings.HasSuffix(base, ".timer") {
 			continue
 		}
-		output, err := exec.CommandContext(ctx, "systemctl", "show", "--property=FragmentPath", "--value", base).Output()
+		output, err := exec.CommandContext(ctx, uninstallSystemctlPath, "show", "--property=FragmentPath", "--value", base).Output()
 		if err != nil {
 			for _, candidate := range paths {
 				if filepath.Base(candidate) == base {
@@ -947,7 +949,7 @@ func unmaskOwnedServices(ctx context.Context, paths []string) error {
 		}
 	}
 	for _, unit := range slices.Compact(units) {
-		if err := exec.CommandContext(ctx, "systemctl", "unmask", "--runtime", unit).Run(); err != nil {
+		if err := exec.CommandContext(ctx, uninstallSystemctlPath, "unmask", "--runtime", unit).Run(); err != nil {
 			return fmt.Errorf("uninstall could not clear fence for %s: %w", unit, err)
 		}
 	}

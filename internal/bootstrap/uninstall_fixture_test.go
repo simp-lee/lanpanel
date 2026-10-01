@@ -22,6 +22,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func setUninstallSystemctlPath(t *testing.T, path string) {
+	t.Helper()
+	previous := uninstallSystemctlPath
+	uninstallSystemctlPath = path
+	t.Cleanup(func() { uninstallSystemctlPath = previous })
+}
+
 func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root-owned lifecycle fixture")
@@ -58,6 +65,7 @@ func TestCommittedUninstallFixtureRemovesOwnedStateAndPreservesExternalFiles(t *
 			t.Fatal(err)
 		}
 	}
+	setUninstallSystemctlPath(t, systemctl)
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var output bytes.Buffer
 	if err := uninstallCommitted(context.Background(), paths, &output); err != nil {
@@ -111,6 +119,7 @@ func TestCommittedUninstallFixtureRejectsStartupAuthorityDrift(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	setUninstallSystemctlPath(t, systemctl)
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var output bytes.Buffer
 	if err := uninstallCommitted(context.Background(), paths, &output); err == nil || !strings.Contains(err.Error(), "startup authority") {
@@ -140,6 +149,7 @@ func TestPublicUninstallFixtureRequiresExactPTYConfirmation(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	setUninstallSystemctlPath(t, systemctl)
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	master, slave := openFixturePTY(t, "UNINSTALL WRONG\n")
 	var output bytes.Buffer
@@ -207,6 +217,7 @@ func TestCommittedUninstallFixtureLateUnmaskFailureKeepsBinary(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; unmask) exit 99;; *) exit 0;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	setUninstallSystemctlPath(t, systemctl)
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var output bytes.Buffer
 	if err := uninstallCommitted(context.Background(), paths, &output); err == nil || !strings.Contains(err.Error(), "clear fence") {
@@ -266,6 +277,7 @@ func TestCommittedUninstallFixtureForeignResidueFailsAndRetries(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\ncase \"$1\" in is-active|show) exit 1;; *) exit 0;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	setUninstallSystemctlPath(t, systemctl)
 	t.Setenv("PATH", filepath.Dir(systemctl)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var output bytes.Buffer
 	if err := uninstallCommitted(context.Background(), paths, &output); err == nil {

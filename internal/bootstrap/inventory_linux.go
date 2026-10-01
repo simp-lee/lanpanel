@@ -24,6 +24,13 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 		values = append(values, filepath.Join(paths.SystemdRoot, name))
 	}
 	values = append(values, filepath.Join(paths.SystemdRoot, "nginx.service"), filepath.Join(paths.SystemdRoot, ".lanpanel-filetxn"))
+	values = append(values,
+		nginxPaths.MainPath(), nginxPaths.SanitizerPath(), nginxPaths.ManifestPath(), nginxPaths.AuditPath, nginxPaths.StateRoot, filepath.Join(nginxPaths.StateRoot, ".lanpanel-contraction-filetxn"),
+		filepath.Join(paths.PersistentRoot, ".lanpanel-filetxn"), filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"),
+		filepath.Join(paths.InstallationRoot, ".lanpanel-filetxn"), filepath.Join(paths.InstallationRoot, "acme-account.key"), filepath.Join(paths.InstallationRoot, "admin-token"), filepath.Join(paths.InstallationRoot, "bundle.json"), filepath.Join(paths.InstallationRoot, "default-rejection.crt"), filepath.Join(paths.InstallationRoot, "default-rejection.key"), filepath.Join(paths.InstallationRoot, "helper-identities.json"), filepath.Join(paths.InstallationRoot, "host-fingerprint"), filepath.Join(paths.InstallationRoot, "managed-confinement.json"), filepath.Join(paths.InstallationRoot, "os-profile.digest"), filepath.Join(paths.InstallationRoot, "release-authority.digest"),
+		filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.StateRoot, "normal.json"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, "emergency"), filepath.Join(paths.SafetyRoot, "state.json"), filepath.Join(paths.OwnershipRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, "records"), filepath.Join(paths.OwnershipRoot, "installation.json"),
+		filepath.Join(paths.PackageRoot, ".filetxn"), filepath.Join(paths.PackageRoot, "journals"), filepath.Join(paths.PackageRoot, "plans"), filepath.Join(paths.PackageRoot, "transactions"), filepath.Join(paths.PackageRoot, "staging"),
+		filepath.Join(filepath.Dir(paths.StartupAuthority), ".lanpanel-filetxn"), "/var/log/lanpanel", "/var/log/lanpanel/.lanpanel-filetxn", "/usr/lib/lanpanel/.lanpanel-filetxn")
 	for _, name := range []string{"lanpanel-runtime.service", "lanpanel-helper.service", "lanpanel-ui.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		values = append(values, filepath.Join(paths.SystemdRoot, "multi-user.target.wants", name))
 	}
@@ -60,19 +67,27 @@ func plannedBootstrapPathsForPlan(paths Paths, plan packages.Plan) ([]string, er
 }
 
 func verifyResumeInventory(journal Journal) error {
-	for _, root := range []string{journal.Paths.PersistentRoot, journal.Paths.RuntimeRoot} {
-		if _, err := walkBounded(root, 512); err != nil {
-			return err
+	allowed := make(map[string]struct{}, len(journal.PlannedPaths)+len(journal.ArtifactDigests))
+	for _, path := range journal.PlannedPaths {
+		allowed[path] = struct{}{}
+	}
+	for path := range journal.ArtifactDigests {
+		if filepath.IsAbs(path) {
+			allowed[path] = struct{}{}
 		}
 	}
-	for _, path := range journal.PlannedPaths {
-		if path == journal.Paths.SystemdRoot || path == journal.Paths.PersistentRoot || path == journal.Paths.RuntimeRoot {
-			continue
-		}
-		if _, err := os.Lstat(path); err == nil {
-			continue
-		} else if !os.IsNotExist(err) {
+	for _, root := range []string{journal.Paths.PersistentRoot, journal.Paths.RuntimeRoot} {
+		entries, err := walkBounded(root, 512)
+		if err != nil {
 			return err
+		}
+		for _, path := range entries {
+			if path == root {
+				continue
+			}
+			if _, ok := allowed[path]; !ok {
+				return fmt.Errorf("bootstrap resume found foreign residue at %q", path)
+			}
 		}
 	}
 	return nil

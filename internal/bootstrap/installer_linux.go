@@ -4,6 +4,7 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -136,6 +137,10 @@ func install(ctx context.Context, request Request, strict bool) error {
 			request.PackagePreflight = preflightResult
 			journal.PackagePlan = request.PackagePlan
 			journal.PackagePreflight = request.PackagePreflight
+			journal.PlannedPaths, err = plannedBootstrapPathsForPlan(journal.Paths, journal.PackagePlan)
+			if err != nil {
+				return fmt.Errorf("refresh bootstrap planned path inventory: %w", err)
+			}
 			if len(journal.InstallerInput) != 0 {
 				journal.InstallerInput, err = rebindPublicInstallerInput(journal.InstallerInput, request.PackagePlan, request.PackagePreflight)
 				if err != nil {
@@ -1094,7 +1099,106 @@ func validateExistingNginxVersion(authority release.InstallIdentity, installed p
 	return nil
 }
 
+func validateExistingNginxPackageAuthority() error {
+	for _, path := range []string{"/usr/sbin/nginx", "/lib/systemd/system/nginx.service"} {
+		if err := validateDpkgOwnedNginxFile(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateDpkgOwnedNginxFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("Nginx authority file %q is unavailable: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("Nginx authority file %q is not regular", path)
+	}
+	entries, err := os.ReadDir("/var/lib/dpkg/info")
+	if err != nil {
+		return fmt.Errorf("read dpkg Nginx ownership directory: %w", err)
+	}
+	if len(entries) > 4096 {
+		return fmt.Errorf("dpkg Nginx ownership directory is too large")
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "nginx") || !strings.HasSuffix(name, ".list") {
+			continue
+		}
+		packageName := strings.TrimSuffix(name, ".list")
+		_, present, observeErr := preflight.ObserveInstalledPackage(context.Background(), packageName)
+		if observeErr != nil {
+			return fmt.Errorf("inspect dpkg Nginx package %s: %w", packageName, observeErr)
+		}
+		if !present {
+			continue
+		}
+		list, readErr := readBoundedNginxAuthorityFile(filepath.Join("/var/lib/dpkg/info", name), 8<<20)
+		if readErr != nil {
+			return fmt.Errorf("read dpkg ownership list for %s: %w", packageName, readErr)
+		}
+		ownedPath := ""
+		for _, candidate := range strings.Split(string(list), "\n") {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				continue
+			}
+			candidateInfo, statErr := os.Stat(candidate)
+			if statErr == nil && candidateInfo.Mode().IsRegular() && os.SameFile(info, candidateInfo) {
+				ownedPath = candidate
+				break
+			}
+		}
+		if ownedPath == "" {
+			continue
+		}
+		md5sums, readErr := readBoundedNginxAuthorityFile(filepath.Join("/var/lib/dpkg/info", packageName+".md5sums"), 8<<20)
+		if readErr != nil {
+			return fmt.Errorf("read dpkg content authority for %s: %w", packageName, readErr)
+		}
+		relative := strings.TrimPrefix(filepath.Clean(ownedPath), string(filepath.Separator))
+		for _, line := range strings.Split(string(md5sums), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 || fields[1] != relative || len(fields[0]) != md5.Size*2 {
+				continue
+			}
+			data, readErr := readBoundedNginxAuthorityFile(path, 128<<20)
+			if readErr != nil {
+				return readErr
+			}
+			if fmt.Sprintf("%x", md5.Sum(data)) != fields[0] {
+				return fmt.Errorf("Nginx authority file %q differs from dpkg content authority", path)
+			}
+			return nil
+		}
+		return fmt.Errorf("dpkg content authority for Nginx file %q is missing", path)
+	}
+	return fmt.Errorf("Nginx authority file %q is not owned by an installed dpkg Nginx package", path)
+}
+
+func readBoundedNginxAuthorityFile(path string, maximum int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maximum {
+		return nil, fmt.Errorf("Nginx authority file %q is too large", path)
+	}
+	return data, nil
+}
+
 func validateExistingNginxAuthority() error {
+	if err := validateExistingNginxPackageAuthority(); err != nil {
+		return err
+	}
 	if err := validateExistingNginxBinary(); err != nil {
 		return err
 	}
@@ -1181,8 +1285,14 @@ func existingNginxReceipt(ctx context.Context, authority release.InstallIdentity
 	if err := validateExistingNginxVersion(authority, installed); err != nil {
 		return "", err
 	}
+	if err := validateExistingNginxPackageAuthority(); err != nil {
+		return "", err
+	}
 	if err := validateExistingNginxBinary(); err != nil {
 		return "", err
+	}
+	if target, readErr := os.Readlink("/etc/systemd/system/nginx.service"); readErr != nil || target != "/dev/null" {
+		return "", fmt.Errorf("reused Nginx unit mask is not the journal-authorized /dev/null mask")
 	}
 	unitPath, err := existingNginxUnitPath()
 	if err != nil {

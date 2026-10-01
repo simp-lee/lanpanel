@@ -35,6 +35,11 @@ func mutableOwnershipPaths(paths Paths) []string {
 
 func ownedInventoryPaths(journal Journal) ([]string, error) {
 	paths := append([]string(nil), journal.PlannedPaths...)
+	for path := range journal.ArtifactDigests {
+		if filepath.IsAbs(path) {
+			paths = append(paths, path)
+		}
+	}
 	for _, root := range []string{journal.Paths.PersistentRoot, journal.Paths.InstallationRoot, journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.PackageRoot, journal.Paths.RuntimeRoot} {
 		entries, err := walkBounded(root, 4096)
 		if err != nil {
