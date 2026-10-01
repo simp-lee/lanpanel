@@ -538,7 +538,7 @@ func (service *EmergencyService) PersistClosing(_ context.Context, inventory clo
 		return err
 	}
 	service.globalCommitted = true
-	if service.safetyStore == nil || service.safetyState == nil || !inventory.Complete {
+	if service.safetyStore == nil || service.safetyState == nil {
 		return nil
 	}
 	normalNext := *service.safetyState

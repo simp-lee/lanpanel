@@ -222,6 +222,7 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 // qualified persistent daemon. PID1 retains direct supervision; the generic
 // one-shot launcher, timeout, and process-group teardown are not involved.
 func ExecutePersistentProfile(profileID ProfileID) error {
+	runtime.LockOSThread()
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("persistent child execution requires root")
 	}
