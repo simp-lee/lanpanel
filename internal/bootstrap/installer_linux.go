@@ -121,7 +121,15 @@ func install(ctx context.Context, request Request, strict bool) error {
 			return fmt.Errorf("existing bootstrap attempt package input authority changed")
 		}
 		preflightRequest := journal.PreflightRequest
-		if journal.Phase == PhasePrepared {
+		refreshPreflight := journal.Phase == PhasePrepared
+		if journal.Phase == PhaseNginxMasked {
+			pending, pendingErr := packageJournalExists(journal.Paths, journal.PackageTransactionID)
+			if pendingErr != nil {
+				return pendingErr
+			}
+			refreshPreflight = !pending
+		}
+		if refreshPreflight {
 			preflightRequest, preflightResult, preflightErr := request.Preflight(ctx, journal.Authority, journal.SafetyGeneration)
 			if preflightErr != nil {
 				return preflightErr
@@ -265,6 +273,21 @@ func validateJournalPackageAuthority(journal Journal) error {
 		return fmt.Errorf("bootstrap journal package authority is invalid")
 	}
 	return nil
+}
+
+func packageJournalExists(paths Paths, transactionID string) (bool, error) {
+	if transactionID == "" || filepath.Base(transactionID) != transactionID {
+		return false, fmt.Errorf("bootstrap package transaction identity is invalid")
+	}
+	path := filepath.Join(paths.PackageRoot, "journals", transactionID+".json")
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func refreshPackagePlanForResume(installed release.InstallIdentity, plan packages.Plan, request preflight.ExpansionRequest, result preflight.Result, now time.Time) (packages.Plan, string, error) {
