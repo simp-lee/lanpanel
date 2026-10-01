@@ -64,6 +64,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 		{Name: roles.ReloadGuard, Handler: func(args []string, _, _ io.Writer) error { return nginxguard.RunReloadGuard(args) }},
 		{Name: roles.RuntimeGuard, Handler: func(args []string, _, _ io.Writer) error { return bootstrap.RunRuntimeGuard(args) }},
 		{Name: roles.ManagedExecutor, Handler: func(args []string, _, _ io.Writer) error { return managedprocess.Execute(args) }},
+		{Name: roles.ProcessBootClear, Handler: func(args []string, _, _ io.Writer) error {
+			if len(args) != 0 || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
+				return fmt.Errorf("process boot clear requires its fixed root invocation")
+			}
+			return managedprocess.SetProcessBootReady(false)
+		}},
 		{Name: roles.DelegationProbe, Handler: func(args []string, _, _ io.Writer) error {
 			if len(args) != 0 {
 				return fmt.Errorf("delegation probe does not accept arguments")

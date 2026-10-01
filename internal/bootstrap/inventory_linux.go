@@ -9,6 +9,7 @@ import (
 	"lanpanel/internal/helper"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/packages"
+	managedprocess "lanpanel/internal/process"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,6 +23,9 @@ func plannedBootstrapPaths(paths Paths) ([]string, error) {
 	}
 	values := []string{paths.Journal, paths.StartupAuthority, paths.CommitPath, paths.PersistentRoot, paths.InstallationRoot, paths.ACMEAccountKey, filepath.Join(paths.InstallationRoot, "acme-account.contact"), paths.StateRoot, paths.SafetyRoot, paths.OwnershipRoot, paths.LockRoot, paths.PackageRoot, paths.RuntimeRoot, paths.SysusersPath, paths.BinaryPath, publicCommandPath(paths), filepath.Dir(paths.BinaryPath), filepath.Join(filepath.Dir(paths.BinaryPath), ".lanpanel-filetxn"), filepath.Join(filepath.Dir(publicCommandPath(paths)), ".lanpanel-filetxn"), "/usr/sbin/policy-rc.d", "/usr/sbin/.lanpanel-filetxn", "/usr/lib/lanpanel/dependencies", "/usr/lib/lanpanel/dependencies/.lanpanel-filetxn", "/usr/lib/lanpanel/dependencies/lego", "/usr/lib/lanpanel/dependencies/tailscale", "/usr/lib/lanpanel/dependencies/goaccess", "/usr/lib/lanpanel/dependencies/headscale", "/usr/lib/lanpanel/dependencies/headscale.tar.gz", "/etc/sysusers.d/lanpanel-headscale.conf", "/etc/sysusers.d/.lanpanel-filetxn", filepath.Join(filepath.Dir(paths.StartupAuthority), ".lanpanel-filetxn"), filepath.Join(paths.PersistentRoot, "sbin", ".lanpanel-filetxn"), helper.FixedIdentityConfigPath, filepath.Join(paths.OwnershipRoot, "installation.json"), filepath.Join(paths.OwnershipRoot, "installation.json"), filepath.Join(paths.PersistentRoot, ".bootstrap-filetxn"), filepath.Join(paths.StateRoot, ".filetxn"), filepath.Join(paths.SafetyRoot, ".filetxn"), filepath.Join(paths.OwnershipRoot, ".lanpanel-filetxn"), filepath.Join(paths.PersistentRoot, "certificates"), filepath.Join(paths.PersistentRoot, "certificates", "chroot"), filepath.Join(paths.PersistentRoot, "certificates", "staging"), filepath.Join(paths.PersistentRoot, "certificates", "webroot"), filepath.Join(paths.PersistentRoot, "certificates", "bundles"), filepath.Join(paths.PersistentRoot, "certificates", "active"), filepath.Join(paths.PersistentRoot, "certificates", "bootstrap"), "/etc/lanpanel-public", "/etc/lanpanel-public/basic", "/var/log/lanpanel/goaccess", "/var/log/lanpanel/goaccess/.retention-reopen.lock", "/run/lanpanel-goaccess", "/etc/lanpanel-public/basic/.txn", nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot, nginxPaths.AuditPath, filepath.Dir(nginxPaths.AuditPath)}
 	values = append(values, filepath.Join(paths.LockRoot, "mutation-admission.lock"), filepath.Join(paths.LockRoot, "exposure.lock"), filepath.Join(paths.RuntimeRoot, filepath.Base(helper.FixedSocketPath)), nginxPaths.PIDPath)
+	if paths == FixedPaths() {
+		values = append(values, managedprocess.ProcessBootReadyPath())
+	}
 	for _, name := range []string{"lanpanel-management.socket", "lanpanel-ui.service", "lanpanel-runtime.service", "lanpanel-process-guard.service", "lanpanel-helper.service", "lanpanel-timer.service", "lanpanel-timer.timer", "lanpanel-recovery.service", "lanpanel-nginx.service"} {
 		values = append(values, filepath.Join(paths.SystemdRoot, name))
 	}
@@ -109,12 +113,16 @@ func resumeInventoryPathAllowed(journal Journal, path string) bool {
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)
 	}
-	for _, exact := range []string{
+	exactPaths := []string{
 		filepath.Join(journal.Paths.LockRoot, "mutation-admission.lock"),
 		filepath.Join(journal.Paths.LockRoot, "exposure.lock"),
 		filepath.Join(journal.Paths.RuntimeRoot, filepath.Base(helper.FixedSocketPath)),
 		nginxPaths.PIDPath,
-	} {
+	}
+	if journal.Paths == FixedPaths() {
+		exactPaths = append(exactPaths, managedprocess.ProcessBootReadyPath())
+	}
+	for _, exact := range exactPaths {
 		if path == exact {
 			return true
 		}

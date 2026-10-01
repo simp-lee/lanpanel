@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/operations"
 	"lanpanel/internal/persist"
 	"lanpanel/internal/process"
+	"lanpanel/internal/resource"
 	"reflect"
 	"strings"
 	"time"
@@ -255,6 +256,232 @@ func cloneBundleForProcess(value *domain.ProcessBundle) *domain.ProcessBundle {
 	copy.EndpointSocketUnits = append([]string(nil), value.EndpointSocketUnits...)
 	copy.ManagedPaths = append([]string(nil), value.ManagedPaths...)
 	return &copy
+}
+
+// ReconcileRequestedProcesses is the boot-only authority for managed process
+// units. PID1 units are gated until this function has stopped stale requested
+// stopped resources and validated every resource it may start.
+func ReconcileRequestedProcesses(ctx context.Context, allowStarts bool) error {
+	if err := process.SetProcessBootReady(false); err != nil {
+		return fmt.Errorf("close managed process boot gate: %w", err)
+	}
+	service, err := OpenFixed()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = service.Close() }()
+	host, err := process.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	document, err := service.Normal().Read()
+	if err != nil {
+		return err
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return fmt.Errorf("installation authority missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return err
+	}
+	resourceIDs := make([]string, 0, len(installation.Resources))
+	for _, item := range installation.Resources {
+		if item.Lifecycle == domain.LifecycleActive && item.Target.Kind == domain.AppTargetLocalHTTP && item.Target.LocalHTTP != nil && item.ManagedProcess != nil {
+			resourceIDs = append(resourceIDs, item.ID)
+		}
+	}
+	var recoveryErr error
+	for _, resourceID := range resourceIDs {
+		if err := reconcileRequestedProcess(ctx, service, host, resourceID, false); err != nil {
+			recoveryErr = errors.Join(recoveryErr, err)
+		}
+	}
+	if recoveryErr != nil || !allowStarts {
+		return recoveryErr
+	}
+	candidates := make([]bootProcessCandidate, 0, len(resourceIDs))
+	for _, resourceID := range resourceIDs {
+		candidate, err := validateRequestedProcess(ctx, service, resourceID)
+		if err != nil {
+			recoveryErr = errors.Join(recoveryErr, err)
+			continue
+		}
+		if candidate.resourceID != "" {
+			candidates = append(candidates, candidate)
+		}
+	}
+	if recoveryErr != nil {
+		return recoveryErr
+	}
+	if err := process.SetProcessBootReady(true); err != nil {
+		return fmt.Errorf("open managed process boot gate: %w", err)
+	}
+	for _, candidate := range candidates {
+		if err := reconcileRequestedProcess(ctx, service, host, candidate.resourceID, true); err != nil {
+			gateErr := process.SetProcessBootReady(false)
+			var stopErr error
+			for _, item := range candidates {
+				stopErr = errors.Join(stopErr, host.StopRuntime(context.WithoutCancel(ctx), item.resourceID, item.relay))
+			}
+			return errors.Join(err, gateErr, stopErr)
+		}
+	}
+	return nil
+}
+
+type bootProcessCandidate struct {
+	resourceID string
+	relay      bool
+}
+
+func validateRequestedProcess(ctx context.Context, service *FixedService, resourceID string) (bootProcessCandidate, error) {
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
+	if err != nil {
+		return bootProcessCandidate{}, err
+	}
+	defer func() { _ = mutationSet.Close() }()
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resourceID, service.Manager())
+	if err != nil {
+		return bootProcessCandidate{}, err
+	}
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
+	document, err := service.Normal().Read()
+	if err != nil {
+		return bootProcessCandidate{}, err
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return bootProcessCandidate{}, fmt.Errorf("installation authority missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return bootProcessCandidate{}, err
+	}
+	for _, item := range installation.Resources {
+		if item.ID != resourceID {
+			continue
+		}
+		if item.Lifecycle != domain.LifecycleActive || item.Target.Kind != domain.AppTargetLocalHTTP || item.Target.LocalHTTP == nil || item.ManagedProcess == nil || item.ManagedProcess.Requested != domain.ProcessRequestedRunning {
+			return bootProcessCandidate{}, nil
+		}
+		if item.ManagedProcess.Applied == nil {
+			return bootProcessCandidate{}, fmt.Errorf("requested-running resource %s has no applied process authority", resourceID)
+		}
+		authority, err := process.LoadExecAuthority(resourceID)
+		if err != nil {
+			return bootProcessCandidate{}, fmt.Errorf("load process authority for %s: %w", resourceID, err)
+		}
+		if err := validateBootProcessAuthority(item, authority, *item.ManagedProcess.Applied); err != nil {
+			return bootProcessCandidate{}, fmt.Errorf("validate process authority for %s: %w", resourceID, err)
+		}
+		return bootProcessCandidate{resourceID: resourceID, relay: item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix}, nil
+	}
+	return bootProcessCandidate{}, nil
+}
+
+func reconcileRequestedProcess(ctx context.Context, service *FixedService, host process.Host, resourceID string, start bool) error {
+	mutationSet, err := operations.OpenMutationSet(operations.MutationConfig{RootPath: fixedRoot + "/locks", Owner: 0, Group: 0, Mode: 0o700, Authority: service.Manager().Authority()})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = mutationSet.Close() }()
+	mutation, exposure, err := mutationSet.AcquireExposure(ctx, "resource/"+resourceID, service.Manager())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = operations.ReleaseExposure(mutation, exposure) }()
+	document, err := service.Normal().Read()
+	if err != nil {
+		return err
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return fmt.Errorf("installation authority missing")
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil {
+		return err
+	}
+	var item *domain.AppResource
+	for index := range installation.Resources {
+		if installation.Resources[index].ID == resourceID {
+			item = &installation.Resources[index]
+			break
+		}
+	}
+	if item == nil || item.Lifecycle != domain.LifecycleActive || item.Target.Kind != domain.AppTargetLocalHTTP || item.Target.LocalHTTP == nil || item.ManagedProcess == nil {
+		return nil
+	}
+	relay := item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix
+	if !start {
+		var stopErr error
+		switch item.ManagedProcess.Requested {
+		case domain.ProcessRequestedStopped:
+			stopErr = host.Stop(ctx, resourceID, relay)
+		case domain.ProcessRequestedRunning:
+			stopErr = host.StopRuntime(ctx, resourceID, relay)
+		default:
+			return fmt.Errorf("resource %s has invalid requested process state", resourceID)
+		}
+		if stopErr != nil {
+			return fmt.Errorf("stop stale resource %s: %w", resourceID, stopErr)
+		}
+		return nil
+	}
+	if item.ManagedProcess.Requested != domain.ProcessRequestedRunning {
+		return nil
+	}
+	if item.ManagedProcess.Applied == nil {
+		return fmt.Errorf("requested-running resource %s has no applied process authority", resourceID)
+	}
+	authority, err := process.LoadExecAuthority(resourceID)
+	if err != nil {
+		return fmt.Errorf("load process authority for %s: %w", resourceID, err)
+	}
+	if err := validateBootProcessAuthority(*item, authority, *item.ManagedProcess.Applied); err != nil {
+		return fmt.Errorf("validate process authority for %s: %w", resourceID, err)
+	}
+	units := process.UnitSet{Bundle: *item.ManagedProcess.Applied, Confinement: authority.Policy, ApplicationUID: authority.UID, ApplicationGID: authority.GID, RelayUID: item.ManagedProcess.Applied.RelayUID, RelayGID: item.ManagedProcess.Applied.RelayGID}
+	if err := host.StartRuntime(ctx, resourceID, units); err != nil {
+		_ = host.StopRuntime(context.WithoutCancel(ctx), resourceID, relay)
+		return fmt.Errorf("start requested-running resource %s: %w", resourceID, err)
+	}
+	observation, err := process.Observe(ctx, "/sys/fs/cgroup", *item.ManagedProcess.Applied, item.Target.LocalHTTP.EndpointKind, []string{"/proc/net/tcp", "/proc/net/tcp6"})
+	if err != nil {
+		stopErr := host.StopRuntime(context.WithoutCancel(ctx), resourceID, relay)
+		return errors.Join(fmt.Errorf("observe started resource %s: %w", resourceID, err), stopErr)
+	}
+	if err := process.VerifyRunning(observation); err != nil {
+		stopErr := host.StopRuntime(context.WithoutCancel(ctx), resourceID, relay)
+		return errors.Join(fmt.Errorf("verify started resource %s: %w", resourceID, err), stopErr)
+	}
+	return nil
+}
+
+func validateBootProcessAuthority(item domain.AppResource, authority process.ExecAuthority, applied domain.ProcessBundle) error {
+	if item.ManagedProcess == nil || item.Target.LocalHTTP == nil || authority.ResourceID != item.ID || !reflect.DeepEqual(authority.Service, item.ManagedProcess.Service) || authority.Policy.ResourceID != item.ID || authority.UID != applied.ApplicationUID || authority.GID != applied.ApplicationGID || authority.Policy.Digest != applied.PolicyDigest || authority.Policy.Cgroup != applied.Cgroup || authority.Evidence.ExecutableDigest != applied.ExecutableDigest || authority.Evidence.WorkingDirectoryIdentity != applied.WorkingDirectoryIdentity || authority.Evidence.EnvironmentFingerprint != applied.EnvironmentFingerprint || !reflect.DeepEqual(authority.Evidence.WritePathIdentities, applied.WritePathIdentities) || applied.ConfigDigest != item.CurrentConfigDigest {
+		return fmt.Errorf("durable applied process authority does not match local execution authority")
+	}
+	paths, err := resource.DerivePaths(item.ID)
+	if err != nil {
+		return err
+	}
+	endpoint := paths.FrontendSocket
+	if item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix {
+		endpoint = paths.BackendSocket
+	}
+	if authority.Endpoint != endpoint || applied.FrontendEndpoint != paths.FrontendSocket || applied.RelayRequired != (item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix) || applied.ApplicationUID != authority.UID || applied.ApplicationGID != authority.GID {
+		return fmt.Errorf("durable process endpoint authority does not match local resource")
+	}
+	if item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointRelayUnix && applied.BackendEndpoint != paths.BackendSocket {
+		return fmt.Errorf("durable relay endpoint authority does not match local resource")
+	}
+	if item.Target.LocalHTTP.EndpointKind == domain.LocalEndpointTCPSocketActivation && (applied.TCPAddress != item.Target.LocalHTTP.TCPAddress || applied.TCPPort != item.Target.LocalHTTP.TCPPort) {
+		return fmt.Errorf("durable TCP endpoint authority does not match local resource")
+	}
+	return nil
 }
 
 func ReconcileJournalLessProcesses(ctx context.Context) error {

@@ -70,6 +70,10 @@ func RunRole(args []string) error {
 	if len(args) != 0 || os.Getuid() != 0 || os.Geteuid() != 0 || os.Getgid() != 0 || os.Getegid() != 0 {
 		return fmt.Errorf("helper role requires its fixed root service invocation")
 	}
+	if err := managedprocess.SetProcessBootReady(false); err != nil {
+		return fmt.Errorf("close managed process boot gate: %w", err)
+	}
+	defer func() { _ = managedprocess.SetProcessBootReady(false) }()
 	readModels := application.FixedReadModelSeams()
 	config, err := ReadIdentityConfig()
 	if err != nil {
@@ -116,6 +120,8 @@ func RunRole(args []string) error {
 	}
 	recordRecovery("startup contraction", reconcileStartupContraction(context.Background()))
 	recordRecovery("terminal Nginx contraction", application.ReconcileTerminalNginxContraction(context.Background()))
+	bootRecoveryAllowed := errors.Join(adminRecoveryErr, otherRecoveryErr) == nil
+	recordRecovery("managed process boot reconciliation", application.ReconcileRequestedProcesses(context.Background(), bootRecoveryAllowed))
 	if recoveryErr := errors.Join(adminRecoveryErr, otherRecoveryErr); recoveryErr != nil {
 		log.Printf("startup recovery incomplete: %v", recoveryErr)
 	}

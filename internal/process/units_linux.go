@@ -63,7 +63,7 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 	if relay {
 		unitRequires = ""
 	}
-	service.WriteString("[Unit]\nDescription=LanPanel managed application " + app.ID + "\nAfter=network.target\n" + unitRequires + "\n[Service]\nType=simple\n")
+	service.WriteString("[Unit]\nDescription=LanPanel managed application " + app.ID + "\nConditionPathExists=" + ProcessBootReadyPath() + "\nBindsTo=lanpanel-helper.service\nAfter=network.target\n" + unitRequires + "\n[Service]\nType=simple\n")
 	service.WriteString("User=root\nGroup=root\nCapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP\n")
 	service.WriteString("ExecStart=/usr/lib/lanpanel/lanpanel managed-executor\nWorkingDirectory=" + escapeSystemd(app.ManagedProcess.Service.WorkingDirectory) + "\n")
 	service.WriteString("Environment=LANPANEL_EXEC_AUTHORITY=" + escapeSystemd(AuthorityPath(app.ID)) + "\n")
@@ -87,7 +87,7 @@ func Render(installationID string, app domain.AppResource, accounts identity.Res
 	if relay {
 		relayIdentity := accounts.Identities[1]
 		relayUID, relayGID = relayIdentity.UID, relayIdentity.GID
-		relayBytes = []byte("[Unit]\nDescription=LanPanel fixed relay " + app.ID + "\nRequires=" + paths.SocketUnit + "\nAfter=" + paths.SocketUnit + " " + paths.ServiceUnit + "\n\n[Service]\nType=simple\nExecStart=/usr/lib/lanpanel/lanpanel relay\nUser=" + fmt.Sprint(relayIdentity.UID) + "\nGroup=" + fmt.Sprint(relayIdentity.GID) + "\nSockets=" + paths.SocketUnit + "\nEnvironment=LANPANEL_RESOURCE_ID=" + app.ID + "\nEnvironment=LANPANEL_RELAY_BACKEND=/backend/http.sock\nUMask=0007\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictSUIDSGID=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nInaccessiblePaths=/proc\nRestrictAddressFamilies=AF_UNIX\nTemporaryFileSystem=/run:ro\nBindReadOnlyPaths=" + filepath.Dir(paths.BackendSocket) + ":/backend\nRestart=on-failure\n")
+		relayBytes = []byte("[Unit]\nDescription=LanPanel fixed relay " + app.ID + "\nConditionPathExists=" + ProcessBootReadyPath() + "\nBindsTo=lanpanel-helper.service\nRequires=" + paths.SocketUnit + "\nAfter=" + paths.SocketUnit + " " + paths.ServiceUnit + "\n\n[Service]\nType=simple\nExecStart=/usr/lib/lanpanel/lanpanel relay\nUser=" + fmt.Sprint(relayIdentity.UID) + "\nGroup=" + fmt.Sprint(relayIdentity.GID) + "\nSockets=" + paths.SocketUnit + "\nEnvironment=LANPANEL_RESOURCE_ID=" + app.ID + "\nEnvironment=LANPANEL_RELAY_BACKEND=/backend/http.sock\nUMask=0007\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nRestrictSUIDSGID=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nInaccessiblePaths=/proc\nRestrictAddressFamilies=AF_UNIX\nTemporaryFileSystem=/run:ro\nBindReadOnlyPaths=" + filepath.Dir(paths.BackendSocket) + ":/backend\nRestart=on-failure\n")
 	}
 	policyBytes := []byte("[Unit]\nDescription=LanPanel confinement slice " + app.ID + "\nBefore=" + paths.ServiceUnit + "\n\n[Slice]\n")
 	for _, destination := range policyProfile.ProtectedDestinations {
@@ -143,7 +143,7 @@ func renderSocket(app domain.AppResource, paths resource.Paths, account identity
 	if local.EndpointKind == domain.LocalEndpointRelayUnix {
 		service = paths.RelayUnit
 	}
-	return []byte("[Unit]\nDescription=LanPanel PID1-owned endpoint " + app.ID + "\nBefore=" + service + "\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\n" + listen + "\n" + mode + "\nService=" + service + "\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n"), nil
+	return []byte("[Unit]\nDescription=LanPanel PID1-owned endpoint " + app.ID + "\nConditionPathExists=" + ProcessBootReadyPath() + "\nBindsTo=lanpanel-helper.service\nBefore=" + service + "\nAfter=lanpanel-runtime.service\nRequires=lanpanel-runtime.service\n\n[Socket]\n" + listen + "\n" + mode + "\nService=" + service + "\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n"), nil
 }
 
 func validateAccounts(accounts identity.ResourceAccountSet, resourceID string, relay bool) error {

@@ -65,6 +65,7 @@ const (
 	ProfileResourceDaemonReload   ProfileID = "resource_daemon_reload"
 	ProfileResourceStart          ProfileID = "resource_start"
 	ProfileResourceStop           ProfileID = "resource_stop"
+	ProfileResourceStopOnly       ProfileID = "resource_stop_only"
 	ProfileResourceShow           ProfileID = "resource_show"
 )
 
@@ -261,6 +262,7 @@ var catalog = map[ProfileID]Profile{
 	ProfileResourceDaemonReload:   {ID: ProfileResourceDaemonReload, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileResourceStart:          {ID: ProfileResourceStart, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileResourceStop:           {ID: ProfileResourceStop, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
+	ProfileResourceStopOnly:       {ID: ProfileResourceStopOnly, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: time.Minute, MaximumOutputBytes: 64 << 10, RootTCB: true},
 	ProfileResourceShow:           {ID: ProfileResourceShow, Executable: "/usr/bin/systemctl", Environment: []string{"LANG=C", "LC_ALL=C"}, IdentityKind: IdentityRoot, Network: NetworkUnixOnly, AllowedAddressFamilies: []int{1}, Timeout: 30 * time.Second, MaximumOutputBytes: 64 << 10, RootTCB: true},
 }
 
@@ -365,7 +367,7 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 		profile.Complete = true
 		return profile, validateProfile(profile)
 	}
-	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceShow || id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
+	resourceProfile := id == ProfileResourceAccounts || id == ProfileResourceDaemonReload || id == ProfileResourceStart || id == ProfileResourceStop || id == ProfileResourceStopOnly || id == ProfileResourceShow || id == ProfileGoAccessAccounts || id == ProfileGoAccessStart || id == ProfileGoAccessRetain || id == ProfileGoAccessStop || id == ProfileGoAccessShow
 	if resourceProfile {
 		if invocation.Package != nil || invocation.Lego != nil || invocation.Tailscale != nil || invocation.Resource == nil || !validResourceIdentity(invocation.Resource.ResourceID) {
 			return Profile{}, fmt.Errorf("resource child invocation authority is invalid")
@@ -415,6 +417,11 @@ func ResolveInvocation(id ProfileID, identities Identities, invocation Invocatio
 			profile.Arguments = []string{"disable", "--now", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service"}
 			if invocation.Resource.Relay {
 				profile.Arguments = []string{"disable", "--now", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service", "lanpanel-relay-" + short + ".service"}
+			}
+		case ProfileResourceStopOnly:
+			profile.Arguments = []string{"stop", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service"}
+			if invocation.Resource.Relay {
+				profile.Arguments = []string{"stop", "lanpanel-app-" + short + ".socket", "lanpanel-app-" + short + ".service", "lanpanel-relay-" + short + ".service"}
 			}
 		case ProfileResourceShow:
 			unit := "lanpanel-app-" + short + ".service"

@@ -29,12 +29,13 @@ const (
 	HeadscaleSTUNRelay    Name = "headscale-stun-relay"
 	PackageNoAutostart    Name = "package-no-autostart"
 	ManagedExecutor       Name = "managed-executor"
+	ProcessBootClear      Name = "process-boot-clear"
 	DelegationProbe       Name = "delegation-probe-child"
 )
 
 var fixed = map[Name]struct{}{
 	UI: {}, ChildExecutor: {}, Helper: {}, StartupGuard: {}, ReloadGuard: {}, RuntimeGuard: {}, Installer: {},
-	StartupRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, DelegationProbe: {},
+	StartupRecovery: {}, Timer: {}, Relay: {}, GoAccessRelay: {}, GoAccessRetention: {}, GoAccessAccountGuard: {}, HeadscalePrivateProbe: {}, HeadscaleControlRelay: {}, HeadscaleSTUNRelay: {}, PackageNoAutostart: {}, ManagedExecutor: {}, ProcessBootClear: {}, DelegationProbe: {},
 }
 
 type Handler func(args []string, stdout, stderr io.Writer) error

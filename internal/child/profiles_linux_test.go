@@ -30,7 +30,7 @@ func TestInvocationCgroupNamesAreTyped(t *testing.T) {
 }
 
 func TestExternalProfilesAreFixedAndIncompleteProfilesStayUnavailable(t *testing.T) {
-	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileLego, ProfileNginxDump, ProfileExistingNginxTest, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileExistingNginxStop, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
+	want := []ProfileID{ProfileAPTDownload, ProfileAPTOfflineTransaction, ProfileAPTSimulate, ProfileAPTTransaction, ProfileDPKGTransaction, ProfileGoAccessAccounts, ProfileGoAccessProbe, ProfileGoAccessRetain, ProfileGoAccessShow, ProfileGoAccessStart, ProfileGoAccessStop, ProfileHeadscaleAccounts, ProfileHeadscaleActivateShow, ProfileHeadscaleActivateStart, ProfileHeadscaleActivateStop, ProfileHeadscaleAdmin, ProfileHeadscaleBootDisable, ProfileHeadscaleBootEnable, ProfileHeadscaleBootPersist, ProfileHeadscaleBootReconcile, ProfileHeadscaleFallbackStop, ProfileHeadscalePrivateProbe, ProfileHeadscaleShow, ProfileHeadscaleStart, ProfileHeadscaleStop, ProfileLego, ProfileNginxDump, ProfileExistingNginxTest, ProfileNginxQuitSignal, ProfileNginxReloadSignal, ProfileNginxReopenSignal, ProfileNginxStart, ProfileNginxTest, ProfileResourceAccounts, ProfileResourceDaemonReload, ProfileResourceShow, ProfileResourceStart, ProfileResourceStop, ProfileResourceStopOnly, ProfileSystemctl, ProfileSystemctlBootstrap, ProfileExistingNginxStop, ProfileSystemctlNginxReload, ProfileSystemctlNginxStart, ProfileSystemctlNginxStop, ProfileSystemdSysusers, ProfileTailscaleAdmin}
 	if got := FixedProfileIDs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("fixed profiles=%v want=%v", got, want)
 	}
@@ -134,15 +134,16 @@ func TestResourceInvocationsDeriveOnlyStableUnits(t *testing.T) {
 		ProfileResourceDaemonReload: {"daemon-reload"},
 		ProfileResourceStart:        {"enable", "--now", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service"},
 		ProfileResourceStop:         {"disable", "--now", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service"},
+		ProfileResourceStopOnly:     {"stop", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service"},
 	} {
 		profile, err := ResolveInvocation(id, Identities{}, Invocation{Resource: &ResourceInvocation{ResourceID: resourceID}})
 		if err != nil || !profile.Complete || !reflect.DeepEqual(profile.Arguments, want) {
 			t.Fatalf("%s profile=%#v error=%v", id, profile, err)
 		}
 	}
-	for _, id := range []ProfileID{ProfileResourceStart, ProfileResourceStop} {
+	for _, id := range []ProfileID{ProfileResourceStart, ProfileResourceStop, ProfileResourceStopOnly} {
 		relay, err := ResolveInvocation(id, Identities{}, Invocation{Resource: &ResourceInvocation{ResourceID: resourceID, Relay: true}})
-		if err != nil || !reflect.DeepEqual(relay.Arguments, map[ProfileID][]string{ProfileResourceStart: {"enable", "--now", "lanpanel-app-00000000000000000000.service", "lanpanel-app-00000000000000000000.socket", "lanpanel-relay-00000000000000000000.service"}, ProfileResourceStop: {"disable", "--now", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service", "lanpanel-relay-00000000000000000000.service"}}[id]) {
+		if err != nil || !reflect.DeepEqual(relay.Arguments, map[ProfileID][]string{ProfileResourceStart: {"enable", "--now", "lanpanel-app-00000000000000000000.service", "lanpanel-app-00000000000000000000.socket", "lanpanel-relay-00000000000000000000.service"}, ProfileResourceStop: {"disable", "--now", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service", "lanpanel-relay-00000000000000000000.service"}, ProfileResourceStopOnly: {"stop", "lanpanel-app-00000000000000000000.socket", "lanpanel-app-00000000000000000000.service", "lanpanel-relay-00000000000000000000.service"}}[id]) {
 			t.Fatalf("relay profile=%#v error=%v", relay, err)
 		}
 	}

@@ -31,6 +31,76 @@ import (
 
 type Host struct{ Launcher *child.Launcher }
 
+const processBootReadyPath = "/run/lanpanel/process-boot-ready"
+
+func ProcessBootReadyPath() string { return processBootReadyPath }
+
+// SetProcessBootReady controls the PID1-visible gate for managed process units.
+// The gate is deliberately fail-closed: a missing marker prevents stale socket
+// and service units from starting before startup recovery has reconciled state.
+func SetProcessBootReady(ready bool) error {
+	directory := filepath.Dir(processBootReadyPath)
+	if !ready {
+		info, err := os.Lstat(processBootReadyPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return fmt.Errorf("process boot gate is unsafe")
+		}
+		return os.Remove(processBootReadyPath)
+	}
+	if err := ensureProcessBootDirectory(directory); err != nil {
+		return err
+	}
+	staging, err := os.CreateTemp(directory, ".process-boot-ready-")
+	if err != nil {
+		return err
+	}
+	stagingName := staging.Name()
+	defer func() { _ = os.Remove(stagingName) }()
+	if err := staging.Chmod(0o600); err != nil {
+		_ = staging.Close()
+		return err
+	}
+	if _, err := staging.WriteString("ready\n"); err != nil {
+		_ = staging.Close()
+		return err
+	}
+	if err := staging.Sync(); err != nil {
+		_ = staging.Close()
+		return err
+	}
+	if err := staging.Close(); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(processBootReadyPath); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			return fmt.Errorf("process boot gate is unsafe")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(stagingName, processBootReadyPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureProcessBootDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o710 && info.Mode().Perm() != 0o711 {
+		return fmt.Errorf("process boot gate directory is unsafe")
+	}
+	return nil
+}
+
 func NewFixedHost() (Host, error) {
 	launcher, err := child.NewLauncher(child.FixedLanPanelExecutable, child.Identities{})
 	return Host{Launcher: launcher}, err
@@ -206,21 +276,38 @@ func (host Host) Install(ctx context.Context, resourceID, installationID string,
 }
 
 func (host Host) Start(ctx context.Context, resourceID string, units UnitSet) error {
+	return host.start(ctx, resourceID, units, false)
+}
+
+// StartRuntime starts and verifies a requested-running resource without
+// changing its durable systemd enablement if verification fails.
+func (host Host) StartRuntime(ctx context.Context, resourceID string, units UnitSet) error {
+	return host.start(ctx, resourceID, units, true)
+}
+
+func (host Host) start(ctx context.Context, resourceID string, units UnitSet, preserveEnablement bool) error {
 	relay := units.Bundle.RelayRequired
 	if err := host.run(ctx, child.ProfileResourceStart, resourceID, relay); err != nil {
 		return err
 	}
-	if err := host.verifyEffectiveUnit(ctx, resourceID, false, units.Confinement); err != nil {
+	cleanup := func() {
+		if preserveEnablement {
+			_ = host.StopRuntime(context.WithoutCancel(ctx), resourceID, relay)
+			return
+		}
 		_ = host.run(context.WithoutCancel(ctx), child.ProfileResourceStop, resourceID, relay)
+	}
+	if err := host.verifyEffectiveUnit(ctx, resourceID, false, units.Confinement); err != nil {
+		cleanup()
 		return err
 	}
 	if err := host.waitApplicationIdentity(ctx, resourceID, units); err != nil {
-		_ = host.run(context.WithoutCancel(ctx), child.ProfileResourceStop, resourceID, relay)
+		cleanup()
 		return err
 	}
 	if relay {
 		if err := host.verifyEffectiveRelay(ctx, resourceID, units); err != nil {
-			_ = host.run(context.WithoutCancel(ctx), child.ProfileResourceStop, resourceID, true)
+			cleanup()
 			return err
 		}
 	}
@@ -325,6 +412,25 @@ func verifyUnappliedStopped(journal Journal) error {
 
 func (host Host) Stop(ctx context.Context, resourceID string, relay bool) error {
 	if err := host.run(ctx, child.ProfileResourceStop, resourceID, relay); err != nil {
+		return err
+	}
+	if relay {
+		paths, err := resource.DerivePaths(resourceID)
+		if err != nil {
+			return err
+		}
+		if err := removeStoppedBackend(paths.BackendSocket); err != nil {
+			return err
+		}
+	}
+	return waitOwnedEndpointsGone(ctx, resourceID)
+}
+
+// StopRuntime stops a managed process without changing its systemd enablement.
+// Boot recovery uses it when durable intent still requests running, so a
+// failed recovery cannot strand that intent behind a disabled unit.
+func (host Host) StopRuntime(ctx context.Context, resourceID string, relay bool) error {
+	if err := host.run(ctx, child.ProfileResourceStopOnly, resourceID, relay); err != nil {
 		return err
 	}
 	if relay {
