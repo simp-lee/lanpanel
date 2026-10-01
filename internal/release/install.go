@@ -162,6 +162,10 @@ func SelectSupportedProfile(manifestBytes []byte, osID, versionID, architecture 
 	return selectSupportedProfile(verified.value, PublicInstallObservation{OSID: osID, OSVersionID: versionID, Architecture: architecture})
 }
 
+// selectSupportedProfile intentionally selects the generic capability contract
+// by architecture, not by Ubuntu/Debian family or release. A release must not
+// grow one profile per distro version; package templates carry reference APT
+// authority while runtime package candidates are checked against their bounds.
 func selectSupportedProfile(manifest ReleaseManifest, observed PublicInstallObservation) (SupportedOSProfile, error) {
 	if observed.Architecture == "" {
 		return SupportedOSProfile{}, fmt.Errorf("install host architecture observation is missing")

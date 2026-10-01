@@ -71,7 +71,7 @@ Bootstrap 会在受保护的临时目录中验证发布包 SHA-256，然后调�
 - 如果已有完整的 LanPanel 安装并由它拥有 Nginx，中断的事务只会依据持久化 journal resume；再次执行同一个签名发布包是幂等的；卸载时不会删除主机所有的 Nginx 软件包。
 - GoAccess 作为固定版本的静态 amd64 二进制随签名发布包提供，安装到 `/usr/lib/lanpanel/dependencies/goaccess`。安装器不会安装、升级或卸载系统 GoAccess，也不会使用 `/usr/bin/goaccess`。
 
-签名的 Host Capability Contract 不是 Ubuntu/Debian 版本白名单。它记录运行所需的主机能力以及签名的软件包闭包；精确软件包版本只约束由 LanPanel 托管的 APT 事务。用户明确选择复用外部 Nginx 后，Nginx 会从该事务中移除，主机上的软件包只按签名的 Nginx 能力版本范围校验。不要因为发行版版本改变运行时兼容逻辑；发布托管式 APT 版本时，应重新采集匹配目标仓库的软件包 profile。
+签名的 Host Capability Contract 不是 Ubuntu/Debian 版本白名单。发行包对每个支持的架构只携带一个通用的 `linux-amd64-apt-dpkg-systemd` 契约，不为每个发行版版本分别携带 profile。profile capture 是签名 APT 计划的参考 authority；对于带版本范围的发行版仓库软件包，安装器使用目标主机自己的签名 APT 候选版本，并按该范围校验。不要因为目标是 Ubuntu 24.04、Debian 12 或 Debian 13 就增加发行版版本分支或额外 profile，应测试满足能力契约的代表性主机。用户明确选择复用外部 Nginx 后，Nginx 会从 APT 事务中移除，主机上的软件包只按签名的 Nginx 能力版本范围校验。
 
 ### 3. 打开管理界面
 

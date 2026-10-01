@@ -84,7 +84,7 @@ make materialize-preview-dependencies \
 
 `materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
-Host Capability Contract 不是 Debian/Ubuntu 版本白名单；它只记录 LanPanel 真正依赖的接口：Linux amd64、systemd、APT/dpkg、Nginx 最低版本，以及 unified cgroup v2、`cgroup.kill` 和 systemd delegation。运行时兼容性不得按发行版版本硬编码。但是，签名的 package template 仍然是托管 APT 事务的权威软件包闭包，其中的精确版本必须来自发布目标仓库；因此发布托管式安装包时，应从匹配的参考主机重新采集 package profile，而不是手工替换版本。显式复用外部 Nginx 时，安装器会把 Nginx 从事务中移除，只按能力版本范围校验已安装的软件包。
+Host Capability Contract 不是 Debian/Ubuntu 版本白名单；它只记录 LanPanel 真正依赖的接口：Linux amd64、systemd、APT/dpkg、Nginx 最低版本，以及 unified cgroup v2、`cgroup.kill` 和 systemd delegation。发行包对每个支持的架构只应包含一个通用的 `linux-amd64-apt-dpkg-systemd` 契约，不应为 Ubuntu 22.04、Ubuntu 24.04、Debian 12、Debian 13 等分别添加 profile；profile 选择也不得按发行版名称或版本号分支。运行时兼容性不得按发行版版本硬编码。profile capture 生成的是签名 APT 计划的参考 authority：带版本范围的发行版仓库包由目标主机的签名 APT 候选版本解析，并按范围检查，而不是要求候选版本等于参考主机版本。发布前应从任一满足能力契约且仓库健康的参考主机采集 profile，不能手工替换 authority；随后用代表性的不同主机验证能力契约，不需要把每个发行版版本的 profile 放进发行包。显式复用外部 Nginx 时，安装器会把 Nginx 从事务中移除，只按能力版本范围校验已安装的软件包。
 
 先运行只读检查：
 

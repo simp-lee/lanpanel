@@ -301,10 +301,12 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile {
 		return "", fmt.Errorf("package plan does not match installer identity")
 	}
-	// The signed profile's exact package tuple constrains a managed APT
-	// transaction. Explicit external-Nginx mode is different: the host package
-	// is not part of that transaction and was already checked against the
-	// capability range in prepareFreshNginxPackagePlan.
+	// The signed profile supplies the reference package tuple and its bounds for
+	// the managed APT transaction. Distro-repository packages with bounds are
+	// resolved from the target host's signed APT candidate; the reference
+	// version is not a distro-version allowlist. Explicit external-Nginx mode
+	// is different: the host package is not part of that transaction and was
+	// already checked against the capability range in prepareFreshNginxPackagePlan.
 	wantPackages := installed.Profile.Packages
 	if plan.ExternalNginx {
 		filtered := make([]release.PackageTuple, 0, len(wantPackages))
