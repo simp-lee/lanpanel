@@ -296,6 +296,10 @@ func validateInstallerPackageAuthority(installed release.InstallIdentity, plan p
 	if err != nil || plan.IntentGeneration == 0 || plan.OSProfileDigest != installed.ProfileDigest || plan.Authority.TargetOSProfileDigest != installed.ProfileDigest || plan.Authority.BinaryDigest != installed.Binary.Digest || plan.Authority.HostFingerprint != installed.HostFingerprint || plan.Authority.ReleaseAuthorityDigest != installed.ReleaseManifestDigest || plan.Authority.Kind != packages.PreviewProfile {
 		return "", fmt.Errorf("package plan does not match installer identity")
 	}
+	// The signed profile's exact package tuple constrains a managed APT
+	// transaction. Explicit external-Nginx mode is different: the host package
+	// is not part of that transaction and was already checked against the
+	// capability range in prepareFreshNginxPackagePlan.
 	wantPackages := installed.Profile.Packages
 	if plan.ExternalNginx {
 		filtered := make([]release.PackageTuple, 0, len(wantPackages))
@@ -1045,6 +1049,9 @@ func prepareFreshNginxPackagePlan(ctx context.Context, authority release.Install
 	return plan, nil
 }
 
+// planForExistingNginx converts an explicit reuse choice into a read-only
+// Nginx package phase. This must not be inferred from the host OS or package
+// version; the prompt is the authority for selecting this mode.
 func planForExistingNginx(plan packages.Plan) (packages.Plan, error) {
 	plan.ExternalNginx = true
 	plan.FirstNginxInstall = false

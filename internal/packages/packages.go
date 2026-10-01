@@ -89,8 +89,12 @@ type Plan struct {
 	Repositories []Repository   `json:"repositories"`
 	// FirstNginxInstall is true only for a fresh LanPanel-owned Nginx
 	// transaction. Internal transactions for an already committed LanPanel
-	// installation set it false. ExternalNginx records an explicit choice to
-	// reuse a compatible pre-existing host Nginx package instead of mutating it.
+	// installation set it false.
+	// ExternalNginx records an explicit choice to reuse a compatible
+	// pre-existing host Nginx package instead of mutating it. It is a mode
+	// choice, not an OS-version exception: the installer removes Nginx from
+	// the signed package closure and validates the host package by capability
+	// range instead.
 	FirstNginxInstall       bool          `json:"first_nginx_install"`
 	ExternalNginx           bool          `json:"external_nginx,omitempty"`
 	LockWait                time.Duration `json:"lock_wait"`

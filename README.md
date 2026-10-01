@@ -71,6 +71,8 @@ Bootstrap verifies the release archive's SHA-256 in a protected temporary direct
 - If an exact LanPanel installation already owns Nginx, an interrupted transaction resumes only from its durable journal. Replaying the same signed release is idempotent; uninstall never removes the host-owned Nginx package.
 - GoAccess is carried in the signed release as a fixed amd64 binary at `/usr/lib/lanpanel/dependencies/goaccess`. The installer never installs, upgrades, or removes a system GoAccess package and never uses `/usr/bin/goaccess`.
 
+The signed Host Capability Contract is not an Ubuntu/Debian version allowlist. It records the required capabilities and the signed package closure. Exact package versions apply to the managed APT transaction; an explicit external-Nginx choice removes Nginx from that transaction and validates the host package by the signed Nginx capability range instead. Do not change runtime compatibility logic for a distro version; capture a matching package profile when publishing a managed APT release.
+
 ### 3. Open the Management UI
 
 The installer prints an installation-specific `127/8` address and high port, and creates an administrator token. With a TTY, the token is shown once; without a TTY, only the path to a root-protected token file is shown. Save it as instructed.

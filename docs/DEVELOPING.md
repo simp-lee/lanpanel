@@ -84,7 +84,7 @@ make materialize-preview-dependencies \
 
 `materialize` 只下载锁定的 URL，构建固定版本的 GoAccess，并验证所有输入和输出的大小及 SHA-256；它不查询 `latest`。`make release-preview` 会自动执行同样的物化步骤。
 
-发布包不为每个 Debian/Ubuntu 版本单独采集 OS Profile。Host Capability Contract 只记录 LanPanel 真正依赖的接口：Linux amd64、systemd、APT/dpkg、Nginx 最低版本，以及 unified cgroup v2、`cgroup.kill` 和 systemd delegation。它可以在任意可用的 APT/dpkg + systemd amd64 临时 VM/CI 镜像中生成一次，不需要使用客户真实主机，也不绑定某个发行版版本或 APT 镜像。
+Host Capability Contract 不是 Debian/Ubuntu 版本白名单；它只记录 LanPanel 真正依赖的接口：Linux amd64、systemd、APT/dpkg、Nginx 最低版本，以及 unified cgroup v2、`cgroup.kill` 和 systemd delegation。运行时兼容性不得按发行版版本硬编码。但是，签名的 package template 仍然是托管 APT 事务的权威软件包闭包，其中的精确版本必须来自发布目标仓库；因此发布托管式安装包时，应从匹配的参考主机重新采集 package profile，而不是手工替换版本。显式复用外部 Nginx 时，安装器会把 Nginx 从事务中移除，只按能力版本范围校验已安装的软件包。
 
 先运行只读检查：
 
