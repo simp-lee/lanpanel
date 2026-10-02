@@ -872,7 +872,21 @@ func validateReleaseFreshness(release []byte) error {
 func longLivedReleaseSuite(release []byte) bool {
 	suite, suiteFound := releaseFieldTokens(release, "Suite")
 	codename, codenameFound := releaseFieldTokens(release, "Codename")
-	return suiteFound && codenameFound && len(suite) == 1 && len(codename) == 1 && suite[0] == codename[0]
+	if !suiteFound || !codenameFound || len(suite) != 1 || len(codename) != 1 {
+		return false
+	}
+	if suite[0] == codename[0] {
+		return true
+	}
+	// Debian keeps a stable release's codename while its moving suite alias
+	// changes to oldstable or oldoldstable. Those base Release files are
+	// intentionally long-lived, just like a codename suite.
+	switch suite[0] {
+	case "stable", "oldstable", "oldoldstable":
+		return true
+	default:
+		return false
+	}
 }
 
 func signedReleaseTime(release []byte, field string) (time.Time, bool, error) {

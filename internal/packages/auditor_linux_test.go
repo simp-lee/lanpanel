@@ -212,6 +212,12 @@ func TestValidateReleaseFreshnessRequiresBoundedMetadataAge(t *testing.T) {
 	if err := validateReleaseFreshness([]byte("Suite: noble\nCodename: noble\nDate: " + stale + "\n")); err != nil {
 		t.Fatalf("long-lived Ubuntu release metadata was rejected: %v", err)
 	}
+	if err := validateReleaseFreshness([]byte("Suite: oldstable\nCodename: bookworm\nDate: " + stale + "\n")); err != nil {
+		t.Fatalf("long-lived Debian oldstable metadata was rejected: %v", err)
+	}
+	if err := validateReleaseFreshness([]byte("Suite: oldstable-updates\nCodename: bookworm\nDate: " + stale + "\n")); err == nil {
+		t.Fatal("stale Debian update metadata was accepted as long-lived")
+	}
 }
 
 func TestLinuxAuditorReadDPKGClassifiesHeldAndInstalledStates(t *testing.T) {
