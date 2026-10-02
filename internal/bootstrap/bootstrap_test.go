@@ -404,7 +404,7 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 		}
 	}
 	nginxUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service")])
-	for _, required := range []string{"Type=simple", "Requires=lanpanel-helper.service lanpanel-recovery.service", "After=network.target lanpanel-helper.service lanpanel-recovery.service", "ExecStart=" + journal.Paths.BinaryPath + " startup-guard", "ExecReload=" + journal.Paths.BinaryPath + " reload-guard", "KillMode=control-group", "KillSignal=SIGQUIT", "Delegate=yes", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE"} {
+	for _, required := range []string{"Type=simple", "Requires=lanpanel-helper.service lanpanel-recovery.service", "After=network.target lanpanel-helper.service lanpanel-recovery.service", "ExecStart=" + journal.Paths.BinaryPath + " startup-guard", "ExecReload=" + journal.Paths.BinaryPath + " reload-guard", "KillMode=control-group", "KillSignal=SIGTERM", "Delegate=yes", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE"} {
 		if !strings.Contains(nginxUnit, required) {
 			t.Fatalf("Nginx unit omitted %q: %s", required, nginxUnit)
 		}
