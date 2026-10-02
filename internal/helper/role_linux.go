@@ -83,6 +83,10 @@ func RunRole(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read admin token before helper recovery: %w", err)
 	}
+	childClosure, err := child.ObserveExclusiveCurrentCgroup()
+	if err != nil {
+		return fmt.Errorf("recover child cgroup before helper startup: %w", err)
+	}
 	deleteRecoveryErr := application.ReconcileResourceDeletes(context.Background())
 	adminRecoveryErr := application.ReconcileAdminTokenRotation(context.Background(), fingerprint)
 	var otherRecoveryErr error
@@ -99,15 +103,11 @@ func RunRole(args []string) error {
 	// Resource-create recovery must establish the safety identity before
 	// certificate recovery reads the shared safety authority.
 	recordRecovery("resource creates", application.ReconcileResourceCreates(context.Background()))
-	childClosure, childErr := child.ObserveExclusiveCurrentCgroup()
-	recordRecovery("child cgroup", childErr)
-	if childErr == nil {
-		recordRecovery("entity mutations", application.ReconcileInterruptedEntityMutations(context.Background(), childClosure, connectorCleanupErr))
-		recordRecovery("managed Basic", application.ReconcileManagedBasic(context.Background(), childClosure))
-		recordRecovery("certificate challenges", application.ReconcileCertificateChallenges(context.Background(), childClosure))
-		recordRecovery("journal-less certificate intents", application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
-		recordRecovery("unstarted certificate journals", application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
-	}
+	recordRecovery("entity mutations", application.ReconcileInterruptedEntityMutations(context.Background(), childClosure, connectorCleanupErr))
+	recordRecovery("managed Basic", application.ReconcileManagedBasic(context.Background(), childClosure))
+	recordRecovery("certificate challenges", application.ReconcileCertificateChallenges(context.Background(), childClosure))
+	recordRecovery("journal-less certificate intents", application.ReconcileJournalLessCertificateIntents(context.Background(), childClosure))
+	recordRecovery("unstarted certificate journals", application.ReconcileUnstartedCertificateJournals(context.Background(), childClosure))
 	recordRecovery("completed certificate renewals", application.ReconcileCompletedCertificateRenewals(context.Background()))
 	recordRecovery("interrupted domain publications", application.ReconcileInterruptedDomainPublications(context.Background()))
 	recordRecovery("certificate expiries", application.ReconcileCertificateExpiries(context.Background(), time.Now().UTC()))

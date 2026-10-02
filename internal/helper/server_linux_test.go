@@ -17,6 +17,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestServerRestartRequestStopsAcceptLoop(t *testing.T) {
+	identities := IdentitySet{UI: PeerIdentity{UID: 1001, GID: 2001}, Timer: PeerIdentity{UID: 1002, GID: 2001}, Recovery: PeerIdentity{UID: 1003, GID: 2001}}
+	server, err := NewServer(identities, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "helper.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(ignore func() error) { _ = ignore() }(listener.Close)
+	server.requestRestart()
+	if err := server.serveUnix(context.Background(), listener, false); !errors.Is(err, errRestartRequested) {
+		t.Fatalf("serveUnix error=%v, want restart request", err)
+	}
+	server.requestRestart()
+}
+
 func TestServerAuthenticatesPeerAndRevalidatesEveryRequest(t *testing.T) {
 	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
 	if uid == 0 || gid == 0 {

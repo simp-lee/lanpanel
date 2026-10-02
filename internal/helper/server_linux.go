@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"lanpanel/internal/child"
 	"lanpanel/internal/domain"
 	"lanpanel/internal/helperproto"
 	"net"
@@ -190,12 +191,16 @@ func PublicationActivateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationPublicationActivate, r, e)
 }
 
+var errRestartRequested = errors.New("helper restart requested")
+
 type Server struct {
 	identities   IdentitySet
 	handlers     map[helperproto.Operation]handler
 	now          func() time.Time
 	ioTimeout    time.Duration
 	mutationGate func(helperproto.Request) error
+	restart      chan struct{}
+	restartOnce  sync.Once
 }
 
 type Options struct {
@@ -219,7 +224,7 @@ func NewServer(identities IdentitySet, registrations []Registration, options Opt
 	if timeout < time.Second || timeout > 30*time.Second {
 		return nil, fmt.Errorf("helper protocol timeout is outside the fixed bound")
 	}
-	server := &Server{identities: identities, handlers: map[helperproto.Operation]handler{}, now: now, ioTimeout: timeout, mutationGate: options.MutationGate}
+	server := &Server{identities: identities, handlers: map[helperproto.Operation]handler{}, now: now, ioTimeout: timeout, mutationGate: options.MutationGate, restart: make(chan struct{})}
 	for _, registration := range registrations {
 		if _, known := helperproto.PolicyFor(registration.operation); !known || registration.handler.revalidate == nil || registration.handler.execute == nil {
 			return nil, fmt.Errorf("helper handler registration is unknown or incomplete")
@@ -255,6 +260,11 @@ func (server *Server) serveUnix(ctx context.Context, listener *net.UnixListener,
 	var workers sync.WaitGroup
 	defer workers.Wait()
 	for {
+		select {
+		case <-server.restart:
+			return errRestartRequested
+		default:
+		}
 		if err := listener.SetDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
 			return err
 		}
@@ -364,7 +374,11 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 			if failureCode == "" {
 				failureCode = "execution_failed"
 			}
-			return server.writeFailure(connection, request.Operation, request.RequestID, failureCode, result.ErrorJobID)
+			responseErr := server.writeFailure(connection, request.Operation, request.RequestID, failureCode, result.ErrorJobID)
+			if child.CgroupClosureUnproved(err) {
+				server.requestRestart()
+			}
+			return responseErr
 		}
 		if result.ErrorCode != "" || result.ErrorJobID != "" {
 			failureCode := result.ErrorCode
@@ -376,6 +390,13 @@ func (server *Server) serveConnection(ctx context.Context, connection *net.UnixC
 		response := helperproto.Response{SchemaVersion: helperproto.SchemaVersion, RequestID: request.RequestID, Code: helperproto.ResponseSucceeded, ResultDigest: result.ResultDigest, Action: result.Action, Resource: result.Resource, Status: result.Status, StatusCatalog: result.StatusCatalog, Headscale: result.Headscale, Connector: result.Connector, Read: result.Read}
 		return helperproto.WriteResponse(connection, request.Operation, response, result.Secret)
 	}
+}
+
+func (server *Server) requestRestart() {
+	if server == nil || server.restart == nil {
+		return
+	}
+	server.restartOnce.Do(func() { close(server.restart) })
 }
 
 func (server *Server) writeFailure(connection *net.UnixConn, operation helperproto.Operation, requestID, code string, jobIDs ...string) error {
