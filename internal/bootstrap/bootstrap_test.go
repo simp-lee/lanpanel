@@ -397,6 +397,15 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 	if !strings.Contains(socket, "ListenStream=127.41.42.43:52345") || !strings.Contains(socket, "FileDescriptorName=lanpanel-management-"+journal.GenerationID) || !strings.Contains(socket, "RemoveOnStop=no") {
 		t.Fatalf("socket=%s", socket)
 	}
+	for _, forbidden := range []string{"After=lanpanel-runtime.service", "Requires=lanpanel-runtime.service"} {
+		if strings.Contains(socket, forbidden) {
+			t.Fatalf("management socket creates a runtime ordering cycle through %q: %s", forbidden, socket)
+		}
+	}
+	runtimeUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-runtime.service")])
+	if strings.Contains(runtimeUnit, "lanpanel-management.socket") {
+		t.Fatalf("runtime unit creates a sockets.target ordering cycle: %s", runtimeUnit)
+	}
 	recoveryUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-recovery.service")])
 	for _, required := range []string{"Type=oneshot", "Before=lanpanel-nginx.service", "Requires=lanpanel-helper.service", "RestrictAddressFamilies=AF_UNIX", "RemainAfterExit=yes"} {
 		if !strings.Contains(recoveryUnit, required) {
