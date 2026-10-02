@@ -404,12 +404,12 @@ func TestSystemdAssetsReserveExactAuthorityAndKeepRolesIndependent(t *testing.T)
 		}
 	}
 	nginxUnit := string(artifacts[filepath.Join(journal.Paths.SystemdRoot, "lanpanel-nginx.service")])
-	for _, required := range []string{"Type=simple", "Requires=lanpanel-helper.service lanpanel-recovery.service", "After=network.target lanpanel-helper.service lanpanel-recovery.service", "ExecStart=" + journal.Paths.BinaryPath + " startup-guard", "ExecReload=" + journal.Paths.BinaryPath + " reload-guard", "ExecStop=" + journal.Paths.BinaryPath + " reload-guard stop", "Delegate=yes", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE"} {
+	for _, required := range []string{"Type=simple", "Requires=lanpanel-helper.service lanpanel-recovery.service", "After=network.target lanpanel-helper.service lanpanel-recovery.service", "ExecStart=" + journal.Paths.BinaryPath + " startup-guard", "ExecReload=" + journal.Paths.BinaryPath + " reload-guard", "KillMode=control-group", "KillSignal=SIGQUIT", "Delegate=yes", "CAP_SETPCAP", "CAP_NET_BIND_SERVICE"} {
 		if !strings.Contains(nginxUnit, required) {
 			t.Fatalf("Nginx unit omitted %q: %s", required, nginxUnit)
 		}
 	}
-	for _, forbidden := range []string{"Type=forking", "CAP_SYS_ADMIN", "CAP_NET_ADMIN"} {
+	for _, forbidden := range []string{"Type=forking", "ExecStop=", "reload-guard stop", "CAP_SYS_ADMIN", "CAP_NET_ADMIN"} {
 		if strings.Contains(nginxUnit, forbidden) {
 			t.Fatalf("Nginx unit contains %q: %s", forbidden, nginxUnit)
 		}
