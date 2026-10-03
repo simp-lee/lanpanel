@@ -59,7 +59,7 @@ func parseMountInfo(path string) ([]struct{ Root, Mountpoint string }, bool, err
 	if err != nil {
 		return nil, false, fmt.Errorf("read cgroup mount topology: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var result []struct{ Root, Mountpoint string }
 	legacy := false
 	scanner := bufio.NewScanner(file)

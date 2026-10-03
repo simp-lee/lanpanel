@@ -1136,10 +1136,10 @@ func validateExistingNginxPackageAuthority() error {
 func validateDpkgOwnedNginxFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("Nginx authority file %q is unavailable: %w", path, err)
+		return fmt.Errorf("nginx authority file %q is unavailable: %w", path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("Nginx authority file %q is not regular", path)
+		return fmt.Errorf("nginx authority file %q is not regular", path)
 	}
 	entries, err := os.ReadDir("/var/lib/dpkg/info")
 	if err != nil {
@@ -1195,13 +1195,13 @@ func validateDpkgOwnedNginxFile(path string) error {
 				return readErr
 			}
 			if fmt.Sprintf("%x", md5.Sum(data)) != fields[0] {
-				return fmt.Errorf("Nginx authority file %q differs from dpkg content authority", path)
+				return fmt.Errorf("nginx authority file %q differs from dpkg content authority", path)
 			}
 			return nil
 		}
 		return fmt.Errorf("dpkg content authority for Nginx file %q is missing", path)
 	}
-	return fmt.Errorf("Nginx authority file %q is not owned by an installed dpkg Nginx package", path)
+	return fmt.Errorf("nginx authority file %q is not owned by an installed dpkg nginx package", path)
 }
 
 func readBoundedNginxAuthorityFile(path string, maximum int64) ([]byte, error) {
@@ -1215,7 +1215,7 @@ func readBoundedNginxAuthorityFile(path string, maximum int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(data)) > maximum {
-		return nil, fmt.Errorf("Nginx authority file %q is too large", path)
+		return nil, fmt.Errorf("nginx authority file %q is too large", path)
 	}
 	return data, nil
 }

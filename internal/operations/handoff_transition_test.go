@@ -33,6 +33,7 @@ func zCert(domains []string) (domain.CertificateBundleIdentity, certificates.Bun
 	c := domain.CertificateBundleIdentity{PointerIdentity: "/var/lib/lanpanel/certificates/active/" + authority.CertificateID + ".current", BindingIdentity: bind, Generation: 1, Fingerprint: zDigest("fingerprint"), SANIdentity: san, ChainIdentity: zDigest("chain"), IssuerIdentity: zDigest("issuer"), DirectoryIdentity: zDigest("directory"), NotAfter: "2030-01-01T00:00:00Z", LastTrustedWall: "2029-01-01T00:00:00Z", Authority: authority}
 	return c, certificates.BundleIdentity{Fingerprint: c.Fingerprint, SANIdentity: c.SANIdentity, ChainIdentity: c.ChainIdentity, IssuerIdentity: c.IssuerIdentity, BindingIdentity: c.BindingIdentity, DirectoryIdentity: c.DirectoryIdentity}
 }
+
 func zDoc(t *testing.T, installation domain.Installation, intent Reservation, record jobs.Record, journals ...JournalRecord) persist.Document {
 	t.Helper()
 	enc := func(v any) json.RawMessage {
@@ -55,6 +56,7 @@ func zDoc(t *testing.T, installation domain.Installation, intent Reservation, re
 	}
 	return persist.Document{SchemaVersion: persist.SchemaVersion, Revision: 1, Entries: entries}
 }
+
 func TestCertificateHandoffTransition(t *testing.T) {
 	now := time.Unix(1700000000, 0).UTC()
 	jobID := zID("job_")

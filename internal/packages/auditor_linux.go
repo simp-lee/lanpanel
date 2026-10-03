@@ -744,11 +744,6 @@ func releaseFieldTokens(release []byte, field string) ([]string, bool) {
 	return values, found
 }
 
-func releaseFieldEqualsTokens(release []byte, field string, expected []string) bool {
-	actual, found := releaseFieldTokens(release, field)
-	return found && slices.Equal(actual, expected)
-}
-
 func releaseSuiteMatches(release []byte, configured string) bool {
 	for _, field := range []string{"Suite", "Codename"} {
 		values, found := releaseFieldTokens(release, field)

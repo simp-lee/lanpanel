@@ -549,13 +549,13 @@ func verifyPortableLinuxBinary(path string) error {
 	if err != nil {
 		return fmt.Errorf("inspect Linux binary: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if file.Class != elf.ELFCLASS64 || file.Machine != elf.EM_X86_64 {
-		return fmt.Errorf("Linux binary is not amd64 ELF")
+		return fmt.Errorf("linux binary is not amd64 ELF")
 	}
 	for _, program := range file.Progs {
 		if program.Type == elf.PT_INTERP {
-			return fmt.Errorf("Linux binary is dynamically linked; release builds must be static")
+			return fmt.Errorf("linux binary is dynamically linked; release builds must be static")
 		}
 	}
 	return nil
