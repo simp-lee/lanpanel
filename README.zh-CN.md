@@ -59,6 +59,7 @@ sudo ./lanpanel install
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
   -o /tmp/lanpanel-bootstrap.sh &&
+chmod +x /tmp/lanpanel-bootstrap.sh &&
 sudo /tmp/lanpanel-bootstrap.sh install
 ```
 
