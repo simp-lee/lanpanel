@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   echo "usage: $0 VERSION ARTIFACT_DIR DOWNLOAD_BASE_URL OUTPUT_DIR" >&2
-  echo "example: $0 v1.2.3-preview dist/release https://github.com/simp-lee/lanpanel/releases/download/v1.2.3-preview dist/releases" >&2
+  echo "example: $0 v0.4.0 dist/release https://github.com/simp-lee/lanpanel/releases/download/v0.4.0 dist/releases" >&2
 }
 
 if [ "$#" -ne 4 ]; then
@@ -15,10 +15,10 @@ artifact_dir=$2
 base_url=$3
 output_dir=$4
 
-case "$version" in
-  v[0-9]*-preview) ;;
-  *) echo "version must be a fixed vN...-preview release" >&2; exit 2 ;;
-esac
+if ! printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "version must be a stable semantic release tag such as v0.4.0" >&2
+  exit 2
+fi
 case "$base_url" in
   https://*) ;;
   *) echo "download base URL must be HTTPS" >&2; exit 2 ;;

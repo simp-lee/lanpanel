@@ -4,7 +4,7 @@
 
 LanPanel 是一个面向个人和相互信任小团队的自托管 Linux 主机管理工具。它通过浏览器管理应用进程、网络入口和可选的可信网络；不会上传、构建或修改你的应用代码。
 
-> **当前状态：Preview。** 适合试用和验证，不代表正式版、高可用或完整生产资格。
+> **当前版本：v0.4.0。** 功能边界和运行限制见下文；本版本不提供高可用能力，也不超出文档中明确的能力范围。
 
 ## 是否适合你
 
@@ -46,7 +46,7 @@ LanPanel 是一个面向个人和相互信任小团队的自托管 Linux 主机�
 
 ### 2. 安装
 
-从 [GitHub Releases](https://github.com/simp-lee/lanpanel/releases) 下载并解压与主机匹配的 Preview 包，在包目录执行：
+从 [GitHub Releases](https://github.com/simp-lee/lanpanel/releases) 下载并解压与主机匹配的 v0.4.0 发布包，在包目录执行：
 
 ```sh
 sudo ./lanpanel install
@@ -54,7 +54,7 @@ sudo ./lanpanel install
 
 这是唯一公开的安装入口。不要自行传入 bundle 路径、摘要、软件包计划、依赖路径或 ACME 联系方式。安装器会自动发现发布材料并校验清单、签名、完整校验和、固定第三方依赖及主机条件；校验失败时不会继续修改主机。
 
-也可以使用官方发布页提供的版本固定 Bootstrap。把 `<tag>` 换成实际的 Preview 标签，不要使用 `latest`：
+也可以使用官方发布页提供的版本固定 Bootstrap。把 `<tag>` 换成固定版本标签，例如 `v0.4.0`，不要使用 `latest`：
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
@@ -249,20 +249,20 @@ sudo lanpanel uninstall
 
 需要迁出产品配置时，可使用无密钥的配置导出；这不等同于产品级备份。不支持产品级备份/恢复、恢复切换或跨主机迁移。手工复制主机或 VM 快照也不会自动成为受支持且可恢复的备份。
 
-## Preview 限制
+## v0.4.0 限制
 
 - 不支持原地发布版本升级、依赖更新器、回滚引擎、状态迁移或跨主机迁移。已提交安装再次执行同一个签名发布包是幂等的；软件包所有权仍遵守上面的规则。
 - 不提供 Repair、主机修复、孤儿状态接管或自动规范化。
 - 不提供 EdgeOne 集成、公网 TCP/UDP 发布、SSH/RDP/VNC、容器、Kubernetes、数据库、应用模板、远程 API、OIDC 或 RBAC。
 - 不提供连接器断开、注销、重置、重新加入或重新绑定自动化；连接器不匹配必须在 LanPanel 外解决。
 - 未提供独立远端权威时，Tailnet HTTP/WebSocket 仅按“未经过实时测试”处理。
-- Preview 不声称 hardened GA、完整审计、实时资格验证或完整可复现发布保证。
+- v0.4.0 不声称具备完整审计、普遍实时资格验证或完整可复现发布保证。
 - 撤销密钥不会使已注册设备过期。
 - 证书、远端路由或入口激活不确定时，系统会优先关闭入口而不是盲目重试；失效关闭 Nginx 可能同时中断 Headscale 控制入口。
 
 ## 开发者
 
-开发、测试和 Preview 发布流程见[开发文档](https://github.com/simp-lee/lanpanel/blob/main/docs/DEVELOPING.md)。
+开发、测试和发布流程见[开发文档](https://github.com/simp-lee/lanpanel/blob/main/docs/DEVELOPING.md)。
 
 ## 许可证
 

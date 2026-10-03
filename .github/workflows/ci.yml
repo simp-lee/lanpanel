@@ -1,4 +1,4 @@
-name: Preview quality
+name: LanPanel quality
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   quality:
-    name: Preview Go quality gate
+    name: LanPanel Go quality gate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -25,7 +25,7 @@ jobs:
       - name: Install pinned linter
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
 
-      - name: Run Preview Go quality gate
+      - name: Run LanPanel Go quality gate
         run: make preview-local-gate
 
       - name: Set up Node.js for browser fixture

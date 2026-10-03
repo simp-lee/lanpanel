@@ -4,7 +4,7 @@
 
 LanPanel is a self-hosted Linux host manager for individuals and mutually trusted small teams. It uses a browser to manage application processes, network ingress, and an optional trusted network. It does not upload, build, or modify your application code.
 
-> **Current status: Preview.** This release is intended for evaluation and testing. It is not a claim of production readiness, high availability, or complete qualification.
+> **Current release: v0.4.0.** Functional boundaries and operational limitations are listed below; this release does not provide high availability or capabilities outside those documented boundaries.
 
 ## Is LanPanel right for you?
 
@@ -46,7 +46,7 @@ Choose the additional preparation for the feature you plan to use:
 
 ### 2. Install
 
-Download the Preview package for the host from [GitHub Releases](https://github.com/simp-lee/lanpanel/releases), extract it, and run this command from the package directory:
+Download the release package for the host from [GitHub Releases](https://github.com/simp-lee/lanpanel/releases), extract it, and run this command from the package directory:
 
 ```sh
 sudo ./lanpanel install
@@ -54,7 +54,7 @@ sudo ./lanpanel install
 
 This is the only public installation entry point. Do not provide a bundle path, digest, package plan, dependency path, or ACME contact. The installer discovers the release materials and verifies the manifest, signature, complete checksums, fixed third-party dependencies, and host conditions before mutation; verification failure stops the installation.
 
-You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with an actual Preview tag; do not use `latest`:
+You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with a fixed release tag such as `v0.4.0`; do not use `latest`:
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
@@ -249,23 +249,23 @@ Before uninstalling, LanPanel shows the managed scope and requires the exact int
 
 Use the secret-free configuration export when you need to take product configuration out of the host. It is not a product backup. A manual host copy or VM snapshot is not automatically a supported and recoverable backup.
 
-## Preview limitations
+## v0.4.0 limitations
 
 - Clean installation only for a new host; no in-place release upgrade, dependency updater, rollback engine, or state/schema migration. Replaying the same signed release after a committed installation is idempotent; package ownership rules above still apply.
 - No supported product backup/restore, restore cutover, or cross-host migration. A manual host copy or VM snapshot is not automatically a supported recoverable backup.
 - No generic Repair, host repair, orphan adoption, or automatic normalization.
-- No EdgeOne integration in Preview.
+- No EdgeOne integration in v0.4.0.
 - No connector disconnect, logout, reset, rejoin, or rebind automation. Connector mismatches must be resolved outside LanPanel.
 - Without an independent remote authority, Tailnet HTTP/WebSocket is reported as not live tested.
 - Key revoke does not expire a registered device.
 - Unpublish, device expiry, and pre-authentication key revocation do not guarantee termination of existing flows.
 - Temporary public HTTP is plaintext and does not expire automatically.
-- Preview does not claim hardened GA, complete audit coverage, live qualification, or complete reproducible-release guarantees.
+- v0.4.0 does not claim complete audit coverage, universal live qualification, or complete reproducible-release guarantees.
 - Fail-closed Nginx stop can interrupt Headscale control ingress.
 
 ## Developers
 
-See the [developer guide](https://github.com/simp-lee/lanpanel/blob/main/docs/DEVELOPING.md) for development, testing, and Preview release workflows.
+See the [developer guide](https://github.com/simp-lee/lanpanel/blob/main/docs/DEVELOPING.md) for development, testing, and release workflows.
 
 ## License
 

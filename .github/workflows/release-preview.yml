@@ -1,20 +1,9 @@
-name: Publish Preview release
+name: Publish LanPanel release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Fixed Preview tag, for example v1.2.3-preview
-        required: true
-        type: string
-      manifest_template:
-        description: Reviewed canonical release manifest template
-        required: true
-        type: string
-      profile_input_dir:
-        description: Directory containing one package template and baseline per profile
-        required: true
-        type: string
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -24,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Check out the selected tag
+      - name: Check out the pushed tag
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Set up Go from go.mod
@@ -39,6 +28,15 @@ jobs:
       - name: Install pinned linter
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
 
+      - name: Validate stable release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo 'tag must be a stable semantic version such as v0.4.0' >&2
+            exit 2
+          fi
+
       - name: Materialize the release signing key
         env:
           RELEASE_KEY_B64: ${{ secrets.LANPANEL_RELEASE_PRIVATE_KEY_B64 }}
@@ -49,16 +47,12 @@ jobs:
 
       - name: Run the shared release orchestrator
         env:
-          PREVIEW_TAG: ${{ inputs.tag }}
+          PREVIEW_TAG: ${{ github.ref_name }}
           PREVIEW_SIGNING_KEY: ${{ runner.temp }}/lanpanel-release-signing-key
-          PREVIEW_MANIFEST_TEMPLATE: ${{ inputs.manifest_template }}
-          PREVIEW_PROFILE_INPUT_DIR: ${{ inputs.profile_input_dir }}
+          PREVIEW_MANIFEST_TEMPLATE: release-inputs/manifest-template.json
+          PREVIEW_PROFILE_INPUT_DIR: release-inputs/profiles/linux-amd64-apt-dpkg-systemd
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          case "$PREVIEW_TAG" in
-            v[0-9]*-preview) ;;
-            *) echo 'tag must be a fixed vN...-preview release' >&2; exit 2 ;;
-          esac
           make release-preview \
             PREVIEW_TAG="$PREVIEW_TAG" \
             PREVIEW_SOURCE_DIR=. \
@@ -72,7 +66,7 @@ jobs:
 
       - name: Upload and verify the GitHub Release
         env:
-          PREVIEW_TAG: ${{ inputs.tag }}
+          PREVIEW_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           make publish-preview-github \

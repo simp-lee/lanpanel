@@ -2,7 +2,7 @@
 
 ## 开发与发布文档
 
-本文面向贡献者、开发者和 Preview 发布维护者。普通用户只需阅读根目录的 [README.md](../README.md)。
+本文面向贡献者、开发者和 LanPanel v0.4.0 发布维护者。普通用户只需阅读根目录的 [README.md](../README.md)。
 
 ## 开发环境
 
@@ -22,7 +22,7 @@ make race                  # race 测试
 make check                 # 完整质量门禁
 ```
 
-`make check` 会依次执行测试、`vet`、Lint 和 race 测试。提交代码前应至少运行一次；CI 使用相同的 Preview 质量门禁。`make tidy` 只在确实需要调整依赖时使用。
+`make check` 会依次执行测试、`vet`、Lint 和 race 测试。提交代码前应至少运行一次；CI 使用相同的质量门禁。`make tidy` 只在确实需要调整依赖时使用。
 
 ### 浏览器 fixture 门禁
 
@@ -57,7 +57,7 @@ make playwright-fixture-gate
 - `internal/`：安装器、UI、应用、网络、证书、进程和发布校验等实现；
 - `scripts/`：依赖物化、发布打包、Bootstrap 生成和 GitHub 发布适配器；
 - `release-inputs/`：经过审查并纳入版本控制的发布输入；
-- `.github/workflows/`：CI 和 Preview 发布工作流。
+- `.github/workflows/`：CI 和 v0.4.0 发布工作流。
 
 根目录 `README.md` 是普通用户文档，同时也是发布清单中的限制说明资产；不要再创建或恢复单独的限制说明文件。
 
@@ -103,7 +103,7 @@ make capture-preview-profile \
 
 采集只读取 APT 候选 Nginx 版本，生成 Host Capability Contract、APT 包模板和依赖基线。发布时 APT/dpkg 仍使用目标主机自身的签名仓库；安装器会在真实目标主机上主动探测 systemd delegation、动态 cgroup v2 mountpoint、`cgroup.kill`、APT/dpkg 状态和 Nginx 最低版本。生成结果必须人工审查后再提交。
 
-## 本地构建 Preview 发布包
+## 本地构建发布包
 
 发布构建必须从干净 worktree 的精确 Git tag 开始。常规流程分为：
 
@@ -117,14 +117,14 @@ make capture-preview-profile \
 
 ```sh
 make release-preview \
-  PREVIEW_TAG=v1.2.3-preview \
+  PREVIEW_TAG=v0.4.0 \
   PREVIEW_SOURCE_DIR="$PWD" \
   PREVIEW_DEPENDENCY_DIR="$PWD/dist/dependencies" \
   PREVIEW_MANIFEST_TEMPLATE="$MANIFEST_TEMPLATE" \
   PREVIEW_PROFILE_INPUT_DIR="$PROFILE_INPUT_DIR" \
   PREVIEW_SIGNING_KEY="$SIGNING_KEY" \
   PREVIEW_ARTIFACT_DIR="$PWD/dist/release" \
-  PREVIEW_DOWNLOAD_BASE_URL="https://github.com/simp-lee/lanpanel/releases/download/v1.2.3-preview" \
+  PREVIEW_DOWNLOAD_BASE_URL="https://github.com/simp-lee/lanpanel/releases/download/v0.4.0" \
   PREVIEW_OUTPUT_DIR="$PWD/dist/releases"
 ```
 
@@ -141,17 +141,28 @@ make release-preview \
 
 ## GitHub 发布
 
-本地打包完成后，使用 GitHub 适配器发布：
+默认发布流程由版本 Tag 自动触发，不需要手动打开 Actions 页面：
+
+```sh
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+`.github/workflows/release-preview.yml` 响应版本 Tag，并在脚本校验通过时发布稳定 SemVer（例如 `v0.4.0`）。它会使用仓库中经过审查的 `release-inputs/manifest-template.json` 和
+`release-inputs/profiles/linux-amd64-apt-dpkg-systemd/`，运行同一套 `make release-preview` 和 GitHub 适配器，创建并验证 GitHub Release。
+
+首次配置仓库时，需要在 GitHub Actions Secret 中添加
+`LANPANEL_RELEASE_PRIVATE_KEY_B64`。之后每个 Tag 发布都会自动使用该 Secret 签名；私钥不能提交到仓库。
+
+也可以在本地执行同一发布适配器：
 
 ```sh
 make publish-preview-github \
-  PREVIEW_TAG=v1.2.3-preview \
+  PREVIEW_TAG=v0.4.0 \
   PREVIEW_OUTPUT_DIR="$PWD/dist/releases"
 ```
 
-适配器要求 `gh` 已认证，且不会覆盖已有 tag。它会创建草稿 Release、校验上传后的字节、正式发布，然后从公开 HTTPS 地址重新下载归档和 Bootstrap，确认 URL、外层归档摘要和 Bootstrap 中的固定摘要一致。上传失败或发布后复验失败都不能视为发布成功。
-
-`.github/workflows/release-preview.yml` 使用同一套 `make release-preview` 和 GitHub 适配器；CI 的发布密钥只能来自受保护的 Secret。发布页面应使用实际的版本固定 Bootstrap 地址，不得改成 `latest` 或未绑定摘要的下载地址。
+适配器要求 `gh` 已认证，且不会覆盖已有 Release。它会创建草稿 Release、校验上传后的字节、正式发布，然后从公开 HTTPS 地址重新下载归档和 Bootstrap，确认 URL、外层归档摘要和 Bootstrap 中的固定摘要一致。发布页面应使用实际的版本固定 Bootstrap 地址，不得改成 `latest` 或未绑定摘要的下载地址。
 
 ## 变更检查清单
 

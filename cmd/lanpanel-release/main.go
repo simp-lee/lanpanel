@@ -104,7 +104,7 @@ func build(source, inputsPath, manifestPath, dependencyPath, packagePath, baseli
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		return err
 	}
-	if err := buildBinary(source, filepath.Join(tmp, "lanpanel")); err != nil {
+	if err := buildBinary(source, filepath.Join(tmp, "lanpanel"), tag); err != nil {
 		return err
 	}
 	signingKey, err := os.ReadFile(signingKeyPath)
@@ -526,8 +526,8 @@ func ensureCleanTag(source, tag string) error {
 	return nil
 }
 
-func buildBinary(source, output string) error {
-	command := exec.Command("go", "build", "-trimpath", "-o", output, "./cmd/lanpanel")
+func buildBinary(source, output, tag string) error {
+	command := exec.Command("go", "build", "-trimpath", "-ldflags", "-X main.version="+tag, "-o", output, "./cmd/lanpanel")
 	command.Dir = source
 	// Build the public Linux binary without CGO so one amd64 artifact does not
 	// inherit the builder's glibc baseline. The runtime already uses pure-Go
