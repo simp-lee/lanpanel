@@ -37,6 +37,14 @@ jobs:
             exit 2
           fi
 
+      - name: Install real lifecycle fixture dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+
+      - name: Run release quality gate
+        run: make preview-local-gate
+
       - name: Materialize the release signing key
         env:
           RELEASE_KEY_B64: ${{ secrets.LANPANEL_RELEASE_PRIVATE_KEY_B64 }}

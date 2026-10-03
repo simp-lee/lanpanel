@@ -25,6 +25,11 @@ jobs:
       - name: Install pinned linter
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
 
+      - name: Install real lifecycle fixture dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+
       - name: Run LanPanel Go quality gate
         run: make preview-local-gate
 
