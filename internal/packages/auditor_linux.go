@@ -70,6 +70,51 @@ func NewLinuxAuditor(launcher ChildLauncher) (*LinuxAuditor, error) {
 	return &LinuxAuditor{launcher: launcher, aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", dpkgRoot: "/var/lib/dpkg", transactionRoot: FixedPackageTransactionRoot, cgroupRoot: cgroupRoot, procRoot: procRoot, policyPath: "/usr/sbin/policy-rc.d", binaryPath: child.FixedLanPanelExecutable, maskRoot: FixedSystemdMaskDirectory, strict: true}, nil
 }
 
+// ValidateHostAPTConfiguration verifies the host APT configuration before
+// apt-get is allowed to run during installation. It deliberately does not
+// require existing signed repository metadata or the installed child binary.
+func ValidateHostAPTConfiguration(ctx context.Context) error {
+	auditor := &LinuxAuditor{aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", strict: true}
+	configuration, err := auditor.readConfigurationFiles(ctx)
+	if err != nil {
+		return err
+	}
+	repositories, err := parseObservedRepositories(configuration, nil)
+	if err != nil {
+		return err
+	}
+	if err := ValidateAPTConfigurationBasic(configuration, repositories); err != nil {
+		return err
+	}
+	keyrings := make(map[string][]byte)
+	for _, file := range configuration {
+		if file.Kind == APTKeyring {
+			keyrings[file.Path] = file.Bytes
+		}
+	}
+	if err := validateObservedRepositoryAuthorities(repositories, keyrings); err != nil {
+		return err
+	}
+	for _, file := range configuration {
+		if file.Kind == APTConfig && forbiddenAPTMetadataRefreshConfiguration(file.Bytes) {
+			return fmt.Errorf("APT configuration redirects metadata paths; automatic metadata refresh is unsafe")
+		}
+	}
+	return nil
+}
+
+// ValidateHostAPTMetadata verifies the signed APT metadata and configuration
+// before the installer creates a journal or mutates the host. It deliberately
+// does not require the installed LanPanel child executable.
+func ValidateHostAPTMetadata(ctx context.Context) error {
+	auditor := &LinuxAuditor{aptRoot: "/etc/apt", aptListsRoot: "/var/lib/apt/lists", strict: true}
+	configuration, repositories, err := auditor.readConfiguration(ctx, Plan{})
+	if err != nil {
+		return err
+	}
+	return ValidateAPTConfigurationBasic(configuration, repositories)
+}
+
 func newTestLinuxAuditor(launcher ChildLauncher, root string) *LinuxAuditor {
 	return &LinuxAuditor{launcher: launcher, aptRoot: filepath.Join(root, "etc/apt"), aptListsRoot: filepath.Join(root, "var/lib/apt/lists"), dpkgRoot: filepath.Join(root, "var/lib/dpkg"), transactionRoot: filepath.Join(root, "var/lib/lanpanel/packages/transactions"), cgroupRoot: filepath.Join(root, "cgroup"), procRoot: filepath.Join(root, "proc"), policyPath: filepath.Join(root, "usr/sbin/policy-rc.d"), binaryPath: filepath.Join(root, "usr/lib/lanpanel/lanpanel"), maskRoot: filepath.Join(root, "etc/systemd/system")}
 }
@@ -342,7 +387,7 @@ func (auditor *LinuxAuditor) observeRepositoryMetadata(ctx context.Context, repo
 			return fmt.Errorf("APT repository %q InRelease signature is invalid: %w", repositories[index].ID, err)
 		}
 		if err := validateReleaseFreshness(plaintext); err != nil {
-			return fmt.Errorf("APT repository %q signed freshness is invalid: %w", repositories[index].ID, err)
+			return fmt.Errorf("APT repository %q (%s suite %s) signed freshness is invalid: %w; refresh APT metadata and verify the system clock", repositories[index].ID, repositories[index].URI, repositories[index].Suite, err)
 		}
 		releaseFiles, err := releaseSHA256Files(plaintext)
 		if err != nil {
@@ -852,7 +897,7 @@ func validateReleaseFreshness(release []byte) error {
 		return fmt.Errorf("signed Release Date is too far in the future")
 	}
 	if now.Sub(date) > maxAPTReleaseAge && !longLivedReleaseSuite(release) {
-		return fmt.Errorf("signed Release Date is older than the maximum metadata age")
+		return fmt.Errorf("signed Release Date %s is older than the maximum metadata age of %s", date.UTC().Format(time.RFC3339), maxAPTReleaseAge)
 	}
 	validUntil, found, err := signedReleaseTime(release, "Valid-Until")
 	if err != nil {
@@ -929,7 +974,7 @@ func digestBytes(data []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) ([]ObservedConfig, []ObservedRepository, error) {
+func (auditor *LinuxAuditor) readConfigurationFiles(ctx context.Context) ([]ObservedConfig, error) {
 	files := []ObservedConfig{}
 	for _, entry := range []struct {
 		path string
@@ -952,15 +997,23 @@ func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) (
 		{filepath.Join(filepath.Dir(auditor.aptRoot), "dpkg/dpkg.cfg.d"), DPKGConfig, true},
 	} {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		observed, err := auditor.readConfigEntry(entry.path, entry.kind, entry.dir)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		files = append(files, observed...)
 	}
 	slices.SortFunc(files, func(left, right ObservedConfig) int { return strings.Compare(left.Path, right.Path) })
+	return files, nil
+}
+
+func (auditor *LinuxAuditor) readConfiguration(ctx context.Context, plan Plan) ([]ObservedConfig, []ObservedRepository, error) {
+	files, err := auditor.readConfigurationFiles(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	basic := len(plan.Repositories) == 0
 	repositories, err := parseObservedRepositories(files, plan.Repositories)
 	if err != nil && !basic {
@@ -1236,11 +1289,11 @@ func parseSourceFile(path string, data []byte) ([]ObservedRepository, error) {
 				return nil, fmt.Errorf("APT source option is unauthorized")
 			}
 			if key == "signed-by" {
+				if value == "" {
+					return nil, fmt.Errorf("APT source signed-by authority is empty")
+				}
 				signedBy = value
 			}
-		}
-		if signedBy == "" {
-			return nil, fmt.Errorf("APT source omits exact signed-by authority")
 		}
 		if binarySource {
 			result = append(result, ObservedRepository{URI: fields[closing+1], Suite: fields[closing+2], Components: append([]string(nil), fields[closing+3:]...), KeyringPath: signedBy, Enabled: true})
@@ -1273,11 +1326,16 @@ func parseDeb822Sources(data []byte) ([]ObservedRepository, error) {
 			}
 		}
 		uris, suites, components, signedBy := strings.Fields(fields["URIs"]), strings.Fields(fields["Suites"]), strings.Fields(fields["Components"]), strings.Fields(fields["Signed-By"])
-		if fields["Types"] != "deb" || len(uris) != 1 || len(suites) == 0 || len(suites) > 16 || len(signedBy) != 1 || len(components) == 0 || fields["Architectures"] != "" && fields["Architectures"] != "amd64" || fields["Enabled"] != "" && fields["Enabled"] != "yes" {
+		_, hasSignedBy := fields["Signed-By"]
+		if fields["Types"] != "deb" || len(uris) != 1 || len(suites) == 0 || len(suites) > 16 || len(signedBy) > 1 || hasSignedBy && len(signedBy) == 0 || len(components) == 0 || fields["Architectures"] != "" && fields["Architectures"] != "amd64" || fields["Enabled"] != "" && fields["Enabled"] != "yes" {
 			return fmt.Errorf("deb822 APT source authority is unsupported")
 		}
+		keyringPath := ""
+		if len(signedBy) == 1 {
+			keyringPath = signedBy[0]
+		}
 		for _, suite := range suites {
-			result = append(result, ObservedRepository{URI: uris[0], Suite: suite, Components: append([]string(nil), components...), KeyringPath: signedBy[0], Enabled: true})
+			result = append(result, ObservedRepository{URI: uris[0], Suite: suite, Components: append([]string(nil), components...), KeyringPath: keyringPath, Enabled: true})
 		}
 		paragraph = nil
 		return nil

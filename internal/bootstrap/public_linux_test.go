@@ -5,6 +5,7 @@ package bootstrap
 import (
 	"encoding/json"
 	"io"
+	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
 	"os"
@@ -47,6 +48,14 @@ func TestExistingNginxVersionUsesCapabilityRange(t *testing.T) {
 		err := validateExistingNginxVersion(authority, preflight.InstalledPackageTuple{Name: "nginx", Version: test.version, Architecture: "amd64"})
 		if (err != nil) != test.wantErr {
 			t.Fatalf("version %s error=%v wantErr=%t", test.version, err, test.wantErr)
+		}
+	}
+}
+
+func TestPublicPackagePlanRequiresHostAPTMode(t *testing.T) {
+	for _, mode := range []packages.Mode{packages.StagedDebs, packages.OfflineDebs} {
+		if err := validatePublicPackagePlan(packages.Plan{Mode: mode}); err == nil {
+			t.Fatalf("public package mode %q was accepted", mode)
 		}
 	}
 }

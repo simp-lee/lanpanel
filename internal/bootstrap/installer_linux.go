@@ -35,6 +35,16 @@ import (
 
 const ProtectedAdminTokenPath = "/var/lib/lanpanel/installation/admin-token"
 
+func shouldPrepareAPTMetadata(strict bool, paths Paths, mode packages.Mode, prepared bool, packageCount int, journalPhase *Phase) bool {
+	if !strict || paths != FixedPaths() || mode != packages.DistroRepository || prepared || packageCount == 0 {
+		return false
+	}
+	if journalPhase != nil && *journalPhase != PhasePrepared && *journalPhase != PhaseNginxMasked {
+		return false
+	}
+	return true
+}
+
 func Install(ctx context.Context, request Request) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -93,6 +103,21 @@ func install(ctx context.Context, request Request, strict bool) error {
 		return err
 	}
 	inputPackagePlanDigest := packagePlanDigest
+	prepareAPTMetadata := func(journalPhase *Phase) error {
+		if !shouldPrepareAPTMetadata(strict, paths, request.PackagePlan.Mode, request.APTMetadataPrepared, len(request.PackagePlan.Packages), journalPhase) {
+			return nil
+		}
+		if err := packages.ValidateHostAPTConfiguration(ctx); err != nil {
+			return fmt.Errorf("installer APT configuration preflight failed: %w", err)
+		}
+		if err := refreshAPTMetadata(ctx); err != nil {
+			return fmt.Errorf("installer APT preparation failed: %w", err)
+		}
+		if err := packages.ValidateHostAPTMetadata(ctx); err != nil {
+			return fmt.Errorf("installer APT metadata preflight failed: %w", err)
+		}
+		return nil
+	}
 	journalPresent, err := journalExists(paths.Journal)
 	if err != nil {
 		return err
@@ -119,6 +144,11 @@ func install(ctx context.Context, request Request, strict bool) error {
 		}
 		if journal.PackageInputPlanDigest != packagePlanDigest {
 			return fmt.Errorf("existing bootstrap attempt package input authority changed")
+		}
+		if journal.Phase == PhasePrepared || journal.Phase == PhaseNginxMasked {
+			if err := prepareAPTMetadata(&journal.Phase); err != nil {
+				return err
+			}
 		}
 		preflightRequest := journal.PreflightRequest
 		refreshPreflight := journal.Phase == PhasePrepared
@@ -215,6 +245,9 @@ func install(ctx context.Context, request Request, strict bool) error {
 	present, _, err := identity.InspectAccounts(accounts)
 	if err != nil || present {
 		return fmt.Errorf("installation account collision before mutation: %w", err)
+	}
+	if err := prepareAPTMetadata(nil); err != nil {
+		return err
 	}
 	preflightRequest, preflightResult, err := request.Preflight(ctx, material.Authority, material.SafetyGeneration)
 	if err != nil {

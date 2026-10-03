@@ -149,6 +149,17 @@ func TestMultiRepositoryPlanBindsEachPackageAndRejectsAmbiguousAuthority(t *test
 	}
 }
 
+func TestAPTSourceFormatsAllowOptionlessTrustedAuthorities(t *testing.T) {
+	binary, err := parseSourceFile("/etc/apt/sources.list", []byte("deb [arch=amd64] https://deb.example.test/debian stable main\n"))
+	if err != nil || len(binary) != 1 || binary[0].KeyringPath != "" {
+		t.Fatalf("optionless binary source=%#v err=%v", binary, err)
+	}
+	deb822, err := parseDeb822Sources([]byte("Types: deb\nURIs: https://deb.example.test/debian\nSuites: stable\nComponents: main\n\n"))
+	if err != nil || len(deb822) != 1 || deb822[0].KeyringPath != "" {
+		t.Fatalf("optionless deb822 source=%#v err=%v", deb822, err)
+	}
+}
+
 func TestDeb822SourcesAcceptCommentsAndMultipleSuites(t *testing.T) {
 	data := []byte("# Ubuntu archive authority\nTypes: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-security\nComponents: main universe restricted multiverse\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n")
 	values, err := parseDeb822Sources(data)
@@ -205,6 +216,42 @@ func TestAPTConfigurationAcceptsDistroSharedKeyringPath(t *testing.T) {
 	observed := []ObservedRepository{{ID: plan.Repositories[0].ID, URI: plan.Repositories[0].URI, Suite: plan.Repositories[0].Suite, Components: []string{"main"}, KeyringPath: plan.Repositories[0].KeyringPath, KeyringDigest: digestBytes([]byte("keyring")), MetadataDigest: plan.Repositories[0].MetadataDigest, CutoffDigest: plan.Repositories[0].CutoffDigest, Enabled: true}}
 	if err := ValidateAPTConfiguration(files, observed, plan.Repositories); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAPTMetadataRefreshRejectsConfigurationRedirects(t *testing.T) {
+	for _, value := range []string{`Dir::Etc::sourcelist "/tmp/sources.list";`, `Dir::State::lists "/tmp/lists";`, `Dir::Cache::archives "/tmp/archives";`, `Dir { Etc { sourcelist "/tmp/sources.list"; }; };`, `APT { Update { Post-Invoke { "/tmp/hook"; }; }; };`, `Acquire::http::Proxy-Auto-Detect "/tmp/helper";`} {
+		if !forbiddenAPTMetadataRefreshConfiguration([]byte(value)) {
+			t.Fatalf("APT metadata refresh accepted configuration redirect %q", value)
+		}
+	}
+	if forbiddenAPTMetadataRefreshConfiguration([]byte(`Dir::Etc::sourceparts "-";`)) == false {
+		t.Fatal("APT metadata refresh accepted a sourceparts redirect")
+	}
+}
+
+func TestObservedAPTRepositoryAuthorityRequiresApprovedKeyring(t *testing.T) {
+	base := ObservedRepository{URI: "https://deb.example.test/debian", Suite: "stable", Components: []string{"main"}, KeyringPath: "/etc/apt/keyrings/release.gpg", Enabled: true}
+	if err := validateObservedRepositoryAuthorities([]ObservedRepository{base}, map[string][]byte{base.KeyringPath: []byte("keyring")}); err != nil {
+		t.Fatal(err)
+	}
+	optionless := base
+	optionless.KeyringPath = ""
+	if err := validateObservedRepositoryAuthorities([]ObservedRepository{optionless}, map[string][]byte{"/etc/apt/trusted.gpg.d/release.gpg": []byte("keyring")}); err != nil {
+		t.Fatalf("optionless trusted APT source was rejected: %v", err)
+	}
+	for _, changed := range []ObservedRepository{
+		{URI: "file:///tmp/repo", Suite: base.Suite, Components: base.Components, KeyringPath: base.KeyringPath, Enabled: true},
+		{URI: base.URI, Suite: base.Suite, Components: base.Components, KeyringPath: "/tmp/release.gpg", Enabled: true},
+		{URI: base.URI, Suite: base.Suite, Components: base.Components, KeyringPath: base.KeyringPath, Enabled: false},
+	} {
+		keyrings := map[string][]byte{base.KeyringPath: []byte("keyring")}
+		if changed.KeyringPath != base.KeyringPath {
+			keyrings = map[string][]byte{}
+		}
+		if err := validateObservedRepositoryAuthorities([]ObservedRepository{changed}, keyrings); err == nil {
+			t.Fatalf("unsafe observed APT repository was accepted: %#v", changed)
+		}
 	}
 }
 
@@ -288,7 +335,7 @@ func TestPackageConfigurationAllowsDistroHooksButRejectsUnsafeOverrides(t *testi
 			t.Fatalf("user APT proxy %q was rejected: %v", allowed, err)
 		}
 	}
-	for _, hostile := range []string{`Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `DPkg::Options { "--admindir=/tmp/other"; };`, `DPkg::Options { "--instdir=/tmp/other"; };`, `APT::Get::AllowUnauthenticated "true";`} {
+	for _, hostile := range []string{`Dir::Bin::dpkg "/tmp/other";`, `Dir { Bin { dpkg "/tmp/other"; }; };`, `DPkg::Options { "--admindir=/tmp/other"; };`, `DPkg::Options { "--instdir=/tmp/other"; };`, `APT::Get::AllowUnauthenticated "true";`, `APT::Update::Post-Invoke-Success { "/tmp/hook"; };`} {
 		changed := append([]ObservedConfig(nil), files...)
 		changed[0].Bytes = []byte(hostile)
 		if err := ValidateAPTConfiguration(changed, repositories, plan.Repositories); err == nil {

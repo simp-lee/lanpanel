@@ -65,10 +65,10 @@ func RunInstallerRole(args []string, stdout io.Writer) error {
 }
 
 func runInstallerAuthority(data []byte, stdout io.Writer) error {
-	return runInstallerAuthorityWithMaterial(data, stdout, nil)
+	return runInstallerAuthorityWithMaterial(data, stdout, nil, false)
 }
 
-func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *identity.Material) error {
+func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *identity.Material, aptMetadataPrepared bool) error {
 	var input installerInput
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -150,7 +150,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if !present || release.DigestBytes(headscaleBytes) != identityValue.Headscale.Archive.Digest || uint64(len(headscaleBytes)) != identityValue.Headscale.Archive.Bytes {
 		return fmt.Errorf("selected Headscale archive is missing or mismatched")
 	}
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, APTMetadataPrepared: aptMetadataPrepared, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 
 func rebindPublicInstallerInput(data []byte, plan packages.Plan, result preflight.Result) ([]byte, error) {

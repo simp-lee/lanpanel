@@ -31,7 +31,7 @@ The current release supports Linux amd64 (x86_64) hosts that satisfy the signed 
 - an APT mirror with signature verification enabled and a healthy package state;
 - enough disk space and available ports.
 
-Before changing the host, the installer checks the capability contract, packages, ports, filesystem, and Nginx ownership/configuration. The distribution name and release number are not compatibility allowlists. Other architectures, hosts without the required capabilities, and hosts that fail these checks are unsupported.
+Before changing the host, the installer checks the capability contract, packages, ports, filesystem, and Nginx ownership/configuration, and refreshes the host's signed APT metadata. This refresh updates package indexes only; it does not upgrade the system. If the system clock or APT sources are invalid, the installer prints actionable diagnostics and stops. The distribution name and release number are not compatibility allowlists. Other architectures, hosts without the required capabilities, and hosts that fail these checks are unsupported.
 
 Installation does not require ACME or DNS operations in advance. You only need a domain, DNS, and the relevant 80/443 network access when you later publish a domain-based HTTPS application.
 

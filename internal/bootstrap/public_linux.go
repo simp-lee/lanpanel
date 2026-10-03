@@ -12,6 +12,7 @@ import (
 	"lanpanel/internal/packages"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/release"
+	"lanpanel/internal/sources"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -73,7 +74,7 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer material.Destroy()
-	if err := runInstallerAuthorityWithMaterial(data, stdout, &material); err != nil {
+	if err := runInstallerAuthorityWithMaterial(data, stdout, &material, true); err != nil {
 		return err
 	}
 	return nil
@@ -160,6 +161,9 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 	if err := release.DecodeCanonical(packageTemplateBytes, &packageTemplate); err != nil {
 		return nil, identity.Material{}, fmt.Errorf("public package template is invalid: %w", err)
 	}
+	if err := packages.ValidatePublicReleasePlan(packageTemplate); err != nil {
+		return nil, identity.Material{}, fmt.Errorf("public package template is not a valid distro repository plan")
+	}
 	identityValue := authority.Identity()
 	var packagePlan packages.Plan
 	var packagePreflight preflight.Result
@@ -170,7 +174,8 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 		}
 		packagePlan = *packagePlanOverride
 		packagePreflight = *packagePreflightOverride
-	} else {
+	}
+	if packagePlanOverride == nil {
 		preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
 		packagePreflightRequest, evaluatedPreflight, err := preflightEvaluator(context.Background(), material.Authority, material.SafetyGeneration)
 		if err != nil {
@@ -184,6 +189,24 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 		}
 		packagePreflight = evaluatedPreflight
 	}
+	if err := validatePublicPackagePlan(packagePlan); err != nil {
+		material.Destroy()
+		return nil, identity.Material{}, err
+	}
+	if packagePlanOverride == nil && len(packagePlan.Packages) != 0 {
+		if err := packages.ValidateHostAPTConfiguration(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, fmt.Errorf("APT configuration preflight failed: %w", err)
+		}
+		if err := refreshAPTMetadata(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, err
+		}
+		if err := packages.ValidateHostAPTMetadata(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, fmt.Errorf("APT metadata preflight failed: %w", err)
+		}
+	}
 	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
 	data, err := json.Marshal(input)
 	if err != nil || len(data) == 0 || len(data) > maximumPublicInstallerInputBytes {
@@ -191,6 +214,21 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 		return nil, identity.Material{}, fmt.Errorf("public installer authority is invalid or unbounded")
 	}
 	return data, material, nil
+}
+
+func validatePublicPackagePlan(plan packages.Plan) error {
+	if err := packages.ValidatePlan(plan); err != nil {
+		return fmt.Errorf("public installer package plan is invalid: %w", err)
+	}
+	if plan.Mode != packages.DistroRepository || plan.NoNetwork || plan.Proxy != nil || len(plan.Repositories) != 0 {
+		return fmt.Errorf("public installer package plan must use the authenticated host APT source")
+	}
+	for _, pkg := range plan.Packages {
+		if pkg.Source.Kind != sources.OfficialDistro || pkg.Source.URL != "" || pkg.Source.OfflinePath != "" || len(pkg.Source.OfficialAuthorities) != 0 || pkg.RepositoryID != "" || pkg.RepositoryFilename != "" || pkg.VersionMinimum == "" && pkg.VersionMaximum == "" {
+			return fmt.Errorf("public installer package source is not a ranged host APT source")
+		}
+	}
+	return nil
 }
 
 func bindPublicPackagePlan(template packages.Plan, identityValue release.InstallIdentity, material identity.Material, request preflight.ExpansionRequest, result preflight.Result, now time.Time, releaseDigest string) (packages.Plan, error) {

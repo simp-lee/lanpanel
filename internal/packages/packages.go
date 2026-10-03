@@ -505,6 +505,36 @@ func packageBindingIdentityValid(binding RepositoryPackageBinding) bool {
 	return packageNamePattern.MatchString(binding.Name) && versionPattern.MatchString(binding.Version) && !moving(binding.Version) && (binding.Architecture == "amd64" || binding.Architecture == "all") && validRepositoryFilename(binding.Filename) && binding.Size > 0 && binding.Size <= 4<<30 && digestPattern.MatchString(binding.Digest)
 }
 
+func validateObservedRepositoryAuthorities(repositories []ObservedRepository, keyrings map[string][]byte) error {
+	if len(repositories) == 0 || len(repositories) > 16 {
+		return fmt.Errorf("APT repository configuration is empty or unbounded")
+	}
+	seenLocation := map[string]bool{}
+	trustedKeyrings := 0
+	for path, keyring := range keyrings {
+		if (path == "/etc/apt/trusted.gpg" || strings.HasPrefix(path, "/etc/apt/trusted.gpg.d/")) && len(keyring) != 0 {
+			trustedKeyrings++
+		}
+	}
+	for _, repository := range repositories {
+		parsed, err := url.Parse(repository.URI)
+		location := repository.URI + "\x00" + repository.Suite
+		keyringApproved := repository.KeyringPath == "" && trustedKeyrings != 0 || cleanRootFile(repository.KeyringPath) && (strings.HasPrefix(repository.KeyringPath, "/etc/apt/") || strings.HasPrefix(repository.KeyringPath, "/usr/share/keyrings/")) && len(keyrings[repository.KeyringPath]) != 0
+		if !repository.Enabled || err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path == "" || parsed.RawPath != "" || parsed.String() != repository.URI || !suitePattern.MatchString(repository.Suite) || len(repository.Components) == 0 || len(repository.Components) > 32 || !keyringApproved || seenLocation[location] {
+			return fmt.Errorf("APT repository authority is invalid, duplicated, or missing its approved keyring")
+		}
+		seenLocation[location] = true
+		seenComponents := map[string]bool{}
+		for _, component := range repository.Components {
+			if !componentPattern.MatchString(component) || seenComponents[component] {
+				return fmt.Errorf("APT repository components are invalid or duplicated")
+			}
+			seenComponents[component] = true
+		}
+	}
+	return nil
+}
+
 func validateRepositories(repositories []Repository) error {
 	if len(repositories) > 16 {
 		return fmt.Errorf("package repository authority set is unbounded")
@@ -556,14 +586,29 @@ func validConfigPath(kind ConfigKind, value string) bool {
 	}
 }
 
-func forbiddenAPTConfiguration(data []byte) bool {
+func forbiddenAPTMetadataRefreshConfiguration(data []byte) bool {
 	lower := strings.ToLower(string(data))
-	if strings.ContainsAny(lower, "\x00\r") {
-		return true
+	for _, directive := range []string{"#include", "#clear", "#if", "rootdir", "proxy-auto-detect", "dir::etc::", "dir::state::", "dir::cache::"} {
+		if strings.Contains(lower, directive) {
+			return true
+		}
 	}
-	if strings.Contains(lower, "admindir") || strings.Contains(lower, "instdir") || strings.Contains(lower, "check-valid-until") && strings.Contains(lower, "false") {
-		return true
+	words := aptConfigurationWords(data)
+	for _, word := range words {
+		if word == "dir" {
+			return true
+		}
 	}
+	for index := 0; index+2 < len(words); index++ {
+		if words[index] == "apt" && words[index+1] == "update" && strings.Contains(words[index+2], "invoke") {
+			return true
+		}
+	}
+	return false
+}
+
+func aptConfigurationWords(data []byte) []string {
+	lower := strings.ToLower(string(data))
 	words := []string{}
 	var token strings.Builder
 	flush := func() {
@@ -580,6 +625,18 @@ func forbiddenAPTConfiguration(data []byte) bool {
 		}
 	}
 	flush()
+	return words
+}
+
+func forbiddenAPTConfiguration(data []byte) bool {
+	lower := strings.ToLower(string(data))
+	if strings.ContainsAny(lower, "\x00\r") {
+		return true
+	}
+	if strings.Contains(lower, "admindir") || strings.Contains(lower, "instdir") || strings.Contains(lower, "check-valid-until") && strings.Contains(lower, "false") || strings.Contains(lower, "apt::update::pre-invoke") || strings.Contains(lower, "apt::update::post-invoke") {
+		return true
+	}
+	words := aptConfigurationWords(data)
 	for _, word := range words {
 		if word == "proxy-auto-detect" || word == "allowunauthenticated" || word == "allowinsecurerepositories" || word == "allow-downgrades" || word == "force-yes" || word == "force-confnew" || word == "admindir" || word == "instdir" {
 			return true

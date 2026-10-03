@@ -170,16 +170,20 @@ type Request struct {
 	PackagePlan        packages.Plan
 	PackagePreflight   preflight.Result
 	PackageTransaction PackageTransaction
-	SourceBinary       []byte
-	LegoBytes          []byte
-	TailscaleBytes     []byte
-	GoAccessBytes      []byte
-	HeadscaleBytes     []byte
-	Random             io.Reader
-	Now                func() time.Time
-	Paths              Paths
-	Output             io.Writer
-	TTY                TTY
+	// A public input builder refreshes APT metadata before binding its
+	// preflight. Direct and resumed invocations leave this false so Install
+	// performs the same preparation before creating or advancing a journal.
+	APTMetadataPrepared bool
+	SourceBinary        []byte
+	LegoBytes           []byte
+	TailscaleBytes      []byte
+	GoAccessBytes       []byte
+	HeadscaleBytes      []byte
+	Random              io.Reader
+	Now                 func() time.Time
+	Paths               Paths
+	Output              io.Writer
+	TTY                 TTY
 }
 
 type TTY interface {
