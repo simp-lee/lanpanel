@@ -29,6 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y bubblewrap
+          sudo chmod u+s "$(command -v bwrap)"
 
       - name: Run LanPanel Go quality gate
         run: make preview-local-gate
