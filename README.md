@@ -4,8 +4,6 @@
 
 LanPanel is a self-hosted Linux host manager for individuals and mutually trusted small teams. It uses a browser to manage application processes, network ingress, and an optional trusted network. It does not upload, build, or modify your application code.
 
-> **Current release: v0.4.0.** Functional boundaries and operational limitations are listed below; this release does not provide high availability or capabilities outside those documented boundaries.
-
 ## Is LanPanel right for you?
 
 | Your goal | Fit |
