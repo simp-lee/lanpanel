@@ -21,6 +21,8 @@ import (
 type ArtifactStager struct {
 	Files    *TransactionFiles
 	Launcher ChildLauncher
+	Progress io.Writer
+	Report   ProgressReporter
 }
 
 func (stager *ArtifactStager) Stage(ctx context.Context, plan Plan) error {
@@ -35,7 +37,7 @@ func (stager *ArtifactStager) Stage(ctx context.Context, plan Plan) error {
 		if stager.Launcher == nil {
 			return fmt.Errorf("distro package download child is unavailable")
 		}
-		result, err := stager.Launcher.RunInvocation(ctx, child.ProfileAPTDownload, packageInvocation(plan, false), nil)
+		result, err := runChildInvocation(stager.Launcher, ctx, child.ProfileAPTDownload, packageInvocation(plan, false), nil, wrapProgressWriter(stager.Progress, stager.Report, child.ProfileAPTDownload, len(plan.Packages)))
 		if err != nil || result.ExitCode != 0 || result.OutputCutOff {
 			return fmt.Errorf("distro package download did not reach a bounded terminal result")
 		}

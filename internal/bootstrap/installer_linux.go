@@ -904,6 +904,9 @@ func createBootstrapDirectories(journal Journal) error {
 		}
 	}
 	if journal.Paths == FixedPaths() {
+		if err := ensureInstallerLogDirectory("/var/log/lanpanel"); err != nil {
+			return fmt.Errorf("bootstrap install log directory: %w", err)
+		}
 		if _, err := ensureDirectory("/etc/sysusers.d", owner, 0o755); err != nil {
 			return err
 		}

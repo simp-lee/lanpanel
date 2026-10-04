@@ -5,7 +5,10 @@ package packages
 import (
 	"context"
 	"fmt"
+	"io"
 	"lanpanel/internal/child"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,12 +23,104 @@ type ChildLauncher interface {
 	RunInvocation(context.Context, child.ProfileID, child.Invocation, []byte) (child.Result, error)
 }
 
+type ProgressChildLauncher interface {
+	RunInvocationWithOutput(context.Context, child.ProfileID, child.Invocation, []byte, io.Writer) (child.Result, error)
+}
+
+func runChildInvocation(launcher ChildLauncher, ctx context.Context, profile child.ProfileID, invocation child.Invocation, input []byte, progress io.Writer) (child.Result, error) {
+	if progressLauncher, ok := launcher.(ProgressChildLauncher); ok {
+		return progressLauncher.RunInvocationWithOutput(ctx, profile, invocation, input, progress)
+	}
+	return launcher.RunInvocation(ctx, profile, invocation, input)
+}
+
+type structuredProgressWriter struct {
+	writer   io.Writer
+	report   ProgressReporter
+	profile  child.ProfileID
+	current  int
+	total    int
+	packages map[string]struct{}
+	lines    []byte
+	mu       sync.Mutex
+}
+
+func (writer *structuredProgressWriter) Write(value []byte) (int, error) {
+	if writer == nil {
+		return len(value), nil
+	}
+	_, _ = writer.writer.Write(value)
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	writer.lines = append(writer.lines, value...)
+	for {
+		index := strings.IndexAny(string(writer.lines), "\r\n")
+		if index < 0 {
+			if len(writer.lines) > 4096 {
+				writer.lines = writer.lines[len(writer.lines)-4096:]
+			}
+			break
+		}
+		line := strings.TrimSpace(string(writer.lines[:index]))
+		writer.lines = writer.lines[index+1:]
+		if line != "" && aptProgressLine(line) && writer.report != nil {
+			if strings.HasPrefix(line, "Unpacking ") || strings.HasPrefix(line, "Setting up ") {
+				name := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(line, "Unpacking "), "Setting up "))
+				if len(name) != 0 {
+					if writer.packages == nil {
+						writer.packages = make(map[string]struct{})
+					}
+					writer.packages[name[0]] = struct{}{}
+					writer.current = len(writer.packages)
+				}
+			}
+			if writer.total > 0 && writer.current > writer.total {
+				writer.current = writer.total
+			}
+			if len(line) > 512 {
+				line = line[:512]
+			}
+			writer.report(ProgressEvent{Stage: aptProgressStage(writer.profile), State: "update", Profile: string(writer.profile), Current: writer.current, Total: writer.total, Message: line})
+		}
+	}
+	return len(value), nil
+}
+
+func aptProgressLine(line string) bool {
+	for _, prefix := range []string{"Get:", "Fetched ", "Reading package lists", "Building dependency tree", "Reading state information", "Selecting previously", "Preparing to unpack", "Unpacking ", "Setting up ", "Processing triggers", "Progress:"} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func aptProgressStage(profile child.ProfileID) string {
+	switch profile {
+	case child.ProfileAPTDownload:
+		return "apt_download"
+	case child.ProfileAPTSimulate:
+		return "apt_simulation"
+	default:
+		return "apt_dpkg_transaction"
+	}
+}
+
+func wrapProgressWriter(writer io.Writer, report ProgressReporter, profile child.ProfileID, total int) io.Writer {
+	if writer == nil || report == nil {
+		return writer
+	}
+	return &structuredProgressWriter{writer: writer, report: report, profile: profile, total: total, packages: make(map[string]struct{})}
+}
+
 type HostExecutor struct {
 	Auditor  AuditProvider
 	Stager   *ArtifactStager
 	Files    *TransactionFiles
 	Masks    *UnitMasks
 	Launcher ChildLauncher
+	Progress io.Writer
+	Report   ProgressReporter
 }
 
 func (executor *HostExecutor) LockRepositories(ctx context.Context, plan Plan) (func(), error) {
@@ -93,7 +188,7 @@ func (executor *HostExecutor) Resolve(ctx context.Context, plan Plan) ([]Package
 		}
 	}
 	staged := plan.Mode == StagedDebs || plan.Mode == OfflineDebs
-	result, err := executor.Launcher.RunInvocation(ctx, child.ProfileAPTSimulate, packageInvocation(plan, staged), nil)
+	result, err := runChildInvocation(executor.Launcher, ctx, child.ProfileAPTSimulate, packageInvocation(plan, staged), nil, wrapProgressWriter(executor.Progress, executor.Report, child.ProfileAPTSimulate, len(plan.Packages)))
 	if err != nil {
 		return nil, fmt.Errorf("exact package simulation failed: %w", err)
 	}
@@ -166,7 +261,11 @@ func (executor *HostExecutor) Run(ctx context.Context, profile child.ProfileID, 
 	if profile != child.ProfileAPTTransaction && profile != child.ProfileAPTOfflineTransaction {
 		return child.Result{}, fmt.Errorf("package executor rejected a non-package child profile")
 	}
-	return executor.Launcher.RunInvocation(ctx, profile, invocation, nil)
+	total := 0
+	if invocation.Package != nil {
+		total = len(invocation.Package.Packages)
+	}
+	return runChildInvocation(executor.Launcher, ctx, profile, invocation, nil, wrapProgressWriter(executor.Progress, executor.Report, profile, total))
 }
 
 func (executor *HostExecutor) Observe(ctx context.Context, plan Plan) (Postcondition, error) {

@@ -119,11 +119,25 @@ type Monitor interface {
 	Start(context.Context, []string, []string) (context.Context, func() error, error)
 }
 
+type ProgressEvent struct {
+	Stage          string `json:"stage"`
+	State          string `json:"state"`
+	Profile        string `json:"profile,omitempty"`
+	Current        int    `json:"current,omitempty"`
+	Total          int    `json:"total,omitempty"`
+	Message        string `json:"message,omitempty"`
+	Timestamp      string `json:"timestamp,omitempty"`
+	ElapsedSeconds int64  `json:"elapsed_seconds,omitempty"`
+}
+
+type ProgressReporter func(ProgressEvent)
+
 type Engine struct {
 	Journals        JournalStore
 	Executor        Executor
 	Monitor         Monitor
 	MonitorRequired bool
+	Progress        ProgressReporter
 	Now             func() time.Time
 }
 
@@ -195,6 +209,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	if err := engine.Journals.Create(ctx, journal); err != nil {
 		return Journal{}, fmt.Errorf("persist package transaction intent: %w", err)
 	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_transaction", State: "started", Current: 0, Total: len(plan.Packages), Message: "package transaction journal created"})
+	}
 	aptConfig, aptSources, err := RenderAPTConfiguration(plan)
 	if err != nil {
 		return journal, err
@@ -208,8 +225,14 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist prepared package transaction files: %w", err)
 	}
 	journal = next
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_artifacts", State: "started", Total: len(plan.Packages), Message: "staging package artifacts"})
+	}
 	if err := engine.Executor.Stage(ctx, plan); err != nil {
 		return journal, fmt.Errorf("stage exact package artifacts: %w", err)
+	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_artifacts", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "package artifacts staged"})
 	}
 	next = journal
 	next.Phase = JournalArtifactsStaged
@@ -217,15 +240,24 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist staged package artifact authority: %w", err)
 	}
 	journal = next
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_resolution", State: "started", Total: len(plan.Packages), Message: "resolving exact package closure"})
+	}
 	resolved, err := engine.Executor.Resolve(ctx, plan)
 	if err != nil {
 		return journal, fmt.Errorf("simulate exact package closure: %w", err)
+	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_resolution", State: "completed", Current: len(resolved), Total: len(plan.Packages), Message: "package closure resolved"})
 	}
 	if !reflectPackages(resolved, plan.Packages) {
 		return journal, fmt.Errorf("resolved package closure differs from the frozen Plan")
 	}
 
 	units := affectedUnits(plan.Packages)
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_masks", State: "started", Total: len(units), Message: "applying package service masks"})
+	}
 	next = journal
 	next.Phase = JournalMasking
 	if err := engine.Journals.Advance(ctx, journal, next); err != nil {
@@ -258,6 +290,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	})
 	if err != nil {
 		return journal, fmt.Errorf("apply package no-autostart masks: %w", err)
+	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_masks", State: "completed", Current: len(masks.Masks), Total: len(units), Message: "package service masks applied"})
 	}
 	if !slices.Equal(masks.Masks, journal.Masks) {
 		return journal, fmt.Errorf("package mask result differs from the exact persisted identities")
@@ -317,10 +352,16 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, fmt.Errorf("persist package child submission: %w", err)
 	}
 	journal = next
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_install", State: "started", Profile: string(profile), Current: 0, Total: len(plan.Packages), Message: "running APT/dpkg transaction"})
+	}
 	invocation := packageInvocation(plan, staged)
 	result, runErr := engine.Executor.Run(monitoredCtx, profile, invocation)
 	monitorErr := stopMonitor()
 	monitorStopped = true
+	if engine.Progress != nil && runErr == nil && result.ExitCode == 0 && !result.OutputCutOff && monitorErr == nil {
+		engine.Progress(ProgressEvent{Stage: "package_install", State: "completed", Profile: string(profile), Current: len(plan.Packages), Total: len(plan.Packages), Message: "APT/dpkg transaction completed"})
+	}
 	if engine.MonitorRequired && engine.Monitor == nil {
 		monitorErr = fmt.Errorf("qualified package monitor is unavailable")
 	}
@@ -339,6 +380,9 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 		return journal, errors.Join(runErr, monitorErr, fmt.Errorf("package child failed under retained no-start masks"))
 	}
 
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_verification", State: "started", Total: len(plan.Packages), Message: "verifying package postcondition"})
+	}
 	observed, err := engine.Executor.Observe(ctx, plan)
 	if err != nil {
 		return journal, fmt.Errorf("observe package postcondition: %w", err)
@@ -378,6 +422,10 @@ func (engine Engine) Execute(ctx context.Context, plan Plan, preflightResult pre
 	if err := engine.Journals.Advance(ctx, journal, next); err != nil {
 		return journal, fmt.Errorf("persist cleaned package transaction: %w", err)
 	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_verification", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "package postcondition verified"})
+		engine.Progress(ProgressEvent{Stage: "package_transaction", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "package transaction completed"})
+	}
 	return next, nil
 }
 
@@ -412,7 +460,13 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 			return journal, err
 		}
 	}
+	if engine.Progress != nil {
+		engine.Progress(ProgressEvent{Stage: "package_transaction", State: "started", Current: 0, Total: len(plan.Packages), Message: "resuming package transaction"})
+	}
 	if journal.Phase == JournalCleaned {
+		if engine.Progress != nil {
+			engine.Progress(ProgressEvent{Stage: "package_transaction", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "package transaction already completed"})
+		}
 		return journal, nil
 	}
 	if journal.Phase == JournalCommitted {
@@ -426,6 +480,9 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 		next.Phase = JournalCleaned
 		if err := engine.Journals.Advance(context.WithoutCancel(ctx), journal, next); err != nil {
 			return journal, err
+		}
+		if engine.Progress != nil {
+			engine.Progress(ProgressEvent{Stage: "package_transaction", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "resumed package transaction cleanup completed"})
 		}
 		return next, nil
 	}
@@ -591,8 +648,14 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 				return journal, err
 			}
 			staged := plan.Mode != DistroRepository || len(plan.Repositories) != 0
+			if engine.Progress != nil {
+				engine.Progress(ProgressEvent{Stage: "package_install", State: "started", Profile: string(journal.PackageProfile), Current: 0, Total: len(plan.Packages), Message: "running resumed APT/dpkg transaction"})
+			}
 			result, runErr := engine.Executor.Run(monitoredCtx, journal.PackageProfile, packageInvocation(plan, staged))
 			monitorErr := stopMonitor()
+			if engine.Progress != nil && runErr == nil && result.ExitCode == 0 && !result.OutputCutOff && monitorErr == nil {
+				engine.Progress(ProgressEvent{Stage: "package_install", State: "completed", Profile: string(journal.PackageProfile), Current: len(plan.Packages), Total: len(plan.Packages), Message: "resumed APT/dpkg transaction completed"})
+			}
 			next = journal
 			next.Phase = JournalChildTerminal
 			next.ChildResultDigest = childResultDigest(result)
@@ -653,6 +716,9 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 				return journal, err
 			}
 		case JournalCleaned:
+			if engine.Progress != nil {
+				engine.Progress(ProgressEvent{Stage: "package_transaction", State: "completed", Current: len(plan.Packages), Total: len(plan.Packages), Message: "resumed package transaction completed"})
+			}
 			return journal, nil
 		default:
 			return journal, fmt.Errorf("package resume phase is unsupported")

@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+LC_ALL=C
+export LC_ALL
 
 if [ "$#" -ne 2 ]; then
   echo "usage: $0 TAG OUTPUT_DIR" >&2
@@ -8,7 +10,10 @@ fi
 tag=$1
 output=$2
 repo=${GITHUB_REPOSITORY:-simp-lee/lanpanel}
-if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+case "$tag" in
+  *[![:print:]]*) echo "tag must be a single printable line" >&2; exit 2 ;;
+esac
+if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   echo "tag must be a stable semantic release tag such as v0.4.0" >&2
   exit 2
 fi
@@ -25,13 +30,24 @@ fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lanpanel-publish.XXXXXXXX")
 release_created=0
+cleanup_done=0
 cleanup() {
+  status=$?
+  if [ "$cleanup_done" -eq 1 ]; then
+    return
+  fi
+  cleanup_done=1
+  trap - HUP INT TERM
   if [ "$release_created" -eq 1 ]; then
     gh release delete "$tag" --repo "$repo" --yes >/dev/null 2>&1 || true
   fi
-  rm -rf -- "$tmp"
+  rm -rf -- "$tmp" || true
+  exit "$status"
 }
 trap cleanup EXIT
+trap "exit 129" HUP
+trap "exit 130" INT
+trap "exit 143" TERM
 archive_digest=$(sha256sum "$archive" | awk '{print $1}')
 bootstrap_digest=$(sha256sum "$bootstrap" | awk '{print $1}')
 base="https://github.com/$repo/releases/download/$tag"
@@ -43,8 +59,12 @@ embedded_digest=$(sed -n "s/^readonly LANPANEL_RELEASE_SHA256='\([0-9a-f]*\)'$/\
 [ "$embedded_digest" = "$archive_digest" ] || { echo "bootstrap digest does not match the local archive" >&2; exit 1; }
 
 # Keep the release draft until the uploaded asset bytes have been checked.
-gh release create "$tag" --repo "$repo" --draft --generate-notes "$archive" "$bootstrap"
+if ! gh release create "$tag" --repo "$repo" --draft --generate-notes; then
+  echo "GitHub release creation failed; inspect and remove any ambiguous draft before retrying" >&2
+  exit 1
+fi
 release_created=1
+gh release upload "$tag" --repo "$repo" "$archive" "$bootstrap"
 gh release download "$tag" --repo "$repo" --pattern "$archive_name" --dir "$tmp" --clobber
 gh release download "$tag" --repo "$repo" --pattern "lanpanel-bootstrap.sh" --dir "$tmp" --clobber
 [ "$(sha256sum "$tmp/$archive_name" | awk '{print $1}')" = "$archive_digest" ] || { echo "GitHub asset differs from local archive" >&2; exit 1; }

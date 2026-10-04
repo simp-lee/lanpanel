@@ -54,6 +54,10 @@ func OpenFixedService() (*Service, error) {
 }
 
 func openFixedService(requireNoPending bool) (*Service, error) {
+	return openFixedServiceWithProgress(requireNoPending, nil)
+}
+
+func openFixedServiceWithProgress(requireNoPending bool, progress io.Writer) (*Service, error) {
 	owner := filetxn.Owner{UID: 0, GID: 0}
 	files, err := filetxn.Open(filetxn.Config{
 		RootPath: FixedPackageRoot, Root: filetxn.Metadata{Owner: owner, Mode: 0o700},
@@ -87,10 +91,26 @@ func openFixedService(requireNoPending bool) (*Service, error) {
 	if err != nil {
 		return fail(err)
 	}
-	stager := &ArtifactStager{Files: transactionFiles, Launcher: launcher}
-	executor := &HostExecutor{Auditor: auditor, Stager: stager, Files: transactionFiles, Masks: masks, Launcher: launcher}
+	var reporter ProgressReporter
+	if progress != nil {
+		if eventWriter, ok := progress.(interface{ ReportProgress(ProgressEvent) }); ok {
+			reporter = eventWriter.ReportProgress
+		} else {
+			progressStarted := time.Now()
+			reporter = func(event ProgressEvent) {
+				event.Timestamp = time.Now().UTC().Format(time.RFC3339)
+				event.ElapsedSeconds = int64(time.Since(progressStarted) / time.Second)
+				data, err := json.Marshal(event)
+				if err == nil {
+					_, _ = fmt.Fprintf(progress, "LanPanel progress: %s\n", data)
+				}
+			}
+		}
+	}
+	stager := &ArtifactStager{Files: transactionFiles, Launcher: launcher, Progress: progress, Report: reporter}
+	executor := &HostExecutor{Auditor: auditor, Stager: stager, Files: transactionFiles, Masks: masks, Launcher: launcher, Progress: progress, Report: reporter}
 	service := &Service{files: files, journal: journals, auditor: auditor, owner: owner, planRoot: FixedPackagePlanRoot, transactions: transactionFiles}
-	service.engine = Engine{Journals: journals, Executor: executor, Monitor: NewLinuxMonitor(), MonitorRequired: false, Now: func() time.Time { return time.Now().UTC() }}
+	service.engine = Engine{Journals: journals, Executor: executor, Monitor: NewLinuxMonitor(), MonitorRequired: false, Progress: reporter, Now: func() time.Time { return time.Now().UTC() }}
 	pending, err := journals.Pending(context.Background())
 	if err != nil {
 		return fail(fmt.Errorf("audit package recovery journals: %w", err))
@@ -105,10 +125,14 @@ func openFixedService(requireNoPending bool) (*Service, error) {
 // reuses the same typed transaction engine and resumes only an exact matching
 // package journal; it does not expose a runtime helper operation.
 func ExecuteFixedInstallerTransaction(ctx context.Context, plan Plan, result preflight.Result) (Journal, error) {
+	return ExecuteFixedInstallerTransactionWithProgress(ctx, plan, result, nil)
+}
+
+func ExecuteFixedInstallerTransactionWithProgress(ctx context.Context, plan Plan, result preflight.Result, progress io.Writer) (Journal, error) {
 	if err := prepareFixedInstallerLayout(); err != nil {
 		return Journal{}, err
 	}
-	service, err := openFixedService(false)
+	service, err := openFixedServiceWithProgress(false, progress)
 	if err != nil {
 		return Journal{}, err
 	}

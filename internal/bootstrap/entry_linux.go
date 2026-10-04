@@ -150,7 +150,11 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	if !present || release.DigestBytes(headscaleBytes) != identityValue.Headscale.Archive.Digest || uint64(len(headscaleBytes)) != identityValue.Headscale.Archive.Bytes {
 		return fmt.Errorf("selected Headscale archive is missing or mismatched")
 	}
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: packages.ExecuteFixedInstallerTransaction, APTMetadataPrepared: aptMetadataPrepared, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
+	progress := newInstallerProgressOutput(stdout)
+	defer func() { _ = progress.Close() }()
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: func(ctx context.Context, plan packages.Plan, result preflight.Result) (packages.Journal, error) {
+		return packages.ExecuteFixedInstallerTransactionWithProgress(ctx, plan, result, progress)
+	}, APTMetadataPrepared: aptMetadataPrepared, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
 
 func rebindPublicInstallerInput(data []byte, plan packages.Plan, result preflight.Result) ([]byte, error) {

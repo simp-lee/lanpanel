@@ -35,6 +35,29 @@ const (
 
 var errOutputLimit = errors.New("external child output limit reached")
 
+type boundedProgressWriter struct {
+	mu        sync.Mutex
+	writer    io.Writer
+	remaining int
+}
+
+func (writer *boundedProgressWriter) Write(value []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.remaining <= 0 {
+		return len(value), nil
+	}
+	limit := len(value)
+	if limit > writer.remaining {
+		limit = writer.remaining
+	}
+	if _, err := writer.writer.Write(value[:limit]); err != nil {
+		return len(value), nil
+	}
+	writer.remaining -= limit
+	return len(value), nil
+}
+
 type Launcher struct {
 	self       string
 	identities Identities
@@ -69,6 +92,12 @@ func (launcher *Launcher) Run(ctx context.Context, profileID ProfileID, input []
 }
 
 func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID, invocation Invocation, input []byte) (Result, error) {
+	return launcher.RunInvocationWithOutput(ctx, profileID, invocation, input, nil)
+}
+
+// RunInvocationWithOutput preserves the bounded audit capture while optionally
+// streaming a second, equally bounded copy for interactive installation progress.
+func (launcher *Launcher) RunInvocationWithOutput(ctx context.Context, profileID ProfileID, invocation Invocation, input []byte, progress io.Writer) (Result, error) {
 	if launcher == nil || os.Geteuid() != 0 {
 		return Result{}, fmt.Errorf("external child launch requires the root helper")
 	}
@@ -124,6 +153,11 @@ func (launcher *Launcher) RunInvocation(ctx context.Context, profileID ProfileID
 	stdout := newDigestWriter(profile.MaximumOutputBytes, profileID == ProfileAPTSimulate || profileID == ProfileResourceShow || profileID == ProfileGoAccessShow || profileID == ProfileHeadscaleAdmin || profileID == ProfileTailscaleAdmin)
 	stderr := newDigestWriter(profile.MaximumOutputBytes)
 	command.Stdout, command.Stderr = stdout, stderr
+	if progress != nil {
+		progressWriter := &boundedProgressWriter{writer: progress, remaining: profile.MaximumOutputBytes}
+		command.Stdout = io.MultiWriter(stdout, progressWriter)
+		command.Stderr = io.MultiWriter(stderr, progressWriter)
+	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
