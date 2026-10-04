@@ -172,6 +172,24 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 		packagePlan = *packagePlanOverride
 		packagePreflight = *packagePreflightOverride
 	}
+	if packagePlanOverride == nil && len(packageTemplate.Packages) != 0 {
+		// The bootstrap preflight reads apt-cache's candidate for Nginx. Refresh
+		// and validate the signed indexes first; otherwise a fresh host with an
+		// empty or stale APT cache is rejected before the advertised refresh can
+		// make the candidate visible.
+		if err := packages.ValidateHostAPTConfiguration(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, fmt.Errorf("APT configuration preflight failed: %w", err)
+		}
+		if err := refreshAPTMetadata(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, err
+		}
+		if err := packages.ValidateHostAPTMetadata(context.Background()); err != nil {
+			material.Destroy()
+			return nil, identity.Material{}, fmt.Errorf("APT metadata preflight failed: %w", err)
+		}
+	}
 	if packagePlanOverride == nil {
 		preflightEvaluator := newInstallerPreflightEvaluator(identityValue)
 		packagePreflightRequest, evaluatedPreflight, err := preflightEvaluator(context.Background(), material.Authority, material.SafetyGeneration)
@@ -189,20 +207,6 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 	if err := validatePublicPackagePlan(packagePlan); err != nil {
 		material.Destroy()
 		return nil, identity.Material{}, err
-	}
-	if packagePlanOverride == nil && len(packagePlan.Packages) != 0 {
-		if err := packages.ValidateHostAPTConfiguration(context.Background()); err != nil {
-			material.Destroy()
-			return nil, identity.Material{}, fmt.Errorf("APT configuration preflight failed: %w", err)
-		}
-		if err := refreshAPTMetadata(context.Background()); err != nil {
-			material.Destroy()
-			return nil, identity.Material{}, err
-		}
-		if err := packages.ValidateHostAPTMetadata(context.Background()); err != nil {
-			material.Destroy()
-			return nil, identity.Material{}, fmt.Errorf("APT metadata preflight failed: %w", err)
-		}
 	}
 	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
 	data, err := json.Marshal(input)
