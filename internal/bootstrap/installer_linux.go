@@ -160,6 +160,12 @@ func install(ctx context.Context, request Request, strict bool) error {
 			refreshPreflight = !pending
 		}
 		if refreshPreflight {
+			if strict && paths == FixedPaths() && !request.PackagePlan.ExternalNginx && slices.ContainsFunc(request.PackagePlan.Packages, func(pkg packages.Package) bool { return pkg.Name == "nginx" }) {
+				request.PackagePlan, err = prepareFreshNginxPackagePlan(ctx, releaseIdentity, request)
+				if err != nil {
+					return err
+				}
+			}
 			preflightRequest, preflightResult, preflightErr := request.Preflight(ctx, journal.Authority, journal.SafetyGeneration)
 			if preflightErr != nil {
 				return preflightErr
@@ -184,8 +190,8 @@ func install(ctx context.Context, request Request, strict bool) error {
 				if err != nil {
 					return err
 				}
-				inputPackagePlanDigest = packagePlanDigest
 			}
+			inputPackagePlanDigest = packagePlanDigest
 			preflightDigest, digestErr := preflight.ExpansionRequestDigest(preflightRequest)
 			if digestErr != nil {
 				return digestErr
@@ -277,8 +283,8 @@ func install(ctx context.Context, request Request, strict bool) error {
 		if err != nil {
 			return err
 		}
-		inputPackagePlanDigest = packagePlanDigest
 	}
+	inputPackagePlanDigest = packagePlanDigest
 	preflightDigest, _ := preflight.ExpansionRequestDigest(preflightRequest)
 	plannedPaths, err := plannedBootstrapPathsForPlan(paths, request.PackagePlan)
 	if err != nil {
@@ -1089,6 +1095,7 @@ func prepareFreshNginxPackagePlan(ctx context.Context, authority release.Install
 		if err := rejectForeignNginxAuthority(); err != nil {
 			return packages.Plan{}, err
 		}
+		plan.FirstNginxInstall = true
 		return plan, nil
 	}
 	if err := validateExistingNginxVersion(authority, installed); err != nil {
