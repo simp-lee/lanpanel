@@ -54,6 +54,7 @@ archive="\$tmp/archive.tar.gz"
 cat > "\$archive"
 printf "%s  %s\\n" "${digest}" "\$archive" | sha256sum --check --status
 mkdir "\$tmp/release"
+chmod 700 "\$tmp/release"
 tar --extract --file "\$archive" --directory "\$tmp/release" --no-same-owner --no-same-permissions
 [ -f "\$tmp/release/lanpanel" ] && [ -x "\$tmp/release/lanpanel" ]
 "\$tmp/release/lanpanel" install
