@@ -97,7 +97,7 @@ func ValidateHostAPTConfiguration(ctx context.Context) error {
 	}
 	for _, file := range configuration {
 		if file.Kind == APTConfig && forbiddenAPTMetadataRefreshConfiguration(file.Bytes) {
-			return fmt.Errorf("APT configuration redirects metadata paths; automatic metadata refresh is unsafe")
+			return fmt.Errorf("APT configuration file %s redirects metadata paths; automatic metadata refresh is unsafe", file.Path)
 		}
 	}
 	return nil

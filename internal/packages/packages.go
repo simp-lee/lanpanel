@@ -588,19 +588,34 @@ func validConfigPath(kind ConfigKind, value string) bool {
 
 func forbiddenAPTMetadataRefreshConfiguration(data []byte) bool {
 	lower := strings.ToLower(string(data))
-	for _, directive := range []string{"#include", "#clear", "#if", "rootdir", "proxy-auto-detect", "dir::etc::", "dir::state::", "dir::cache::"} {
+	for _, directive := range []string{"#include", "#clear", "#if", "rootdir", "proxy-auto-detect"} {
 		if strings.Contains(lower, directive) {
 			return true
 		}
 	}
 	words := aptConfigurationWords(data)
 	for index, word := range words {
-		if word == "dir" {
-			// Debian's stock 00CDMountPoint sets Dir::Media::MountPath;
-			// it does not redirect APT state, cache, or source metadata.
-			if index+2 >= len(words) || words[index+1] != "media" || words[index+2] != "mountpath" {
+		if word != "dir" {
+			continue
+		}
+		if index+2 >= len(words) {
+			return true
+		}
+		// These are the only standard Dir namespaces that do not affect
+		// repository metadata: Debian's CD mount path and apt-listchanges'
+		// own configuration paths. Dir::Etc/State/Cache redirects remain
+		// blocked because the refresh and auditor use fixed paths.
+		switch words[index+1] {
+		case "media":
+			if words[index+2] != "mountpath" {
 				return true
 			}
+		case "etc":
+			if words[index+2] != "apt-listchanges-main" && words[index+2] != "apt-listchanges-parts" {
+				return true
+			}
+		default:
+			return true
 		}
 	}
 	for index := 0; index+2 < len(words); index++ {

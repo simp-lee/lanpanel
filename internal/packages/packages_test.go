@@ -228,9 +228,9 @@ func TestAPTMetadataRefreshRejectsConfigurationRedirects(t *testing.T) {
 	if forbiddenAPTMetadataRefreshConfiguration([]byte(`Dir::Etc::sourceparts "-";`)) == false {
 		t.Fatal("APT metadata refresh accepted a sourceparts redirect")
 	}
-	for _, value := range []string{`Dir::Media::MountPath "/media/cdrom";`, `Dir { Media { MountPath "/media/cdrom"; }; };`} {
+	for _, value := range []string{`Dir::Media::MountPath "/media/cdrom";`, `Dir { Media { MountPath "/media/cdrom"; }; };`, `Dir::Etc::apt-listchanges-main "listchanges.conf";`, `Dir::Etc::apt-listchanges-parts "listchanges.conf.d";`} {
 		if forbiddenAPTMetadataRefreshConfiguration([]byte(value)) {
-			t.Fatalf("APT metadata refresh rejected harmless media configuration %q", value)
+			t.Fatalf("APT metadata refresh rejected harmless standard configuration %q", value)
 		}
 	}
 }
