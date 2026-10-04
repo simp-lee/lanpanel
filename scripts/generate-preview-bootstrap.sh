@@ -58,7 +58,7 @@ run_privileged() {
 }
 run_privileged < "\$archive" '
 set -eu
-tmp="\$(mktemp -d /root/.lanpanel-release.XXXXXXXX)"
+tmp="\$(mktemp -d /run/lanpanel-release.XXXXXXXX)"
 cleanup() { rm -rf -- "\$tmp"; }
 trap cleanup EXIT HUP INT TERM
 archive="\$tmp/archive.tar.gz"
