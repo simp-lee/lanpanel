@@ -594,9 +594,13 @@ func forbiddenAPTMetadataRefreshConfiguration(data []byte) bool {
 		}
 	}
 	words := aptConfigurationWords(data)
-	for _, word := range words {
+	for index, word := range words {
 		if word == "dir" {
-			return true
+			// Debian's stock 00CDMountPoint sets Dir::Media::MountPath;
+			// it does not redirect APT state, cache, or source metadata.
+			if index+2 >= len(words) || words[index+1] != "media" || words[index+2] != "mountpath" {
+				return true
+			}
 		}
 	}
 	for index := 0; index+2 < len(words); index++ {

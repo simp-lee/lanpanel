@@ -220,13 +220,18 @@ func TestAPTConfigurationAcceptsDistroSharedKeyringPath(t *testing.T) {
 }
 
 func TestAPTMetadataRefreshRejectsConfigurationRedirects(t *testing.T) {
-	for _, value := range []string{`Dir::Etc::sourcelist "/tmp/sources.list";`, `Dir::State::lists "/tmp/lists";`, `Dir::Cache::archives "/tmp/archives";`, `Dir { Etc { sourcelist "/tmp/sources.list"; }; };`, `APT { Update { Post-Invoke { "/tmp/hook"; }; }; };`, `Acquire::http::Proxy-Auto-Detect "/tmp/helper";`} {
+	for _, value := range []string{`Dir::Etc::sourcelist "/tmp/sources.list";`, `Dir::State::lists "/tmp/lists";`, `Dir::Cache::archives "/tmp/archives";`, `Dir::Media::Other "/tmp/other";`, `Dir { Etc { sourcelist "/tmp/sources.list"; }; };`, `APT { Update { Post-Invoke { "/tmp/hook"; }; }; };`, `Acquire::http::Proxy-Auto-Detect "/tmp/helper";`} {
 		if !forbiddenAPTMetadataRefreshConfiguration([]byte(value)) {
 			t.Fatalf("APT metadata refresh accepted configuration redirect %q", value)
 		}
 	}
 	if forbiddenAPTMetadataRefreshConfiguration([]byte(`Dir::Etc::sourceparts "-";`)) == false {
 		t.Fatal("APT metadata refresh accepted a sourceparts redirect")
+	}
+	for _, value := range []string{`Dir::Media::MountPath "/media/cdrom";`, `Dir { Media { MountPath "/media/cdrom"; }; };`} {
+		if forbiddenAPTMetadataRefreshConfiguration([]byte(value)) {
+			t.Fatalf("APT metadata refresh rejected harmless media configuration %q", value)
+		}
 	}
 }
 
