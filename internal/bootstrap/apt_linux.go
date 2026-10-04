@@ -76,7 +76,7 @@ func refreshAPTMetadataWithOutput(parent context.Context, update aptMetadataUpda
 	if update == nil {
 		return fmt.Errorf("APT metadata refresh command is missing")
 	}
-	fmt.Fprintln(stderr, "LanPanel: refreshing signed APT repository metadata...")
+	_, _ = fmt.Fprintln(stderr, "LanPanel: refreshing signed APT repository metadata...")
 	ctx, cancel := context.WithTimeout(parent, aptMetadataRefreshTimeout)
 	defer cancel()
 	var output aptRefreshOutput
