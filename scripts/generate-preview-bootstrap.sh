@@ -70,4 +70,5 @@ tar --extract --file "\$archive" --directory "\$tmp/release" --no-same-owner --n
 [ -f "\$tmp/release/lanpanel" ] && [ -x "\$tmp/release/lanpanel" ]
 "\$tmp/release/lanpanel" install
 '
+printf '%s\n' 'LanPanel installation completed successfully.'
 EOF
