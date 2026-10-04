@@ -192,8 +192,11 @@ func readInstallerAssets(paths map[string]string) (map[string][]byte, error) {
 		}
 		for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
 			var stat unix.Stat_t
-			if unix.Lstat(parent, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
-				return nil, fmt.Errorf("installer asset parent is unsafe")
+			if err := unix.Lstat(parent, &stat); err != nil {
+				return nil, fmt.Errorf("installer asset parent %q is unavailable: %w", parent, err)
+			}
+			if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
+				return nil, fmt.Errorf("installer asset parent %q is unsafe", parent)
 			}
 			if parent == "/" {
 				break
