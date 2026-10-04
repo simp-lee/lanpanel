@@ -43,7 +43,7 @@ embedded_digest=$(sed -n "s/^readonly LANPANEL_RELEASE_SHA256='\([0-9a-f]*\)'$/\
 [ "$embedded_digest" = "$archive_digest" ] || { echo "bootstrap digest does not match the local archive" >&2; exit 1; }
 
 # Keep the release draft until the uploaded asset bytes have been checked.
-gh release create "$tag" --repo "$repo" --draft --title "LanPanel $tag" --notes "LanPanel $tag" "$archive" "$bootstrap"
+gh release create "$tag" --repo "$repo" --draft --generate-notes "$archive" "$bootstrap"
 release_created=1
 gh release download "$tag" --repo "$repo" --pattern "$archive_name" --dir "$tmp" --clobber
 gh release download "$tag" --repo "$repo" --pattern "lanpanel-bootstrap.sh" --dir "$tmp" --clobber
