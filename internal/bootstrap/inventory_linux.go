@@ -109,6 +109,9 @@ func verifyResumeInventory(journal Journal) error {
 }
 
 func resumeInventoryPathAllowed(journal Journal, path string) bool {
+	if journal.Phase != PhasePrepared && path == filepath.Join(journal.Paths.PackageRoot, "journals", journal.PackageTransactionID+".json") {
+		return true
+	}
 	nginxPaths := nginx.FixedPaths()
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)

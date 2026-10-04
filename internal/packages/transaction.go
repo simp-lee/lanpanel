@@ -491,7 +491,7 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 		now = engine.Now
 	}
 	observedNow := now().UTC()
-	terminalRecovery := journal.Phase == JournalChildSubmitted || journal.Phase == JournalChildTerminal && journal.ChildSucceeded || journal.Phase == JournalVerified
+	terminalRecovery := journal.Phase == JournalChildSubmitted || journal.Phase == JournalChildTerminal && (journal.ChildSucceeded || journal.ErrorCode == "unit_or_listener_bypass") || journal.Phase == JournalVerified
 	cancel := func() {}
 	if !terminalRecovery {
 		if err := preflight.RequireExpansionResult(preflightResult, []preflight.ExpansionScope{preflight.ExpansionBootstrap, preflight.ExpansionHeadscale}, "installation", plan.IntentGeneration, observedNow); err != nil {
@@ -512,7 +512,7 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 	case JournalPrepared, JournalFilesPrepared, JournalArtifactsStaged, JournalMasking, JournalMasksApplied:
 		unlockRepositories, err = engine.Executor.LockRepositories(ctx, plan)
 	case JournalChildTerminal:
-		if journal.ChildSucceeded {
+		if journal.ChildSucceeded || journal.ErrorCode == "unit_or_listener_bypass" {
 			unlockRepositories, err = engine.Executor.LockRepositories(ctx, plan)
 		}
 	}
@@ -676,7 +676,12 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 			return journal, fmt.Errorf("submitted package child terminal result is unknown and remains fenced")
 		case JournalChildTerminal:
 			if !journal.ChildSucceeded {
-				return journal, fmt.Errorf("failed package child remains fenced and is not retryable as success")
+				if journal.ErrorCode != "unit_or_listener_bypass" {
+					return journal, fmt.Errorf("failed package child remains fenced and is not retryable as success")
+				}
+				if err := engine.Executor.VerifyMasks(ctx, journal.Masks); err != nil {
+					return journal, err
+				}
 			}
 			observed, err := engine.Executor.Observe(ctx, plan)
 			if err != nil {
@@ -692,6 +697,7 @@ func (engine Engine) Resume(ctx context.Context, plan Plan, preflightResult pref
 			}
 			next := journal
 			next.Phase = JournalVerified
+			next.ChildSucceeded = true
 			next.PostconditionDigest = postDigest
 			next.ErrorCode = ""
 			if err := advance(next); err != nil {

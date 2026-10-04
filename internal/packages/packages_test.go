@@ -1032,6 +1032,25 @@ func TestPackageTransactionPreservesPartialJournalAndMasksOnBypass(t *testing.T)
 	}
 }
 
+func TestPackageResumeReconcilesExactPostconditionAfterMonitorCancellation(t *testing.T) {
+	plan := testPlan(t, DistroRepository)
+	executor := newFakeExecutor(plan)
+	journals := &memoryJournals{}
+	monitor := &fakeMonitor{terminal: errors.New("unit inventory changed")}
+	engine, result := testEngine(journals, executor, monitor)
+	journal, err := engine.Execute(context.Background(), plan, result)
+	if err == nil || journal.ErrorCode != "unit_or_listener_bypass" {
+		t.Fatalf("initial monitor failure journal=%#v err=%v", journal, err)
+	}
+	resumed, err := engine.Resume(context.Background(), plan, result, journal)
+	if err != nil || resumed.Phase != JournalCleaned || !resumed.ChildSucceeded || len(executor.unmasked) == 0 {
+		t.Fatalf("exact monitor recovery failed: journal=%#v unmasked=%v err=%v", resumed, executor.unmasked, err)
+	}
+	if executor.runCount != 1 {
+		t.Fatalf("monitor recovery reran the package child: runs=%d", executor.runCount)
+	}
+}
+
 func testEngine(journals JournalStore, executor Executor, monitor Monitor) (Engine, preflight.Result) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	result := preflight.Result{SchemaVersion: preflight.SchemaVersion, Scope: string(preflight.ExpansionBootstrap), Target: "installation", Generation: 1, RequestDigest: "sha256:" + strings.Repeat("6", 64), Allowed: true, ObservedAt: now, ValidUntil: now.Add(preflight.MaximumAge), Findings: []preflight.Finding{{Code: "ready", Disposition: preflight.FindingPassed, Summary: "shared expansion preflight passed", Identity: "fixture"}}}
