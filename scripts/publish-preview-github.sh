@@ -61,4 +61,4 @@ public_digest=$(sed -n "s/^readonly LANPANEL_RELEASE_SHA256='\([0-9a-f]*\)'$/\1/
 [ "$public_url" = "$expected_archive_url" ] && [ "$public_digest" = "$archive_digest" ] || { echo "public bootstrap is not bound to the published archive" >&2; exit 1; }
 release_created=0
 printf 'published and verified: %s/%s\n' "$repo" "$tag"
-printf 'install: curl -fL %s -o /tmp/lanpanel-bootstrap.sh && chmod +x /tmp/lanpanel-bootstrap.sh && sudo /tmp/lanpanel-bootstrap.sh install\n' "$bootstrap_url"
+printf 'install: curl -fL %s | sh\n' "$bootstrap_url"

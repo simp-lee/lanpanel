@@ -57,13 +57,10 @@ sudo ./lanpanel install
 也可以使用官方发布页提供的版本固定 Bootstrap。把 `<tag>` 换成固定版本标签，例如 `v0.4.0`，不要使用 `latest`：
 
 ```sh
-curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
-  -o /tmp/lanpanel-bootstrap.sh &&
-chmod +x /tmp/lanpanel-bootstrap.sh &&
-sudo /tmp/lanpanel-bootstrap.sh install
+curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh | sh
 ```
 
-Bootstrap 会在受保护的临时目录中验证发布包 SHA-256，然后调用同一个 `install` 流程；不会把下载内容直接交给 Shell，也没有第三方下载源回退。系统软件包使用主机自己的、启用签名校验的 APT 镜像，请不要关闭仓库签名检查或使用 `--allow-unauthenticated`。
+Bootstrap 会在受保护的临时目录中下载并验证发布包 SHA-256，然后根据当前 UID 选择直接以 root 执行或使用 `sudo`，再调用同一个 `install` 流程；没有第三方下载源回退。系统软件包使用主机自己的、启用签名校验的 APT 镜像，请不要关闭仓库签名检查或使用 `--allow-unauthenticated`。
 
 ### Nginx 软件包所有权与内置 GoAccess
 

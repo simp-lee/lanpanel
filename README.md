@@ -57,13 +57,10 @@ This is the only public installation entry point. Do not provide a bundle path, 
 You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with a fixed release tag such as `v0.4.0`; do not use `latest`:
 
 ```sh
-curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh \
-  -o /tmp/lanpanel-bootstrap.sh &&
-chmod +x /tmp/lanpanel-bootstrap.sh &&
-sudo /tmp/lanpanel-bootstrap.sh install
+curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh | sh
 ```
 
-Bootstrap verifies the release archive's SHA-256 in a protected temporary directory and then invokes the same `install` flow. It does not pipe downloaded content to a shell and has no third-party download fallback. System packages still come from the host's own APT mirror with signature verification enabled; do not disable repository signature checks or use `--allow-unauthenticated`.
+Bootstrap downloads and verifies the release archive's SHA-256 in a protected temporary directory, then chooses direct root execution or `sudo` based on the current UID before invoking the same `install` flow. It has no third-party download fallback. System packages still come from the host's own APT mirror with signature verification enabled; do not disable repository signature checks or use `--allow-unauthenticated`.
 
 ### Nginx package ownership and bundled GoAccess
 

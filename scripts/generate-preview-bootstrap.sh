@@ -44,8 +44,19 @@ fi
 printf '%s  %s\\n' "\$LANPANEL_RELEASE_SHA256" "\$archive" | sha256sum --check --status
 # Stream the already downloaded archive into a root-owned temporary directory.
 # The privileged side verifies the stream before extraction, preventing a
-# user-writable extracted binary from crossing the sudo boundary.
-cat "\$archive" | sudo sh -c '
+# user-writable extracted binary from crossing the privilege boundary.
+if [ "\$(id -u)" -ne 0 ]; then
+  command -v sudo >/dev/null 2>&1 || { echo 'bootstrap requires root or sudo' >&2; exit 1; }
+  sudo -v
+fi
+run_privileged() {
+  if [ "\$(id -u)" -eq 0 ]; then
+    sh -c "\$1"
+  else
+    sudo sh -c "\$1"
+  fi
+}
+run_privileged < "\$archive" '
 set -eu
 tmp="\$(mktemp -d /root/.lanpanel-release.XXXXXXXX)"
 cleanup() { rm -rf -- "\$tmp"; }
