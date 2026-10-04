@@ -40,29 +40,26 @@ func runPublicInstaller(args []string, stdout io.Writer) error {
 		return err
 	}
 	if resuming {
-		data, journalPhase, err := readPublicInstallerInputFromJournal()
+		storedData, journalPhase, err := readPublicInstallerInputFromJournal()
 		if err != nil {
 			return err
 		}
-		if err := validatePublicInstallerResume(journalPhase, data); err != nil {
+		if err := validatePublicInstallerResume(journalPhase, storedData); err != nil {
 			return err
 		}
-		if journalPhase == PhaseActivated {
-			bundleDir, err := currentArtifactDirectory()
-			if err != nil {
-				return err
-			}
-			material, packagePlan, packagePreflight, err := readPublicInstallerReplayAuthority()
-			if err != nil {
-				return err
-			}
-			data, material, err := buildPublicInstallerInputWithMaterial(bundleDir, material, &packagePlan, &packagePreflight)
-			if err != nil {
-				return err
-			}
-			defer material.Destroy()
-			return runInstallerAuthority(data, stdout)
+		bundleDir, err := currentArtifactDirectory()
+		if err != nil {
+			return err
 		}
+		material, packagePlan, packagePreflight, err := readPublicInstallerResumeAuthority()
+		if err != nil {
+			return err
+		}
+		data, material, err := buildPublicInstallerInputWithMaterial(bundleDir, material, &packagePlan, &packagePreflight)
+		if err != nil {
+			return err
+		}
+		defer material.Destroy()
 		return runInstallerAuthority(data, stdout)
 	}
 	bundleDir, err := currentArtifactDirectory()
@@ -321,16 +318,13 @@ func validatePublicInstallerResume(phase Phase, data []byte) error {
 	return nil
 }
 
-func readPublicInstallerReplayAuthority() (identity.Material, packages.Plan, preflight.Result, error) {
+func readPublicInstallerResumeAuthority() (identity.Material, packages.Plan, preflight.Result, error) {
 	store, journal, err := openJournal(FixedPaths().Journal, 0, 0)
 	if err != nil {
 		return identity.Material{}, packages.Plan{}, preflight.Result{}, err
 	}
 	if closeErr := store.close(); closeErr != nil {
 		return identity.Material{}, packages.Plan{}, preflight.Result{}, closeErr
-	}
-	if journal.Phase != PhaseActivated {
-		return identity.Material{}, packages.Plan{}, preflight.Result{}, fmt.Errorf("public installer replay journal is not activated")
 	}
 	return identity.Material{AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, SafetyGeneration: journal.SafetyGeneration, Authority: journal.Authority}, journal.PackagePlan, journal.PackagePreflight, nil
 }
