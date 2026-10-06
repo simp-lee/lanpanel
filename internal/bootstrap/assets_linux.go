@@ -212,7 +212,7 @@ func finalizeStartupAuthorityFile(path string, expected StartupAuthority, uid, g
 }
 
 func verifyStartupAuthorityFile(path string, expected StartupAuthority, uid, gid uint32) error {
-	if expected.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(expected.AttemptID) || !identity.ValidateInstallationID(expected.InstallationID) || !identity.ValidateGenerationID(expected.GenerationID) || identity.ValidateManagementAuthority(expected.Management) != nil || !release.ValidDigest(expected.CommitDigest) {
+	if expected.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(expected.AttemptID) || !identity.ValidateInstallationID(expected.InstallationID) || !identity.ValidateGenerationID(expected.GenerationID) || identity.ValidateManagementAuthority(expected.Management) != nil || validateSSHAccess(expected.SSHAccess) != nil || !release.ValidDigest(expected.CommitDigest) {
 		return fmt.Errorf("expected startup authority binding is invalid")
 	}
 	data, err := encodeCanonical(expected)

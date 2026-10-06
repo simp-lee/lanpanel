@@ -61,18 +61,21 @@ func operationRegistry() (*operations.Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.HeadscaleDeploy, Owner: "application.headscale-control", Results: table}, {Operation: operations.PreauthKeyCreate, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.PreauthKeyRevoke, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.DeviceExpire, Owner: "application.headscale-device", Results: table}, {Operation: operations.ConnectorLogin, Owner: "application.connector-login", Results: table}, {Operation: operations.ResourceDelete, Owner: "application.resource-delete", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.CertificateExpiry, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.AutomaticReconciliation, Owner: "application.reconciliation", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}, {Operation: operations.GoAccessRetirement, Owner: "application.goaccess", Results: table}})
+	return operations.NewRegistry([]operations.Registration{{Operation: operations.AdminTokenRotate, Owner: "application.admin-token", Results: table}, {Operation: operations.HeadscaleDeploy, Owner: "application.headscale-control", Results: table}, {Operation: operations.PreauthKeyCreate, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.PreauthKeyRevoke, Owner: "application.headscale-preauth", Results: table}, {Operation: operations.DeviceExpire, Owner: "application.headscale-device", Results: table}, {Operation: operations.ConnectorLogin, Owner: "application.connector-login", Results: table}, {Operation: operations.ResourceDelete, Owner: "application.resource-delete", Results: table}, {Operation: operations.Publish, Owner: "application.publication", Results: table}, {Operation: operations.CertificateRenew, Owner: "application.certificate", Results: table}, {Operation: operations.CertificateExpiry, Owner: "application.certificate", Results: table}, {Operation: operations.ManagedBasicCreate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicRotate, Owner: "application.basic", Results: table}, {Operation: operations.ManagedBasicDelete, Owner: "application.basic", Results: table}, {Operation: operations.StaticRootRegister, Owner: "application.static", Results: table}, {Operation: operations.ExternalHTPasswdRegister, Owner: "application.external-htpasswd", Results: table}, {Operation: operations.ManagementHTTPSConfigure, Owner: "application.management-https", Results: table}, {Operation: operations.CloseAll, Owner: "application.contraction", Results: table}, {Operation: operations.Unpublish, Owner: "application.contraction", Results: table}, {Operation: operations.AutomaticReconciliation, Owner: "application.reconciliation", Results: table}, {Operation: operations.StartupContraction, Owner: "application.contraction", Results: table}, {Operation: operations.GoAccessRetirement, Owner: "application.goaccess", Results: table}})
 }
 
 type FixedService struct {
-	normal    *persist.Store
-	manager   *locks.Manager
-	safety    *safety.Store
-	emergency *safety.EmergencyStore
-	ownership *ownership.Store
-	plans     *plans.Store
-	closeOnce sync.Once
-	closeErr  error
+	root       string
+	owner      filetxn.Owner
+	management *managementHTTPSRuntime
+	normal     *persist.Store
+	manager    *locks.Manager
+	safety     *safety.Store
+	emergency  *safety.EmergencyStore
+	ownership  *ownership.Store
+	plans      *plans.Store
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func OpenFixed() (*FixedService, error) {
@@ -116,7 +119,7 @@ func OpenFixed() (*FixedService, error) {
 		_ = normal.Close()
 		return fail(err)
 	}
-	return &FixedService{normal: normal, manager: manager, safety: safetyStore, emergency: emergency, ownership: ownershipStore, plans: planStore}, nil
+	return &FixedService{root: fixedRoot, owner: owner, normal: normal, manager: manager, safety: safetyStore, emergency: emergency, ownership: ownershipStore, plans: planStore}, nil
 }
 
 func (s *FixedService) Close() error {

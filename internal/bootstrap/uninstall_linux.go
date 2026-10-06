@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	osuser "os/user"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -366,8 +367,8 @@ func bindCurrentAuthorityArtifacts(paths Paths, journal Journal, commitBytes []b
 	if err != nil {
 		return err
 	}
-	expectedStartup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: release.DigestBytes(commitBytes)}
-	if startup != expectedStartup {
+	expectedStartup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, SSHAccess: journal.SSHAccess, CommitDigest: release.DigestBytes(commitBytes)}
+	if !reflect.DeepEqual(startup, expectedStartup) {
 		return fmt.Errorf("uninstall startup authority differs from committed identity")
 	}
 	if inventory.Artifacts == nil {

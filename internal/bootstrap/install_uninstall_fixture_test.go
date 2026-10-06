@@ -47,7 +47,7 @@ func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
 		defer func() { _ = slave.Close() }()
 		command := exec.Command("bwrap", args...)
 		command.ExtraFiles = []*os.File{slave}
-		command.Env = append(os.Environ(), "LANPANEL_REAL_LIFECYCLE_CHILD=1", "TMPDIR=/tmp")
+		command.Env = append(os.Environ(), "LANPANEL_REAL_LIFECYCLE_CHILD=1", "TMPDIR=/tmp", "GOTMPDIR=/tmp")
 		output, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("isolated real lifecycle failed: %v\n%s", err, output)

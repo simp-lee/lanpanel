@@ -22,6 +22,7 @@ func CoreActions() []domain.OperationCode {
 		domain.OperationPlan,
 		domain.OperationStatus,
 		domain.OperationAdminTokenRotate,
+		domain.OperationManagementHTTPSConfigure,
 		domain.OperationHeadscaleInitialize,
 		domain.OperationHeadscaleControlDeploy,
 		domain.OperationHeadscaleReissue,

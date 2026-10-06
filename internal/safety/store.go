@@ -219,26 +219,12 @@ func VerifyStateFile(path string, owner filetxn.Owner) error {
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || stat.Uid != owner.UID || stat.Gid != owner.GID || stat.Nlink != 1 || stat.Size > maxStateBytes {
 		return fmt.Errorf("independent safety state has unsafe type, owner, mode, links, or size")
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxStateBytes+1))
-	decoder.DisallowUnknownFields()
-	var state State
-	if err := decoder.Decode(&state); err != nil {
-		return fmt.Errorf("decode independent safety state: %w", err)
+	data, err := io.ReadAll(io.LimitReader(file, maxStateBytes+1))
+	if err != nil || len(data) > maxStateBytes {
+		return fmt.Errorf("read independent safety state")
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("independent safety state contains trailing data")
-	}
-	if err := Validate(state); err != nil {
+	if _, err := decodeState(data); err != nil {
 		return err
-	}
-	checksum := state.Checksum
-	state.Checksum = ""
-	expected, err := stateChecksum(state)
-	if err != nil {
-		return err
-	}
-	if checksum != expected {
-		return fmt.Errorf("independent safety state checksum mismatch")
 	}
 	return nil
 }
@@ -328,28 +314,14 @@ func (store *Store) read(requireAuthority bool) (State, error) {
 		return State{}, fmt.Errorf("wrap independent safety state descriptor")
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
-	decoder := json.NewDecoder(io.LimitReader(file, maxStateBytes+1))
-	decoder.DisallowUnknownFields()
-	var state State
-	if err := decoder.Decode(&state); err != nil {
-		return State{}, fmt.Errorf("decode independent safety state: %w", err)
+	data, err := io.ReadAll(io.LimitReader(file, maxStateBytes+1))
+	if err != nil || len(data) > maxStateBytes {
+		return State{}, fmt.Errorf("read independent safety state")
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return State{}, fmt.Errorf("independent safety state contains trailing data")
-	}
-	if err := Validate(state); err != nil {
-		return State{}, err
-	}
-	checksum := state.Checksum
-	state.Checksum = ""
-	expected, err := stateChecksum(state)
+	state, err := decodeState(data)
 	if err != nil {
 		return State{}, err
 	}
-	if checksum != expected {
-		return State{}, fmt.Errorf("independent safety state checksum mismatch")
-	}
-	state.Checksum = checksum
 	if requireAuthority {
 		if err := validateOwnershipAuthority(state, store.config.Ownership); err != nil {
 			return State{}, err
@@ -744,6 +716,9 @@ func validateTransitionWithOrphanedReservation(role ClearRole, current, next Sta
 	if err := validateHeadscaleTransition(role, current.Headscale, next.Headscale, proof.Headscale); err != nil {
 		return err
 	}
+	if err := validateManagementHTTPSTransition(role, current.ManagementHTTPS, next.ManagementHTTPS); err != nil {
+		return err
+	}
 	beforeResources := map[string]ResourceSafety{}
 	afterResources := map[string]ResourceSafety{}
 	for _, resource := range current.Resources {
@@ -908,6 +883,60 @@ func validateHeadscaleTransition(role ClearRole, before, after HeadscaleSafety, 
 	}
 	if (before.CertificateExpiry != nil && after.CertificateExpiry == nil || before.Reactivating != nil && after.Reactivating == nil) && !validHeadscaleProof(before, after, proof) {
 		return fmt.Errorf("headscale expiry or reactivation clear lacks matching convergence proof")
+	}
+	return nil
+}
+
+func validateManagementHTTPSTransition(role ClearRole, before, after ManagementHTTPSSafety) error {
+	if reflect.DeepEqual(before, after) {
+		return nil
+	}
+	beforeGenerations := managementHTTPSGenerations(before)
+	if role == RoleCertificateActivation && before.ChallengePending != nil && after.ChallengePending == nil && after.ActiveCertificate != nil {
+		delete(beforeGenerations, "active_certificate")
+		beforeGenerations["active_certificate"] = after.ActiveCertificate.Generation
+		delete(beforeGenerations, "challenge_pending")
+	}
+	if err := validateMonotonicGenerationSequence(before.GenerationSequence, after.GenerationSequence, beforeGenerations, managementHTTPSGenerations(after)); err != nil {
+		return fmt.Errorf("management HTTPS: %w", err)
+	}
+	if before.EntryDigest != after.EntryDigest {
+		if role == RoleCertificateActivation && (before.ChallengePending == nil || after.ChallengePending != nil || after.ActiveCertificate == nil || reflect.DeepEqual(before.ActiveCertificate, after.ActiveCertificate)) {
+			return fmt.Errorf("management HTTPS entry authority does not accompany exact certificate activation")
+		}
+		if after.EntryDigest == "" {
+			expiryContraction := role == RoleContraction && before.EntryDigest != "" && before.CertificateExpiry != nil && after.CertificateExpiry != nil && after.ActiveCertificate != nil
+			if (after.ActiveCertificate != nil && !expiryContraction) || role != RoleContraction && role != RoleDelete {
+				return fmt.Errorf("management HTTPS entry authority was cleared by an unauthorized role")
+			}
+		} else if role != RoleCertificateActivation {
+			return fmt.Errorf("management HTTPS entry authority has an unauthorized writer")
+		}
+	}
+	if !reflect.DeepEqual(before.ActiveCertificate, after.ActiveCertificate) {
+		if after.ActiveCertificate == nil {
+			return fmt.Errorf("management HTTPS active certificate cannot be cleared")
+		}
+		if role == RoleCertificateObservation {
+			if before.ActiveCertificate == nil || after.ActiveCertificate.Generation != before.ActiveCertificate.Generation || after.ActiveCertificate.Fingerprint != before.ActiveCertificate.Fingerprint || after.ActiveCertificate.Binding != before.ActiveCertificate.Binding || !after.ActiveCertificate.NotAfter.Equal(before.ActiveCertificate.NotAfter) || after.ActiveCertificate.LastTrustedWall.Before(before.ActiveCertificate.LastTrustedWall) || !after.ActiveCertificate.LastTrustedWall.Before(after.ActiveCertificate.NotAfter) {
+				return fmt.Errorf("management HTTPS certificate observation is invalid")
+			}
+		} else if role == RoleCertificateActivation {
+			replacingExpired := before.ActiveCertificate != nil && before.EntryDigest == "" && before.CertificateExpiry != nil
+			if before.ChallengePending == nil || after.ChallengePending != nil || !after.ActiveCertificate.NotAfter.After(after.ActiveCertificate.LastTrustedWall) || before.ActiveCertificate != nil && !replacingExpired && (after.ActiveCertificate.Generation != before.ActiveCertificate.Generation+1 || after.ActiveCertificate.Fingerprint == before.ActiveCertificate.Fingerprint) || replacingExpired && (after.ActiveCertificate.Generation != before.ActiveCertificate.Generation+1 || after.ActiveCertificate.Fingerprint == before.ActiveCertificate.Fingerprint && after.ActiveCertificate.Binding == before.ActiveCertificate.Binding) {
+				return fmt.Errorf("management HTTPS certificate activation does not replace exact challenge authority")
+			}
+		} else {
+			return fmt.Errorf("management HTTPS active certificate has an unauthorized writer")
+		}
+	}
+	if err := deadlineTransition(role, before.CertificateExpiry, after.CertificateExpiry, RoleCertificateActivation, ClearBaseContraction); err != nil {
+		if role != RoleCertificateActivation || before.CertificateExpiry == nil || after.CertificateExpiry != nil || before.ActiveCertificate == nil || before.EntryDigest != "" || before.ChallengePending == nil {
+			return fmt.Errorf("management HTTPS certificate expiry: %w", err)
+		}
+	}
+	if err := challengeTransition(role, before.ChallengePending, after.ChallengePending); err != nil {
+		return fmt.Errorf("management HTTPS: %w", err)
 	}
 	return nil
 }
@@ -1307,10 +1336,68 @@ func validRole(role ClearRole) bool {
 	}
 }
 
+type legacyState struct {
+	SchemaVersion     string           `json:"schema_version"`
+	Revision          uint64           `json:"revision"`
+	AuthoritySequence uint64           `json:"authority_sequence"`
+	Checksum          string           `json:"checksum,omitempty"`
+	GlobalClose       GlobalClose      `json:"global_close"`
+	StopFenceSequence uint64           `json:"stop_fence_sequence"`
+	StopFence         *StopFence       `json:"stop_fence,omitempty"`
+	Headscale         HeadscaleSafety  `json:"headscale"`
+	Resources         []ResourceSafety `json:"resources"`
+}
+
+func decodeState(data []byte) (State, error) {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	var state State
+	if err := decoder.Decode(&state); err != nil {
+		return State{}, fmt.Errorf("decode independent safety state: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return State{}, fmt.Errorf("independent safety state contains trailing data")
+	}
+	if err := Validate(state); err != nil {
+		return State{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return State{}, fmt.Errorf("decode independent safety state fields: %w", err)
+	}
+	checksum := state.Checksum
+	state.Checksum = ""
+	expected, err := stateChecksum(state)
+	if err != nil {
+		return State{}, err
+	}
+	if checksum != expected {
+		if _, present := fields["management_https"]; present {
+			return State{}, fmt.Errorf("independent safety state checksum mismatch")
+		}
+		legacyExpected, legacyErr := legacyStateChecksum(state)
+		if legacyErr != nil || checksum != legacyExpected {
+			return State{}, fmt.Errorf("independent safety state checksum mismatch")
+		}
+	}
+	state.Checksum = checksum
+	return state, nil
+}
+
 func stateChecksum(state State) (string, error) {
 	state.Checksum = ""
 	state.Resources = canonicalResources(state.Resources)
 	data, err := json.Marshal(state)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func legacyStateChecksum(state State) (string, error) {
+	legacy := legacyState{SchemaVersion: state.SchemaVersion, Revision: state.Revision, AuthoritySequence: state.AuthoritySequence, GlobalClose: state.GlobalClose, StopFenceSequence: state.StopFenceSequence, StopFence: state.StopFence, Headscale: state.Headscale, Resources: canonicalResources(state.Resources)}
+	data, err := json.Marshal(legacy)
 	if err != nil {
 		return "", err
 	}

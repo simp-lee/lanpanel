@@ -71,15 +71,23 @@ Bootstrap 会在受保护的临时目录中下载并验证发布包 SHA-256，�
 
 ### 3. 打开管理界面
 
-安装器会显示本次安装专用的 `127/8` 地址和高位端口，并创建管理员令牌：有 TTY 时显示一次；无 TTY 时只显示受 root 保护的令牌文件路径，请按提示保存。
+安装器会显示本次安装专用的 `127/8` 地址和高位端口，并创建用于首次登录 Management UI 的管理员令牌：有 TTY 时显示一次；无 TTY 时只显示受 root 保护的令牌文件路径。请安全保存，并在首次登录后按需轮换。
 
-Management UI 只监听本机回环地址，不会直接暴露到公网。远程管理时，使用 SSH 隧道连接安装器显示的**准确地址和端口**，不能用 `localhost` 替代：
+以后无需记忆或解析配置文件，可执行以下命令查询 Management UI 访问信息；该命令不会输出令牌：
 
 ```sh
-ssh -N -L 8080:<安装器显示的地址>:<安装器显示的端口> <用户>@<主机>
+sudo lanpanel info
 ```
 
-然后在本机浏览器打开 `http://127.0.0.1:8080`。日常应用管理没有 CLI、终端、Shell 或文件管理器；UI 进程不以 root 运行，需要特权的操作会经过受保护的 typed helper。
+Management UI 只监听本机回环地址，不会直接暴露到公网。远程管理时，SSH 隧道的本地监听地址和端口必须与 authority 中的**准确地址和端口相同**；不能使用 `localhost`，因为 UI 会校验 HTTP `Host`：
+
+```sh
+ssh -N -L <地址>:<端口>:<地址>:<端口> <用户>@<主机>
+```
+
+然后在本机浏览器打开 `http://<地址>:<端口>/`。如需更换登录令牌，可执行 `sudo lanpanel token reset`，并立即保存命令一次性输出的新令牌。日常应用管理没有 CLI、终端、Shell 或文件管理器；UI 进程不以 root 运行，需要特权的操作会经过受保护的 typed helper。
+
+可选的 Management HTTPS 在登录后通过 **Management Access** 配置；首次保存只是 typed pending 请求，不会直接开放公网入口。准确的 loopback 地址和 SSH 隧道始终保留为恢复 authority。只有专用 ACME、证书、安全状态和 Nginx 激活检查全部完成后，HTTPS 才具备开放资格。
 
 ## 日常使用
 
@@ -94,6 +102,10 @@ ssh -N -L 8080:<安装器显示的地址>:<安装器显示的端口> <用户>@<�
 域名 HTTPS 使用 HTTP-01，或使用 Cloudflare、Route53、DigitalOcean、Google Cloud、Tencent Cloud 的 DNS-01。使用 DNS-01 时，在 Management UI 的 provider 字段中填写准确的代码：`cloudflare`、`route53`、`digitalocean`、`gcloud` 或 `tencentcloud`。ACME 联系方式在登录后的 Management UI 中设置，首次申请证书前会再次校验；安装阶段不会要求输入，也不会把它写进命令行或日志。
 
 Management UI 不提供 `tailnet_http` 的远端进程控制：它只保存固定的 peer/source/port，并在发布前分别观察 connector、route 和 target evidence。它不会部署文件、运行远程 Shell，也不承诺终止远端已有服务。撤销发布、设备过期和撤销预授权密钥会在适用范围内阻止新的正常路径使用，但已经建立的 TCP/WebSocket 连接可能继续存在；LanPanel 不承诺立即终止这些连接。
+
+如需无凭据的本地 ACME 协议检查，可运行 `make pebble-dns01`。它会临时准备固定版本的 Pebble、`pebble-challtestsrv` 和发布锁定的 Lego 压缩包，在本地 fake CA 上执行真实 DNS-01 订单和证书签发，并在退出时清理临时工具。也可以设置 `PEBBLE_BIN`、`CHALLTESTSRV_BIN` 或 `LEGO_BIN` 复用已有二进制；这不能替代安装主机验证或 staging/provider 验证。
+
+如需真实本地 Nginx HTTPS 图检查，可运行 `make nginx-https-integration`；它会把 Debian Nginx 包下载并解包到临时 root，测试后清理，不执行系统安装。
 
 仓库提供可重复的浏览器 fixture 门禁。使用 checkout 时，先准备 Node 依赖和固定版本的 Chromium，再运行 `make playwright-fixture-gate`（`npm ci`，然后 `npx playwright install chromium`）。fixture 只使用内存中的 typed resource、status、probe、Job 和副作用计数；它不验证真实持久化、Nginx、进程、DNS、ACME、Tailscale 或远程命令。
 

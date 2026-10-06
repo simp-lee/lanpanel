@@ -46,6 +46,7 @@ const (
 	AppsDirectory        = "apps-enabled"
 	ChallengesDirectory  = "challenges-enabled"
 	ControlDirectory     = "control-enabled"
+	ManagementDirectory  = "management-enabled"
 	TemporaryDirectory   = "temporary-enabled"
 	AuditMarker          = "# lanpanel rejection audit\n"
 )
@@ -83,23 +84,33 @@ func (paths Paths) StagingPath() string   { return filepath.Join(paths.ConfigRoo
 type EntryKind string
 
 const (
-	EntryApp       EntryKind = "app"
-	EntryChallenge EntryKind = "challenge"
-	EntryControl   EntryKind = "control"
-	EntryTemporary EntryKind = "temporary"
+	EntryApp        EntryKind = "app"
+	EntryChallenge  EntryKind = "challenge"
+	EntryControl    EntryKind = "control"
+	EntryManagement EntryKind = "management"
+	EntryTemporary  EntryKind = "temporary"
 )
 
 type Entry struct {
-	Kind       EntryKind      `json:"kind"`
-	ResourceID string         `json:"resource_id,omitempty"`
-	Relative   string         `json:"relative"`
-	Digest     string         `json:"digest"`
-	Domains    []string       `json:"domains,omitempty"`
-	Listeners  []string       `json:"listeners,omitempty"`
-	Generation uint64         `json:"generation"`
-	Temporary  *TemporarySite `json:"temporary,omitempty"`
-	Challenge  *ChallengeSite `json:"challenge,omitempty"`
-	Domain     *DomainSite    `json:"domain,omitempty"`
+	Kind       EntryKind       `json:"kind"`
+	ResourceID string          `json:"resource_id,omitempty"`
+	Relative   string          `json:"relative"`
+	Digest     string          `json:"digest"`
+	Domains    []string        `json:"domains,omitempty"`
+	Listeners  []string        `json:"listeners,omitempty"`
+	Generation uint64          `json:"generation"`
+	Temporary  *TemporarySite  `json:"temporary,omitempty"`
+	Challenge  *ChallengeSite  `json:"challenge,omitempty"`
+	Domain     *DomainSite     `json:"domain,omitempty"`
+	Management *ManagementSite `json:"management,omitempty"`
+}
+type ManagementSite struct {
+	Host               string `json:"host"`
+	CertificatePointer string `json:"certificate_pointer"`
+	RejectionAuditPath string `json:"rejection_audit_path"`
+	UpstreamNetwork    string `json:"upstream_network"`
+	UpstreamAddress    string `json:"upstream_address"`
+	WebSocket          bool   `json:"websocket"`
 }
 type DomainSite struct {
 	Hosts              []string      `json:"hosts"`
@@ -307,7 +318,7 @@ func ValidateManifest(manifest Manifest) error {
 		return fmt.Errorf("nginx graph entries are noncanonical")
 	}
 	seenPath := map[string]bool{}
-	seenDomain := map[string]string{}
+	seenDomain := map[string]domainBinding{}
 	seenListener := map[string]string{}
 	for _, entry := range manifest.Entries {
 		if !validEntry(entry) || seenPath[entry.Relative] {
@@ -315,10 +326,10 @@ func ValidateManifest(manifest Manifest) error {
 		}
 		seenPath[entry.Relative] = true
 		for _, domain := range entry.Domains {
-			if owner := seenDomain[domain]; owner != "" && owner != entry.ResourceID {
-				return fmt.Errorf("nginx domain %q belongs to multiple resources", domain)
+			if prior, present := seenDomain[domain]; present && !sharedChallengeDomain(prior, entry) {
+				return fmt.Errorf("nginx domain %q belongs to multiple ingress entries", domain)
 			}
-			seenDomain[domain] = entry.ResourceID
+			seenDomain[domain] = domainBinding{resourceID: entry.ResourceID, kind: entry.Kind}
 		}
 		for _, listener := range entry.Listeners {
 			if sharedHTTPSListener(listener) {
@@ -379,7 +390,7 @@ func VerifyConfigIdentity(paths Paths, owner filetxn.Owner) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	allowed := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, TemporaryDirectory: true}
+	allowed := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, ManagementDirectory: true, TemporaryDirectory: true}
 	for _, entry := range entries {
 		if !allowed[entry.Name()] {
 			return Manifest{}, fmt.Errorf("foreign Nginx root graph entry %q", entry.Name())
@@ -438,7 +449,7 @@ func auditManifestGraph(paths Paths, owner filetxn.Owner, manifest Manifest, all
 	if err != nil {
 		return err
 	}
-	allowedRoot := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, TemporaryDirectory: true}
+	allowedRoot := map[string]bool{MainFileName: true, SanitizerFileName: true, ManifestFileName: true, filepath.Base(paths.StagingPath()): true, AppsDirectory: true, ChallengesDirectory: true, ControlDirectory: true, ManagementDirectory: true, TemporaryDirectory: true}
 	for _, item := range rootEntries {
 		if !allowedRoot[item.Name()] {
 			return fmt.Errorf("foreign Nginx root graph entry %q", item.Name())
@@ -455,7 +466,7 @@ func auditManifestGraph(paths Paths, owner filetxn.Owner, manifest Manifest, all
 			return fmt.Errorf("nginx graph entry %q differs from its manifest", entry.Relative)
 		}
 	}
-	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
+	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, ManagementDirectory, TemporaryDirectory} {
 		entries, readErr := os.ReadDir(filepath.Join(paths.ConfigRoot, directory))
 		if readErr != nil {
 			return readErr
@@ -485,7 +496,7 @@ func validateGraphBoundary(paths Paths, owner filetxn.Owner) error {
 			}
 		}
 	}
-	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory), paths.StateRoot} {
+	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, ManagementDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory), paths.StateRoot} {
 		if err := validateDirectory(directory, owner); err != nil {
 			return err
 		}
@@ -672,9 +683,10 @@ func renderMain(paths Paths) string {
 		"    add_header X-LanPanel-Rejection default always;\n" +
 		"    return 421;\n" +
 		"  }\n" +
-		"  include " + filepath.Join(paths.ConfigRoot, ControlDirectory, "*.conf") + ";\n" +
 		"  include " + filepath.Join(paths.ConfigRoot, ChallengesDirectory, "*.conf") + ";\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, ControlDirectory, "*.conf") + ";\n" +
 		"  include " + filepath.Join(paths.ConfigRoot, AppsDirectory, "*.conf") + ";\n" +
+		"  include " + filepath.Join(paths.ConfigRoot, ManagementDirectory, "*.conf") + ";\n" +
 		"  include " + filepath.Join(paths.ConfigRoot, TemporaryDirectory, "*.conf") + ";\n" +
 		"}\n"
 }
@@ -714,6 +726,10 @@ func DomainSNIGuard(domains []string) (string, error) {
 }
 
 func (entry Entry) valid() bool { return validEntry(entry) }
+func challengeResourcePattern(value string) bool {
+	return resourcePattern.MatchString(value) || value == "management_https"
+}
+
 func validEntry(entry Entry) bool {
 	if entry.Generation == 0 || !validDigest(entry.Digest) || filepath.IsAbs(entry.Relative) || filepath.Clean(entry.Relative) != entry.Relative || strings.Contains(entry.Relative, "\\") || filepath.Ext(entry.Relative) != ".conf" {
 		return false
@@ -725,11 +741,15 @@ func validEntry(entry Entry) bool {
 			return false
 		}
 	case EntryChallenge:
-		if prefix != ChallengesDirectory || !resourcePattern.MatchString(entry.ResourceID) || len(entry.Domains) == 0 || entry.Challenge == nil || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}) || !validChallengeSite(*entry.Challenge, entry.Domains) {
+		if prefix != ChallengesDirectory || !challengeResourcePattern(entry.ResourceID) || len(entry.Domains) == 0 || entry.Challenge == nil || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:80", "tcp:[::]:80"}) || !validChallengeSite(*entry.Challenge, entry.Domains) {
 			return false
 		}
 	case EntryControl:
 		if prefix != ControlDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}) || entry.Domain == nil || !validDomainSite(*entry.Domain, entry.Domains) || entry.Domain.AuthMode != "application_managed" || entry.Domain.UpstreamNetwork != "unix" || !entry.Domain.WebSocket || len(entry.Domain.Static) != 0 || entry.Domain.GoAccess != nil || entry.Challenge != nil && !validChallengeSite(*entry.Challenge, entry.Domains) {
+			return false
+		}
+	case EntryManagement:
+		if prefix != ManagementDirectory || entry.ResourceID != "" || len(entry.Domains) != 1 || !slices.Equal(entry.Listeners, []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}) || entry.Domain != nil || entry.Management == nil || !validManagementSite(*entry.Management, entry.Domains) || entry.Challenge != nil && !validChallengeSite(*entry.Challenge, entry.Domains) {
 			return false
 		}
 	case EntryTemporary:
@@ -750,6 +770,27 @@ func validEntry(entry Entry) bool {
 		}
 	}
 	return true
+}
+
+type domainBinding struct {
+	resourceID string
+	kind       EntryKind
+}
+
+func sharedChallengeDomain(prior domainBinding, entry Entry) bool {
+	if entry.Kind == EntryChallenge && (entry.ResourceID == "headscale" || entry.ResourceID == "management_https") {
+		return prior.kind == EntryControl && entry.ResourceID == "headscale" || prior.kind == EntryManagement && entry.ResourceID == "management_https"
+	}
+	if prior.kind == EntryChallenge && (prior.resourceID == "headscale" || prior.resourceID == "management_https") {
+		return entry.Kind == EntryControl && prior.resourceID == "headscale" || entry.Kind == EntryManagement && prior.resourceID == "management_https"
+	}
+	if entry.Kind == EntryChallenge {
+		return prior.resourceID != "" && prior.resourceID == entry.ResourceID
+	}
+	if prior.kind == EntryChallenge {
+		return entry.ResourceID != "" && prior.resourceID == entry.ResourceID
+	}
+	return false
 }
 
 func sharedHTTPSListener(value string) bool {
@@ -843,6 +884,48 @@ func validTemporarySite(site TemporarySite, listener string) bool {
 func validTailnetSource(value string, bits int) bool {
 	address, err := netip.ParseAddr(value)
 	return err == nil && address.IsGlobalUnicast() && !address.IsLoopback() && address.BitLen() == bits
+}
+
+func validManagementSite(site ManagementSite, domains []string) bool {
+	if len(domains) != 1 || site.Host != domains[0] || !validDomain(site.Host) || !strings.HasPrefix(site.CertificatePointer, "/var/lib/lanpanel/certificates/active/") || filepath.Clean(site.CertificatePointer) != site.CertificatePointer || strings.ContainsAny(site.CertificatePointer, "\x00\r\n") || site.RejectionAuditPath != "/var/log/lanpanel/nginx-rejections.log" || site.UpstreamNetwork != "tcp" || !site.WebSocket {
+		return false
+	}
+	host, port, err := net.SplitHostPort(site.UpstreamAddress)
+	address, addressErr := netip.ParseAddr(host)
+	value, valueErr := strconv.ParseUint(port, 10, 16)
+	return err == nil && addressErr == nil && address.IsLoopback() && !address.IsUnspecified() && valueErr == nil && value >= 1024
+}
+
+// BuildManagementEntry constructs the only Nginx entry that may proxy the
+// installation Management authority. It intentionally requires an active,
+// identity-bound certificate; pending or failed ACME state cannot produce an
+// externally serving entry.
+func BuildManagementEntry(installation domain.Installation) (Entry, error) {
+	if installation.ManagementHTTPS == nil {
+		return Entry{}, fmt.Errorf("management HTTPS is not configured")
+	}
+	if err := domain.ValidateManagementHTTPSConfig(*installation.ManagementHTTPS); err != nil {
+		return Entry{}, fmt.Errorf("management HTTPS configuration: %w", err)
+	}
+	if installation.ManagementHTTPS.Phase != domain.ManagementHTTPSActive || installation.ManagementHTTPS.CertificateBundle == nil {
+		return Entry{}, fmt.Errorf("management HTTPS certificate is not active")
+	}
+	certificate := installation.ManagementHTTPS.CertificateBundle
+	entry := Entry{
+		Kind:       EntryManagement,
+		Relative:   ManagementDirectory + "/management.conf",
+		Domains:    []string{installation.ManagementHTTPS.Domain},
+		Listeners:  []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"},
+		Generation: installation.ManagementHTTPS.Generation,
+		Management: &ManagementSite{Host: installation.ManagementHTTPS.Domain, CertificatePointer: certificate.PointerIdentity, RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", UpstreamNetwork: "tcp", UpstreamAddress: net.JoinHostPort(installation.Management.Address, strconv.FormatUint(uint64(installation.Management.Port), 10)), WebSocket: true},
+	}
+	entry.Digest = "sha256:" + strings.Repeat("0", 64)
+	digest, err := DigestEntry(entry)
+	if err != nil {
+		return Entry{}, err
+	}
+	entry.Digest = digest
+	return entry, nil
 }
 
 func validDomainSite(site DomainSite, domains []string) bool {
@@ -986,6 +1069,21 @@ func DigestEntry(entry Entry) (string, error) {
 	return digest(data), nil
 }
 
+func renderManagement(entry Entry) ([]byte, error) {
+	site := entry.Management
+	host := site.Host
+	certificate := quoteNginxArgument(site.CertificatePointer + "/certificate.pem")
+	key := quoteNginxArgument(site.CertificatePointer + "/private-key.pem")
+	var output strings.Builder
+	fmt.Fprintf(&output, "server {\n  listen 80;\n  listen [::]:80;\n  server_name %s;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host != %s) { return 421; }\n", host, quoteNginxArgument(site.RejectionAuditPath), quoteNginxArgument(host))
+	if entry.Challenge != nil {
+		output.WriteString(renderChallengeLocations(*entry.Challenge))
+	}
+	output.WriteString("  location / { return 308 https://$http_host$request_uri; }\n}\n")
+	fmt.Fprintf(&output, "server {\n  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n  server_name %s;\n  ssl_certificate %s;\n  ssl_certificate_key %s;\n  ssl_protocols TLSv1.2 TLSv1.3;\n  access_log %s lanpanel_rejection if=$lanpanel_rejection_loggable;\n  if ($http_host != %s) { return 421; }\n  if ($ssl_server_name != %s) { return 421; }\n  location / {\n    proxy_http_version 1.1;\n    proxy_set_header Host $http_host;\n    proxy_set_header Origin $http_origin;\n    proxy_set_header Cookie $http_cookie;\n    proxy_set_header Authorization $http_authorization;\n    proxy_set_header X-LanPanel-CSRF $http_x_lanpanel_csrf;\n    proxy_set_header Forwarded \"\";\n    proxy_set_header X-Forwarded-For \"\";\n    proxy_set_header X-Forwarded-Host \"\";\n    proxy_set_header X-Forwarded-Proto \"\";\n    proxy_set_header X-Forwarded-Port \"\";\n    proxy_set_header X-Real-IP \"\";\n    proxy_set_header X-Client-IP \"\";\n    proxy_set_header X-Cluster-Client-IP \"\";\n    proxy_set_header CF-Connecting-IP \"\";\n    proxy_set_header True-Client-IP \"\";\n    proxy_set_header EO-Connecting-IP \"\";\n    proxy_set_header X-LanPanel-Closure-ID \"\";\n    proxy_set_header X-Forwarded-For $remote_addr;\n    proxy_set_header X-Forwarded-Host $http_host;\n    proxy_set_header X-Forwarded-Proto https;\n    proxy_set_header X-Real-IP $remote_addr;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection \"upgrade\";\n    proxy_pass http://%s;\n  }\n}\n", host, certificate, key, quoteNginxArgument(site.RejectionAuditPath), quoteNginxArgument(host), quoteNginxArgument(host), site.UpstreamAddress)
+	return []byte(output.String()), nil
+}
+
 func RenderEntry(entry Entry) ([]byte, error) {
 	if !validEntry(entry) {
 		return nil, fmt.Errorf("nginx graph entry authority is invalid")
@@ -1016,6 +1114,9 @@ func RenderEntry(entry Entry) ([]byte, error) {
 	}
 	if entry.Kind == EntryApp && entry.Domain != nil {
 		return renderDomain(entry)
+	}
+	if entry.Kind == EntryManagement {
+		return renderManagement(entry)
 	}
 	if entry.Kind != EntryTemporary {
 		return RenderClosedEntry(entry)

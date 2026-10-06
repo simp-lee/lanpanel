@@ -472,6 +472,116 @@ func (host Host) ContractResource(ctx context.Context, resourceID string) (Resul
 	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: "sha256:" + hex.EncodeToString(sum[:])}, nil
 }
 
+// ContractManagement removes exactly the active Management HTTPS entry and
+// reloads Nginx. When stopBeforeMutation is set, it first fences the whole
+// runtime; this is required when another independent certificate expiry may
+// make the remaining graph unsafe to reload.
+func (host Host) ContractManagement(ctx context.Context, expected nginx.Entry, reloadAuthority ReloadAuthority, stopBeforeMutation bool) (Result, error) {
+	if host.Launcher == nil || expected.Kind != nginx.EntryManagement || expected.Relative == "" {
+		return Result{}, fmt.Errorf("management contraction authority is incomplete")
+	}
+	reloadAuthority = reloadAuthority.ForContraction()
+	priorManifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return Result{}, err
+	}
+	prior, err := host.observer(priorManifest).Observe(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if prior.Master == nil && (len(prior.Workers) != 0 || len(prior.Listeners) != 0) {
+		return Result{}, fmt.Errorf("stopped Nginx runtime inconsistent")
+	}
+	fence := func(cause error) error {
+		_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+		return errors.Join(cause, stopErr)
+	}
+	present := false
+	for _, entry := range priorManifest.Entries {
+		if entry.Kind != nginx.EntryManagement {
+			continue
+		}
+		if entry.Relative != expected.Relative || !reflect.DeepEqual(entry, expected) {
+			return Result{}, fence(fmt.Errorf("management Nginx entry identity changed"))
+		}
+		present = true
+	}
+	if !present {
+		if prior.Master == nil && (len(prior.Workers) != 0 || len(prior.Listeners) != 0) {
+			return Result{}, fmt.Errorf("stopped Nginx runtime inconsistent")
+		}
+		if prior.Master == nil {
+			return Result{Manifest: priorManifest}, nil
+		}
+		if stopBeforeMutation {
+			if _, err := host.StopAndVerify(context.WithoutCancel(ctx)); err != nil {
+				return Result{}, err
+			}
+			return Result{Manifest: priorManifest}, nil
+		}
+		if err := host.run(ctx, child.ProfileNginxTest); err != nil {
+			_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			return Result{}, errors.Join(err, stopErr)
+		}
+		if err := signalAuthorizedReload(host.Paths, host.Owner, priorManifest, reloadAuthority, func() error {
+			return host.run(ctx, child.ProfileNginxReloadSignal)
+		}); err != nil {
+			_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			return Result{}, errors.Join(err, stopErr)
+		}
+		runtime, err := closure.WaitPriorWorkers(ctx, host.observer(priorManifest), prior.Workers, nginx.DefaultWorkerTimeout)
+		if err != nil || runtime.Master == nil {
+			if err == nil {
+				err = fmt.Errorf("management contraction prior workers remain")
+			}
+			_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			return Result{}, errors.Join(err, stopErr)
+		}
+		raw, err := json.Marshal(priorManifest)
+		if err != nil {
+			return Result{}, err
+		}
+		sum := sha256.Sum256(append([]byte("management_https\x00"), raw...))
+		return Result{Manifest: priorManifest, RuntimeDigest: "sha256:" + hex.EncodeToString(sum[:])}, nil
+	}
+	if stopBeforeMutation && prior.Master != nil {
+		if _, err := host.StopAndVerify(context.WithoutCancel(ctx)); err != nil {
+			return Result{}, err
+		}
+		prior, err = host.observer(priorManifest).Observe(ctx)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	manifest, paths, err := nginx.RemoveEntry(ctx, host.Paths, host.Owner, expected)
+	if err != nil {
+		return Result{}, fence(err)
+	}
+	if prior.Master != nil {
+		if err := host.run(ctx, child.ProfileNginxTest); err != nil {
+			return Result{}, fence(err)
+		}
+		if err := signalAuthorizedReload(host.Paths, host.Owner, manifest, reloadAuthority, func() error {
+			return host.run(ctx, child.ProfileNginxReloadSignal)
+		}); err != nil {
+			return Result{}, fence(err)
+		}
+		runtime, err := closure.WaitPriorWorkers(ctx, host.observer(manifest), prior.Workers, nginx.DefaultWorkerTimeout)
+		if err != nil || runtime.Master == nil {
+			if err == nil {
+				err = fmt.Errorf("management contraction prior workers remain")
+			}
+			return Result{}, fence(err)
+		}
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return Result{}, err
+	}
+	sum := sha256.Sum256(append([]byte("management_https\x00"), raw...))
+	return Result{Manifest: manifest, ModifiedPaths: paths, RuntimeDigest: "sha256:" + hex.EncodeToString(sum[:])}, nil
+}
+
 func (host Host) run(ctx context.Context, profile child.ProfileID) error {
 	result, err := host.Launcher.Run(ctx, profile, nil)
 	if err != nil || result.ExitCode != 0 || result.OutputCutOff {

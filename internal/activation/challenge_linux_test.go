@@ -28,7 +28,7 @@ func challengeTransactionFixture(t *testing.T) (nginx.Paths, filetxn.Owner, chal
 	t.Helper()
 	root := t.TempDir()
 	paths := nginx.Paths{ConfigRoot: filepath.Join(root, "config"), StateRoot: filepath.Join(root, "state"), AuditPath: filepath.Join(root, "audit"), CertificatePath: filepath.Join(root, "default.crt"), PrivateKeyPath: filepath.Join(root, "default.key"), PIDPath: filepath.Join(root, "nginx.pid")}
-	for _, directory := range []string{paths.ConfigRoot, paths.StateRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, nginx.AppsDirectory), filepath.Join(paths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(paths.ConfigRoot, nginx.ControlDirectory), filepath.Join(paths.ConfigRoot, nginx.TemporaryDirectory)} {
+	for _, directory := range []string{paths.ConfigRoot, paths.StateRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, nginx.AppsDirectory), filepath.Join(paths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(paths.ConfigRoot, nginx.ControlDirectory), filepath.Join(paths.ConfigRoot, nginx.ManagementDirectory), filepath.Join(paths.ConfigRoot, nginx.TemporaryDirectory)} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}

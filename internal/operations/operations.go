@@ -24,6 +24,7 @@ import (
 	"lanpanel/internal/plans"
 	"lanpanel/internal/preflight"
 	"lanpanel/internal/publication"
+	"lanpanel/internal/reservations"
 	appresource "lanpanel/internal/resource"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/storeauthority"
@@ -51,6 +52,7 @@ const (
 	StaticRootRegister       Type = "static_root_register"
 	ExternalHTPasswdRegister Type = "external_htpasswd_register"
 	AdminTokenRotate         Type = "admin_token_rotate"
+	ManagementHTTPSConfigure Type = "management_https_configure"
 	AutomaticReconciliation  Type = "automatic_exact_journal_reconciliation"
 	StartupContraction       Type = "startup_activation_contraction"
 	GoAccessRetirement       Type = "goaccess_retirement_reconciliation"
@@ -1093,6 +1095,19 @@ func (admitter *Admitter) BeginPlanless(ctx context.Context, mutation *MutationL
 	return result, err
 }
 
+func validRemoteWaitAdmissionSource(reservation Reservation) bool {
+	switch reservation.AdmissionSource {
+	case AdmissionPlan:
+		return true
+	case AdmissionTimer:
+		return reservation.Operation == CertificateRenew || reservation.Operation == AutomaticReconciliation && reservation.Target == "management_https"
+	case AdmissionUI:
+		return reservation.Operation == HeadscaleInitialize || reservation.Operation == HeadscaleUserCreate
+	default:
+		return false
+	}
+}
+
 func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string) (Reservation, error) {
 	if admitter == nil || !authoritativeOperationLeases(admitter.normal, mutation, exposure) {
 		return Reservation{}, fmt.Errorf("authoritative mutation then exposure locks are required")
@@ -1117,7 +1132,7 @@ func (admitter *Admitter) markRemoteWait(ctx context.Context, mutation *Mutation
 		if err != nil {
 			return err
 		}
-		if (reservation.Phase != PhaseLocalIntent && reservation.Phase != PhaseReentered) || (reservation.AdmissionSource != AdmissionPlan && (reservation.AdmissionSource != AdmissionTimer || reservation.Operation != CertificateRenew) && (reservation.AdmissionSource != AdmissionUI || reservation.Operation != HeadscaleInitialize && reservation.Operation != HeadscaleUserCreate)) {
+		if (reservation.Phase != PhaseLocalIntent && reservation.Phase != PhaseReentered) || !validRemoteWaitAdmissionSource(reservation) {
 			return fmt.Errorf("remote wait requires Plan issuance or timer renewal authority")
 		}
 		reservation.Phase = PhaseRemoteWait
@@ -1363,7 +1378,7 @@ func (admitter *Admitter) ReenterHTTP01Contraction(ctx context.Context, mutation
 		return Reservation{}, nil, nil, errors.Join(err, persist.ErrRevision)
 	}
 	intent, err := loadReservationEntries(document.Entries, jobID)
-	if err != nil || intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered || intent.Consumption == nil || intent.Operation != Publish && intent.Operation != CertificateRenew && intent.Operation != HeadscaleDeploy {
+	if err != nil || intent.Phase != PhaseRemoteWait && intent.Phase != PhaseReentered || intent.Consumption == nil || intent.Operation != Publish && intent.Operation != CertificateRenew && intent.Operation != HeadscaleDeploy && intent.Operation != AutomaticReconciliation {
 		return Reservation{}, nil, nil, fmt.Errorf("operation is not in HTTP-01 remote wait or reentry")
 	}
 	mutation, exposure, err := mutationSet.AcquireExposure(ctx, intent.Target, manager)
@@ -1468,7 +1483,7 @@ func (admitter *Admitter) Reenter(ctx context.Context, mutationSet *MutationSet,
 		if !plans.SameBindingIdentity(binding, snapshot) {
 			return fail(fmt.Errorf("plan-derived binding changed during remote wait"))
 		}
-	} else if (intent.AdmissionSource != AdmissionTimer || intent.Operation != CertificateRenew) && (intent.AdmissionSource != AdmissionUI || intent.Operation != HeadscaleInitialize && intent.Operation != HeadscaleUserCreate) {
+	} else if !validRemoteWaitAdmissionSource(intent) {
 		return fail(fmt.Errorf("remote wait admission source invalid"))
 	}
 	var result Reservation
@@ -2147,7 +2162,7 @@ func (admitter *Admitter) TerminalizeContractedCertificate(ctx context.Context, 
 		if err != nil {
 			return err
 		}
-		identityMatches := ((intent.Operation == Publish || intent.Operation == CertificateRenew) && intent.Target == "resource/"+intent.SafetyBinding.ResourceID || intent.Operation == CertificateRenew && strings.HasPrefix(intent.Target, "headscale/") && intent.SafetyBinding.ResourceID == "headscale") && intent.SafetyBinding.PlanID == pending.PlanID && intent.SafetyBinding.IntentGeneration == pending.Generation && intent.SafetyBinding.CandidateDigest == pending.SANIdentity && intent.SafetyBinding.CandidateBundle == pending.ACMEBinding
+		identityMatches := ((intent.Operation == Publish || intent.Operation == CertificateRenew) && intent.Target == "resource/"+intent.SafetyBinding.ResourceID || intent.Operation == CertificateRenew && strings.HasPrefix(intent.Target, "headscale/") && intent.SafetyBinding.ResourceID == "headscale" || intent.Operation == CertificateRenew && intent.Target == "management_https" && intent.SafetyBinding.ResourceID == "management_https" || intent.Operation == AutomaticReconciliation && intent.Target == "management_https" && intent.SafetyBinding.ResourceID == "management_https" && intent.SafetyBinding.CandidateDigest == pending.ConfigDigest) && intent.SafetyBinding.PlanID == pending.PlanID && intent.SafetyBinding.IntentGeneration == pending.Generation && (intent.SafetyBinding.CandidateDigest == pending.SANIdentity || intent.SafetyBinding.CandidateDigest == pending.ConfigDigest) && intent.SafetyBinding.CandidateBundle == pending.ACMEBinding
 		if !identityMatches {
 			return fmt.Errorf("certificate reconciliation intent mismatched")
 		}
@@ -4163,6 +4178,146 @@ func (admitter *Admitter) CommitResourceDeleteRemoval(ctx context.Context, mutat
 	return err
 }
 
+func (admitter *Admitter) CommitManagementHTTPSConfigure(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.ManagementHTTPSConfig) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.Phase != domain.ManagementHTTPSPending || candidate.CertificateBundle != nil || candidate.LastFailureCode != "" {
+		return fmt.Errorf("management HTTPS configuration commit requires a pending candidate")
+	}
+	binding, err := canonicalValueDigest(candidate)
+	if err != nil {
+		return err
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != ManagementHTTPSConfigure || intent.Phase != PhaseLocalIntent || intent.Target != string(plans.TargetInstallation) || mutation.Target() != intent.Target || intent.SafetyBinding.CandidateDigest != binding || intent.SafetyBinding.CandidateBundle != binding {
+			return fmt.Errorf("management HTTPS configuration intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		if prior := installation.ManagementHTTPS; prior != nil && candidate.Generation != prior.Generation+1 || prior == nil && candidate.Generation != 1 {
+			return fmt.Errorf("management HTTPS configuration generation changed")
+		}
+		installation.ManagementHTTPS = &candidate
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return err
+		}
+		if _, err := reservations.BuildClaims(installation); err != nil {
+			return fmt.Errorf("management HTTPS configuration reservation conflict: %w", err)
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitManagementHTTPSExpiry(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.ManagementHTTPSConfig) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.Phase != domain.ManagementHTTPSExpired || candidate.LastFailureCode != "certificate_expired" {
+		return fmt.Errorf("management HTTPS expiry commit requires an expired candidate")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != AutomaticReconciliation || !strings.HasPrefix(intent.Target, "journal/management-https-expiry-") || intent.Phase != PhaseLocalIntent || mutation.Target() != intent.Target || intent.SafetyBinding.CandidateBundle != candidate.ACMEBinding || intent.SafetyBinding.ExpiryGeneration == 0 {
+			return fmt.Errorf("management HTTPS expiry intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		prior := installation.ManagementHTTPS
+		if prior == nil || prior.Phase != domain.ManagementHTTPSActive || candidate.Generation != prior.Generation || !reflect.DeepEqual(candidate.Certificate, prior.Certificate) || !reflect.DeepEqual(candidate.CertificateBundle, prior.CertificateBundle) || candidate.ACMEBinding != prior.ACMEBinding {
+			return fmt.Errorf("management HTTPS expiry authority changed")
+		}
+		installation.ManagementHTTPS = &candidate
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return err
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitManagementHTTPSIssue(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.ManagementHTTPSConfig) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.Phase != domain.ManagementHTTPSActive || candidate.CertificateBundle == nil || candidate.LastFailureCode != "" {
+		return fmt.Errorf("management HTTPS issuance commit requires an active certificate candidate")
+	}
+	state, err := admitter.safety.Read()
+	if err != nil {
+		return err
+	}
+	expectedBundleGeneration := uint64(1)
+	if active := state.ManagementHTTPS.ActiveCertificate; active != nil {
+		if state.ManagementHTTPS.EntryDigest != "" || state.ManagementHTTPS.CertificateExpiry == nil || active.Generation == ^uint64(0) {
+			return fmt.Errorf("management HTTPS issuance safety replacement authority is invalid")
+		}
+		expectedBundleGeneration = active.Generation + 1
+	}
+	if candidate.CertificateBundle.Generation != expectedBundleGeneration {
+		return fmt.Errorf("management HTTPS issuance bundle generation changed")
+	}
+	_, _, err = admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != AutomaticReconciliation || intent.Target != "management_https" || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != "management_https" || intent.SafetyBinding.CandidateBundle != candidate.ACMEBinding {
+			return fmt.Errorf("management HTTPS issuance intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		prior := installation.ManagementHTTPS
+		if prior == nil || prior.Phase != domain.ManagementHTTPSPending || prior.CertificateBundle != nil || candidate.Generation != prior.Generation || candidate.ACMEBinding != prior.ACMEBinding || !reflect.DeepEqual(candidate.Certificate, prior.Certificate) || candidate.CertificateBundle.Generation == 0 || candidate.CertificateBundle.BindingIdentity != prior.ACMEBinding {
+			return fmt.Errorf("management HTTPS issuance authority changed")
+		}
+		installation.ManagementHTTPS = &candidate
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return err
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
+func (admitter *Admitter) CommitManagementHTTPSRenewal(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, candidate domain.ManagementHTTPSConfig) error {
+	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || candidate.Phase != domain.ManagementHTTPSActive || candidate.CertificateBundle == nil || candidate.LastFailureCode != "" {
+		return fmt.Errorf("management HTTPS renewal commit requires an active certificate candidate")
+	}
+	_, _, err := admitter.normal.Update(ctx, exposure, expectedRevision, func(transaction *persist.Transaction) error {
+		intent, err := loadReservation(transaction, jobID)
+		if err != nil || intent.Operation != CertificateRenew || intent.Target != "management_https" || intent.Phase != PhaseReentered || mutation.Target() != intent.Target || intent.SafetyBinding.ResourceID != "management_https" || intent.SafetyBinding.CandidateBundle != candidate.ACMEBinding {
+			return fmt.Errorf("management HTTPS renewal intent mismatched")
+		}
+		installation, err := loadInstallation(transaction)
+		if err != nil {
+			return err
+		}
+		prior := installation.ManagementHTTPS
+		if prior == nil || prior.Phase != domain.ManagementHTTPSActive || prior.CertificateBundle == nil || candidate.Generation != prior.Generation || candidate.ACMEBinding != prior.ACMEBinding || !reflect.DeepEqual(candidate.Certificate, prior.Certificate) || candidate.CertificateBundle.Generation != prior.CertificateBundle.Generation+1 || candidate.CertificateBundle.BindingIdentity != prior.CertificateBundle.BindingIdentity {
+			return fmt.Errorf("management HTTPS renewal authority changed")
+		}
+		installation.ManagementHTTPS = &candidate
+		if err := domain.ValidateInstallation(installation); err != nil {
+			return err
+		}
+		raw, err := persist.EncodeEntry(installation)
+		if err != nil {
+			return err
+		}
+		return transaction.Replace("installations/current", raw)
+	})
+	return err
+}
+
 func (admitter *Admitter) CommitConnectorBinding(ctx context.Context, mutation *MutationLease, exposure *locks.Lease, expectedRevision uint64, jobID string, connector domain.TailnetConnector) error {
 	if !authoritativeOperationLeases(admitter.normal, mutation, exposure) || connector.LastOperation != domain.OperationConnectorBindingSet || connector.LastJobID != jobID {
 		return fmt.Errorf("connector binding commit requires exact authority")
@@ -5782,6 +5937,22 @@ func (admitter *Admitter) CompleteWithSecret(ctx context.Context, mutation *Muta
 	return completed, err
 }
 
+func exactManagementCertificatePublicationAuthority(document persist.Document, state safety.State, intent Reservation) bool {
+	if intent.Operation != AutomaticReconciliation || intent.Target != "management_https" || intent.SafetyBinding.ResourceID != "management_https" || intent.SafetyBinding.CandidateDigest == "" || intent.SafetyBinding.CandidateBundle == "" || intent.SafetyBinding.CertificateIdentity == "" {
+		return false
+	}
+	raw, present := document.Entries["installations/current"]
+	if !present {
+		return false
+	}
+	installation, err := domain.DecodeInstallation(raw)
+	if err != nil || installation.ManagementHTTPS == nil || installation.ManagementHTTPS.Phase != domain.ManagementHTTPSActive || installation.ManagementHTTPS.CertificateBundle == nil || installation.ManagementHTTPS.CertificateBundle.BindingIdentity != intent.SafetyBinding.CandidateBundle || installation.ManagementHTTPS.CertificateBundle.Authority == nil || installation.ManagementHTTPS.CertificateBundle.Authority.CertificateID != intent.SafetyBinding.CertificateIdentity {
+		return false
+	}
+	active := state.ManagementHTTPS.ActiveCertificate
+	return state.ManagementHTTPS.ChallengePending == nil && state.ManagementHTTPS.CertificateExpiry == nil && state.ManagementHTTPS.EntryDigest != "" && active != nil && active.Binding == intent.SafetyBinding.CandidateBundle && active.Fingerprint == installation.ManagementHTTPS.CertificateBundle.Fingerprint
+}
+
 func exactCertificatePublicationAuthority(state safety.State, intent Reservation) bool {
 	handoff := intent.CertificateHandoff
 	if handoff == nil || state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone {
@@ -5808,6 +5979,9 @@ func exactHTTP01Challenge(state safety.State, operation Type, binding SafetyBind
 	if !exactCertificateChallenge(state, operation, binding) {
 		return false
 	}
+	if binding.ResourceID == "management_https" {
+		return state.ManagementHTTPS.ChallengePending != nil && state.ManagementHTTPS.ChallengePending.Method == "http-01"
+	}
 	if binding.ResourceID == "headscale" {
 		return state.Headscale.ChallengePending != nil && state.Headscale.ChallengePending.Method == "http-01"
 	}
@@ -5820,6 +5994,16 @@ func exactHTTP01Challenge(state safety.State, operation Type, binding SafetyBind
 }
 
 func exactCertificateChallenge(state safety.State, operation Type, binding SafetyBinding) bool {
+	if binding.ResourceID == "management_https" {
+		pending := state.ManagementHTTPS.ChallengePending
+		if pending == nil || pending.PlanID != binding.PlanID || pending.Generation != binding.IntentGeneration || pending.CertificateIdentity != binding.CertificateIdentity || pending.ACMEBinding != binding.CandidateBundle {
+			return false
+		}
+		if operation == AutomaticReconciliation {
+			return pending.ConfigDigest == binding.CandidateDigest
+		}
+		return operation == CertificateRenew && pending.SANIdentity == binding.CandidateDigest
+	}
 	if binding.ResourceID == "headscale" {
 		pending := state.Headscale.ChallengePending
 		if pending == nil || pending.PlanID != binding.PlanID || pending.Generation != binding.IntentGeneration || pending.CertificateIdentity != binding.CertificateIdentity {
@@ -5868,13 +6052,14 @@ func (admitter *Admitter) validateFreshAuthority(document persist.Document, inte
 		return err
 	}
 	if !isContraction(intent.Operation) && currentDigest != intent.Consumption.SafetyDigest {
-		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew || intent.Operation == HeadscaleDeploy) && exactCertificateChallenge(state, intent.Operation, intent.SafetyBinding)
+		ownedChallenge := (intent.Operation == Publish || intent.Operation == CertificateRenew || intent.Operation == AutomaticReconciliation && intent.Target == "management_https" || intent.Operation == HeadscaleDeploy) && exactCertificateChallenge(state, intent.Operation, intent.SafetyBinding)
 		certificateHandoff := intent.Operation == Publish && exactCertificatePublicationAuthority(state, intent)
-		if !ownedChallenge && !certificateHandoff {
+		managementHandoff := exactManagementCertificatePublicationAuthority(document, state, intent)
+		if !ownedChallenge && !certificateHandoff && !managementHandoff {
 			return fmt.Errorf("contraction or safety transition preempted operation authority")
 		}
 	}
-	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil && !exactCertificatePublicationAuthority(state, intent) {
+	if err := authorize(intent.Operation, state, intent.SafetyBinding, true, observedNow); err != nil && !exactCertificatePublicationAuthority(state, intent) && !exactManagementCertificatePublicationAuthority(document, state, intent) {
 		return err
 	}
 	if intent.AdmissionSource != AdmissionPlan {
@@ -5923,6 +6108,20 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 	if operation == AutomaticReconciliation && binding.ResourceID == "headscale" {
 		if state.GlobalClose.Phase != safety.GlobalCloseNone || !validExpiryBinding(CertificateExpiry, state, binding) {
 			return fmt.Errorf("headscale expiry reconciliation authority is stale or globally blocked")
+		}
+	}
+	if operation == AutomaticReconciliation && binding.ResourceID == "" && binding.CandidateBundle != "" {
+		if !validManagementExpiryBinding(state, binding, now) {
+			return fmt.Errorf("management HTTPS expiry reconciliation authority is stale or not due")
+		}
+	}
+	if operation == AutomaticReconciliation && binding.ResourceID == "management_https" {
+		active := state.ManagementHTTPS.ActiveCertificate
+		expiredReplacement := active != nil && state.ManagementHTTPS.EntryDigest == "" && state.ManagementHTTPS.CertificateExpiry != nil
+		completedCandidate := active != nil && state.ManagementHTTPS.EntryDigest != "" && active.Binding == binding.CandidateBundle
+		exactPending := state.ManagementHTTPS.ChallengePending != nil && exactCertificateChallenge(state, operation, binding)
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || !validIdentityRef(binding.PlanID) || binding.CandidateBundle == "" || binding.CandidateDigest == "" || active != nil && !expiredReplacement && !completedCandidate || state.ManagementHTTPS.ChallengePending != nil && !exactPending {
+			return fmt.Errorf("management HTTPS issuance is blocked by safety marker")
 		}
 	}
 	if operation == StartupContraction && !validStartupBinding(state, binding) {
@@ -5989,7 +6188,12 @@ func authorize(operation Type, state safety.State, binding SafetyBinding, consum
 			return fmt.Errorf("headscale renewal blocked by safety marker")
 		}
 	}
-	if operation == CertificateRenew && binding.ResourceID != "headscale" {
+	if operation == CertificateRenew && binding.ResourceID == "management_https" {
+		ownedChallenge := exactCertificateChallenge(state, operation, binding)
+		if state.GlobalClose.Phase != safety.GlobalCloseNone || state.ManagementHTTPS.ActiveCertificate == nil || state.ManagementHTTPS.CertificateExpiry != nil || state.ManagementHTTPS.ChallengePending != nil && !ownedChallenge || state.ManagementHTTPS.ActiveCertificate.Binding != binding.CandidateBundle {
+			return fmt.Errorf("management HTTPS renewal blocked by safety marker")
+		}
+	} else if operation == CertificateRenew && binding.ResourceID != "headscale" {
 		var resource *safety.ResourceSafety
 		for index := range state.Resources {
 			if state.Resources[index].ResourceID == binding.ResourceID {
@@ -6159,6 +6363,21 @@ func validExpiryProposal(operation Type, state safety.State, binding SafetyBindi
 		return binding.Deadline.Equal(deadline)
 	}
 	return false
+}
+
+func validManagementExpiryBinding(state safety.State, binding SafetyBinding, now time.Time) bool {
+	if binding.ResourceID != "" || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || !exactDigest(binding.CandidateBundle) || now.IsZero() {
+		return false
+	}
+	management := state.ManagementHTTPS
+	active := management.ActiveCertificate
+	if active == nil || active.Binding != binding.CandidateBundle || management.ChallengePending != nil {
+		return false
+	}
+	if marker := management.CertificateExpiry; marker != nil {
+		return marker.Generation == binding.ExpiryGeneration && marker.Binding == binding.CandidateBundle && marker.Deadline.Equal(binding.Deadline)
+	}
+	return binding.ExpiryGeneration == management.GenerationSequence+1 && binding.Deadline.Equal(active.NotAfter) && !now.Before(active.NotAfter)
 }
 
 func validExpiryBinding(operation Type, state safety.State, binding SafetyBinding) bool {
@@ -6608,7 +6827,8 @@ func validateJournalRecord(value JournalRecord) error {
 		}
 		exactResource := len(value.ResourceIDs) == 1 && value.Target == "resource/"+value.ResourceIDs[0]
 		exactHeadscale := len(value.ResourceIDs) == 0 && (value.Target == "headscale" || strings.HasPrefix(value.Target, "headscale/"))
-		if value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy || !exactResource && !exactHeadscale {
+		exactManagement := len(value.ResourceIDs) == 0 && value.Target == "management_https"
+		if value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != AutomaticReconciliation && value.Operation != HeadscaleDeploy || !exactResource && !exactHeadscale && !exactManagement {
 			return fmt.Errorf("certificate activation journal identity is invalid")
 		}
 		if value.RuntimeDigest != "" && (!exactHeadscale || value.Operation != CertificateRenew || value.Phase != JournalTerminal) {
@@ -7057,6 +7277,10 @@ func canonicalValueDigest(value any) (string, error) {
 }
 
 func exactRunningInstallationAuthority(before, after persist.Document, predicate func(Reservation) bool) error {
+	return exactRunningInstallationAuthorityWithReentry(before, after, false, predicate)
+}
+
+func exactRunningInstallationAuthorityWithReentry(before, after persist.Document, allowReentered bool, predicate func(Reservation) bool) error {
 	matches := 0
 	for _, key := range persist.EntryKeys(after, "intents") {
 		jobID := strings.TrimPrefix(key, "intents/")
@@ -7068,7 +7292,8 @@ func exactRunningInstallationAuthority(before, after persist.Document, predicate
 		if err != nil {
 			return fmt.Errorf("installation collection transition lacks current job: %w", err)
 		}
-		if afterIntent.Phase != PhaseLocalIntent || afterRecord.Status != jobs.StatusRunning {
+		localIntent := afterIntent.Phase == PhaseLocalIntent || allowReentered && afterIntent.Phase == PhaseReentered
+		if !localIntent || afterRecord.Status != jobs.StatusRunning {
 			continue
 		}
 		beforeIntent, err := loadReservationEntries(before.Entries, jobID)
@@ -7263,6 +7488,55 @@ func validateCredentialTransition(before, after persist.Document, oldInstallatio
 	}
 }
 
+func validateManagementHTTPSTransition(before, after persist.Document, oldInstallation, newInstallation domain.Installation) error {
+	if reflect.DeepEqual(oldInstallation.ManagementHTTPS, newInstallation.ManagementHTTPS) {
+		return nil
+	}
+	candidate := newInstallation.ManagementHTTPS
+	if candidate == nil {
+		return fmt.Errorf("management HTTPS configuration transition removed its typed authority")
+	}
+	if candidate.Phase == domain.ManagementHTTPSActive {
+		old := oldInstallation.ManagementHTTPS
+		if old != nil && old.Phase == domain.ManagementHTTPSPending {
+			if candidate.Generation != old.Generation || candidate.ACMEBinding != old.ACMEBinding || !reflect.DeepEqual(candidate.Certificate, old.Certificate) || old.CertificateBundle != nil || candidate.CertificateBundle == nil || candidate.CertificateBundle.Generation == 0 || candidate.CertificateBundle.BindingIdentity != old.ACMEBinding || candidate.LastFailureCode != "" {
+				return fmt.Errorf("management HTTPS issuance transition is not an exact pending certificate replacement")
+			}
+			return exactRunningInstallationAuthorityWithReentry(before, after, true, func(intent Reservation) bool {
+				return intent.Operation == AutomaticReconciliation && intent.Target == "management_https" && intent.SafetyBinding.ResourceID == "management_https" && intent.SafetyBinding.CandidateBundle == old.ACMEBinding && intent.SafetyBinding.CandidateDigest != ""
+			})
+		}
+		if old == nil || old.Phase != domain.ManagementHTTPSActive || candidate.Generation != old.Generation || candidate.ACMEBinding != old.ACMEBinding || !reflect.DeepEqual(candidate.Certificate, old.Certificate) || candidate.CertificateBundle == nil || old.CertificateBundle == nil || candidate.CertificateBundle.Generation != old.CertificateBundle.Generation+1 || candidate.CertificateBundle.BindingIdentity != old.CertificateBundle.BindingIdentity || candidate.LastFailureCode != "" {
+			return fmt.Errorf("management HTTPS renewal transition is not an exact active certificate replacement")
+		}
+		return exactRunningInstallationAuthorityWithReentry(before, after, true, func(intent Reservation) bool {
+			return intent.Operation == CertificateRenew && intent.Target == "management_https" && intent.SafetyBinding.ResourceID == "management_https" && intent.SafetyBinding.CandidateBundle == old.ACMEBinding
+		})
+	}
+	if candidate.Phase == domain.ManagementHTTPSExpired {
+		old := oldInstallation.ManagementHTTPS
+		if old == nil || old.Phase != domain.ManagementHTTPSActive || candidate.Generation != old.Generation || candidate.ACMEBinding != old.ACMEBinding || !reflect.DeepEqual(candidate.Certificate, old.Certificate) || !reflect.DeepEqual(candidate.CertificateBundle, old.CertificateBundle) || candidate.LastFailureCode != "certificate_expired" {
+			return fmt.Errorf("management HTTPS expiry transition is not an exact active authority contraction")
+		}
+		return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+			return intent.Operation == AutomaticReconciliation && strings.HasPrefix(intent.Target, "journal/management-https-expiry-") && intent.SafetyBinding.ExpiryGeneration != 0 && intent.SafetyBinding.CandidateBundle == old.ACMEBinding
+		})
+	}
+	if candidate.Phase != domain.ManagementHTTPSPending || candidate.Generation == 0 || candidate.CertificateBundle != nil || candidate.LastFailureCode != "" {
+		return fmt.Errorf("management HTTPS configuration transition is not a pending typed candidate")
+	}
+	if old := oldInstallation.ManagementHTTPS; old != nil && candidate.Generation != old.Generation+1 || old == nil && candidate.Generation != 1 {
+		return fmt.Errorf("management HTTPS configuration generation is not monotonic")
+	}
+	binding, err := canonicalValueDigest(*candidate)
+	if err != nil {
+		return err
+	}
+	return exactRunningInstallationAuthority(before, after, func(intent Reservation) bool {
+		return intent.Operation == ManagementHTTPSConfigure && intent.Target == string(plans.TargetInstallation) && intent.SafetyBinding.CandidateDigest == binding && intent.SafetyBinding.CandidateBundle == binding
+	})
+}
+
 func validateStaticRootTransition(before, after persist.Document, oldInstallation, newInstallation domain.Installation) error {
 	if reflect.DeepEqual(oldInstallation.StaticRoots, newInstallation.StaticRoots) {
 		return nil
@@ -7370,9 +7644,13 @@ func validateOperationStateTransitions(before, after persist.Document) error {
 	if err := validateStaticRootTransition(before, after, oldInstallation, newInstallation); err != nil {
 		return err
 	}
+	if err := validateManagementHTTPSTransition(before, after, oldInstallation, newInstallation); err != nil {
+		return err
+	}
 	oldBase, newBase := oldInstallation, newInstallation
 	oldBase.Headscale, newBase.Headscale = nil, nil
 	oldBase.Connector, newBase.Connector = nil, nil
+	oldBase.ManagementHTTPS, newBase.ManagementHTTPS = nil, nil
 	oldBase.Credentials, newBase.Credentials = nil, nil
 	oldBase.StaticRoots, newBase.StaticRoots = nil, nil
 	oldBase.Resources, newBase.Resources = nil, nil
@@ -8153,7 +8431,7 @@ func validateHeadscaleDeployBinding(operation Type, safetyBinding SafetyBinding,
 }
 
 func validateReservation(value Reservation) error {
-	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || value.SafetyBinding.ACMEBinding != "" && !exactDigest(value.SafetyBinding.ACMEBinding) || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != HeadscaleDeploy) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
+	if (value.SafetyBinding.CertificateIdentity == "") != (value.SafetyBinding.ChallengeMethod == "") || value.SafetyBinding.ACMEBinding != "" && !exactDigest(value.SafetyBinding.ACMEBinding) || (value.SafetyBinding.CertificateIdentity != "" && ((value.Operation != Publish && value.Operation != CertificateRenew && value.Operation != AutomaticReconciliation && value.Operation != HeadscaleDeploy) || !validIdentityRef(value.SafetyBinding.CertificateIdentity) || (value.SafetyBinding.ChallengeMethod != "http-01" && value.SafetyBinding.ChallengeMethod != "dns-01"))) {
 		return fmt.Errorf("operation certificate challenge binding invalid")
 	}
 	if (value.Operation == ManagedBasicRotate || value.Operation == ManagedBasicDelete) != (value.SafetyBinding.PriorFingerprint != "") || value.SafetyBinding.PriorFingerprint != "" && !exactDigest(value.SafetyBinding.PriorFingerprint) {
@@ -8200,7 +8478,7 @@ func validateReservation(value Reservation) error {
 func reservationKey(jobID string) string { return "intents/" + jobID }
 func validType(value Type) bool {
 	switch value {
-	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, AdminTokenRotate, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, HeadscaleDeploy, HeadscaleUserCreate, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorBindingSet, ConnectorLogin, ResourceCreate, ResourceUpdate, ResourceDelete, ProcessStart, ProcessStop:
+	case Publish, Unpublish, CloseAll, EmergencyCloseAll, CertificateExpiry, CertificateRenew, ManagedBasicCreate, ManagedBasicRotate, ManagedBasicDelete, StaticRootRegister, ExternalHTPasswdRegister, AdminTokenRotate, ManagementHTTPSConfigure, AutomaticReconciliation, StartupContraction, GoAccessRetirement, HeadscaleInitialize, HeadscaleDeploy, HeadscaleUserCreate, PreauthKeyCreate, PreauthKeyRevoke, DeviceExpire, ConnectorBindingSet, ConnectorLogin, ResourceCreate, ResourceUpdate, ResourceDelete, ProcessStart, ProcessStop:
 		return true
 	}
 	return false
@@ -8220,6 +8498,10 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 	case "connector":
 		if identity != "" || request.SafetyBinding.ResourceID != "" || (request.Operation != ConnectorBindingSet && request.Operation != ConnectorLogin) {
 			return fmt.Errorf("connector target authority is invalid")
+		}
+	case "management_https":
+		if identity != "" || request.Operation != CertificateRenew && request.Operation != AutomaticReconciliation || request.SafetyBinding.ResourceID != "management_https" {
+			return fmt.Errorf("management HTTPS target authority is invalid")
 		}
 	case "headscale_user", "preauth_key", "device":
 		if identity == "" || request.SafetyBinding.ResourceID != "headscale" || (request.Operation != PreauthKeyCreate && request.Operation != PreauthKeyRevoke && request.Operation != DeviceExpire) {
@@ -8261,6 +8543,13 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 		}
 		return nil
 	}
+	if request.Operation == AutomaticReconciliation && strings.HasPrefix(request.Target, "journal/management-https-expiry-") {
+		expected := SafetyBinding{ExpiryGeneration: binding.ExpiryGeneration, Deadline: binding.Deadline, CandidateBundle: binding.CandidateBundle}
+		if request.Source != AdmissionTimer || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || binding.CandidateBundle == "" || !reflect.DeepEqual(binding, expected) {
+			return fmt.Errorf("management HTTPS expiry reconciliation requires exact timer authority")
+		}
+		return nil
+	}
 	if request.Operation == CertificateExpiry {
 		expected := SafetyBinding{ExpiryGeneration: binding.ExpiryGeneration, ResourceID: binding.ResourceID, Deadline: binding.Deadline, CandidateBundle: binding.CandidateBundle}
 		if request.Source != AdmissionTimer || binding.ExpiryGeneration == 0 || binding.Deadline.IsZero() || binding.CandidateBundle == "" || !reflect.DeepEqual(binding, expected) {
@@ -8277,6 +8566,19 @@ func validateSafetyTargetBinding(request AdmitRequest) error {
 	if request.Operation == ResourceCreate && request.Source == AdmissionUI {
 		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || binding.CandidateDigest != "" && !exactDigest(binding.CandidateDigest) || binding.CandidateBundle != "" || request.OperationBinding != "" && !exactDigest(request.OperationBinding) {
 			return fmt.Errorf("authenticated resource creation binding is invalid")
+		}
+		return nil
+	}
+	if request.Operation == AutomaticReconciliation && request.Target == "management_https" {
+		expected := SafetyBinding{ResourceID: "management_https", PlanID: binding.PlanID, IntentGeneration: binding.IntentGeneration, CandidateDigest: binding.CandidateDigest, CandidateBundle: binding.CandidateBundle}
+		if request.Source != AdmissionTimer || !validIdentityRef(binding.PlanID) || !exactDigest(binding.CandidateDigest) || !exactDigest(binding.CandidateBundle) || !reflect.DeepEqual(binding, expected) {
+			return fmt.Errorf("management HTTPS issuance requires exact timer authority")
+		}
+		return nil
+	}
+	if request.Operation == ManagementHTTPSConfigure && request.Source == AdmissionUI {
+		if request.PlanID != "" || binding.PlanID != "" || binding.IntentGeneration != 0 || !exactDigest(binding.CandidateDigest) || binding.CandidateBundle != binding.CandidateDigest || request.OperationBinding != "" {
+			return fmt.Errorf("authenticated management HTTPS configuration binding is invalid")
 		}
 		return nil
 	}
@@ -8330,7 +8632,7 @@ func validateAdmissionSource(operation Type, source AdmissionSource, planID stri
 			return fmt.Errorf("runtime-guard admission is not authorized for operation")
 		}
 	case AdmissionUI:
-		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister {
+		if planID != "" || operation != HeadscaleInitialize && operation != HeadscaleUserCreate && operation != ConnectorBindingSet && operation != ResourceCreate && operation != ResourceUpdate && operation != ProcessStart && operation != ProcessStop && operation != ManagedBasicCreate && operation != StaticRootRegister && operation != ExternalHTPasswdRegister && operation != ManagementHTTPSConfigure {
 			return fmt.Errorf("authenticated UI admission is not authorized for operation")
 		}
 	default:

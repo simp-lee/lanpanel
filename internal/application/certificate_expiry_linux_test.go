@@ -25,6 +25,22 @@ type certificateExpiryTestSafety struct {
 	authority locks.Authority
 }
 
+func TestIndependentCertificateExpiryContractionStopsForConcurrentAuthority(t *testing.T) {
+	state := safety.EmptyState()
+	if independentCertificateContractionRequiresStop(state) {
+		t.Fatal("unrelated certificate expiry stop fence was requested")
+	}
+	state.Headscale.CertificateExpiry = &safety.DeadlineMarker{Generation: 1, Deadline: time.Unix(1_700_000_000, 0).UTC(), Binding: "binding"}
+	if !independentCertificateContractionRequiresStop(state) {
+		t.Fatal("Headscale expiry did not request a stop fence")
+	}
+	state = safety.EmptyState()
+	state.Resources = []safety.ResourceSafety{{ResourceID: "res_expired", CertificateExpiry: &safety.DeadlineMarker{Generation: 1, Deadline: time.Unix(1_700_000_000, 0).UTC(), Binding: "binding"}}}
+	if !independentCertificateContractionRequiresStop(state) {
+		t.Fatal("App expiry did not request a stop fence")
+	}
+}
+
 func (store certificateExpiryTestSafety) Read() (safety.State, error) { return store.state, nil }
 func (store certificateExpiryTestSafety) LockAuthority() locks.Authority {
 	return store.authority

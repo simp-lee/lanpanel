@@ -432,7 +432,7 @@ func (fixture resourceRecoveryFixture) openService() (*FixedService, error) {
 		_ = normal.Close()
 		return fail(err)
 	}
-	return &FixedService{normal: normal, manager: manager, safety: safetyStore, emergency: emergency, ownership: ownershipStore}, nil
+	return &FixedService{root: fixture.root, owner: fixture.owner, normal: normal, manager: manager, safety: safetyStore, emergency: emergency, ownership: ownershipStore}, nil
 }
 
 func (fixture resourceRecoveryFixture) acquire(t *testing.T, service *FixedService, target string) (*operations.MutationSet, *operations.MutationLease, *locks.Lease) {

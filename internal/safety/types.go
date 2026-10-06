@@ -151,6 +151,14 @@ type HeadscaleSafety struct {
 	Reactivating       *HeadscaleReactivating      `json:"reactivating,omitempty"`
 }
 
+type ManagementHTTPSSafety struct {
+	GenerationSequence uint64                      `json:"generation_sequence,omitempty"`
+	ActiveCertificate  *ActiveCertificateAuthority `json:"active_certificate,omitempty"`
+	EntryDigest        string                      `json:"entry_digest,omitempty"`
+	CertificateExpiry  *DeadlineMarker             `json:"certificate_expiry,omitempty"`
+	ChallengePending   *ChallengePending           `json:"challenge_pending,omitempty"`
+}
+
 type StopFenceKind string
 
 const (
@@ -215,15 +223,16 @@ type StopFence struct {
 }
 
 type State struct {
-	SchemaVersion     string           `json:"schema_version"`
-	Revision          uint64           `json:"revision"`
-	AuthoritySequence uint64           `json:"authority_sequence"`
-	Checksum          string           `json:"checksum,omitempty"`
-	GlobalClose       GlobalClose      `json:"global_close"`
-	StopFenceSequence uint64           `json:"stop_fence_sequence"`
-	StopFence         *StopFence       `json:"stop_fence,omitempty"`
-	Headscale         HeadscaleSafety  `json:"headscale"`
-	Resources         []ResourceSafety `json:"resources"`
+	SchemaVersion     string                `json:"schema_version"`
+	Revision          uint64                `json:"revision"`
+	AuthoritySequence uint64                `json:"authority_sequence"`
+	Checksum          string                `json:"checksum,omitempty"`
+	GlobalClose       GlobalClose           `json:"global_close"`
+	StopFenceSequence uint64                `json:"stop_fence_sequence"`
+	StopFence         *StopFence            `json:"stop_fence,omitempty"`
+	Headscale         HeadscaleSafety       `json:"headscale"`
+	ManagementHTTPS   ManagementHTTPSSafety `json:"management_https"`
+	Resources         []ResourceSafety      `json:"resources"`
 }
 
 func EmptyState() State {

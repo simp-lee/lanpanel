@@ -14,6 +14,39 @@ import (
 
 const testDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestManagementHTTPSConfigValidation(t *testing.T) {
+	installation := validPreviewInstallation()
+	installation.ManagementHTTPS = &ManagementHTTPSConfig{
+		Domain: "panel.example.test",
+		Certificate: CertificateRequest{
+			ChallengeMethod: "http-01",
+			DirectoryURL:    "https://acme.example.test/directory",
+			TermsAccepted:   true,
+		},
+		Phase:      ManagementHTTPSPending,
+		Generation: 1,
+	}
+	if err := ValidateInstallation(installation); err != nil {
+		t.Fatalf("pending management HTTPS config rejected: %v", err)
+	}
+
+	base := *installation.ManagementHTTPS
+	for name, mutate := range map[string]func(*ManagementHTTPSConfig){
+		"invalid_domain":             func(value *ManagementHTTPSConfig) { value.Domain = "*.example.test" },
+		"active_without_certificate": func(value *ManagementHTTPSConfig) { value.Phase = ManagementHTTPSActive },
+		"invalid_failure_code":       func(value *ManagementHTTPSConfig) { value.LastFailureCode = "unsafe failure" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			installation.ManagementHTTPS = &candidate
+			if err := ValidateInstallation(installation); err == nil {
+				t.Fatal("invalid management HTTPS config accepted")
+			}
+		})
+	}
+}
+
 func TestTemporaryPublicationRejectsReservedIPv4(t *testing.T) {
 	for _, address := range []string{"0.0.0.1", "192.88.99.1", "192.0.2.1", "240.0.0.1"} {
 		if err := ValidateTemporaryPublicIPv4(address); err == nil {

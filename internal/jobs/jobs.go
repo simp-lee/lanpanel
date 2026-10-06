@@ -46,6 +46,7 @@ var (
 		"exact_reconciliation_closed":                {},
 		"interrupted_lifecycle_contracted":           {},
 		"managed_basic_interrupted":                  {},
+		"management_https_expiry_interrupted":        {},
 		"managed_basic_hash_failed":                  {},
 		"managed_basic_generation_failed":            {},
 		"managed_basic_revalidation_failed":          {},

@@ -489,7 +489,7 @@ func TestTokenDeliveryMarksAttemptBeforeOutputAndNeverRedirectsSecret(t *testing
 	if err := deliverToken(store, &journal, Request{Output: &output}, token); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(output.String(), string(token)) || !strings.Contains(output.String(), ProtectedAdminTokenPath) {
+	if strings.Contains(output.String(), string(token)) || !strings.Contains(output.String(), ProtectedAdminTokenPath) || !strings.Contains(output.String(), "Management UI URL: http://127.41.42.43:52345") {
 		t.Fatalf("redirected output=%q", output.String())
 	}
 	if !journal.TokenDeliveryAttempted {

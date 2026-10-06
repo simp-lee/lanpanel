@@ -17,6 +17,7 @@ import (
 	"lanpanel/internal/session"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -900,11 +901,20 @@ func TestPlaywrightFixture(t *testing.T) {
 	controlDone := make(chan error, 1)
 	go func() { controlDone <- controlServer.Serve(controlListener) }()
 
-	fmt.Printf("LANPANEL_FIXTURE_ORIGIN=http://%s\n", authority)
+	origin := "http://" + authority
+	var tlsFixture *httptest.Server
+	if os.Getenv("LANPANEL_PLAYWRIGHT_HTTPS_FIXTURE") == "1" {
+		tlsFixture = httptest.NewTLSServer(server)
+		origin = tlsFixture.URL
+		_ = listener.Close()
+	}
+	fmt.Printf("LANPANEL_FIXTURE_ORIGIN=%s\n", origin)
 	fmt.Printf("LANPANEL_FIXTURE_CONTROL=http://%s\n", controlListener.Addr().String())
-	serveErr := server.Serve()
-	if !errors.Is(serveErr, http.ErrServerClosed) {
-		t.Fatal(serveErr)
+	if tlsFixture == nil {
+		serveErr := server.Serve()
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Fatal(serveErr)
+		}
 	}
 	select {
 	case <-shutdownResponded:
@@ -919,5 +929,8 @@ func TestPlaywrightFixture(t *testing.T) {
 	cancelControl()
 	if err := <-controlDone; !errors.Is(err, http.ErrServerClosed) {
 		t.Fatal(err)
+	}
+	if tlsFixture != nil {
+		tlsFixture.Close()
 	}
 }

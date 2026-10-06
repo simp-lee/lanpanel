@@ -71,15 +71,23 @@ The signed Host Capability Contract is not an Ubuntu/Debian version allowlist. A
 
 ### 3. Open the Management UI
 
-The installer prints an installation-specific `127/8` address and high port, and creates an administrator token. With a TTY, the token is shown once; without a TTY, only the path to a root-protected token file is shown. Save it as instructed.
+The installer prints an installation-specific `127/8` address and high port, and creates an administrator token for the first Management UI login. With a TTY, the token is shown once; without a TTY, only the path to a root-protected token file is shown. Save it securely and rotate it after first login if needed.
 
-The Management UI listens only on the local loopback interface and is not directly exposed to the public internet. For remote administration, use an SSH tunnel to the **exact address and port** printed by the installer; do not replace it with `localhost`:
+The Management UI listens only on the local loopback interface and is not directly exposed to the public internet. To retrieve the Management UI access information later without exposing the token, run:
 
 ```sh
-ssh -N -L 8080:<address shown by the installer>:<port shown by the installer> <user>@<host>
+sudo lanpanel info
 ```
 
-Then open `http://127.0.0.1:8080` in a browser on your computer. There is no CLI, terminal, shell, or file manager for day-to-day application management. The UI runs as a non-root process; privileged operations cross a protected typed helper boundary.
+For remote administration, bind the SSH tunnel to the **same local address and port** as the exact authority; do not replace it with `localhost` because the UI validates the HTTP `Host` header:
+
+```sh
+ssh -N -L <address>:<port>:<address>:<port> <user>@<host>
+```
+
+Then open `http://<address>:<port>/` in a browser on your computer. If the token must be replaced, run `sudo lanpanel token reset` and save the one-time token output. There is no CLI, terminal, shell, or file manager for day-to-day application management. The UI runs as a non-root process; privileged operations cross a protected typed helper boundary.
+
+Optional Management HTTPS is configured after login under **Management Access**; the initial save is a typed pending request, not public exposure. The exact loopback address and SSH tunnel remain the recovery authority. HTTPS is only eligible after the dedicated ACME, certificate, safety, and Nginx activation checks complete.
 
 ## Daily use
 
@@ -94,6 +102,10 @@ Then open `http://127.0.0.1:8080` in a browser on your computer. There is no CLI
 Domain HTTPS uses HTTP-01 or DNS-01 with Cloudflare, Route53, DigitalOcean, Google Cloud, or Tencent Cloud. For DNS-01, enter the exact provider code `cloudflare`, `route53`, `digitalocean`, `gcloud`, or `tencentcloud` in the Management UI. Set the ACME contact in the authenticated Management UI; it is checked again before the first certificate request and is not requested during installation or written to command-line arguments or logs.
 
 The Management UI does not provide remote process control for `tailnet_http`: it stores a fixed peer/source/port and observes connector, route, and target evidence before publication. It does not deploy files, run a remote shell, or promise to terminate an existing remote service. Unpublish, device expiry, and pre-authentication-key revocation prevent new normal-path use where applicable, but existing TCP/WebSocket connections may persist; LanPanel does not promise immediate termination.
+
+For a credential-free local ACME protocol check, run `make pebble-dns01`. It temporarily prepares pinned Pebble and `pebble-challtestsrv` binaries plus the release-locked Lego archive, performs a real DNS-01 order and certificate issuance against the local fake CA, and removes the temporary tools afterward. Set `PEBBLE_BIN`, `CHALLTESTSRV_BIN`, or `LEGO_BIN` to reuse an existing executable. This does not replace installed-host or staging-provider validation.
+
+For a real local Nginx HTTPS graph check, run `make nginx-https-integration`; it downloads the Debian Nginx packages into a temporary root and removes them afterward without a system installation.
 
 For repeatable browser checks, the repository provides a fixture-only gate. From a checkout, prepare Node dependencies and the pinned Chromium browser, then run `make playwright-fixture-gate` (`npm ci`, followed by `npx playwright install chromium`). The fixture uses in-memory typed resources, status, probes, Jobs, and side-effect counters; it does not qualify real persistence, Nginx, processes, DNS, ACME, Tailscale, or remote commands.
 

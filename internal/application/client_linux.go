@@ -74,8 +74,12 @@ type ManagedBasicPayload struct {
 	Confirmation string `json:"confirmation"`
 }
 type (
-	DomainStatusPayload struct{}
-	StaticRootPayload   struct {
+	DomainStatusPayload    struct{}
+	ManagementHTTPSPayload struct {
+		Config       domain.ManagementHTTPSConfig `json:"config"`
+		Confirmation string                       `json:"confirmation"`
+	}
+	StaticRootPayload struct {
 		Path         string `json:"path"`
 		Confirmation string `json:"confirmation"`
 	}
@@ -105,16 +109,19 @@ type RotationResult struct {
 	JobID       string
 	Token       []byte
 }
-type ContractionResult struct {
-	JobID             string `json:"job_id,omitempty"`
-	JobResult         string `json:"job_result,omitempty"`
-	PlanID            string `json:"plan_id,omitempty"`
-	Emergency         bool   `json:"emergency,omitempty"`
-	Outcome           string `json:"outcome"`
-	AccessClosed      bool   `json:"access_closed"`
-	SharedIngressDown bool   `json:"shared_ingress_down"`
-	AccessMayRemain   bool   `json:"access_may_remain"`
-}
+type (
+	ManagementHTTPSActionResult = ManagementHTTPSResult
+	ContractionResult           struct {
+		JobID             string `json:"job_id,omitempty"`
+		JobResult         string `json:"job_result,omitempty"`
+		PlanID            string `json:"plan_id,omitempty"`
+		Emergency         bool   `json:"emergency,omitempty"`
+		Outcome           string `json:"outcome"`
+		AccessClosed      bool   `json:"access_closed"`
+		SharedIngressDown bool   `json:"shared_ingress_down"`
+		AccessMayRemain   bool   `json:"access_may_remain"`
+	}
+)
 
 func HelperService(client HelperClient) (*Service, error) {
 	return HelperServiceWithResourcesAndSeams(client, nil, ReadModelSeams{})
@@ -164,6 +171,18 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 			return Result{}, helperFailure(err, "admin token rotation failed")
 		}
 		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: RotationResult{reply.Digest, reply.Action.JobID, reply.Secret}}, nil
+	})
+	managementHTTPSAction, _ := RegisterAction(domain.OperationManagementHTTPSConfigure, ManagementHTTPSPayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
+		payload := call.Payload.(ManagementHTTPSPayload)
+		reply, err := client(ctx, helperproto.OperationManagementHTTPSConfigure, helperproto.ActionPayload{Operation: string(call.Operation), TargetKind: string(call.Target.Kind), ActorIdentity: actor.Identity, ActorGeneration: actor.Generation, Confirmation: payload.Confirmation, ManagementHTTPS: &payload.Config})
+		if err != nil {
+			return Result{}, helperFailure(err, "management HTTPS configuration failed")
+		}
+		if reply.Action == nil || reply.Action.JobID == "" || len(reply.Secret) != 0 {
+			clear(reply.Secret)
+			return Result{}, fmt.Errorf("management HTTPS configuration failed")
+		}
+		return Result{Operation: call.Operation, Target: call.Target, JobID: reply.Action.JobID, Payload: ManagementHTTPSActionResult{JobID: reply.Action.JobID, JobResult: reply.Action.JobResult, Phase: domain.ManagementHTTPSPending, Domain: payload.Config.Domain}}, nil
 	})
 	managedBasicAction := func(ctx context.Context, actor Actor, call Call) (Result, error) {
 		payload := call.Payload.(ManagedBasicPayload)
@@ -263,7 +282,7 @@ func helperServiceComplete(client HelperClient, resourceClient ResourceHelperCli
 	}
 	closeAll, _ := RegisterAction("close_all", ConfirmationPayload{}, true, false, contractionAction)
 	unpublish, _ := RegisterAction("unpublish", ConfirmationPayload{}, true, false, contractionAction)
-	registrations := []Registration{plan, rotate, basicCreate, basicRotate, basicDelete, staticRootAction, externalHTPasswdAction, domainStatusAction, closeAll, unpublish}
+	registrations := []Registration{plan, rotate, managementHTTPSAction, basicCreate, basicRotate, basicDelete, staticRootAction, externalHTPasswdAction, domainStatusAction, closeAll, unpublish}
 	if resourceClient != nil {
 		headscaleAction, _ := RegisterAction(domain.OperationHeadscaleInitialize, HeadscaleInitializePayload{}, true, false, func(ctx context.Context, actor Actor, call Call) (Result, error) {
 			payload := call.Payload.(HeadscaleInitializePayload)

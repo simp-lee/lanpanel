@@ -362,9 +362,29 @@ func TestApplicationPayloadIsOperationBound(t *testing.T) {
 	}
 }
 
+func TestManagementHTTPSConfigurePayloadAndResponseAreReachable(t *testing.T) {
+	now := time.Now().UTC()
+	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-management-https", Operation: OperationManagementHTTPSConfigure, Target: "installation", IntentGeneration: 1, Deadline: now.Add(time.Minute), Action: &ActionPayload{
+		Operation: string(OperationManagementHTTPSConfigure), TargetKind: "installation", ActorIdentity: "session", ActorGeneration: 1, Confirmation: "configure",
+		ManagementHTTPS: &domain.ManagementHTTPSConfig{Domain: "management.example.com", Generation: 1, Phase: domain.ManagementHTTPSPending, Certificate: domain.CertificateRequest{ChallengeMethod: "http-01", DirectoryURL: "https://acme.example.com/directory", TermsAccepted: true}},
+	}}
+	var err error
+	request.InputDigest, err = ApplicationInputDigest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateRequest(request, now); err != nil {
+		t.Fatalf("management HTTPS request rejected: %v", err)
+	}
+	response := Response{SchemaVersion: SchemaVersion, RequestID: request.RequestID, Code: ResponseSucceeded, ResultDigest: digest("management.example.com"), Action: &ActionResult{JobID: "job_" + strings.Repeat("a", 64), JobResult: "succeeded", Operation: string(OperationManagementHTTPSConfigure), TargetKind: "installation"}}
+	if err := ValidateResponse(OperationManagementHTTPSConfigure, response); err != nil {
+		t.Fatalf("management HTTPS response rejected: %v", err)
+	}
+}
+
 func TestFinalCallerOperationMatrixIsClosed(t *testing.T) {
 	expected := []Operation{
-		"application_plan", "admin_token_verify", "admin_token_source_status", "management_profile_status",
+		"application_plan", "admin_token_verify", "admin_token_source_status", "management_profile_status", "management_https_configure",
 		"admin_token_rotate", "admin_token_rotate_reconcile", "certificate_renew", "managed_basic_generate",
 		"managed_basic_delete", "static_root_register", "external_htpasswd_register", "domain_status",
 		"contraction_close", "startup_contraction", "headscale_initialize", "headscale_deploy",
@@ -383,7 +403,7 @@ func TestFinalCallerOperationMatrixIsClosed(t *testing.T) {
 			t.Fatalf("removed helper operation %q remains reachable", removed)
 		}
 	}
-	if Authorized(CallerTimer, OperationApplicationPlan) || Authorized(Caller("foreign"), OperationContractionClose) || !Authorized(CallerTimer, OperationCertificateRenew) || !Authorized(CallerRecovery, OperationStartupContraction) {
+	if !Authorized(CallerCLI, OperationApplicationPlan) || !Authorized(CallerCLI, OperationAdminTokenRotate) || Authorized(CallerCLI, OperationAdminTokenSource) || Authorized(CallerCLI, OperationContractionClose) || Authorized(CallerTimer, OperationApplicationPlan) || Authorized(Caller("foreign"), OperationContractionClose) || !Authorized(CallerTimer, OperationCertificateRenew) || !Authorized(CallerRecovery, OperationStartupContraction) {
 		t.Fatal("caller crossed the fixed final helper operation matrix")
 	}
 	request := Request{SchemaVersion: SchemaVersion, RequestID: "request-one", Operation: OperationManagementProfile, Target: strings.Repeat("x", 257), IntentGeneration: 1, Deadline: time.Now().Add(time.Minute), InputDigest: digest("input")}

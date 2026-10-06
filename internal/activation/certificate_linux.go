@@ -14,6 +14,7 @@ import (
 	"lanpanel/internal/closure"
 	"lanpanel/internal/nginx"
 	"net"
+	"reflect"
 	"time"
 )
 
@@ -85,6 +86,34 @@ func restoreCertificateRuntime(ctx context.Context, restorePointer func(context.
 		return err
 	}
 	return probe(ctx)
+}
+
+func (host Host) StartCertificate(ctx context.Context, authority ReloadAuthority) (closure.RuntimeSnapshot, error) {
+	if host.Launcher == nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate start runtime authority incomplete")
+	}
+	manifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	if err := authority.CheckRuntime(); err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	if err := authority.Guard(manifest); err != nil {
+		return closure.RuntimeSnapshot{}, fmt.Errorf("certificate start rejected: %w", err)
+	}
+	if err := host.run(ctx, child.ProfileSystemctlNginxStart); err != nil {
+		return closure.RuntimeSnapshot{}, err
+	}
+	currentManifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil || !reflect.DeepEqual(currentManifest, manifest) {
+		return closure.RuntimeSnapshot{}, errors.Join(err, fmt.Errorf("nginx graph changed during certificate start"))
+	}
+	snapshot, err := host.WaitForPriorWorkers(ctx, currentManifest, nil)
+	if err != nil {
+		return snapshot, fmt.Errorf("nginx unavailable after certificate start: %w", err)
+	}
+	return snapshot, nil
 }
 
 func (host Host) ReloadCertificate(ctx context.Context, authority ReloadAuthority) (closure.RuntimeSnapshot, error) {
@@ -168,8 +197,12 @@ func (host Host) VerifyServedCertificate(ctx context.Context, serverName, finger
 }
 
 func probeServedCertificate(ctx context.Context, serverName, expectedFingerprint string) error {
+	return probeServedCertificateAt(ctx, "127.0.0.1:443", serverName, expectedFingerprint)
+}
+
+func probeServedCertificateAt(ctx context.Context, address, serverName, expectedFingerprint string) error {
 	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}}
-	connection, err := dialer.DialContext(ctx, "tcp", "127.0.0.1:443")
+	connection, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return fmt.Errorf("probe served certificate: %w", err)
 	}

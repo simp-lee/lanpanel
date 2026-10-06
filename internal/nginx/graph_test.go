@@ -52,7 +52,7 @@ func TestConfigIdentitySurvivesPartialTeardown(t *testing.T) {
 	if err := os.RemoveAll(paths.StateRoot); err != nil {
 		t.Fatal(err)
 	}
-	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, TemporaryDirectory} {
+	for _, directory := range []string{AppsDirectory, ChallengesDirectory, ControlDirectory, ManagementDirectory, TemporaryDirectory} {
 		if err := os.RemoveAll(filepath.Join(paths.ConfigRoot, directory)); err != nil {
 			t.Fatal(err)
 		}
@@ -334,6 +334,65 @@ func TestReloadGuardAllowsExactActivatingDomainAndRejectsStalePlan(t *testing.T)
 	}
 }
 
+func TestManagementEntryRendersExactHostSNIAndOriginBoundary(t *testing.T) {
+	entry := Entry{
+		Kind:       EntryManagement,
+		Relative:   ManagementDirectory + "/management.conf",
+		Digest:     testDigest("management"),
+		Domains:    []string{"panel.example.test"},
+		Listeners:  []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"},
+		Generation: 1,
+		Management: &ManagementSite{Host: "panel.example.test", CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.current", RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", UpstreamNetwork: "tcp", UpstreamAddress: "127.15.177.99:53639", WebSocket: true},
+	}
+	data, err := RenderEntry(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, fragment := range []string{"if ($http_host != \"panel.example.test\")", "if ($ssl_server_name != \"panel.example.test\")", "proxy_set_header Origin $http_origin;", "proxy_set_header X-LanPanel-CSRF $http_x_lanpanel_csrf;", "proxy_pass http://127.15.177.99:53639;"} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("management render missing %q:\n%s", fragment, text)
+		}
+	}
+	if strings.Contains(text, "0.0.0.0") {
+		t.Fatalf("management upstream leaked a wildcard address: %s", text)
+	}
+}
+
+func TestManagementEntryRejectsNonLoopbackUpstream(t *testing.T) {
+	entry := Entry{
+		Kind:       EntryManagement,
+		Relative:   ManagementDirectory + "/management.conf",
+		Digest:     testDigest("management"),
+		Domains:    []string{"panel.example.test"},
+		Listeners:  []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"},
+		Generation: 1,
+		Management: &ManagementSite{Host: "panel.example.test", CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.current", RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", UpstreamNetwork: "tcp", UpstreamAddress: "10.0.0.1:53639", WebSocket: true},
+	}
+	if _, err := RenderEntry(entry); err == nil {
+		t.Fatal("management entry accepted non-loopback upstream")
+	}
+}
+
+func TestManagementGuardRequiresIndependentActiveAuthority(t *testing.T) {
+	_, manifest := installTestGraph(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	entry := Entry{Kind: EntryManagement, Relative: ManagementDirectory + "/management.conf", Digest: testDigest("management"), Domains: []string{"panel.example.test"}, Listeners: []string{"tcp:0.0.0.0:443", "tcp:0.0.0.0:80", "tcp:[::]:443", "tcp:[::]:80"}, Generation: 1, Management: &ManagementSite{Host: "panel.example.test", CertificatePointer: "/var/lib/lanpanel/certificates/active/cert_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.current", RejectionAuditPath: "/var/log/lanpanel/nginx-rejections.log", UpstreamNetwork: "tcp", UpstreamAddress: "127.15.177.99:53639", WebSocket: true}}
+	manifest.Entries = []Entry{entry}
+	certificate := &domain.CertificateBundleIdentity{PointerIdentity: entry.Management.CertificatePointer, Generation: 1, Fingerprint: testDigest("certificate"), BindingIdentity: "management-binding", NotAfter: now.Add(time.Hour).Format(time.RFC3339), LastTrustedWall: now.Add(-time.Minute).Format(time.RFC3339)}
+	installation := &domain.Installation{InstallationID: manifest.InstallationID, Management: domain.ManagementAuthority{Address: "127.15.177.99", Port: 53639}, ManagementHTTPS: &domain.ManagementHTTPSConfig{Domain: "panel.example.test", Phase: domain.ManagementHTTPSActive, Generation: 1, CertificateBundle: certificate}}
+	state := safety.EmptyState()
+	state.ManagementHTTPS = safety.ManagementHTTPSSafety{GenerationSequence: 1, EntryDigest: entry.Digest, ActiveCertificate: &safety.ActiveCertificateAuthority{Generation: 1, Fingerprint: certificate.Fingerprint, Binding: "management-binding", LastTrustedWall: now.Add(-time.Minute), NotAfter: now.Add(time.Hour)}}
+	input := GuardInput{Action: GuardStart, Manifest: manifest, Safety: state, Installation: installation, Now: now}
+	if decision := Guard(input); !decision.Allowed {
+		t.Fatalf("exact management authority rejected: %#v", decision)
+	}
+	input.Safety.ManagementHTTPS.EntryDigest = testDigest("stale")
+	if decision := Guard(input); decision.Allowed {
+		t.Fatalf("stale management authority was allowed: %#v", decision)
+	}
+}
+
 func TestBasicStaticRoutesRenderAnonymousAndAuthenticatedBoundaries(t *testing.T) {
 	entry := Entry{
 		Kind:       EntryApp,
@@ -390,7 +449,7 @@ func installTestGraph(t *testing.T) (Paths, Manifest) {
 	t.Helper()
 	root := t.TempDir()
 	paths := Paths{ConfigRoot: filepath.Join(root, "config"), StateRoot: filepath.Join(root, "state"), AuditPath: filepath.Join(root, "audit"), CertificatePath: filepath.Join(root, "default.crt"), PrivateKeyPath: filepath.Join(root, "default.key"), PIDPath: filepath.Join(root, "nginx.pid")}
-	for _, directory := range []string{paths.ConfigRoot, paths.StateRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory)} {
+	for _, directory := range []string{paths.ConfigRoot, paths.StateRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, ManagementDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory)} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}

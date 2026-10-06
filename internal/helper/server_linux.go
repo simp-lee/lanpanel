@@ -83,6 +83,10 @@ func ManagementProfileHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationManagementProfile, r, e)
 }
 
+func ManagementHTTPSConfigureHandler(r Revalidator, e Executor) Registration {
+	return newRegistration(helperproto.OperationManagementHTTPSConfigure, r, e)
+}
+
 func AdminTokenRotateHandler(r Revalidator, e Executor) Registration {
 	return newRegistration(helperproto.OperationAdminTokenRotate, r, e)
 }
@@ -411,6 +415,8 @@ func (server *Server) writeFailure(connection *net.UnixConn, operation helperpro
 func (server *Server) callerFor(credential unix.Ucred) (helperproto.Caller, bool) {
 	identity := PeerIdentity{UID: credential.Uid, GID: credential.Gid}
 	switch identity {
+	case PeerIdentity{UID: 0, GID: 0}:
+		return helperproto.CallerCLI, true
 	case server.identities.UI:
 		return helperproto.CallerUI, true
 	case server.identities.Timer:

@@ -144,6 +144,9 @@ func BuildClaims(installation domain.Installation) ([]Claim, error) {
 	}
 	managementOwner := installationOwner + ":management"
 	claims = append(claims, Claim{Kind: KindListener, Value: listenerValue("tcp", installation.Management.Port), Owner: managementOwner})
+	if installation.ManagementHTTPS != nil {
+		claims = append(claims, Claim{Kind: KindExactDomain, Value: installation.ManagementHTTPS.Domain, Owner: managementOwner})
+	}
 	for _, path := range installation.Management.ManagedPaths {
 		claims = append(claims, Claim{Kind: KindManagedPath, Value: path, Owner: managementOwner})
 	}

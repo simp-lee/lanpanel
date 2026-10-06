@@ -19,6 +19,9 @@ func Validate(state State) error {
 	if err := validateHeadscale(state.Headscale); err != nil {
 		return err
 	}
+	if err := validateManagementHTTPS(state.ManagementHTTPS); err != nil {
+		return err
+	}
 	seen := map[string]struct{}{}
 	for index, resource := range state.Resources {
 		if _, duplicate := seen[resource.ResourceID]; duplicate {
@@ -87,6 +90,36 @@ func validateHeadscale(headscale HeadscaleSafety) error {
 	}
 	if headscale.ChallengePending != nil && headscale.Reactivating != nil {
 		return fmt.Errorf("headscale challenge and reactivation identities are mutually exclusive")
+	}
+	return nil
+}
+
+func validateManagementHTTPS(value ManagementHTTPSSafety) error {
+	if maximumGeneration(managementHTTPSGenerations(value)) > value.GenerationSequence {
+		return fmt.Errorf("management HTTPS generation exceeds its monotonic sequence")
+	}
+	entrylessExpired := value.ActiveCertificate != nil && value.EntryDigest == "" && value.CertificateExpiry != nil
+	if (value.ActiveCertificate == nil) != (value.EntryDigest == "") && !entrylessExpired || value.EntryDigest != "" && !isDigest(value.EntryDigest) {
+		return fmt.Errorf("management HTTPS entry authority invalid")
+	}
+	if value.ActiveCertificate != nil {
+		active := value.ActiveCertificate
+		if active.Generation == 0 || !isDigest(active.Fingerprint) || !validRef(active.Binding) || active.NotAfter.IsZero() || active.LastTrustedWall.IsZero() || !active.NotAfter.After(active.LastTrustedWall) {
+			return fmt.Errorf("management HTTPS active certificate authority invalid")
+		}
+	}
+	if value.CertificateExpiry != nil {
+		if err := validateDeadlineMarker(*value.CertificateExpiry); err != nil {
+			return fmt.Errorf("management HTTPS certificate expiry: %w", err)
+		}
+		if value.ActiveCertificate == nil || value.CertificateExpiry.Binding != value.ActiveCertificate.Binding {
+			return fmt.Errorf("management HTTPS certificate expiry lacks active authority")
+		}
+	}
+	if value.ChallengePending != nil {
+		if err := validateChallenge(*value.ChallengePending); err != nil {
+			return fmt.Errorf("management HTTPS challenge: %w", err)
+		}
 	}
 	return nil
 }
@@ -509,6 +542,20 @@ func resourceGenerations(resource ResourceSafety) map[string]uint64 {
 	}
 	if resource.Reactivating != nil {
 		values["reactivating"] = resource.Reactivating.Generation
+	}
+	return values
+}
+
+func managementHTTPSGenerations(value ManagementHTTPSSafety) map[string]uint64 {
+	values := map[string]uint64{}
+	if value.ActiveCertificate != nil {
+		values["active_certificate"] = value.ActiveCertificate.Generation
+	}
+	if value.CertificateExpiry != nil {
+		values["certificate_expiry"] = value.CertificateExpiry.Generation
+	}
+	if value.ChallengePending != nil {
+		values["challenge_pending"] = value.ChallengePending.Generation
 	}
 	return values
 }

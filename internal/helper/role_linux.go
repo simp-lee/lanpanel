@@ -128,13 +128,18 @@ func RunRole(args []string) error {
 	var tokenMu sync.Mutex
 	contractionPlans := newEmergencyPlanStore()
 	applicationHandler := ApplicationPlanHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
-		if caller != helperproto.CallerUI || request.Action == nil {
+		cliAllowed := caller == helperproto.CallerCLI && request.Action != nil && request.Action.Operation == "admin_token_rotate"
+		callerAllowed := caller == helperproto.CallerUI || cliAllowed
+		if request.Action == nil || request.Target != "installation" || !callerAllowed {
 			return fmt.Errorf("application caller invalid")
 		}
 		return nil
-	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+	}, func(ctx context.Context, caller helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("application request carried secret")
+		}
+		if caller == helperproto.CallerCLI && request.Action.Operation != "admin_token_rotate" {
+			return ExecutionResult{}, fmt.Errorf("CLI application operation is unauthorized")
 		}
 		if request.Action.Operation == "close_all" || request.Action.Operation == "unpublish" {
 			service, normalErr := application.OpenFixed()
@@ -191,7 +196,7 @@ func RunRole(args []string) error {
 		return ExecutionResult{ResultDigest: request.InputDigest, Action: &helperproto.ActionResult{PlanID: plan.ID, Confirmation: plan.NonceDigest, Operation: plan.Operation, TargetKind: string(plan.Target.Kind), TargetID: plan.Target.ID, ExposureSummary: plan.ExposureSummary, Prerequisites: plan.Prerequisites, ExpiresAt: plan.ExpiresAt}}, nil
 	})
 	authRevalidate := func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
-		if caller != helperproto.CallerUI || request.Target != "installation" {
+		if (caller != helperproto.CallerUI && caller != helperproto.CallerCLI) || request.Target != "installation" {
 			return fmt.Errorf("admin token caller is unauthorized")
 		}
 		return nil
@@ -1415,6 +1420,22 @@ func RunRole(args []string) error {
 	}, func(ctx context.Context, _ helperproto.Caller, _ helperproto.Request, _ *helperproto.Secret) (ExecutionResult, error) {
 		return executeCertificateTimer(ctx)
 	})
+	managementHTTPSHandler := ManagementHTTPSConfigureHandler(func(_ context.Context, caller helperproto.Caller, request helperproto.Request) error {
+		if caller != helperproto.CallerUI || request.Target != "installation" || request.Action == nil || request.Action.ManagementHTTPS == nil || request.Action.Confirmation != "configure" {
+			return fmt.Errorf("management HTTPS configuration caller unauthorized")
+		}
+		return nil
+	}, func(ctx context.Context, _ helperproto.Caller, request helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
+		if secret != nil || request.Action == nil || request.Action.ManagementHTTPS == nil {
+			return ExecutionResult{}, fmt.Errorf("management HTTPS configuration payload invalid")
+		}
+		actor := fmt.Sprintf("ui/%s/generation/%d", request.Action.ActorIdentity, request.Action.ActorGeneration)
+		result, err := application.ConfigureManagementHTTPS(ctx, *request.Action.ManagementHTTPS, actor)
+		if err != nil {
+			return mutationExecutionFailure(err)
+		}
+		return ExecutionResult{ResultDigest: digestString(result.Domain), Action: &helperproto.ActionResult{JobID: result.JobID, JobResult: result.JobResult, Operation: string(domain.OperationManagementHTTPSConfigure), TargetKind: "installation"}}, nil
+	})
 	profileHandler := ManagementProfileHandler(authRevalidate, func(_ context.Context, _ helperproto.Caller, _ helperproto.Request, secret *helperproto.Secret) (ExecutionResult, error) {
 		if secret != nil {
 			return ExecutionResult{}, fmt.Errorf("management profile request carried secret")
@@ -1441,7 +1462,7 @@ func RunRole(args []string) error {
 		}
 		return fmt.Errorf("startup recovery is incomplete")
 	}
-	server, err := NewServer(config.Identities, []Registration{applicationHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, headscaleReadHandler, headscaleMutationHandler, preauthPlanHandler, preauthCreateHandler, connectorMutationHandler, connectorReadHandler, connectorPlanHandler, connectorLoginHandler, resourceDeleteHandler, productReadHandler, resourceMutationHandler, resourceMutationSecretHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, headscaleDeployHandler, headscaleReissueHandler, renewalHandler, profileHandler}, Options{MutationGate: mutationGate})
+	server, err := NewServer(config.Identities, []Registration{applicationHandler, verifyHandler, sourceHandler, rotateHandler, reconcileHandler, contractionHandler, startupHandler, headscaleHandler, headscaleReadHandler, headscaleMutationHandler, preauthPlanHandler, preauthCreateHandler, connectorMutationHandler, connectorReadHandler, connectorPlanHandler, connectorLoginHandler, resourceDeleteHandler, productReadHandler, resourceMutationHandler, resourceMutationSecretHandler, processHandler, publicationHandler, managedBasicHandler, managedBasicDeleteHandler, staticRootHandler, externalHTPasswdHandler, domainStatusHandler, headscaleDeployHandler, headscaleReissueHandler, renewalHandler, managementHTTPSHandler, profileHandler}, Options{MutationGate: mutationGate})
 	if err != nil {
 		return err
 	}
@@ -1899,6 +1920,14 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		_ = service.Close()
 		return independent(decisionErr)
 	}
+	managementDecision, decisionErr := renewal.EvaluateManagementHTTPS(now, 30*24*time.Hour, installation.ManagementHTTPS, state)
+	if decisionErr != nil {
+		_ = service.Close()
+		return independent(decisionErr)
+	}
+	if state.ManagementHTTPS.CertificateExpiry != nil {
+		managementDecision = renewal.DecisionContract
+	}
 	if state.GlobalClose.Phase == safety.GlobalCloseNone && state.Headscale.CertificateExpiry != nil {
 		headscaleDecision = renewal.DecisionContract
 	}
@@ -1925,6 +1954,24 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		return independent(err)
 	}
 	summary := strings.Builder{}
+	if managementDecision == renewal.DecisionContract {
+		if err := application.ContractExpiredManagementHTTPS(ctx, now); err != nil {
+			return independent(err)
+		}
+		summary.WriteString("management_https:contracted;")
+	} else if managementDecision == renewal.DecisionRenew {
+		fingerprint, renewErr := executeManagementHTTPSRenewal(ctx)
+		if renewErr != nil {
+			return independent(renewErr)
+		}
+		fmt.Fprintf(&summary, "management_https:renewed:%s;", fingerprint)
+	} else if application.ManagementHTTPSIssueDue(installation.ManagementHTTPS, state) {
+		fingerprint, issueErr := executeManagementHTTPSIssue(ctx)
+		if issueErr != nil {
+			return independent(issueErr)
+		}
+		fmt.Fprintf(&summary, "management_https:issued:%s;", fingerprint)
+	}
 	switch headscaleDecision {
 	case renewal.DecisionContract:
 		if err := application.ContractExpiredHeadscaleCertificate(ctx, now); err != nil {
@@ -1959,6 +2006,54 @@ func executeCertificateTimer(ctx context.Context) (ExecutionResult, error) {
 		break
 	}
 	return ExecutionResult{ResultDigest: digestString(summary.String())}, nil
+}
+
+func executeManagementHTTPSIssue(ctx context.Context) (string, error) {
+	execution, err := application.BeginManagementHTTPSIssue(ctx)
+	return executeManagementHTTPSExecution(ctx, execution, err, true)
+}
+
+func executeManagementHTTPSRenewal(ctx context.Context) (string, error) {
+	execution, err := application.BeginManagementHTTPSRenew(ctx)
+	return executeManagementHTTPSExecution(ctx, execution, err, false)
+}
+
+func executeManagementHTTPSExecution(ctx context.Context, execution *application.CertificateExecution, err error, issue bool) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	defer func(ignore func() error) { _ = ignore() }(execution.Close)
+	abort := func(cause error) error { return execution.Abort(context.WithoutCancel(ctx), cause) }
+	stageIdentity := child.Identity{UID: execution.StageUID, GID: execution.StageGID, Chroot: "/var/lib/lanpanel/certificates/chroot/" + execution.Challenge.Safety.CertificateIdentity}
+	if err := execution.ActivateChallenge(ctx); err != nil {
+		return "", abort(err)
+	}
+	result, runErr := execution.RunRemote(ctx, stageIdentity.UID, stageIdentity.GID)
+	if err := execution.TerminalizeChild(ctx, result, runErr); err != nil {
+		return "", abort(err)
+	}
+	if runErr != nil {
+		return "", abort(runErr)
+	}
+	material, err := execution.LoadIssued(time.Now().UTC())
+	if err != nil {
+		return "", abort(err)
+	}
+	bundle, err := certificates.StageIssued(ctx, certificates.FixedBundlesRoot, execution.Challenge.Safety.CertificateIdentity, execution.BundleGeneration, execution.Child.InputDigest, material, filetxn.Owner{UID: stageIdentity.UID, GID: stageIdentity.GID}, time.Now().UTC(), func(identity certificates.Identity) error { return execution.AuthorizeStagedCertificate(ctx, identity) })
+	if err != nil {
+		return "", abort(err)
+	}
+	var record jobs.Record
+	if issue {
+		record, err = execution.CompleteManagementHTTPSIssue(ctx, bundle)
+	} else {
+		record, err = execution.CompleteRenewal(ctx, bundle)
+	}
+	if err != nil {
+		return "", abort(err)
+	}
+	_ = record
+	return bundle.Fingerprint, nil
 }
 
 func executeCertificateRenewal(ctx context.Context, resourceID string) (string, error) {

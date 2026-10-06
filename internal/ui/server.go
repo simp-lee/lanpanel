@@ -311,8 +311,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	securityHeaders(writer)
+	if s.isHTTPSProxyRequest(request) {
+		writer.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	}
 	actionRoute := request.Method == http.MethodPost && strings.HasPrefix(request.URL.Path, "/api/actions/")
-	if request.Host != s.config.Authority || request.URL.RawQuery != "" && !actionRoute || request.URL.RawPath != "" {
+	if !s.isHTTPSProxyRequest(request) && request.Host != s.config.Authority || request.URL.RawQuery != "" && !actionRoute || request.URL.RawPath != "" {
 		reject(writer, http.StatusMisdirectedRequest)
 		return
 	}
@@ -323,7 +326,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	case request.Method == http.MethodGet && request.URL.Path == "/":
 		s.shell(writer, request)
 	case request.Method == http.MethodGet && request.URL.Path == appCSSPath:
-		if presentOriginInvalid(request, s.origin()) {
+		if presentOriginInvalid(request, s.originFor(request)) {
 			reject(writer, http.StatusForbidden)
 			return
 		}
@@ -331,7 +334,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		_, _ = io.WriteString(writer, appCSS)
 	case request.Method == http.MethodGet && request.URL.Path == appJSPath:
-		if presentOriginInvalid(request, s.origin()) {
+		if presentOriginInvalid(request, s.originFor(request)) {
 			reject(writer, http.StatusForbidden)
 			return
 		}
@@ -354,7 +357,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) shell(writer http.ResponseWriter, request *http.Request) {
-	if presentOriginInvalid(request, s.origin()) {
+	if presentOriginInvalid(request, s.originFor(request)) {
 		reject(writer, http.StatusForbidden)
 		return
 	}
@@ -371,7 +374,7 @@ func (s *Server) writeStructuredShell(writer http.ResponseWriter) {
 
 func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 	contentType, ok := exactHeader(request, "Content-Type")
-	if !exactOrigin(request, s.origin()) || !ok || contentType != "application/x-www-form-urlencoded" {
+	if !exactOrigin(request, s.originFor(request)) || !ok || contentType != "application/x-www-form-urlencoded" {
 		reject(writer, http.StatusForbidden)
 		return
 	}
@@ -400,7 +403,7 @@ func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 		reject(writer, http.StatusUnauthorized)
 		return
 	}
-	credentials, err := s.config.Sessions.Issue(s.origin(), fingerprint)
+	credentials, err := s.config.Sessions.Issue(s.originFor(request), fingerprint)
 	s.barrier.Unlock()
 	if err != nil {
 		if auditErr := s.appendAudit(audit.Record{Operation: "login", Target: "installation", Actor: fingerprint, At: time.Now().UTC(), Result: "failed", ErrorCode: "session_issue_failed", Paths: []string{}}); auditErr != nil {
@@ -415,7 +418,7 @@ func (s *Server) login(writer http.ResponseWriter, request *http.Request) {
 		reject(writer, http.StatusServiceUnavailable)
 		return
 	}
-	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: credentials.Selector, Path: "/", HttpOnly: true, Secure: s.isHTTPSProxyRequest(request), SameSite: http.SameSiteStrictMode})
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(map[string]string{"proof": credentials.Proof, "csrf": credentials.CSRF})
 }
@@ -462,7 +465,7 @@ func (s *Server) current(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) logout(writer http.ResponseWriter, request *http.Request) {
-	if !exactOrigin(request, s.origin()) {
+	if !exactOrigin(request, s.originFor(request)) {
 		reject(writer, http.StatusForbidden)
 		return
 	}
@@ -493,12 +496,12 @@ func (s *Server) logout(writer http.ResponseWriter, request *http.Request) {
 	}
 	s.cancelActions(&principal, nil)
 	s.config.Sessions.Logout(principal)
-	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.isHTTPSProxyRequest(request), SameSite: http.SameSiteStrictMode})
 	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
-	if !exactOrigin(request, s.origin()) {
+	if !exactOrigin(request, s.originFor(request)) {
 		reject(writer, http.StatusForbidden)
 		return
 	}
@@ -548,7 +551,7 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		s.barrier.RUnlock()
 		return
 	}
-	principal, err := s.config.Sessions.AuthenticateSocket(selector, frame.Proof, s.origin(), fingerprint)
+	principal, err := s.config.Sessions.AuthenticateSocket(selector, frame.Proof, s.originFor(request), fingerprint)
 	if err != nil {
 		s.barrier.RUnlock()
 		return
@@ -584,7 +587,7 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	controller := http.NewResponseController(writer)
 	_ = controller.SetWriteDeadline(time.Now().Add(12 * time.Minute))
-	if !exactOrigin(request, s.origin()) {
+	if !exactOrigin(request, s.originFor(request)) {
 		reject(writer, http.StatusForbidden)
 		return
 	}
@@ -684,9 +687,10 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	publishOperation := operation == domain.OperationPublish
 	basicOperation := operation == domain.OperationManagedBasicCreate || operation == domain.OperationManagedBasicRotate || operation == domain.OperationManagedBasicDelete
 	staticOperation := operation == domain.OperationStaticRootRegister || operation == domain.OperationExternalHTPasswdRegister
+	managementHTTPSOperation := operation == domain.OperationManagementHTTPSConfigure
 	statusOperation := operation == domain.OperationStatus
 	productReadOperation := operation == domain.OperationDiagnostics || operation == domain.OperationConfigurationExport || operation == domain.OperationJobList || operation == domain.OperationJobDetail
-	if operation != domain.OperationAdminTokenRotate && operation != domain.OperationCloseAll && operation != domain.OperationUnpublish && !headscaleOperation && !headscaleControlOperation && !headscaleReissueOperation && !headscaleReadOperation && !headscaleUserCreateOperation && !headscaleLifecycleOperation && !connectorBindingOperation && !connectorVerifyOperation && !connectorLoginOperation && !resourceOperation && !resourceDeleteOperation && !processOperation && !publishOperation && !basicOperation && !staticOperation && !statusOperation && !productReadOperation || s.config.Actions == nil {
+	if operation != domain.OperationAdminTokenRotate && operation != domain.OperationCloseAll && operation != domain.OperationUnpublish && !headscaleOperation && !headscaleControlOperation && !headscaleReissueOperation && !headscaleReadOperation && !headscaleUserCreateOperation && !headscaleLifecycleOperation && !connectorBindingOperation && !connectorVerifyOperation && !connectorLoginOperation && !resourceOperation && !resourceDeleteOperation && !processOperation && !publishOperation && !basicOperation && !staticOperation && !managementHTTPSOperation && !statusOperation && !productReadOperation || s.config.Actions == nil {
 		reject(writer, http.StatusNotFound)
 		return
 	}
@@ -810,7 +814,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		actionErrorCode = httpErrorCode(status)
 		rejectWithError(writer, status, err)
 	}
-	if planRoute && (headscaleOperation || headscaleReadOperation || headscaleUserCreateOperation || connectorBindingOperation || connectorVerifyOperation || productReadOperation || resourceOperation || processOperation || staticOperation || statusOperation || basicOperation && operation != domain.OperationManagedBasicDelete && operation != domain.OperationManagedBasicRotate) {
+	if planRoute && (headscaleOperation || headscaleReadOperation || headscaleUserCreateOperation || connectorBindingOperation || connectorVerifyOperation || productReadOperation || resourceOperation || processOperation || staticOperation || managementHTTPSOperation || statusOperation || basicOperation && operation != domain.OperationManagedBasicDelete && operation != domain.OperationManagedBasicRotate) {
 		reject(writer, http.StatusNotFound)
 		return
 	}
@@ -1224,6 +1228,42 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 		s.sessionJSON(writer, principal, result.Payload)
 		return
 	}
+	if managementHTTPSOperation {
+		request.Body = http.MaxBytesReader(writer, request.Body, 16<<10)
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		defer clear(data)
+		var payload application.ManagementHTTPSPayload
+		if decodeExactJSON(data, &payload) != nil || payload.Confirmation != "configure" {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		candidate := payload.Config
+		candidate.Phase = domain.ManagementHTTPSPending
+		candidate.Generation = 1
+		candidate.CertificateBundle = nil
+		candidate.LastFailureCode = ""
+		if err := domain.ValidateManagementHTTPSConfig(candidate); err != nil {
+			reject(writer, http.StatusBadRequest)
+			return
+		}
+		payload.Config = candidate
+		result, err := s.config.Actions.Invoke(request.Context(), application.Actor{Kind: application.ActorUI, Identity: principal.Selector, Generation: principal.Generation}, application.Call{Operation: operation, Target: target, Payload: payload})
+		if err != nil {
+			actionFailure(err, http.StatusServiceUnavailable)
+			return
+		}
+		value, ok := result.Payload.(application.ManagementHTTPSActionResult)
+		if !ok || value.JobID == "" {
+			reject(writer, http.StatusServiceUnavailable)
+			return
+		}
+		s.sessionJSON(writer, principal, value)
+		return
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, 4096)
 	data, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -1333,7 +1373,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 	}
 	s.config.Sessions.CommitTokenRotation(rotation.Fingerprint)
 	secretResponse = true
-	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(writer, &http.Cookie{Name: session.SelectorCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.isHTTPSProxyRequest(request), SameSite: http.SameSiteStrictMode})
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(struct {
 		JobID string `json:"job_id"`
@@ -1342,7 +1382,7 @@ func (s *Server) action(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) authenticate(request *http.Request, mutation bool) (session.Principal, bool) {
-	if presentOriginInvalid(request, s.origin()) {
+	if presentOriginInvalid(request, s.originFor(request)) {
 		return session.Principal{}, false
 	}
 	selector, ok := exactCookie(request, session.SelectorCookie)
@@ -1371,10 +1411,25 @@ func (s *Server) authenticate(request *http.Request, mutation bool) (session.Pri
 		s.cancelActions(nil, nil)
 		return session.Principal{}, false
 	}
-	principal, err := s.config.Sessions.Authenticate(selector, proof, csrf, s.origin(), fingerprint, mutation)
+	principal, err := s.config.Sessions.Authenticate(selector, proof, csrf, s.originFor(request), fingerprint, mutation)
 	return principal, err == nil
 }
 func (s *Server) origin() string { return "http://" + s.config.Authority }
+
+func (s *Server) isHTTPSProxyRequest(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	return request.TLS != nil || len(request.Header.Values("X-Forwarded-Proto")) == 1 && request.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func (s *Server) originFor(request *http.Request) string {
+	if s.isHTTPSProxyRequest(request) && request.Host != "" {
+		return "https://" + request.Host
+	}
+	return s.origin()
+}
+
 func securityHeaders(writer http.ResponseWriter) {
 	h := writer.Header()
 	h.Set("Cache-Control", "no-store, private")

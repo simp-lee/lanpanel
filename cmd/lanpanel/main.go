@@ -32,6 +32,12 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) > 0 && args[0] == "info" {
+		return bootstrap.RunPublicInfo(args[1:], stdout)
+	}
+	if len(args) > 1 && args[0] == "token" && args[1] == "reset" {
+		return bootstrap.RunPublicTokenReset(args[2:], stdout)
+	}
 	if len(args) > 0 && args[0] == "install" {
 		return bootstrap.RunInstallerRole(args, stdout)
 	}

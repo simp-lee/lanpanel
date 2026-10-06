@@ -38,6 +38,11 @@ func TestConflictRegistry(t *testing.T) {
 		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
 			t.Fatalf("BuildClaims(control alias collision) error = %v", err)
 		}
+		installation = validInstallation()
+		installation.ManagementHTTPS = &domain.ManagementHTTPSConfig{Domain: installation.Resources[0].Publication.DomainHTTPS.CanonicalDomain, Generation: 1, Phase: domain.ManagementHTTPSPending, Certificate: domain.CertificateRequest{ChallengeMethod: "http-01", DirectoryURL: "https://acme.example.com/directory", TermsAccepted: true}, ACMEBinding: digest}
+		if _, err := BuildClaims(installation); err == nil || !errors.As(err, new(ConflictError)) {
+			t.Fatalf("BuildClaims(management HTTPS collision) error = %v", err)
+		}
 	})
 
 	t.Run("domain_claim_grammar_is_strict", func(t *testing.T) {

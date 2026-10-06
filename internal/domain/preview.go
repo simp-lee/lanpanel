@@ -119,6 +119,7 @@ const (
 	OperationPlan                     OperationCode = "plan"
 	OperationStatus                   OperationCode = "status"
 	OperationAdminTokenRotate         OperationCode = "admin_token_rotate"
+	OperationManagementHTTPSConfigure OperationCode = "management_https_configure"
 	OperationHeadscaleInitialize      OperationCode = "headscale_initialize"
 	OperationHeadscaleControlDeploy   OperationCode = "headscale_control_deploy"
 	OperationHeadscaleReissue         OperationCode = "headscale_certificate_reissue"
@@ -152,21 +153,44 @@ const (
 )
 
 type Installation struct {
-	SchemaVersion  string              `json:"schema_version"`
-	InstallationID string              `json:"installation_id"`
-	Management     ManagementAuthority `json:"management"`
-	Headscale      *HeadscaleDomain    `json:"headscale,omitempty"`
-	Connector      *TailnetConnector   `json:"connector,omitempty"`
-	Credentials    []Credential        `json:"credentials,omitempty"`
-	StaticRoots    []StaticContentRoot `json:"static_roots,omitempty"`
-	ManagedPaths   []string            `json:"managed_paths,omitempty"`
-	Resources      []AppResource       `json:"resources,omitempty"`
+	SchemaVersion   string                 `json:"schema_version"`
+	InstallationID  string                 `json:"installation_id"`
+	Management      ManagementAuthority    `json:"management"`
+	ManagementHTTPS *ManagementHTTPSConfig `json:"management_https,omitempty"`
+	Headscale       *HeadscaleDomain       `json:"headscale,omitempty"`
+	Connector       *TailnetConnector      `json:"connector,omitempty"`
+	Credentials     []Credential           `json:"credentials,omitempty"`
+	StaticRoots     []StaticContentRoot    `json:"static_roots,omitempty"`
+	ManagedPaths    []string               `json:"managed_paths,omitempty"`
+	Resources       []AppResource          `json:"resources,omitempty"`
 }
 
 type ManagementAuthority struct {
 	Address      string   `json:"address"`
 	Port         uint16   `json:"port"`
 	ManagedPaths []string `json:"managed_paths,omitempty"`
+}
+
+type ManagementHTTPSPhase string
+
+const (
+	ManagementHTTPSPending    ManagementHTTPSPhase = "pending"
+	ManagementHTTPSValidating ManagementHTTPSPhase = "validating"
+	ManagementHTTPSIssuing    ManagementHTTPSPhase = "issuing"
+	ManagementHTTPSActivating ManagementHTTPSPhase = "activating"
+	ManagementHTTPSActive     ManagementHTTPSPhase = "active"
+	ManagementHTTPSFailed     ManagementHTTPSPhase = "failed"
+	ManagementHTTPSExpired    ManagementHTTPSPhase = "expired"
+)
+
+type ManagementHTTPSConfig struct {
+	Domain            string                     `json:"domain"`
+	Certificate       CertificateRequest         `json:"certificate"`
+	ACMEBinding       string                     `json:"acme_binding,omitempty"`
+	Phase             ManagementHTTPSPhase       `json:"phase"`
+	Generation        uint64                     `json:"generation"`
+	CertificateBundle *CertificateBundleIdentity `json:"certificate_bundle,omitempty"`
+	LastFailureCode   string                     `json:"last_failure_code,omitempty"`
 }
 
 type HeadscaleInitializationPhase string
@@ -599,7 +623,7 @@ func (err PrerequisiteError) Error() string { return string(err.Code) }
 
 func ParseOperationCode(value string) (OperationCode, error) {
 	switch OperationCode(value) {
-	case OperationPlan, OperationStatus, OperationAdminTokenRotate,
+	case OperationPlan, OperationStatus, OperationAdminTokenRotate, OperationManagementHTTPSConfigure,
 		OperationHeadscaleInitialize, OperationHeadscaleControlDeploy, OperationHeadscaleReissue,
 		OperationHeadscaleUserCreate, OperationHeadscaleUserList, OperationPreauthKeyCreate,
 		OperationPreauthKeyList, OperationPreauthKeyRevoke, OperationDeviceList, OperationDeviceExpire,
@@ -730,11 +754,12 @@ func PublicationPrerequisites(installation Installation, resourceID string) erro
 }
 
 var (
-	idPattern               = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
-	certificateIDPattern    = regexp.MustCompile(`^cert_[0-9a-f]{32}$`)
-	staticRootIDPattern     = regexp.MustCompile(`^static_[0-9a-f]{32}$`)
-	headscaleVersionPattern = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
-	headscaleRefPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	idPattern                     = regexp.MustCompile(`^(?:ins|hds|con|res|proc|cred)_[0-9a-f]{32}$`)
+	certificateIDPattern          = regexp.MustCompile(`^cert_[0-9a-f]{32}$`)
+	staticRootIDPattern           = regexp.MustCompile(`^static_[0-9a-f]{32}$`)
+	headscaleVersionPattern       = regexp.MustCompile(`^(?:v)?[0-9][0-9A-Za-z.+:~_-]{0,127}$`)
+	headscaleRefPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
+	managementHTTPSFailurePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 )
 
 func validateHeadscale(value HeadscaleDomain) error {
@@ -932,6 +957,11 @@ func ValidateInstallation(installation Installation) error {
 	if err := validateManagement(installation.Management); err != nil {
 		return fmt.Errorf("management: %w", err)
 	}
+	if installation.ManagementHTTPS != nil {
+		if err := validateManagementHTTPS(*installation.ManagementHTTPS); err != nil {
+			return fmt.Errorf("management_https: %w", err)
+		}
+	}
 	if err := validatePaths("managed_paths", installation.ManagedPaths); err != nil {
 		return err
 	}
@@ -1076,6 +1106,57 @@ func validateManagement(authority ManagementAuthority) error {
 		return fmt.Errorf("port must be in 1024..65535")
 	}
 	return validatePaths("management.managed_paths", authority.ManagedPaths)
+}
+
+func ValidateManagementHTTPSConfig(value ManagementHTTPSConfig) error {
+	return validateManagementHTTPS(value)
+}
+
+func validateManagementHTTPS(value ManagementHTTPSConfig) error {
+	if err := validateDomain(value.Domain); err != nil {
+		return fmt.Errorf("domain: %w", err)
+	}
+	if value.Certificate.ChallengeMethod != "http-01" && value.Certificate.ChallengeMethod != "dns-01" {
+		return fmt.Errorf("certificate challenge method is invalid")
+	}
+	if !canonicalHTTPSURL(value.Certificate.DirectoryURL) || !value.Certificate.TermsAccepted {
+		return fmt.Errorf("certificate authority is invalid")
+	}
+	if value.Certificate.ChallengeMethod == "http-01" && (value.Certificate.DNSProvider != "" || value.Certificate.ProviderProfilePath != "" || value.Certificate.AuthoritativeZone != "") {
+		return fmt.Errorf("http-01 must not contain DNS provider authority")
+	}
+	if value.Certificate.ChallengeMethod == "dns-01" && (!validDNSProvider(value.Certificate.DNSProvider) || !cleanAbsolutePath(value.Certificate.ProviderProfilePath) || value.Certificate.AuthoritativeZone == "") {
+		return fmt.Errorf("dns-01 provider authority is invalid")
+	}
+	if value.ACMEBinding != "" && !validSHA256Digest(value.ACMEBinding) {
+		return fmt.Errorf("acme_binding is invalid")
+	}
+	if value.Generation == 0 {
+		return fmt.Errorf("generation must be non-zero")
+	}
+	switch value.Phase {
+	case ManagementHTTPSPending, ManagementHTTPSValidating, ManagementHTTPSIssuing, ManagementHTTPSActivating, ManagementHTTPSActive, ManagementHTTPSFailed, ManagementHTTPSExpired:
+	default:
+		return fmt.Errorf("phase %q is invalid", value.Phase)
+	}
+	if value.CertificateBundle != nil {
+		if _, err := validateCertificateBundleIdentity(*value.CertificateBundle, ""); err != nil {
+			return fmt.Errorf("certificate bundle: %w", err)
+		}
+		if value.CertificateBundle.SANIdentity != certificateSANIdentity([]string{value.Domain}) {
+			return fmt.Errorf("certificate bundle SAN identity does not bind domain")
+		}
+		if value.ACMEBinding != "" && value.CertificateBundle.BindingIdentity != value.ACMEBinding {
+			return fmt.Errorf("certificate bundle ACME binding does not match configuration")
+		}
+	}
+	if value.Phase == ManagementHTTPSActive && (value.CertificateBundle == nil || value.ACMEBinding == "") {
+		return fmt.Errorf("active management HTTPS requires a certificate bundle and ACME binding")
+	}
+	if value.LastFailureCode != "" && !managementHTTPSFailurePattern.MatchString(value.LastFailureCode) {
+		return fmt.Errorf("last_failure_code is invalid")
+	}
+	return nil
 }
 
 func validateResource(resource AppResource, credentialIDs map[string]struct{}, credentialOwners map[string]string, staticRootIDs map[string]struct{}) error {

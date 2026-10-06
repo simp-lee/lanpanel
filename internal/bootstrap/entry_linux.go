@@ -38,6 +38,7 @@ type installerInput struct {
 	AssetPaths                    map[string]string   `json:"asset_paths"`
 	PackagePlan                   packages.Plan       `json:"package_plan"`
 	PackagePreflight              preflight.Result    `json:"package_preflight"`
+	SSHAccess                     *SSHAccess          `json:"ssh_access,omitempty"`
 }
 
 // RunInstallerRole accepts either the release tooling's inherited fd 3 or
@@ -72,7 +73,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	var input installerInput
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
+	if err := decoder.Decode(&input); err != nil || validateSSHAccess(input.SSHAccess) != nil {
 		return fmt.Errorf("installer release authority is invalid")
 	}
 	var trailing any
@@ -152,7 +153,7 @@ func runInstallerAuthorityWithMaterial(data []byte, stdout io.Writer, material *
 	}
 	progress := newInstallerProgressOutput(stdout)
 	defer func() { _ = progress.Close() }()
-	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: func(ctx context.Context, plan packages.Plan, result preflight.Result) (packages.Journal, error) {
+	return Install(context.Background(), Request{ReleaseAuthority: authority, Material: material, InstallerInput: installerInput, SSHAccess: input.SSHAccess, Preflight: preflightEvaluator, PackagePlan: input.PackagePlan, PackagePreflight: input.PackagePreflight, PackageTransaction: func(ctx context.Context, plan packages.Plan, result preflight.Result) (packages.Journal, error) {
 		return packages.ExecuteFixedInstallerTransactionWithProgress(ctx, plan, result, progress)
 	}, APTMetadataPrepared: aptMetadataPrepared, SourceBinary: assets["lanpanel"], LegoBytes: legoBytes, TailscaleBytes: tailscaleBytes, GoAccessBytes: goaccessBytes, HeadscaleBytes: headscaleBytes, Now: func() time.Time { return time.Now().UTC() }, Paths: FixedPaths(), Output: stdout, TTY: ControllingTTY{}})
 }
@@ -286,7 +287,7 @@ func (ControllingTTY) Confirm(message string) (bool, error) {
 	}
 }
 
-func (ControllingTTY) WriteToken(token []byte) error {
+func (ControllingTTY) WriteToken(access ManagementAccess, token []byte) error {
 	fd, err := unix.Open("/dev/tty", unix.O_WRONLY|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
@@ -297,12 +298,8 @@ func (ControllingTTY) WriteToken(token []byte) error {
 		return fmt.Errorf("controlling TTY is unavailable")
 	}
 	defer func(ignore func() error) { _ = ignore() }(file.Close)
-	if _, err := file.Write([]byte("LanPanel admin token: ")); err != nil {
+	if _, err := fmt.Fprintf(file, "Management UI URL: %s\nSSH tunnel command: %s\nBrowser URL: %s\nLanPanel admin token: %s\n", access.URL, access.SSHCommand, access.BrowserURL, token); err != nil {
 		return err
 	}
-	if _, err := file.Write(token); err != nil {
-		return err
-	}
-	_, err = file.Write([]byte("\n"))
-	return err
+	return nil
 }

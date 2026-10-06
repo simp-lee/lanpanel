@@ -19,10 +19,12 @@ make test                  # 单元测试
 make vet                   # go vet
 make lint                  # golangci-lint
 make race                  # race 测试
+make nginx-https-integration # 临时 Nginx TLS/Host/SNI 集成测试
+make pebble-dns01          # 临时 Pebble/challtestsrv/Lego ACME 测试
 make check                 # 完整质量门禁
 ```
 
-`make check` 会依次执行测试、`vet`、Lint 和 race 测试。提交代码前应至少运行一次；CI 使用相同的质量门禁。`make tidy` 只在确实需要调整依赖时使用。
+`make check` 会依次执行测试、`vet`、Lint 和 race 测试。提交代码前应至少运行一次；CI 使用相同的质量门禁。`make nginx-https-integration` 会用 APT 下载 Nginx 包到临时 root，不需要 root 权限，不修改系统安装，并在退出时清理。`make pebble-dns01` 会临时准备固定版本的 Pebble、challtestsrv 和发布锁定的 Lego；也可通过 `PEBBLE_BIN`、`CHALLTESTSRV_BIN`、`LEGO_BIN` 复用已有二进制。两个测试都只使用临时目录、临时端口、自签名测试证书和本地 fake CA。`make tidy` 只在确实需要调整依赖时使用。
 
 ### 浏览器 fixture 门禁
 

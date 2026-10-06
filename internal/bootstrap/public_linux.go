@@ -208,7 +208,7 @@ func buildPublicInstallerInputWithMaterial(bundleDir string, material identity.M
 		material.Destroy()
 		return nil, identity.Material{}, err
 	}
-	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight}
+	input := installerInput{SchemaVersion: installerInputSchema, Kind: release.InstallPublicRelease, ExpectedReleaseManifestDigest: release.DigestBytes(manifestBytes), ReleaseManifest: manifestBytes, ReleaseSignature: checksums[release.ReleaseSignaturePath], Checksums: checksums["SHA256SUMS"], AssetPaths: assetPaths, PackagePlan: packagePlan, PackagePreflight: packagePreflight, SSHAccess: discoverSSHAccess()}
 	data, err := json.Marshal(input)
 	if err != nil || len(data) == 0 || len(data) > maximumPublicInstallerInputBytes {
 		material.Destroy()

@@ -35,6 +35,23 @@ func TestRenewalDecisionUsesAppliedCertificateAndSafety(t *testing.T) {
 	}
 }
 
+func TestManagementHTTPSRenewalUsesIndependentAuthority(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	deadline := now.Add(20 * 24 * time.Hour)
+	config := &domain.ManagementHTTPSConfig{Phase: domain.ManagementHTTPSActive, CertificateBundle: &domain.CertificateBundleIdentity{Generation: 2, Fingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BindingIdentity: "management-binding", NotAfter: deadline.Format(time.RFC3339), LastTrustedWall: now.Add(-time.Minute).Format(time.RFC3339)}}
+	state := safety.EmptyState()
+	state.ManagementHTTPS.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: 2, Fingerprint: config.CertificateBundle.Fingerprint, Binding: config.CertificateBundle.BindingIdentity, NotAfter: deadline, LastTrustedWall: now.Add(-time.Minute)}
+	decision, err := EvaluateManagementHTTPS(now, 30*24*time.Hour, config, state)
+	if err != nil || decision != DecisionRenew {
+		t.Fatalf("decision=%s err=%v", decision, err)
+	}
+	state.ManagementHTTPS.ActiveCertificate.NotAfter = now.Add(-time.Second)
+	decision, err = EvaluateManagementHTTPS(now, time.Hour, config, state)
+	if err != nil || decision != DecisionContract {
+		t.Fatalf("expired decision=%s err=%v", decision, err)
+	}
+}
+
 func TestHeadscaleRenewalUsesOnlyCommittedControlCertificate(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	deadline := now.Add(20 * 24 * time.Hour)

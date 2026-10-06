@@ -4,6 +4,8 @@ package activation
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"lanpanel/internal/closure"
@@ -11,7 +13,10 @@ import (
 	"lanpanel/internal/filetxn"
 	"lanpanel/internal/nginx"
 	"lanpanel/internal/safety"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,6 +124,22 @@ func certificateReloadTestRuntime(manifest nginx.Manifest, beforeGuard func(), s
 		Wait: func(context.Context, nginx.Manifest, []closure.ProcessIdentity) (closure.RuntimeSnapshot, error) {
 			return closure.RuntimeSnapshot{Master: &master}, nil
 		},
+	}
+}
+
+func TestProbeServedCertificateAcceptsOnlyExactPeerFingerprint(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	sum := sha256.Sum256(server.Certificate().Raw)
+	expected := "sha256:" + hex.EncodeToString(sum[:])
+	if err := probeServedCertificateAt(context.Background(), server.Listener.Addr().String(), "panel.example.test", expected); err != nil {
+		t.Fatalf("exact served certificate was rejected: %v", err)
+	}
+	if err := probeServedCertificateAt(context.Background(), server.Listener.Addr().String(), "panel.example.test", "sha256:"+strings.Repeat("0", 64)); err == nil {
+		t.Fatal("wrong served certificate fingerprint was accepted")
+	}
+	if err := probeServedCertificateAt(context.Background(), "127.0.0.1:1", "panel.example.test", expected); err == nil {
+		t.Fatal("unreachable served certificate endpoint was accepted")
 	}
 }
 

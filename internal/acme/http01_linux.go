@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"lanpanel/internal/acmeaccount"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,7 +47,11 @@ type HTTP01Presenter interface {
 }
 
 func RunHTTP01(ctx context.Context, request IssueRequest, presenter HTTP01Presenter) (IssueResult, error) {
-	if presenter == nil || request.Binding.Method != ChallengeHTTP01 || request.CertificateID == "" || len(request.Domains) == 0 || request.UID == 0 || request.GID == 0 {
+	return runHTTP01(ctx, request, presenter, writeHTTP01Issued, nil, loadHTTP01AccountKey)
+}
+
+func runHTTP01(ctx context.Context, request IssueRequest, presenter HTTP01Presenter, writeIssued func(IssueRequest, *ecdsa.PrivateKey, [][]byte) error, httpClient *http.Client, loadAccountKey func(Binding) (*ecdsa.PrivateKey, error)) (IssueResult, error) {
+	if presenter == nil || writeIssued == nil || loadAccountKey == nil || request.Binding.Method != ChallengeHTTP01 || request.CertificateID == "" || len(request.Domains) == 0 || request.UID == 0 || request.GID == 0 {
 		return IssueResult{}, fmt.Errorf("HTTP-01 issue authority incomplete")
 	}
 	if err := ValidateBinding(request.Binding); err != nil {
@@ -57,11 +62,11 @@ func RunHTTP01(ctx context.Context, request IssueRequest, presenter HTTP01Presen
 	if !slices.Equal(domains, request.Domains) {
 		return IssueResult{}, fmt.Errorf("HTTP-01 SAN inventory is noncanonical")
 	}
-	accountKey, err := loadHTTP01AccountKey(request.Binding)
+	accountKey, err := loadAccountKey(request.Binding)
 	if err != nil {
 		return IssueResult{}, err
 	}
-	client := &xacme.Client{Key: accountKey, DirectoryURL: request.Binding.DirectoryURL, UserAgent: "LanPanel HTTP-01"}
+	client := &xacme.Client{Key: accountKey, DirectoryURL: request.Binding.DirectoryURL, UserAgent: "LanPanel HTTP-01", HTTPClient: httpClient}
 	account, err := client.GetReg(ctx, "")
 	if errors.Is(err, xacme.ErrNoAccount) {
 		account, err = client.Register(ctx, &xacme.Account{Contact: []string{"mailto:" + request.Binding.AccountEmail}}, xacme.AcceptTOS)
@@ -159,7 +164,7 @@ func RunHTTP01(ctx context.Context, request IssueRequest, presenter HTTP01Presen
 	if len(chain) < 2 {
 		return IssueResult{}, fmt.Errorf("HTTP-01 CA returned an incomplete certificate chain")
 	}
-	if err := writeHTTP01Issued(request, certificateKey, chain); err != nil {
+	if err := writeIssued(request, certificateKey, chain); err != nil {
 		return IssueResult{}, err
 	}
 	var identity bytes.Buffer
@@ -427,6 +432,14 @@ func loadHTTP01AccountKey(binding Binding) (*ecdsa.PrivateKey, error) {
 func writeHTTP01Issued(request IssueRequest, key *ecdsa.PrivateKey, chain [][]byte) error {
 	base := filepath.Join(request.Chroot, "work", "certificates")
 	if request.Chroot != "/var/lib/lanpanel/certificates/chroot/"+request.CertificateID || filepath.Clean(base) != base {
+		return fmt.Errorf("HTTP-01 certificate output authority invalid")
+	}
+	return writeHTTP01IssuedAt(request, key, chain, request.Chroot)
+}
+
+func writeHTTP01IssuedAt(request IssueRequest, key *ecdsa.PrivateKey, chain [][]byte, outputRoot string) error {
+	base := filepath.Join(outputRoot, "work", "certificates")
+	if filepath.Clean(base) != base || outputRoot == "" {
 		return fmt.Errorf("HTTP-01 certificate output authority invalid")
 	}
 	if err := ensureStageDirectory(base, request.UID, request.GID); err != nil {

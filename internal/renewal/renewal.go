@@ -58,6 +58,32 @@ func Evaluate(input Input) (Decision, error) {
 	return DecisionIdle, nil
 }
 
+func EvaluateManagementHTTPS(now time.Time, renewBefore time.Duration, config *domain.ManagementHTTPSConfig, state safety.State) (Decision, error) {
+	if now.IsZero() || renewBefore <= 0 {
+		return "", fmt.Errorf("management HTTPS renewal clock authority incomplete")
+	}
+	if config == nil || config.Phase != domain.ManagementHTTPSActive || config.CertificateBundle == nil {
+		return DecisionIdle, nil
+	}
+	if state.StopFence != nil || state.GlobalClose.Phase != safety.GlobalCloseNone {
+		return DecisionIdle, nil
+	}
+	certificate := config.CertificateBundle
+	deadline, deadlineErr := time.Parse(time.RFC3339, certificate.NotAfter)
+	lastWall, wallErr := time.Parse(time.RFC3339, certificate.LastTrustedWall)
+	active := state.ManagementHTTPS.ActiveCertificate
+	if deadlineErr != nil || wallErr != nil || active == nil || active.Generation != certificate.Generation || active.Fingerprint != certificate.Fingerprint || active.Binding != certificate.BindingIdentity || !active.NotAfter.Equal(deadline) || active.LastTrustedWall.Before(lastWall) || now.Before(active.LastTrustedWall) || !deadline.After(now) {
+		return DecisionContract, nil
+	}
+	if state.ManagementHTTPS.CertificateExpiry != nil || state.ManagementHTTPS.ChallengePending != nil {
+		return DecisionIdle, nil
+	}
+	if !now.Add(renewBefore).Before(deadline) {
+		return DecisionRenew, nil
+	}
+	return DecisionIdle, nil
+}
+
 func EvaluateHeadscale(now time.Time, renewBefore time.Duration, headscale *domain.HeadscaleDomain, state safety.State) (Decision, error) {
 	if now.IsZero() || renewBefore <= 0 {
 		return "", fmt.Errorf("headscale renewal clock authority incomplete")

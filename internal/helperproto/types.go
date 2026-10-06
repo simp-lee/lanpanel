@@ -20,6 +20,7 @@ type Caller string
 
 const (
 	CallerUI       Caller = "ui"
+	CallerCLI      Caller = "cli"
 	CallerTimer    Caller = "timer"
 	CallerRecovery Caller = "startup_recovery"
 )
@@ -33,6 +34,7 @@ const (
 	OperationAdminTokenVerify         Operation = "admin_token_verify"
 	OperationAdminTokenSource         Operation = "admin_token_source_status"
 	OperationManagementProfile        Operation = "management_profile_status"
+	OperationManagementHTTPSConfigure Operation = "management_https_configure"
 	OperationAdminTokenRotate         Operation = "admin_token_rotate"
 	OperationAdminTokenReconcile      Operation = "admin_token_rotate_reconcile"
 	OperationCertificateRenew         Operation = "certificate_renew"
@@ -70,11 +72,12 @@ type Policy struct {
 }
 
 var policies = map[Operation]Policy{
-	OperationApplicationPlan:          {Callers: []Caller{CallerUI}},
+	OperationApplicationPlan:          {Callers: []Caller{CallerUI, CallerCLI}},
 	OperationAdminTokenVerify:         {Callers: []Caller{CallerUI}, SecretInput: true},
 	OperationAdminTokenSource:         {Callers: []Caller{CallerUI}},
 	OperationManagementProfile:        {Callers: []Caller{CallerUI}},
-	OperationAdminTokenRotate:         {Callers: []Caller{CallerUI}, SecretOutput: true},
+	OperationManagementHTTPSConfigure: {Callers: []Caller{CallerUI}},
+	OperationAdminTokenRotate:         {Callers: []Caller{CallerUI, CallerCLI}, SecretOutput: true},
 	OperationAdminTokenReconcile:      {Callers: []Caller{CallerUI}},
 	OperationCertificateRenew:         {Callers: []Caller{CallerUI, CallerTimer}},
 	OperationManagedBasicGenerate:     {Callers: []Caller{CallerUI}, SecretOutput: true},
@@ -110,16 +113,17 @@ var (
 )
 
 type ActionPayload struct {
-	Operation            string `json:"operation"`
-	TargetKind           string `json:"target_kind"`
-	TargetID             string `json:"target_id,omitempty"`
-	ActorIdentity        string `json:"actor_identity"`
-	ActorGeneration      uint64 `json:"actor_generation"`
-	PlanID               string `json:"plan_id,omitempty"`
-	Confirmation         string `json:"confirmation,omitempty"`
-	Username             string `json:"username,omitempty"`
-	StaticRoot           string `json:"static_root_path,omitempty"`
-	ExternalHTPasswdFile string `json:"external_htpasswd_path,omitempty"`
+	Operation            string                        `json:"operation"`
+	TargetKind           string                        `json:"target_kind"`
+	TargetID             string                        `json:"target_id,omitempty"`
+	ActorIdentity        string                        `json:"actor_identity"`
+	ActorGeneration      uint64                        `json:"actor_generation"`
+	PlanID               string                        `json:"plan_id,omitempty"`
+	Confirmation         string                        `json:"confirmation,omitempty"`
+	ManagementHTTPS      *domain.ManagementHTTPSConfig `json:"management_https,omitempty"`
+	Username             string                        `json:"username,omitempty"`
+	StaticRoot           string                        `json:"static_root_path,omitempty"`
+	ExternalHTPasswdFile string                        `json:"external_htpasswd_path,omitempty"`
 }
 type ResourcePayload struct {
 	Operation       string                          `json:"operation"`
@@ -305,7 +309,7 @@ func ValidateRequest(request Request, now time.Time) error {
 	if request.SchemaVersion != SchemaVersion || !known || !refPattern.MatchString(request.RequestID) || !validOperationTarget(request.Operation, request.Target) || request.IntentGeneration == 0 || request.Deadline.IsZero() || !request.Deadline.After(now) || request.Deadline.Sub(now) > maximum || !digestPattern.MatchString(request.InputDigest) {
 		return fmt.Errorf("helper request schema or immutable authority is invalid")
 	}
-	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose || request.Operation == OperationManagedBasicGenerate || request.Operation == OperationManagedBasicDelete || request.Operation == OperationStaticRootRegister || request.Operation == OperationExternalHTPasswdRegister || request.Operation == OperationDomainStatus
+	actionOperation := request.Operation == OperationApplicationPlan || request.Operation == OperationManagementHTTPSConfigure || request.Operation == OperationAdminTokenRotate || request.Operation == OperationContractionClose || request.Operation == OperationManagedBasicGenerate || request.Operation == OperationManagedBasicDelete || request.Operation == OperationStaticRootRegister || request.Operation == OperationExternalHTPasswdRegister || request.Operation == OperationDomainStatus
 	resourceOperation := request.Operation == OperationHeadscaleInitialize || request.Operation == OperationHeadscaleDeploy || request.Operation == OperationHeadscaleReissue || request.Operation == OperationHeadscaleRead || request.Operation == OperationHeadscaleMutation || request.Operation == OperationPreauthKeyPlan || request.Operation == OperationPreauthKeyCreate || request.Operation == OperationConnectorMutation || request.Operation == OperationConnectorRead || request.Operation == OperationConnectorLoginPlan || request.Operation == OperationConnectorLogin || request.Operation == OperationProductRead || request.Operation == OperationResourceDelete || request.Operation == OperationResourceMutation || request.Operation == OperationResourceMutationSecret || request.Operation == OperationProcessLifecycle || request.Operation == OperationPublicationActivate
 	if actionOperation != (request.Action != nil) || resourceOperation != (request.Resource != nil) || actionOperation && request.Resource != nil || resourceOperation && request.Action != nil {
 		return fmt.Errorf("helper typed payload shape is invalid")
@@ -314,6 +318,7 @@ func ValidateRequest(request Request, now time.Time) error {
 		return fmt.Errorf("helper resource payload shape is invalid")
 	}
 	planAction := request.Operation == OperationApplicationPlan && (((request.Action.Operation == "admin_token_rotate" || request.Action.Operation == "close_all") && request.Action.TargetKind == "installation" && request.Action.TargetID == "") || ((request.Action.Operation == "publish" || request.Action.Operation == "unpublish" || request.Action.Operation == "resource_delete") && request.Action.TargetKind == "resource" && request.Action.TargetID != "") || ((request.Action.Operation == "managed_basic_delete" || request.Action.Operation == "managed_basic_rotate") && request.Action.TargetKind == "credential" && request.Action.TargetID != "")) && request.Action.PlanID == "" && request.Action.Confirmation == ""
+	managementHTTPSAction := request.Operation == OperationManagementHTTPSConfigure && request.Action.Operation == string(OperationManagementHTTPSConfigure) && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.Confirmation == "configure" && request.Action.ManagementHTTPS != nil
 	rotationAction := request.Operation == OperationAdminTokenRotate && request.Action.Operation == "admin_token_rotate" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.PlanID != "" && request.Action.Confirmation == "rotate"
 	contractionAction := request.Operation == OperationContractionClose && ((request.Action.Operation == "close_all" && request.Action.TargetKind == "installation" && request.Action.TargetID == "" && request.Action.Confirmation == "close") || (request.Action.Operation == "unpublish" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Action.Confirmation == "unpublish")) && request.Action.PlanID != ""
 	managedGenerate := request.Operation == OperationManagedBasicGenerate && ((request.Action.Operation == "managed_basic_create" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && basicUsernamePattern.MatchString(request.Action.Username) && request.Action.PlanID == "" && request.Action.Confirmation == "generate") || (request.Action.Operation == "managed_basic_rotate" && request.Action.TargetKind == "credential" && request.Action.TargetID != "" && request.Target == "credential/"+request.Action.TargetID && request.Action.Username == "" && refPattern.MatchString(request.Action.PlanID) && request.Action.Confirmation == "rotate"))
@@ -321,7 +326,7 @@ func ValidateRequest(request Request, now time.Time) error {
 	externalRegister := request.Operation == OperationExternalHTPasswdRegister && request.Action.Operation == "external_htpasswd_register" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID == "" && request.Action.Confirmation == "register" && filepath.IsAbs(request.Action.ExternalHTPasswdFile) && filepath.Clean(request.Action.ExternalHTPasswdFile) == request.Action.ExternalHTPasswdFile && request.Action.StaticRoot == ""
 	statusAction := request.Operation == OperationDomainStatus && request.Action.Operation == "status" && request.Action.TargetKind == "resource" && request.Action.TargetID != "" && request.Target == "resource/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID == "" && request.Action.Confirmation == "" && request.Action.StaticRoot == "" && request.Action.ExternalHTPasswdFile == ""
 	managedDelete := request.Operation == OperationManagedBasicDelete && request.Action.Operation == "managed_basic_delete" && request.Action.TargetKind == "credential" && request.Action.TargetID != "" && request.Target == "credential/"+request.Action.TargetID && request.Action.Username == "" && request.Action.PlanID != "" && request.Action.Confirmation == "delete"
-	if request.Action != nil && (!validAction(*request.Action) || !planAction && !rotationAction && !contractionAction && !managedGenerate && !managedDelete && !staticRegister && !externalRegister && !statusAction || (request.Operation != OperationManagedBasicGenerate && request.Action.Username != "") || (request.Operation != OperationStaticRootRegister && request.Action.StaticRoot != "") || (request.Operation != OperationExternalHTPasswdRegister && request.Action.ExternalHTPasswdFile != "")) {
+	if request.Action != nil && (!validAction(*request.Action) || !planAction && !managementHTTPSAction && !rotationAction && !contractionAction && !managedGenerate && !managedDelete && !staticRegister && !externalRegister && !statusAction || (request.Operation != OperationManagedBasicGenerate && request.Action.Username != "") || (request.Operation != OperationStaticRootRegister && request.Action.StaticRoot != "") || (request.Operation != OperationExternalHTPasswdRegister && request.Action.ExternalHTPasswdFile != "")) {
 		return fmt.Errorf("helper action payload is invalid")
 	}
 	if request.Action != nil || request.Resource != nil {
@@ -341,7 +346,7 @@ func ValidateRequest(request Request, now time.Time) error {
 // ApplicationInputDigest binds the complete immutable application request,
 // including its typed action payload, nonce, generation, and deadline.
 func ApplicationInputDigest(request Request) (string, error) {
-	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationHeadscaleInitialize && request.Operation != OperationHeadscaleDeploy && request.Operation != OperationHeadscaleReissue && request.Operation != OperationHeadscaleRead && request.Operation != OperationHeadscaleMutation && request.Operation != OperationPreauthKeyPlan && request.Operation != OperationPreauthKeyCreate && request.Operation != OperationConnectorMutation && request.Operation != OperationConnectorRead && request.Operation != OperationConnectorLoginPlan && request.Operation != OperationConnectorLogin && request.Operation != OperationProductRead && request.Operation != OperationResourceDelete && request.Operation != OperationResourceMutation && request.Operation != OperationResourceMutationSecret && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
+	if request.Action == nil && request.Resource == nil || request.Operation != OperationApplicationPlan && request.Operation != OperationManagementHTTPSConfigure && request.Operation != OperationAdminTokenRotate && request.Operation != OperationContractionClose && request.Operation != OperationManagedBasicGenerate && request.Operation != OperationManagedBasicDelete && request.Operation != OperationStaticRootRegister && request.Operation != OperationExternalHTPasswdRegister && request.Operation != OperationDomainStatus && request.Operation != OperationHeadscaleInitialize && request.Operation != OperationHeadscaleDeploy && request.Operation != OperationHeadscaleReissue && request.Operation != OperationHeadscaleRead && request.Operation != OperationHeadscaleMutation && request.Operation != OperationPreauthKeyPlan && request.Operation != OperationPreauthKeyCreate && request.Operation != OperationConnectorMutation && request.Operation != OperationConnectorRead && request.Operation != OperationConnectorLoginPlan && request.Operation != OperationConnectorLogin && request.Operation != OperationProductRead && request.Operation != OperationResourceDelete && request.Operation != OperationResourceMutation && request.Operation != OperationResourceMutationSecret && request.Operation != OperationProcessLifecycle && request.Operation != OperationPublicationActivate {
 		return "", fmt.Errorf("application helper request is invalid")
 	}
 	request.InputDigest = ""
@@ -374,7 +379,7 @@ func validOperationTarget(operation Operation, target string) bool {
 	switch operation {
 	case OperationApplicationPlan:
 		return target == "installation" || exactID && (kind == "resource" || kind == "credential")
-	case OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationAdminTokenRotate, OperationAdminTokenReconcile:
+	case OperationAdminTokenVerify, OperationAdminTokenSource, OperationManagementProfile, OperationManagementHTTPSConfigure, OperationAdminTokenRotate, OperationAdminTokenReconcile:
 		return target == "installation"
 	case OperationContractionClose:
 		return target == "installation" || exactID && kind == "resource"
@@ -491,7 +496,25 @@ func validContractionOutcome(outcome string, accessClosed, sharedDown, mayRemain
 var basicUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$`)
 
 func validAction(value ActionPayload) bool {
-	return refPattern.MatchString(value.Operation) && refPattern.MatchString(value.TargetKind) && (value.TargetID == "" || refPattern.MatchString(value.TargetID)) && refPattern.MatchString(value.ActorIdentity) && value.ActorGeneration != 0 && (value.PlanID == "" || refPattern.MatchString(value.PlanID)) && (value.Confirmation == "" || refPattern.MatchString(value.Confirmation)) && (value.Username == "" || basicUsernamePattern.MatchString(value.Username)) && len(value.StaticRoot) <= 4096 && !strings.ContainsAny(value.StaticRoot, "\x00\r\n") && len(value.ExternalHTPasswdFile) <= 4096 && !strings.ContainsAny(value.ExternalHTPasswdFile, "\x00\r\n")
+	if !refPattern.MatchString(value.Operation) || !refPattern.MatchString(value.TargetKind) || value.TargetID != "" && !refPattern.MatchString(value.TargetID) || !refPattern.MatchString(value.ActorIdentity) || value.ActorGeneration == 0 || value.PlanID != "" && !refPattern.MatchString(value.PlanID) || value.Confirmation != "" && !refPattern.MatchString(value.Confirmation) || value.Username != "" && !basicUsernamePattern.MatchString(value.Username) || len(value.StaticRoot) > 4096 || strings.ContainsAny(value.StaticRoot, "\x00\r\n") || len(value.ExternalHTPasswdFile) > 4096 || strings.ContainsAny(value.ExternalHTPasswdFile, "\x00\r\n") {
+		return false
+	}
+	if value.ManagementHTTPS != nil {
+		if value.Operation != string(OperationManagementHTTPSConfigure) || value.TargetKind != "installation" || value.TargetID != "" || value.PlanID != "" || value.Confirmation != "configure" {
+			return false
+		}
+		candidate := *value.ManagementHTTPS
+		candidate.Phase = domain.ManagementHTTPSPending
+		candidate.Generation = 1
+		candidate.CertificateBundle = nil
+		candidate.LastFailureCode = ""
+		if err := domain.ValidateManagementHTTPSConfig(candidate); err != nil {
+			return false
+		}
+	} else if value.Operation == string(OperationManagementHTTPSConfigure) {
+		return false
+	}
+	return true
 }
 
 func validHeadscalePlanOrSuccess(action ActionResult, operation string) bool {
@@ -617,7 +640,7 @@ func ValidateResponse(operation Operation, response Response) error {
 			return fmt.Errorf("successful helper response is incomplete")
 		}
 		headscaleTerminalResult := response.Action != nil && response.Action.PlanID == "" && response.Action.JobID != "" && response.Action.JobResult == "succeeded" && (operation == OperationHeadscaleDeploy || operation == OperationHeadscaleReissue)
-		if operation != OperationPublicationActivate && operation != OperationContractionClose && !headscaleTerminalResult && response.Action != nil && response.Action.JobResult != "" {
+		if operation != OperationPublicationActivate && operation != OperationManagementHTTPSConfigure && operation != OperationContractionClose && !headscaleTerminalResult && response.Action != nil && response.Action.JobResult != "" {
 			return fmt.Errorf("unrelated helper response carried a job result")
 		}
 		if operation != OperationDomainStatus && response.Resource != nil && (response.Resource.GoAccessRetirementJobID != "" || len(response.Resource.GoAccessRetirementGenerations) != 0) {
@@ -646,6 +669,10 @@ func ValidateResponse(operation Operation, response Response) error {
 			validTarget := action != nil && ((action.Operation == "admin_token_rotate" || action.Operation == "close_all") && action.TargetKind == "installation" && action.TargetID == "" || (action.Operation == "publish" || action.Operation == "unpublish" || action.Operation == "resource_delete") && action.TargetKind == "resource" && action.TargetID != "" || (action.Operation == "managed_basic_delete" || action.Operation == "managed_basic_rotate") && action.TargetKind == "credential" && action.TargetID != "")
 			if !validTarget || !refPattern.MatchString(action.PlanID) || !digestPattern.MatchString(action.Confirmation) || action.JobID != "" || !validDisplay(action.ExposureSummary) || !validDisplay(action.Prerequisites) || action.ExpiresAt.IsZero() || action.ContractionOutcome != "" || action.AccessClosed || action.SharedIngressDown || action.AccessMayRemain {
 				return fmt.Errorf("application Plan response shape is invalid")
+			}
+		case OperationManagementHTTPSConfigure:
+			if response.Action == nil || !jobIDPattern.MatchString(response.Action.JobID) || response.Action.JobResult != "succeeded" || response.Action.Operation != string(OperationManagementHTTPSConfigure) || response.Action.TargetKind != "installation" || response.Action.TargetID != "" || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain || response.Action.Emergency || response.Action.PublicURL != "" || response.Resource != nil {
+				return fmt.Errorf("management HTTPS response shape is invalid")
 			}
 		case OperationAdminTokenRotate:
 			if response.Action == nil || !refPattern.MatchString(response.Action.JobID) || response.Action.PlanID != "" || response.Action.Confirmation != "" || response.Action.Operation != "" || response.Action.TargetKind != "" || response.Action.TargetID != "" || response.Action.ExposureSummary != "" || response.Action.Prerequisites != "" || !response.Action.ExpiresAt.IsZero() || response.Action.ContractionOutcome != "" || response.Action.AccessClosed || response.Action.SharedIngressDown || response.Action.AccessMayRemain {

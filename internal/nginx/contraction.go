@@ -486,7 +486,7 @@ func reconcileContractionGraphStaging(paths Paths, owner filetxn.Owner, journal 
 	// A process may have died after the atomic namespace operation but before
 	// filetxn synchronized both directories. Synchronize every bounded graph
 	// directory before removing only the exact journal-bound tombstones above.
-	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory)} {
+	for _, directory := range []string{paths.ConfigRoot, paths.StagingPath(), filepath.Join(paths.ConfigRoot, AppsDirectory), filepath.Join(paths.ConfigRoot, ChallengesDirectory), filepath.Join(paths.ConfigRoot, ControlDirectory), filepath.Join(paths.ConfigRoot, ManagementDirectory), filepath.Join(paths.ConfigRoot, TemporaryDirectory)} {
 		fd, openErr := unix.Open(directory, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if openErr != nil {
 			return openErr

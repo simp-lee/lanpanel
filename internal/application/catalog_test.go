@@ -220,7 +220,7 @@ func TestTypedActionRejectsWrongPayloadAndActor(t *testing.T) {
 
 func TestFinalCoreActionVocabularyIsExact(t *testing.T) {
 	expected := []domain.OperationCode{
-		"plan", "status", "admin_token_rotate", "headscale_initialize",
+		"plan", "status", "admin_token_rotate", "management_https_configure", "headscale_initialize",
 		"headscale_control_deploy", "headscale_certificate_reissue", "headscale_user_create", "headscale_user_list",
 		"preauth_key_create", "preauth_key_list", "preauth_key_revoke", "device_list", "device_expire",
 		"connector_binding_set", "connector_verify", "connector_login", "resource_create", "resource_update", "publish", "unpublish", "close_all",

@@ -86,6 +86,14 @@ func basicReservationRejectionCode(operation operations.Type) string {
 }
 
 func beginBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding, planID string) (*basicExecution, error) {
+	return beginBasicSource(ctx, operation, target, actor, binding, planID, operations.AdmissionUI)
+}
+
+func beginPlanlessBasic(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding) (*basicExecution, error) {
+	return beginBasicSource(ctx, operation, target, actor, binding, "", operations.AdmissionTimer)
+}
+
+func beginBasicSource(ctx context.Context, operation operations.Type, target, actor string, binding operations.SafetyBinding, planID string, source operations.AdmissionSource) (*basicExecution, error) {
 	service, err := OpenFixed()
 	if err != nil {
 		return nil, err
@@ -102,9 +110,8 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 	if err != nil {
 		return fail(err)
 	}
-	source := operations.AdmissionUI
 	var confirmationProof string
-	if planID != "" {
+	if source == operations.AdmissionUI && planID != "" {
 		plan, planErr := service.ReadPlan(planID)
 		if planErr != nil || plan.Operation != string(operation) || plan.Target.Kind != "credential" || plan.Target.ID != strings.TrimPrefix(target, "credential/") || plan.ActorIdentity != actor || !plan.Config.Applicable || plan.Config.Digest != binding.PriorFingerprint {
 			return fail(fmt.Errorf("managed Basic Plan changed"))
@@ -149,10 +156,13 @@ func beginBasic(ctx context.Context, operation operations.Type, target, actor st
 		return cleanupReserved(err)
 	}
 	var intent operations.Reservation
-	if source == operations.AdmissionPlan {
+	switch source {
+	case operations.AdmissionPlan:
 		intent, err = admitter.ConsumePlan(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1, ConfirmationProof: confirmationProof})
-	} else {
+	case operations.AdmissionUI:
 		intent, err = admitter.BeginUI(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
+	default:
+		intent, err = admitter.BeginPlanless(ctx, mutation, exposure, operations.ConsumeRequest{JobID: job.ID, ExpectedRevision: fresh.Revision, IntentGeneration: fresh.Revision + 1})
 	}
 	if err != nil {
 		return cleanupReserved(err)

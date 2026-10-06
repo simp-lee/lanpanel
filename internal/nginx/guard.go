@@ -8,7 +8,10 @@ import (
 	"lanpanel/internal/domain"
 	"lanpanel/internal/safety"
 	"lanpanel/internal/storeauthority"
+	"net"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -63,6 +66,13 @@ func Guard(input GuardInput) GuardDecision {
 			}
 			continue
 		}
+		if entry.Kind == EntryChallenge && entry.ResourceID == "management_https" {
+			pending := input.Safety.ManagementHTTPS.ChallengePending
+			if pending == nil || pending.Generation != entry.Generation || !exactHTTPChallengeEntry(pending, entry) || !managementChallengeSnapshotMatches(pending.BaseMarkers, input.Safety.ManagementHTTPS) {
+				return GuardDecision{Reason: "management HTTPS challenge graph lacks exact authority"}
+			}
+			continue
+		}
 		if entry.Kind == EntryControl {
 			if active := input.Safety.Headscale.Reactivating; active != nil {
 				if entry.Domain == nil || active.ControlGeneration != entry.Generation || active.CertificateGeneration == 0 || active.CertificateFingerprint == "" || active.CandidateBundle == "" || active.ActivationDigest == "" || active.ControlEntryDigest != entry.Digest || input.Now.Before(active.CertificateLastTrustedWall) || !input.Now.Before(active.CertificateUntil) {
@@ -88,6 +98,22 @@ func Guard(input GuardInput) GuardDecision {
 			}
 			if input.Installation == nil || input.Installation.Headscale == nil || !input.Installation.Headscale.Enabled || input.Installation.Headscale.Applied == nil || input.Installation.Headscale.Certificate == nil || entry.Domain == nil || entry.Generation != input.Installation.Headscale.Applied.Generation || certificate == nil || input.Safety.Headscale.CertificateExpiry != nil || certificate.Fingerprint != input.Installation.Headscale.Certificate.Fingerprint || certificate.Generation != input.Installation.Headscale.Certificate.Generation || input.Now.Before(certificate.LastTrustedWall) || !input.Now.Before(certificate.NotAfter) {
 				return GuardDecision{Reason: "control ingress lacks valid committed Headscale certificate authority"}
+			}
+			continue
+		}
+		if entry.Kind == EntryManagement {
+			config := input.Installation.ManagementHTTPS
+			authority := input.Safety.ManagementHTTPS
+			if config == nil || config.Phase != domain.ManagementHTTPSActive || config.CertificateBundle == nil || authority.ActiveCertificate == nil || authority.EntryDigest != entry.Digest || entry.Generation != config.Generation || entry.Management == nil || entry.Management.Host != config.Domain || entry.Management.CertificatePointer != config.CertificateBundle.PointerIdentity || entry.Management.UpstreamAddress != net.JoinHostPort(input.Installation.Management.Address, strconv.FormatUint(uint64(input.Installation.Management.Port), 10)) || authority.ActiveCertificate.Generation != config.CertificateBundle.Generation || authority.ActiveCertificate.Fingerprint != config.CertificateBundle.Fingerprint || authority.ActiveCertificate.Binding != config.CertificateBundle.BindingIdentity || authority.ActiveCertificate.NotAfter.Format(time.RFC3339) != config.CertificateBundle.NotAfter || input.Now.Before(authority.ActiveCertificate.LastTrustedWall) || !input.Now.Before(authority.ActiveCertificate.NotAfter) {
+				return GuardDecision{Reason: "management HTTPS ingress lacks exact active certificate authority"}
+			}
+			if entry.Challenge != nil {
+				if !exactHTTPChallengeEntry(authority.ChallengePending, entry) {
+					return GuardDecision{Reason: "management HTTPS challenge authority changed"}
+				}
+			}
+			if authority.CertificateExpiry != nil && !input.Now.Before(authority.CertificateExpiry.Deadline) {
+				return GuardDecision{Reason: "management HTTPS certificate expiry blocks ingress"}
 			}
 			continue
 		}
@@ -123,6 +149,20 @@ func Guard(input GuardInput) GuardDecision {
 		}
 	}
 	return GuardDecision{Allowed: true, Reason: "exact durable safety and disk graph match"}
+}
+
+func managementChallengeSnapshotMatches(snapshot []safety.MarkerSnapshot, authority safety.ManagementHTTPSSafety) bool {
+	if len(snapshot) != 3 {
+		return false
+	}
+	wantExpiry := safety.SnapshotAbsent
+	var expiryGeneration uint64
+	if authority.CertificateExpiry != nil {
+		wantExpiry = safety.SnapshotPresent
+		expiryGeneration = authority.CertificateExpiry.Generation
+	}
+	want := []safety.MarkerSnapshot{{Kind: safety.MarkerStickyUnpublished, State: safety.SnapshotAbsent}, {Kind: safety.MarkerContraction, State: safety.SnapshotAbsent}, {Kind: safety.MarkerCertificateExpiry, State: wantExpiry, Generation: expiryGeneration}}
+	return reflect.DeepEqual(snapshot, want)
 }
 
 func exactHTTPChallengeEntry(pending *safety.ChallengePending, entry Entry) bool {

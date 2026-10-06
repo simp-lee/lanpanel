@@ -84,6 +84,7 @@ type Journal struct {
 	Sequence               uint64                       `json:"sequence"`
 	Release                release.InstallIdentity      `json:"release"`
 	Authority              identity.ManagementAuthority `json:"management_authority"`
+	SSHAccess              *SSHAccess                   `json:"ssh_access,omitempty"`
 	PreflightRequest       preflight.ExpansionRequest   `json:"preflight_request"`
 	PreflightDigest        string                       `json:"preflight_digest"`
 	PackageTransactionID   string                       `json:"package_transaction_id"`
@@ -184,11 +185,12 @@ type Request struct {
 	Paths               Paths
 	Output              io.Writer
 	TTY                 TTY
+	SSHAccess           *SSHAccess
 }
 
 type TTY interface {
 	Attached() bool
-	WriteToken([]byte) error
+	WriteToken(ManagementAccess, []byte) error
 }
 
 type installerPrompt interface {
@@ -196,7 +198,7 @@ type installerPrompt interface {
 }
 
 func validateJournal(value Journal) error {
-	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
+	if value.SchemaVersion != JournalSchemaVersion || len(value.InstallerInput) > maximumPublicInstallerInputBytes || value.Paths.CommitPath == "" || value.Paths.StartupAuthority == "" || value.Paths.ACMEAccountKey != filepath.Join(value.Paths.InstallationRoot, "acme-account.key") || len(value.PlannedPaths) == 0 || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || value.SafetyGeneration == 0 || !validPhase(value.Phase) || value.Sequence == 0 || release.ValidateInstallIdentity(value.Release) != nil || identity.ValidateManagementAuthority(value.Authority) != nil || validateSSHAccess(value.SSHAccess) != nil || value.PreflightRequest.Target != "installation" || value.PreflightRequest.Scope != preflight.ExpansionBootstrap || value.PreflightDigest == "" || value.PackageTransactionID == "" || !release.ValidDigest(value.PackagePlanDigest) || value.Accounts.HelperClientGroup == "" || value.Paths.PersistentRoot == "" || len(value.ArtifactDigests) == 0 {
 		return fmt.Errorf("bootstrap journal is incomplete or invalid")
 	}
 	beforePackages := value.Phase == PhasePrepared || value.Phase == PhaseNginxMasked

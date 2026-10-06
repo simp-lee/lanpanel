@@ -60,12 +60,16 @@ func BindResumeInstallAuthority(verified *InstallAuthority, persisted InstallIde
 	if verified == nil || ValidateInstallIdentity(persisted) != nil {
 		return nil, fmt.Errorf("resume install authority is invalid")
 	}
+	// Re-clone the persisted value before comparison. Older installers may have
+	// serialized empty slices as [] while the current clone normalizes them to
+	// nil; that representation change is not a release-authority change.
+	expected := cloneInstallIdentity(persisted)
 	candidate := verified.Identity()
-	candidate.AuthorityCreatedAt = persisted.AuthorityCreatedAt
-	if !reflect.DeepEqual(candidate, persisted) {
+	candidate.AuthorityCreatedAt = expected.AuthorityCreatedAt
+	if !reflect.DeepEqual(candidate, expected) {
 		return nil, fmt.Errorf("resume install authority differs from verified immutable input")
 	}
-	return &InstallAuthority{identity: cloneInstallIdentity(persisted)}, nil
+	return &InstallAuthority{identity: expected}, nil
 }
 
 func RehydrateInstallAuthority(value InstallIdentity) (*InstallAuthority, error) {

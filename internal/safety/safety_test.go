@@ -14,6 +14,26 @@ import (
 	"time"
 )
 
+func TestLegacySafetyStateChecksumRemainsReadable(t *testing.T) {
+	state := stateWithResource()
+	checksum, err := legacyStateChecksum(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := legacyState{SchemaVersion: state.SchemaVersion, Revision: state.Revision, AuthoritySequence: state.AuthoritySequence, Checksum: checksum, GlobalClose: state.GlobalClose, StopFenceSequence: state.StopFenceSequence, StopFence: state.StopFence, Headscale: state.Headscale, Resources: state.Resources}
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeState(encoded)
+	if err != nil {
+		t.Fatalf("decodeState(legacy): %v", err)
+	}
+	if decoded.Checksum != checksum || decoded.ManagementHTTPS != (ManagementHTTPSSafety{}) {
+		t.Fatalf("decoded legacy state = %#v", decoded)
+	}
+}
+
 func TestP1SafetySchemaContainsOnlyLiveAuthorities(t *testing.T) {
 	state := stateWithResource()
 	encoded, err := json.Marshal(state)

@@ -290,7 +290,7 @@ func install(ctx context.Context, request Request, strict bool) error {
 	if err != nil {
 		return fmt.Errorf("bootstrap planned path inventory failed: %w", err)
 	}
-	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
+	journal := Journal{SchemaVersion: JournalSchemaVersion, AttemptID: material.AttemptID, InstallationID: material.InstallationID, GenerationID: material.GenerationID, SafetyGeneration: material.SafetyGeneration, Phase: PhasePrepared, Sequence: 1, Release: releaseIdentity, Authority: material.Authority, SSHAccess: request.SSHAccess, PreflightRequest: preflightRequest, PreflightDigest: preflightDigest, PackageTransactionID: request.PackagePlan.TransactionID, PackagePlanDigest: packagePlanDigest, PackageInputPlanDigest: inputPackagePlanDigest, PackagePlan: request.PackagePlan, PackagePreflight: request.PackagePreflight, Accounts: accounts, Paths: paths, ArtifactDigests: map[string]string{"release_binary": releaseIdentity.Binary.Digest}, PlannedPaths: plannedPaths, InstallerInput: append([]byte(nil), request.InstallerInput...)}
 	if err := validateJournal(journal); err != nil {
 		return err
 	}
@@ -803,7 +803,7 @@ func resume(ctx context.Context, store *journalStore, journal Journal, request R
 			}
 		}
 		journal.FinalCommitDigest = digestBytes(commitBytes)
-		startup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, CommitDigest: journal.FinalCommitDigest}
+		startup := StartupAuthority{SchemaVersion: "lanpanel.startup-authority.v1", AttemptID: journal.AttemptID, InstallationID: journal.InstallationID, GenerationID: journal.GenerationID, Management: journal.Authority, SSHAccess: journal.SSHAccess, CommitDigest: journal.FinalCommitDigest}
 		uiIdentity, _ := identity.IdentityFor(journal.Accounts, identity.RoleUI)
 		startupGID := uiIdentity.GID
 		if journal.Paths != FixedPaths() {
@@ -883,7 +883,7 @@ func createBootstrapDirectories(journal Journal) error {
 	if journal.Paths != FixedPaths() {
 		nginxPaths = testNginxPaths(journal.Paths)
 	}
-	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot} {
+	for _, path := range []string{journal.Paths.StateRoot, journal.Paths.SafetyRoot, journal.Paths.OwnershipRoot, journal.Paths.LockRoot, journal.Paths.PackageRoot, filepath.Join(journal.Paths.PackageRoot, ".filetxn"), filepath.Join(journal.Paths.PackageRoot, "journals"), filepath.Join(journal.Paths.PackageRoot, "plans"), filepath.Join(journal.Paths.PackageRoot, "transactions"), filepath.Join(journal.Paths.PackageRoot, "staging"), filepath.Join(journal.Paths.PersistentRoot, ".bootstrap-filetxn"), nginxPaths.ConfigRoot, nginxPaths.StagingPath(), filepath.Join(nginxPaths.ConfigRoot, nginx.AppsDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ChallengesDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ControlDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.ManagementDirectory), filepath.Join(nginxPaths.ConfigRoot, nginx.TemporaryDirectory), nginxPaths.StateRoot} {
 		if _, err := ensureDirectory(path, owner, 0o700); err != nil {
 			return fmt.Errorf("bootstrap directory %q: %w", path, err)
 		}
@@ -1457,6 +1457,11 @@ func deliverToken(store *journalStore, journal *Journal, request Request, token 
 	if journal.TokenDeliveryAttempted {
 		return nil
 	}
+	access, err := managementAccessFor(journal.Authority, journal.SSHAccess)
+	if err != nil {
+		return fmt.Errorf("management UI authority is invalid before token delivery: %w", err)
+	}
+	access.TokenSource = ProtectedAdminTokenPath
 	if request.TTY != nil && request.TTY.Attached() && len(token) == 0 {
 		var err error
 		token, err = readCommittedArtifact(filepath.Join(journal.Paths.InstallationRoot, "admin-token"), 4096, 0o600)
@@ -1471,10 +1476,10 @@ func deliverToken(store *journalStore, journal *Journal, request Request, token 
 		return err
 	}
 	if request.TTY != nil && request.TTY.Attached() && len(token) != 0 {
-		return request.TTY.WriteToken(token)
+		return request.TTY.WriteToken(access, token)
 	}
 	if request.Output != nil {
-		_, err := fmt.Fprintf(request.Output, "Admin token is stored at %s\n", ProtectedAdminTokenPath)
+		_, err := fmt.Fprintf(request.Output, "Management UI URL: %s\nSSH tunnel command: %s\nBrowser URL: %s\nAdmin token is stored at %s\nToken rotation: sudo lanpanel token reset\n", access.URL, access.SSHCommand, access.BrowserURL, access.TokenSource)
 		return err
 	}
 	return nil
@@ -1534,6 +1539,7 @@ type StartupAuthority struct {
 	InstallationID string                       `json:"installation_id"`
 	GenerationID   string                       `json:"generation_id"`
 	Management     identity.ManagementAuthority `json:"management_authority"`
+	SSHAccess      *SSHAccess                   `json:"ssh_access,omitempty"`
 	CommitDigest   string                       `json:"commit_digest"`
 }
 
@@ -1560,7 +1566,7 @@ func ReadPublicStartupAuthority(paths Paths) (StartupAuthority, error) {
 	if err != nil || int64(len(data)) != stat.Size {
 		return value, fmt.Errorf("bootstrap startup authority read failed")
 	}
-	if decodeCanonical(data, &value) != nil || value.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || identity.ValidateManagementAuthority(value.Management) != nil || !release.ValidDigest(value.CommitDigest) {
+	if decodeCanonical(data, &value) != nil || value.SchemaVersion != "lanpanel.startup-authority.v1" || !identity.ValidateAttemptID(value.AttemptID) || !identity.ValidateInstallationID(value.InstallationID) || !identity.ValidateGenerationID(value.GenerationID) || identity.ValidateManagementAuthority(value.Management) != nil || validateSSHAccess(value.SSHAccess) != nil || !release.ValidDigest(value.CommitDigest) {
 		return value, fmt.Errorf("bootstrap startup authority is invalid")
 	}
 	return value, nil

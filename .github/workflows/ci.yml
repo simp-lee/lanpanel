@@ -34,6 +34,9 @@ jobs:
       - name: Run LanPanel Go quality gate
         run: make preview-local-gate
 
+      - name: Run real Nginx HTTPS integration gate
+        run: make nginx-https-integration
+
       - name: Set up Node.js for browser fixture
         uses: actions/setup-node@v4
         with:

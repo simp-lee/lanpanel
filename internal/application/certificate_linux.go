@@ -70,35 +70,38 @@ func activeCertificateMatchesIdentity(active *safety.ActiveCertificateAuthority,
 }
 
 type CertificateExecution struct {
-	Service          *FixedService
-	Admitter         *operations.Admitter
-	MutationSet      *operations.MutationSet
-	Mutation         *operations.MutationLease
-	Exposure         *locks.Lease
-	JobID            string
-	Operation        operations.Type
-	Revision         uint64
-	Resource         domain.AppResource
-	Binding          acme.Binding
-	Challenge        challenge.Prepared
-	DNSPreflight     *acme.DNSPreflight
-	DNSLocks         *acme.OwnerLocks
-	InstallationID   string
-	Plan             plans.Plan
-	Deadline         time.Time
-	BundleGeneration uint64
-	PriorCertificate *domain.CertificateBundleIdentity
-	Child            operations.ChildRecord
-	StageRoot        string
-	StageUID         uint32
-	StageGID         uint32
-	LegoDigest       string
-	RemoteStarted    bool
-	Headscale        bool
-	HeadscaleID      string
-	HeadscalePrior   *domain.CertificateBundleIdentity
-	ClosureUncertain bool
-	RecoveryPending  bool
+	Service                *FixedService
+	Admitter               *operations.Admitter
+	MutationSet            *operations.MutationSet
+	Mutation               *operations.MutationLease
+	Exposure               *locks.Lease
+	JobID                  string
+	Operation              operations.Type
+	Revision               uint64
+	Resource               domain.AppResource
+	Binding                acme.Binding
+	Challenge              challenge.Prepared
+	DNSPreflight           *acme.DNSPreflight
+	DNSLocks               *acme.OwnerLocks
+	InstallationID         string
+	Plan                   plans.Plan
+	Deadline               time.Time
+	BundleGeneration       uint64
+	PriorCertificate       *domain.CertificateBundleIdentity
+	Child                  operations.ChildRecord
+	StageRoot              string
+	StageUID               uint32
+	StageGID               uint32
+	LegoDigest             string
+	RemoteStarted          bool
+	Headscale              bool
+	ManagementHTTPS        bool
+	InitialPointer         *certificates.Pointer
+	InitialConfigCommitted bool
+	HeadscaleID            string
+	HeadscalePrior         *domain.CertificateBundleIdentity
+	ClosureUncertain       bool
+	RecoveryPending        bool
 }
 
 func BeginCertificateIssue(ctx context.Context, actor Actor, envelopeTarget string, payload ConfirmationPayload) (*CertificateExecution, error) {
@@ -1374,7 +1377,7 @@ func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, res
 	if child.CgroupClosureUnproved(runErr) {
 		return runErr
 	}
-	if execution.Operation == operations.CertificateRenew && !time.Now().UTC().Before(execution.Deadline) {
+	if (execution.Operation == operations.CertificateRenew || execution.Operation == operations.AutomaticReconciliation && execution.ManagementHTTPS) && !time.Now().UTC().Before(execution.Deadline) {
 		return fmt.Errorf("certificate renewal remote deadline elapsed")
 	}
 	if _, err := execution.Reenter(ctx); err != nil {
@@ -1397,14 +1400,27 @@ func (execution *CertificateExecution) TerminalizeChild(ctx context.Context, res
 		if loadErr != nil || installation.Headscale.Certificate == nil || execution.HeadscalePrior == nil || !reflect.DeepEqual(*installation.Headscale.Certificate, *execution.HeadscalePrior) {
 			return fmt.Errorf("headscale renewal authority changed during remote wait: %w", loadErr)
 		}
+	} else if execution.ManagementHTTPS {
+		raw, present := document.Entries["installations/current"]
+		if !present {
+			return fmt.Errorf("management HTTPS installation authority missing")
+		}
+		installation, loadErr := domain.DecodeInstallation(raw)
+		if execution.Operation == operations.AutomaticReconciliation {
+			if loadErr != nil || installation.ManagementHTTPS == nil || installation.ManagementHTTPS.Phase != domain.ManagementHTTPSPending || installation.ManagementHTTPS.CertificateBundle != nil {
+				return fmt.Errorf("management HTTPS issuance authority changed during remote wait: %w", loadErr)
+			}
+		} else if loadErr != nil || installation.ManagementHTTPS == nil || installation.ManagementHTTPS.Phase != domain.ManagementHTTPSActive || execution.PriorCertificate == nil || installation.ManagementHTTPS.CertificateBundle == nil || !reflect.DeepEqual(*installation.ManagementHTTPS.CertificateBundle, *execution.PriorCertificate) {
+			return fmt.Errorf("management HTTPS renewal authority changed during remote wait: %w", loadErr)
+		}
 	} else {
 		_, current, err = loadCertificateResource(document.Entries, execution.Resource.ID)
 		if err != nil {
 			return err
 		}
 	}
-	if execution.Headscale {
-		// Exact committed Headscale authority was checked above.
+	if execution.Headscale || execution.ManagementHTTPS {
+		// Exact non-App renewal authority was checked above.
 	} else if execution.Operation == operations.Publish {
 		if current.Publication.DomainHTTPS == nil {
 			return fmt.Errorf("certificate publication config disappeared")
@@ -1478,6 +1494,24 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 		if raw, present := document.Entries["journals/certificate-"+execution.JobID]; present {
 			var journal operations.JournalRecord
 			if json.Unmarshal(raw, &journal) == nil && journal.Certificate != nil {
+				if execution.ManagementHTTPS {
+					if observedPointer, pointerErr := certificates.ObservePointer(journal.Certificate.CertificateID); pointerErr == nil && observedPointer == journal.Certificate.CandidatePointer {
+						return errors.Join(cause, fmt.Errorf("management HTTPS certificate candidate remains pointed and requires recovery"))
+					}
+				}
+				if execution.InitialPointer != nil && execution.InitialConfigCommitted {
+					return errors.Join(cause, fmt.Errorf("management HTTPS initial activation left a durable candidate after activation failure"))
+				}
+				if execution.InitialPointer != nil {
+					candidatePath, pathErr := certificates.BundlePath(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration)
+					if pathErr != nil {
+						return errors.Join(cause, pathErr)
+					}
+					if removeErr := certificates.RemovePointer(ctx, *execution.InitialPointer, candidatePath); removeErr != nil {
+						return errors.Join(cause, removeErr)
+					}
+					execution.InitialPointer = nil
+				}
 				cleanupErr := certificates.RemoveInactiveBundle(journal.Certificate.CertificateID, journal.Certificate.CandidateGeneration, journal.Certificate.CandidateBundleIdentity, journal.Certificate.StageUID, journal.Certificate.StageGID)
 				if cleanupErr != nil {
 					return errors.Join(cause, cleanupErr)
@@ -1558,6 +1592,11 @@ func (execution *CertificateExecution) Abort(ctx context.Context, cause error) e
 			next.Headscale.ChallengePending = nil
 			changed = true
 		}
+	} else if execution.ManagementHTTPS {
+		if next.ManagementHTTPS.ChallengePending != nil && challenge.Matches(*next.ManagementHTTPS.ChallengePending, execution.Challenge) {
+			next.ManagementHTTPS.ChallengePending = nil
+			changed = true
+		}
 	} else {
 		for index := range next.Resources {
 			if next.Resources[index].ResourceID == execution.Resource.ID && next.Resources[index].ChallengePending != nil && challenge.Matches(*next.Resources[index].ChallengePending, execution.Challenge) {
@@ -1631,6 +1670,11 @@ func (execution *CertificateExecution) clearHTTP01PresentationAuthority(ctx cont
 			return fmt.Errorf("headscale HTTP-01 active authority changed")
 		}
 		next.Headscale.ChallengePending = &base.Safety
+	} else if execution.ManagementHTTPS {
+		if state.ManagementHTTPS.ChallengePending == nil || !challenge.Matches(*state.ManagementHTTPS.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("management HTTPS HTTP-01 active authority changed")
+		}
+		next.ManagementHTTPS.ChallengePending = &base.Safety
 	} else {
 		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 		matched := false
@@ -1683,6 +1727,8 @@ func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context
 	resourceID := execution.Resource.ID
 	if execution.Headscale {
 		resourceID = "headscale"
+	} else if execution.ManagementHTTPS {
+		resourceID = "management_https"
 	}
 	manifest, err := nginx.Audit(host.Paths, host.Owner)
 	if err != nil {
@@ -1727,6 +1773,9 @@ func (execution *CertificateExecution) removeActiveChallenge(ctx context.Context
 func certificateExecutionTarget(execution *CertificateExecution) string {
 	if execution != nil && execution.Headscale {
 		return "headscale"
+	}
+	if execution != nil && execution.ManagementHTTPS {
+		return "management_https"
 	}
 	if execution == nil {
 		return ""
@@ -1991,6 +2040,8 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	resourceIDs := []string{execution.Resource.ID}
 	if execution.Headscale {
 		target, resourceIDs = "headscale/"+execution.HeadscaleID, nil
+	} else if execution.ManagementHTTPS {
+		target, resourceIDs = "management_https", nil
 	}
 	journal := operations.JournalRecord{SchemaVersion: "lanpanel.journal.v1", ID: "certificate-" + execution.JobID, JobID: execution.JobID, Kind: operations.JournalCertificateActivation, Operation: operations.CertificateRenew, InstallationID: execution.InstallationID, Target: target, Generation: execution.Child.IntentGeneration, Deadline: execution.Deadline, ArtifactDigest: execution.Child.InputDigest, ResourceIDs: resourceIDs, ChildIDs: []string{execution.Child.ID}, Phase: operations.JournalActive, Certificate: &operations.CertificateJournalIdentity{CertificateID: identity.ID, PriorGeneration: prior.Generation, CandidateGeneration: identity.Generation, PriorPointer: priorPath, CandidatePointer: candidatePath, PriorFingerprint: prior.Fingerprint, CandidateFingerprint: identity.Fingerprint, PriorBundleIdentity: certificateBundleIdentity(prior), CandidateBundleIdentity: certificates.BundleIdentityFor(identity), Challenge: execution.Challenge.Safety, StageUID: execution.StageUID, StageGID: execution.StageGID}}
 	if err := execution.Admitter.PutJournal(ctx, execution.Mutation, execution.Exposure, execution.Revision, journal, false); err != nil {
@@ -2022,6 +2073,23 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		}
 		execution.Revision++
 		commitErr = execution.Admitter.CommitHeadscaleCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, prior, candidate)
+	} else if execution.ManagementHTTPS {
+		freshDocument, readErr := execution.Service.normal.Read()
+		if readErr != nil {
+			return jobs.Record{}, readErr
+		}
+		raw, present := freshDocument.Entries["installations/current"]
+		if !present {
+			return jobs.Record{}, fmt.Errorf("management HTTPS installation authority missing")
+		}
+		installation, decodeErr := domain.DecodeInstallation(raw)
+		if decodeErr != nil || installation.ManagementHTTPS == nil {
+			return jobs.Record{}, fmt.Errorf("management HTTPS configuration disappeared: %w", decodeErr)
+		}
+		management := *installation.ManagementHTTPS
+		management.CertificateBundle = &candidate
+		management.LastFailureCode = ""
+		commitErr = execution.Admitter.CommitManagementHTTPSRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, management)
 	} else {
 		commitErr = execution.Admitter.CommitCertificateRenewal(ctx, execution.Mutation, execution.Exposure, execution.Revision, execution.JobID, execution.Resource.ID, prior, candidate)
 	}
@@ -2037,7 +2105,7 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		return jobs.Record{}, &activation.Failure{Cause: commitErr, PriorRestored: true}
 	}
 	execution.Revision++
-	if !execution.Headscale {
+	if !execution.Headscale && !execution.ManagementHTTPS {
 		if err := execution.Service.CommitRenewedCertificateAuthority(ctx, execution.Exposure, execution.Resource.ID, candidate); err != nil {
 			return jobs.Record{}, execution.fenceCertificateActivation(context.WithoutCancel(ctx), host, activationResult.Pointer, candidate, err)
 		}
@@ -2055,7 +2123,6 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 	}
 	next := state
 	next.Revision++
-	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 	matched := false
 	if execution.Headscale {
 		pending := next.Headscale.ChallengePending
@@ -2065,25 +2132,39 @@ func (execution *CertificateExecution) CompleteRenewal(ctx context.Context, iden
 		next.Headscale.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: candidate.Generation, Fingerprint: candidate.Fingerprint, Binding: candidate.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
 		next.Headscale.ChallengePending = nil
 		matched = true
-	}
-	for index := range next.Resources {
-		if !execution.Headscale && next.Resources[index].ResourceID == execution.Resource.ID {
-			pending := next.Resources[index].ChallengePending
-			if pending == nil || !challenge.Matches(*pending, execution.Challenge) {
-				return jobs.Record{}, fmt.Errorf("renewal challenge authority changed")
+	} else if execution.ManagementHTTPS {
+		pending := next.ManagementHTTPS.ChallengePending
+		if pending == nil || !challenge.Matches(*pending, execution.Challenge) {
+			return jobs.Record{}, fmt.Errorf("management HTTPS renewal challenge authority changed")
+		}
+		next.ManagementHTTPS.ActiveCertificate = &safety.ActiveCertificateAuthority{Generation: candidate.Generation, Fingerprint: candidate.Fingerprint, Binding: candidate.BindingIdentity, NotAfter: identity.NotAfter, LastTrustedWall: identity.LastTrustedWall}
+		next.ManagementHTTPS.ChallengePending = nil
+		matched = true
+	} else {
+		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+		for index := range next.Resources {
+			if next.Resources[index].ResourceID == execution.Resource.ID {
+				pending := next.Resources[index].ChallengePending
+				if pending == nil || !challenge.Matches(*pending, execution.Challenge) {
+					return jobs.Record{}, fmt.Errorf("renewal challenge authority changed")
+				}
+				next.Resources[index].ChallengePending = nil
+				matched = true
 			}
-			next.Resources[index].ChallengePending = nil
-			matched = true
 		}
 	}
 	if !matched {
 		return jobs.Record{}, fmt.Errorf("renewal safety resource missing")
 	}
 	role := safety.RoleChallenge
-	if execution.Headscale {
+	if execution.Headscale || execution.ManagementHTTPS {
 		role = safety.RoleCertificateActivation
 	}
 	if _, err := execution.Service.safety.Commit(ctx, execution.Exposure, role, state.Revision, next, safety.TransitionProof{}); err != nil {
+		if execution.ManagementHTTPS {
+			_, stopErr := host.StopAndVerify(context.WithoutCancel(ctx))
+			return jobs.Record{}, errors.Join(err, stopErr)
+		}
 		return jobs.Record{}, err
 	}
 	if execution.Headscale {
@@ -2119,6 +2200,14 @@ func (execution *CertificateExecution) fenceCertificateActivation(ctx context.Co
 		observed := safety.StopObservation{MasterStopped: snapshot.Master == nil, WorkersStopped: len(snapshot.Workers) == 0, ListenersStopped: len(snapshot.Listeners) == 0, ObservedAt: time.Now().UTC()}
 		updateErr := execution.Service.UpdateCertificateActivationFence(ctx, execution.Exposure, observed, stopErr != nil)
 		return errors.Join(cause, stopErr, updateErr)
+	}
+	if execution.ManagementHTTPS {
+		snapshot, stopErr := host.StopAndVerify(ctx)
+		if stopErr != nil {
+			return errors.Join(cause, stopErr)
+		}
+		_ = snapshot
+		return errors.Join(cause, fmt.Errorf("management HTTPS certificate activation fenced by stopped Nginx runtime"))
 	}
 	if err := execution.Service.MarkCertificateActivationUncertain(ctx, execution.Exposure, execution.Resource.ID, candidate.BindingIdentity, now); err != nil {
 		return errors.Join(cause, err)
@@ -2233,6 +2322,8 @@ func (execution *CertificateExecution) PresentHTTP01(ctx context.Context, presen
 	resourceID := execution.Resource.ID
 	if execution.Headscale {
 		resourceID = "headscale"
+	} else if execution.ManagementHTTPS {
+		resourceID = "management_https"
 	}
 	active, err := challenge.PresentHTTPForResource(resourceID, execution.Challenge, presentation.Host, presentation.Token, presentation.KeyAuthorizationDigest)
 	if err != nil {
@@ -2255,6 +2346,11 @@ func (execution *CertificateExecution) PresentHTTP01(ctx context.Context, presen
 			return fmt.Errorf("headscale HTTP-01 base authority changed")
 		}
 		next.Headscale.ChallengePending = &active.Safety
+	} else if execution.ManagementHTTPS {
+		if state.ManagementHTTPS.ChallengePending == nil || !challenge.Matches(*state.ManagementHTTPS.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("management HTTPS HTTP-01 base authority changed")
+		}
+		next.ManagementHTTPS.ChallengePending = &active.Safety
 	} else {
 		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 		matched := false
@@ -2312,6 +2408,11 @@ func (execution *CertificateExecution) CleanUpHTTP01(ctx context.Context, presen
 			return fmt.Errorf("headscale HTTP-01 active authority changed")
 		}
 		next.Headscale.ChallengePending = &base.Safety
+	} else if execution.ManagementHTTPS {
+		if state.ManagementHTTPS.ChallengePending == nil || !challenge.Matches(*state.ManagementHTTPS.ChallengePending, execution.Challenge) {
+			return fmt.Errorf("management HTTPS HTTP-01 active authority changed")
+		}
+		next.ManagementHTTPS.ChallengePending = &base.Safety
 	} else {
 		next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
 		matched := false
@@ -2390,6 +2491,7 @@ func (execution *CertificateExecution) Close() error {
 }
 
 type certificateSafetyOnly struct {
+	normal    *persist.Store
 	manager   *locks.Manager
 	ownership *ownership.Store
 	emergency *safety.EmergencyStore
@@ -2455,7 +2557,62 @@ func (service *certificateSafetyOnly) Close() error {
 	if service == nil {
 		return nil
 	}
-	return errors.Join(service.store.Close(), service.emergency.Close(), service.ownership.Close(), service.manager.Close())
+	var normalErr error
+	if service.normal != nil {
+		normalErr = service.normal.Close()
+	}
+	return errors.Join(service.store.Close(), service.emergency.Close(), service.ownership.Close(), normalErr, service.manager.Close())
+}
+
+func independentCertificateContractionRequiresStop(state safety.State) bool {
+	if state.Headscale.CertificateExpiry != nil {
+		return true
+	}
+	for _, resource := range state.Resources {
+		if resource.CertificateExpiry != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *certificateSafetyOnly) managementReloadAuthority(exposure *locks.Lease) (activation.ReloadAuthority, error) {
+	if service == nil || exposure == nil || !exposure.Holds(locks.Exposure) {
+		return activation.ReloadAuthority{}, fmt.Errorf("certificate expiry reload authority is incomplete")
+	}
+	if service.normal == nil {
+		normal, err := persist.Open(persist.Config{RootPath: fixedRoot + "/state", StagingPath: fixedRoot + "/state/.filetxn", StatePath: fixedRoot + "/state/normal.json", Owner: filetxn.Owner{UID: 0, GID: 0}, LockAuthority: service.manager.Authority()})
+		if err != nil {
+			return activation.ReloadAuthority{}, err
+		}
+		if err := operations.Register(normal); err != nil {
+			_ = normal.Close()
+			return activation.ReloadAuthority{}, err
+		}
+		service.normal = normal
+	}
+	refresh := func() (activation.ReloadAuthoritySnapshot, error) {
+		state, err := service.store.ReadForRecovery(exposure)
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		document, err := service.normal.Read()
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		installation, err := domain.DecodeInstallation(document.Entries["installations/current"])
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		ownershipAuthority, err := fixedOwnershipAuthority(service.ownership)
+		if err != nil {
+			return activation.ReloadAuthoritySnapshot{}, err
+		}
+		return activation.ReloadAuthoritySnapshot{Safety: state, Installation: installation, Ownership: ownershipAuthority, ObservedAt: time.Now().UTC()}, nil
+	}
+	return activation.NewReloadAuthorityWithRuntimeCheck(refresh, func() error {
+		return VerifyInstalledPackageProfile(context.Background())
+	})
 }
 
 func independentHeadscaleExpiryJournalMatches(state safety.State, journal control.Journal) bool {
@@ -2487,9 +2644,25 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	}
 	due := false
 	appDue := false
+	managementDue := false
 	headscaleDue := false
 	next := state
 	next.Resources = append([]safety.ResourceSafety(nil), state.Resources...)
+	if active := next.ManagementHTTPS.ActiveCertificate; next.ManagementHTTPS.CertificateExpiry != nil {
+		due = true
+		managementDue = true
+	} else if active != nil {
+		deadline := active.NotAfter
+		if now.Before(active.LastTrustedWall) {
+			deadline = now
+		}
+		if !deadline.After(now) {
+			next.ManagementHTTPS.GenerationSequence++
+			next.ManagementHTTPS.CertificateExpiry = &safety.DeadlineMarker{Generation: next.ManagementHTTPS.GenerationSequence, Deadline: deadline, Binding: active.Binding}
+			due = true
+			managementDue = true
+		}
+	}
 	if state.GlobalClose.Phase == safety.GlobalCloseNone {
 		if active := next.Headscale.ActiveCertificate; next.Headscale.CertificateExpiry != nil {
 			due = true
@@ -2532,12 +2705,21 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	if !due {
 		return nil
 	}
-	if !reflect.DeepEqual(state.Resources, next.Resources) || !reflect.DeepEqual(state.Headscale, next.Headscale) {
+	if !reflect.DeepEqual(state.Resources, next.Resources) || !reflect.DeepEqual(state.Headscale, next.Headscale) || !reflect.DeepEqual(state.ManagementHTTPS, next.ManagementHTTPS) {
 		next.Revision++
 		_, err = service.store.Commit(ctx, exposure, safety.RoleCertificateActivation, state.Revision, next, safety.TransitionProof{})
 	}
 	if err != nil {
 		return err
+	}
+	if managementDue && state.ManagementHTTPS.EntryDigest != "" {
+		if err := contractIndependentManagementHTTPSExpiry(ctx, service, exposure, state, appDue || headscaleDue); err != nil {
+			return err
+		}
+		state, err = service.store.ReadForRecovery(exposure)
+		if err != nil {
+			return err
+		}
 	}
 	if headscaleDue {
 		controlStore := control.NewStore(control.FixedPaths(), filetxn.Owner{UID: 0, GID: 0})
@@ -2626,6 +2808,53 @@ func ContractIndependentCertificateExpiries(ctx context.Context, now time.Time) 
 	return ReconcileTerminalNginxContraction(ctx)
 }
 
+func contractIndependentManagementHTTPSExpiry(ctx context.Context, service *certificateSafetyOnly, exposure *locks.Lease, state safety.State, stopBeforeMutation bool) error {
+	if service == nil || exposure == nil || state.ManagementHTTPS.EntryDigest == "" {
+		return fmt.Errorf("independent Management HTTPS expiry authority is incomplete")
+	}
+	host, err := activation.NewFixedHost()
+	if err != nil {
+		return err
+	}
+	manifest, err := nginx.Audit(host.Paths, host.Owner)
+	if err != nil {
+		return err
+	}
+	var managementEntry *nginx.Entry
+	for index := range manifest.Entries {
+		entry := manifest.Entries[index]
+		if entry.Kind != nginx.EntryManagement {
+			continue
+		}
+		if managementEntry != nil || entry.Digest != state.ManagementHTTPS.EntryDigest {
+			return fmt.Errorf("independent Management HTTPS expiry entry authority changed")
+		}
+		managementEntry = &entry
+	}
+	if managementEntry == nil {
+		return fmt.Errorf("independent Management HTTPS expiry entry is absent")
+	}
+	authority, err := service.managementReloadAuthority(exposure)
+	if err != nil {
+		return err
+	}
+	if _, err := host.ContractManagement(ctx, *managementEntry, authority, stopBeforeMutation); err != nil {
+		return err
+	}
+	fresh, err := service.store.ReadForRecovery(exposure)
+	if err != nil {
+		return err
+	}
+	if fresh.ManagementHTTPS.EntryDigest != state.ManagementHTTPS.EntryDigest {
+		return fmt.Errorf("independent Management HTTPS expiry safety authority changed")
+	}
+	cleared := fresh
+	cleared.Revision++
+	cleared.ManagementHTTPS.EntryDigest = ""
+	_, err = service.store.Commit(ctx, exposure, safety.RoleContraction, fresh.Revision, cleared, safety.TransitionProof{})
+	return err
+}
+
 func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, now time.Time) error {
 	if service == nil || now.IsZero() {
 		return fmt.Errorf("certificate wall observation invalid")
@@ -2661,6 +2890,12 @@ func (service *FixedService) ObserveCertificateTrustedWall(ctx context.Context, 
 		copy := *active
 		copy.LastTrustedWall = now.UTC()
 		next.Headscale.ActiveCertificate = &copy
+		changed = true
+	}
+	if active := next.ManagementHTTPS.ActiveCertificate; active != nil && now.After(active.LastTrustedWall) && active.NotAfter.After(now) {
+		copy := *active
+		copy.LastTrustedWall = now.UTC()
+		next.ManagementHTTPS.ActiveCertificate = &copy
 		changed = true
 	}
 	if !changed {
@@ -2708,6 +2943,14 @@ func ReconcileCertificateExpiries(ctx context.Context, now time.Time) error {
 		_ = service.Close()
 		return fallback(decisionErr)
 	}
+	managementDecision, decisionErr := renewal.EvaluateManagementHTTPS(now, 30*24*time.Hour, installation.ManagementHTTPS, state)
+	if decisionErr != nil {
+		_ = service.Close()
+		return fallback(decisionErr)
+	}
+	if state.ManagementHTTPS.CertificateExpiry != nil {
+		managementDecision = renewal.DecisionContract
+	}
 	if state.GlobalClose.Phase == safety.GlobalCloseNone && state.Headscale.CertificateExpiry != nil {
 		headscaleDecision = renewal.DecisionContract
 	}
@@ -2728,6 +2971,17 @@ func ReconcileCertificateExpiries(ctx context.Context, now time.Time) error {
 		}
 	}
 	if err := service.Close(); err != nil {
+		return fallback(err)
+	}
+	if err := ReconcileManagementHTTPSExpiryJobs(ctx); err != nil {
+		return fallback(err)
+	}
+	if managementDecision == renewal.DecisionContract {
+		if err := ContractExpiredManagementHTTPS(ctx, now); err != nil {
+			return fallback(err)
+		}
+	}
+	if err := ReconcileManagementHTTPSExpiryJobs(ctx); err != nil {
 		return fallback(err)
 	}
 	if headscaleDecision == renewal.DecisionContract {
@@ -2786,7 +3040,7 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 			continue
 		}
 		var intent operations.Reservation
-		if json.Unmarshal(raw, &intent) != nil || (intent.Operation != operations.Publish && intent.Operation != operations.CertificateRenew) || (intent.Phase != operations.PhaseReserved && intent.Phase != operations.PhaseLocalIntent) || intent.SafetyBinding.CertificateIdentity == "" || (intent.SafetyBinding.ChallengeMethod != "http-01" && intent.SafetyBinding.ChallengeMethod != "dns-01") {
+		if json.Unmarshal(raw, &intent) != nil || !journalLessCertificateIntent(intent) {
 			continue
 		}
 		hasJournal, hasChild, hasChallenge := false, false, false
@@ -2807,6 +3061,12 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 		for _, resource := range state.Resources {
 			pending := resource.ChallengePending
 			if pending != nil && resource.ResourceID == intent.SafetyBinding.ResourceID && pending.PlanID == intent.SafetyBinding.PlanID && pending.Generation == intent.SafetyBinding.IntentGeneration {
+				hasChallenge = true
+			}
+		}
+		if intent.SafetyBinding.ResourceID == "management_https" {
+			pending := state.ManagementHTTPS.ChallengePending
+			if pending != nil && pending.PlanID == intent.SafetyBinding.PlanID && pending.Generation == intent.SafetyBinding.IntentGeneration {
 				hasChallenge = true
 			}
 		}
@@ -2878,6 +3138,11 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 			_ = mutationSet.Close()
 			return fmt.Errorf("journal-less Headscale certificate acquired challenge authority")
 		}
+		if intent.SafetyBinding.ResourceID == "management_https" && freshState.ManagementHTTPS.ChallengePending != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("journal-less management HTTPS certificate acquired challenge authority")
+		}
 		_, completeErr := admitter.TerminalizeJournalLessCertificate(ctx, mutation, exposure, document.Revision, jobID, childClosure)
 		releaseErr := operations.ReleaseExposure(mutation, exposure)
 		closeErr := mutationSet.Close()
@@ -2886,6 +3151,13 @@ func ReconcileJournalLessCertificateIntents(ctx context.Context, childClosure st
 		}
 	}
 	return nil
+}
+
+func journalLessCertificateIntent(intent operations.Reservation) bool {
+	operationAllowed := intent.Operation == operations.Publish || intent.Operation == operations.CertificateRenew || intent.Operation == operations.AutomaticReconciliation && intent.Target == "management_https"
+	phaseAllowed := intent.Phase == operations.PhaseReserved || intent.Phase == operations.PhaseLocalIntent
+	challengeAllowed := intent.SafetyBinding.ChallengeMethod == "http-01" || intent.SafetyBinding.ChallengeMethod == "dns-01"
+	return operationAllowed && phaseAllowed && intent.SafetyBinding.CertificateIdentity != "" && challengeAllowed
 }
 
 func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure string) error {
@@ -2927,6 +3199,9 @@ func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure str
 			}
 		}
 		if intent.SafetyBinding.ResourceID == "headscale" && state.Headscale.ChallengePending != nil && state.Headscale.ChallengePending.PlanID == intent.SafetyBinding.PlanID && state.Headscale.ChallengePending.Generation == intent.SafetyBinding.IntentGeneration {
+			hasChallenge = true
+		}
+		if intent.SafetyBinding.ResourceID == "management_https" && state.ManagementHTTPS.ChallengePending != nil && state.ManagementHTTPS.ChallengePending.PlanID == intent.SafetyBinding.PlanID && state.ManagementHTTPS.ChallengePending.Generation == intent.SafetyBinding.IntentGeneration {
 			hasChallenge = true
 		}
 		if !hasChallenge {
@@ -2997,6 +3272,11 @@ func ReconcileUnstartedCertificateJournals(ctx context.Context, childClosure str
 			_ = mutationSet.Close()
 			return fmt.Errorf("unstarted Headscale certificate acquired challenge authority")
 		}
+		if intent.SafetyBinding.ResourceID == "management_https" && freshState.ManagementHTTPS.ChallengePending != nil {
+			_ = operations.ReleaseExposure(mutation, exposure)
+			_ = mutationSet.Close()
+			return fmt.Errorf("unstarted management HTTPS certificate acquired challenge authority")
+		}
 		if err := errors.Join(acme.RemoveStage(journal.Certificate.CertificateID, journal.Certificate.StageUID, journal.Certificate.StageGID), acme.RemoveWebroot(journal.Certificate.CertificateID, journal.Certificate.StageUID, journal.Certificate.StageGID)); err != nil {
 			_ = operations.ReleaseExposure(mutation, exposure)
 			_ = mutationSet.Close()
@@ -3036,7 +3316,7 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 			continue
 		}
 		var journal operations.JournalRecord
-		if json.Unmarshal(raw, &journal) == nil && journal.Kind == operations.JournalCertificateActivation && journal.Operation == operations.CertificateRenew && (journal.Phase == operations.JournalActive || journal.Phase == operations.JournalTerminal) {
+		if json.Unmarshal(raw, &journal) == nil && journal.Kind == operations.JournalCertificateActivation && (journal.Operation == operations.CertificateRenew || journal.Operation == operations.AutomaticReconciliation && journal.Target == "management_https") && (journal.Phase == operations.JournalActive || journal.Phase == operations.JournalTerminal) {
 			var intent operations.Reservation
 			if intentRaw, present := document.Entries["intents/"+journal.JobID]; present && json.Unmarshal(intentRaw, &intent) == nil && intent.Phase != operations.PhaseTerminal && intent.Phase != operations.PhaseRejected {
 				journalIDs = append(journalIDs, journal.ID)
@@ -3053,6 +3333,12 @@ func ReconcileCompletedCertificateRenewals(ctx context.Context) error {
 		var journal operations.JournalRecord
 		if !present || json.Unmarshal(raw, &journal) != nil || journal.Certificate == nil {
 			return fmt.Errorf("completed renewal journal changed")
+		}
+		if journal.Target == "management_https" && (journal.Operation == operations.AutomaticReconciliation || journal.Operation == operations.CertificateRenew) {
+			if err := reconcileCompletedManagementHTTPSCertificate(ctx, service, journalID); err != nil {
+				return err
+			}
+			continue
 		}
 		if strings.HasPrefix(journal.Target, "headscale/") {
 			if err := reconcileCompletedHeadscaleRenewal(ctx, journalID); err != nil {
@@ -3231,6 +3517,15 @@ func ReconcileCertificateChallenges(ctx context.Context, childClosure string) er
 	}
 	if state.Headscale.ChallengePending != nil {
 		if err := reconcileInterruptedHeadscaleChallenge(ctx, service, childClosure); err != nil {
+			return err
+		}
+		state, err = service.safety.Read()
+		if err != nil {
+			return err
+		}
+	}
+	if state.ManagementHTTPS.ChallengePending != nil {
+		if err := reconcileInterruptedManagementHTTPSChallenge(ctx, service, childClosure); err != nil {
 			return err
 		}
 		state, err = service.safety.Read()

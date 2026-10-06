@@ -41,6 +41,7 @@ type SystemStatus struct {
 	NginxStatus     string           `json:"nginx_status"`
 	NginxEntryCount int              `json:"nginx_entry_count"`
 	SafetyChecksum  string           `json:"safety_checksum"`
+	ManagementHTTPS string           `json:"management_https"`
 	Headscale       string           `json:"headscale"`
 	Connector       string           `json:"connector"`
 	Resources       []ResourceStatus `json:"resources"`
@@ -207,7 +208,9 @@ func ReadSystemStatus(ctx context.Context) (SystemStatus, error) {
 			nginxStatus = "disk_verified_runtime_unknown"
 		}
 	}
-	result := SystemStatus{ObservedAt: time.Now().UTC(), InstallationID: installation.InstallationID, NginxStatus: nginxStatus, NginxEntryCount: len(manifest.Entries), SafetyChecksum: state.Checksum, Headscale: "not_configured", Connector: "not_configured", Resources: []ResourceStatus{}}
+	observedAt := time.Now().UTC()
+	managementHTTPSStatus := observeManagementHTTPSStatus(installation, state, manifest, runtimeHealthy, observedAt)
+	result := SystemStatus{ObservedAt: observedAt, InstallationID: installation.InstallationID, NginxStatus: nginxStatus, NginxEntryCount: len(manifest.Entries), SafetyChecksum: state.Checksum, ManagementHTTPS: managementHTTPSStatus, Headscale: "not_configured", Connector: "not_configured", Resources: []ResourceStatus{}}
 	if installation.Headscale != nil {
 		result.Headscale = "configured"
 		if state.Headscale.CertificateExpiry != nil {
@@ -310,6 +313,33 @@ func observeNginxStatusForResource(ctx context.Context, service *FixedService, i
 		return manifest, false, domain.FailureEvidenceMismatch, false
 	}
 	return manifest, true, domain.FailureNone, false
+}
+
+func observeManagementHTTPSStatus(installation domain.Installation, state safety.State, manifest nginx.Manifest, runtimeHealthy bool, now time.Time) string {
+	config := installation.ManagementHTTPS
+	if config == nil {
+		return "not_configured"
+	}
+	if config.Phase != domain.ManagementHTTPSActive {
+		return string(config.Phase)
+	}
+	if config.CertificateBundle == nil || state.ManagementHTTPS.ActiveCertificate == nil {
+		return "configured_runtime_unknown"
+	}
+	certificate := state.ManagementHTTPS.ActiveCertificate
+	if !now.Before(certificate.NotAfter) || state.ManagementHTTPS.CertificateExpiry != nil && !now.Before(state.ManagementHTTPS.CertificateExpiry.Deadline) {
+		return "expired"
+	}
+	entry, err := nginx.BuildManagementEntry(installation)
+	if err != nil || entry.Digest != state.ManagementHTTPS.EntryDigest || !runtimeHealthy {
+		return "configured_runtime_unknown"
+	}
+	for _, observed := range manifest.Entries {
+		if observed.Kind == nginx.EntryManagement && observed.Relative == entry.Relative && observed.Digest == entry.Digest && observed.Generation == entry.Generation {
+			return "healthy"
+		}
+	}
+	return "configured_runtime_unknown"
 }
 
 func expectedNginxRuntimeListeners(manifest nginx.Manifest) []string {
