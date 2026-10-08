@@ -217,6 +217,9 @@ func uninstallCommitted(ctx context.Context, paths Paths, out io.Writer, expecte
 	if err := bindCurrentAuthorityArtifacts(paths, journal, commitBytes, &inventory); err != nil {
 		return err
 	}
+	if err := bindCurrentAdminTokenArtifact(paths, &inventory); err != nil {
+		return err
+	}
 	if err := stopOwnedServices(ctx, inventory.Paths); err != nil {
 		return err
 	}
@@ -391,6 +394,64 @@ func bindCurrentAuthorityArtifacts(paths Paths, journal Journal, commitBytes []b
 		}
 		inventory.Artifacts[path] = release.DigestBytes(data)
 	}
+	return nil
+}
+
+func bindCurrentAdminTokenArtifact(paths Paths, inventory *OwnershipInventory) error {
+	if inventory == nil {
+		return fmt.Errorf("uninstall ownership inventory is missing")
+	}
+	path := filepath.Join(paths.InstallationRoot, "admin-token")
+	const adminTokenEncodedBytes = 64
+	parentFD, err := unix.Open(filepath.Dir(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("uninstall cannot inspect admin token parent %q: %w", filepath.Dir(path), err)
+	}
+	defer func() { _ = unix.Close(parentFD) }()
+	var parentStat unix.Stat_t
+	if unix.Fstat(parentFD, &parentStat) != nil || parentStat.Mode&unix.S_IFMT != unix.S_IFDIR || parentStat.Uid != 0 || parentStat.Gid != 0 || parentStat.Mode&0o022 != 0 {
+		return fmt.Errorf("uninstall foreign admin token parent %q", filepath.Dir(path))
+	}
+	fd, err := unix.Openat(parentFD, filepath.Base(path), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("uninstall cannot inspect %q: %w", path, err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("uninstall admin token descriptor is invalid")
+	}
+	defer func() { _ = file.Close() }()
+	var before, after unix.Stat_t
+	if unix.Fstat(fd, &before) != nil || before.Mode&unix.S_IFMT != unix.S_IFREG || before.Nlink != 1 || before.Uid != 0 || before.Gid != 0 || before.Mode&0o777 != 0o600 || before.Size != adminTokenEncodedBytes {
+		return fmt.Errorf("uninstall foreign admin token metadata at %q", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, adminTokenEncodedBytes+1))
+	if err != nil {
+		clear(data)
+		return fmt.Errorf("uninstall cannot read %q: %w", path, err)
+	}
+	if len(data) != adminTokenEncodedBytes || unix.Fstat(fd, &after) != nil || before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Mode != after.Mode || before.Nlink != after.Nlink || before.Uid != after.Uid || before.Gid != after.Gid {
+		clear(data)
+		return fmt.Errorf("uninstall foreign admin token at %q", path)
+	}
+	for _, value := range data {
+		if (value < '0' || value > '9') && (value < 'a' || value > 'f') {
+			clear(data)
+			return fmt.Errorf("uninstall foreign admin token format at %q", path)
+		}
+	}
+	if inventory.Artifacts == nil {
+		inventory.Artifacts = map[string]string{}
+	}
+	inventory.Artifacts[path] = release.DigestBytes(data)
+	clear(data)
 	return nil
 }
 

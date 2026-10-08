@@ -339,7 +339,7 @@ func installFixtureState(t *testing.T, paths Paths, externalPaths ...string) {
 		name string
 		mode os.FileMode
 		data string
-	}{{"admin-token", 0o600, "fixture-admin"}, {"default-rejection.crt", 0o644, "fixture-crt"}, {"default-rejection.key", 0o600, "fixture-key"}, {"host-fingerprint", 0o600, "fixture-host"}, {"os-profile.digest", 0o600, "fixture-profile"}, {"release-authority.digest", 0o600, "fixture-authority"}} {
+	}{{"admin-token", 0o600, strings.Repeat("a", 64)}, {"default-rejection.crt", 0o644, "fixture-crt"}, {"default-rejection.key", 0o600, "fixture-key"}, {"host-fingerprint", 0o600, "fixture-host"}, {"os-profile.digest", 0o600, "fixture-profile"}, {"release-authority.digest", 0o600, "fixture-authority"}} {
 		if err := os.WriteFile(filepath.Join(paths.InstallationRoot, file.name), []byte(file.data), file.mode); err != nil {
 			t.Fatal(err)
 		}

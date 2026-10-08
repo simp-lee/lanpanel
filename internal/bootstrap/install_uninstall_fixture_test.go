@@ -27,6 +27,15 @@ import (
 // a private mount/user namespace. It deliberately does not use the fabricated
 // committed-state helper used by the narrower uninstall predicate tests.
 func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
+	runRealInstallThenPublicUninstallFixture(t, false)
+}
+
+func TestRealInstallThenPublicUninstallAfterAdminTokenRotationFixture(t *testing.T) {
+	runRealInstallThenPublicUninstallFixture(t, true)
+}
+
+func runRealInstallThenPublicUninstallFixture(t *testing.T, rotateToken bool) {
+	t.Helper()
 	if os.Getenv("LANPANEL_REAL_LIFECYCLE_CHILD") != "1" {
 		namespaceRoot := t.TempDir()
 		if err := os.Chmod(namespaceRoot, 0o755); err != nil {
@@ -40,7 +49,7 @@ func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
 		args := []string{
 			"--unshare-user", "--uid", "0", "--gid", "0", "--unshare-pid", "--bind", namespaceRoot, "/",
 			"--proc", "/proc", "--dev-bind", "/dev", "/dev", "--ro-bind", "/bin", "/bin", "--ro-bind", "/sbin", "/sbin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/usr/bin", "/usr/bin", "--ro-bind", "/usr/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu", "--ro-bind", "/usr/lib64", "/usr/lib64", "--ro-bind", os.Args[0], "/tmp/lifecycle.test",
-			"/tmp/lifecycle.test", "-test.run=^TestRealInstallThenPublicUninstallFixture$", "-test.v",
+			"/tmp/lifecycle.test", "-test.run=^" + t.Name() + "$", "-test.v",
 		}
 		master, slave := openFixturePTY(t, "UNINSTALL LANPANEL\n")
 		defer func() { _ = master.Close() }()
@@ -141,6 +150,23 @@ func TestRealInstallThenPublicUninstallFixture(t *testing.T) {
 	var inventory OwnershipInventory
 	if err := decodeCanonical(inventoryBytes, &inventory); err != nil {
 		t.Fatal(err)
+	}
+	if rotateToken {
+		// Rotate by atomically replacing the protected source, leaving the
+		// committed installation inventory untouched, as the runtime does.
+		token, err := identity.GenerateAdminToken(bytes.NewReader(bytes.Repeat([]byte{0x42}, identity.AdminTokenRandomBytes)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := filepath.Join(paths.InstallationRoot, ".admin-token.rotate")
+		if err := os.WriteFile(candidate, token, 0o600); err != nil {
+			clear(token)
+			t.Fatal(err)
+		}
+		clear(token)
+		if err := os.Rename(candidate, filepath.Join(paths.InstallationRoot, "admin-token")); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	tty := os.NewFile(uintptr(3), "lifecycle-confirmation-tty")
