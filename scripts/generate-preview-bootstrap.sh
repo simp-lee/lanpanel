@@ -20,7 +20,7 @@ case "$digest" in
   *[![:print:]]*) echo "artifact digest must be a single printable line" >&2; exit 2 ;;
 esac
 if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "version must be a stable semantic release tag such as v0.4.0" >&2
+  echo "version must be a stable semantic release tag such as vMAJOR.MINOR.PATCH" >&2
   exit 2
 fi
 case "$url" in https://*) ;; *) echo "artifact URL must be HTTPS" >&2; exit 2;; esac

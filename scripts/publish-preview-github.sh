@@ -14,7 +14,7 @@ case "$tag" in
   *[![:print:]]*) echo "tag must be a single printable line" >&2; exit 2 ;;
 esac
 if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "tag must be a stable semantic release tag such as v0.4.0" >&2
+  echo "tag must be a stable semantic release tag such as vMAJOR.MINOR.PATCH" >&2
   exit 2
 fi
 command -v gh >/dev/null 2>&1 || { echo "gh CLI is required for GitHub publishing" >&2; exit 1; }

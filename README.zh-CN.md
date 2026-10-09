@@ -44,7 +44,7 @@ LanPanel 是一个面向个人和相互信任小团队的自托管 Linux 主机�
 
 ### 2. 安装
 
-从 [GitHub Releases](https://github.com/simp-lee/lanpanel/releases) 下载并解压与主机匹配的 v0.4.0 发布包，在包目录执行：
+从 [GitHub Releases](https://github.com/simp-lee/lanpanel/releases) 下载并解压与主机匹配的发布包，在包目录执行：
 
 ```sh
 sudo ./lanpanel install
@@ -52,7 +52,7 @@ sudo ./lanpanel install
 
 这是唯一公开的安装入口。不要自行传入 bundle 路径、摘要、软件包计划、依赖路径或 ACME 联系方式。安装器会自动发现发布材料并校验清单、签名、完整校验和、固定第三方依赖及主机条件；校验失败时不会继续修改主机。
 
-也可以使用官方发布页提供的版本固定 Bootstrap。把 `<tag>` 换成固定版本标签，例如 `v0.4.0`，不要使用 `latest`：
+也可以使用官方发布页提供的版本固定 Bootstrap。把 `<tag>` 换成要安装版本的固定标签，不要使用 `latest`：
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh | sh

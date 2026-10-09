@@ -52,7 +52,7 @@ sudo ./lanpanel install
 
 This is the only public installation entry point. Do not provide a bundle path, digest, package plan, dependency path, or ACME contact. The installer discovers the release materials and verifies the manifest, signature, complete checksums, fixed third-party dependencies, and host conditions before mutation; verification failure stops the installation.
 
-You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with a fixed release tag such as `v0.4.0`; do not use `latest`:
+You can also use the version-pinned Bootstrap published on the official release page. Replace `<tag>` with the fixed release tag for the version you intend to install; do not use `latest`:
 
 ```sh
 curl -fL https://github.com/simp-lee/lanpanel/releases/download/<tag>/lanpanel-bootstrap.sh | sh

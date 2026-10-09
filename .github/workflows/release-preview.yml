@@ -33,7 +33,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if ! printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo 'tag must be a stable semantic version such as v0.4.0' >&2
+            echo 'tag must be a stable semantic version such as vMAJOR.MINOR.PATCH' >&2
             exit 2
           fi
 

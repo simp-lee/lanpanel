@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   echo "usage: $0 VERSION ARTIFACT_DIR DOWNLOAD_BASE_URL OUTPUT_DIR" >&2
-  echo "example: $0 v0.4.0 dist/release https://github.com/simp-lee/lanpanel/releases/download/v0.4.0 dist/releases" >&2
+  echo "example: $0 vMAJOR.MINOR.PATCH dist/release https://github.com/simp-lee/lanpanel/releases/download/vMAJOR.MINOR.PATCH dist/releases" >&2
 }
 
 if [ "$#" -ne 4 ]; then
@@ -16,7 +16,7 @@ base_url=$3
 output_dir=$4
 
 if ! printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "version must be a stable semantic release tag such as v0.4.0" >&2
+  echo "version must be a stable semantic release tag such as vMAJOR.MINOR.PATCH" >&2
   exit 2
 fi
 case "$base_url" in

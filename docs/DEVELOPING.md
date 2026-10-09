@@ -2,7 +2,7 @@
 
 ## 开发与发布文档
 
-本文面向贡献者、开发者和 LanPanel v0.4.0 发布维护者。普通用户只需阅读根目录的 [README.md](../README.md)。
+本文面向贡献者、开发者和 LanPanel 发布维护者。普通用户只需阅读根目录的 [README.md](../README.md)。
 
 ## 开发环境
 
@@ -59,7 +59,7 @@ make playwright-fixture-gate
 - `internal/`：安装器、UI、应用、网络、证书、进程和发布校验等实现；
 - `scripts/`：依赖物化、发布打包、Bootstrap 生成和 GitHub 发布适配器；
 - `release-inputs/`：经过审查并纳入版本控制的发布输入；
-- `.github/workflows/`：CI 和 v0.4.0 发布工作流。
+- `.github/workflows/`：CI 和发布工作流。
 
 根目录 `README.md` 是普通用户文档，同时也是发布清单中的限制说明资产；不要再创建或恢复单独的限制说明文件。
 
@@ -115,18 +115,18 @@ make capture-preview-profile \
 4. **verify/package**：校验完整发布目录并制作外层归档及 Bootstrap；
 5. **publish**（可选）：上传后重新下载并校验公开文件。
 
-完整本地流程使用 `make release-preview`。它不会查询 `latest`，但需要以下输入：已审查的发布清单模板、Profile 输入目录、签名私钥路径，以及各阶段的输出目录。例如：
+完整本地流程使用 `make release-preview`。它不会查询 `latest`，但需要以下输入：已审查的发布清单模板、Profile 输入目录、签名私钥路径，以及各阶段的输出目录。以下示例假定环境变量 `RELEASE_TAG` 已设置为目标固定版本标签：
 
 ```sh
 make release-preview \
-  PREVIEW_TAG=v0.4.0 \
+  PREVIEW_TAG="$RELEASE_TAG" \
   PREVIEW_SOURCE_DIR="$PWD" \
   PREVIEW_DEPENDENCY_DIR="$PWD/dist/dependencies" \
   PREVIEW_MANIFEST_TEMPLATE="$MANIFEST_TEMPLATE" \
   PREVIEW_PROFILE_INPUT_DIR="$PROFILE_INPUT_DIR" \
   PREVIEW_SIGNING_KEY="$SIGNING_KEY" \
   PREVIEW_ARTIFACT_DIR="$PWD/dist/release" \
-  PREVIEW_DOWNLOAD_BASE_URL="https://github.com/simp-lee/lanpanel/releases/download/v0.4.0" \
+  PREVIEW_DOWNLOAD_BASE_URL="https://github.com/simp-lee/lanpanel/releases/download/$RELEASE_TAG" \
   PREVIEW_OUTPUT_DIR="$PWD/dist/releases"
 ```
 
@@ -143,24 +143,24 @@ make release-preview \
 
 ## GitHub 发布
 
-默认发布流程由版本 Tag 自动触发，不需要手动打开 Actions 页面：
+默认发布流程由版本 Tag 自动触发，不需要手动打开 Actions 页面。以下命令假定环境变量 `RELEASE_TAG` 已设置为目标版本标签：
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag "$RELEASE_TAG"
+git push origin "$RELEASE_TAG"
 ```
 
-`.github/workflows/release-preview.yml` 响应版本 Tag，并在脚本校验通过时发布稳定 SemVer（例如 `v0.4.0`）。它会使用仓库中经过审查的 `release-inputs/manifest-template.json` 和
+`.github/workflows/release-preview.yml` 响应版本 Tag，并在脚本校验通过时发布稳定 SemVer 标签（例如 `$RELEASE_TAG`）。它会使用仓库中经过审查的 `release-inputs/manifest-template.json` 和
 `release-inputs/profiles/linux-amd64-apt-dpkg-systemd/`，运行同一套 `make release-preview` 和 GitHub 适配器，创建并验证 GitHub Release。
 
 首次配置仓库时，需要在 GitHub Actions Secret 中添加
 `LANPANEL_RELEASE_PRIVATE_KEY_B64`。之后每个 Tag 发布都会自动使用该 Secret 签名；私钥不能提交到仓库。
 
-也可以在本地执行同一发布适配器：
+也可以在本地执行同一发布适配器；以下命令假定环境变量 `RELEASE_TAG` 已设置：
 
 ```sh
 make publish-preview-github \
-  PREVIEW_TAG=v0.4.0 \
+  PREVIEW_TAG="$RELEASE_TAG" \
   PREVIEW_OUTPUT_DIR="$PWD/dist/releases"
 ```
 
