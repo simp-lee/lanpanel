@@ -257,18 +257,18 @@ Before uninstalling, LanPanel shows the managed scope and requires the exact int
 
 Use the secret-free configuration export when you need to take product configuration out of the host. It is not a product backup. A manual host copy or VM snapshot is not automatically a supported and recoverable backup.
 
-## v0.4.0 limitations
+## Limitations
 
 - Clean installation only for a new host; no in-place release upgrade, dependency updater, rollback engine, or state/schema migration. Replaying the same signed release after a committed installation is idempotent; package ownership rules above still apply.
 - No supported product backup/restore, restore cutover, or cross-host migration. A manual host copy or VM snapshot is not automatically a supported recoverable backup.
 - No generic Repair, host repair, orphan adoption, or automatic normalization.
-- No EdgeOne integration in v0.4.0.
+- No EdgeOne integration.
 - No connector disconnect, logout, reset, rejoin, or rebind automation. Connector mismatches must be resolved outside LanPanel.
 - Without an independent remote authority, Tailnet HTTP/WebSocket is reported as not live tested.
 - Key revoke does not expire a registered device.
 - Unpublish, device expiry, and pre-authentication key revocation do not guarantee termination of existing flows.
 - Temporary public HTTP is plaintext and does not expire automatically.
-- v0.4.0 does not claim complete audit coverage, universal live qualification, or complete reproducible-release guarantees.
+- Does not claim complete audit coverage, universal live qualification, or complete reproducible-release guarantees.
 - Fail-closed Nginx stop can interrupt Headscale control ingress.
 
 ## Developers
