@@ -917,16 +917,17 @@ func validateManagementHTTPSTransition(role ClearRole, before, after ManagementH
 		if after.ActiveCertificate == nil {
 			return fmt.Errorf("management HTTPS active certificate cannot be cleared")
 		}
-		if role == RoleCertificateObservation {
+		switch role {
+		case RoleCertificateObservation:
 			if before.ActiveCertificate == nil || after.ActiveCertificate.Generation != before.ActiveCertificate.Generation || after.ActiveCertificate.Fingerprint != before.ActiveCertificate.Fingerprint || after.ActiveCertificate.Binding != before.ActiveCertificate.Binding || !after.ActiveCertificate.NotAfter.Equal(before.ActiveCertificate.NotAfter) || after.ActiveCertificate.LastTrustedWall.Before(before.ActiveCertificate.LastTrustedWall) || !after.ActiveCertificate.LastTrustedWall.Before(after.ActiveCertificate.NotAfter) {
 				return fmt.Errorf("management HTTPS certificate observation is invalid")
 			}
-		} else if role == RoleCertificateActivation {
+		case RoleCertificateActivation:
 			replacingExpired := before.ActiveCertificate != nil && before.EntryDigest == "" && before.CertificateExpiry != nil
 			if before.ChallengePending == nil || after.ChallengePending != nil || !after.ActiveCertificate.NotAfter.After(after.ActiveCertificate.LastTrustedWall) || before.ActiveCertificate != nil && !replacingExpired && (after.ActiveCertificate.Generation != before.ActiveCertificate.Generation+1 || after.ActiveCertificate.Fingerprint == before.ActiveCertificate.Fingerprint) || replacingExpired && (after.ActiveCertificate.Generation != before.ActiveCertificate.Generation+1 || after.ActiveCertificate.Fingerprint == before.ActiveCertificate.Fingerprint && after.ActiveCertificate.Binding == before.ActiveCertificate.Binding) {
 				return fmt.Errorf("management HTTPS certificate activation does not replace exact challenge authority")
 			}
-		} else {
+		default:
 			return fmt.Errorf("management HTTPS active certificate has an unauthorized writer")
 		}
 	}
